@@ -110,6 +110,34 @@ On an X11 session instead of Wayland, reconfigure with
 `-DMLN_WITH_WAYLAND=OFF -DMLN_WITH_X11=ON`.
 :::
 
+## Pre-baking tiles to PMTiles
+
+For the precache path (render fast from a ready archive, or ship a region), the
+`chartplotter-bake` CLI bakes a cell to a PMTiles archive offline — the native
+analogue of chartplotter-go's `bake`:
+
+```sh
+ninja -C build chartplotter-bake          # or: cd engine && zig build  (-> engine/zig-out/bin/)
+
+chartplotter-bake bake \
+  ../chartplotter-go/testdata/US4MD81M.000 \
+  -o charts.pmtiles --minzoom 8 --maxzoom 16 \
+  [US4MD81M.001 US4MD81M.002 ...]         # optional update files, applied in order
+
+chartplotter-bake inspect charts.pmtiles  # zoom range + tile counts
+chartplotter-bake version
+```
+
+The archive then renders through the same hosts (`chartplotter charts.pmtiles
+style/chart-zig-day.json`).
+
+:::note Baker portrayal
+The baker currently emits the `classify()` fallback styling, not the full S-101
+portrayal (running the embedded Lua rules from the baker needs them linked into
+the exe — tracked as a follow-up). For full-S-52 output today, render live from a
+cell/ENC_ROOT.
+:::
+
 ## S-101 self-tests
 
 `chartplotter-render` also wraps the embedded-Lua / S-101 bring-up checks:

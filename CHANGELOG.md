@@ -6,6 +6,30 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Added — offline baker + portrayal/style refinements
+- **`chartplotter-bake` CLI** (`engine/tools/bake.zig`): pre-bake a cell to a
+  PMTiles archive — `chartplotter-bake bake <cell.000> -o out.pmtiles
+  [--minzoom N --maxzoom N] [updates…]` — over the cell's bounds, plus `inspect`,
+  `cell`, and `version`. The precache path that mirrors chartplotter-go's `bake`.
+  (Bakes with the `classify()` fallback styling for now; full S-101 portrayal in
+  the baker needs the embedded Lua linked into the exe — tracked as follow-up.)
+- **SCAMIN decluttering**: the live path now routes features carrying SCAMIN
+  (attr 133) into `*_scamin` MVT buckets, and `build_style.py` gives those layers
+  a per-feature `minzoom` derived from the SCAMIN 1:N denominator, so minor
+  features drop out below their scale (replacing the M1 "both shown" stub).
+- **S-52 draw priority**: `draw_prio` (from the S-101 instruction stream) is now
+  emitted on features and used as the area fill-sort-key (Go sync `3ca4d5f`).
+- **Drying-line contour**: 0 m `VALDCO` is emitted on DEPCNT lines + a
+  line-centre contour-label style layer (Go sync `f86b750`).
+- **M_QUAL data quality**: `zoneOfConfidence` is synthesized from CATZOC (via a
+  generalized complex-attribute binding) so `QualityOfBathymetricData` portrays
+  (Go sync `49e9cd9`).
+- QUAPOS quality-of-position is parsed + aggregated per feature (Go sync
+  `1b04ebb`); the approximate-position dashed-line *application* is still to come.
+- Derived depth attrs (`defaultClearanceDepth`/`surroundingDepth`, Go sync
+  `a9c8afd`) are computed + supplied to dangers; the under/awash danger rules
+  still error pending mariner-settings binding work (a deeper portrayal gap).
+
 ### Changed — public identity & C API (breaking, pre-1.0)
 - Library renamed `libtilegen.a` → **`libchartplotter.a`**; public header
   `include/tilegen.h` → **`include/chartplotter.h`**; C ABI prefix `tg_` → `chartplotter_`.

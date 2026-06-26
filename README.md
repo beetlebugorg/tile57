@@ -80,8 +80,9 @@ Full instructions are in the
 | Target | What it is |
 |--------|-----------|
 | `libchartplotter.a` | the Zig tile generator + its C ABI |
-| `chartplotter-render` | headless host: chart → PNG (PMTiles or a live S-57 cell) |
+| `chartplotter-render` | headless host: chart → PNG (PMTiles, an S-57 cell, or an ENC_ROOT) |
 | `chartplotter` | interactive GLFW window: pan/zoom a live chart (desktop presets) |
+| `chartplotter-bake` | offline CLI: pre-bake a cell to a PMTiles archive (the precache path) |
 
 ## Documentation
 

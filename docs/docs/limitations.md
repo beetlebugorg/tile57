@@ -39,19 +39,28 @@ not lower all of these into tile geometry — features that depend on a construc
 the engine does not handle lose that constructed part (the rest of the feature —
 its symbol, fill, or label — still draws).
 
-## Live-path layer gaps
+## Portrayal / live-path gaps
 
-The live cell→MVT path emits seven of the layers in the
-[tile schema](./tile-schema.md). Still to come:
+The live cell→MVT path emits the layers in the [tile schema](./tile-schema.md)
+including the `*_scamin` declutter buckets and `draw_prio` ordering. Remaining
+gaps:
 
-- **`*_scamin` declutter buckets** — per-SCAMIN layer splits so minor features
-  drop out at their own zoom thresholds. Without them, the live path does not yet
-  declutter as aggressively as a Go-baked archive.
+- **Under/awash danger depths.** Obstruction / Wreck / UnderwaterAwashRock of
+  unknown depth still error in the rules (the live render logs "arithmetic on a
+  nil value (field 'Value')") and are dropped. The derived `defaultClearanceDepth`
+  / `surroundingDepth` attributes are now computed and supplied to those features,
+  but the danger rules need the mariner-settings depth binding wired through the
+  portrayal context before they stop erroring — that is still outstanding.
+- **Approximate-position (QUAPOS) dashing.** QUAPOS is parsed and aggregated per
+  feature, but the solid→dashed line-style switch for low-accuracy geometry is not
+  applied yet.
 - **Light sectors** — sectored/directional light legs and arcs are not yet emitted
   by the live path (they exist in the Go baker).
+- **Baker portrayal.** `chartplotter-bake` emits the `classify()` fallback styling,
+  not full S-101 portrayal (the embedded Lua isn't linked into that exe yet).
 
 A pre-baked PMTiles archive from chartplotter-go does not have these gaps; they are
-specific to live in-process generation.
+specific to live in-process generation / the native baker.
 
 ## ENC_ROOT loading
 
