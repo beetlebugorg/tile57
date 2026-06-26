@@ -65,7 +65,7 @@ build/chartplotter-render \
   38.97 -76.49 12 renders/from_cell.png
 ```
 
-The format is auto-detected (`CHARTPLOTTER_FORMAT_AUTO`): PMTiles first, then S-57 cell.
+The format is auto-detected (`TILE57_FORMAT_AUTO`): PMTiles first, then S-57 cell.
 
 ## Step 2b: Point at an ENC_ROOT (many cells + updates)
 
@@ -119,9 +119,9 @@ For the precache path (render fast from a ready archive, or ship a region), the
 analogue of chartplotter-go's `bake`:
 
 ```sh
-ninja -C build chartplotter-bake          # or: cd engine && zig build  (-> engine/zig-out/bin/)
+cd engine && zig build       # builds engine/zig-out/bin/chartplotter-bake (pure Zig)
 
-chartplotter-bake bake \
+engine/zig-out/bin/chartplotter-bake bake \
   ../chartplotter-go/testdata/US4MD81M.000 \
   -o charts.pmtiles --minzoom 8 --maxzoom 16 \
   [US4MD81M.001 US4MD81M.002 ...]         # optional update files, applied in order
@@ -152,7 +152,7 @@ build/chartplotter-render --s101portray <rules-dir>   # a real DepthArea rule em
 
 ## Runtime knobs
 
-- `CHARTPLOTTER_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57
+- `TILE57_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57
   cells. A fallback only: it applies when the host passes `NULL` for
   the `rules_dir` argument (the hosts auto-resolve + pass it). Defaults to the vendored
   catalogue at `vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.

@@ -45,7 +45,7 @@ Mapbox Vector Tile bytes  ─────────▶  MapLibre Native  (Char
    symbols, patterns, soundings, and text.
 5. **Project, clip, encode.** Each primitive is projected to web-mercator tile
    coordinates, clipped to the tile (extent 4096, buffer 64), and encoded as MVT.
-6. **Serve.** `chartplotter_tile_get` returns the tile's bytes; the `ChartTileSource`
+6. **Serve.** `tile57_tile_get` returns the tile's bytes; the `ChartTileSource`
    `FileSource` hands them to MapLibre for `zigtiles://{z}/{x}/{y}` requests.
 
 The same `chartplotter_*` API also reads a pre-baked **PMTiles** archive instead
