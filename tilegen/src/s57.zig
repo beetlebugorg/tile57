@@ -92,10 +92,10 @@ pub const Cell = struct {
         return self.nodes.get(key_vi);
     }
 
-    /// Full coordinates of an edge: begin node + interior SG2D + end node,
-    /// reversed if ornt==2. Appends into `out`.
-    fn edgeCoords(self: Cell, a: Allocator, edge_rcid: u32, ornt: u8, out: *std.ArrayList(LonLat)) !void {
-        const idx = self.edges.get(edge_rcid) orelse return;
+    /// One edge's full coordinates: begin node + interior SG2D + end node,
+    /// reversed if ornt==2. Returns a fresh slice (caller arena).
+    fn edgeCoordsRaw(self: Cell, a: Allocator, edge_rcid: u32, ornt: u8) ![]LonLat {
+        const idx = self.edges.get(edge_rcid) orelse return &.{};
         const e = self.vectors[idx];
         var tmp = std.ArrayList(LonLat).empty;
         if (e.begin_node != 0) {
@@ -106,21 +106,56 @@ pub const Cell = struct {
             if (self.nodeCoord(e.end_node)) |p| try tmp.append(a, p);
         }
         if (ornt == 2) std.mem.reverse(LonLat, tmp.items);
-        // Merge: drop a leading point identical to the current tail (shared node).
-        var items = tmp.items;
-        if (out.items.len > 0 and items.len > 0) {
-            const tail = out.items[out.items.len - 1];
-            if (tail.lon == items[0].lon and tail.lat == items[0].lat) items = items[1..];
-        }
-        try out.appendSlice(a, items);
+        return tmp.items;
     }
 
-    /// Assemble a feature's line/area geometry: concatenate its FSPT edges into
-    /// a single coordinate chain (a ring for area features). Caller arena.
+    /// Assemble a feature's line/area geometry into one or more connected parts.
+    /// Edges are taken in FSPT order; a part is extended while each edge's start
+    /// touches the current tail (the shared node is dropped), and a NEW part is
+    /// started at any discontinuity. This keeps disjoint rings / multi-part
+    /// geometry separate instead of joining them with a spurious straight jump
+    /// across the cell (the cause of long crossing lines on areas like CTNARE).
+    pub fn lineGeometryParts(self: Cell, a: Allocator, f: Feature) ![][]LonLat {
+        var parts = std.ArrayList([]LonLat).empty;
+        var cur = std.ArrayList(LonLat).empty;
+        for (f.refs) |ref| {
+            if (ref.name.rcnm != RCNM_VE) continue;
+            const edge = try self.edgeCoordsRaw(a, ref.name.rcid, ref.ornt);
+            if (edge.len == 0) continue;
+            if (cur.items.len == 0) {
+                try cur.appendSlice(a, edge);
+                continue;
+            }
+            const tail = cur.items[cur.items.len - 1];
+            const last = edge[edge.len - 1];
+            if (tail.lon == edge[0].lon and tail.lat == edge[0].lat) {
+                try cur.appendSlice(a, edge[1..]); // connected forward: drop shared node
+            } else if (tail.lon == last.lon and tail.lat == last.lat) {
+                // Edge connects at its far end: the stored ORNT didn't orient it
+                // for this traversal. Reverse it so the ring stays continuous.
+                std.mem.reverse(LonLat, edge);
+                try cur.appendSlice(a, edge[1..]);
+            } else {
+                try parts.append(a, cur.items); // genuine discontinuity: flush + restart
+                cur = std.ArrayList(LonLat).empty;
+                try cur.appendSlice(a, edge);
+            }
+        }
+        if (cur.items.len > 0) try parts.append(a, cur.items);
+        return parts.items;
+    }
+
+    /// Legacy single-chain assembly (concatenate all FSPT edges). Prefer
+    /// lineGeometryParts; kept for callers/tests that want one flat chain.
     pub fn lineGeometry(self: Cell, a: Allocator, f: Feature) ![]LonLat {
         var out = std.ArrayList(LonLat).empty;
-        for (f.refs) |ref| {
-            if (ref.name.rcnm == RCNM_VE) try self.edgeCoords(a, ref.name.rcid, ref.ornt, &out);
+        for (try self.lineGeometryParts(a, f)) |part| {
+            var items = part;
+            if (out.items.len > 0 and items.len > 0) {
+                const tail = out.items[out.items.len - 1];
+                if (tail.lon == items[0].lon and tail.lat == items[0].lat) items = items[1..];
+            }
+            try out.appendSlice(a, items);
         }
         return out.items;
     }

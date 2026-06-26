@@ -117,6 +117,41 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("  objl {d} prim: point(1)={d} line(2)={d} area(3)={d} none(255)={d}\n", .{ objl, pc[1], pc[2], pc[3], pc[255] });
         }
 
+        // Find features whose assembled geometry has an anomalously long
+        // segment (a "jump"): symptom of concatenating non-contiguous FSPT
+        // edges. Flag any segment longer than 10% of the cell diagonal.
+        if (gb) |b| {
+            const diag = @sqrt((b[2] - b[0]) * (b[2] - b[0]) + (b[3] - b[1]) * (b[3] - b[1]));
+            const thresh = 0.10 * diag;
+            var jumpy: usize = 0;
+            var worst_objl: u16 = 0;
+            var worst_len: f64 = 0;
+            for (cell.features) |f| {
+                if (f.prim != 2 and f.prim != 3) continue;
+                // Measure the longest segment WITHIN each connected part (the
+                // render uses lineGeometryParts, so per-part is what matters).
+                const parts = cell.lineGeometryParts(arena, f) catch continue;
+                var maxseg: f64 = 0;
+                for (parts) |g| {
+                    var i: usize = 1;
+                    while (i < g.len) : (i += 1) {
+                        const dx = g[i].lon - g[i - 1].lon;
+                        const dy = g[i].lat - g[i - 1].lat;
+                        const d = @sqrt(dx * dx + dy * dy);
+                        if (d > maxseg) maxseg = d;
+                    }
+                }
+                if (maxseg > thresh) {
+                    jumpy += 1;
+                    if (maxseg > worst_len) {
+                        worst_len = maxseg;
+                        worst_objl = f.objl;
+                    }
+                }
+            }
+            std.debug.print("  per-part geometry jumps (>10% cell diag): {d} features; worst objl={d} seg={d:.4} (diag={d:.4})\n", .{ jumpy, worst_objl, worst_len, diag });
+        }
+
         // Confirm DRVAL1/DRVAL2 attribute codes on a sample DEPARE.
         for (cell.features) |f| {
             if (f.objl == 42 and f.attrs.len > 0) {

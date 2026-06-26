@@ -86,17 +86,30 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
         return;
     }
 
-    // Line/area features.
-    const g = cell.lineGeometry(a, f) catch return;
-    if (g.len < 2) return;
-    if (!overlaps(geomBounds(g), tb)) return;
-    const proj = try a.alloc(mvt.Point, g.len);
-    for (g, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+    // Line/area features: assemble into connected parts (rings / chains) so
+    // disjoint geometry isn't joined by a spurious straight jump across the cell.
+    const geo_parts = cell.lineGeometryParts(a, f) catch return;
+    if (geo_parts.len == 0) return;
+
+    // Project each usable part; quick-reject if none overlap the tile.
+    var projected = std.ArrayList([]mvt.Point).empty;
+    var any_overlap = false;
+    for (geo_parts) |gp| {
+        if (gp.len < 2) continue;
+        if (overlaps(geomBounds(gp), tb)) any_overlap = true;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+        try projected.append(a, proj);
+    }
+    if (!any_overlap or projected.items.len == 0) return;
 
     if (f.prim == 3) {
         if (p.fill_token) |token| {
-            const ring = try tile.clipPolygon(a, proj, box);
-            if (ring.len >= 3) {
+            // Emit each ring as its own filled polygon (avoids hole/winding
+            // misinterpretation; correct for disjoint area parts).
+            for (projected.items) |proj| {
+                const ring = try tile.clipPolygon(a, proj, box);
+                if (ring.len < 3) continue;
                 const parts = try a.alloc([]const mvt.Point, 1);
                 parts[0] = ring;
                 const props = try a.alloc(mvt.Prop, 1);
@@ -106,15 +119,17 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
         }
     }
     for (p.lines) |ln| {
-        const sub = try tile.clipLine(a, proj, box);
-        if (sub.len == 0) continue;
-        const parts = try a.alloc([]const mvt.Point, sub.len);
-        for (sub, 0..) |s, i| parts[i] = s;
-        const props = try a.alloc(mvt.Prop, 3);
-        props[0] = .{ .key = "color_token", .value = .{ .string = ln.color } };
-        props[1] = .{ .key = "width_px", .value = .{ .double = ln.width } };
-        props[2] = .{ .key = "dash", .value = .{ .string = "solid" } };
-        try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
+        for (projected.items) |proj| {
+            const sub = try tile.clipLine(a, proj, box);
+            if (sub.len == 0) continue;
+            const parts = try a.alloc([]const mvt.Point, sub.len);
+            for (sub, 0..) |s, i| parts[i] = s;
+            const props = try a.alloc(mvt.Prop, 3);
+            props[0] = .{ .key = "color_token", .value = .{ .string = ln.color } };
+            props[1] = .{ .key = "width_px", .value = .{ .double = ln.width } };
+            props[2] = .{ .key = "dash", .value = .{ .string = "solid" } };
+            try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
+        }
     }
 }
 
@@ -146,37 +161,39 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
         }
         const cls = classify(f.objl);
         if (cls.kind == .skip) continue;
-        const g = cell.lineGeometry(a, f) catch continue;
-        if (g.len < 2) continue;
-        if (!overlaps(geomBounds(g), tb)) continue;
+        const geo_parts = cell.lineGeometryParts(a, f) catch continue;
+        if (geo_parts.len == 0) continue;
 
-        // Project to tile coordinates.
-        const proj = try a.alloc(mvt.Point, g.len);
-        for (g, 0..) |p, i| proj[i] = tile.project(p.lon, p.lat, z, x, y, tile.EXTENT);
+        for (geo_parts) |gp| {
+            if (gp.len < 2) continue;
+            if (!overlaps(geomBounds(gp), tb)) continue;
+            const proj = try a.alloc(mvt.Point, gp.len);
+            for (gp, 0..) |p, i| proj[i] = tile.project(p.lon, p.lat, z, x, y, tile.EXTENT);
 
-        if (cls.kind == .area) {
-            const ring = try tile.clipPolygon(a, proj, box);
-            if (ring.len < 3) continue;
-            const parts = try a.alloc([]const mvt.Point, 1);
-            parts[0] = ring;
-            // Depth areas carry DRVAL1/DRVAL2 so the style's SEABED01 shading
-            // applies (areasFillColor keys on `drval1`).
-            var aprops = std.ArrayList(mvt.Prop).empty;
-            try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
-            try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
-            if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
-            if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
-            try areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
-        } else {
-            const sub = try tile.clipLine(a, proj, box);
-            if (sub.len == 0) continue;
-            const parts = try a.alloc([]const mvt.Point, sub.len);
-            for (sub, 0..) |s, i| parts[i] = s;
-            const lprops = try a.alloc(mvt.Prop, 3);
-            lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
-            lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
-            lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
-            try lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
+            if (cls.kind == .area) {
+                const ring = try tile.clipPolygon(a, proj, box);
+                if (ring.len < 3) continue;
+                const parts = try a.alloc([]const mvt.Point, 1);
+                parts[0] = ring;
+                // Depth areas carry DRVAL1/DRVAL2 so the style's SEABED01 shading
+                // applies (areasFillColor keys on `drval1`).
+                var aprops = std.ArrayList(mvt.Prop).empty;
+                try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
+                try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
+                if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
+                if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
+                try areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
+            } else {
+                const sub = try tile.clipLine(a, proj, box);
+                if (sub.len == 0) continue;
+                const parts = try a.alloc([]const mvt.Point, sub.len);
+                for (sub, 0..) |s, i| parts[i] = s;
+                const lprops = try a.alloc(mvt.Prop, 3);
+                lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
+                lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
+                lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
+                try lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
+            }
         }
     }
 
