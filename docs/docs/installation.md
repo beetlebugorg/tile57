@@ -50,7 +50,7 @@ it on your `PATH`; CMake finds it automatically (it also checks `~/.local/bin`
 and `~/.local/share/zig-0.16.0`).
 
 :::note Lua is vendored
-Lua 5.4 is vendored under `tilegen/vendor/lua` and compiled into
+Lua 5.4 is vendored under `engine/vendor/lua` and compiled into
 `libchartplotter.a` — no system Lua is needed.
 :::
 

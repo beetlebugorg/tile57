@@ -14,8 +14,8 @@ cache.sqlite
 /style/chart-*.json
 
 # Zig
-/tilegen/.zig-cache/
-/tilegen/zig-out/
+/engine/.zig-cache/
+/engine/zig-out/
 /.zig-cache/
 /zig-out/
 

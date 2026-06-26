@@ -64,13 +64,13 @@ add_subdirectory(vendor/maplibre-native)
 # ---------------------------------------------------------------------------
 # Zig tile generator (libchartplotter.a), built by its own `zig build`, linked
 # into the C++ host. This is the public C ABI seam (include/chartplotter.h) for
-# live in-process tile generation. The Zig sources live under tilegen/ (the
+# live in-process tile generation. The Zig sources live under engine/ (the
 # implementation keeps the descriptive "tile generator" name).
 # ---------------------------------------------------------------------------
 find_program(ZIG_EXECUTABLE zig HINTS "$ENV{HOME}/.local/bin" "$ENV{HOME}/.local/share/zig-0.16.0")
 if(ZIG_EXECUTABLE)
-  set(TILEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tilegen)
-  set(CHARTPLOTTER_LIB ${TILEGEN_DIR}/zig-out/lib/libchartplotter.a)
+  set(ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/engine)
+  set(CHARTPLOTTER_LIB ${ENGINE_DIR}/zig-out/lib/libchartplotter.a)
   # Always invoke `zig build` (Zig's own cache makes it a no-op when nothing
   # changed). A glob of src/*.zig is evaluated at configure time and misses new
   # files / the C shim / vendored Lua, so relying on it for deps left the lib

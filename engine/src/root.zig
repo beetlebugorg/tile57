@@ -1,4 +1,4 @@
-//! tilegen — the Zig chart tile generator.
+//! engine — the Zig chart tile generator.
 //!
 //! Bottom-up build order (see ../../docs/docs/architecture.md):
 //!   M4: mvt + pmtiles + tile (encode MVT, write PMTiles)   <- in progress

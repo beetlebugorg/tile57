@@ -122,7 +122,7 @@ the full FeatureCatalogue.xml + all classes.
 
 ## Live-generation layer parity (status 2026-06-26)
 
-The live path (`tilegen/src/s57_mvt.zig`) now emits **areas, area_patterns,
+The live path (`engine/src/s57_mvt.zig`) now emits **areas, area_patterns,
 lines, point_symbols, soundings, text** — the visible content roughly matches a
 Go-baked render (depth shading, soundings at correct size, symbols, dashed
 leading lines, patterned dredged/foul areas). The remaining `_scamin` /

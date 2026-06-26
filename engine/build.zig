@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
 
     // Pure-Zig public module (no libc). Used by the tests and the bake CLI so
     // those Zig-linked executables don't pull in the system crt.
-    const mod = b.addModule("tilegen", .{
+    const mod = b.addModule("engine", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -27,9 +27,7 @@ pub fn build(b: *std.Build) void {
 
     // Static library (libchartplotter.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
-    // never in a Zig-linked exe. The internal Zig module / dir keep the
-    // descriptive "tilegen" name (the implementation IS a tile generator); only
-    // the public artifact and C ABI take the chartplotter identity.
+    // never in a Zig-linked exe.
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/lib_root.zig"),
         .target = target,
@@ -56,7 +54,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/bake.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "tilegen", .module = mod }},
+            .imports = &.{.{ .name = "engine", .module = mod }},
         }),
     });
     b.installArtifact(bake);

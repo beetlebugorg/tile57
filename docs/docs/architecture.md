@@ -18,15 +18,15 @@ A chart cell flows through these stages, all inside `libchartplotter.a`:
 
 ```
 S-57 ENC cell (.000)
-   │  decode the binary container     tilegen/src/iso8211.zig
+   │  decode the binary container     engine/src/iso8211.zig
    ▼
-S-57 feature + geometry model         tilegen/src/s57.zig
-   │  apply S-101 portrayal           tilegen/src/portray.zig + embedded Lua 5.4
+S-57 feature + geometry model         engine/src/s57.zig
+   │  apply S-101 portrayal           engine/src/portray.zig + embedded Lua 5.4
    ▼                                   (vendor/S-101_Portrayal-Catalogue)
 Primitive instruction stream
-   │  adapt to drawing primitives     tilegen/src/s101_adapt.zig, s101_instr.zig
+   │  adapt to drawing primitives     engine/src/s101_adapt.zig, s101_instr.zig
    ▼
-web-mercator project + clip + encode  tilegen/src/s57_mvt.zig, mvt.zig, tile.zig
+web-mercator project + clip + encode  engine/src/s57_mvt.zig, mvt.zig, tile.zig
    ▼
 Mapbox Vector Tile bytes  ─────────▶  MapLibre Native  (ChartTileSource FileSource)
 ```
@@ -108,7 +108,7 @@ some doing. What matters, and why:
   `notModified` when MapLibre re-requests an unchanged tile. Without this, MapLibre
   re-requested **and re-parsed** tiles 15–60×/sec, and each re-parse re-uploaded to
   the GPU → constant flicker (even at 100–300 fps).
-- **In-process tile cache** (`tilegen/src/capi.zig`): generated/decoded tiles are
+- **In-process tile cache** (`engine/src/capi.zig`): generated/decoded tiles are
   memoized (`z<<48|x<<24|y`), so re-requests never re-decode.
 - **Async present** (`app/metal_backend.mm`): `presentDrawable` + `commit`, like
   MapLibre's own macOS SDK (`MLNMapView+Metal`). `presentsWithTransaction` +

@@ -9,7 +9,7 @@ Extracts, per the Host* contract:
   - informationTypes: code -> {bindings}
 upper = -1 means infinite.
 
-Usage: gen-catalogue.py tilegen/vendor/s101/FeatureCatalogue.xml -o tilegen/vendor/s101/catalogue.json
+Usage: gen-catalogue.py engine/vendor/s101/FeatureCatalogue.xml -o engine/vendor/s101/catalogue.json
 """
 import argparse, json, sys
 import xml.etree.ElementTree as ET

@@ -7,9 +7,9 @@ bindings / instruction adaptation / MVT emission:
 
 | Go file | Zig equivalent |
 |---------|----------------|
-| `internal/engine/s101/*` (Host* callbacks) | `tilegen/csrc/lua_shim.c`, `tilegen/src/portray.zig` |
-| `internal/engine/portrayal/*` (adapt → primitives) | `tilegen/src/s101_adapt.zig`, `s101_instr.zig`, `s57_mvt.zig` |
-| `internal/s57/*` (model + geometry/topology) | `tilegen/src/s57.zig`, `iso8211.zig` |
+| `internal/engine/s101/*` (Host* callbacks) | `engine/csrc/lua_shim.c`, `engine/src/portray.zig` |
+| `internal/engine/portrayal/*` (adapt → primitives) | `engine/src/s101_adapt.zig`, `s101_instr.zig`, `s57_mvt.zig` |
+| `internal/s57/*` (model + geometry/topology) | `engine/src/s57.zig`, `iso8211.zig` |
 | `internal/engine/bake/*` (multi-cell baking) | *no equivalent* — Zig generates live, single-cell |
 | `web/src/chart-canvas/*` (style) | `style/build_style.py` |
 

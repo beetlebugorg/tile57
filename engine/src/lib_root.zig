@@ -6,7 +6,7 @@
 //! linked by clang++ in the host (avoiding Zig's linker tripping on the
 //! system crt's .sframe relocations).
 
-pub const tilegen = @import("root.zig");
+pub const engine = @import("root.zig");
 pub const capi = @import("capi.zig");
 pub const portray = @import("portray.zig");
 pub const catalogue = @import("catalogue.zig");

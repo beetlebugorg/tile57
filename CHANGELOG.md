@@ -9,7 +9,8 @@ C ABI is not yet frozen.
 ### Changed — public identity & C API (breaking, pre-1.0)
 - Library renamed `libtilegen.a` → **`libchartplotter.a`**; public header
   `include/tilegen.h` → **`include/chartplotter.h`**; C ABI prefix `tg_` → `chartplotter_`.
-  The Zig sources and `tilegen/` dir keep their descriptive name.
+  The Zig tile-generator sources moved from `tilegen/` to **`engine/`** (Zig
+  module also renamed `tilegen` → `engine`).
 - Redesigned the C ABI for coherence (see `docs/API.md`):
   - one opener `chartplotter_source_open(data, len, chartplotter_format, rules_dir)` with a
     `CHARTPLOTTER_FORMAT_AUTO` sniff, replacing the two openers + the try/fallback both

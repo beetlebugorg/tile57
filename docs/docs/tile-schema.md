@@ -17,7 +17,7 @@ Every tile uses an extent of **4096** and a buffer of **64**.
 :::note Live path coverage
 Whether the tiles come from a pre-baked PMTiles archive or are generated live from
 a raw S-57 cell, the schema is the same. The live path
-(`tilegen/src/s57_mvt.zig`) currently emits `areas`, `area_patterns`, `lines`,
+(`engine/src/s57_mvt.zig`) currently emits `areas`, `area_patterns`, `lines`,
 `complex_lines`, `point_symbols`, `soundings`, and `text`; the `*_scamin`
 declutter buckets are still to come (see [Known limitations](./limitations.md)).
 :::

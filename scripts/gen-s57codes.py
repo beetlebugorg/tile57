@@ -4,7 +4,7 @@ Go reference (objectclass.go's objectClassCode map + s57attributes.csv) into a
 compact s57codes.json. Chained with catalogue.json's S-57 aliases, this gives
 OBJL/ATTL (numeric) -> S-101 feature/attribute code for the adaptation.
 
-Usage: gen-s57codes.py --go ../chartplotter-go -o tilegen/vendor/s101/s57codes.json
+Usage: gen-s57codes.py --go ../chartplotter-go -o engine/vendor/s101/s57codes.json
 """
 import argparse, csv, json, re, os, sys
 

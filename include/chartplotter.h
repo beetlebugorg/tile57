@@ -3,7 +3,7 @@
  * libchartplotter is an embeddable nautical-chart tile source. You open a source
  * from in-memory bytes (a PMTiles archive or a raw S-57 ENC cell) and it serves
  * decompressed Mapbox Vector Tiles by (z, x, y). The bytes are produced by the
- * Zig tile generator (the "tilegen" implementation) and consumed by any MVT
+ * Zig tile generator (the engine/ sources) and consumed by any MVT
  * renderer — in this repo, MapLibre Native via the bundled ChartTileSource
  * adapter (app/chart_tile_source.*), but the ABI itself is renderer-agnostic.
  *

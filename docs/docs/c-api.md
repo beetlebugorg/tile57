@@ -15,7 +15,7 @@ It is renderer-agnostic — in this repo the consumer is MapLibre Native via the
 `ChartTileSource` adapter (`app/chart_tile_source.*`), but any MVT consumer works.
 
 :::note Naming
-The Zig sources live under `tilegen/` (the implementation really is a tile
+The Zig sources live under `engine/` (the implementation really is a tile
 generator); only the artifact and this ABI carry the `chartplotter` name.
 :::
 

@@ -1,4 +1,4 @@
-//! tilegen CLI.
+//! engine CLI.
 //!
 //!   bake inspect <file.pmtiles> [z x y]
 //!       Parse a PMTiles archive (header + directory) and, if z/x/y is given,
@@ -8,7 +8,7 @@
 //! Baking from S-57 cells lands at M6 (decode -> portrayal -> tile).
 
 const std = @import("std");
-const tilegen = @import("tilegen");
+const engine = @import("engine");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const path = args[2];
         const data = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
-        var r = try tilegen.pmtiles.Reader.init(arena, data);
+        var r = try engine.pmtiles.Reader.init(arena, data);
         defer r.deinit();
         const h = r.header;
         std.debug.print(
@@ -34,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
             const x = try std.fmt.parseInt(u32, args[4], 10);
             const y = try std.fmt.parseInt(u32, args[5], 10);
             if (try r.getTile(arena, z, x, y)) |tile| {
-                const layers = try tilegen.mvt.decode(arena, tile);
+                const layers = try engine.mvt.decode(arena, tile);
                 std.debug.print("  tile {d}/{d}/{d}: {d} bytes, {d} layers:\n", .{ z, x, y, tile.len, layers.len });
                 for (layers) |L| {
                     std.debug.print("    {s}: {d} features (extent {d})\n", .{ L.name, L.features.len, L.extent });
@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 3 and std.mem.eql(u8, args[1], "cell")) {
         const path = args[2];
         const data = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
-        var file = try tilegen.iso8211.parse(arena, data);
+        var file = try engine.iso8211.parse(arena, data);
         defer file.deinit();
         const L = file.ddr.leader;
         std.debug.print(
@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("  DSID={d} feature(FRID)={d} vector(VRID)={d} other={d}\n", .{ dsid, frid, vrid, other });
 
         // S-57 model: coordinate factors, geometry bounds, a few object classes.
-        var cell = try tilegen.s57.parseCell(arena, data);
+        var cell = try engine.s57.parseCell(arena, data);
         defer cell.deinit();
         std.debug.print("  S-57: comf={d} cscl=1:{d}  vectors={d} features={d}\n", .{ cell.params.comf, cell.params.cscl, cell.vectors.len, cell.features.len });
         if (cell.bounds()) |b| {
@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
             if (f.objl == 42 and f.attrs.len > 0) {
                 std.debug.print("  sample DEPARE attrs: ", .{});
                 for (f.attrs) |x| std.debug.print("[{d}]={s} ", .{ x.code, x.value });
-                if (f.attrFloat(tilegen.s57.ATTR_DRVAL1)) |d| std.debug.print("-> DRVAL1={d:.1}", .{d});
+                if (f.attrFloat(engine.s57.ATTR_DRVAL1)) |d| std.debug.print("-> DRVAL1={d:.1}", .{d});
                 std.debug.print("\n", .{});
                 break;
             }
@@ -166,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print(
-        "tilegen — usage:\n  bake inspect <file.pmtiles> [z x y]\n  bake cell <file.000>\n" ++
+        "engine — usage:\n  bake inspect <file.pmtiles> [z x y]\n  bake cell <file.000>\n" ++
             "(baking from S-57 cells comes at M6)\n",
         .{},
     );

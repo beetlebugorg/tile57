@@ -40,13 +40,13 @@ Zig pipeline mirrors it stage for stage.
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                 tilegen/src/iso8211.zig
+   │  ISO 8211 decode                 engine/src/iso8211.zig
    ▼
-S-57 feature + geometry model         tilegen/src/s57.zig
-   │  S-101 portrayal (embedded Lua)  tilegen/src/portray.zig
+S-57 feature + geometry model         engine/src/s57.zig
+   │  S-101 portrayal (embedded Lua)  engine/src/portray.zig
    ▼
 Primitive instruction stream
-   │  project + clip + encode         tilegen/src/{s57_mvt,tile,mvt}.zig
+   │  project + clip + encode         engine/src/{s57_mvt,tile,mvt}.zig
    ▼
 Mapbox Vector Tiles  ─────────────▶   MapLibre Native  (ChartTileSource FileSource)
 ```
