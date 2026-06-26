@@ -44,10 +44,6 @@ if(APPLE)
   set(MLN_WITH_OPENGL   OFF CACHE BOOL "")
   set(MLN_WITH_EGL      OFF CACHE BOOL "")
   set(MLN_DARWIN_USE_LIBUV ON CACHE BOOL "") # libuv run loop on darwin
-  # Drain Metal objects (drawables/command buffers) per frame. Without this, the
-  # libuv run loop never drains the autorelease pool, so they accumulate during
-  # rapid frames -> drawable churn -> flicker on fast pan/zoom. ON for the window.
-  set(MLN_CREATE_AUTORELEASEPOOL ON CACHE BOOL "")
 else()
   set(MLN_WITH_OPENGL   ON  CACHE BOOL "")
   set(MLN_WITH_EGL      ON  CACHE BOOL "")   # surfaceless headless backend
