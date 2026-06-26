@@ -30,6 +30,9 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     echo "ERROR: no objects extracted from $LIB" >&2
     exit 1
   fi
+  # llvm-ar's deterministic mode zeroes the permission bits, so extracted objects
+  # come out mode 000 and libtool can't read them (errno=13). Make them readable.
+  chmod u+rw "$tmp"/*.o
   "$LIBTOOL" -static -o "$LIB" "$tmp"/*.o
   if command -v nm >/dev/null && ! nm "$LIB" 2>/dev/null | grep -q ' T _tg_open_bytes'; then
     echo "ERROR: _tg_open_bytes missing after re-pack (libtool=$LIBTOOL — Apple's is /usr/bin/libtool)" >&2
