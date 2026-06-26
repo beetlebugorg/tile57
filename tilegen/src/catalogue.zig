@@ -9,11 +9,13 @@ const std = @import("std");
 // Provided via build.zig addAnonymousImport (the file lives under vendor/,
 // outside the module's src/ root, so it can't be embedded by relative path).
 const json_bytes = @embedFile("catalogue_json");
+const s57codes_bytes = @embedFile("s57codes_json"); // {obj:{code:acronym}, attr:{code:acronym}}
 
 pub const Binding = struct { ref: []const u8, lower: i32, upper: i32 };
 
 const Catalogue = struct {
     parsed: std.json.Parsed(std.json.Value),
+    codes_parsed: ?std.json.Parsed(std.json.Value) = null,
     feature_codes: [][]const u8,
     simple_codes: [][]const u8,
     complex_codes: [][]const u8,
@@ -22,6 +24,8 @@ const Catalogue = struct {
     simple_valuetype: std.StringHashMap([]const u8),
     feature_alias: std.StringHashMap([]const u8), // UPPER(S-57 acronym) -> S-101 code
     attr_alias: std.StringHashMap([]const u8),
+    obj_acronym: std.AutoHashMap(u16, []const u8), // S-57 OBJL -> acronym
+    attr_acronym: std.AutoHashMap(u16, []const u8), // S-57 ATTL -> acronym
 };
 
 var g_cat: ?Catalogue = null;
@@ -80,6 +84,8 @@ fn ensureLoaded() void {
         .simple_valuetype = std.StringHashMap([]const u8).init(a),
         .feature_alias = std.StringHashMap([]const u8).init(a),
         .attr_alias = std.StringHashMap([]const u8).init(a),
+        .obj_acronym = std.AutoHashMap(u16, []const u8).init(a),
+        .attr_acronym = std.AutoHashMap(u16, []const u8).init(a),
     };
 
     // featureTypes
@@ -125,7 +131,45 @@ fn ensureLoaded() void {
         cat.complex_codes = codes.items;
     };
 
+    // S-57 numeric code -> acronym tables.
+    if (std.json.parseFromSlice(std.json.Value, a, s57codes_bytes, .{})) |cp| {
+        cat.codes_parsed = cp;
+        if (cp.value == .object) {
+            const co = cp.value.object;
+            if (co.get("obj")) |ov| if (ov == .object) {
+                for (ov.object.keys()) |k| {
+                    const code = std.fmt.parseInt(u16, k, 10) catch continue;
+                    if (ov.object.get(k).? == .string)
+                        cat.obj_acronym.put(code, ov.object.get(k).?.string) catch {};
+                }
+            };
+            if (co.get("attr")) |av| if (av == .object) {
+                for (av.object.keys()) |k| {
+                    const code = std.fmt.parseInt(u16, k, 10) catch continue;
+                    if (av.object.get(k).? == .string)
+                        cat.attr_acronym.put(code, av.object.get(k).?.string) catch {};
+                }
+            };
+        }
+    } else |_| {}
+
     g_cat = cat;
+}
+
+/// S-57 OBJL (numeric) -> S-101 feature class code, via acronym.
+pub fn resolveFeatureByObjl(objl: u16) ?[]const u8 {
+    ensureLoaded();
+    const c = &(g_cat orelse return null);
+    const acr = c.obj_acronym.get(objl) orelse return null;
+    return resolveFeature(acr);
+}
+
+/// S-57 ATTL (numeric) -> S-101 attribute code, via acronym.
+pub fn resolveAttrByCode(attl: u16) ?[]const u8 {
+    ensureLoaded();
+    const c = &(g_cat orelse return null);
+    const acr = c.attr_acronym.get(attl) orelse return null;
+    return resolveAttr(acr);
 }
 
 // ---- Zig-side lookups (for s101_adapt) -----------------------------------

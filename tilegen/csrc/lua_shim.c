@@ -558,7 +558,7 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "  local instr\n"
         "  if ok then nok=nok+1; instr=table.concat(fp.DrawingInstructions, ';')\n"
         "  else nerr=nerr+1; instr='ERROR:'..tostring(err)\n"
-        "    errs[feature.Code]=(errs[feature.Code] or tostring(err)) end\n"
+        "    errs[feature.Code]=(errs[feature.Code] or (tostring(err)..' [prim='..tostring(feature.PrimitiveType)..']')) end\n"
         "  tg_store(tonumber(feature.ID), instr)\nend\n"
         "io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors\\n')\n"
         "for code,e in pairs(errs) do io.stderr:write('  '..code..': '..e..'\\n') end\n";

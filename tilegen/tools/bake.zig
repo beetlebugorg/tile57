@@ -108,6 +108,15 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("  assembled: {d} line/area features ({d} verts), {d} point features; sample in-bounds={}\n", .{ line_feats, line_verts, pt_feats, sample_ok });
 
+        // prim histogram for DEPCNT(74) and SOUNDG(129).
+        for ([_]u16{ 42, 30, 74, 129 }) |objl| {
+            var pc = [_]usize{0} ** 256;
+            for (cell.features) |f| if (f.objl == objl) {
+                pc[f.prim] += 1;
+            };
+            std.debug.print("  objl {d} prim: point(1)={d} line(2)={d} area(3)={d} none(255)={d}\n", .{ objl, pc[1], pc[2], pc[3], pc[255] });
+        }
+
         // Confirm DRVAL1/DRVAL2 attribute codes on a sample DEPARE.
         for (cell.features) |f| {
             if (f.objl == 42 and f.attrs.len > 0) {

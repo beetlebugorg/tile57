@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const s57 = @import("s57.zig");
+const catalogue = @import("catalogue.zig");
 
 pub const NameVal = struct { name: []const u8, value: []const u8 };
 
@@ -18,33 +19,12 @@ pub const Adapted = struct {
     attrs: []NameVal, // S-101 attribute name -> value
 };
 
-/// S-57 object class (OBJL) -> S-101 feature class name. Minimal set; grows as
-/// classes are added. (Some S-57 classes alias by attribute — LIGHTS, MORFAC,
-/// ADMARE — handled later.)
+/// S-57 object class (OBJL) -> S-101 feature class code, via the Feature
+/// Catalogue (OBJL -> acronym -> code). Covers all ~150 classes. (Attribute-
+/// dependent aliasing — LIGHTS, MORFAC, ADMARE — is handled later; this returns
+/// the catalogue's primary alias target.)
 pub fn resolveCode(objl: u16) ?[]const u8 {
-    return switch (objl) {
-        42 => "DepthArea",
-        46 => "DredgedArea",
-        71 => "LandArea",
-        119 => "BuiltUpArea",
-        30 => "Coastline",
-        122 => "ShorelineConstruction",
-        74 => "DepthContour",
-        129 => "Sounding",
-        else => null,
-    };
-}
-
-/// S-57 attribute code -> S-101 attribute name (the camelCase names the rules
-/// read). Minimal set covering the supported classes.
-fn s101AttrName(code: u16) ?[]const u8 {
-    return switch (code) {
-        s57.ATTR_DRVAL1 => "depthRangeMinimumValue",
-        s57.ATTR_DRVAL2 => "depthRangeMaximumValue",
-        s57.ATTR_VALSOU => "valueOfSounding",
-        s57.ATTR_VALDCO => "valueOfDepthContour",
-        else => null,
-    };
+    return catalogue.resolveFeatureByObjl(objl);
 }
 
 fn primitiveName(prim: u8) []const u8 {
@@ -65,7 +45,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         if (prim.len == 0) continue;
         var attrs = std.ArrayList(NameVal).empty;
         for (f.attrs) |at| {
-            if (s101AttrName(at.code)) |name|
+            if (catalogue.resolveAttrByCode(at.code)) |name|
                 try attrs.append(a, .{ .name = name, .value = at.value });
         }
         try out.append(a, .{ .feature_index = i, .code = code, .primitive = prim, .attrs = attrs.items });
