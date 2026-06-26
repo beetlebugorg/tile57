@@ -6,6 +6,7 @@
 #include <mbgl/storage/resource.hpp>
 #include <mbgl/storage/response.hpp>
 #include <mbgl/storage/resource_options.hpp>
+#include <mbgl/util/chrono.hpp>
 #include <mbgl/util/client_options.hpp>
 
 #include <cstdio>
@@ -27,6 +28,10 @@ std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource 
     auto req = std::make_unique<mbgl::FileSourceRequest>(std::move(callback));
 
     mbgl::Response response;
+    // Tiles are deterministic (a fixed PMTiles archive or the loaded cell), so
+    // they never go stale — give them a far-future expiry so MapLibre doesn't
+    // treat them as needing revalidation and re-request/re-render them.
+    response.expires = mbgl::Timestamp::max();
     int z = 0;
     unsigned x = 0, y = 0;
     const char *rest = resource.url.c_str() + std::strlen(PREFIX);
