@@ -5,18 +5,30 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GO="${GO:-$ROOT/../chartplotter-go}"
-
-# Pick the matching prebuilt Go binary (…_s101 embeds the catalogue).
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"   # linux | darwin
 arch="$(uname -m)"
 case "$arch" in
   x86_64|amd64) arch=amd64 ;;
   arm64|aarch64) arch=arm64 ;;
 esac
-# Find a usable Go binary: BIN override, then a prebuilt dist/ binary for this
-# OS/arch (_s101 = catalogue embedded), then a locally-built bin/chartplotter.
+
 BIN="${BIN:-}"
+GO="${GO:-}"
+
+# Resolve the Go repo. If BIN is given, derive it from BIN's location; else look
+# for chartplotter-go or chartplotter as a sibling.
+if [[ -n "$BIN" && -z "$GO" ]]; then
+  GO="$(cd "$(dirname "$BIN")/.." 2>/dev/null && pwd || true)"
+fi
+if [[ -z "$GO" || ! -d "$GO/internal/engine/s101catalog" ]]; then
+  for cand in "$ROOT/../chartplotter-go" "$ROOT/../chartplotter"; do
+    [[ -d "$cand/internal/engine/s101catalog" ]] && GO="$cand" && break
+  done
+fi
+GO="${GO:-$ROOT/../chartplotter-go}"
+
+# Find a usable Go binary: BIN override, then a prebuilt dist/ binary, then a
+# locally-built bin/chartplotter.
 if [[ -z "$BIN" ]]; then
   for cand in \
     "$GO/dist/chartplotter_${os}_${arch}_s101" \
@@ -28,18 +40,19 @@ fi
 
 if [[ -z "$BIN" || ! -x "$BIN" ]]; then
   echo "No Go binary found. Build it first:" >&2
-  echo "    (cd $GO && make build)        # -> bin/chartplotter (embeds the S-101 catalogue)" >&2
+  echo "    (cd $GO && make build)        # -> bin/chartplotter" >&2
   echo "  then re-run, or set BIN=/path/to/chartplotter" >&2
   exit 1
 fi
-echo "using Go binary: $BIN" >&2
+echo "using Go binary: $BIN   (Go repo: $GO)" >&2
 
-# A plain (non-_s101) build needs the catalogue pointed at on disk. emit-assets
+# Always point emit-assets/bake at the on-disk S-101 catalogue when present
+# (harmless override for _s101 builds; required for plain builds). emit-assets
 # takes only --s101 <PortrayalCatalog>; bake also takes --s101-fc <FC.xml>.
 EMIT_S101=()
 BAKE_S101=()
 CATDIR="$GO/internal/engine/s101catalog/catalog"
-if [[ "$BIN" != *_s101 ]] && [[ -d "$CATDIR/PortrayalCatalog" ]]; then
+if [[ -d "$CATDIR/PortrayalCatalog" ]]; then
   EMIT_S101=(--s101 "$CATDIR/PortrayalCatalog")
   BAKE_S101=(--s101 "$CATDIR/PortrayalCatalog" --s101-fc "$CATDIR/FeatureCatalogue.xml")
 fi
