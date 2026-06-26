@@ -45,6 +45,30 @@ Source: the per-commit analysis workflow (13 chartplotter-go commits, 2026-06-26
 A pre-baked PMTiles archive from chartplotter-go already contains all the
 deferred/skipped fixes; they only matter for Zig's *live* generation path.
 
+## Discovery: derived depth attributes (prerequisite for a9c8afd)
+
+`a9c8afd` is small *in Go* because Go already has a `DepthIndex` +
+`DerivedAttrs(feature)` that supplies `defaultClearanceDepth` (always) and
+`surroundingDepth` (when a containing depth area is found). Zig's `adaptCell`
+(`s101_adapt.zig`) only maps existing S-57 attrs — it computes **no** derived
+attrs. Consequences:
+
+- Our `surroundingDepth` is always absent, so UDWHAZ05 can't take its safe-water
+  branch (the a9c8afd fix).
+- Our `defaultClearanceDepth` is also absent, which is almost certainly why the
+  live render logs `Obstruction` / `UnderwaterAwashRock` / `Wreck` errors
+  ("attempt to perform arithmetic on a nil value (field 'Value')") — the danger
+  rules read a derived depth that isn't there, error, and the feature is
+  suppressed.
+
+So porting a9c8afd really means building the small `DepthIndex` (DEPARE/DRGARE
+polygons → shoalest DRVAL1 at a point, via point-in-polygon — we now have the
+even-odd test from 30db686) + a `DerivedAttrs` step that appends
+`defaultClearanceDepth` + `surroundingDepth` to the adapted feature's `attrs`
+(which already flow to the Lua host). High value — it should both stop false
+ISODGR marks **and** fix the current danger-rule errors — but it's an M–L effort
+best verified visually on a real cell.
+
 ## Bigger items (separate efforts)
 
 - `ab9b63a` (SYMINS for NEWOBJ + SWPARE fallback + true symbol size) is high-value
