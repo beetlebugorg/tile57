@@ -6,7 +6,7 @@ sidebar_position: 4
 
 # The libchartplotter C API
 
-`libchartplotter.a` is the Zig tile generator behind a hand-written C ABI. The
+`libchartplotter.a` is the Zig tile generator behind a small C ABI. The
 public header is `include/chartplotter.h`; the symbol prefix is `chartplotter_`. The library
 opens a chart **source** from in-memory bytes (a PMTiles archive or a raw S-57 ENC
 cell) and serves decompressed **Mapbox Vector Tiles** by `(z, x, y)`.

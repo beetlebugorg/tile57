@@ -43,16 +43,12 @@ with platform chrome (SwiftUI / GTK4) to come.
 
 ## Status
 
-| Milestone | What | State |
-|-----------|------|-------|
-| M0 | MapLibre Native builds; headless EGL render | ✅ done |
-| M1 | Annapolis chart from Go-baked PMTiles + ported S-52 style (Day/Dusk/Night) | ✅ done |
-| M2 | Full S-52 fidelity: symbols, glyphs + text, soundings, area patterns, depth-shading | ✅ done |
-| M3 | Interactive pan/zoom window serving live Zig tiles (`chartplotter`) | ✅ done |
-| M4 | Zig MVT + gzip + PMTiles + projection/clip, differential-tested vs Go | ✅ done |
-| M5 | Live in-process tile generation (`libchartplotter.a` + custom `FileSource`) | ✅ done |
-| M6a–c | Zig ISO 8211 + S-57 decode + topology → **live cell → MVT → MapLibre** | ✅ done |
-| M6d | Embedded-Lua **S-101 portrayal** (real IHO rules) → live ECDIS chart from a raw cell | ✅ core done (~96% of features) |
+The full pipeline works: a raw S-57 cell (or an ENC_ROOT of cells, with their
+updates) decodes, runs the official IHO S-101 Portrayal Catalogue in embedded
+Lua, and renders live in a window or to a PNG; pre-baked PMTiles archives also
+render. Most everyday ENC features draw; the remaining portrayal gaps are listed
+under [Known limitations](./limitations.md), and recent changes are in the
+[CHANGELOG](https://github.com/beetlebugorg/chartplotter-native/blob/main/CHANGELOG.md).
 
 ## Where to go next
 

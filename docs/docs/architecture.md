@@ -61,7 +61,7 @@ A few choices shape the whole project:
 - **CMake is the top-level integrator.** MapLibre Native is embedded via
   `add_subdirectory(vendor/maplibre-native)` and built by its own CMake. The Zig
   tile generator is a leaf static library (`libchartplotter.a`) with a
-  hand-written [C ABI](./c-api.md), built by `scripts/zig-build-lib.sh`.
+  [C ABI](./c-api.md), built by `scripts/zig-build-lib.sh`.
 - **Live, in-process generation is the target.** `libchartplotter.a` generates one
   tile's MVT bytes on demand; the `ChartTileSource` `mbgl::FileSource` (scheme
   `zigtiles://`) hands them to MapLibre. Tiles are memoized in an in-process cache.
@@ -85,21 +85,6 @@ Two C++ hosts link `libchartplotter.a`, both registering the same
   MapLibre's `HeadlessFrontend`. The verification path on displayless boxes.
 - **`chartplotter`** (`app/zig_glfw.cpp`) — interactive, reuses MapLibre's
   `GLFWView` for a pannable/zoomable window.
-
-## Milestones
-
-| M | Deliverable | Status |
-|---|-------------|--------|
-| M0 | MapLibre `mbgl-render` builds (headless EGL) | ✅ done |
-| M1 | Annapolis chart from Go-baked PMTiles + ported S-52 style | ✅ done |
-| M2 | S-52 fidelity: symbols, glyphs + text, soundings, area patterns, depth-shading | ✅ done |
-| M3 | Own window (`chartplotter`, reuses GLFWView); interactive pan/zoom of live tiles | ✅ done |
-| M4 | Zig encoder core: mvt + gzip + pmtiles + tile (project/clip), differential-tested vs Go | ✅ done |
-| M5 | Live in-process generation via custom `FileSource` + C ABI | ✅ done |
-| M6a | ISO 8211 decoder (parses real cells) | ✅ done |
-| M6b | S-57 model: dataset params, vectors, features | ✅ done |
-| M6c | Topology assembly + live cell → MVT → MapLibre (crude classify) | ✅ done |
-| M6d | S-57 attributes + embedded-Lua S-101 portrayal → full S-52 | ✅ core done (~96% of features) |
 
 ## macOS interactive rendering notes
 
