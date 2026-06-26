@@ -2,11 +2,19 @@
 // tile generator (libtilegen.a) for URLs of the form zigtiles://{z}/{x}/{y}.
 //
 // It is registered in the (unused) Mbtiles slot of MapLibre's MainResourceLoader
-// so tile requests route to it by canRequest(). For M5 it is backed by a Zig
-// PMTiles reader; at M6 the same source serves live-generated tiles unchanged.
+// so tile requests route to it by canRequest(). Backed by a Zig PMTiles reader
+// or live-generated tiles, interchangeably.
+//
+// Generation runs synchronously on the request (render/runloop) thread by
+// default. Set CHART_ASYNC to run it on a dedicated worker thread instead (off
+// the render thread), which can smooth fast pan/zoom where many tiles are
+// requested at once.
 #pragma once
 
 #include <mbgl/storage/file_source.hpp>
+#include <mbgl/util/thread.hpp>
+
+#include <memory>
 
 struct tg_source;
 
@@ -15,6 +23,7 @@ namespace cpn {
 class ZigTileSource final : public mbgl::FileSource {
 public:
     explicit ZigTileSource(tg_source *src);
+    ~ZigTileSource() override;
 
     std::unique_ptr<mbgl::AsyncRequest> request(const mbgl::Resource &, Callback) override;
     bool canRequest(const mbgl::Resource &) const override;
@@ -25,7 +34,9 @@ public:
     mbgl::ClientOptions getClientOptions() override;
 
 private:
+    class Impl;
     tg_source *src;
+    std::unique_ptr<mbgl::util::Thread<Impl>> worker; // null -> synchronous
 };
 
 } // namespace cpn

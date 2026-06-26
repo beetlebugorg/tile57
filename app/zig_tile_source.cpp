@@ -8,7 +8,7 @@
 #include <mbgl/storage/resource_options.hpp>
 #include <mbgl/util/client_options.hpp>
 
-#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -17,24 +17,12 @@ namespace cpn {
 
 static constexpr const char *PREFIX = "zigtiles://";
 
-ZigTileSource::ZigTileSource(tg_source *s) : src(s) {}
-
-bool ZigTileSource::canRequest(const mbgl::Resource &resource) const {
-    return resource.url.rfind(PREFIX, 0) == 0;
-}
-
-std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource &resource, Callback callback) {
-    auto req = std::make_unique<mbgl::FileSourceRequest>(std::move(callback));
-
-    mbgl::Response response;
+// Fill `response` with the tile for a zigtiles:// URL (shared by the sync and
+// worker paths). Pure read of the Zig source; safe to call off the main thread.
+static void fillResponse(tg_source *src, const std::string &url, mbgl::Response &response) {
     int z = 0;
     unsigned x = 0, y = 0;
-    const char *rest = resource.url.c_str() + std::strlen(PREFIX);
-    // [diag] count requests so we can see if tiles are re-requested every frame
-    // (i.e. not cached) — esp. when idle, which would explain constant flicker.
-    static int req_count = 0;
-    ++req_count;
-    std::fprintf(stderr, "[zigtiles] req %s (#%d)\n", rest, req_count);
+    const char *rest = url.c_str() + std::strlen(PREFIX);
     if (std::sscanf(rest, "%d/%u/%u", &z, &x, &y) == 3) {
         uint8_t *out = nullptr;
         size_t len = 0;
@@ -52,9 +40,44 @@ std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource 
         response.error = std::make_unique<mbgl::Response::Error>(
             mbgl::Response::Error::Reason::Other, "bad zigtiles url");
     }
+}
 
-    // Deliver on the current RunLoop (FileSourceRequest handles cancellation).
-    req->actor().invoke(&mbgl::FileSourceRequest::setResponse, std::move(response));
+// Worker that generates tiles off the render thread and delivers the response
+// back to the request's mailbox (on the originating loop). Used when CHART_ASYNC.
+class ZigTileSource::Impl {
+public:
+    Impl(const mbgl::ActorRef<Impl> &, tg_source *src_) : src(src_) {}
+    void request(const mbgl::Resource &resource, const mbgl::ActorRef<mbgl::FileSourceRequest> &req) {
+        mbgl::Response response;
+        fillResponse(src, resource.url, response);
+        req.invoke(&mbgl::FileSourceRequest::setResponse, response);
+    }
+
+private:
+    tg_source *src;
+};
+
+ZigTileSource::ZigTileSource(tg_source *s) : src(s) {
+    if (std::getenv("CHART_ASYNC")) {
+        worker = std::make_unique<mbgl::util::Thread<Impl>>("ZigTileSource", s);
+    }
+}
+
+ZigTileSource::~ZigTileSource() = default;
+
+bool ZigTileSource::canRequest(const mbgl::Resource &resource) const {
+    return resource.url.rfind(PREFIX, 0) == 0;
+}
+
+std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource &resource, Callback callback) {
+    auto req = std::make_unique<mbgl::FileSourceRequest>(std::move(callback));
+    if (worker) {
+        worker->actor().invoke(&Impl::request, resource, req->actor());
+    } else {
+        mbgl::Response response;
+        fillResponse(src, resource.url, response);
+        req->actor().invoke(&mbgl::FileSourceRequest::setResponse, std::move(response));
+    }
     return req;
 }
 
