@@ -9,8 +9,6 @@
 #include <mbgl/util/chrono.hpp>
 #include <mbgl/util/client_options.hpp>
 
-#include <atomic>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -96,11 +94,6 @@ bool ZigTileSource::canRequest(const mbgl::Resource &resource) const {
 }
 
 std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource &resource, Callback callback) {
-    // [diag] request rate: if this climbs fast while IDLE, MapLibre is
-    // re-requesting (and re-parsing) held tiles -> the residual flicker.
-    static std::atomic<uint64_t> n{0};
-    const uint64_t c = ++n;
-    if (c % 60 == 0) std::fprintf(stderr, "[zigtiles] %llu requests\n", (unsigned long long)c);
     auto req = std::make_unique<mbgl::FileSourceRequest>(std::move(callback));
     if (worker) {
         worker->actor().invoke(&Impl::request, resource, req->actor());
