@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # One-shot "after a git pull" refresh. Regenerates the styles (they're generated,
-# not version-controlled, so `git pull` never updates them) and rebuilds our
-# host target. NOTE: `mbgl-glfw` is MapLibre's own binary and does NOT depend on
-# our code — pulling our changes never recompiles it; only a MapLibre submodule
-# bump does. Our code lives in `chartshot-zig` and the styles.
+# not version-controlled, so `git pull` never updates them) and rebuilds our host
+# targets: the headless `chartshot-zig` and, when the build dir has GLFW enabled,
+# the interactive window `chart-glfw-zig`. Both render the same in-process Zig
+# tile pipeline. (MapLibre's own `mbgl-glfw` is unrelated to our code.)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Pick whichever build dir exists.
+# Pick whichever build dir exists, preferring the GLFW/desktop dirs (a superset:
+# they build both the headless host and the interactive window).
 BUILD=""
-for d in build build-macos build-desktop build-macos-desktop; do
+for d in build-macos-desktop build-desktop build-macos build; do
   [[ -d "$ROOT/$d" ]] && BUILD="$d" && break
 done
 
@@ -28,8 +29,22 @@ if [[ -n "$BUILD" ]]; then
   cmake -S "$ROOT" -B "$ROOT/$BUILD" >/dev/null
   echo "==> building chartshot-zig in $BUILD" >&2
   ninja -C "$ROOT/$BUILD" chartshot-zig
-  echo "done. (For the interactive window, mbgl-glfw reads the style at runtime —"
-  echo " just re-run it; no rebuild needed for style changes.)"
+  # The interactive window only exists when this build dir has GLFW enabled.
+  WIN=""
+  if grep -q 'chart-glfw-zig' "$ROOT/$BUILD/build.ninja" 2>/dev/null; then
+    echo "==> building chart-glfw-zig (interactive window) in $BUILD" >&2
+    ninja -C "$ROOT/$BUILD" chart-glfw-zig
+    WIN="$BUILD/chart-glfw-zig"
+  fi
+  echo "done."
+  echo "  headless PNG:  $BUILD/chartshot-zig reference/tiles/annapolis.pmtiles style/chart-zig-day.json 38.978 -76.487 14 out.png"
+  if [[ -n "$WIN" ]]; then
+    echo "  interactive:   $WIN reference/tiles/annapolis.pmtiles style/chart-zig-day.json"
+    echo "                 (drag to pan, scroll to zoom; pass a .000 cell for live generation)"
+  else
+    echo "  (no interactive window in this build dir — use a desktop preset:"
+    echo "   cmake --preset macos-desktop   # or: desktop   on Linux)"
+  fi
 else
   echo "no build dir found; run 'cmake --preset <headless|desktop|macos|macos-desktop>' first" >&2
 fi
