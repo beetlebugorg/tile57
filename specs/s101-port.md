@@ -155,8 +155,34 @@ Implement in `s101_adapt` (synthesize a featureName complex attr from OBJNAM) +
 Count` = l_zero) + ensure `catalogue.json` binds `featureName`. Also drives
 light characteristics and other name-derived labels.
 
-Next live-gen work, ranked by visual impact:
-0. **feature-name text** — see "BIGGEST REMAINING GAP" above.
+### featureName DONE 2026-06-26
+`featureName` complex attribute is now synthesized from OBJNAM (s101_adapt
+captures it; `tgp_name`/`tgp_complex_count`; `lua_shim` serves the
+`featureName:1` -> `name` sub-attribute). Verified: rules read real names. Few
+new visible labels on US5MD1MC (named features are buoys, unlabeled by S-52
+default) but it's required infra and labels named areas/regions elsewhere.
+
+### Remaining text/portrayal gaps (investigated 2026-06-26)
+Only ~41/3156 features emit text. By feature code: LightAllAround (lights),
+DredgedArea, MagneticVariation. The big visible gaps + 83 portrayal errors:
+
+1. **Light characteristic text** ("Fl R 4s 10M") — biggest visible gap. LIGHTS
+   now classify as LightAllAround (was LightAirObstruction) and the rule calls
+   the description builder, but `AddTextInstruction` returns early on empty text:
+   the light attrs (lightCharacteristic, colour, signalGroup/Period, VALNMR) map
+   and are provided, BUT they're **enumerations** — the LITDSN02 builder needs
+   the enum value->label mapping (e.g. LITCHR 2 -> "Fl") from
+   `HostGetSimpleAttributeTypeInfo`'s ListedValues, which `lp_simple_info`
+   doesn't supply. Provide enumeration definitions from the catalogue.
+2. **Portrayal errors (83)** — `S100Scripting.lua:264 arithmetic on nil 'Value'`
+   for Obstruction/Wreck/UnderwaterAwashRock (VALSOU/depth ScaledDecimal not
+   provided); `SpanOpening` nil `verticalClearanceClosed`; `NavigationLine` nil
+   `orientation`; `Sounding` "Invalid primitive type" (harmless — soundings are
+   handled directly in s57_mvt, so the portrayal SOUNDG failure is ignorable, or
+   feed MultiPoint to silence it). These need the missing simple attrs provided.
+3. **Light sector arcs** — LightSectored (SECTR1/SECTR2/VALNMR) emits sector
+   limit rays/arcs; the stream path can't carry them yet (needs AugmentedRay /
+   the sector_lines geometry). Style layer exists (added 2026-06-26).
 1. **soundings** — DONE 2026-06-26. `s57.Cell.soundingsFor` gathers a SOUNDG
    feature's SG3D multipoint; `s57_mvt.sndfrmSyms` ports SNDFRM04's core digit
    composition; each sounding is emitted into the `soundings` layer with
