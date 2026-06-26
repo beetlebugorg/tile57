@@ -1,0 +1,332 @@
+//! ISO/IEC 8211 reader for S-57 ENC cells (.000/.NNN).
+//! Port of pkg/iso8211. Parses the binary container into a Data Descriptive
+//! Record (DDR, the schema) followed by Data Records (DR), each a set of
+//! tag -> raw field bytes. S-57 semantics (subfield interpretation) live in
+//! s57.zig (M6b).
+//!
+//! Spec: ISO 8211:1994 / IHO S-57 Part 3 Annex A.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const FT: u8 = 0x1e; // field terminator
+pub const UT: u8 = 0x1f; // unit terminator
+
+pub const Leader = struct {
+    record_length: usize,
+    interchange_level: u8,
+    leader_id: u8, // 'L' = DDR, 'D' = DR
+    version: u8,
+    field_control_length: usize,
+    field_area_start: usize,
+    size_of_field_length: u8,
+    size_of_field_position: u8,
+    size_of_field_tag: u8,
+
+    fn parse(buf: []const u8) !Leader {
+        if (buf.len < 24) return error.ShortLeader;
+        return .{
+            .record_length = try asciiInt(buf[0..5]),
+            .interchange_level = buf[5],
+            .leader_id = buf[6],
+            .version = buf[8],
+            .field_control_length = try asciiInt(buf[10..12]),
+            .field_area_start = try asciiInt(buf[12..17]),
+            .size_of_field_length = try asciiDigit(buf[20]),
+            .size_of_field_position = try asciiDigit(buf[21]),
+            .size_of_field_tag = try asciiDigit(buf[23]),
+        };
+    }
+};
+
+pub const DirectoryEntry = struct {
+    tag: []const u8,
+    length: usize,
+    position: usize,
+};
+
+pub const Field = struct {
+    tag: []const u8,
+    data: []const u8, // field bytes, field terminator stripped
+};
+
+pub const SubfieldDef = struct {
+    format_type: u8, // 'A','I','R','B',...
+    width: usize, // 0 = variable
+};
+
+pub const FieldControl = struct {
+    tag: []const u8,
+    struct_code: u8, // 0=elementary,1=vector,2=array
+    type_code: u8, // 0=char,1=implicit,5=binary
+    name: []const u8,
+    format_controls: []const u8,
+    subfields: []SubfieldDef,
+};
+
+pub const Record = struct {
+    leader: Leader,
+    entries: []DirectoryEntry,
+    fields: []Field,
+
+    pub fn field(self: Record, tag: []const u8) ?[]const u8 {
+        for (self.fields) |f| if (std.mem.eql(u8, f.tag, tag)) return f.data;
+        return null;
+    }
+};
+
+pub const File = struct {
+    ddr: Record,
+    field_controls: []FieldControl,
+    records: []Record,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *File) void {
+        self.arena.deinit();
+    }
+
+    pub fn fieldControl(self: File, tag: []const u8) ?FieldControl {
+        for (self.field_controls) |fc| if (std.mem.eql(u8, fc.tag, tag)) return fc;
+        return null;
+    }
+};
+
+fn asciiInt(buf: []const u8) !usize {
+    var v: usize = 0;
+    var any = false;
+    for (buf) |c| {
+        if (c == ' ' or c == 0) continue;
+        if (c < '0' or c > '9') return error.BadAsciiInt;
+        v = v * 10 + (c - '0');
+        any = true;
+    }
+    return if (any) v else 0;
+}
+
+fn asciiDigit(c: u8) !u8 {
+    if (c < '0' or c > '9') return error.BadAsciiDigit;
+    return c - '0';
+}
+
+fn parseDirectory(a: Allocator, leader: Leader, rec: []const u8) ![]DirectoryEntry {
+    const entry_len = leader.size_of_field_tag + leader.size_of_field_length + leader.size_of_field_position;
+    var list = std.ArrayList(DirectoryEntry).empty;
+    var pos: usize = 24;
+    const dir_end = leader.field_area_start; // directory ends where field area begins
+    while (pos + entry_len <= dir_end) {
+        if (rec[pos] == FT) break; // directory terminator
+        const tag = rec[pos .. pos + leader.size_of_field_tag];
+        var o = pos + leader.size_of_field_tag;
+        const length = try asciiInt(rec[o .. o + leader.size_of_field_length]);
+        o += leader.size_of_field_length;
+        const position = try asciiInt(rec[o .. o + leader.size_of_field_position]);
+        try list.append(a, .{ .tag = tag, .length = length, .position = position });
+        pos += entry_len;
+    }
+    return list.items;
+}
+
+fn parseFields(a: Allocator, entries: []DirectoryEntry, field_area: []const u8) ![]Field {
+    var list = std.ArrayList(Field).empty;
+    for (entries) |e| {
+        if (e.position + e.length > field_area.len) return error.FieldOutOfBounds;
+        var data = field_area[e.position .. e.position + e.length];
+        if (data.len > 0 and data[data.len - 1] == FT) data = data[0 .. data.len - 1];
+        try list.append(a, .{ .tag = e.tag, .data = data });
+    }
+    return list.items;
+}
+
+fn parseRecord(a: Allocator, bytes: []const u8, offset: usize) !struct { rec: Record, next: usize } {
+    const leader = try Leader.parse(bytes[offset..]);
+    if (leader.record_length == 0 or offset + leader.record_length > bytes.len) return error.BadRecordLength;
+    const rec_bytes = bytes[offset .. offset + leader.record_length];
+    const entries = try parseDirectory(a, leader, rec_bytes);
+    const field_area = rec_bytes[leader.field_area_start..];
+    const fields = try parseFields(a, entries, field_area);
+    return .{ .rec = .{ .leader = leader, .entries = entries, .fields = fields }, .next = offset + leader.record_length };
+}
+
+/// Parse the DDR's data descriptive fields. In ISO 8211 each data field is
+/// described by its OWN DDR entry (keyed by the real tag, e.g. "DSID","FRID").
+/// A descriptive field's content is:
+///   <field-control-length controls> <name> UT <array-descriptor> UT <format-controls>
+/// where the array descriptor carries the '!'-joined subfield labels.
+fn parseFieldControls(a: Allocator, ddr: Record, field_control_length: usize) ![]FieldControl {
+    var list = std.ArrayList(FieldControl).empty;
+    for (ddr.fields) |f| {
+        if (std.mem.eql(u8, f.tag, "0000")) continue; // field control field
+        if (f.data.len < 2) continue;
+        const struct_code: u8 = if (f.data[0] >= '0' and f.data[0] <= '9') f.data[0] - '0' else 0;
+        const type_code: u8 = if (f.data[1] >= '0' and f.data[1] <= '9') f.data[1] - '0' else 0;
+        // Skip the fixed field-control bytes, then split name / array-desc / format.
+        const rest = if (f.data.len > field_control_length) f.data[field_control_length..] else f.data[0..0];
+        var it = std.mem.splitScalar(u8, rest, UT);
+        const name = it.next() orelse "";
+        _ = it.next(); // array descriptor (subfield labels) — unused; s57.zig uses the fixed schema
+        const fmt = it.next() orelse "";
+        try list.append(a, .{
+            .tag = f.tag,
+            .struct_code = struct_code,
+            .type_code = type_code,
+            .name = name,
+            .format_controls = fmt,
+            .subfields = try parseSubfields(a, fmt),
+        });
+    }
+    return list.items;
+}
+
+/// Parse format controls like "(A,I(4),B(40))" into subfield defs.
+pub fn parseSubfields(a: Allocator, fmt_in: []const u8) ![]SubfieldDef {
+    var list = std.ArrayList(SubfieldDef).empty;
+    var fmt = std.mem.trim(u8, fmt_in, " ");
+    if (fmt.len == 0) return list.items;
+    if (fmt[0] == '(') fmt = fmt[1..];
+    if (fmt.len > 0 and fmt[fmt.len - 1] == ')') fmt = fmt[0 .. fmt.len - 1];
+
+    var i: usize = 0;
+    while (i < fmt.len) {
+        // optional leading repeat count, e.g. "2A(3)" or "3I"
+        var repeat: usize = 1;
+        const rstart = i;
+        while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') i += 1;
+        if (i > rstart) repeat = try asciiInt(fmt[rstart..i]);
+        if (i >= fmt.len) break;
+        const ftype = fmt[i];
+        i += 1;
+        var width: usize = 0;
+        if (i < fmt.len and fmt[i] == '(') {
+            i += 1;
+            const wstart = i;
+            while (i < fmt.len and fmt[i] != ')') i += 1;
+            width = try asciiInt(fmt[wstart..i]);
+            if (i < fmt.len) i += 1; // skip ')'
+        }
+        var k: usize = 0;
+        while (k < repeat) : (k += 1) try list.append(a, .{ .format_type = ftype, .width = width });
+        if (i < fmt.len and fmt[i] == ',') i += 1;
+    }
+    return list.items;
+}
+
+/// Parse a whole ISO 8211 file from in-memory bytes (borrowed; keep alive).
+pub fn parse(gpa: Allocator, bytes: []const u8) !File {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    const first = try parseRecord(a, bytes, 0);
+    if (first.rec.leader.leader_id != 'L') return error.NotADDR;
+    const field_controls = try parseFieldControls(a, first.rec, first.rec.leader.field_control_length);
+
+    var records = std.ArrayList(Record).empty;
+    var off = first.next;
+    while (off + 24 <= bytes.len) {
+        const r = parseRecord(a, bytes, off) catch break;
+        try records.append(a, r.rec);
+        off = r.next;
+    }
+    return .{ .ddr = first.rec, .field_controls = field_controls, .records = records.items, .arena = arena };
+}
+
+// ---- tests --------------------------------------------------------------
+
+test "subfield format control parsing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const s = try parseSubfields(a, "(A,I(4),B(40))");
+    try std.testing.expectEqual(@as(usize, 3), s.len);
+    try std.testing.expectEqual(@as(u8, 'A'), s[0].format_type);
+    try std.testing.expectEqual(@as(usize, 0), s[0].width);
+    try std.testing.expectEqual(@as(u8, 'I'), s[1].format_type);
+    try std.testing.expectEqual(@as(usize, 4), s[1].width);
+    try std.testing.expectEqual(@as(usize, 40), s[2].width);
+
+    // repeat count expands.
+    const r = try parseSubfields(a, "(2A(2),I)");
+    try std.testing.expectEqual(@as(usize, 3), r.len);
+    try std.testing.expectEqual(@as(u8, 'A'), r[0].format_type);
+    try std.testing.expectEqual(@as(u8, 'A'), r[1].format_type);
+    try std.testing.expectEqual(@as(u8, 'I'), r[2].format_type);
+}
+
+test "parse a synthesized minimal ISO 8211 file" {
+    const a = std.testing.allocator;
+
+    // Build a tiny DDR + one DR by hand. The DDR describes field "TEST" via its
+    // OWN entry (S-57 convention): 9 field-control bytes, then
+    // name UT array-descriptor UT format-controls.
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+
+    const fc_data = "0000;&   "; // field control field (0000) content, 9 bytes
+    // "00" struct/type codes + 7 pad = 9 control bytes, then name/desc/format.
+    const test_def = "000000000Test field" ++ [_]u8{UT} ++ "" ++ [_]u8{UT} ++ "(A)";
+
+    try writeRecord(a, &buf, 'L', &.{
+        .{ .tag = "0000", .data = fc_data },
+        .{ .tag = "TEST", .data = test_def },
+    });
+    try writeRecord(a, &buf, 'D', &.{
+        .{ .tag = "TEST", .data = "HELLO" },
+    });
+
+    var file = try parse(a, buf.items);
+    defer file.deinit();
+
+    try std.testing.expectEqual(@as(u8, 'L'), file.ddr.leader.leader_id);
+    try std.testing.expectEqual(@as(usize, 1), file.records.len);
+    try std.testing.expectEqualStrings("HELLO", file.records[0].field("TEST").?);
+
+    const fc = file.fieldControl("TEST").?;
+    try std.testing.expectEqualStrings("Test field", fc.name);
+    try std.testing.expectEqual(@as(usize, 1), fc.subfields.len);
+    try std.testing.expectEqual(@as(u8, 'A'), fc.subfields[0].format_type);
+}
+
+// Test helper: write a record (leader+directory+field area) with tag size 4,
+// length size 3, position size 4 (matching real S-57 entry maps closely enough).
+fn writeRecord(a: Allocator, out: *std.ArrayList(u8), leader_id: u8, fields: []const Field) !void {
+    const TAGN = 4;
+    const LENN = 3;
+    const POSN = 4;
+    var area = std.ArrayList(u8).empty;
+    defer area.deinit(a);
+    var dir = std.ArrayList(u8).empty;
+    defer dir.deinit(a);
+    for (fields) |f| {
+        const pos = area.items.len;
+        try area.appendSlice(a, f.data);
+        try area.append(a, FT);
+        const flen = f.data.len + 1;
+        var ebuf: [TAGN + LENN + POSN]u8 = undefined;
+        @memcpy(ebuf[0..TAGN], f.tag);
+        _ = std.fmt.bufPrint(ebuf[TAGN .. TAGN + LENN], "{d:0>3}", .{flen}) catch unreachable;
+        _ = std.fmt.bufPrint(ebuf[TAGN + LENN ..], "{d:0>4}", .{pos}) catch unreachable;
+        try dir.appendSlice(a, &ebuf);
+    }
+    try dir.append(a, FT); // directory terminator
+    const field_area_start = 24 + dir.items.len;
+    const record_length = field_area_start + area.items.len;
+
+    var leader: [24]u8 = undefined;
+    @memset(&leader, ' ');
+    _ = std.fmt.bufPrint(leader[0..5], "{d:0>5}", .{record_length}) catch unreachable;
+    leader[5] = '3';
+    leader[6] = leader_id;
+    leader[8] = '1';
+    leader[10] = '0';
+    leader[11] = '9';
+    _ = std.fmt.bufPrint(leader[12..17], "{d:0>5}", .{field_area_start}) catch unreachable;
+    leader[20] = '0' + LENN;
+    leader[21] = '0' + POSN;
+    leader[22] = '0';
+    leader[23] = '0' + TAGN;
+
+    try out.appendSlice(a, &leader);
+    try out.appendSlice(a, dir.items);
+    try out.appendSlice(a, area.items);
+}

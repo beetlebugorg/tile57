@@ -44,8 +44,30 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "cell")) {
+        const path = args[2];
+        const data = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
+        var file = try tilegen.iso8211.parse(arena, data);
+        defer file.deinit();
+        const L = file.ddr.leader;
+        std.debug.print(
+            "{s}\n  DDR: interchange={c} version={c} tag_size={d} field_controls={d}\n  data records: {d}\n",
+            .{ path, L.interchange_level, L.version, L.size_of_field_tag, file.field_controls.len, file.records.len },
+        );
+        // Tally the S-57 record kind by its leading field.
+        var dsid: usize = 0;
+        var frid: usize = 0;
+        var vrid: usize = 0;
+        var other: usize = 0;
+        for (file.records) |r| {
+            if (r.field("FRID") != null) frid += 1 else if (r.field("VRID") != null) vrid += 1 else if (r.field("DSID") != null) dsid += 1 else other += 1;
+        }
+        std.debug.print("  DSID={d} feature(FRID)={d} vector(VRID)={d} other={d}\n", .{ dsid, frid, vrid, other });
+        return;
+    }
+
     std.debug.print(
-        "tilegen — usage: bake inspect <file.pmtiles> [z x y]\n" ++
+        "tilegen — usage:\n  bake inspect <file.pmtiles> [z x y]\n  bake cell <file.000>\n" ++
             "(baking from S-57 cells comes at M6)\n",
         .{},
     );
