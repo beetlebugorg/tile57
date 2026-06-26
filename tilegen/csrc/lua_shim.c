@@ -392,6 +392,12 @@ static int lp_feature_info(lua_State *L) { /* HostGetFeatureTypeInfo(code) */
     lua_setfield(L, -2, "Code");
     lua_newtable(L);
     bindings_from_cat(L, 0, code, clen);
+    /* Guaranteed attrs (mirror Go's withGuaranteed): some rules read these
+     * without the nil-safe '!' on feature types the catalogue doesn't bind them
+     * to. Binding them makes such a read return nil instead of erroring. */
+    push_binding(L, "inTheWater");
+    push_binding(L, "orientationValue");
+    push_binding(L, "topmark");
     lua_setfield(L, -2, "AttributeBindings");
     return 1;
 }
