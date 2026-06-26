@@ -322,7 +322,13 @@ static const char *PORTRAY_CLASSES[] = {
     "Coastline", "ShorelineConstruction", "DepthContour", "Sounding", 0};
 static const char *PORTRAY_ATTRS_REAL[] = {
     "depthRangeMinimumValue", "depthRangeMaximumValue",
-    "valueOfSounding", "valueOfDepthContour", "orientationValue", 0};
+    "valueOfSounding", "valueOfDepthContour", "orientationValue",
+    /* attrs the supported area/line rules read (absent -> nil) */
+    "categoryOfCoastline", "condition", "restriction", "featureName",
+    "waterLevelEffect", "natureOfSurface", "natureOfSurfaceQualifier",
+    "status", "colour", "categoryOfDredgedArea", "scaleMinimum",
+    "qualityOfBathymetricData", "categoryOfBuiltUpArea", "verticalLength",
+    "heightLength", "elevation", "verticalUncertainty", 0};
 static const char *PORTRAY_ATTRS_BOOL[] = {"inTheWater", 0};
 
 static int lp_feature_codes(lua_State *L) {
@@ -503,12 +509,18 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "cp('PreferredLanguage','text','eng')\n"
         "PortrayalInitializeContextParameters(cps)\n"
         "local ctx=portrayalContext.ContextParameters\n"
+        "local nok,nerr,errs=0,0,{}\n"
         "for _,item in ipairs(portrayalContext.FeaturePortrayalItems) do\n"
         "  local feature=item.Feature\n"
         "  local fp=item:NewFeaturePortrayal()\n"
         "  local ok,err=pcall(function() require(feature.Code); _G[feature.Code](feature,fp,ctx) end)\n"
-        "  local instr = ok and table.concat(fp.DrawingInstructions, ';') or ('ERROR:'..tostring(err))\n"
-        "  tg_store(tonumber(feature.ID), instr)\nend\n";
+        "  local instr\n"
+        "  if ok then nok=nok+1; instr=table.concat(fp.DrawingInstructions, ';')\n"
+        "  else nerr=nerr+1; instr='ERROR:'..tostring(err)\n"
+        "    errs[feature.Code]=(errs[feature.Code] or tostring(err)) end\n"
+        "  tg_store(tonumber(feature.ID), instr)\nend\n"
+        "io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors\\n')\n"
+        "for code,e in pairs(errs) do io.stderr:write('  '..code..': '..e..'\\n') end\n";
     int rc = 0;
     if (luaL_dostring(L, driver) != LUA_OK) {
         fprintf(stderr, "[s101] dispatch: %s\n", lua_tostring(L, -1));
