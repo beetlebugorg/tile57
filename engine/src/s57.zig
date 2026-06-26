@@ -387,43 +387,195 @@ fn parseSG3D(a: Allocator, data: []const u8, comf: f64, somf: f64) ![]Sounding {
 }
 
 /// Parse an S-57 cell from raw bytes (does the ISO 8211 decode internally).
+/// Parse a single S-57 base cell (no updates).
 pub fn parseCell(gpa: Allocator, bytes: []const u8) !Cell {
-    var file = try iso.parse(gpa, bytes);
-    defer file.deinit(); // we copy what we keep into our own arena
+    return parseCellWithUpdates(gpa, bytes, &.{});
+}
 
+const vkey = struct {
+    fn of(rcnm: u8, rcid: u32) u64 {
+        return (@as(u64, rcnm) << 32) | rcid;
+    }
+};
+
+// FOID composite key (AGEN, FIDN, FIDS) — the stable feature identity across
+// updates (RCID alone is not unique; S-57 §7.6.2). FOID = AGEN(2) FIDN(4) FIDS(2).
+fn foidKey(fo: []const u8) u64 {
+    if (fo.len < 8) return 0;
+    return (@as(u64, u16le(fo, 0)) << 48) | (@as(u64, u32le(fo, 2)) << 16) | u16le(fo, 6);
+}
+
+// Apply an S-57 update-control field (SGCC for coordinates §8.4.3.2, FSPC for
+// feature-spatial pointers §8.4.2.2 — identical structure) to `existing`. The
+// control is repeating 5-byte entries: UI(1) (1=insert,2=delete,3=modify),
+// IX(2, 1-based), NC(2, count). Insert/modify consume items from `upd` in order;
+// delete consumes none. Applied in sequence so a small edit touches only its
+// indexed entries and keeps the rest of the base list intact. Allocates in `a`.
+fn applyControl(a: Allocator, comptime T: type, existing: []const T, upd: []const T, ctrl: []const u8) ![]T {
+    var out = std.ArrayList(T).empty;
+    try out.appendSlice(a, existing);
+    var ui: usize = 0;
+    var off: usize = 0;
+    while (off + 5 <= ctrl.len) : (off += 5) {
+        const instr = ctrl[off];
+        const raw = u16le(ctrl, off + 1);
+        var idx: usize = if (raw == 0) 0 else raw - 1;
+        const nc: usize = u16le(ctrl, off + 3);
+        switch (instr) {
+            1 => { // insert nc items before idx
+                const end = @min(ui + nc, upd.len);
+                const ins = upd[ui..end];
+                ui = end;
+                if (idx > out.items.len) idx = out.items.len;
+                try out.insertSlice(a, idx, ins);
+            },
+            2 => { // delete nc items starting at idx
+                const endd = @min(idx + nc, out.items.len);
+                if (idx < out.items.len and idx < endd) try out.replaceRange(a, idx, endd - idx, &.{});
+            },
+            3 => { // modify nc items starting at idx (replace with new ones)
+                const end = @min(ui + nc, upd.len);
+                const repl = upd[ui..end];
+                ui = end;
+                var k: usize = 0;
+                while (k < repl.len and idx + k < out.items.len) : (k += 1) out.items[idx + k] = repl[k];
+            },
+            else => {},
+        }
+    }
+    return out.items;
+}
+
+// Merge one ISO 8211 file (base or update) into the record lists, keyed by FOID
+// (features) / (RCNM,RCID) (vectors). Insertion order is preserved (deterministic
+// output); deletes tombstone the slot (null). For the base, every record inserts.
+fn mergeFile(
+    gpa: Allocator,
+    a: Allocator,
+    feats: *std.ArrayList(?Feature),
+    fidx: *std.AutoHashMap(u64, usize),
+    vecs: *std.ArrayList(?VectorRecord),
+    vidx: *std.AutoHashMap(u64, usize),
+    bytes: []const u8,
+    comf: f64,
+    somf: f64,
+    is_update: bool,
+) !void {
+    var file = try iso.parse(gpa, bytes);
+    defer file.deinit(); // kept data is copied into arena `a`
+
+    for (file.records) |rec| {
+        if (rec.field("VRID")) |vrid| {
+            if (vrid.len < 8) continue;
+            const rcnm = vrid[0];
+            const rcid = u32le(vrid, 1);
+            const ruin: u8 = if (is_update) vrid[7] else 1;
+            const key = vkey.of(rcnm, rcid);
+
+            if (ruin == 2) { // delete
+                if (vidx.get(key)) |i| vecs.items[i] = null;
+                continue;
+            }
+            var v = VectorRecord{ .rcnm = rcnm, .rcid = rcid, .points = &.{}, .soundings = &.{} };
+            if (rec.field("SG2D")) |sg| v.points = try parseSG2D(a, sg, comf);
+            if (rec.field("SG3D")) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
+            if (rec.field("VRPT")) |vp| parseVRPT(&v, vp);
+
+            if (ruin == 3) { // modify in place
+                if (vidx.get(key)) |i| if (vecs.items[i]) |*ex| {
+                    if (rec.field("SGCC")) |sgcc| {
+                        ex.points = try applyControl(a, LonLat, ex.points, v.points, sgcc);
+                    } else if (rec.field("SG2D") != null) {
+                        ex.points = v.points;
+                    }
+                    if (rec.field("SG3D") != null) ex.soundings = v.soundings;
+                    if (rec.field("VRPT") != null) { // begin/end full-replace (VRPC indexing not modelled)
+                        ex.begin_node = v.begin_node;
+                        ex.end_node = v.end_node;
+                    }
+                };
+                continue;
+            }
+            // insert (1) — upsert
+            if (vidx.get(key)) |i| {
+                vecs.items[i] = v;
+            } else {
+                try vecs.append(a, v);
+                try vidx.put(key, vecs.items.len - 1);
+            }
+        } else if (rec.field("FRID")) |frid| {
+            if (frid.len < 12) continue;
+            // RCNM(1) RCID(4) PRIM(1)@5 GRUP(1)@6 OBJL(2)@7 RVER(2)@9 RUIN(1)@11
+            const ruin: u8 = if (is_update) frid[11] else 1;
+            var f = Feature{ .rcnm = frid[0], .rcid = u32le(frid, 1), .prim = frid[5], .objl = u16le(frid, 7) };
+            const key = if (rec.field("FOID")) |fo| foidKey(fo) else vkey.of(f.rcnm, f.rcid);
+
+            if (ruin == 2) {
+                if (fidx.get(key)) |i| feats.items[i] = null;
+                continue;
+            }
+            if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
+            if (rec.field("ATTF")) |at| f.attrs = try parseATTF(a, at);
+
+            if (ruin == 3) {
+                if (fidx.get(key)) |i| if (feats.items[i]) |*ex| {
+                    if (rec.field("FSPC")) |fspc| {
+                        ex.refs = try applyControl(a, SpatialRef, ex.refs, f.refs, fspc);
+                    } else if (rec.field("FSPT") != null) {
+                        ex.refs = f.refs;
+                    }
+                    if (rec.field("ATTF") != null) ex.attrs = f.attrs;
+                };
+                continue;
+            }
+            if (fidx.get(key)) |i| {
+                feats.items[i] = f;
+            } else {
+                try feats.append(a, f);
+                try fidx.put(key, feats.items.len - 1);
+            }
+        }
+    }
+}
+
+/// Parse an S-57 base cell and apply its sequential update files (.001, .002, …
+/// in order). Updates are merged at the record level (S-57 §8.4): insert / delete
+/// / modify by FOID (features) or (RCNM,RCID) (vectors), with SGCC/FSPC control
+/// fields for indexed coordinate/pointer edits. Pass an empty `updates` for a
+/// plain base cell.
+pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []const []const u8) !Cell {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
+    // DSPM (coordinate factors) from the base cell.
     var params = DatasetParams{};
-    var vectors = std.ArrayList(VectorRecord).empty;
-    var features = std.ArrayList(Feature).empty;
-
-    for (file.records) |rec| {
-        if (rec.field("DSPM")) |d| {
+    {
+        var bf = try iso.parse(gpa, base_bytes);
+        defer bf.deinit();
+        for (bf.records) |rec| if (rec.field("DSPM")) |d| {
             params = parseDSPM(d);
-        }
+        };
     }
     const comf: f64 = @floatFromInt(params.comf);
     const somf: f64 = @floatFromInt(params.somf);
 
-    for (file.records) |rec| {
-        if (rec.field("VRID")) |vrid| {
-            if (vrid.len < 5) continue;
-            var v = VectorRecord{ .rcnm = vrid[0], .rcid = u32le(vrid, 1), .points = &.{}, .soundings = &.{} };
-            if (rec.field("SG2D")) |sg| v.points = try parseSG2D(a, sg, comf);
-            if (rec.field("SG3D")) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
-            if (rec.field("VRPT")) |vp| parseVRPT(&v, vp);
-            try vectors.append(a, v);
-        } else if (rec.field("FRID")) |frid| {
-            if (frid.len < 9) continue;
-            // RCNM(1) RCID(4) PRIM(1)@5 GRUP(1)@6 OBJL(2)@7
-            var f = Feature{ .rcnm = frid[0], .rcid = u32le(frid, 1), .prim = frid[5], .objl = u16le(frid, 7) };
-            if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
-            if (rec.field("ATTF")) |at| f.attrs = try parseATTF(a, at);
-            try features.append(a, f);
-        }
-    }
+    // Record lists (insertion order) + FOID/(RCNM,RCID) indices for the merge.
+    var feats = std.ArrayList(?Feature).empty;
+    var vecs = std.ArrayList(?VectorRecord).empty;
+    var fidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer fidx.deinit();
+    var vidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer vidx.deinit();
+
+    try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, base_bytes, comf, somf, false);
+    for (updates) |u| try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true);
+
+    // Flatten the surviving records (skip tombstones) into the final arrays.
+    var vectors = std.ArrayList(VectorRecord).empty;
+    for (vecs.items) |mv| if (mv) |v| try vectors.append(a, v);
+    var features = std.ArrayList(Feature).empty;
+    for (feats.items) |mf| if (mf) |f| try features.append(a, f);
 
     // Build node + edge indices for topology assembly, plus an index of the
     // VI records that carry SG3D soundings (multipoint geometry for SOUNDG).
@@ -432,12 +584,12 @@ pub fn parseCell(gpa: Allocator, bytes: []const u8) !Cell {
     var sounding_vecs = std.AutoHashMap(u64, usize).init(gpa);
     for (vectors.items, 0..) |v, i| {
         if ((v.rcnm == RCNM_VI or v.rcnm == RCNM_VC) and v.points.len > 0) {
-            try nodes.put((@as(u64, v.rcnm) << 32) | v.rcid, v.points[0]);
+            try nodes.put(vkey.of(v.rcnm, v.rcid), v.points[0]);
         } else if (v.rcnm == RCNM_VE) {
             try edges.put(v.rcid, i);
         }
         if (v.soundings.len > 0) {
-            try sounding_vecs.put((@as(u64, v.rcnm) << 32) | v.rcid, i);
+            try sounding_vecs.put(vkey.of(v.rcnm, v.rcid), i);
         }
     }
 

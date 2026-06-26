@@ -84,12 +84,12 @@ fn resolveRulesDir(rules_dir: ?[*:0]const u8) []const u8 {
     return "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
 }
 
-// Parse + portray one S-57 cell into a CellBackend (no Source wrapper). Reads
-// `bytes` but does not take ownership (the cell model copies what it keeps).
-// Returns null if the bytes are not a valid cell. Portrayal failure is non-fatal
-// (the tile generator falls back to classify()).
-fn buildCellBackend(bytes: []const u8, dir: []const u8) ?CellBackend {
-    const cell = s57.parseCell(gpa, bytes) catch return null;
+// Parse (+ apply S-57 updates) + portray one cell into a CellBackend (no Source
+// wrapper). Reads the bytes but does not take ownership (the cell model copies
+// what it keeps). Returns null if the base bytes are not a valid cell. Portrayal
+// failure is non-fatal (the tile generator falls back to classify()).
+fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const u8) ?CellBackend {
+    const cell = s57.parseCellWithUpdates(gpa, base, updates) catch return null;
     var cb = CellBackend{ .cell = cell };
     const pa = gpa.create(std.heap.ArenaAllocator) catch return cb;
     pa.* = std.heap.ArenaAllocator.init(gpa);
@@ -113,7 +113,7 @@ fn freeCellBackend(cb: *CellBackend) void {
 
 // Open a single raw S-57 cell. Returns null if the bytes are not a valid cell.
 fn openCell(bytes: []const u8, rules_dir: ?[*:0]const u8) ?*Source {
-    var cb = buildCellBackend(bytes, resolveRulesDir(rules_dir)) orelse return null;
+    var cb = buildCellBackend(bytes, &.{}, resolveRulesDir(rules_dir)) orelse return null;
     const src = gpa.create(Source) catch {
         freeCellBackend(&cb);
         return null;
@@ -145,9 +145,14 @@ export fn chartplotter_source_open_cells(
     var list = std.ArrayList(CellBackend).empty;
     const inputs = cells_ptr[0..count];
     for (inputs) |in| {
-        // TODO(go-sync): apply in.updates (.001…) before portrayal. For now the
-        // base cell is used; updates are parsed/applied in a follow-up.
-        if (buildCellBackend(in.base[0..in.base_len], dir)) |cb| {
+        // Collect this cell's update buffers (.001…) into a slice for the parser.
+        var ups = std.ArrayList([]const u8).empty;
+        defer ups.deinit(gpa);
+        if (in.updates) |uptr| if (in.update_lens) |ulen| {
+            var k: usize = 0;
+            while (k < in.update_count) : (k += 1) ups.append(gpa, uptr[k][0..ulen[k]]) catch break;
+        };
+        if (buildCellBackend(in.base[0..in.base_len], ups.items, dir)) |cb| {
             list.append(gpa, cb) catch {
                 var c = cb;
                 freeCellBackend(&c);
