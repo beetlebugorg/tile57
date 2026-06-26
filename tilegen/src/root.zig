@@ -18,6 +18,7 @@ pub const s57 = @import("s57.zig");
 pub const s57_mvt = @import("s57_mvt.zig");
 pub const s101_instr = @import("s101_instr.zig");
 pub const s101_adapt = @import("s101_adapt.zig");
+pub const catalogue = @import("catalogue.zig");
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {
@@ -30,5 +31,6 @@ test {
     _ = s57_mvt;
     _ = s101_instr;
     _ = s101_adapt;
+    _ = catalogue;
     _ = @import("mvt_parity_test.zig");
 }

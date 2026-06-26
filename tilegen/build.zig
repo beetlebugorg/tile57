@@ -21,6 +21,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The distilled S-101 catalogue, embedded (@embedFile "catalogue_json").
+    mod.addAnonymousImport("catalogue_json", .{ .root_source_file = b.path("vendor/s101/catalogue.json") });
 
     // Static library (libtilegen.a): C ABI + embedded Lua. Its own root so the
     // C sources / libc only land in the archive (linked by the C++ host), never
@@ -32,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
+    lib_mod.addAnonymousImport("catalogue_json", .{ .root_source_file = b.path("vendor/s101/catalogue.json") });
     lib_mod.addIncludePath(b.path("vendor/lua/src"));
     lib_mod.addCSourceFile(.{ .file = b.path("csrc/lua_shim.c"), .flags = &.{"-DLUA_USE_POSIX"} });
     lib_mod.addCSourceFiles(.{

@@ -20,6 +20,19 @@ extern const char *tgp_primitive(size_t i, size_t *len);
 extern const char *tgp_attr(size_t i, const char *name, size_t nlen, size_t *len);
 extern void tgp_emit(size_t i, const char *instr, size_t len);
 
+/* Catalogue accessors implemented in Zig (catalogue.zig). */
+extern size_t tgc_feature_count(void);
+extern const char *tgc_feature_code(size_t i, size_t *len);
+extern size_t tgc_simple_count(void);
+extern const char *tgc_simple_code(size_t i, size_t *len);
+extern size_t tgc_complex_count(void);
+extern const char *tgc_complex_code(size_t i, size_t *len);
+extern size_t tgc_feature_binding_count(const char *code, size_t code_len);
+extern size_t tgc_complex_binding_count(const char *code, size_t code_len);
+extern void tgc_binding(unsigned char kind, const char *code, size_t code_len, size_t j,
+                        const char **ref, size_t *ref_len, int *lower, int *upper);
+extern const char *tgc_simple_valuetype(const char *code, size_t code_len, size_t *len);
+
 /* Run a trivial Lua chunk and return its integer result, or a negative error.
  * Used to verify the embedded interpreter end to end. */
 long tg_lua_selftest(void) {
@@ -312,73 +325,100 @@ int tg_lua_portray_demo(const char *dir) {
     return 0;
 }
 
-/* ---- cell-driven portrayal (Host* backed by the Zig adapted features) ---- */
+/* ---- cell-driven portrayal (Host* backed by the Zig adapted features + the
+ *      real Feature Catalogue via tgc_* accessors) ------------------------- */
 
-/* Supported S-101 classes + the attributes the rules read. Over-bind every
- * attribute on every class (a missing one then reads as nil, not an error) plus
- * a few "guaranteed" attrs some rules read unguarded. Grows as classes land. */
-static const char *PORTRAY_CLASSES[] = {
-    "DepthArea", "DredgedArea", "LandArea", "BuiltUpArea",
-    "Coastline", "ShorelineConstruction", "DepthContour", "Sounding", 0};
-static const char *PORTRAY_ATTRS_REAL[] = {
-    "depthRangeMinimumValue", "depthRangeMaximumValue",
-    "valueOfSounding", "valueOfDepthContour", "orientationValue",
-    /* attrs the supported area/line rules read (absent -> nil) */
-    "categoryOfCoastline", "condition", "restriction", "featureName",
-    "waterLevelEffect", "natureOfSurface", "natureOfSurfaceQualifier",
-    "status", "colour", "categoryOfDredgedArea", "scaleMinimum",
-    "qualityOfBathymetricData", "categoryOfBuiltUpArea", "verticalLength",
-    "heightLength", "elevation", "verticalUncertainty", 0};
-static const char *PORTRAY_ATTRS_BOOL[] = {"inTheWater", 0};
-
+/* Build {ref -> {UpperMultiplicity, LowerMultiplicity}} for a feature(0)/
+ * complex(1) code from the catalogue. The AttributeBindings table is at -1. */
+static void bindings_from_cat(lua_State *L, unsigned char kind, const char *code, size_t clen) {
+    size_t n = (kind == 0) ? tgc_feature_binding_count(code, clen)
+                           : tgc_complex_binding_count(code, clen);
+    for (size_t j = 0; j < n; j++) {
+        const char *ref = "";
+        size_t rl = 0;
+        int lo = 0, up = 1;
+        tgc_binding(kind, code, clen, j, &ref, &rl, &lo, &up);
+        lua_newtable(L);
+        lua_pushinteger(L, up < 0 ? (1 << 30) : up);
+        lua_setfield(L, -2, "UpperMultiplicity");
+        lua_pushinteger(L, lo);
+        lua_setfield(L, -2, "LowerMultiplicity");
+        lua_pushlstring(L, ref, rl);
+        lua_pushvalue(L, -2);    /* dup binding table */
+        lua_settable(L, -4);     /* bindings[ref] = {...} */
+        lua_pop(L, 1);           /* pop the leftover binding table */
+    }
+}
 static int lp_feature_codes(lua_State *L) {
+    size_t n = tgc_feature_count();
     lua_newtable(L);
-    for (int i = 0; PORTRAY_CLASSES[i]; i++) {
-        lua_pushstring(L, PORTRAY_CLASSES[i]);
-        lua_rawseti(L, -2, i + 1);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *c = tgc_feature_code(i, &len);
+        lua_pushlstring(L, c, len);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
     }
     return 1;
 }
 static int lp_simple_codes(lua_State *L) {
+    size_t n = tgc_simple_count();
     lua_newtable(L);
-    int n = 0;
-    for (int i = 0; PORTRAY_ATTRS_REAL[i]; i++) {
-        lua_pushstring(L, PORTRAY_ATTRS_REAL[i]);
-        lua_rawseti(L, -2, ++n);
-    }
-    for (int i = 0; PORTRAY_ATTRS_BOOL[i]; i++) {
-        lua_pushstring(L, PORTRAY_ATTRS_BOOL[i]);
-        lua_rawseti(L, -2, ++n);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *c = tgc_simple_code(i, &len);
+        lua_pushlstring(L, c, len);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
     }
     return 1;
 }
-static void bind_all(lua_State *L) { /* AttributeBindings table at top */
-    for (int i = 0; PORTRAY_ATTRS_REAL[i]; i++) push_binding(L, PORTRAY_ATTRS_REAL[i]);
-    for (int i = 0; PORTRAY_ATTRS_BOOL[i]; i++) push_binding(L, PORTRAY_ATTRS_BOOL[i]);
+static int lp_complex_codes(lua_State *L) {
+    size_t n = tgc_complex_count();
+    lua_newtable(L);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *c = tgc_complex_code(i, &len);
+        lua_pushlstring(L, c, len);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    return 1;
 }
 static int lp_feature_info(lua_State *L) { /* HostGetFeatureTypeInfo(code) */
-    const char *code = luaL_checkstring(L, 1);
+    size_t clen = 0;
+    const char *code = luaL_checklstring(L, 1, &clen);
     lua_newtable(L);
     lua_pushstring(L, "FeatureTypeInfo");
     lua_setfield(L, -2, "Type");
-    lua_pushstring(L, code);
+    lua_pushlstring(L, code, clen);
     lua_setfield(L, -2, "Code");
     lua_newtable(L);
-    bind_all(L);
+    bindings_from_cat(L, 0, code, clen);
+    lua_setfield(L, -2, "AttributeBindings");
+    return 1;
+}
+static int lp_complex_info(lua_State *L) { /* HostGetComplexAttributeTypeInfo(code) */
+    size_t clen = 0;
+    const char *code = luaL_checklstring(L, 1, &clen);
+    lua_newtable(L);
+    lua_pushstring(L, "ComplexAttributeInfo");
+    lua_setfield(L, -2, "Type");
+    lua_pushlstring(L, code, clen);
+    lua_setfield(L, -2, "Code");
+    lua_newtable(L);
+    bindings_from_cat(L, 1, code, clen);
     lua_setfield(L, -2, "AttributeBindings");
     return 1;
 }
 static int lp_simple_info(lua_State *L) { /* HostGetSimpleAttributeTypeInfo(code) */
-    const char *code = luaL_checkstring(L, 1);
-    const char *vt = "real";
-    for (int i = 0; PORTRAY_ATTRS_BOOL[i]; i++)
-        if (strcmp(code, PORTRAY_ATTRS_BOOL[i]) == 0) vt = "boolean";
+    size_t clen = 0;
+    const char *code = luaL_checklstring(L, 1, &clen);
+    size_t vl = 0;
+    const char *vt = tgc_simple_valuetype(code, clen, &vl);
     lua_newtable(L);
     lua_pushstring(L, "SimpleAttributeInfo");
     lua_setfield(L, -2, "Type");
-    lua_pushstring(L, code);
+    lua_pushlstring(L, code, clen);
     lua_setfield(L, -2, "Code");
-    lua_pushstring(L, vt);
+    lua_pushlstring(L, vt, vl);
     lua_setfield(L, -2, "ValueType");
     return 1;
 }
@@ -459,9 +499,10 @@ int tg_portray_run(const char *dir, size_t dir_len) {
     lua_register(L, "HostPortrayalEmit", l_true);
     lua_register(L, "HostDebuggerEntry", l_noop);
     lua_register(L, "tg_store", lp_store);
+    lua_register(L, "HostGetComplexAttributeTypeCodes", lp_complex_codes);
+    lua_register(L, "HostGetComplexAttributeTypeInfo", lp_complex_info);
     /* empty catalogue tables */
     lua_register(L, "HostGetInformationTypeCodes", l_empty_table);
-    lua_register(L, "HostGetComplexAttributeTypeCodes", l_empty_table);
     lua_register(L, "HostGetRoleTypeCodes", l_empty_table);
     lua_register(L, "HostGetInformationAssociationTypeCodes", l_empty_table);
     lua_register(L, "HostGetFeatureAssociationTypeCodes", l_empty_table);

@@ -1,0 +1,240 @@
+//! S-101 Feature Catalogue loader. The compact catalogue.json (distilled from
+//! the vendored FeatureCatalogue.xml by scripts/gen-catalogue.py) is embedded
+//! and parsed once; C-ABI accessors (tgc_*) let lua_shim.c build the Lua tables
+//! the Host*TypeInfo/TypeCodes callbacks return, and resolve S-57 aliases ->
+//! S-101 codes for the adaptation.
+
+const std = @import("std");
+
+// Provided via build.zig addAnonymousImport (the file lives under vendor/,
+// outside the module's src/ root, so it can't be embedded by relative path).
+const json_bytes = @embedFile("catalogue_json");
+
+pub const Binding = struct { ref: []const u8, lower: i32, upper: i32 };
+
+const Catalogue = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    feature_codes: [][]const u8,
+    simple_codes: [][]const u8,
+    complex_codes: [][]const u8,
+    feature_bindings: std.StringHashMap([]Binding),
+    complex_bindings: std.StringHashMap([]Binding),
+    simple_valuetype: std.StringHashMap([]const u8),
+    feature_alias: std.StringHashMap([]const u8), // UPPER(S-57 acronym) -> S-101 code
+    attr_alias: std.StringHashMap([]const u8),
+};
+
+var g_cat: ?Catalogue = null;
+
+fn upper(a: std.mem.Allocator, s: []const u8) []const u8 {
+    const out = a.alloc(u8, s.len) catch return s;
+    for (s, 0..) |c, i| out[i] = std.ascii.toUpper(c);
+    return out;
+}
+
+fn parseBindings(a: std.mem.Allocator, v: std.json.Value) []Binding {
+    const arr = switch (v) {
+        .array => |x| x,
+        else => return &.{},
+    };
+    var list = std.ArrayList(Binding).empty;
+    for (arr.items) |item| {
+        const t = switch (item) {
+            .array => |x| x,
+            else => continue,
+        };
+        if (t.items.len < 3) continue;
+        const ref = switch (t.items[0]) {
+            .string => |s| s,
+            else => continue,
+        };
+        const lo: i32 = switch (t.items[1]) {
+            .integer => |n| @intCast(n),
+            else => 0,
+        };
+        const up: i32 = switch (t.items[2]) {
+            .integer => |n| @intCast(n),
+            else => 1,
+        };
+        list.append(a, .{ .ref = ref, .lower = lo, .upper = up }) catch {};
+    }
+    return list.items;
+}
+
+fn ensureLoaded() void {
+    if (g_cat != null) return;
+    const a = std.heap.page_allocator; // process-lifetime
+    const parsed = std.json.parseFromSlice(std.json.Value, a, json_bytes, .{}) catch return;
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+
+    var cat = Catalogue{
+        .parsed = parsed,
+        .feature_codes = &.{},
+        .simple_codes = &.{},
+        .complex_codes = &.{},
+        .feature_bindings = std.StringHashMap([]Binding).init(a),
+        .complex_bindings = std.StringHashMap([]Binding).init(a),
+        .simple_valuetype = std.StringHashMap([]const u8).init(a),
+        .feature_alias = std.StringHashMap([]const u8).init(a),
+        .attr_alias = std.StringHashMap([]const u8).init(a),
+    };
+
+    // featureTypes
+    if (root.get("featureTypes")) |ftv| if (ftv == .object) {
+        const ft = ftv.object;
+        var codes = std.ArrayList([]const u8).empty;
+        for (ft.keys()) |code| {
+            const entry = ft.get(code).?.object;
+            codes.append(a, code) catch {};
+            cat.feature_bindings.put(code, parseBindings(a, entry.get("bindings") orelse .null)) catch {};
+            if (entry.get("alias")) |al| if (al == .array) for (al.array.items) |av| {
+                if (av == .string) cat.feature_alias.put(upper(a, av.string), code) catch {};
+            };
+        }
+        cat.feature_codes = codes.items;
+    };
+    // simpleAttrs
+    if (root.get("simpleAttrs")) |sav| if (sav == .object) {
+        const sa = sav.object;
+        var codes = std.ArrayList([]const u8).empty;
+        for (sa.keys()) |code| {
+            const entry = sa.get(code).?.object;
+            codes.append(a, code) catch {};
+            if (entry.get("valueType")) |vt| if (vt == .string) cat.simple_valuetype.put(code, vt.string) catch {};
+            if (entry.get("alias")) |al| if (al == .array) for (al.array.items) |av| {
+                if (av == .string) cat.attr_alias.put(upper(a, av.string), code) catch {};
+            };
+        }
+        cat.simple_codes = codes.items;
+    };
+    // complexAttrs
+    if (root.get("complexAttrs")) |cav| if (cav == .object) {
+        const ca = cav.object;
+        var codes = std.ArrayList([]const u8).empty;
+        for (ca.keys()) |code| {
+            const entry = ca.get(code).?.object;
+            codes.append(a, code) catch {};
+            cat.complex_bindings.put(code, parseBindings(a, entry.get("bindings") orelse .null)) catch {};
+            if (entry.get("alias")) |al| if (al == .array) for (al.array.items) |av| {
+                if (av == .string) cat.attr_alias.put(upper(a, av.string), code) catch {};
+            };
+        }
+        cat.complex_codes = codes.items;
+    };
+
+    g_cat = cat;
+}
+
+// ---- Zig-side lookups (for s101_adapt) -----------------------------------
+
+pub fn resolveFeature(s57_acronym: []const u8) ?[]const u8 {
+    ensureLoaded();
+    const c = &(g_cat orelse return null);
+    var buf: [64]u8 = undefined;
+    if (s57_acronym.len > buf.len) return null;
+    for (s57_acronym, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
+    return c.feature_alias.get(buf[0..s57_acronym.len]);
+}
+
+pub fn resolveAttr(s57_acronym: []const u8) ?[]const u8 {
+    ensureLoaded();
+    const c = &(g_cat orelse return null);
+    var buf: [64]u8 = undefined;
+    if (s57_acronym.len > buf.len) return null;
+    for (s57_acronym, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
+    return c.attr_alias.get(buf[0..s57_acronym.len]);
+}
+
+pub fn isComplex(code: []const u8) bool {
+    ensureLoaded();
+    const c = &(g_cat orelse return false);
+    return c.complex_bindings.contains(code);
+}
+
+// ---- C-ABI accessors (for lua_shim.c) ------------------------------------
+
+export fn tgc_loaded() callconv(.c) bool {
+    ensureLoaded();
+    return g_cat != null;
+}
+
+export fn tgc_feature_count() callconv(.c) usize {
+    ensureLoaded();
+    return if (g_cat) |c| c.feature_codes.len else 0;
+}
+export fn tgc_feature_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const s = g_cat.?.feature_codes[i];
+    out_len.* = s.len;
+    return s.ptr;
+}
+export fn tgc_simple_count() callconv(.c) usize {
+    ensureLoaded();
+    return if (g_cat) |c| c.simple_codes.len else 0;
+}
+export fn tgc_simple_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const s = g_cat.?.simple_codes[i];
+    out_len.* = s.len;
+    return s.ptr;
+}
+export fn tgc_complex_count() callconv(.c) usize {
+    ensureLoaded();
+    return if (g_cat) |c| c.complex_codes.len else 0;
+}
+export fn tgc_complex_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const s = g_cat.?.complex_codes[i];
+    out_len.* = s.len;
+    return s.ptr;
+}
+
+fn bindingsOf(map: *std.StringHashMap([]Binding), code: []const u8) []Binding {
+    return map.get(code) orelse &.{};
+}
+
+export fn tgc_feature_binding_count(code_ptr: [*]const u8, code_len: usize) callconv(.c) usize {
+    const c = &(g_cat orelse return 0);
+    return bindingsOf(&c.feature_bindings, code_ptr[0..code_len]).len;
+}
+export fn tgc_complex_binding_count(code_ptr: [*]const u8, code_len: usize) callconv(.c) usize {
+    const c = &(g_cat orelse return 0);
+    return bindingsOf(&c.complex_bindings, code_ptr[0..code_len]).len;
+}
+
+/// Fill ref/lower/upper for binding j of feature/complex `code`. kind 0=feature,1=complex.
+export fn tgc_binding(kind: u8, code_ptr: [*]const u8, code_len: usize, j: usize, ref_out: *[*]const u8, ref_len: *usize, lower: *i32, upper_out: *i32) callconv(.c) void {
+    const c = &(g_cat orelse return);
+    const code = code_ptr[0..code_len];
+    const b = if (kind == 0) bindingsOf(&c.feature_bindings, code) else bindingsOf(&c.complex_bindings, code);
+    if (j >= b.len) return;
+    ref_out.* = b[j].ref.ptr;
+    ref_len.* = b[j].ref.len;
+    lower.* = b[j].lower;
+    upper_out.* = b[j].upper;
+}
+
+export fn tgc_simple_valuetype(code_ptr: [*]const u8, code_len: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const c = &(g_cat orelse {
+        out_len.* = 4;
+        return "text";
+    });
+    const vt = c.simple_valuetype.get(code_ptr[0..code_len]) orelse "text";
+    out_len.* = vt.len;
+    return vt.ptr;
+}
+
+test "catalogue loads + resolves aliases + bindings" {
+    try std.testing.expect(tgc_loaded());
+    try std.testing.expect(tgc_feature_count() > 100);
+    try std.testing.expectEqualStrings("DepthArea", resolveFeature("DEPARE").?);
+    try std.testing.expectEqualStrings("depthRangeMinimumValue", resolveAttr("DRVAL1").?);
+    try std.testing.expect(isComplex("featureName"));
+    // DepthArea binds depthRangeMinimumValue.
+    var found = false;
+    const c = &g_cat.?;
+    for (c.feature_bindings.get("DepthArea").?) |b| {
+        if (std.mem.eql(u8, b.ref, "depthRangeMinimumValue")) found = true;
+    }
+    try std.testing.expect(found);
+}

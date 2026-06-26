@@ -9,8 +9,10 @@
 pub const tilegen = @import("root.zig");
 pub const capi = @import("capi.zig");
 pub const portray = @import("portray.zig");
+pub const catalogue = @import("catalogue.zig");
 
 comptime {
     _ = capi; // force the C ABI export fns into the archive
     _ = portray; // force the tgp_* accessors into the archive
+    _ = catalogue; // force the tgc_* accessors into the archive
 }
