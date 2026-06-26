@@ -13,4 +13,5 @@ pub const mvt = @import("mvt.zig");
 
 test {
     _ = mvt;
+    _ = @import("mvt_parity_test.zig");
 }
