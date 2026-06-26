@@ -47,9 +47,9 @@ pub fn build(b: *std.Build) void {
     const lib = b.addLibrary(.{ .name = "chartplotter", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
 
-    // The offline baker / inspector CLI (pure Zig).
+    // The offline baker / inspector CLI (pure Zig). Source stays at tools/bake.zig.
     const bake = b.addExecutable(.{
-        .name = "bake",
+        .name = "chartplotter-bake",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/bake.zig"),
             .target = target,
