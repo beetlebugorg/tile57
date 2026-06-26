@@ -88,6 +88,20 @@ def icon_size():
     return ["/", ["coalesce", ["get", "scale"], ATLAS_PPU], ATLAS_PPU]
 
 
+SAFETY_DEPTH = 10  # mariner default; soundings <= this use the bold (S) glyphs
+
+
+def soundings_image():
+    """SNDFRM04: depth <= safety depth uses bold sym_s, else faint sym_g; older
+    tiles fall back to symbol_names. Port of s52-style.mjs soundingsIconImage
+    (metric). The names are pre-composited into the sprite by build_sprite.py."""
+    return ["case",
+            ["has", "sym_s"],
+            ["case", ["<=", ["coalesce", ["get", "depth"], 0], SAFETY_DEPTH],
+             ["get", "sym_s"], ["get", "sym_g"]],
+            ["get", "symbol_names"]]
+
+
 def point_symbol_layers():
     """Point symbols (buoys/beacons/lights/...). Split by rotation reference:
     screen-up (viewport) vs true-north (map), per S-52 ROT."""
@@ -204,6 +218,11 @@ def build(pmtiles_path, palette, scheme, glyphs_dir=None, sprite_base=None):
     # point symbols (sprite required) — above lines, below text.
     if sprite_base:
         layers += point_symbol_layers()
+        # spot soundings (depth numbers), drawn as pre-composited digit glyphs.
+        layers.append({
+            "id": "soundings", "type": "symbol", "source": "chart", "source-layer": "soundings",
+            "layout": {"icon-image": soundings_image(), "icon-size": icon_size(),
+                       "icon-allow-overlap": False}})
 
     # text labels (glyphs required) — drawn above everything.
     layers += text_layers(palette, scheme)

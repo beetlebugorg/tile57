@@ -14,8 +14,11 @@ area-symbol case.
 
 Usage: build_sprite.py --sprite reference/assets/sprite.json -o reference/assets/sprite-mln
 """
-import argparse, json, math, os
+import argparse, json, math, os, sys
 from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mvt_inspect as M  # noqa: E402
 
 
 def centred(cell, img, by_pivot=True):
@@ -31,6 +34,49 @@ def centred(cell, img, by_pivot=True):
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     canvas.paste(sub, (round(W / 2 - px), round(H / 2 - py)))
     return canvas
+
+
+def composite_sounding(names_str, sj, img):
+    """Composite a comma-joined glyph list into one pivot-centred image (port of
+    SpriteBuilder.compositeSounding). Each glyph self-positions via its pivot."""
+    cells = []
+    minX = minY = math.inf
+    maxX = maxY = -math.inf
+    for name in names_str.split(","):
+        c = sj.get(name)
+        if not c or "w" not in c:
+            continue
+        left, top = -c.get("pivot_x", 0), -c.get("pivot_y", 0)
+        cells.append((c, left, top))
+        minX, minY = min(minX, left), min(minY, top)
+        maxX, maxY = max(maxX, left + c["w"]), max(maxY, top + c["h"])
+    if not cells:
+        return None
+    halfW, halfH = max(-minX, maxX), max(-minY, maxY)
+    W, H = max(1, math.ceil(2 * halfW)), max(1, math.ceil(2 * halfH))
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    for c, left, top in cells:
+        sub = img.crop((c["x"], c["y"], c["x"] + c["w"], c["y"] + c["h"]))
+        canvas.paste(sub, (round(W / 2 + left), round(H / 2 + top)))
+    return canvas
+
+
+def sounding_strings(tiles_path):
+    """Collect distinct comma-joined sounding glyph lists (sym_s/sym_g/
+    symbol_names) from the soundings layer across all tiles."""
+    out = set()
+    for data in M.iter_all_tiles(tiles_path):
+        for name, extent, keys, values, feats in M.iter_layers(data):
+            if name != "soundings":
+                continue
+            idx = {k: i for i, k in enumerate(keys)}
+            for fb in feats:
+                _, props = M.feature_props(fb, keys, values)
+                for fld in ("sym_s", "sym_g", "symbol_names"):
+                    v = props.get(fld)
+                    if isinstance(v, str) and "," in v:
+                        out.add(v)
+    return out
 
 
 def pack(images, pad=1, atlas_w=2048):
@@ -66,6 +112,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sprite", required=True, help="emitted sprite.json (png alongside)")
     ap.add_argument("--patterns", help="emitted patterns.json (png alongside); added as pat:<name>")
+    ap.add_argument("--tiles", help="pmtiles archive; pre-composite its sounding glyph stacks")
     ap.add_argument("-o", "--out", required=True, help="output base path (writes .png + .json)")
     ap.add_argument("--ctr", action="store_true", default=True,
                     help="also emit ctr:<name> bbox-centred variants")
@@ -96,6 +143,17 @@ def main():
             pid = "pat:" + name
             images.append((pid, centred(cell, pimg, by_pivot=False)))
             ratios[pid] = PATTERN_PIXEL_RATIO
+
+    # Soundings: pre-composite each comma-joined glyph stack found in the tiles,
+    # keyed by the exact string the style's icon-image expression produces.
+    if a.tiles:
+        stacks = sounding_strings(a.tiles)
+        n = 0
+        for s in stacks:
+            im = composite_sounding(s, sj, img)
+            if im is not None:
+                images.append((s, im)); n += 1
+        print(f"composited {n} sounding stacks from {os.path.basename(a.tiles)}")
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     atlas, meta = pack(images)

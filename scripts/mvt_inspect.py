@@ -100,6 +100,45 @@ def get_tile(path, z, x, y):
     return None
 
 
+def iter_all_tiles(path):
+    """Yield decompressed MVT tile blobs for every tile in the archive (root +
+    one level of leaf directories)."""
+    raw = open(path, 'rb').read()
+    hdr = raw[:127]
+    (root_off, root_len, meta_off, meta_len, leaf_off, leaf_len,
+     data_off, data_len, *_) = struct.unpack_from('<QQQQQQQQ', hdr, 8)
+    icomp = hdr[97]; tcomp = hdr[98]
+    md = lambda b, c: gzip.decompress(b) if c == 2 else b
+    def emit_dir(d):
+        for (eid, run, off, length) in d:
+            if run == 0:  # leaf pointer
+                leaf = md(raw[leaf_off + off: leaf_off + off + length], icomp)
+                yield from emit_dir(parse_dir(leaf))
+            else:
+                blob = raw[data_off + off: data_off + off + length]
+                yield md(blob, tcomp)
+    yield from emit_dir(parse_dir(md(raw[root_off:root_off + root_len], icomp)))
+
+
+def iter_layers(tile_data):
+    """Yield (name, extent, keys, values, features) for each layer in a tile."""
+    pos = 0
+    while pos < len(tile_data):
+        key, pos = read_varint(tile_data, pos)
+        field = key >> 3; wt = key & 7
+        if field == 3 and wt == 2:
+            ln, pos = read_varint(tile_data, pos)
+            yield parse_layer(tile_data[pos:pos + ln]); pos += ln
+        elif wt == 2:
+            ln, pos = read_varint(tile_data, pos); pos += ln
+        elif wt == 0:
+            _, pos = read_varint(tile_data, pos)
+        elif wt == 5:
+            pos += 4
+        elif wt == 1:
+            pos += 8
+
+
 def parse_value(buf):
     pos = 0
     while pos < len(buf):
