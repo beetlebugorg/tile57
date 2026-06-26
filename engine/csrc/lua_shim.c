@@ -18,8 +18,9 @@ extern size_t tgp_count(void);
 extern const char *tgp_code(size_t i, size_t *len);
 extern const char *tgp_primitive(size_t i, size_t *len);
 extern const char *tgp_attr(size_t i, const char *name, size_t nlen, size_t *len);
-extern const char *tgp_name(size_t i, size_t *len);
 extern size_t tgp_complex_count(size_t i, const char *name, size_t nlen);
+extern const char *tgp_complex_attr(size_t i, const char *path, size_t plen,
+                                    const char *code, size_t clen, size_t *len);
 extern void tgp_emit(size_t i, const char *instr, size_t len);
 
 /* Catalogue accessors implemented in Zig (catalogue.zig). */
@@ -461,12 +462,15 @@ static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value}
     const char *path = lua_tostring(L, 2);
     const char *code = luaL_checkstring(L, 3);
     size_t len = 0;
-    const char *v;
-    /* featureName[1].name: the framework reads the `name` sub-attribute with
-     * attributePath "featureName:1". Serve it from the synthesized name. */
-    if (path && strstr(path, "featureName") && strcmp(code, "name") == 0) {
-        v = tgp_name(i, &len);
-    } else {
+    const char *v = NULL;
+    /* A simple attribute inside a complex instance carries a non-empty
+     * attributePath whose leading segment names the complex (e.g. "featureName:1",
+     * "zoneOfConfidence:1"); serve it from the synthesized complex-attribute store.
+     * Falls back to the flat attr list when there is no such complex sub-attr. */
+    if (path && *path) {
+        v = tgp_complex_attr(i, path, strlen(path), code, strlen(code), &len);
+    }
+    if (!v) {
         v = tgp_attr(i, code, strlen(code), &len);
     }
     lua_newtable(L);

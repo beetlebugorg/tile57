@@ -125,6 +125,8 @@ pub const Name = struct { rcnm: u8, rcid: u32 };
 pub const SpatialRef = struct {
     name: Name,
     ornt: u8, // 1=forward, 2=reverse, 255=null (FSPT)
+    usag: u8 = 0, // USAG masking usage: 1=exterior, 2=interior, 3=exterior boundary truncated by data limit
+    mask: u8 = 0, // MASK: 1=mask (edge not drawn), 2=show, 255=null
 };
 
 pub const VectorRecord = struct {
@@ -134,6 +136,7 @@ pub const VectorRecord = struct {
     soundings: []Sounding, // SG3D (sounding nodes)
     begin_node: u32 = 0, // VRPT TOPI=1 (edges) — connected-node RCID
     end_node: u32 = 0, // VRPT TOPI=2 (edges)
+    quapos: i32 = 0, // QUAPOS quality of position (S-57 spatial-level ATTV); 0 if absent
 };
 
 // S-57 attribute codes (Appendix A) used by portrayal.
@@ -142,6 +145,15 @@ pub const ATTR_DRVAL2: u16 = 88;
 pub const ATTR_VALSOU: u16 = 179;
 pub const ATTR_VALDCO: u16 = 174;
 pub const ATTR_OBJNAM: u16 = 116;
+pub const ATTR_CATZOC: u16 = 72; // M_QUAL category of zone of confidence
+pub const ATTR_QUAPOS: u16 = 402; // spatial-level quality of position (ATTV on edges/nodes)
+
+/// True for a QUAPOS that means "low accuracy" — S-52 draws such geometry DASHED
+/// (approximate-position line style). I.e. present and not surveyed (1), precisely
+/// known (10) or calculated (11). 0 means the attribute was absent.
+pub fn isLowAccuracyQuapos(q: i32) bool {
+    return q != 0 and q != 1 and q != 10 and q != 11;
+}
 
 pub const Attr = struct { code: u16, value: []const u8 };
 
@@ -278,6 +290,31 @@ pub const Cell = struct {
         return null;
     }
 
+    /// Effective QUAPOS (quality of position) over a feature's DRAWN edges: the
+    /// low-accuracy value held by the MAJORITY of its drawn VE edges, else 0.
+    /// QUAPOS is an S-57 spatial-level attribute on the edge records (not a feature
+    /// attribute); S-52 draws low-accuracy geometry dashed. Mirrors the Go
+    /// constructLineStringGeometry / boundaryQuapos aggregate: masked (MASK==1) and
+    /// truncated (USAG==3) edges are not drawn and don't count.
+    pub fn featureQuapos(self: Cell, f: Feature) i32 {
+        var total: usize = 0;
+        var low: usize = 0;
+        var low_val: i32 = 0;
+        for (f.refs) |ref| {
+            if (ref.name.rcnm != RCNM_VE) continue;
+            if (ref.mask == 1 or ref.usag == 3) continue; // not drawn
+            const idx = self.edges.get(ref.name.rcid) orelse continue;
+            total += 1;
+            const q = self.vectors[idx].quapos;
+            if (isLowAccuracyQuapos(q)) {
+                low += 1;
+                low_val = q;
+            }
+        }
+        if (total > 0 and low * 2 > total) return low_val;
+        return 0;
+    }
+
     /// Bounding box of all vector coordinates (lon/lat). Returns null if empty.
     pub fn bounds(self: Cell) ?[4]f64 {
         var min_lon: f64 = 1e9;
@@ -357,6 +394,18 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
     return list.items;
 }
 
+/// ATTV (spatial-level attributes) carry QUAPOS — quality of position lives on the
+/// edge/node records, not on the feature. ATTV shares the ATTL(2)+ATVL layout of a
+/// feature's ATTF, so reuse parseATTF and pull out QUAPOS. Returns 0 if absent.
+fn quaposFromAttv(a: Allocator, data: []const u8) i32 {
+    const attrs = parseATTF(a, data) catch return 0;
+    for (attrs) |at| {
+        if (at.code == ATTR_QUAPOS)
+            return std.fmt.parseInt(i32, std.mem.trim(u8, at.value, " "), 10) catch 0;
+    }
+    return 0;
+}
+
 /// FSPT: repeated 8-byte entries NAME(5)+ORNT(1)+USAG(1)+MASK(1).
 fn parseFSPT(a: Allocator, data: []const u8) ![]SpatialRef {
     const n = data.len / 8;
@@ -364,7 +413,7 @@ fn parseFSPT(a: Allocator, data: []const u8) ![]SpatialRef {
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const o = i * 8;
-        refs[i] = .{ .name = .{ .rcnm = data[o], .rcid = u32le(data, o + 1) }, .ornt = data[o + 5] };
+        refs[i] = .{ .name = .{ .rcnm = data[o], .rcid = u32le(data, o + 1) }, .ornt = data[o + 5], .usag = data[o + 6], .mask = data[o + 7] };
     }
     return refs;
 }
@@ -480,6 +529,7 @@ fn mergeFile(
             if (rec.field("SG2D")) |sg| v.points = try parseSG2D(a, sg, comf);
             if (rec.field("SG3D")) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
             if (rec.field("VRPT")) |vp| parseVRPT(&v, vp);
+            if (rec.field("ATTV")) |av| v.quapos = quaposFromAttv(a, av);
 
             if (ruin == 3) { // modify in place
                 if (vidx.get(key)) |i| if (vecs.items[i]) |*ex| {
@@ -493,6 +543,7 @@ fn mergeFile(
                         ex.begin_node = v.begin_node;
                         ex.end_node = v.end_node;
                     }
+                    if (rec.field("ATTV") != null) ex.quapos = v.quapos;
                 };
                 continue;
             }
@@ -609,6 +660,53 @@ test "parse DSPM coordinate factors" {
     try std.testing.expectEqual(@as(i32, 10_000_000), p.comf);
     try std.testing.expectEqual(@as(i32, 10), p.somf);
     try std.testing.expectEqual(@as(i32, 25000), p.cscl);
+}
+
+test "featureQuapos majority-of-drawn-edges aggregate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Three edges: two low-accuracy (QUAPOS 4 = approximate), one surveyed (1).
+    const vectors = try a.alloc(VectorRecord, 3);
+    vectors[0] = .{ .rcnm = RCNM_VE, .rcid = 10, .points = &.{}, .soundings = &.{}, .quapos = 4 };
+    vectors[1] = .{ .rcnm = RCNM_VE, .rcid = 11, .points = &.{}, .soundings = &.{}, .quapos = 1 };
+    vectors[2] = .{ .rcnm = RCNM_VE, .rcid = 12, .points = &.{}, .soundings = &.{}, .quapos = 4 };
+
+    var edges = std.AutoHashMap(u32, usize).init(a);
+    try edges.put(10, 0);
+    try edges.put(11, 1);
+    try edges.put(12, 2);
+
+    var cell = Cell{
+        .params = .{},
+        .vectors = vectors,
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, LonLat).init(a),
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    // 2 of 3 drawn edges low-accuracy -> majority -> returns the low value.
+    const refs = [_]SpatialRef{
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 10 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 11 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 12 }, .ornt = 1 },
+    };
+    const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 2, .objl = 30, .refs = &refs };
+    try std.testing.expectEqual(@as(i32, 4), cell.featureQuapos(f));
+
+    // Masking the low-accuracy edge 10 drops it: drawn edges 11(q=1),12(q=4) ->
+    // 1 of 2 low -> not a majority -> 0 (drawn solid).
+    const refs2 = [_]SpatialRef{
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 10 }, .ornt = 1, .mask = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 11 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 12 }, .ornt = 1 },
+    };
+    const f2 = Feature{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 30, .refs = &refs2 };
+    try std.testing.expectEqual(@as(i32, 0), cell.featureQuapos(f2));
 }
 
 test "parse SG2D coordinates to lon/lat" {
