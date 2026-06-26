@@ -30,6 +30,11 @@ std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource 
     int z = 0;
     unsigned x = 0, y = 0;
     const char *rest = resource.url.c_str() + std::strlen(PREFIX);
+    // [diag] count requests so we can see if tiles are re-requested every frame
+    // (i.e. not cached) — esp. when idle, which would explain constant flicker.
+    static int req_count = 0;
+    ++req_count;
+    std::fprintf(stderr, "[zigtiles] req %s (#%d)\n", rest, req_count);
     if (std::sscanf(rest, "%d/%u/%u", &z, &x, &y) == 3) {
         uint8_t *out = nullptr;
         size_t len = 0;
