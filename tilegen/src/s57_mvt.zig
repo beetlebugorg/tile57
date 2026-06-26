@@ -30,6 +30,61 @@ fn classify(objl: u16) Class {
     };
 }
 
+/// Port of SNDFRM04's core digit composition (the SOUNDG03 path): build the
+/// comma-joined sounding glyph-name string for a depth and prefix ("SOUNDS"
+/// bold/shallow or "SOUNDG" faint/deep). Omits the swept / low-accuracy-ring /
+/// negative-value prefixes (they need quality attributes we don't read yet), so
+/// soundings flagged with those won't match a sprite composite; the common ones
+/// do. Returns "" for depths we don't compose (>= 1000 m).
+fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64) ![]const u8 {
+    const d = @abs(depth);
+    const tenths: i64 = @intFromFloat(@round(d * 10.0));
+    const idepth: i64 = @divTrunc(tenths, 10);
+    const frac: u8 = @intCast(@mod(tenths, 10));
+    var dbuf: [8]u8 = undefined;
+    const ds = std.fmt.bufPrint(&dbuf, "{d}", .{idepth}) catch return "";
+    var toks = std.ArrayList([]const u8).empty;
+    if (idepth < 10) {
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[0] }));
+        if (frac != 0) try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
+    } else if (idepth < 31 and frac != 0) {
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
+    } else if (idepth < 100) {
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[0] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[1] }));
+    } else if (idepth < 1000) {
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[2] }));
+    } else return "";
+    return std.mem.join(a, ",", toks.items);
+}
+
+/// Emit a SOUNDG feature's multipoint soundings into the `soundings` layer, one
+/// point per sounding, with sym_s/sym_g/depth so the style's SNDFRM glyphs and
+/// the mariner safety-depth switch (soundings_image) render the depth digits.
+fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, out: *std.ArrayList(mvt.Feature)) !void {
+    const snds = cell.soundingsFor(a, f) catch return;
+    for (snds) |s| {
+        if (s.lon < tb[0] or s.lon > tb[2] or s.lat < tb[1] or s.lat > tb[3]) continue;
+        const sym_s = try sndfrmSyms(a, "SOUNDS", s.depth);
+        if (sym_s.len == 0) continue;
+        const sym_g = try sndfrmSyms(a, "SOUNDG", s.depth);
+        const pt = tile.project(s.lon, s.lat, z, x, y, tile.EXTENT);
+        const parts = try a.alloc([]const mvt.Point, 1);
+        const single = try a.alloc(mvt.Point, 1);
+        single[0] = pt;
+        parts[0] = single;
+        const props = try a.alloc(mvt.Prop, 3);
+        props[0] = .{ .key = "sym_s", .value = .{ .string = sym_s } };
+        props[1] = .{ .key = "sym_g", .value = .{ .string = sym_g } };
+        props[2] = .{ .key = "depth", .value = .{ .double = s.depth } };
+        try out.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+    }
+}
+
 fn overlaps(b0: [4]f64, b1: [4]f64) bool {
     return b0[0] <= b1[2] and b0[2] >= b1[0] and b0[1] <= b1[3] and b0[3] >= b1[1];
 }
@@ -153,9 +208,17 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
     var lines = std.ArrayList(mvt.Feature).empty;
     var points = std.ArrayList(mvt.Feature).empty;
     var texts = std.ArrayList(mvt.Feature).empty;
+    var soundings = std.ArrayList(mvt.Feature).empty;
     const layers_ctx = Layers{ .areas = &areas, .lines = &lines, .points = &points, .texts = &texts };
 
     for (cell.features, 0..) |f, fi| {
+        // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
+        // the `soundings` layer (the flat S-101 instruction stream can't carry
+        // per-sounding geometry). Bypasses the portrayal/classify dispatch.
+        if (f.objl == 129) {
+            try emitSoundings(a, cell.*, f, z, x, y, tb, &soundings);
+            continue;
+        }
         // S-101 portrayal path: style this feature from its instruction stream.
         if (portrayal) |pp| {
             if (fi < pp.len) if (pp[fi]) |instr| {
@@ -205,10 +268,22 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
     if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
     if (lines.items.len > 0) try layers.append(a, .{ .name = "lines", .features = lines.items });
     if (points.items.len > 0) try layers.append(a, .{ .name = "point_symbols", .features = points.items });
+    if (soundings.items.len > 0) try layers.append(a, .{ .name = "soundings", .features = soundings.items });
     if (texts.items.len > 0) try layers.append(a, .{ .name = "text", .features = texts.items });
     if (layers.items.len == 0) return gpa.alloc(u8, 0); // empty tile
 
     return mvt.encode(gpa, .{ .layers = layers.items });
+}
+
+test "SNDFRM04 digit composition matches the Lua rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("SOUNDS12,SOUNDS57", try sndfrmSyms(a, "SOUNDS", 2.7));
+    try std.testing.expectEqualStrings("SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", 0.6));
+    try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0));
+    try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6));
+    try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0));
 }
 
 test "generate a tile from a cell is well-formed MVT" {
@@ -220,6 +295,7 @@ test "generate a tile from a cell is well-formed MVT" {
         .features = &.{},
         .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
         .edges = std.AutoHashMap(u32, usize).init(gpa),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
         .arena = std.heap.ArenaAllocator.init(gpa),
     };
     defer cell.deinit();

@@ -73,6 +73,7 @@ test "adapt a depth area" {
         .features = &feats,
         .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
         .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer cell.arena.deinit();

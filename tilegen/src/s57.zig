@@ -77,12 +77,27 @@ pub const Cell = struct {
     features: []const Feature,
     nodes: std.AutoHashMap(u64, LonLat), // (rcnm<<32|rcid) -> point (VI/VC)
     edges: std.AutoHashMap(u32, usize), // edge rcid -> index into vectors
+    sounding_vecs: std.AutoHashMap(u64, usize), // (rcnm<<32|rcid) -> vector idx (SG3D nodes)
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Cell) void {
         self.nodes.deinit();
         self.edges.deinit();
+        self.sounding_vecs.deinit();
         self.arena.deinit();
+    }
+
+    /// All soundings (lon/lat/depth) carried by a multipoint feature's
+    /// referenced VI vector records (SG3D). Used for SOUNDG portrayal.
+    pub fn soundingsFor(self: Cell, a: Allocator, f: Feature) ![]Sounding {
+        var out = std.ArrayList(Sounding).empty;
+        for (f.refs) |ref| {
+            const key = (@as(u64, ref.name.rcnm) << 32) | ref.name.rcid;
+            if (self.sounding_vecs.get(key)) |idx| {
+                try out.appendSlice(a, self.vectors[idx].soundings);
+            }
+        }
+        return out.items;
     }
 
     fn nodeCoord(self: Cell, rcid: u32) ?LonLat {
@@ -317,18 +332,23 @@ pub fn parseCell(gpa: Allocator, bytes: []const u8) !Cell {
         }
     }
 
-    // Build node + edge indices for topology assembly.
+    // Build node + edge indices for topology assembly, plus an index of the
+    // VI records that carry SG3D soundings (multipoint geometry for SOUNDG).
     var nodes = std.AutoHashMap(u64, LonLat).init(gpa);
     var edges = std.AutoHashMap(u32, usize).init(gpa);
+    var sounding_vecs = std.AutoHashMap(u64, usize).init(gpa);
     for (vectors.items, 0..) |v, i| {
         if ((v.rcnm == RCNM_VI or v.rcnm == RCNM_VC) and v.points.len > 0) {
             try nodes.put((@as(u64, v.rcnm) << 32) | v.rcid, v.points[0]);
         } else if (v.rcnm == RCNM_VE) {
             try edges.put(v.rcid, i);
         }
+        if (v.soundings.len > 0) {
+            try sounding_vecs.put((@as(u64, v.rcnm) << 32) | v.rcid, i);
+        }
     }
 
-    return .{ .params = params, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .arena = arena };
+    return .{ .params = params, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .arena = arena };
 }
 
 // ---- tests --------------------------------------------------------------
