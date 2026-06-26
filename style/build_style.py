@@ -216,6 +216,16 @@ def build(pmtiles_path, palette, scheme, glyphs_dir=None, sprite_base=None,
             "paint": line_paint(palette),
         })
 
+    # light sector limit lines (LIGHTS sectors): thin solid/dashed rays from the
+    # light to each sector boundary. Carries color_token/width_px/dash like the
+    # plain line layers, so reuse line_specs + line_paint.
+    for name, filt, dash in line_specs:
+        layers.append({
+            "id": f"sector_lines-{name}", "type": "line", "source": "chart",
+            "source-layer": "sector_lines",
+            "filter": filt, "paint": line_paint(palette, dash),
+        })
+
     # point symbols (sprite required) — above lines, below text.
     if sprite_base:
         layers += point_symbol_layers()

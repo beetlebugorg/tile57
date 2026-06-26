@@ -17,7 +17,7 @@ MapLibre Native in a desktop window, with platform chrome (SwiftUI / GTK4) to co
 | M0 | MapLibre Native builds; headless EGL render | ✅ done |
 | M1 | Annapolis chart renders from Go-baked PMTiles + ported style (areas + lines, Day/Dusk/Night) | ✅ done |
 | M2 | Full S-52 fidelity: symbols, glyphs+text, soundings, area patterns, depth-shading | ✅ done |
-| M3 | Own minimal interactive window (clone GLFWView) | next |
+| M3 | Interactive pan/zoom window serving live Zig tiles (`chart-glfw-zig`) | ✅ done |
 | M4 | Zig MVT + gzip + PMTiles + projection/clip, differential-tested vs Go | ✅ done |
 | M5 | Live in-process tile generation (`libtilegen.a` + custom `FileSource`) | ✅ done |
 | M6a–c | Zig ISO 8211 + S-57 decode + topology → **live cell→MVT→MapLibre** | ✅ done |
@@ -92,21 +92,30 @@ OUT="$PWD/renders/annapolis.png" LAT=38.978 LON=-76.482 ZOOM=14 RATIO=2 \
   bash scripts/chartshot.sh        # chartshot.sh finds whichever build dir exists
 ```
 
-### 3b. Interactive window → pan/zoom
+### 3b. Interactive window → pan/zoom (live Zig tiles)
+
+`chart-glfw-zig` (M3) opens a real pannable/zoomable window whose vector tiles
+come from the in-process Zig generator (`libtilegen.a`) — the same source the
+headless `chartshot-zig` uses, but interactive. It takes a PMTiles archive **or**
+a raw `.000` ENC cell (live generation).
 
 ```sh
 # macOS (Metal):                          Linux (Wayland):
 cmake --preset macos-desktop              # cmake --preset desktop
-ninja -C build-macos-desktop mbgl-glfw    # ninja -C build-desktop mbgl-glfw
+ninja -C build-macos-desktop chart-glfw-zig   # ninja -C build-desktop chart-glfw-zig
 
-# run it (path is <build>/vendor/maplibre-native/platform/glfw/mbgl-glfw):
-build-macos-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw \
-  -s style/chart-day.json -x -76.482 -y 38.978 -z 14
+# run it (defaults to Annapolis if lat/lon/zoom omitted):
+build-macos-desktop/chart-glfw-zig \
+  reference/tiles/annapolis.pmtiles \     # or a raw .000 cell for live generation
+  style/chart-zig-day.json 38.978 -76.487 13
 ```
 
-Drag pans, scroll zooms. Swap `chart-day.json` for `chart-dusk.json` /
-`chart-night.json`. The first `mbgl-core` build is large (~15 min on 8 cores;
-`ccache` makes rebuilds fast).
+Drag pans, scroll zooms. The first `mbgl-core` build is large (~15 min on 8
+cores; `ccache` makes rebuilds fast). Requires Zig (see prerequisites).
+
+The upstream `mbgl-glfw` demo is still available for a plain online style:
+`ninja -C build-desktop mbgl-glfw` then
+`build-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw -s style/chart-day.json -x -76.482 -y 38.978 -z 14`.
 
 ### 3c. Live Zig generation → PNG (tiles generated from a raw S-57 cell)
 
@@ -122,6 +131,8 @@ build/chartshot-zig \
   38.97 -76.49 12 renders/from_cell.png
 ```
 
-`chartshot-zig` auto-detects a PMTiles archive vs a raw S-57 cell. Portrayal is
-currently a crude object-class→color map (S-101 Lua rules are in progress);
-depth shading from DRVAL1/2 already works.
+`chartshot-zig` auto-detects a PMTiles archive vs a raw S-57 cell, and runs the
+embedded-Lua S-101 portrayal (real IHO rules) over the cell — depth areas,
+contours, coastline, symbols and text. The live path currently emits 4 of the
+11 MVT layers the Go baker produces (soundings / light sectors / area patterns /
+SCAMIN declutter variants are next — see `specs/s101-port.md`).

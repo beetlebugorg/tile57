@@ -114,3 +114,40 @@ Recommended order: minimal per-class catalogue + resolveCode/buildRoot for
 DEPARE/COALNE/DEPCNT/SOUNDG -> Zig-driven Lua over real cell features ->
 s101_instr -> MVT (visible real-S-101 render of a few classes) -> then expand to
 the full FeatureCatalogue.xml + all classes.
+
+---
+
+## Live-generation layer parity (status 2026-06-26)
+
+The headless + GLFW hosts work; the live path (`tilegen/src/s57_mvt.zig`
+`generateTile`/`emitFromInstr`) currently emits **4 of the 11** MVT layers the Go
+baker produces, so a live-rendered cell is sparser than a Go-baked one.
+
+Emitted live: `areas`, `lines`, `point_symbols`, `text`.
+Missing live (Go baker has them): `soundings`, `sector_lines`, `area_patterns`,
+`areas_scamin`, `lines_scamin`, `complex_lines_scamin` (+ `area_patterns_scamin`).
+
+Next live-gen work, ranked by visual impact:
+1. **soundings** — multipoint geometry (`s57.Sounding`/SG3D, fed via
+   `_HostFeaturePoints`); emit one point per sounding into a `soundings` layer
+   with the depth value so `soundings_image()` (SNDFRM04 digit glyphs) renders.
+   Essential for a usable chart.
+2. **sector_lines** — light sector limit rays (LIGHTS w/ SECTR1/SECTR2/VALNMR).
+   Style layer now exists (added 2026-06-26); the live path must emit the layer.
+3. **area_patterns** — `AreaFillReference` instructions -> `area_patterns` layer
+   (`pattern_name`), so DRGARE/FOUL/quality fills tile.
+4. **_scamin variants + complex_lines** — needs the SCAMIN split + complex
+   (symbolised) line baking the Go path does.
+
+## Deferred style-fidelity items (PMTiles + live)
+
+- **SCAMIN gating** (`build_style.py`): `_scamin` layers + soundings/text draw
+  unconditionally at all zooms (over-cluttered, heavy collision drop). Add a
+  scale-vs-`scamin` zoom gate + mariner text-group (`tgrp`) filter. *Risk:* wrong
+  zoom math hides features — verify against the Go web reference before shipping.
+- **complex line symbology**: `complex_lines*` carry `linestyle_name` (e.g.
+  CTNARE51) but are drawn as flat solid strokes. Approximate with a
+  `line-dasharray` match on `linestyle_name`, or bake decorations into geometry.
+- **@2x sprite** (NOT a bug): `sprite-mln@2x.png` is a 1x copy w/ `pixelRatio:1`
+  — renders at *correct physical size* on retina (verified at ratio 2.0), just
+  not extra-crisp. True crispness needs 2x SVG rasterization in the Go pipeline.
