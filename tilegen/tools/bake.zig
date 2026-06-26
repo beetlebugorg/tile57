@@ -63,6 +63,26 @@ pub fn main(init: std.process.Init) !void {
             if (r.field("FRID") != null) frid += 1 else if (r.field("VRID") != null) vrid += 1 else if (r.field("DSID") != null) dsid += 1 else other += 1;
         }
         std.debug.print("  DSID={d} feature(FRID)={d} vector(VRID)={d} other={d}\n", .{ dsid, frid, vrid, other });
+
+        // S-57 model: coordinate factors, geometry bounds, a few object classes.
+        var cell = try tilegen.s57.parseCell(arena, data);
+        defer cell.deinit();
+        std.debug.print("  S-57: comf={d} cscl=1:{d}  vectors={d} features={d}\n", .{ cell.params.comf, cell.params.cscl, cell.vectors.len, cell.features.len });
+        if (cell.bounds()) |b| {
+            std.debug.print("  geometry bounds: lon [{d:.4}, {d:.4}]  lat [{d:.4}, {d:.4}]\n", .{ b[0], b[2], b[1], b[3] });
+        }
+        const named = [_]struct { objl: u16, name: []const u8 }{
+            .{ .objl = 42, .name = "DEPARE" }, .{ .objl = 30, .name = "COALNE" },
+            .{ .objl = 129, .name = "SOUNDG" }, .{ .objl = 71, .name = "LNDARE" },
+            .{ .objl = 122, .name = "SLCONS" }, .{ .objl = 74, .name = "DEPCNT" },
+        };
+        for (named) |nm| {
+            var c: usize = 0;
+            for (cell.features) |f| {
+                if (f.objl == nm.objl) c += 1;
+            }
+            if (c > 0) std.debug.print("    {s}(objl {d}): {d}\n", .{ nm.name, nm.objl, c });
+        }
         return;
     }
 
