@@ -27,3 +27,6 @@ cache.sqlite
 /reference/chartplotter-go
 __pycache__/
 *.pyc
+
+# Python venv (auto-managed by scripts/py.sh)
+/.venv/
