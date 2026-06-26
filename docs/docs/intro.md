@@ -32,7 +32,8 @@ with platform chrome (SwiftUI / GTK4) to come.
 - **Native, not web.** The renderer is MapLibre Native in a desktop window, not
   MapLibre GL JS in a browser.
 - **Tiles in Zig.** The ISO 8211 / S-57 / S-101 / MVT pipeline is reimplemented
-  in Zig as `libchartplotter.a`, exposing a small [C ABI](./c-api.md).
+  in Zig as `libtile57`, and the `libchartplotter` widget draws them — both behind
+  small [C APIs](./c-api.md).
 - **Live, in-process generation.** Instead of pre-baking a PMTiles archive, the
   Zig library generates a tile's vector bytes on demand behind a custom MapLibre
   `FileSource` — so you can render straight from a raw `.000` cell. (Reading a
@@ -55,7 +56,8 @@ under [Known limitations](./limitations.md), and recent changes are in the
 - [**Installation**](./installation.md) — submodules, toolchain, reference data.
 - [**Getting Started**](./getting-started.md) — build and run the headless and
   interactive hosts.
-- [**C API**](./c-api.md) — embed `libchartplotter` in your own renderer.
+- [**C APIs**](./c-api.md) — embed the `libchartplotter` widget, or `libtile57`
+  for raw tiles.
 - [**Architecture**](./architecture.md) — the pipeline and design decisions.
 - [**Tile Schema**](./tile-schema.md) — the vector-tile layer contract.
 - [**Known Limitations**](./limitations.md) — what does not render yet.

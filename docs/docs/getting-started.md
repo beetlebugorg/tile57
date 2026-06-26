@@ -12,13 +12,15 @@ interactive window. It assumes you have finished [Installation](./installation.m
 
 ## What the build produces
 
-Three targets, built only when Zig 0.16 is found:
+Built only when Zig 0.16 is found:
 
 | Target | Kind | What it is |
 |--------|------|-----------|
-| `libchartplotter.a` | static lib | the Zig tile generator + its [C ABI](./c-api.md). Linked into the hosts below. |
-| `chartplotter-render` | executable | headless host: renders a chart to a PNG. Takes a PMTiles archive **or** a raw `.000` S-57 cell (live generation). |
-| `chartplotter` | executable | interactive GLFW window: pan/zoom a live chart. Only built with the desktop presets. |
+| `libtile57.a` | static lib | the Zig S-57 tile generator + its `tile57_*` [C ABI](./c-api.md). |
+| `libchartplotter.a` | static lib | the chart **widget** (window + render) over MapLibre + libtile57; `chartplotter_*` [C API](./c-api.md). |
+| `chartplotter-render` | executable | headless host: renders a chart to a PNG (PMTiles, an S-57 cell, or an ENC_ROOT). |
+| `chartplotter` | executable | interactive GLFW window over libchartplotter. Only built with the desktop presets. |
+| `chartplotter-bake` | executable | offline CLI: pre-bake a cell to a PMTiles archive. |
 
 MapLibre Native's own demo tools (`mbgl-render`, `mbgl-glfw`) also build, but they
 are not part of our code.
@@ -152,7 +154,7 @@ build/chartplotter-render --s101portray <rules-dir>   # a real DepthArea rule em
 
 - `CHARTPLOTTER_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57
   cells. A fallback only: it applies when the host passes `NULL` for
-  `chartplotter_source_open`'s `rules_dir` (both hosts do). Defaults to the vendored
+  the `rules_dir` argument (the hosts auto-resolve + pass it). Defaults to the vendored
   catalogue at `vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.
 - `CHART_CONTINUOUS=1` (interactive window) — present every frame instead of the
   default on-demand rendering. An escape hatch for displays where the on-demand

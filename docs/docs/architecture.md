@@ -14,7 +14,7 @@ implementation and parity oracle; the Zig pipeline mirrors it stage for stage.
 
 ## The pipeline
 
-A chart cell flows through these stages, all inside `libchartplotter.a`:
+A chart cell flows through these stages, all inside `libtile57`:
 
 ```
 S-57 ENC cell (.000)
@@ -60,12 +60,15 @@ A few choices shape the whole project:
 
 - **CMake is the top-level integrator.** MapLibre Native is embedded via
   `add_subdirectory(vendor/maplibre-native)` and built by its own CMake. The Zig
-  tile generator is a leaf static library (`libchartplotter.a`) with a
-  [C ABI](./c-api.md), built by `scripts/zig-build-lib.sh`.
-- **Live, in-process generation is the target.** `libchartplotter.a` generates one
-  tile's MVT bytes on demand; the `ChartTileSource` `mbgl::FileSource` (scheme
-  `zigtiles://`) hands them to MapLibre. Tiles are memoized in an in-process cache.
-  The offline CLI baker is kept too (cheap, and the differential-test driver).
+  tile generator is a leaf static library (`libtile57`, `tile57_*`) built by
+  `scripts/zig-build-lib.sh`; the chart **widget** `libchartplotter`
+  (`chartplotter_*`) wraps MapLibre + libtile57 and is what an app embeds. Both
+  have small [C APIs](./c-api.md).
+- **Live, in-process generation is the target.** `libtile57` generates one tile's
+  MVT bytes on demand; the `ChartTileSource` `mbgl::FileSource` (scheme
+  `zigtiles://`, inside libchartplotter) hands them to MapLibre. Tiles are memoized
+  in an in-process cache. The offline CLI baker is kept too (cheap, and the
+  differential-test driver).
 - **Register in the unused Mbtiles slot.** Rather than patch MapLibre, the host
   registers `ChartTileSource` as the factory for `FileSourceType::Mbtiles` *before*
   the `Map` is constructed, so `zigtiles://` requests route to it.
@@ -76,15 +79,19 @@ A few choices shape the whole project:
 - **Renderer is platform-native.** Metal on macOS, OpenGL via surfaceless **EGL**
   on Linux (headless render-to-PNG works displayless).
 
-## Hosts
+## The widget + hosts
 
-Two C++ hosts link `libchartplotter.a`, both registering the same
-`ChartTileSource`:
+`libchartplotter` (`app/chartplotter.cpp`) holds the MapLibre glue — it registers
+`ChartTileSource` in the unused Mbtiles slot, builds the `Map`, and exposes:
 
-- **`chartplotter-render`** (`app/zig_render.cpp`) — headless, renders one PNG via
-  MapLibre's `HeadlessFrontend`. The verification path on displayless boxes.
-- **`chartplotter`** (`app/zig_glfw.cpp`) — interactive, reuses MapLibre's
-  `GLFWView` for a pannable/zoomable window.
+- `chartplotter_render_png(...)` — headless, via MapLibre's `HeadlessFrontend`.
+- `chartplotter_view_open/run/close(...)` — an interactive window, reusing
+  MapLibre's `GLFWView` (compiled in only with GLFW; the desktop presets).
+
+The executables are thin mains over it: `chartplotter-render`
+(`app/chartplotter_render_main.cpp`) and `chartplotter`
+(`app/chartplotter_main.cpp`). `chartplotter-bake` (`engine/tools/bake.zig`) is a
+separate pure-Zig CLI over `libtile57` for the offline precache path.
 
 ## macOS interactive rendering notes
 

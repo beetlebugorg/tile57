@@ -23,14 +23,15 @@
 ---
 
 **chartplotter-native** generates **marine chart tiles** natively and draws them
-in a real desktop window. A **Zig tile generator** (`libchartplotter.a`) turns
-NOAA **S-57** ENC cells into S-52 marine chart tiles — running the official IHO
-**S-101 Portrayal Catalogue** in embedded Lua — and
-**[MapLibre Native](https://github.com/maplibre/maplibre-native)** draws them
-(Metal on macOS, OpenGL/EGL on Linux). Tiles are generated live and in-process
-behind a custom MapLibre `FileSource`, so it renders straight from a raw `.000`
-cell — or a whole **ENC_ROOT** directory (every cell + its `.001…` updates,
-overlaid). Reading a pre-baked PMTiles archive works too.
+in a real desktop window. A **Zig tile generator** (`libtile57`) turns NOAA
+**S-57** ENC cells into S-52 marine chart tiles — running the official IHO
+**S-101 Portrayal Catalogue** in embedded Lua — and the **`libchartplotter`**
+widget draws them with
+**[MapLibre Native](https://github.com/maplibre/maplibre-native)** (Metal on
+macOS, OpenGL/EGL on Linux). Tiles are generated live and in-process behind a
+custom MapLibre `FileSource`, so it renders straight from a raw `.000` cell — or a
+whole **ENC_ROOT** directory (every cell + its `.001…` updates, overlaid).
+Reading a pre-baked PMTiles archive works too.
 
 It is the native sibling of
 [**chartplotter-go**](https://github.com/beetlebugorg/chartplotter), which bakes the
@@ -52,9 +53,10 @@ Primitive instruction stream
 Mapbox Vector Tiles  ─────────────▶   MapLibre Native  (ChartTileSource FileSource)
 ```
 
-The pipeline lives in `libchartplotter.a` behind a small
-[C ABI](https://beetlebugorg.github.io/chartplotter-native/c-api)
-(`include/chartplotter.h`, `chartplotter_*`).
+Two libraries: **`libtile57`** is the tile pipeline (`tile57_*`,
+`include/tile57.h`); **`libchartplotter`** is the embeddable chart widget that
+opens a window and draws the tiles (`chartplotter_*`, `include/chartplotter.h`).
+See the [C APIs](https://beetlebugorg.github.io/chartplotter-native/c-api).
 
 ## Build
 
@@ -79,9 +81,10 @@ Full instructions are in the
 
 | Target | What it is |
 |--------|-----------|
-| `libchartplotter.a` | the Zig tile generator + its C ABI |
+| `libchartplotter.a` | the embeddable chart **widget** (window + render), `chartplotter_*` |
+| `libtile57.a` | the Zig S-57 **tile generator** + its `tile57_*` C ABI |
+| `chartplotter` | interactive GLFW window over libchartplotter (desktop presets) |
 | `chartplotter-render` | headless host: chart → PNG (PMTiles, an S-57 cell, or an ENC_ROOT) |
-| `chartplotter` | interactive GLFW window: pan/zoom a live chart (desktop presets) |
 | `chartplotter-bake` | offline CLI: pre-bake a cell to a PMTiles archive (the precache path) |
 
 ## Documentation

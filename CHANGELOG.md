@@ -30,27 +30,26 @@ C ABI is not yet frozen.
   `a9c8afd`) are computed + supplied to dangers; the under/awash danger rules
   still error pending mariner-settings binding work (a deeper portrayal gap).
 
-### Changed — public identity & C API (breaking, pre-1.0)
-- Library renamed `libtilegen.a` → **`libchartplotter.a`**; public header
-  `include/tilegen.h` → **`include/chartplotter.h`**; C ABI prefix `tg_` → `chartplotter_`.
-  The Zig tile-generator sources moved from `tilegen/` to **`engine/`** (Zig
-  module also renamed `tilegen` → `engine`).
-- Redesigned the C ABI for coherence (see `docs/API.md`):
-  - one opener `chartplotter_source_open(data, len, chartplotter_format, rules_dir)` with a
-    `CHARTPLOTTER_FORMAT_AUTO` sniff, replacing the two openers + the try/fallback both
-    hosts duplicated; `chartplotter_source_format()` reports the resolved backend.
-  - S-101 rules dir is now an argument (env `CHARTPLOTTER_S101_RULES`, renamed
-    from `TG_S101_RULES`, is only a fallback when it is NULL).
-  - `chartplotter_source_zoom_range()` folds the two zoom getters into one call;
-    `chartplotter_tile_get` returns a named `chartplotter_tile_status`.
-  - added `chartplotter_source_clear_cache()`, `chartplotter_version()` + `CHARTPLOTTER_VERSION_*`.
-  - documented lifetime (must outlive the renderer) + threading (not internally
-    synchronized) contracts in the header.
-  - moved the Lua/S-101 self-tests to `include/chartplotter_diag.h` (`chartplotter_diag_*`).
-- App binaries renamed: `chart-glfw-zig` → **`chartplotter`** (interactive
-  window), `chartshot-zig` → **`chartplotter-render`** (headless PNG host).
-- C++ FileSource adapter renamed `ZigTileSource` → **`ChartTileSource`**
-  (`app/zig_tile_source.*` → `app/chart_tile_source.*`).
+### Changed — two-library architecture + C APIs (breaking, pre-1.0)
+- The project is now two C libraries with distinct roles:
+  - **`libtile57`** — the Zig S-57 tile generator (was `libtilegen.a` / `tg_*`).
+    Prefix `tile57_*`, headers `include/tile57.h` + `include/tile57_diag.h`. The
+    sources live under `engine/` (Zig module `engine`). Env var
+    `TILE57_S101_RULES`.
+  - **`libchartplotter`** — the embeddable chart **widget** that opens a window
+    and renders (it wraps MapLibre Native + libtile57). Prefix `chartplotter_*`,
+    header `include/chartplotter.h`. (`libchartplotter` previously named the tile
+    generator; that role is now `libtile57`.)
+- Redesigned the tile-source C ABI: one opener
+  `tile57_source_open(data, len, format, rules_dir)` with a `TILE57_FORMAT_AUTO`
+  sniff (replacing two openers + the duplicated try/fallback) plus
+  `tile57_source_open_cells` for an ENC_ROOT; `tile57_source_format/zoom_range/
+  bounds/clear_cache`, a named `tile57_tile_status`, `tile57_version`, and the
+  S-101 rules dir as an argument (env `TILE57_S101_RULES` is only a NULL
+  fallback). Lifetime + threading contracts documented in the header.
+- App binaries: `chart-glfw-zig` → **`chartplotter`** (window), `chartshot-zig`
+  → **`chartplotter-render`** (headless PNG); both are now thin mains over
+  `libchartplotter`. C++ FileSource adapter `ZigTileSource` → **`ChartTileSource`**.
 
 ### Removed
 - The dead `CHART_ASYNC` worker path in the tile-source adapter (an artifact of
@@ -72,9 +71,13 @@ C ABI is not yet frozen.
   target as the C++ host (`CMAKE_OSX_DEPLOYMENT_TARGET`, default 14.3).
 
 ### Added
+- **`libchartplotter` chart-widget library**: `chartplotter_view_open/run/close`
+  (open an interactive window) + `chartplotter_render_png` (headless) + the
+  `chartplotter_view_options` (size/title/style/rules/camera). The MapLibre glue
+  the two hosts used to duplicate now lives once in the library.
 - **ENC_ROOT support**: point a host at a directory to load every base cell plus
   its sequential `.001…` update files, overlaid. New
-  `chartplotter_source_open_cells` C API + a `cells` backend
+  `tile57_source_open_cells` C API + a `cells` backend
   (`s57_mvt.generateTileMulti`); the host walks the directory (`app/enc_root.hpp`).
 - **S-57 update application** (`parseCellWithUpdates`): record-level merge by FOID
   / (RCNM,RCID) with RUIN insert/delete/modify and the SGCC/FSPC control fields.

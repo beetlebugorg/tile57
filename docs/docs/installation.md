@@ -51,7 +51,7 @@ and `~/.local/share/zig-0.16.0`).
 
 :::note Lua is vendored
 Lua 5.4 is vendored under `engine/vendor/lua` and compiled into
-`libchartplotter.a` — no system Lua is needed.
+`libtile57.a` — no system Lua is needed.
 :::
 
 :::tip First build is slow
