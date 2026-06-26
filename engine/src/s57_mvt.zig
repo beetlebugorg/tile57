@@ -18,6 +18,12 @@ const s101 = @import("s101_instr.zig");
 // size 1.0), i.e. ~2.8x too large.
 const SYMBOL_SCALE: f64 = 0.02834627777338028;
 
+// S-57 attribute code for SCAMIN (the minimum display scale 1:N, S-57 Appendix A
+// attr 133 / S-52 §8.4). Features carrying it are routed to a dedicated *_scamin
+// MVT layer so the style can drop them below their 1:N scale; the value travels on
+// the feature as the `scamin` property so the style derives the per-feature minzoom.
+const ATTR_SCAMIN: u16 = 133;
+
 // Area representative point (where an area's label/symbol is placed) and the
 // polygon-geometry helpers live in s57.zig so the portrayal adapter shares them.
 
@@ -120,10 +126,43 @@ const Layers = struct {
     lines: *std.ArrayList(mvt.Feature),
     points: *std.ArrayList(mvt.Feature),
     texts: *std.ArrayList(mvt.Feature),
+    // SCAMIN buckets: a feature carrying SCAMIN (s57 attr 133) routes here instead
+    // of the base list, and carries a `scamin` property so the style gates its
+    // display below the feature's 1:N scale (see s57_mvt.ATTR_SCAMIN / build_style.py).
+    areas_scamin: *std.ArrayList(mvt.Feature),
+    area_patterns_scamin: *std.ArrayList(mvt.Feature),
+    lines_scamin: *std.ArrayList(mvt.Feature),
+    points_scamin: *std.ArrayList(mvt.Feature),
+    texts_scamin: *std.ArrayList(mvt.Feature),
 };
+
+/// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
+fn featureScamin(f: s57.Feature) ?i64 {
+    const v = f.attr(ATTR_SCAMIN) orelse return null;
+    const n = std.fmt.parseInt(i64, std.mem.trim(u8, v, " "), 10) catch return null;
+    return if (n > 0) n else null;
+}
+
+/// Append the metadata tags shared by every emitFromInstr feature: the S-52
+/// draw priority (always) and, for SCAMIN-gated features, the 1:N denominator.
+fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), draw_prio: i64, scamin: ?i64) !void {
+    try props.append(a, .{ .key = "draw_prio", .value = .{ .int = draw_prio } });
+    if (scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
+}
 
 fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     const p = try s101.parse(a, instr);
+    const prio = p.draw_prio;
+
+    // Route each feature into its base layer or the *_scamin bucket depending on
+    // whether it carries a SCAMIN (1:N) display limit. Same geometry/properties
+    // either way; the bucket lets the style gate the feature below its scale.
+    const scamin = featureScamin(f);
+    const areas_l = if (scamin != null) L.areas_scamin else L.areas;
+    const apat_l = if (scamin != null) L.area_patterns_scamin else L.area_patterns;
+    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
+    const points_l = if (scamin != null) L.points_scamin else L.points;
+    const texts_l = if (scamin != null) L.texts_scamin else L.texts;
 
     // Point features (buoys/beacons/lights/landmarks/soundings): symbols + text
     // placed at the feature's node.
@@ -136,18 +175,20 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
         single[0] = pt;
         parts[0] = single;
         for (p.points) |sym| {
-            const props = try a.alloc(mvt.Prop, 3);
-            props[0] = .{ .key = "symbol_name", .value = .{ .string = sym.symbol } };
-            props[1] = .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } };
-            props[2] = .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } };
-            try L.points.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+            var props = std.ArrayList(mvt.Prop).empty;
+            try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
+            try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
+            try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+            try appendMeta(a, &props, prio, scamin);
+            try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         }
         for (p.texts) |t| {
-            const props = try a.alloc(mvt.Prop, 3);
-            props[0] = .{ .key = "text", .value = .{ .string = t.text } };
-            props[1] = .{ .key = "color_token", .value = .{ .string = t.color } };
-            props[2] = .{ .key = "font_size_px", .value = .{ .double = 11 } };
-            try L.texts.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+            var props = std.ArrayList(mvt.Prop).empty;
+            try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
+            try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
+            try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
+            try appendMeta(a, &props, prio, scamin);
+            try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         }
         return;
     }
@@ -181,9 +222,10 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
             for (rings.items) |ring| {
                 const parts = try a.alloc([]const mvt.Point, 1);
                 parts[0] = ring;
-                const props = try a.alloc(mvt.Prop, 1);
-                props[0] = .{ .key = "color_token", .value = .{ .string = token } };
-                try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
+                var props = std.ArrayList(mvt.Prop).empty;
+                try props.append(a, .{ .key = "color_token", .value = .{ .string = token } });
+                try appendMeta(a, &props, prio, scamin);
+                try areas_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
             }
         }
         // AreaFillReference -> a tiled fill pattern (DRGARE/FOUL/quality fills).
@@ -191,12 +233,19 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
             for (rings.items) |ring| {
                 const parts = try a.alloc([]const mvt.Point, 1);
                 parts[0] = ring;
-                const props = try a.alloc(mvt.Prop, 1);
-                props[0] = .{ .key = "pattern_name", .value = .{ .string = pat } };
-                try L.area_patterns.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
+                var props = std.ArrayList(mvt.Prop).empty;
+                try props.append(a, .{ .key = "pattern_name", .value = .{ .string = pat } });
+                try appendMeta(a, &props, prio, scamin);
+                try apat_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
             }
         }
     }
+    // DEPCNT depth-contour value (metres), incl. the 0 m drying/chart-datum line:
+    // baked whenever VALDCO is explicitly present (even 0) so the style can label
+    // it; a missing VALDCO is unknown, not zero, so it's left off. Mirrors the Go
+    // contourValdco fix (no `> 0` drop).
+    const valdco: ?f64 = if (f.objl == 43) f.attrFloat(s57.ATTR_VALDCO) else null;
+
     for (p.lines) |ln| {
         // _simple_ -> solid; any named/complex line style (NAVLNE/RECTRC leading
         // lines, CTNARE limits, …) is approximated as dashed rather than a bold
@@ -207,11 +256,13 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
             for (sub, 0..) |s, i| parts[i] = s;
-            const props = try a.alloc(mvt.Prop, 3);
-            props[0] = .{ .key = "color_token", .value = .{ .string = ln.color } };
-            props[1] = .{ .key = "width_px", .value = .{ .double = ln.width } };
-            props[2] = .{ .key = "dash", .value = .{ .string = dash } };
-            try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
+            var props = std.ArrayList(mvt.Prop).empty;
+            try props.append(a, .{ .key = "color_token", .value = .{ .string = ln.color } });
+            try props.append(a, .{ .key = "width_px", .value = .{ .double = ln.width } });
+            try props.append(a, .{ .key = "dash", .value = .{ .string = dash } });
+            if (valdco) |v| try props.append(a, .{ .key = "valdco", .value = .{ .double = v } });
+            try appendMeta(a, &props, prio, scamin);
+            try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
         }
     }
 
@@ -227,11 +278,12 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
                 single[0] = cpt;
                 parts[0] = single;
                 for (p.texts) |t| {
-                    const props = try a.alloc(mvt.Prop, 3);
-                    props[0] = .{ .key = "text", .value = .{ .string = t.text } };
-                    props[1] = .{ .key = "color_token", .value = .{ .string = t.color } };
-                    props[2] = .{ .key = "font_size_px", .value = .{ .double = 11 } };
-                    try L.texts.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+                    var props = std.ArrayList(mvt.Prop).empty;
+                    try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
+                    try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
+                    try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
+                    try appendMeta(a, &props, prio, scamin);
+                    try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
                 }
             }
         }
@@ -266,18 +318,39 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
     var lines = std.ArrayList(mvt.Feature).empty;
     var points = std.ArrayList(mvt.Feature).empty;
     var texts = std.ArrayList(mvt.Feature).empty;
+    var areas_scamin = std.ArrayList(mvt.Feature).empty;
+    var area_patterns_scamin = std.ArrayList(mvt.Feature).empty;
+    var lines_scamin = std.ArrayList(mvt.Feature).empty;
+    var points_scamin = std.ArrayList(mvt.Feature).empty;
+    var texts_scamin = std.ArrayList(mvt.Feature).empty;
     var soundings = std.ArrayList(mvt.Feature).empty;
-    const layers_ctx = Layers{ .areas = &areas, .area_patterns = &area_patterns, .lines = &lines, .points = &points, .texts = &texts };
+    const layers_ctx = Layers{
+        .areas = &areas,
+        .area_patterns = &area_patterns,
+        .lines = &lines,
+        .points = &points,
+        .texts = &texts,
+        .areas_scamin = &areas_scamin,
+        .area_patterns_scamin = &area_patterns_scamin,
+        .lines_scamin = &lines_scamin,
+        .points_scamin = &points_scamin,
+        .texts_scamin = &texts_scamin,
+    };
 
     for (cells) |cr| try appendCellFeatures(a, layers_ctx, &soundings, cr.cell, cr.portrayal, z, x, y, tb, box);
 
     var layers = std.ArrayList(mvt.Layer).empty;
     if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
+    if (areas_scamin.items.len > 0) try layers.append(a, .{ .name = "areas_scamin", .features = areas_scamin.items });
     if (area_patterns.items.len > 0) try layers.append(a, .{ .name = "area_patterns", .features = area_patterns.items });
+    if (area_patterns_scamin.items.len > 0) try layers.append(a, .{ .name = "area_patterns_scamin", .features = area_patterns_scamin.items });
     if (lines.items.len > 0) try layers.append(a, .{ .name = "lines", .features = lines.items });
+    if (lines_scamin.items.len > 0) try layers.append(a, .{ .name = "lines_scamin", .features = lines_scamin.items });
     if (points.items.len > 0) try layers.append(a, .{ .name = "point_symbols", .features = points.items });
+    if (points_scamin.items.len > 0) try layers.append(a, .{ .name = "point_symbols_scamin", .features = points_scamin.items });
     if (soundings.items.len > 0) try layers.append(a, .{ .name = "soundings", .features = soundings.items });
     if (texts.items.len > 0) try layers.append(a, .{ .name = "text", .features = texts.items });
+    if (texts_scamin.items.len > 0) try layers.append(a, .{ .name = "text_scamin", .features = texts_scamin.items });
     if (layers.items.len == 0) return gpa.alloc(u8, 0); // empty tile
 
     return mvt.encode(gpa, .{ .layers = layers.items });
@@ -359,6 +432,80 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0));
     try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6));
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0));
+}
+
+fn findProp(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
+    for (props) |pr| if (std.mem.eql(u8, pr.key, key)) return pr.value;
+    return null;
+}
+
+test "featureScamin reads s57 attr 133" {
+    const with = s57.Feature{ .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14, .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }} };
+    try std.testing.expectEqual(@as(?i64, 22000), featureScamin(with));
+    const zero = s57.Feature{ .rcnm = 0, .rcid = 2, .prim = 1, .objl = 14, .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "0" }} };
+    try std.testing.expectEqual(@as(?i64, null), featureScamin(zero)); // 0 = "always shown", not a bucket
+    const without = s57.Feature{ .rcnm = 0, .rcid = 3, .prim = 1, .objl = 14 };
+    try std.testing.expectEqual(@as(?i64, null), featureScamin(without));
+}
+
+test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
+        .edges = std.AutoHashMap(u32, usize).init(gpa),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
+        .arena = std.heap.ArenaAllocator.init(gpa),
+    };
+    defer cell.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, .{ .lon = 0, .lat = 0 });
+
+    var areas = std.ArrayList(mvt.Feature).empty;
+    var area_patterns = std.ArrayList(mvt.Feature).empty;
+    var lines = std.ArrayList(mvt.Feature).empty;
+    var points = std.ArrayList(mvt.Feature).empty;
+    var texts = std.ArrayList(mvt.Feature).empty;
+    var areas_s = std.ArrayList(mvt.Feature).empty;
+    var apat_s = std.ArrayList(mvt.Feature).empty;
+    var lines_s = std.ArrayList(mvt.Feature).empty;
+    var points_s = std.ArrayList(mvt.Feature).empty;
+    var texts_s = std.ArrayList(mvt.Feature).empty;
+    const L = Layers{
+        .areas = &areas,         .area_patterns = &area_patterns,        .lines = &lines,
+        .points = &points,       .texts = &texts,
+        .areas_scamin = &areas_s, .area_patterns_scamin = &apat_s,       .lines_scamin = &lines_s,
+        .points_scamin = &points_s, .texts_scamin = &texts_s,
+    };
+    const tb = [4]f64{ -1, -1, 1, 1 };
+    const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
+
+    // SCAMIN-carrying point -> point_symbols_scamin, with draw_prio=7 + scamin=22000.
+    const f_sc = s57.Feature{
+        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
+    };
+    try emitFromInstr(a, cell, f_sc, "DrawingPriority:7;PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
+    try std.testing.expectEqual(@as(usize, 0), points.items.len);
+    try std.testing.expectEqual(@as(usize, 1), points_s.items.len);
+    try std.testing.expectEqual(@as(i64, 7), findProp(points_s.items[0].properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(i64, 22000), findProp(points_s.items[0].properties, "scamin").?.int);
+
+    // No SCAMIN -> base point_symbols layer, draw_prio default 0, no scamin.
+    const f_base = s57.Feature{
+        .rcnm = 0, .rcid = 2, .prim = 1, .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+    };
+    try emitFromInstr(a, cell, f_base, "PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
+    try std.testing.expectEqual(@as(usize, 1), points.items.len);
+    try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "scamin"));
 }
 
 test "generate a tile from a cell is well-formed MVT" {
