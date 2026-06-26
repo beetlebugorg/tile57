@@ -50,8 +50,8 @@ Tiles carry **color tokens** (not RGB); the style resolves Day/Dusk/Night from
 | M0 | MapLibre `mbgl-render` builds (headless EGL) | none | ✅ done |
 | M1 | Pan/zoom the Annapolis chart from `reference/tiles/annapolis.pmtiles` + minimal ported `style.json` (areas + lines) | none | ✅ done |
 | M2 | S-52 fidelity: symbols, glyphs+text, soundings, area patterns, day/dusk/night, depth-shading | none | ✅ done |
-| M3 | Own minimal window (clone GLFWView); interactive pan/zoom | none | next |
-| M4 | Zig offline baker (`tile`+`mvt`+`pmtiles`), validated vs Go | Zig CLI | |
+| M3 | Own minimal window (clone GLFWView); interactive pan/zoom | none | (mbgl-glfw works now) |
+| M4 | Zig offline baker (`tile`+`mvt`+`pmtiles`), validated vs Go | Zig CLI | 🔄 mvt done (encoder/decoder + parity test vs Go); next pmtiles + gzip + tile project/clip |
 | M5 | Live in-process generation via custom `FileSource` + C ABI | Zig lib + glue | |
 | M6 | Full Zig pipeline: ISO8211+S-57 decode -> embedded-Lua S-101 -> MVT | Zig | |
 
