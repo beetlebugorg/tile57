@@ -1,0 +1,110 @@
+---
+id: getting-started
+title: Getting Started
+sidebar_position: 3
+---
+
+# Getting Started
+
+This guide builds the project and renders a chart — first to a PNG, then in an
+interactive window. It assumes you have finished [Installation](./installation.md)
+(submodules, toolchain, reference data).
+
+## What the build produces
+
+Three targets, built only when Zig 0.16 is found:
+
+| Target | Kind | What it is |
+|--------|------|-----------|
+| `libchartplotter.a` | static lib | the Zig tile generator + its [C ABI](./c-api.md). Linked into the hosts below. |
+| `chartplotter-render` | executable | headless host: renders a chart to a PNG. Takes a PMTiles archive **or** a raw `.000` S-57 cell (live generation). |
+| `chartplotter` | executable | interactive GLFW window: pan/zoom a live chart. Only built with the desktop presets. |
+
+MapLibre Native's own demo tools (`mbgl-render`, `mbgl-glfw`) also build, but they
+are not part of our code.
+
+## Presets
+
+| Preset | Build dir | Renderer | Our binaries |
+|--------|-----------|----------|--------------|
+| `headless` | `build/` | Linux surfaceless EGL | `chartplotter-render` |
+| `desktop`  | `build-desktop/` | Linux OpenGL + GLFW + Wayland | `chartplotter`, `chartplotter-render` |
+| `macos`    | `build-macos/` | macOS Metal (headless) | `chartplotter-render` |
+| `macos-desktop` | `build-macos-desktop/` | macOS Metal + GLFW | `chartplotter`, `chartplotter-render` |
+
+## Step 1: Render a chart to a PNG (headless)
+
+The headless host needs no display, so it works on a server or in CI.
+
+```sh
+# Linux:                                   macOS:
+cmake --preset headless                    # cmake --preset macos
+ninja -C build chartplotter-render         # ninja -C build-macos chartplotter-render
+
+# From a baked PMTiles archive:
+build/chartplotter-render \
+  reference/tiles/annapolis.pmtiles \
+  style/chart-zig-day.json \
+  38.978 -76.487 14 renders/annapolis.png 1024 768 2
+```
+
+The arguments are
+`<archive.pmtiles|cell.000> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]`.
+
+## Step 2: Render straight from a raw S-57 cell (live generation)
+
+No pre-baked tiles — the Zig library generates them on demand and runs the
+embedded-Lua S-101 portrayal over the cell:
+
+```sh
+build/chartplotter-render \
+  ../chartplotter-go/testdata/US4MD81M.000 \   # a raw S-57 cell
+  style/chart-zig-day.json \
+  38.97 -76.49 12 renders/from_cell.png
+```
+
+The format is auto-detected (`CHARTPLOTTER_FORMAT_AUTO`): PMTiles first, then S-57 cell.
+
+## Step 3: Open the interactive window
+
+`chartplotter` opens a real pannable/zoomable window. Drag to pan, scroll to
+zoom. It takes a PMTiles archive **or** a raw `.000` cell.
+
+```sh
+# Linux (Wayland):                         macOS (Metal):
+cmake --preset desktop                     # cmake --preset macos-desktop
+ninja -C build-desktop chartplotter        # ninja -C build-macos-desktop chartplotter
+
+# frames the data extent if lat/lon/zoom are omitted:
+build-desktop/chartplotter \
+  reference/tiles/annapolis.pmtiles \
+  style/chart-zig-day.json 38.978 -76.487 13
+```
+
+:::note Linux X11
+On an X11 session instead of Wayland, reconfigure with
+`-DMLN_WITH_WAYLAND=OFF -DMLN_WITH_X11=ON`.
+:::
+
+## S-101 self-tests
+
+`chartplotter-render` also wraps the embedded-Lua / S-101 bring-up checks:
+
+```sh
+build/chartplotter-render --s101check   <rules-dir>   # the framework loads
+build/chartplotter-render --s101run     <rules-dir>   # it executes
+build/chartplotter-render --s101portray <rules-dir>   # a real DepthArea rule emits instructions
+```
+
+## Runtime knobs
+
+- `CHARTPLOTTER_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57
+  cells. A fallback only: it applies when the host passes `NULL` for
+  `chartplotter_source_open`'s `rules_dir` (both hosts do). Defaults to the vendored
+  catalogue at `vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.
+- `CHART_CONTINUOUS=1` (interactive window) — present every frame instead of the
+  default on-demand rendering. An escape hatch for displays where the on-demand
+  path goes idle-blank; not normally needed.
+
+See [**Architecture → macOS rendering notes**](./architecture.md#macos-interactive-rendering-notes)
+for why the interactive window is set up the way it is.

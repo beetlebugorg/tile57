@@ -1,6 +1,6 @@
 //! tilegen — the Zig chart tile generator.
 //!
-//! Bottom-up build order (see ../../docs/PLAN.md):
+//! Bottom-up build order (see ../../docs/docs/architecture.md):
 //!   M4: mvt + pmtiles + tile (encode MVT, write PMTiles)   <- in progress
 //!   M5: capi (libchartplotter.a) for live in-process generation
 //!   M6: iso8211 + s57 decode -> embedded-Lua S-101 portrayal

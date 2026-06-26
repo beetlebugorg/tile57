@@ -1,0 +1,27 @@
+/**
+ * chartplotter-native docs theme. A deep-water blue primary palette (shared with
+ * the chartplotter-go docs).
+ */
+
+:root {
+  --ifm-color-primary: #0b6ea8;
+  --ifm-color-primary-dark: #0a6397;
+  --ifm-color-primary-darker: #095e8e;
+  --ifm-color-primary-darkest: #074d75;
+  --ifm-color-primary-light: #0c79b9;
+  --ifm-color-primary-lighter: #0d7ec2;
+  --ifm-color-primary-lightest: #1090d8;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #4fb3e6;
+  --ifm-color-primary-dark: #2ea4e1;
+  --ifm-color-primary-darker: #1d9cdd;
+  --ifm-color-primary-darkest: #1781b8;
+  --ifm-color-primary-light: #70c2eb;
+  --ifm-color-primary-lighter: #81caee;
+  --ifm-color-primary-lightest: #b3e0f5;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}

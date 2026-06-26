@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render the chart to a PNG offscreen via MapLibre Native's mbgl-render (headless
-# EGL). This is the verification path on a headless box; the interactive GLFW
-# window is a separate target (see docs/BUILD.md).
+# EGL). This is the upstream generic render path; our own headless host is
+# chartplotter-render (see docs/docs/getting-started.md).
 #
 # Env overrides: STYLE OUT LAT LON ZOOM W H RATIO BEARING DEBUG
 #   DEBUG=1 draws tile borders + parse status.
