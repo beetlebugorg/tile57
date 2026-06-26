@@ -1,7 +1,6 @@
 #include "chart_tile_source.hpp"
 #include "chartplotter.h"
 
-#include <mbgl/actor/actor_ref.hpp>
 #include <mbgl/storage/file_source_request.hpp>
 #include <mbgl/storage/resource.hpp>
 #include <mbgl/storage/response.hpp>
@@ -10,7 +9,6 @@
 #include <mbgl/util/client_options.hpp>
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -19,9 +17,7 @@ namespace cpn {
 
 static constexpr const char *PREFIX = "zigtiles://";
 
-// Fill `response` with the tile for a zigtiles:// request (shared by the sync
-// and worker paths). Pure read of the chart source; safe to call off the main
-// thread.
+// Fill `response` with the tile for a zigtiles:// request.
 //
 // Conditional-request support is what stops the flicker: our tiles are
 // deterministic, so each gets a stable etag. When MapLibre re-requests a tile it
@@ -66,26 +62,7 @@ static void fillResponse(cp_source *src, const mbgl::Resource &resource, mbgl::R
     }
 }
 
-// Worker that generates tiles off the render thread and delivers the response
-// back to the request's mailbox (on the originating loop). Used when CHART_ASYNC.
-class ChartTileSource::Impl {
-public:
-    Impl(const mbgl::ActorRef<Impl> &, cp_source *src_) : src(src_) {}
-    void request(const mbgl::Resource &resource, const mbgl::ActorRef<mbgl::FileSourceRequest> &req) {
-        mbgl::Response response;
-        fillResponse(src, resource, response);
-        req.invoke(&mbgl::FileSourceRequest::setResponse, response);
-    }
-
-private:
-    cp_source *src;
-};
-
-ChartTileSource::ChartTileSource(cp_source *s) : src(s) {
-    if (std::getenv("CHART_ASYNC")) {
-        worker = std::make_unique<mbgl::util::Thread<Impl>>("ChartTileSource", s);
-    }
-}
+ChartTileSource::ChartTileSource(cp_source *s) : src(s) {}
 
 ChartTileSource::~ChartTileSource() = default;
 
@@ -95,13 +72,9 @@ bool ChartTileSource::canRequest(const mbgl::Resource &resource) const {
 
 std::unique_ptr<mbgl::AsyncRequest> ChartTileSource::request(const mbgl::Resource &resource, Callback callback) {
     auto req = std::make_unique<mbgl::FileSourceRequest>(std::move(callback));
-    if (worker) {
-        worker->actor().invoke(&Impl::request, resource, req->actor());
-    } else {
-        mbgl::Response response;
-        fillResponse(src, resource, response);
-        req->actor().invoke(&mbgl::FileSourceRequest::setResponse, std::move(response));
-    }
+    mbgl::Response response;
+    fillResponse(src, resource, response);
+    req->actor().invoke(&mbgl::FileSourceRequest::setResponse, std::move(response));
     return req;
 }
 

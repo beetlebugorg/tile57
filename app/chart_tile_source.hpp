@@ -6,14 +6,12 @@
 // so tile requests route to it by canRequest(). Backed by a PMTiles reader or
 // live-generated tiles, interchangeably.
 //
-// Generation runs synchronously on the request (render/runloop) thread by
-// default. Set CHART_ASYNC to run it on a dedicated worker thread instead (off
-// the render thread), which can smooth fast pan/zoom where many tiles are
-// requested at once.
+// Tiles are generated synchronously on the request (render/runloop) thread.
+// libchartplotter caches generated/decoded tiles, so re-requests are cheap and
+// the source only needs to be touched from this one thread.
 #pragma once
 
 #include <mbgl/storage/file_source.hpp>
-#include <mbgl/util/thread.hpp>
 
 #include <memory>
 
@@ -35,9 +33,7 @@ public:
     mbgl::ClientOptions getClientOptions() override;
 
 private:
-    class Impl;
     cp_source *src;
-    std::unique_ptr<mbgl::util::Thread<Impl>> worker; // null -> synchronous
 };
 
 } // namespace cpn
