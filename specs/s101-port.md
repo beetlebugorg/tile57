@@ -140,10 +140,16 @@ Next live-gen work, ranked by visual impact:
    Live point symbols hardcode `scale=0.08` in `s57_mvt.emitFromInstr`, so every
    icon draws at size 1.0; use the PointInstruction's own scale instead (live
    buoys look oversized vs the Go baker).
-1. **soundings** — multipoint geometry (`s57.Sounding`/SG3D, fed via
-   `_HostFeaturePoints`); emit one point per sounding into a `soundings` layer
-   with the depth value so `soundings_image()` (SNDFRM04 digit glyphs) renders.
-   Essential for a usable chart.
+1. **soundings** — DONE 2026-06-26. `s57.Cell.soundingsFor` gathers a SOUNDG
+   feature's SG3D multipoint; `s57_mvt.sndfrmSyms` ports SNDFRM04's core digit
+   composition; each sounding is emitted into the `soundings` layer with
+   sym_s/sym_g/depth. Verified on US5MD1MC.000. *Remaining:* the
+   swept/low-accuracy-ring (`B1`/`C2`/`C3`)/negative prefixes (need quality
+   attrs via the spatial-quality association) — those soundings don't yet match
+   a sprite composite. Fully-correct alternative: feed `_HostFeaturePoints` real
+   soundings + a MultiPoint spatial association so the Lua SOUNDG03/SNDFRM04 run
+   and emit `AugmentedPoint:GeographicCRS,X,Y` + PointInstructions (parse those
+   in `s101_instr`).
 2. **sector_lines** — light sector limit rays (LIGHTS w/ SECTR1/SECTR2/VALNMR).
    Style layer now exists (added 2026-06-26); the live path must emit the layer.
 3. **area_patterns** — `AreaFillReference` instructions -> `area_patterns` layer
