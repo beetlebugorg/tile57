@@ -27,11 +27,20 @@ pub const DatasetParams = struct {
     cscl: i32 = 0, // compilation scale (1:N)
 };
 
+pub const Name = struct { rcnm: u8, rcid: u32 };
+
+pub const SpatialRef = struct {
+    name: Name,
+    ornt: u8, // 1=forward, 2=reverse, 255=null (FSPT)
+};
+
 pub const VectorRecord = struct {
     rcnm: u8,
     rcid: u32,
     points: []LonLat, // SG2D coordinates (node = 1 point; edge = interior chain)
     soundings: []Sounding, // SG3D (sounding nodes)
+    begin_node: u32 = 0, // VRPT TOPI=1 (edges) — connected-node RCID
+    end_node: u32 = 0, // VRPT TOPI=2 (edges)
 };
 
 pub const Feature = struct {
@@ -39,16 +48,71 @@ pub const Feature = struct {
     rcid: u32,
     prim: u8, // 1=point, 2=line, 3=area, 255=none
     objl: u16, // S-57 object class code
+    refs: []SpatialRef = &.{}, // FSPT spatial pointers
 };
 
 pub const Cell = struct {
     params: DatasetParams,
     vectors: []VectorRecord,
     features: []Feature,
+    nodes: std.AutoHashMap(u64, LonLat), // (rcnm<<32|rcid) -> point (VI/VC)
+    edges: std.AutoHashMap(u32, usize), // edge rcid -> index into vectors
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Cell) void {
+        self.nodes.deinit();
+        self.edges.deinit();
         self.arena.deinit();
+    }
+
+    fn nodeCoord(self: Cell, rcid: u32) ?LonLat {
+        const key_vc = (@as(u64, RCNM_VC) << 32) | rcid;
+        if (self.nodes.get(key_vc)) |p| return p;
+        const key_vi = (@as(u64, RCNM_VI) << 32) | rcid;
+        return self.nodes.get(key_vi);
+    }
+
+    /// Full coordinates of an edge: begin node + interior SG2D + end node,
+    /// reversed if ornt==2. Appends into `out`.
+    fn edgeCoords(self: Cell, a: Allocator, edge_rcid: u32, ornt: u8, out: *std.ArrayList(LonLat)) !void {
+        const idx = self.edges.get(edge_rcid) orelse return;
+        const e = self.vectors[idx];
+        var tmp = std.ArrayList(LonLat).empty;
+        if (e.begin_node != 0) {
+            if (self.nodeCoord(e.begin_node)) |p| try tmp.append(a, p);
+        }
+        try tmp.appendSlice(a, e.points);
+        if (e.end_node != 0) {
+            if (self.nodeCoord(e.end_node)) |p| try tmp.append(a, p);
+        }
+        if (ornt == 2) std.mem.reverse(LonLat, tmp.items);
+        // Merge: drop a leading point identical to the current tail (shared node).
+        var items = tmp.items;
+        if (out.items.len > 0 and items.len > 0) {
+            const tail = out.items[out.items.len - 1];
+            if (tail.lon == items[0].lon and tail.lat == items[0].lat) items = items[1..];
+        }
+        try out.appendSlice(a, items);
+    }
+
+    /// Assemble a feature's line/area geometry: concatenate its FSPT edges into
+    /// a single coordinate chain (a ring for area features). Caller arena.
+    pub fn lineGeometry(self: Cell, a: Allocator, f: Feature) ![]LonLat {
+        var out = std.ArrayList(LonLat).empty;
+        for (f.refs) |ref| {
+            if (ref.name.rcnm == RCNM_VE) try self.edgeCoords(a, ref.name.rcid, ref.ornt, &out);
+        }
+        return out.items;
+    }
+
+    /// A point feature's coordinate (its isolated/connected node).
+    pub fn pointGeometry(self: Cell, f: Feature) ?LonLat {
+        for (f.refs) |ref| {
+            const key = (@as(u64, ref.name.rcnm) << 32) | ref.name.rcid;
+            if (self.nodes.get(key)) |p| return p;
+            if (self.nodeCoord(ref.name.rcid)) |p| return p;
+        }
+        return null;
     }
 
     /// Bounding box of all vector coordinates (lon/lat). Returns null if empty.
@@ -103,6 +167,29 @@ fn parseSG2D(a: Allocator, data: []const u8, comf: f64) ![]LonLat {
     return pts;
 }
 
+/// VRPT: repeated 9-byte entries NAME(5)+ORNT(1)+USAG(1)+TOPI(1)+MASK(1).
+/// Sets begin/end connected-node RCIDs on the edge (TOPI 1=begin, 2=end).
+fn parseVRPT(v: *VectorRecord, data: []const u8) void {
+    var off: usize = 0;
+    while (off + 9 <= data.len) : (off += 9) {
+        const rcid = u32le(data, off + 1);
+        const topi = data[off + 7];
+        if (topi == 1) v.begin_node = rcid else if (topi == 2) v.end_node = rcid;
+    }
+}
+
+/// FSPT: repeated 8-byte entries NAME(5)+ORNT(1)+USAG(1)+MASK(1).
+fn parseFSPT(a: Allocator, data: []const u8) ![]SpatialRef {
+    const n = data.len / 8;
+    const refs = try a.alloc(SpatialRef, n);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const o = i * 8;
+        refs[i] = .{ .name = .{ .rcnm = data[o], .rcid = u32le(data, o + 1) }, .ornt = data[o + 5] };
+    }
+    return refs;
+}
+
 fn parseSG3D(a: Allocator, data: []const u8, comf: f64, somf: f64) ![]Sounding {
     const n = data.len / 12;
     const out = try a.alloc(Sounding, n);
@@ -147,20 +234,29 @@ pub fn parseCell(gpa: Allocator, bytes: []const u8) !Cell {
             var v = VectorRecord{ .rcnm = vrid[0], .rcid = u32le(vrid, 1), .points = &.{}, .soundings = &.{} };
             if (rec.field("SG2D")) |sg| v.points = try parseSG2D(a, sg, comf);
             if (rec.field("SG3D")) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
+            if (rec.field("VRPT")) |vp| parseVRPT(&v, vp);
             try vectors.append(a, v);
         } else if (rec.field("FRID")) |frid| {
             if (frid.len < 9) continue;
             // RCNM(1) RCID(4) PRIM(1)@5 GRUP(1)@6 OBJL(2)@7
-            try features.append(a, .{
-                .rcnm = frid[0],
-                .rcid = u32le(frid, 1),
-                .prim = frid[5],
-                .objl = u16le(frid, 7),
-            });
+            var f = Feature{ .rcnm = frid[0], .rcid = u32le(frid, 1), .prim = frid[5], .objl = u16le(frid, 7) };
+            if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
+            try features.append(a, f);
         }
     }
 
-    return .{ .params = params, .vectors = vectors.items, .features = features.items, .arena = arena };
+    // Build node + edge indices for topology assembly.
+    var nodes = std.AutoHashMap(u64, LonLat).init(gpa);
+    var edges = std.AutoHashMap(u32, usize).init(gpa);
+    for (vectors.items, 0..) |v, i| {
+        if ((v.rcnm == RCNM_VI or v.rcnm == RCNM_VC) and v.points.len > 0) {
+            try nodes.put((@as(u64, v.rcnm) << 32) | v.rcid, v.points[0]);
+        } else if (v.rcnm == RCNM_VE) {
+            try edges.put(v.rcid, i);
+        }
+    }
+
+    return .{ .params = params, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .arena = arena };
 }
 
 // ---- tests --------------------------------------------------------------

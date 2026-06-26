@@ -83,6 +83,30 @@ pub fn main(init: std.process.Init) !void {
             }
             if (c > 0) std.debug.print("    {s}(objl {d}): {d}\n", .{ nm.name, nm.objl, c });
         }
+
+        // Topology assembly: resolve feature geometry via FSPT/VRPT/edges/nodes.
+        var line_feats: usize = 0;
+        var line_verts: usize = 0;
+        var pt_feats: usize = 0;
+        var sample_ok = false;
+        const gb = cell.bounds();
+        for (cell.features) |f| {
+            if (f.prim == 2 or f.prim == 3) {
+                const g = try cell.lineGeometry(arena, f);
+                if (g.len >= 2) {
+                    line_feats += 1;
+                    line_verts += g.len;
+                    if (!sample_ok and gb != null) {
+                        const p = g[0];
+                        sample_ok = p.lon >= gb.?[0] - 1e-6 and p.lon <= gb.?[2] + 1e-6 and
+                            p.lat >= gb.?[1] - 1e-6 and p.lat <= gb.?[3] + 1e-6;
+                    }
+                }
+            } else if (f.prim == 1) {
+                if (cell.pointGeometry(f) != null) pt_feats += 1;
+            }
+        }
+        std.debug.print("  assembled: {d} line/area features ({d} verts), {d} point features; sample in-bounds={}\n", .{ line_feats, line_verts, pt_feats, sample_ok });
         return;
     }
 
