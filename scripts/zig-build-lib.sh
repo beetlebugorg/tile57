@@ -16,16 +16,25 @@ LIB="$ROOT/tilegen/zig-out/lib/libtilegen.a"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "==> re-packing $LIB for macOS ld alignment" >&2
-  if command -v nm >/dev/null; then
-    echo "  [diag] pre-repack symbols (zig-built archive):" >&2
-    nm "$LIB" 2>/dev/null | grep -iE 'tg_open_bytes|tg_close|tg_lua_version' | head >&2 || echo "  (none)" >&2
-  fi
-  # Apple's ld64 rejects archive members that aren't 8-byte aligned, and Zig's
-  # archive isn't. Feeding the archive back to libtool only copies the bad
-  # members (it warns + drops them). The fix is to EXTRACT the objects and
-  # re-archive them from the .o files (fresh members get aligned). Extract with
-  # Zig's own ar (reads its archive reliably); re-archive with Apple's libtool
-  # (NOT Homebrew's GNU libtool, whose `-static` is unrelated to archiving).
+
+  dump_syms() { # $1=label $2=archive-or-object
+    command -v nm >/dev/null || return 0
+    echo "  [diag] $1:" >&2
+    nm "$2" 2>/dev/null | grep -iE 'tg_open_bytes|tg_close|tg_lua_version' | head >&2 \
+      || echo "    (no tg_* symbols)" >&2
+  }
+  dump_syms "pre-repack (zig-built archive)" "$LIB"
+
+  # Apple's ld64 rejects archive members whose offsets aren't 8-byte aligned,
+  # and Zig's `ar` doesn't align them. Earlier attempts to re-archive the .o
+  # members with libtool produced an aligned archive but lost the *global*
+  # export aliases (`T _tg_*`), keeping only the module-local `_capi.tg_*`.
+  #
+  # Robust fix: partial-link all members into ONE relocatable object with
+  # `ld -r`. That (a) removes per-member alignment from the equation entirely
+  # and (b) preserves every global symbol (ld -r keeps globals global; we pass
+  # no -unexported_symbols_list). Then wrap that single object in an archive
+  # with Apple's libtool, which guarantees the lone member is aligned.
   LIBTOOL="${LIBTOOL:-/usr/bin/libtool}"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
@@ -35,15 +44,19 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     exit 1
   fi
   # llvm-ar's deterministic mode zeroes the permission bits, so extracted objects
-  # come out mode 000 and libtool can't read them (errno=13). Make them readable.
+  # come out mode 000 and the linker can't read them (errno=13). Make them readable.
   chmod u+rw "$tmp"/*.o
-  "$LIBTOOL" -static -o "$LIB" "$tmp"/*.o
-  if command -v nm >/dev/null; then
-    # Match the symbol name only (macOS prefixes with _, type column varies).
-    if ! nm "$LIB" 2>/dev/null | grep -q 'tg_open_bytes'; then
-      echo "ERROR: tg_open_bytes missing after re-pack. tg_* symbols found:" >&2
-      nm "$LIB" 2>/dev/null | grep -i 'tg_' | head -5 >&2
-      exit 1
-    fi
+
+  combined="$tmp/tilegen_combined.o"
+  # -r: relocatable (partial) link; undefined libc refs from Lua are fine here.
+  ld -r -o "$combined" "$tmp"/*.o
+  dump_syms "post ld -r (combined object)" "$combined"
+
+  "$LIBTOOL" -static -o "$LIB" "$combined"
+  dump_syms "post-repack (final archive)" "$LIB"
+
+  if command -v nm >/dev/null && ! nm "$LIB" 2>/dev/null | grep -qi 'tg_open_bytes'; then
+    echo "ERROR: tg_open_bytes missing after re-pack (see diag above)." >&2
+    exit 1
   fi
 fi
