@@ -65,6 +65,46 @@ def line_paint(palette, dash=None):
 
 FONT = ["Noto Sans Regular"]
 
+# Sprite atlas pixels-per-unit (sprite.json _meta.px_per_unit). icon-size =
+# feature scale / atlasPpu (so scale==atlasPpu -> size 1).
+ATLAS_PPU = 0.08
+
+
+def point_symbol_image():
+    """OBSTRN/WRECKS danger swap (sym_deep when deeper than safety contour) +
+    pivot_center 'ctr:' variant. Port of s52-style.mjs pointSymbolImage with
+    default safety contour."""
+    name = ["case",
+            ["all", ["has", "sym_deep"], [">", ["coalesce", ["get", "danger_depth"], 0], SFC]],
+            ["get", "sym_deep"],
+            ["get", "symbol_name"]]
+    return ["case",
+            ["==", ["coalesce", ["get", "pivot_center"], 0], 1],
+            ["concat", "ctr:", name],
+            name]
+
+
+def icon_size():
+    return ["/", ["coalesce", ["get", "scale"], ATLAS_PPU], ATLAS_PPU]
+
+
+def point_symbol_layers():
+    """Point symbols (buoys/beacons/lights/...). Split by rotation reference:
+    screen-up (viewport) vs true-north (map), per S-52 ROT."""
+    common = {
+        "icon-image": point_symbol_image(), "icon-size": icon_size(),
+        "icon-rotate": ["coalesce", ["get", "rotation_deg"], 0],
+        "icon-allow-overlap": True, "icon-ignore-placement": True, "symbol-z-order": "source",
+    }
+    return [
+        {"id": "point_symbols", "type": "symbol", "source": "chart", "source-layer": "point_symbols",
+         "filter": ["!=", ["coalesce", ["get", "rot_north"], 0], 1],
+         "layout": {**common, "icon-rotation-alignment": "viewport"}},
+        {"id": "point_symbols-north", "type": "symbol", "source": "chart", "source-layer": "point_symbols",
+         "filter": ["==", ["coalesce", ["get", "rot_north"], 0], 1],
+         "layout": {**common, "icon-rotation-alignment": "map"}},
+    ]
+
 # S-52 halign/valign -> data-driven MapLibre text-anchor (port of chart-style.mjs).
 _VROW = ["match", ["coalesce", ["get", "valign"], "middle"], "top", "top", "bottom", "bottom", "center"]
 TEXT_ANCHOR = ["match", ["concat", _VROW, "|", ["coalesce", ["get", "halign"], "center"]],
@@ -118,7 +158,7 @@ def text_layers(palette, scheme):
     ]
 
 
-def build(pmtiles_path, palette, scheme, glyphs_dir=None):
+def build(pmtiles_path, palette, scheme, glyphs_dir=None, sprite_base=None):
     sea = palette.get("DEPDW", "#93aebb")
     src_url = "pmtiles://file://" + os.path.abspath(pmtiles_path)
 
@@ -153,7 +193,11 @@ def build(pmtiles_path, palette, scheme, glyphs_dir=None):
             "paint": line_paint(palette),
         })
 
-    # text labels (glyphs required) — drawn above fills/lines.
+    # point symbols (sprite required) — above lines, below text.
+    if sprite_base:
+        layers += point_symbol_layers()
+
+    # text labels (glyphs required) — drawn above everything.
     layers += text_layers(palette, scheme)
 
     style = {
@@ -164,6 +208,8 @@ def build(pmtiles_path, palette, scheme, glyphs_dir=None):
     }
     if glyphs_dir:
         style["glyphs"] = "file://" + os.path.abspath(glyphs_dir) + "/{fontstack}/{range}.pbf"
+    if sprite_base:
+        style["sprite"] = "file://" + os.path.abspath(sprite_base)
     return style
 
 
@@ -173,11 +219,12 @@ def main():
     ap.add_argument("--colortables", required=True)
     ap.add_argument("--scheme", default="day", choices=["day", "dusk", "night"])
     ap.add_argument("--glyphs", help="glyphs dir (…/{fontstack}/{range}.pbf); enables text")
+    ap.add_argument("--sprite", help="sprite base path (…/sprite-mln, no extension); enables symbols")
     ap.add_argument("-o", "--out", required=True)
     a = ap.parse_args()
 
     palette = json.load(open(a.colortables))[a.scheme]
-    style = build(a.pmtiles, palette, a.scheme, glyphs_dir=a.glyphs)
+    style = build(a.pmtiles, palette, a.scheme, glyphs_dir=a.glyphs, sprite_base=a.sprite)
     with open(a.out, "w") as f:
         json.dump(style, f, indent=1)
     print(f"wrote {a.out}: {len(style['layers'])} layers, source -> {style['sources']['chart']['url']}",
