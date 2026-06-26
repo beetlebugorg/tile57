@@ -106,6 +106,7 @@ fn geomBounds(g: []const s57.LonLat) [4]f64 {
 /// text grow here next.)
 const Layers = struct {
     areas: *std.ArrayList(mvt.Feature),
+    area_patterns: *std.ArrayList(mvt.Feature),
     lines: *std.ArrayList(mvt.Feature),
     points: *std.ArrayList(mvt.Feature),
     texts: *std.ArrayList(mvt.Feature),
@@ -159,17 +160,30 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
     if (!any_overlap or projected.items.len == 0) return;
 
     if (f.prim == 3) {
+        // Clip each ring once (each as its own polygon: avoids hole/winding
+        // misinterpretation; correct for disjoint area parts).
+        var rings = std.ArrayList([]const mvt.Point).empty;
+        for (projected.items) |proj| {
+            const ring = try tile.clipPolygon(a, proj, box);
+            if (ring.len >= 3) try rings.append(a, ring);
+        }
         if (p.fill_token) |token| {
-            // Emit each ring as its own filled polygon (avoids hole/winding
-            // misinterpretation; correct for disjoint area parts).
-            for (projected.items) |proj| {
-                const ring = try tile.clipPolygon(a, proj, box);
-                if (ring.len < 3) continue;
+            for (rings.items) |ring| {
                 const parts = try a.alloc([]const mvt.Point, 1);
                 parts[0] = ring;
                 const props = try a.alloc(mvt.Prop, 1);
                 props[0] = .{ .key = "color_token", .value = .{ .string = token } };
                 try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
+            }
+        }
+        // AreaFillReference -> a tiled fill pattern (DRGARE/FOUL/quality fills).
+        for (p.patterns) |pat| {
+            for (rings.items) |ring| {
+                const parts = try a.alloc([]const mvt.Point, 1);
+                parts[0] = ring;
+                const props = try a.alloc(mvt.Prop, 1);
+                props[0] = .{ .key = "pattern_name", .value = .{ .string = pat } };
+                try L.area_patterns.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
             }
         }
     }
@@ -205,11 +219,12 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
     var areas = std.ArrayList(mvt.Feature).empty;
+    var area_patterns = std.ArrayList(mvt.Feature).empty;
     var lines = std.ArrayList(mvt.Feature).empty;
     var points = std.ArrayList(mvt.Feature).empty;
     var texts = std.ArrayList(mvt.Feature).empty;
     var soundings = std.ArrayList(mvt.Feature).empty;
-    const layers_ctx = Layers{ .areas = &areas, .lines = &lines, .points = &points, .texts = &texts };
+    const layers_ctx = Layers{ .areas = &areas, .area_patterns = &area_patterns, .lines = &lines, .points = &points, .texts = &texts };
 
     for (cell.features, 0..) |f, fi| {
         // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
@@ -266,6 +281,7 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
 
     var layers = std.ArrayList(mvt.Layer).empty;
     if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
+    if (area_patterns.items.len > 0) try layers.append(a, .{ .name = "area_patterns", .features = area_patterns.items });
     if (lines.items.len > 0) try layers.append(a, .{ .name = "lines", .features = lines.items });
     if (points.items.len > 0) try layers.append(a, .{ .name = "point_symbols", .features = points.items });
     if (soundings.items.len > 0) try layers.append(a, .{ .name = "soundings", .features = soundings.items });
