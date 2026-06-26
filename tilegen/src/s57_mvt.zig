@@ -211,6 +211,38 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
             try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
         }
     }
+
+    // Area / line labels (TextInstruction): placed at the geometry centroid (a
+    // rough label point; the Go baker computes a proper one). Without this only
+    // point-feature labels show, so area/channel/place names were missing.
+    if (p.texts.len > 0) {
+        var clon: f64 = 0;
+        var clat: f64 = 0;
+        var n: usize = 0;
+        for (geo_parts) |gp| for (gp) |q| {
+            clon += q.lon;
+            clat += q.lat;
+            n += 1;
+        };
+        if (n > 0) {
+            const lon = clon / @as(f64, @floatFromInt(n));
+            const lat = clat / @as(f64, @floatFromInt(n));
+            if (lon >= tb[0] and lon <= tb[2] and lat >= tb[1] and lat <= tb[3]) {
+                const cpt = tile.project(lon, lat, z, x, y, tile.EXTENT);
+                const parts = try a.alloc([]const mvt.Point, 1);
+                const single = try a.alloc(mvt.Point, 1);
+                single[0] = cpt;
+                parts[0] = single;
+                for (p.texts) |t| {
+                    const props = try a.alloc(mvt.Prop, 3);
+                    props[0] = .{ .key = "text", .value = .{ .string = t.text } };
+                    props[1] = .{ .key = "color_token", .value = .{ .string = t.color } };
+                    props[2] = .{ .key = "font_size_px", .value = .{ .double = 11 } };
+                    try L.texts.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+                }
+            }
+        }
+    }
 }
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from `cell`.

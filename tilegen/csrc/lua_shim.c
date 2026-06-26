@@ -556,7 +556,7 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "cp('PreferredLanguage','text','eng')\n"
         "PortrayalInitializeContextParameters(cps)\n"
         "local ctx=portrayalContext.ContextParameters\n"
-        "local nok,nerr,errs=0,0,{}\n"
+        "local nok,nerr,ntext,errs=0,0,0,{}\n"
         "for _,item in ipairs(portrayalContext.FeaturePortrayalItems) do\n"
         "  local feature=item.Feature\n"
         "  local fp=item:NewFeaturePortrayal()\n"
@@ -565,8 +565,9 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "  if ok then nok=nok+1; instr=table.concat(fp.DrawingInstructions, ';')\n"
         "  else nerr=nerr+1; instr='ERROR:'..tostring(err)\n"
         "    errs[feature.Code]=(errs[feature.Code] or (tostring(err)..' [prim='..tostring(feature.PrimitiveType)..']')) end\n"
+        "  if instr and instr:find('TextInstruction') then ntext=ntext+1 end\n"
         "  tg_store(tonumber(feature.ID), instr)\nend\n"
-        "io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors\\n')\n"
+        "io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors, '..ntext..' with text\\n')\n"
         "for code,e in pairs(errs) do io.stderr:write('  '..code..': '..e..'\\n') end\n";
     int rc = 0;
     if (luaL_dostring(L, driver) != LUA_OK) {
