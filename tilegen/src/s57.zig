@@ -15,6 +15,99 @@ const iso = @import("iso8211.zig");
 pub const LonLat = struct { lon: f64, lat: f64 };
 pub const Sounding = struct { lon: f64, lat: f64, depth: f64 };
 
+// --- Polygon geometry helpers (shared by MVT emission + portrayal) ----------
+
+/// Area centroid (centre of gravity) of a single ring via the shoelace formula;
+/// null for a degenerate (zero-area) ring. Raw lon/lat — the cos(lat) skew is
+/// immaterial for a centring point over a chart-sized area. Edges wrap, so the
+/// ring may be open or closed.
+pub fn ringCentroid(ring: []const LonLat) ?LonLat {
+    if (ring.len < 3) return null;
+    var area2: f64 = 0;
+    var cx: f64 = 0;
+    var cy: f64 = 0;
+    var i: usize = 0;
+    while (i < ring.len) : (i += 1) {
+        const j = (i + 1) % ring.len;
+        const cross = ring[i].lon * ring[j].lat - ring[j].lon * ring[i].lat;
+        area2 += cross;
+        cx += (ring[i].lon + ring[j].lon) * cross;
+        cy += (ring[i].lat + ring[j].lat) * cross;
+    }
+    if (@abs(area2) < 1e-12) return null;
+    const a6 = 3.0 * area2; // 6 * (signed area = area2 / 2)
+    return .{ .lon = cx / a6, .lat = cy / a6 };
+}
+
+/// Even-odd point-in-polygon over the union of rings (exterior boundary + holes):
+/// inside the exterior AND outside every hole.
+pub fn pointInRingsEvenOdd(lon: f64, lat: f64, rings: []const []LonLat) bool {
+    var inside = false;
+    for (rings) |ring| {
+        if (ring.len < 2) continue;
+        var j: usize = ring.len - 1;
+        var i: usize = 0;
+        while (i < ring.len) : (i += 1) {
+            const a = ring[i];
+            const b = ring[j];
+            if ((a.lat > lat) != (b.lat > lat) and
+                lon < (b.lon - a.lon) * (lat - a.lat) / (b.lat - a.lat) + a.lon)
+            {
+                inside = !inside;
+            }
+            j = i;
+        }
+    }
+    return inside;
+}
+
+/// The representative point for an area's parts — its centre of gravity when that
+/// lies inside (S-52 PresLib §8.5.3), else the vertex average. The first part is
+/// treated as the exterior ring (like the Go baker). Null with no usable vertices.
+pub fn areaRepresentativePoint(rings: []const []LonLat) ?LonLat {
+    if (rings.len == 0) return null;
+    if (ringCentroid(rings[0])) |c| {
+        if (pointInRingsEvenOdd(c.lon, c.lat, rings)) return c;
+    }
+    var clon: f64 = 0;
+    var clat: f64 = 0;
+    var n: usize = 0;
+    for (rings) |ring| for (ring) |q| {
+        clon += q.lon;
+        clat += q.lat;
+        n += 1;
+    };
+    if (n == 0) return null;
+    return .{ .lon = clon / @as(f64, @floatFromInt(n)), .lat = clat / @as(f64, @floatFromInt(n)) };
+}
+
+test "area representative point centres on the centroid when inside" {
+    const t = std.testing;
+    // A wide rectangle (0,0)-(10,2): the centre of gravity is dead-centre.
+    var rect = [_]LonLat{
+        .{ .lon = 0, .lat = 0 },  .{ .lon = 10, .lat = 0 },
+        .{ .lon = 10, .lat = 2 }, .{ .lon = 0, .lat = 2 },
+    };
+    var parts = [_][]LonLat{rect[0..]};
+    const rp = areaRepresentativePoint(parts[0..]).?;
+    try t.expectApproxEqAbs(@as(f64, 5), rp.lon, 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 1), rp.lat, 1e-9);
+
+    // Even-odd containment: centre inside, far point outside.
+    try t.expect(pointInRingsEvenOdd(5, 1, parts[0..]));
+    try t.expect(!pointInRingsEvenOdd(20, 1, parts[0..]));
+
+    // A triangle's centroid is the mean of its three vertices.
+    var tri = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 6, .lat = 0 }, .{ .lon = 0, .lat = 6 } };
+    const c = ringCentroid(tri[0..]).?;
+    try t.expectApproxEqAbs(@as(f64, 2), c.lon, 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 2), c.lat, 1e-9);
+
+    // A degenerate (collinear / 2-point) ring has no centroid.
+    var deg = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 1, .lat = 1 } };
+    try t.expect(ringCentroid(deg[0..]) == null);
+}
+
 // S-57 vector record names (RCNM).
 pub const RCNM_VI: u8 = 110; // isolated node
 pub const RCNM_VC: u8 = 120; // connected node
