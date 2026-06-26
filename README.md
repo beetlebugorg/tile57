@@ -36,11 +36,17 @@ Full details (presets, env knobs, troubleshooting) live in
 ```sh
 git clone <this-repo> chartplotter-native
 cd chartplotter-native
-git submodule update --init --recursive     # MapLibre Native (~1.6 GB)
+git submodule update --init --recursive     # MapLibre Native (~1.6 GB) +
+                                            # the official IHO S-101 catalogue
+                                            # (Portrayal Catalogue + Feature
+                                            # Catalogue; ~350 MB for the FC repo)
 ```
 
-Also check out the Go reference repo as a sibling (`../chartplotter-go`) — it
-supplies the tiles + S-52 assets the app renders.
+The S-101 catalogue (rules, symbols, color profiles, feature catalogue) is
+vendored as submodules under `vendor/` — the Zig portrayal engine and the
+asset/tile generation use it directly. You still need the Go reference repo as a
+sibling (`../chartplotter` or `../chartplotter-go`) for its binary, which bakes
+the PMTiles + emits the S-52 client assets (sprites/colors/glyphs).
 
 ### 1. Prerequisites
 
