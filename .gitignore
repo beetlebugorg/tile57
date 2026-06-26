@@ -1,0 +1,31 @@
+# Build output
+/build/
+/build-*/
+
+# Offscreen render artifacts + the mbgl-render tile cache
+/renders/
+cache.sqlite
+
+# Large reference data (baked tiles / Go binary outputs) — regenerate locally
+/reference/tiles/
+/reference/assets/
+
+# Generated, machine-specific styles (absolute pmtiles paths) — gen-style.sh
+/style/chart-day.json
+/style/chart-dusk.json
+/style/chart-night.json
+
+# Zig
+/tilegen/.zig-cache/
+/tilegen/zig-out/
+/.zig-cache/
+/zig-out/
+
+# Editor / OS
+*.swp
+.DS_Store
+
+# Parity-oracle symlink (depends on sibling checkout layout)
+/reference/chartplotter-go
+__pycache__/
+*.pyc
