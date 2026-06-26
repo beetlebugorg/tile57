@@ -7,9 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PMTILES="${PMTILES:-$ROOT/reference/tiles/annapolis.pmtiles}"
 COLORS="${COLORS:-$ROOT/reference/assets/colortables.json}"
+GLYPHS="${GLYPHS:-$ROOT/reference/assets/glyphs}"
 
 for scheme in day dusk night; do
   python3 "$ROOT/style/build_style.py" \
-    --pmtiles "$PMTILES" --colortables "$COLORS" \
+    --pmtiles "$PMTILES" --colortables "$COLORS" --glyphs "$GLYPHS" \
     --scheme "$scheme" -o "$ROOT/style/chart-$scheme.json"
 done

@@ -63,7 +63,62 @@ def line_paint(palette, dash=None):
     return p
 
 
-def build(pmtiles_path, palette, scheme):
+FONT = ["Noto Sans Regular"]
+
+# S-52 halign/valign -> data-driven MapLibre text-anchor (port of chart-style.mjs).
+_VROW = ["match", ["coalesce", ["get", "valign"], "middle"], "top", "top", "bottom", "bottom", "center"]
+TEXT_ANCHOR = ["match", ["concat", _VROW, "|", ["coalesce", ["get", "halign"], "center"]],
+               "center|left", "left", "center|right", "right", "center|center", "center",
+               "top|center", "top", "bottom|center", "bottom",
+               "top|left", "top-left", "top|right", "top-right",
+               "bottom|left", "bottom-left", "bottom|right", "bottom-right",
+               "center"]
+
+# Collision priority: lower sort-key placed first = wins. Rank by text group
+# (tgrp), then larger font wins within a tier.
+TEXT_SORT_KEY = ["-",
+                 ["match", ["coalesce", ["get", "tgrp"], -1],
+                  11, 0, [21, 26, 29], 100, 23, 50, 150],
+                 ["coalesce", ["get", "font_size_px"], 10]]
+
+
+def text_color(scheme, palette):
+    if scheme == "day":
+        return color_expr("color_token", palette, "#000000")
+    return "#aab7bf" if scheme == "night" else "#dde7ec"
+
+
+def text_halo_color(scheme):
+    return "rgba(255,255,255,0.9)" if scheme == "day" else "rgba(0,0,0,0.85)"
+
+
+def text_layers(palette, scheme):
+    """General collidable text + an always-on LIGHTS characteristic layer
+    (port of chart-style.mjs textLayers + light-text). Mariner text-group
+    filtering is omitted at M2 (all groups shown)."""
+    halo = {"text-halo-color": text_halo_color(scheme), "text-halo-width": 1.4, "text-halo-blur": 0.5}
+    return [
+        {"id": "light-text", "type": "symbol", "source": "chart", "source-layer": "text",
+         "filter": ["==", ["get", "class"], "LIGHTS"],
+         "layout": {
+             "text-field": ["coalesce", ["get", "text"], ""], "text-font": FONT,
+             "text-size": ["coalesce", ["get", "font_size_px"], 10],
+             "text-anchor": "top", "text-offset": [0, 0.4], "text-justify": "left",
+             "symbol-sort-key": ["-", 0, ["coalesce", ["get", "font_size_px"], 10]],
+             "text-allow-overlap": False, "text-optional": True},
+         "paint": {"text-color": text_color(scheme, palette), **halo}},
+        {"id": "text", "type": "symbol", "source": "chart", "source-layer": "text",
+         "filter": ["!=", ["get", "class"], "LIGHTS"],
+         "layout": {
+             "text-field": ["coalesce", ["get", "text"], ""], "text-font": FONT,
+             "text-size": ["coalesce", ["get", "font_size_px"], 11],
+             "text-anchor": TEXT_ANCHOR, "symbol-sort-key": TEXT_SORT_KEY,
+             "text-allow-overlap": False, "text-optional": True},
+         "paint": {"text-color": text_color(scheme, palette), **halo}},
+    ]
+
+
+def build(pmtiles_path, palette, scheme, glyphs_dir=None):
     sea = palette.get("DEPDW", "#93aebb")
     src_url = "pmtiles://file://" + os.path.abspath(pmtiles_path)
 
@@ -98,12 +153,18 @@ def build(pmtiles_path, palette, scheme):
             "paint": line_paint(palette),
         })
 
-    return {
+    # text labels (glyphs required) — drawn above fills/lines.
+    layers += text_layers(palette, scheme)
+
+    style = {
         "version": 8,
-        "name": f"chartplotter-native ({scheme}, M1)",
+        "name": f"chartplotter-native ({scheme}, M2)",
         "sources": {"chart": {"type": "vector", "url": src_url}},
         "layers": layers,
     }
+    if glyphs_dir:
+        style["glyphs"] = "file://" + os.path.abspath(glyphs_dir) + "/{fontstack}/{range}.pbf"
+    return style
 
 
 def main():
@@ -111,11 +172,12 @@ def main():
     ap.add_argument("--pmtiles", required=True)
     ap.add_argument("--colortables", required=True)
     ap.add_argument("--scheme", default="day", choices=["day", "dusk", "night"])
+    ap.add_argument("--glyphs", help="glyphs dir (…/{fontstack}/{range}.pbf); enables text")
     ap.add_argument("-o", "--out", required=True)
     a = ap.parse_args()
 
     palette = json.load(open(a.colortables))[a.scheme]
-    style = build(a.pmtiles, palette, a.scheme)
+    style = build(a.pmtiles, palette, a.scheme, glyphs_dir=a.glyphs)
     with open(a.out, "w") as f:
         json.dump(style, f, indent=1)
     print(f"wrote {a.out}: {len(style['layers'])} layers, source -> {style['sources']['chart']['url']}",

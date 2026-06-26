@@ -27,6 +27,9 @@ mkdir -p "$ROOT/reference/tiles" "$ROOT/reference/assets"
 echo "==> emit-assets" >&2
 "$BIN" emit-assets "$ROOT/reference/assets"
 
+echo "==> copy glyphs (Noto Sans, from the Go web assets)" >&2
+cp -r "$GO/web/glyphs" "$ROOT/reference/assets/glyphs"
+
 echo "==> bake annapolis.pmtiles" >&2
 "$BIN" bake -o "$ROOT/reference/tiles/annapolis.pmtiles" \
   "$GO/testdata/US4MD81M.000" "$GO/testdata/US5MD1MC.000"
