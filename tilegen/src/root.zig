@@ -10,8 +10,12 @@
 const std = @import("std");
 
 pub const mvt = @import("mvt.zig");
+pub const gzip = @import("gzip.zig");
+pub const pmtiles = @import("pmtiles.zig");
 
 test {
     _ = mvt;
+    _ = gzip;
+    _ = pmtiles;
     _ = @import("mvt_parity_test.zig");
 }
