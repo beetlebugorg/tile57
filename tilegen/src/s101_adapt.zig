@@ -41,7 +41,16 @@ fn primitiveName(prim: u8) []const u8 {
 pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
     var out = std.ArrayList(Adapted).empty;
     for (cell.features, 0..) |f, i| {
-        const code = resolveCode(f.objl) orelse continue;
+        var code = resolveCode(f.objl) orelse continue;
+        // LIGHTS (objl 75) needs attribute-dependent aliasing: the catalogue's
+        // primary alias for the "LIGHTS" acronym is one variant (here
+        // LightAirObstruction), but real navigational lights are LightAllAround
+        // (or LightSectored when they carry sector limits). Route them so the
+        // light flare + characteristic text (LightAllAround) actually renders.
+        // (Sectored lights carry SECTR1/SECTR2 (codes 136/137); their sector
+        // arcs aren't rendered from the stream yet, so all lights use
+        // LightAllAround for now — the flare + characteristic still render.)
+        if (f.objl == 75) code = "LightAllAround";
         const prim = primitiveName(f.prim);
         if (prim.len == 0) continue;
         var attrs = std.ArrayList(NameVal).empty;
