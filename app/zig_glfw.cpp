@@ -20,6 +20,7 @@
 
 #include <mbgl/gfx/backend.hpp>
 #include <mbgl/map/map.hpp>
+#include <mbgl/map/map_observer.hpp>
 #include <mbgl/map/map_options.hpp>
 #include <mbgl/renderer/renderer.hpp>
 #include <mbgl/storage/file_source_manager.hpp>
@@ -46,6 +47,25 @@ static std::string readFile(const char *path) {
     ss << f.rdbuf();
     return ss.str();
 }
+
+// Continuous-render observer. GLFWView renders on-demand (only when "dirty"), but
+// on macOS 26 / Metal 4 the CAMetalLayer goes BLANK once drawing stops on idle
+// (confirmed: upstream mbgl-glfw does it too; the chart returns on any pan/zoom).
+// Re-invalidate after each frame / on idle so the view keeps presenting (stays
+// at 60fps with vsync — unlike --benchmark, which disables vsync). We pass this
+// to the Map instead of GLFWView and forward the two events GLFWView handles, so
+// nothing else changes (input is via GLFW callbacks, not the observer).
+class ContinuousObserver final : public mbgl::MapObserver {
+public:
+    explicit ContinuousObserver(GLFWView &v) : view(v) {}
+    void onWillStartRenderingFrame() override { view.onWillStartRenderingFrame(); }
+    void onDidFinishLoadingStyle() override { view.onDidFinishLoadingStyle(); }
+    void onDidFinishRenderingFrame(const RenderFrameStatus &) override { view.invalidate(); }
+    void onDidBecomeIdle() override { view.invalidate(); }
+
+private:
+    GLFWView &view;
+};
 
 int main(int argc, char **argv) {
     if (argc < 3) {
@@ -103,8 +123,11 @@ int main(int argc, char **argv) {
         });
 
     // 4) Map in the default (Continuous) mode for interactivity — do NOT set
-    //    MapMode::Static (that's for one-shot headless renders).
-    mbgl::Map map(rendererFrontend, view,
+    //    MapMode::Static (that's for one-shot headless renders). Use the
+    //    continuous-render observer (keeps the Metal layer from blanking on idle)
+    //    instead of the bare GLFWView.
+    ContinuousObserver observer(view);
+    mbgl::Map map(rendererFrontend, observer,
                   mbgl::MapOptions().withSize(view.getSize()).withPixelRatio(view.getPixelRatio()),
                   resourceOptions, clientOptions);
 
