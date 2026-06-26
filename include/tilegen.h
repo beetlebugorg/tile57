@@ -52,6 +52,10 @@ const char *tg_lua_version(void);
  * on error (diagnostics to stderr). Validates Lua 5.4 compatibility. */
 int tg_lua_check_rules(const char *dir);
 
+/* Run the S-101 framework with stub Host callbacks + empty feature set, proving
+ * it executes (not just loads) in embedded Lua. Returns 0 on success. */
+int tg_lua_run_framework(const char *dir);
+
 #ifdef __cplusplus
 }
 #endif

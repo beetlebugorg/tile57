@@ -39,7 +39,12 @@ int main(int argc, char **argv) {
     if (argc >= 3 && std::string(argv[1]) == "--s101check") {
         std::cerr << "embedded " << tg_lua_version() << "\n";
         int rc = tg_lua_check_rules(argv[2]);
-        std::cerr << (rc == 0 ? "S-101 framework: OK\n" : "S-101 framework: FAILED\n");
+        std::cerr << (rc == 0 ? "S-101 framework: load OK\n" : "S-101 framework: load FAILED\n");
+        return rc == 0 ? 0 : 1;
+    }
+    if (argc >= 3 && std::string(argv[1]) == "--s101run") {
+        int rc = tg_lua_run_framework(argv[2]);
+        std::cerr << (rc == 0 ? "S-101 framework: run OK\n" : "S-101 framework: run FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc < 7) {

@@ -61,5 +61,14 @@ re-port them. Lua 5.4 is embedded in `libtilegen.a` (proven working).
 
 ## Status
 
-Lua 5.4 embedded + self-test passing. classify() placeholder in s57_mvt.zig
-covers DEPARE/LNDARE/COALNE/DEPCNT/etc. with depth shading. Next: step 1.
+- Lua 5.4 embedded + self-test passing.
+- S-101 framework **loads** in 5.4 (`--s101check`).
+- S-101 framework **executes** in 5.4 with stub Host callbacks + empty features
+  (`--s101run` -> FeaturePortrayalItems=0). Runtime is 5.4-compatible.
+- classify() placeholder in s57_mvt.zig covers DEPARE/LNDARE/COALNE/DEPCNT/etc.
+  with live depth shading.
+
+**Next (no remaining unknowns):** step 3 — implement the real Host* callbacks
+(C stubs in lua_shim.c -> back them with the Zig s57.Cell via small extern
+accessors) + step 4 (FeatureCatalogue.xml for type codes) + step 5 (instruction
+-> MVT), then dispatch each cell feature through its rule.
