@@ -79,6 +79,80 @@ if(ZIG_EXECUTABLE)
     ${CMAKE_CURRENT_SOURCE_DIR}/app
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native/platform/default/include)
   target_link_libraries(chartshot-zig PRIVATE mbgl-compiler-options mbgl-core ${TILEGEN_LIB})
+
+  # -------------------------------------------------------------------------
+  # Interactive GLFW window host (M3): the same in-process Zig tile source,
+  # but in a real pannable/zoomable window instead of a one-shot PNG.
+  #
+  # There is no reusable mbgl-glfw *library* (platform/glfw/CMakeLists.txt only
+  # builds the mbgl-glfw executable), so we compile the GLFW view/backend source
+  # set ourselves with our own main (app/zig_glfw.cpp). Built only when GLFW is
+  # enabled (the desktop / macos-desktop presets), where MapLibre has already
+  # added its glfw subdir — so `tinyobjloader` is an existing target we just
+  # link (do NOT re-include vendor/tinyobjloader.cmake; FetchContent would
+  # redeclare it).
+  # -------------------------------------------------------------------------
+  if(MLN_WITH_GLFW)
+    set(MLN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native)
+    if(NOT WIN32)
+      find_package(PkgConfig REQUIRED)
+      pkg_search_module(GLFW glfw3 REQUIRED)
+    endif()
+
+    add_executable(chart-glfw-zig
+      app/zig_glfw.cpp
+      app/zig_tile_source.cpp
+      ${MLN_DIR}/platform/glfw/glfw_view.cpp
+      ${MLN_DIR}/platform/glfw/glfw_renderer_frontend.cpp
+      ${MLN_DIR}/platform/glfw/test_writer.cpp
+      ${MLN_DIR}/platform/glfw/example_custom_drawable_style_layer.cpp
+      ${MLN_DIR}/platform/default/src/mbgl/map/map_snapshotter.cpp)
+    add_dependencies(chart-glfw-zig tilegen_lib)
+
+    # GLFWView bakes a default asset path in at compile time.
+    set_property(SOURCE ${MLN_DIR}/platform/glfw/glfw_view.cpp
+      PROPERTY COMPILE_DEFINITIONS MLN_ASSETS_PATH="${MLN_DIR}/platform/glfw/assets/")
+
+    if(APPLE)
+      target_sources(chart-glfw-zig PRIVATE ${MLN_DIR}/platform/glfw/glfw_apple_init.mm)
+    endif()
+    if(MLN_WITH_OPENGL)
+      find_package(OpenGL REQUIRED)
+      target_sources(chart-glfw-zig PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
+    endif()
+    if(MLN_WITH_METAL)
+      target_sources(chart-glfw-zig PRIVATE
+        ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
+        ${MLN_DIR}/platform/glfw/metal_backend.mm)
+      target_link_libraries(chart-glfw-zig PRIVATE mbgl-vendor-metal-cpp)
+    endif()
+    if(MLN_WITH_EGL)
+      target_compile_definitions(chart-glfw-zig PRIVATE MBGL_WITH_EGL=1)
+    endif()
+    if(DEFINED MLN_WITH_X11 AND MLN_WITH_X11)
+      target_compile_definitions(chart-glfw-zig PRIVATE MLN_WITH_X11=1)
+    endif()
+    if(DEFINED MLN_WITH_WAYLAND AND MLN_WITH_WAYLAND)
+      target_compile_definitions(chart-glfw-zig PRIVATE MLN_WITH_WAYLAND=1)
+    endif()
+
+    target_include_directories(chart-glfw-zig PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/app
+      ${MLN_DIR}/platform/glfw
+      ${MLN_DIR}/src
+      ${MLN_DIR}/platform/default/include
+      ${GLFW_INCLUDE_DIRS})
+
+    target_link_libraries(chart-glfw-zig PRIVATE
+      Mapbox::Map mbgl-compiler-options mbgl-vendor-rapidjson
+      MapLibreNative::Base::cheap-ruler-cpp tinyobjloader
+      $<$<BOOL:${GLFW_LIBRARY_DIRS}>:-L${GLFW_LIBRARY_DIRS}> ${GLFW_LIBRARIES}
+      ${TILEGEN_LIB})
+    if(NOT WIN32 AND MLN_WITH_OPENGL)
+      target_link_libraries(chart-glfw-zig PRIVATE OpenGL::GL)
+    endif()
+  endif()
 else()
   message(STATUS "zig not found; skipping chartshot-zig (Zig tile source host)")
 endif()

@@ -47,8 +47,8 @@
   ],
   "buildPresets": [
     { "name": "headless", "configurePreset": "headless", "targets": ["mbgl-render"] },
-    { "name": "desktop", "configurePreset": "desktop", "targets": ["mbgl-glfw"] },
+    { "name": "desktop", "configurePreset": "desktop", "targets": ["mbgl-glfw", "chart-glfw-zig"] },
     { "name": "macos", "configurePreset": "macos", "targets": ["mbgl-render"] },
-    { "name": "macos-desktop", "configurePreset": "macos-desktop", "targets": ["mbgl-glfw"] }
+    { "name": "macos-desktop", "configurePreset": "macos-desktop", "targets": ["mbgl-glfw", "chart-glfw-zig"] }
   ]
 }
