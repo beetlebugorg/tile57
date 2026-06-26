@@ -23,3 +23,9 @@ for scheme in day dusk night; do
     --pmtiles "$PMTILES" --colortables "$COLORS" --glyphs "$GLYPHS" --sprite "$SPRITE" \
     --scheme "$scheme" -o "$ROOT/style/chart-$scheme.json"
 done
+
+# A day style whose chart source is served by the Zig FileSource (chartshot-zig).
+python3 "$ROOT/style/build_style.py" \
+  --pmtiles "$PMTILES" --colortables "$COLORS" --glyphs "$GLYPHS" --sprite "$SPRITE" \
+  --scheme day --source-tiles "zigtiles://{z}/{x}/{y}" --minzoom 9 --maxzoom 16 \
+  -o "$ROOT/style/chart-zig-day.json"

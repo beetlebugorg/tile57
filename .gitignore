@@ -10,10 +10,8 @@ cache.sqlite
 /reference/tiles/
 /reference/assets/
 
-# Generated, machine-specific styles (absolute pmtiles paths) — gen-style.sh
-/style/chart-day.json
-/style/chart-dusk.json
-/style/chart-night.json
+# Generated, machine-specific styles (absolute asset paths) — gen-style.sh
+/style/chart-*.json
 
 # Zig
 /tilegen/.zig-cache/

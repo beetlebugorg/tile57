@@ -172,7 +172,8 @@ def text_layers(palette, scheme):
     ]
 
 
-def build(pmtiles_path, palette, scheme, glyphs_dir=None, sprite_base=None):
+def build(pmtiles_path, palette, scheme, glyphs_dir=None, sprite_base=None,
+          source_tiles=None, minzoom=0, maxzoom=16):
     sea = palette.get("DEPDW", "#93aebb")
     src_url = "pmtiles://file://" + os.path.abspath(pmtiles_path)
 
@@ -227,10 +228,18 @@ def build(pmtiles_path, palette, scheme, glyphs_dir=None, sprite_base=None):
     # text labels (glyphs required) — drawn above everything.
     layers += text_layers(palette, scheme)
 
+    # Source: a tiles-template vector source (e.g. zigtiles://{z}/{x}/{y}, served
+    # by the Zig FileSource) or, by default, the native pmtiles:// archive.
+    if source_tiles:
+        chart_source = {"type": "vector", "tiles": [source_tiles],
+                        "minzoom": minzoom, "maxzoom": maxzoom}
+    else:
+        chart_source = {"type": "vector", "url": src_url}
+
     style = {
         "version": 8,
         "name": f"chartplotter-native ({scheme}, M2)",
-        "sources": {"chart": {"type": "vector", "url": src_url}},
+        "sources": {"chart": chart_source},
         "layers": layers,
     }
     if glyphs_dir:
@@ -247,15 +256,20 @@ def main():
     ap.add_argument("--scheme", default="day", choices=["day", "dusk", "night"])
     ap.add_argument("--glyphs", help="glyphs dir (…/{fontstack}/{range}.pbf); enables text")
     ap.add_argument("--sprite", help="sprite base path (…/sprite-mln, no extension); enables symbols")
+    ap.add_argument("--source-tiles", help="use a tiles URL template (e.g. zigtiles://{z}/{x}/{y}) instead of pmtiles://")
+    ap.add_argument("--minzoom", type=int, default=9)
+    ap.add_argument("--maxzoom", type=int, default=16)
     ap.add_argument("-o", "--out", required=True)
     a = ap.parse_args()
 
     palette = json.load(open(a.colortables))[a.scheme]
-    style = build(a.pmtiles, palette, a.scheme, glyphs_dir=a.glyphs, sprite_base=a.sprite)
+    style = build(a.pmtiles, palette, a.scheme, glyphs_dir=a.glyphs, sprite_base=a.sprite,
+                  source_tiles=a.source_tiles, minzoom=a.minzoom, maxzoom=a.maxzoom)
     with open(a.out, "w") as f:
         json.dump(style, f, indent=1)
-    print(f"wrote {a.out}: {len(style['layers'])} layers, source -> {style['sources']['chart']['url']}",
-          file=sys.stderr)
+    src = style["sources"]["chart"]
+    where = src.get("url") or (src.get("tiles") or [""])[0]
+    print(f"wrote {a.out}: {len(style['layers'])} layers, source -> {where}", file=sys.stderr)
 
 
 if __name__ == "__main__":

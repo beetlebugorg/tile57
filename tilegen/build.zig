@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .pic = true, // libtilegen.a links into a PIE C++ host
     });
 
     // Static library (libtilegen.a) — the C ABI surface (src/capi.zig) and the

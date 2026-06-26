@@ -13,6 +13,11 @@ pub const mvt = @import("mvt.zig");
 pub const gzip = @import("gzip.zig");
 pub const pmtiles = @import("pmtiles.zig");
 pub const tile = @import("tile.zig");
+pub const capi = @import("capi.zig"); // C ABI exports for libtilegen.a
+
+comptime {
+    _ = capi; // force the export fns into the static library
+}
 
 test {
     _ = mvt;
