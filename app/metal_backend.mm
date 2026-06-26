@@ -121,6 +121,12 @@ public:
     if (surface) {
       commandBuffer->waitUntilScheduled();
       surface->present();
+      // presentsWithTransaction queues the present to the current CoreAnimation
+      // transaction, which is normally committed by the main CFRunLoop. The GLFW
+      // libuv loop never commits it promptly, so the present defers, drawables
+      // don't free, and the next nextDrawable() blocks for hundreds of ms (2-8
+      // fps with wildly varying frame times). Flush commits the transaction now.
+      [CATransaction flush];
     }
     commandBuffer.reset();
     renderPassDescriptor.reset();
