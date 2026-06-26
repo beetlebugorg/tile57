@@ -83,94 +83,95 @@ if(ZIG_EXECUTABLE)
     COMMENT "Building libtile57.a (zig build + macOS archive re-pack)"
     VERBATIM)
 
-  add_executable(chartplotter-render app/zig_render.cpp app/chart_tile_source.cpp)
-  add_dependencies(chartplotter-render tile57_lib)
-  target_include_directories(chartplotter-render PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/app
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native/platform/default/include)
-  target_link_libraries(chartplotter-render PRIVATE mbgl-compiler-options mbgl-core ${TILE57_LIB})
-
   # -------------------------------------------------------------------------
-  # Interactive GLFW window host (M3): the same in-process Zig tile source,
-  # but in a real pannable/zoomable window instead of a one-shot PNG.
+  # libchartplotter — the embeddable chart-widget library (CMake target
+  # `chartplotter_widget`, artifact libchartplotter.a). It wraps MapLibre Native
+  # + libtile57 behind the C API in include/chartplotter.h: render a chart to a
+  # PNG offscreen (always), and — when built with GLFW (the desktop presets) —
+  # open an interactive window (chartplotter_view_*). The exes are thin mains.
   #
-  # There is no reusable mbgl-glfw *library* (platform/glfw/CMakeLists.txt only
-  # builds the mbgl-glfw executable), so we compile the GLFW view/backend source
-  # set ourselves with our own main (app/zig_glfw.cpp). Built only when GLFW is
-  # enabled (the desktop / macos-desktop presets), where MapLibre has already
-  # added its glfw subdir — so `tinyobjloader` is an existing target we just
-  # link (do NOT re-include vendor/tinyobjloader.cmake; FetchContent would
-  # redeclare it).
+  # There is no reusable mbgl-glfw *library* (platform/glfw only builds the
+  # mbgl-glfw exe), so the window half compiles MapLibre's GLFW view/backend
+  # source set into this library, guarded by CHARTPLOTTER_WITH_GLFW. (tinyobjloader
+  # / cheap-ruler are existing targets from MapLibre's glfw subdir — just link
+  # them; do NOT re-include vendor/tinyobjloader.cmake.)
   # -------------------------------------------------------------------------
+  set(MLN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native)
+
+  add_library(chartplotter_widget STATIC app/chartplotter.cpp app/chart_tile_source.cpp)
+  set_target_properties(chartplotter_widget PROPERTIES OUTPUT_NAME chartplotter)
+  add_dependencies(chartplotter_widget tile57_lib)
+  target_include_directories(chartplotter_widget PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_include_directories(chartplotter_widget PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/app
+    ${MLN_DIR}/platform/default/include)
+  target_link_libraries(chartplotter_widget PUBLIC mbgl-core ${TILE57_LIB})
+  target_link_libraries(chartplotter_widget PRIVATE mbgl-compiler-options)
+
   if(MLN_WITH_GLFW)
-    set(MLN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native)
     if(NOT WIN32)
       find_package(PkgConfig REQUIRED)
       pkg_search_module(GLFW glfw3 REQUIRED)
     endif()
-
-    add_executable(chartplotter
-      app/zig_glfw.cpp
-      app/chart_tile_source.cpp
+    target_compile_definitions(chartplotter_widget PRIVATE CHARTPLOTTER_WITH_GLFW=1)
+    target_sources(chartplotter_widget PRIVATE
       ${MLN_DIR}/platform/glfw/glfw_view.cpp
       ${MLN_DIR}/platform/glfw/glfw_renderer_frontend.cpp
       ${MLN_DIR}/platform/glfw/test_writer.cpp
       ${MLN_DIR}/platform/glfw/example_custom_drawable_style_layer.cpp
       ${MLN_DIR}/platform/default/src/mbgl/map/map_snapshotter.cpp)
-    add_dependencies(chartplotter tile57_lib)
-
     # GLFWView bakes a default asset path in at compile time.
     set_property(SOURCE ${MLN_DIR}/platform/glfw/glfw_view.cpp
       PROPERTY COMPILE_DEFINITIONS MLN_ASSETS_PATH="${MLN_DIR}/platform/glfw/assets/")
-
     if(APPLE)
-      target_sources(chartplotter PRIVATE ${MLN_DIR}/platform/glfw/glfw_apple_init.mm)
+      target_sources(chartplotter_widget PRIVATE ${MLN_DIR}/platform/glfw/glfw_apple_init.mm)
     endif()
     if(MLN_WITH_OPENGL)
       find_package(OpenGL REQUIRED)
-      target_sources(chartplotter PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
+      target_sources(chartplotter_widget PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
     endif()
     if(MLN_WITH_METAL)
-      # Use our patched metal_backend.mm (nextDrawable nil-check + no-timeout, to
-      # stop the whole-screen blank/flicker on fast pan/zoom) instead of the
-      # vendored one; metal_backend.h is reused unchanged.
-      target_sources(chartplotter PRIVATE
+      # Our patched metal_backend.mm (nextDrawable nil-check + no-timeout) instead
+      # of the vendored one; metal_backend.h is reused unchanged. metal-cpp is
+      # header-only and mbgl-core links Metal PRIVATE, so we link the Apple
+      # frameworks here (QuartzCore for the CAMetalLayer/CALayer Obj-C symbols our
+      # bridge uses, plus Metal + Foundation for the metal-cpp objects).
+      target_sources(chartplotter_widget PRIVATE
         ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
         ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm)
-      # metal-cpp (mbgl-vendor-metal-cpp) is header-only and mbgl-core links Metal
-      # PRIVATE, so this target must link the Apple frameworks itself: QuartzCore
-      # for the CAMetalLayer / CALayer Obj-C class symbols our metal_backend.mm
-      # bridges to, plus Metal and Foundation for the metal-cpp objects.
-      target_link_libraries(chartplotter PRIVATE mbgl-vendor-metal-cpp
+      target_link_libraries(chartplotter_widget PUBLIC mbgl-vendor-metal-cpp
         "-framework QuartzCore" "-framework Metal" "-framework Foundation")
     endif()
     if(MLN_WITH_EGL)
-      target_compile_definitions(chartplotter PRIVATE MBGL_WITH_EGL=1)
+      target_compile_definitions(chartplotter_widget PRIVATE MBGL_WITH_EGL=1)
     endif()
     if(DEFINED MLN_WITH_X11 AND MLN_WITH_X11)
-      target_compile_definitions(chartplotter PRIVATE MLN_WITH_X11=1)
+      target_compile_definitions(chartplotter_widget PRIVATE MLN_WITH_X11=1)
     endif()
     if(DEFINED MLN_WITH_WAYLAND AND MLN_WITH_WAYLAND)
-      target_compile_definitions(chartplotter PRIVATE MLN_WITH_WAYLAND=1)
+      target_compile_definitions(chartplotter_widget PRIVATE MLN_WITH_WAYLAND=1)
     endif()
-
-    target_include_directories(chartplotter PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/app
-      ${MLN_DIR}/platform/glfw
-      ${MLN_DIR}/src
-      ${MLN_DIR}/platform/default/include
-      ${GLFW_INCLUDE_DIRS})
-
-    target_link_libraries(chartplotter PRIVATE
-      Mapbox::Map mbgl-compiler-options mbgl-vendor-rapidjson
-      MapLibreNative::Base::cheap-ruler-cpp tinyobjloader
-      $<$<BOOL:${GLFW_LIBRARY_DIRS}>:-L${GLFW_LIBRARY_DIRS}> ${GLFW_LIBRARIES}
-      ${TILE57_LIB})
+    target_include_directories(chartplotter_widget PRIVATE
+      ${MLN_DIR}/platform/glfw ${MLN_DIR}/src ${GLFW_INCLUDE_DIRS})
+    target_link_libraries(chartplotter_widget PUBLIC
+      Mapbox::Map mbgl-vendor-rapidjson MapLibreNative::Base::cheap-ruler-cpp tinyobjloader
+      $<$<BOOL:${GLFW_LIBRARY_DIRS}>:-L${GLFW_LIBRARY_DIRS}> ${GLFW_LIBRARIES})
     if(NOT WIN32 AND MLN_WITH_OPENGL)
-      target_link_libraries(chartplotter PRIVATE OpenGL::GL)
+      target_link_libraries(chartplotter_widget PUBLIC OpenGL::GL)
     endif()
+  endif()
+
+  # Thin exes over libchartplotter.
+  add_executable(chartplotter-render app/chartplotter_render_main.cpp)
+  target_include_directories(chartplotter-render PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/app)
+  target_link_libraries(chartplotter-render PRIVATE chartplotter_widget mbgl-compiler-options)
+
+  if(MLN_WITH_GLFW)
+    add_executable(chartplotter app/chartplotter_main.cpp)
+    target_include_directories(chartplotter PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/app)
+    target_link_libraries(chartplotter PRIVATE chartplotter_widget mbgl-compiler-options)
   endif()
 else()
   message(STATUS "zig not found; skipping chartplotter / chartplotter-render (Zig tile source hosts)")
