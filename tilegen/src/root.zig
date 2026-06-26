@@ -15,6 +15,7 @@ pub const pmtiles = @import("pmtiles.zig");
 pub const tile = @import("tile.zig");
 pub const iso8211 = @import("iso8211.zig");
 pub const s57 = @import("s57.zig");
+pub const s57_mvt = @import("s57_mvt.zig");
 pub const capi = @import("capi.zig"); // C ABI exports for libtilegen.a
 
 comptime {
@@ -28,5 +29,6 @@ test {
     _ = tile;
     _ = iso8211;
     _ = s57;
+    _ = s57_mvt;
     _ = @import("mvt_parity_test.zig");
 }

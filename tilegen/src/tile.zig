@@ -32,6 +32,24 @@ pub fn project(lon: f64, lat: f64, z: u8, tx: u32, ty: u32, extent: i32) mvt.Poi
     return .{ .x = @intFromFloat(@round(px)), .y = @intFromFloat(@round(py)) };
 }
 
+/// Geographic bounds of tile (z,x,y): [min_lon, min_lat, max_lon, max_lat].
+pub fn tileBoundsLonLat(z: u8, tx: u32, ty: u32) [4]f64 {
+    const n = @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+    const fx: f64 = @floatFromInt(tx);
+    const fy: f64 = @floatFromInt(ty);
+    const lon0 = fx / n * 360.0 - 180.0;
+    const lon1 = (fx + 1.0) / n * 360.0 - 180.0;
+    const lat = struct {
+        fn at(yy: f64, nn: f64) f64 {
+            const m = std.math.pi * (1.0 - 2.0 * yy / nn);
+            return std.math.atan(std.math.sinh(m)) * 180.0 / std.math.pi;
+        }
+    };
+    const lat0 = lat.at(fy + 1.0, n); // bottom (min lat)
+    const lat1 = lat.at(fy, n); // top (max lat)
+    return .{ lon0, lat0, lon1, lat1 };
+}
+
 /// Inclusive tile box used for clipping (extent +/- buffer).
 pub const Box = struct {
     min: i32,

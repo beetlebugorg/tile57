@@ -247,11 +247,9 @@ pub fn encode(gpa: Allocator, tile: Tile) ![]u8 {
         for (keys.items) |k| try putLenDelim(&lb, a, 3, k);
         // values = 4
         for (values.items) |v| try encodeValue(&lb, a, v);
-        // extent = 5
-        if (layer.extent != 4096) {
-            try putTag(&lb, a, 5, 0);
-            try putVarint(&lb, a, layer.extent);
-        }
+        // extent = 5 (always emit; MapLibre requires it)
+        try putTag(&lb, a, 5, 0);
+        try putVarint(&lb, a, layer.extent);
 
         // Tile.layers = 3
         try putLenDelim(&out, gpa, 3, lb.items);

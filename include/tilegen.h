@@ -23,6 +23,11 @@ typedef struct tg_source tg_source;
 /* Open a PMTiles archive from in-memory bytes (the host owns file IO).
  * Returns an opaque handle, or NULL on error. Close with tg_close. */
 tg_source *tg_open_bytes(const uint8_t *data, size_t len);
+
+/* Open a raw S-57 ENC cell (.000); tiles are generated live on demand.
+ * Returns an opaque handle, or NULL on error. */
+tg_source *tg_open_cell_bytes(const uint8_t *data, size_t len);
+
 void tg_close(tg_source *src);
 
 uint8_t tg_min_zoom(tg_source *src);

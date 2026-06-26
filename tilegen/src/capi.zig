@@ -1,28 +1,31 @@
 //! C ABI for libtilegen.a — what the C++ MapLibre host links against.
 //!
-//! For M5 a "tile source" is backed by the Zig PMTiles reader: the C++ host
-//! hands us the archive bytes (it owns file IO) and asks for tiles by (z,x,y);
-//! we return decompressed MVT. At M6 the same C ABI gets a second constructor
-//! that generates tiles live from S-57 cells — the host doesn't change.
+//! A source is one of two backends behind the same tile API:
+//!   - tg_open_bytes:      a PMTiles archive (Zig reader)            [M5]
+//!   - tg_open_cell_bytes: a raw S-57 cell, tiles generated live     [M6c]
+//! The C++ ZigTileSource doesn't care which — it just calls tg_get_tile.
 //!
-//! Contract: POD across the seam (ptr/len + error codes); all Zig errors,
-//! slices and optionals stay inside Zig. Header: ../../include/tilegen.h.
+//! Contract: POD across the seam (ptr/len + error codes); Zig errors, slices
+//! and optionals stay inside Zig. Header: ../../include/tilegen.h.
 
 const std = @import("std");
 const pmtiles = @import("pmtiles.zig");
+const s57 = @import("s57.zig");
+const s57_mvt = @import("s57_mvt.zig");
 
-// page_allocator (mmap-backed) keeps the Zig static lib free of a libc
-// dependency — the C++ host links libc itself. tg_free takes the slice length
-// so freeing works without a managing allocator.
 const gpa = std.heap.page_allocator;
 
-const Source = struct {
+const Backend = union(enum) {
     reader: pmtiles.Reader,
-    data: []u8, // owned copy of the archive bytes
+    cell: s57.Cell,
 };
 
-/// Open a PMTiles archive from in-memory bytes (the host reads the file).
-/// Returns an opaque handle, or null on error.
+const Source = struct {
+    backend: Backend,
+    data: ?[]u8, // owned archive bytes (PMTiles backend only)
+};
+
+/// Open a PMTiles archive from in-memory bytes. Returns a handle or null.
 export fn tg_open_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*Source {
     const copy = gpa.dupe(u8, data_ptr[0..data_len]) catch return null;
     const reader = pmtiles.Reader.init(gpa, copy) catch {
@@ -35,28 +38,51 @@ export fn tg_open_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*S
         gpa.free(copy);
         return null;
     };
-    src.* = .{ .reader = reader, .data = copy };
+    src.* = .{ .backend = .{ .reader = reader }, .data = copy };
+    return src;
+}
+
+/// Open a raw S-57 cell; tiles are generated live. Returns a handle or null.
+/// The bytes are only read during this call (the cell model copies what it keeps).
+export fn tg_open_cell_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*Source {
+    const cell = s57.parseCell(gpa, data_ptr[0..data_len]) catch return null;
+    const src = gpa.create(Source) catch {
+        var c = cell;
+        c.deinit();
+        return null;
+    };
+    src.* = .{ .backend = .{ .cell = cell }, .data = null };
     return src;
 }
 
 export fn tg_close(src: ?*Source) callconv(.c) void {
     const s = src orelse return;
-    s.reader.deinit();
-    gpa.free(s.data);
+    switch (s.backend) {
+        .reader => |*r| r.deinit(),
+        .cell => |*c| c.deinit(),
+    }
+    if (s.data) |d| gpa.free(d);
     gpa.destroy(s);
 }
 
-/// Min/max zoom of the archive (so the host can build the source's tilejson).
 export fn tg_min_zoom(src: ?*Source) callconv(.c) u8 {
-    return if (src) |s| s.reader.header.min_zoom else 0;
+    const s = src orelse return 0;
+    return switch (s.backend) {
+        .reader => |r| r.header.min_zoom,
+        .cell => 0,
+    };
 }
 export fn tg_max_zoom(src: ?*Source) callconv(.c) u8 {
-    return if (src) |s| s.reader.header.max_zoom else 0;
+    const s = src orelse return 0;
+    return switch (s.backend) {
+        .reader => |r| r.header.max_zoom,
+        .cell => 18,
+    };
 }
 
-/// Fetch tile (z,x,y) as decompressed MVT bytes.
-/// Returns 1 and sets out/out_len (caller frees with tg_free) if found;
-/// 0 if the tile is absent; negative on error.
+/// Fetch tile (z,x,y) as MVT bytes (PMTiles: decompressed; cell: generated).
+/// Returns 1 + out/out_len (free with tg_free) if non-empty, 0 if empty/absent,
+/// negative on error.
 export fn tg_get_tile(
     src: ?*Source,
     z: u8,
@@ -66,10 +92,16 @@ export fn tg_get_tile(
     out_len: *usize,
 ) callconv(.c) c_int {
     const s = src orelse return -1;
-    const tile = s.reader.getTile(gpa, z, x, y) catch return -2;
-    const t = tile orelse return 0;
-    out.* = t.ptr;
-    out_len.* = t.len;
+    const bytes = switch (s.backend) {
+        .reader => |*r| (r.getTile(gpa, z, x, y) catch return -2) orelse return 0,
+        .cell => |*c| s57_mvt.generateTile(gpa, c, z, x, y) catch return -2,
+    };
+    if (bytes.len == 0) {
+        gpa.free(bytes);
+        return 0;
+    }
+    out.* = bytes.ptr;
+    out_len.* = bytes.len;
     return 1;
 }
 

@@ -55,13 +55,21 @@ int main(int argc, char **argv) {
         std::cerr << "could not read archive: " << archive << "\n";
         return 1;
     }
-    g_src = tg_open_bytes(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
+    // Try a PMTiles archive first; if it's not one (e.g. a raw .000 cell),
+    // open it as an S-57 cell and generate tiles live.
+    const auto *raw = reinterpret_cast<const uint8_t *>(bytes.data());
+    g_src = tg_open_bytes(raw, bytes.size());
+    const char *mode = "pmtiles";
     if (!g_src) {
-        std::cerr << "tg_open_bytes failed (not a PMTiles v3 archive?)\n";
+        g_src = tg_open_cell_bytes(raw, bytes.size());
+        mode = "s57-cell (live generation)";
+    }
+    if (!g_src) {
+        std::cerr << "could not open as PMTiles or S-57 cell\n";
         return 1;
     }
-    std::cerr << "tilegen source opened: zoom " << int(tg_min_zoom(g_src)) << ".."
-              << int(tg_max_zoom(g_src)) << "\n";
+    std::cerr << "tilegen source opened [" << mode << "]: zoom " << int(tg_min_zoom(g_src))
+              << ".." << int(tg_max_zoom(g_src)) << "\n";
 
     // Register the Zig source in the (unused) Mbtiles slot BEFORE the Map builds
     // its resource loader, so zigtiles:// requests route to it.
@@ -83,6 +91,7 @@ int main(int argc, char **argv) {
     map.getStyle().loadJSON(readFile(stylePath.c_str()));
     map.jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{lat, lon}).withZoom(zoom));
 
+    int rc = 0;
     try {
         auto result = frontend.render(map);
         std::ofstream out(outPath, std::ios::binary);
@@ -90,10 +99,11 @@ int main(int argc, char **argv) {
         std::cerr << "wrote " << outPath << "\n";
     } catch (const std::exception &e) {
         std::cerr << "render error: " << e.what() << "\n";
-        tg_close(g_src);
-        return 1;
+        rc = 1;
     }
-
-    tg_close(g_src);
-    return 0;
+    // Note: g_src outlives the Map (which holds ZigTileSource instances via the
+    // resource loader); we intentionally do NOT tg_close here. The process is
+    // exiting, so the OS reclaims it — closing first would be a use-after-free
+    // during Map teardown.
+    return rc;
 }
