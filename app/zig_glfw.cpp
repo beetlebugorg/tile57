@@ -122,11 +122,15 @@ int main(int argc, char **argv) {
             return std::make_unique<cpn::ZigTileSource>(g_src);
         });
 
-    // 4) Map in the default (Continuous) mode for interactivity — do NOT set
-    //    MapMode::Static (that's for one-shot headless renders). Use the
-    //    continuous-render observer (keeps the Metal layer from blanking on idle)
-    //    instead of the bare GLFWView.
-    ContinuousObserver observer(view);
+    // 4) Map in the default (Continuous) MapMode for interactivity. Observer:
+    //    on-demand (the bare GLFWView) by default; the continuous-render wrapper
+    //    only when CHART_CONTINUOUS is set — so we can isolate whether forcing a
+    //    render every frame is what triggers the per-frame tile re-request flood.
+    ContinuousObserver contObserver(view);
+    const bool continuous = std::getenv("CHART_CONTINUOUS") != nullptr;
+    std::cerr << "render: " << (continuous ? "continuous (CHART_CONTINUOUS)" : "on-demand") << "\n";
+    mbgl::MapObserver &observer =
+        continuous ? static_cast<mbgl::MapObserver &>(contObserver) : static_cast<mbgl::MapObserver &>(view);
     mbgl::Map map(rendererFrontend, observer,
                   mbgl::MapOptions().withSize(view.getSize()).withPixelRatio(view.getPixelRatio()),
                   resourceOptions, clientOptions);
