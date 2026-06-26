@@ -49,7 +49,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 
   combined="$tmp/tilegen_combined.o"
   # -r: relocatable (partial) link; undefined libc refs from Lua are fine here.
-  ld -r -o "$combined" "$tmp"/*.o
+  # The newer ld-prime has historically had `-r` gaps; fall back to the classic
+  # linker if the default one can't do the partial link.
+  if ! ld -r -o "$combined" "$tmp"/*.o 2>"$tmp/ld.err"; then
+    cat "$tmp/ld.err" >&2
+    echo "  [diag] ld -r failed; retrying with -ld_classic" >&2
+    ld -r -ld_classic -o "$combined" "$tmp"/*.o
+  fi
   dump_syms "post ld -r (combined object)" "$combined"
 
   "$LIBTOOL" -static -o "$LIB" "$combined"
