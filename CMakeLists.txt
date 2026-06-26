@@ -78,6 +78,7 @@ if(ZIG_EXECUTABLE)
   add_custom_target(chartplotter_lib ALL
     BYPRODUCTS ${CHARTPLOTTER_LIB}
     COMMAND ${CMAKE_COMMAND} -E env "ZIG=${ZIG_EXECUTABLE}"
+            "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/zig-build-lib.sh ReleaseFast
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Building libchartplotter.a (zig build + macOS archive re-pack)"
@@ -138,10 +139,10 @@ if(ZIG_EXECUTABLE)
       target_sources(chartplotter PRIVATE
         ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
         ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm)
-      # QuartzCore provides CATransaction / CAMetalLayer (our metal_backend.mm
-      # uses [CATransaction flush] + the CAMetalLayer.presentsWithTransaction
-      # property directly). Metal-cpp covers the C++ side but not these Obj-C
-      # class symbols.
+      # metal-cpp (mbgl-vendor-metal-cpp) is header-only and mbgl-core links Metal
+      # PRIVATE, so this target must link the Apple frameworks itself: QuartzCore
+      # for the CAMetalLayer / CALayer Obj-C class symbols our metal_backend.mm
+      # bridges to, plus Metal and Foundation for the metal-cpp objects.
       target_link_libraries(chartplotter PRIVATE mbgl-vendor-metal-cpp
         "-framework QuartzCore" "-framework Metal" "-framework Foundation")
     endif()

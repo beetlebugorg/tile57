@@ -19,11 +19,6 @@
 #include <Metal/Metal.hpp>
 #include <QuartzCore/CAMetalLayer.hpp>
 
-// Obj-C QuartzCore, for the one property metal-cpp does not expose
-// (CAMetalLayer.presentsWithTransaction). The metal-cpp CA::MetalLayer* IS the
-// underlying Obj-C object, so a __bridge cast reaches it.
-#import <QuartzCore/QuartzCore.h>
-
 namespace mbgl {
 
 using namespace mtl;

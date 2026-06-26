@@ -10,7 +10,20 @@ ZIG="${ZIG:-zig}"
 OPT="${1:-ReleaseFast}"
 
 cd "$ROOT/tilegen"
-"$ZIG" build "-Doptimize=$OPT"
+zbuild_args=("-Doptimize=$OPT")
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # Build the archive for the SAME macOS deployment target the C++ host uses
+  # (CMAKE_OSX_DEPLOYMENT_TARGET, forwarded as MACOSX_DEPLOYMENT_TARGET), so ld
+  # doesn't warn that our objects were built for a newer macOS than the host.
+  # Defaults to 14.3 (CMakePresets.json) when run outside CMake.
+  deptgt="${MACOSX_DEPLOYMENT_TARGET:-14.3}"
+  case "$(uname -m)" in
+    arm64 | aarch64) zarch=aarch64 ;;
+    *) zarch=x86_64 ;;
+  esac
+  zbuild_args+=("-Dtarget=${zarch}-macos.${deptgt}")
+fi
+"$ZIG" build "${zbuild_args[@]}"
 
 LIB="$ROOT/tilegen/zig-out/lib/libchartplotter.a"
 
