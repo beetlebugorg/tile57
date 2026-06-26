@@ -8,6 +8,7 @@
 #include "chartplotter.h"
 #include "chartplotter_diag.h"
 #include "chart_tile_source.hpp"
+#include "enc_root.hpp"
 
 #include <mbgl/gfx/backend.hpp>
 #include <mbgl/gfx/headless_frontend.hpp>
@@ -54,7 +55,7 @@ int main(int argc, char **argv) {
         return rc == 0 ? 0 : 1;
     }
     if (argc < 7) {
-        std::cerr << "usage: chartplotter-render <archive.pmtiles|cell.000> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]\n";
+        std::cerr << "usage: chartplotter-render <archive.pmtiles|cell.000|ENC_ROOT> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]\n";
         return 2;
     }
     const std::string archive = argv[1];
@@ -67,20 +68,18 @@ int main(int argc, char **argv) {
     const uint32_t height = argc > 8 ? std::strtoul(argv[8], nullptr, 10) : 768;
     const float ratio = argc > 9 ? std::strtof(argv[9], nullptr) : 1.0f;
 
-    // Read the archive bytes; libchartplotter copies what it keeps.
-    const std::string bytes = readFile(archive.c_str());
-    if (bytes.empty()) {
-        std::cerr << "could not read archive: " << archive << "\n";
-        return 1;
-    }
-    // AUTO: the library sniffs PMTiles, else opens it as an S-57 cell (live gen).
-    const auto *raw = reinterpret_cast<const uint8_t *>(bytes.data());
-    g_src = chartplotter_source_open(raw, bytes.size(), CHARTPLOTTER_FORMAT_AUTO, nullptr);
+    // Open the path: a file (PMTiles or one S-57 cell, auto-detected) or an
+    // ENC_ROOT directory (all base cells + their updates, overlaid). The host
+    // reads the bytes; libchartplotter copies what it keeps.
+    g_src = cpn::openPath(archive, nullptr);
     if (!g_src) {
-        std::cerr << "could not open as PMTiles or S-57 cell\n";
+        std::cerr << "could not open as ENC_ROOT, PMTiles, or S-57 cell: " << archive << "\n";
         return 1;
     }
-    const char *mode = chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
+    const char *mode = std::filesystem::is_directory(archive) ? "ENC_ROOT (live generation)"
+                       : chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES
+                           ? "pmtiles"
+                           : "s57-cell (live generation)";
     uint8_t minZoom = 0, maxZoom = 0;
     chartplotter_source_zoom_range(g_src, &minZoom, &maxZoom);
     std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";

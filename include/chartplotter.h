@@ -61,6 +61,26 @@ typedef enum {
 chartplotter_source *chartplotter_source_open(const uint8_t *data, size_t len,
                           chartplotter_format format, const char *rules_dir);
 
+/* One ENC cell for chartplotter_source_open_cells: the base .000 bytes plus its
+ * sequential update files (.001, .002, … in order). `updates`/`update_lens` are
+ * parallel arrays of length `update_count`; pass update_count = 0 (and NULL
+ * arrays) for a base-only cell. All bytes are copied. */
+typedef struct {
+    const uint8_t *base;
+    size_t base_len;
+    const uint8_t *const *updates;
+    const size_t *update_lens;
+    size_t update_count;
+} chartplotter_cell_input;
+
+/* Open an ENC_ROOT as a multi-cell source: every cell is overlaid when a tile is
+ * generated, so a region spanning several cells renders them all. The host scans
+ * the directory and reads the files (it owns file IO); this parses + portrays
+ * each cell. `rules_dir` is as in chartplotter_source_open. Returns an opaque
+ * handle, or NULL if no cell parses. Close with chartplotter_source_close. */
+chartplotter_source *chartplotter_source_open_cells(
+    const chartplotter_cell_input *cells, size_t count, const char *rules_dir);
+
 /* The resolved backend format (meaningful after a CHARTPLOTTER_FORMAT_AUTO open). */
 chartplotter_format chartplotter_source_format(chartplotter_source *src);
 

@@ -36,6 +36,7 @@ const CellBackend = struct {
 const Backend = union(enum) {
     reader: pmtiles.Reader,
     cell: CellBackend,
+    cells: []CellBackend, // ENC_ROOT: several cells, overlaid per tile
 };
 
 const Source = struct {
@@ -74,39 +75,100 @@ fn openPmtiles(copy: []u8) ?*Source {
     return src;
 }
 
-// Open a raw S-57 cell (reads `bytes` but does not take ownership — the cell
-// model copies what it keeps). Returns null if the bytes are not a valid cell.
-fn openCell(bytes: []const u8, rules_dir: ?[*:0]const u8) ?*Source {
+// Resolve the S-101 rules directory: explicit argument, else
+// CHARTPLOTTER_S101_RULES, else the vendored official catalogue (works when run
+// from the repo root).
+fn resolveRulesDir(rules_dir: ?[*:0]const u8) []const u8 {
+    if (rules_dir) |d| return std.mem.span(d);
+    if (tg_env_rules()) |dirz| return std.mem.span(dirz);
+    return "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+}
+
+// Parse + portray one S-57 cell into a CellBackend (no Source wrapper). Reads
+// `bytes` but does not take ownership (the cell model copies what it keeps).
+// Returns null if the bytes are not a valid cell. Portrayal failure is non-fatal
+// (the tile generator falls back to classify()).
+fn buildCellBackend(bytes: []const u8, dir: []const u8) ?CellBackend {
     const cell = s57.parseCell(gpa, bytes) catch return null;
+    var cb = CellBackend{ .cell = cell };
+    const pa = gpa.create(std.heap.ArenaAllocator) catch return cb;
+    pa.* = std.heap.ArenaAllocator.init(gpa);
+    if (portray.portrayCell(pa.allocator(), &cb.cell, dir)) |res| {
+        cb.portrayal = res;
+        cb.portray_arena = pa;
+    } else |_| {
+        pa.deinit();
+        gpa.destroy(pa);
+    }
+    return cb;
+}
+
+fn freeCellBackend(cb: *CellBackend) void {
+    cb.cell.deinit();
+    if (cb.portray_arena) |pa| {
+        pa.deinit();
+        gpa.destroy(pa);
+    }
+}
+
+// Open a single raw S-57 cell. Returns null if the bytes are not a valid cell.
+fn openCell(bytes: []const u8, rules_dir: ?[*:0]const u8) ?*Source {
+    var cb = buildCellBackend(bytes, resolveRulesDir(rules_dir)) orelse return null;
     const src = gpa.create(Source) catch {
-        var c = cell;
-        c.deinit();
+        freeCellBackend(&cb);
         return null;
     };
-    src.* = .{ .backend = .{ .cell = .{ .cell = cell } }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    src.* = .{ .backend = .{ .cell = cb }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    return src;
+}
 
-    // Optional S-101 portrayal: run the rules once and cache per-feature
-    // instruction streams. Rules dir precedence: explicit rules_dir argument,
-    // else CHARTPLOTTER_S101_RULES, else the vendored official catalogue
-    // (works when run from the repo root). Falls back to classify() on error.
-    {
-        const dir: []const u8 = if (rules_dir) |d|
-            std.mem.span(d)
-        else if (tg_env_rules()) |dirz|
-            std.mem.span(dirz)
-        else
-            "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
-        const pa = gpa.create(std.heap.ArenaAllocator) catch return src;
-        pa.* = std.heap.ArenaAllocator.init(gpa);
-        const cb = &src.backend.cell;
-        if (portray.portrayCell(pa.allocator(), &cb.cell, dir)) |res| {
-            cb.portrayal = res;
-            cb.portray_arena = pa;
-        } else |_| {
-            pa.deinit();
-            gpa.destroy(pa);
+// One ENC cell's bytes: the base .000 plus its sequential update files (.001…).
+// Mirrors chartplotter_cell_input in chartplotter.h.
+const CellInput = extern struct {
+    base: [*]const u8,
+    base_len: usize,
+    updates: ?[*]const [*]const u8,
+    update_lens: ?[*]const usize,
+    update_count: usize,
+};
+
+/// Open an ENC_ROOT as a multi-cell source: each input is a base cell (plus, in a
+/// later step, its updates). The cells are overlaid when a tile is generated.
+/// The host scans the directory and reads the files (it owns file IO); this just
+/// parses + portrays each cell. Returns null if no cell parses.
+export fn chartplotter_source_open_cells(
+    cells_ptr: [*]const CellInput,
+    count: usize,
+    rules_dir: ?[*:0]const u8,
+) callconv(.c) ?*Source {
+    const dir = resolveRulesDir(rules_dir);
+    var list = std.ArrayList(CellBackend).empty;
+    const inputs = cells_ptr[0..count];
+    for (inputs) |in| {
+        // TODO(go-sync): apply in.updates (.001…) before portrayal. For now the
+        // base cell is used; updates are parsed/applied in a follow-up.
+        if (buildCellBackend(in.base[0..in.base_len], dir)) |cb| {
+            list.append(gpa, cb) catch {
+                var c = cb;
+                freeCellBackend(&c);
+            };
         }
     }
+    if (list.items.len == 0) {
+        list.deinit(gpa);
+        return null;
+    }
+    const owned = list.toOwnedSlice(gpa) catch {
+        for (list.items) |*cb| freeCellBackend(cb);
+        list.deinit(gpa);
+        return null;
+    };
+    const src = gpa.create(Source) catch {
+        for (owned) |*cb| freeCellBackend(cb);
+        gpa.free(owned);
+        return null;
+    };
+    src.* = .{ .backend = .{ .cells = owned }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
     return src;
 }
 
@@ -141,7 +203,7 @@ export fn chartplotter_source_format(src: ?*Source) callconv(.c) c_int {
     const s = src orelse return @intFromEnum(Format.auto);
     return switch (s.backend) {
         .reader => @intFromEnum(Format.pmtiles),
-        .cell => @intFromEnum(Format.s57_cell),
+        .cell, .cells => @intFromEnum(Format.s57_cell),
     };
 }
 
@@ -149,12 +211,10 @@ export fn chartplotter_source_close(src: ?*Source) callconv(.c) void {
     const s = src orelse return;
     switch (s.backend) {
         .reader => |*r| r.deinit(),
-        .cell => |*cb| {
-            cb.cell.deinit();
-            if (cb.portray_arena) |pa| {
-                pa.deinit();
-                gpa.destroy(pa);
-            }
+        .cell => |*cb| freeCellBackend(cb),
+        .cells => |cbs| {
+            for (cbs) |*cb| freeCellBackend(cb);
+            gpa.free(cbs);
         },
     }
     var it = s.cache.valueIterator();
@@ -176,7 +236,7 @@ export fn chartplotter_source_zoom_range(src: ?*Source, min_z: *u8, max_z: *u8) 
             min_z.* = r.header.min_zoom;
             max_z.* = r.header.max_zoom;
         },
-        .cell => {
+        .cell, .cells => {
             min_z.* = 0;
             max_z.* = 18;
         },
@@ -202,6 +262,20 @@ export fn chartplotter_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n
             };
         },
         .cell => |*cb| b = cb.cell.bounds() orelse return false,
+        .cells => |cbs| {
+            var have = false;
+            var u: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }; // [w,s,e,n]
+            for (cbs) |*cb| {
+                const cbnd = cb.cell.bounds() orelse continue;
+                u[0] = @min(u[0], cbnd[0]);
+                u[1] = @min(u[1], cbnd[1]);
+                u[2] = @max(u[2], cbnd[2]);
+                u[3] = @max(u[3], cbnd[3]);
+                have = true;
+            }
+            if (!have) return false;
+            b = u;
+        },
     }
     // Reject degenerate (a point) or near-global bounds (likely unset/default).
     if (b[2] - b[0] <= 1e-9 or b[3] - b[1] <= 1e-9) return false;
@@ -241,6 +315,12 @@ export fn chartplotter_tile_get(
     const bytes: []u8 = switch (s.backend) {
         .reader => |*r| (r.getTile(gpa, z, x, y) catch return -1) orelse (gpa.alloc(u8, 0) catch return -1),
         .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -1,
+        .cells => |cbs| blk: {
+            const refs = gpa.alloc(s57_mvt.CellRef, cbs.len) catch return -1;
+            defer gpa.free(refs);
+            for (cbs, 0..) |*cb, i| refs[i] = .{ .cell = &cb.cell, .portrayal = cb.portrayal };
+            break :blk s57_mvt.generateTileMulti(gpa, refs, z, x, y) catch return -1;
+        },
     };
     s.cache.put(key, bytes) catch {}; // best-effort; cache owns `bytes` on success
     if (bytes.len == 0) return 0;

@@ -14,6 +14,7 @@
 
 #include "chartplotter.h"
 #include "chart_tile_source.hpp"
+#include "enc_root.hpp"
 
 #include "glfw_renderer_frontend.hpp"
 #include "glfw_view.hpp"
@@ -69,27 +70,25 @@ private:
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        std::cerr << "usage: chartplotter <archive.pmtiles|cell.000> <style.json> [lat lon zoom]\n";
+        std::cerr << "usage: chartplotter <archive.pmtiles|cell.000|ENC_ROOT> <style.json> [lat lon zoom]\n";
         return 2;
     }
     const std::string archive = argv[1];
     const std::string stylePath = argv[2];
     const bool cameraFromArgs = argc > 5;
 
-    // Open the archive in Zig (host owns the bytes). Try PMTiles first; fall
-    // back to a raw S-57 cell (live in-process generation).
-    const std::string bytes = readFile(archive.c_str());
-    if (bytes.empty()) {
-        std::cerr << "could not read archive: " << archive << "\n";
-        return 1;
-    }
-    const auto *raw = reinterpret_cast<const uint8_t *>(bytes.data());
-    g_src = chartplotter_source_open(raw, bytes.size(), CHARTPLOTTER_FORMAT_AUTO, nullptr);
+    // Open the path: a file (PMTiles or one S-57 cell, auto-detected) or an
+    // ENC_ROOT directory (all base cells + their updates, overlaid). The host
+    // reads the bytes; libchartplotter copies what it keeps.
+    g_src = cpn::openPath(archive, nullptr);
     if (!g_src) {
-        std::cerr << "could not open as PMTiles or S-57 cell: " << archive << "\n";
+        std::cerr << "could not open as ENC_ROOT, PMTiles, or S-57 cell: " << archive << "\n";
         return 1;
     }
-    const char *mode = chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
+    const char *mode = std::filesystem::is_directory(archive) ? "ENC_ROOT (live generation)"
+                       : chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES
+                           ? "pmtiles"
+                           : "s57-cell (live generation)";
     uint8_t minZoom = 0, maxZoom = 0;
     chartplotter_source_zoom_range(g_src, &minZoom, &maxZoom);
     std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";

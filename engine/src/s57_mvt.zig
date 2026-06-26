@@ -238,11 +238,22 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
     }
 }
 
-/// Generate MVT bytes (uncompressed) for tile (z,x,y) from `cell`.
+/// One cell plus its optional per-feature S-101 instruction streams.
+pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null };
+
+/// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
 /// `portrayal`, if given, is indexed by feature index and holds each feature's
 /// S-101 instruction stream (from the Lua engine); features with an instruction
 /// stream are styled by it, the rest fall back to classify().
 pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, portrayal: ?[]const ?[]const u8) ![]u8 {
+    const one = [_]CellRef{.{ .cell = cell, .portrayal = portrayal }};
+    return generateTileMulti(gpa, &one, z, x, y);
+}
+
+/// Generate MVT bytes (uncompressed) for tile (z,x,y) overlaying one or more
+/// cells (an ENC_ROOT). Each cell's features are appended into the shared layers,
+/// so a tile spanning several cells carries all of them.
+pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -258,18 +269,45 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
     var soundings = std.ArrayList(mvt.Feature).empty;
     const layers_ctx = Layers{ .areas = &areas, .area_patterns = &area_patterns, .lines = &lines, .points = &points, .texts = &texts };
 
+    for (cells) |cr| try appendCellFeatures(a, layers_ctx, &soundings, cr.cell, cr.portrayal, z, x, y, tb, box);
+
+    var layers = std.ArrayList(mvt.Layer).empty;
+    if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
+    if (area_patterns.items.len > 0) try layers.append(a, .{ .name = "area_patterns", .features = area_patterns.items });
+    if (lines.items.len > 0) try layers.append(a, .{ .name = "lines", .features = lines.items });
+    if (points.items.len > 0) try layers.append(a, .{ .name = "point_symbols", .features = points.items });
+    if (soundings.items.len > 0) try layers.append(a, .{ .name = "soundings", .features = soundings.items });
+    if (texts.items.len > 0) try layers.append(a, .{ .name = "text", .features = texts.items });
+    if (layers.items.len == 0) return gpa.alloc(u8, 0); // empty tile
+
+    return mvt.encode(gpa, .{ .layers = layers.items });
+}
+
+/// Append one cell's features for tile (z,x,y) into the shared layer lists.
+fn appendCellFeatures(
+    a: Allocator,
+    L: Layers,
+    soundings: *std.ArrayList(mvt.Feature),
+    cell: *s57.Cell,
+    portrayal: ?[]const ?[]const u8,
+    z: u8,
+    x: u32,
+    y: u32,
+    tb: [4]f64,
+    box: tile.Box,
+) !void {
     for (cell.features, 0..) |f, fi| {
         // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
         // the `soundings` layer (the flat S-101 instruction stream can't carry
         // per-sounding geometry). Bypasses the portrayal/classify dispatch.
         if (f.objl == 129) {
-            try emitSoundings(a, cell.*, f, z, x, y, tb, &soundings);
+            try emitSoundings(a, cell.*, f, z, x, y, tb, soundings);
             continue;
         }
         // S-101 portrayal path: style this feature from its instruction stream.
         if (portrayal) |pp| {
             if (fi < pp.len) if (pp[fi]) |instr| {
-                try emitFromInstr(a, cell.*, f, instr, z, x, y, tb, box, layers_ctx);
+                try emitFromInstr(a, cell.*, f, instr, z, x, y, tb, box, L);
                 continue;
             };
         }
@@ -296,7 +334,7 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
                 try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
                 if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
                 if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
-                try areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
+                try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
             } else {
                 const sub = try tile.clipLine(a, proj, box);
                 if (sub.len == 0) continue;
@@ -306,21 +344,10 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
                 lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
                 lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
                 lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
-                try lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
+                try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
             }
         }
     }
-
-    var layers = std.ArrayList(mvt.Layer).empty;
-    if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
-    if (area_patterns.items.len > 0) try layers.append(a, .{ .name = "area_patterns", .features = area_patterns.items });
-    if (lines.items.len > 0) try layers.append(a, .{ .name = "lines", .features = lines.items });
-    if (points.items.len > 0) try layers.append(a, .{ .name = "point_symbols", .features = points.items });
-    if (soundings.items.len > 0) try layers.append(a, .{ .name = "soundings", .features = soundings.items });
-    if (texts.items.len > 0) try layers.append(a, .{ .name = "text", .features = texts.items });
-    if (layers.items.len == 0) return gpa.alloc(u8, 0); // empty tile
-
-    return mvt.encode(gpa, .{ .layers = layers.items });
 }
 
 test "SNDFRM04 digit composition matches the Lua rule" {
