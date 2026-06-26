@@ -41,6 +41,12 @@ int tg_get_tile(tg_source *src, uint8_t z, uint32_t x, uint32_t y,
 
 void tg_free(uint8_t *ptr, size_t len);
 
+/* Embedded Lua (S-101 portrayal). tg_lua_selftest runs a trivial chunk and
+ * returns 42 on success (negative on error); tg_lua_version returns e.g.
+ * "Lua 5.4". Proves the interpreter is embedded and linked. */
+long tg_lua_selftest(void);
+const char *tg_lua_version(void);
+
 #ifdef __cplusplus
 }
 #endif

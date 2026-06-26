@@ -70,6 +70,8 @@ int main(int argc, char **argv) {
     }
     std::cerr << "tilegen source opened [" << mode << "]: zoom " << int(tg_min_zoom(g_src))
               << ".." << int(tg_max_zoom(g_src)) << "\n";
+    std::cerr << "embedded " << tg_lua_version() << " self-test: " << tg_lua_selftest()
+              << " (expect 42)\n";
 
     // Register the Zig source in the (unused) Mbtiles slot BEFORE the Map builds
     // its resource loader, so zigtiles:// requests route to it.

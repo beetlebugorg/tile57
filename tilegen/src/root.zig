@@ -16,11 +16,7 @@ pub const tile = @import("tile.zig");
 pub const iso8211 = @import("iso8211.zig");
 pub const s57 = @import("s57.zig");
 pub const s57_mvt = @import("s57_mvt.zig");
-pub const capi = @import("capi.zig"); // C ABI exports for libtilegen.a
-
-comptime {
-    _ = capi; // force the export fns into the static library
-}
+// capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {
     _ = mvt;

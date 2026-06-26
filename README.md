@@ -21,7 +21,7 @@ MapLibre Native in a desktop window, with platform chrome (SwiftUI / GTK4) to co
 | M4 | Zig MVT + gzip + PMTiles + projection/clip, differential-tested vs Go | ✅ done |
 | M5 | Live in-process tile generation (`libtilegen.a` + custom `FileSource`) | ✅ done |
 | M6a–c | Zig ISO 8211 + S-57 decode + topology → **live cell→MVT→MapLibre** (crude portrayal) | ✅ done |
-| M6d | S-57 attributes + embedded-Lua **S-101 portrayal** → full S-52 fidelity from live gen | next |
+| M6d | S-57 attributes (✅) + embedded-Lua (✅ Lua 5.4) **S-101 portrayal** → full S-52 from live gen | 🔄 in progress |
 
 See **[docs/PLAN.md](docs/PLAN.md)** for the architecture and **[docs/BUILD.md](docs/BUILD.md)**
 for build/run instructions.
@@ -59,6 +59,12 @@ sudo pacman -S --needed cmake ninja clang python-pillow \
 sudo pacman -S --needed ccache
 ```
 
+**Zig 0.16.0** — only needed for the Zig tile generator (`tilegen/`, used by the
+live-generation host `chartshot-zig`). Not required for the PMTiles paths above.
+Install from [ziglang.org/download](https://ziglang.org/download/) (pin 0.16.0)
+and put it on `PATH`; CMake finds it automatically. Lua 5.4 is vendored under
+`tilegen/vendor/lua` and built into `libtilegen.a` (no system Lua needed).
+
 ### 2. Generate the reference data (tiles + assets + styles)
 
 Builds the Go binary's output the app needs (assets, a baked `annapolis.pmtiles`,
@@ -95,3 +101,21 @@ build-macos-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw \
 Drag pans, scroll zooms. Swap `chart-day.json` for `chart-dusk.json` /
 `chart-night.json`. The first `mbgl-core` build is large (~15 min on 8 cores;
 `ccache` makes rebuilds fast).
+
+### 3c. Live Zig generation → PNG (tiles generated from a raw S-57 cell)
+
+Renders straight from a `.000` ENC cell — no pre-baked PMTiles — using the Zig
+tile generator (`libtilegen.a`) behind a custom MapLibre `FileSource`. Requires
+Zig (see prerequisites).
+
+```sh
+ninja -C build chartshot-zig        # or build-macos; builds libtilegen.a via zig
+build/chartshot-zig \
+  ../chartplotter-go/testdata/US4MD81M.000 \  # a raw S-57 cell (or a .pmtiles)
+  style/chart-zig-day.json \                  # zigtiles:// source
+  38.97 -76.49 12 renders/from_cell.png
+```
+
+`chartshot-zig` auto-detects a PMTiles archive vs a raw S-57 cell. Portrayal is
+currently a crude object-class→color map (S-101 Lua rules are in progress);
+depth shading from DRVAL1/2 already works.
