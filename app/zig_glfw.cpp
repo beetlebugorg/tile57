@@ -126,11 +126,16 @@ int main(int argc, char **argv) {
     //    on-demand (the bare GLFWView) by default; the continuous-render wrapper
     //    only when CHART_CONTINUOUS is set — so we can isolate whether forcing a
     //    render every frame is what triggers the per-frame tile re-request flood.
+    // Present EVERY frame by default: on a ProMotion display the refresh rate
+    // only stays steady (no flicker/judder) if a drawable is presented each
+    // frame — MapLibre's macOS SDK gets this from MTKView's CADisplayLink; the
+    // GLFW backend renders on-demand, so we drive it continuously instead.
+    // (CHART_ONDEMAND falls back to on-demand for comparison.)
     ContinuousObserver contObserver(view);
-    const bool continuous = std::getenv("CHART_CONTINUOUS") != nullptr;
-    std::cerr << "render: " << (continuous ? "continuous (CHART_CONTINUOUS)" : "on-demand") << "\n";
+    const bool onDemand = std::getenv("CHART_ONDEMAND") != nullptr;
+    std::cerr << "render: " << (onDemand ? "on-demand (CHART_ONDEMAND)" : "continuous (present every frame)") << "\n";
     mbgl::MapObserver &observer =
-        continuous ? static_cast<mbgl::MapObserver &>(contObserver) : static_cast<mbgl::MapObserver &>(view);
+        onDemand ? static_cast<mbgl::MapObserver &>(view) : static_cast<mbgl::MapObserver &>(contObserver);
     mbgl::Map map(rendererFrontend, observer,
                   mbgl::MapOptions().withSize(view.getSize()).withPixelRatio(view.getPixelRatio()),
                   resourceOptions, clientOptions);

@@ -35,17 +35,13 @@ public:
         commandQueue(NS::TransferPtr(backend.getDevice()->newCommandQueue())),
         swapchain(NS::TransferPtr(CA::MetalLayer::layer())) {
     swapchain->setDevice(backend.getDevice().get());
-    // *** PATCH: block for a drawable instead of returning nil under load, so a
-    // missing drawable never blanks the frame. ***
+    // Triple-buffered, async present — matches MapLibre's macOS SDK
+    // (MLNMapView+Metal) and the Zed 120fps findings. Smoothness comes from
+    // presenting EVERY frame (the host renders continuously) so the ProMotion
+    // display holds a steady refresh, NOT from presentsWithTransaction (which
+    // stalls on a non-CADisplayLink loop) or per-frame GPU waits.
     swapchain->setMaximumDrawableCount(3);
     swapchain->setAllowsNextDrawableTimeout(false);
-    // *** PATCH (the canonical macOS Metal flicker fix, per Apple's CAMetalLayer
-    // docs / "Glitchless Metal Window Resizing"): present the drawable
-    // SYNCHRONOUSLY within the CoreAnimation transaction instead of the async
-    // commandBuffer->presentDrawable(). Eliminates the tearing/flicker on fast
-    // pan/zoom and resize. The matching present sequence is in swap(). metal-cpp
-    // doesn't expose this property, so set it on the Obj-C CAMetalLayer. ***
-    ((__bridge CAMetalLayer *)swapchain.get()).presentsWithTransaction = YES;
   }
 
   void setBackendSize(mbgl::Size size_) {
@@ -112,22 +108,14 @@ public:
   }
 
   void swap() override {
-    // *** PATCH: presentsWithTransaction present sequence (Apple-documented Metal
-    // flicker fix). Do NOT use commandBuffer->presentDrawable() (that's the async
-    // path). Instead commit, wait until the command buffer is SCHEDULED, then
-    // present the drawable synchronously — so the swap happens inside the same
-    // CoreAnimation transaction as the layout, with no tearing/flicker. ***
-    commandBuffer->commit();
+    // Async present (presentDrawable + commit), exactly like MapLibre's macOS
+    // MLNMapView+Metal swap(). No presentsWithTransaction / waitUntil* — those
+    // stall on the GLFW (non-CADisplayLink) loop. Display smoothness comes from
+    // the host presenting every frame.
     if (surface) {
-      commandBuffer->waitUntilScheduled();
-      surface->present();
-      // presentsWithTransaction queues the present to the current CoreAnimation
-      // transaction, which is normally committed by the main CFRunLoop. The GLFW
-      // libuv loop never commits it promptly, so the present defers, drawables
-      // don't free, and the next nextDrawable() blocks for hundreds of ms (2-8
-      // fps with wildly varying frame times). Flush commits the transaction now.
-      [CATransaction flush];
+      commandBuffer->presentDrawable(surface.get());
     }
+    commandBuffer->commit();
     commandBuffer.reset();
     renderPassDescriptor.reset();
     surface.reset();

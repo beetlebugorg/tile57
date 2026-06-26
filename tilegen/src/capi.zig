@@ -34,7 +34,16 @@ const Backend = union(enum) {
 const Source = struct {
     backend: Backend,
     data: ?[]u8, // owned archive bytes (PMTiles backend only)
+    // In-memory tile cache (key = z<<48|x<<24|y -> MVT bytes). The host renders
+    // continuously and MapLibre re-requests tiles, so without this every frame
+    // would re-decode (PMTiles) or re-generate (cell) the same tiles. Values are
+    // owned here; tg_get_tile returns a fresh copy the caller frees.
+    cache: std.AutoHashMap(u64, []u8),
 };
+
+fn tileKey(z: u8, x: u32, y: u32) u64 {
+    return (@as(u64, z) << 48) | (@as(u64, x) << 24) | @as(u64, y);
+}
 
 /// Open a PMTiles archive from in-memory bytes. Returns a handle or null.
 export fn tg_open_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*Source {
@@ -49,7 +58,7 @@ export fn tg_open_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*S
         gpa.free(copy);
         return null;
     };
-    src.* = .{ .backend = .{ .reader = reader }, .data = copy };
+    src.* = .{ .backend = .{ .reader = reader }, .data = copy, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
     return src;
 }
 
@@ -62,7 +71,7 @@ export fn tg_open_cell_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c
         c.deinit();
         return null;
     };
-    src.* = .{ .backend = .{ .cell = .{ .cell = cell } }, .data = null };
+    src.* = .{ .backend = .{ .cell = .{ .cell = cell } }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
 
     // Optional S-101 portrayal: if a rules directory is set, run the rules once
     // and cache per-feature instruction streams. Falls back to classify() if
@@ -101,6 +110,9 @@ export fn tg_close(src: ?*Source) callconv(.c) void {
             }
         },
     }
+    var it = s.cache.valueIterator();
+    while (it.next()) |v| gpa.free(v.*);
+    s.cache.deinit();
     if (s.data) |d| gpa.free(d);
     gpa.destroy(s);
 }
@@ -162,16 +174,28 @@ export fn tg_get_tile(
     out_len: *usize,
 ) callconv(.c) c_int {
     const s = src orelse return -1;
-    const bytes = switch (s.backend) {
-        .reader => |*r| (r.getTile(gpa, z, x, y) catch return -2) orelse return 0,
+    const key = tileKey(z, x, y);
+
+    // Cache hit: hand back a fresh copy (empty slice cached == empty tile).
+    if (s.cache.get(key)) |cached| {
+        if (cached.len == 0) return 0;
+        const dup = gpa.dupe(u8, cached) catch return -2;
+        out.* = dup.ptr;
+        out_len.* = dup.len;
+        return 1;
+    }
+
+    // Miss: generate/decode once, then cache the canonical bytes (even empty, so
+    // empty tiles aren't recomputed every frame).
+    const bytes: []u8 = switch (s.backend) {
+        .reader => |*r| (r.getTile(gpa, z, x, y) catch return -2) orelse (gpa.alloc(u8, 0) catch return -2),
         .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -2,
     };
-    if (bytes.len == 0) {
-        gpa.free(bytes);
-        return 0;
-    }
-    out.* = bytes.ptr;
-    out_len.* = bytes.len;
+    s.cache.put(key, bytes) catch {}; // best-effort; cache owns `bytes` on success
+    if (bytes.len == 0) return 0;
+    const dup = gpa.dupe(u8, bytes) catch return -2;
+    out.* = dup.ptr;
+    out_len.* = dup.len;
     return 1;
 }
 
