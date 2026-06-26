@@ -47,6 +47,11 @@ int main(int argc, char **argv) {
         std::cerr << (rc == 0 ? "S-101 framework: run OK\n" : "S-101 framework: run FAILED\n");
         return rc == 0 ? 0 : 1;
     }
+    if (argc >= 3 && std::string(argv[1]) == "--s101portray") {
+        int rc = tg_lua_portray_demo(argv[2]);
+        std::cerr << (rc == 0 ? "S-101 portray: OK\n" : "S-101 portray: FAILED\n");
+        return rc == 0 ? 0 : 1;
+    }
     if (argc < 7) {
         std::cerr << "usage: chartshot-zig <archive.pmtiles> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]\n";
         return 2;

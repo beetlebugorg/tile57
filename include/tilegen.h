@@ -56,6 +56,11 @@ int tg_lua_check_rules(const char *dir);
  * it executes (not just loads) in embedded Lua. Returns 0 on success. */
 int tg_lua_run_framework(const char *dir);
 
+/* Run the real DepthArea rule against a synthetic feature with a minimal
+ * hardcoded catalogue; prints the emitted S-101 instruction stream to stderr.
+ * Returns 0 on success. Proof-of-portrayal before the full Host binding. */
+int tg_lua_portray_demo(const char *dir);
+
 #ifdef __cplusplus
 }
 #endif

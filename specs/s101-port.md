@@ -65,6 +65,11 @@ re-port them. Lua 5.4 is embedded in `libtilegen.a` (proven working).
 - S-101 framework **loads** in 5.4 (`--s101check`).
 - S-101 framework **executes** in 5.4 with stub Host callbacks + empty features
   (`--s101run` -> FeaturePortrayalItems=0). Runtime is 5.4-compatible.
+- **Real S-101 rule proven end to end** (`--s101portray`): the actual
+  `DepthArea`/`DEPARE03` rule, with a minimal hardcoded catalogue + one
+  synthetic feature + the 13 context parameters + spatial glue, emits correct
+  S-52 instructions: `ColorFill:DEPMS; AreaFillReference:DIAMOND1;
+  AlertReference:SafetyContour; ...`. The whole portrayal path works.
 - classify() placeholder in s57_mvt.zig covers DEPARE/LNDARE/COALNE/DEPCNT/etc.
   with live depth shading.
 
