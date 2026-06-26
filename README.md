@@ -25,16 +25,72 @@ MapLibre Native in a desktop window, with platform chrome (SwiftUI / GTK4) to co
 See **[docs/PLAN.md](docs/PLAN.md)** for the architecture and **[docs/BUILD.md](docs/BUILD.md)**
 for build/run instructions.
 
-## Quick start
+## Build
+
+Full details (presets, env knobs, troubleshooting) live in
+**[docs/BUILD.md](docs/BUILD.md)**. The short version:
+
+### 0. Get the code + MapLibre Native
 
 ```sh
-# 1. reference data (needs the Go binary) — see docs/BUILD.md
-# 2. headless render to PNG (no display needed)
-cmake --preset headless && ninja -C build mbgl-render
-OUT="$PWD/renders/annapolis.png" LAT=38.978 LON=-76.482 ZOOM=14 RATIO=2 bash scripts/chartshot.sh
+git clone <this-repo> chartplotter-native
+cd chartplotter-native
+git submodule update --init --recursive     # MapLibre Native (~1.6 GB)
+```
 
-# 3. interactive window (Wayland desktop)
-cmake --preset desktop && ninja -C build-desktop mbgl-glfw
-build-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw \
+Also check out the Go reference repo as a sibling (`../chartplotter-go`) — it
+supplies the tiles + S-52 assets the app renders.
+
+### 1. Prerequisites
+
+**macOS** (Apple Silicon or Intel):
+```sh
+xcode-select --install                       # Clang + Metal
+brew install cmake ninja libuv
+pip3 install Pillow                           # for the sprite builder
+```
+
+**Linux** (Arch shown; adapt for your distro):
+```sh
+sudo pacman -S --needed cmake ninja clang python-pillow \
+  glfw wayland libxkbcommon libepoxy        # glfw+wayland only for the window
+# optional but recommended for fast rebuilds:
+sudo pacman -S --needed ccache
+```
+
+### 2. Generate the reference data (tiles + assets + styles)
+
+Builds the Go binary's output the app needs (assets, a baked `annapolis.pmtiles`,
+sprite sheet, and the styles). Requires `../chartplotter-go` with its prebuilt
+`dist/` binaries (or run `make build` there first):
+
+```sh
+scripts/gen-reference.sh                      # picks the right Go binary for your OS/arch
+```
+
+### 3a. Headless render → PNG (no display needed; good for CI / verifying)
+
+```sh
+# macOS:                          Linux:
+cmake --preset macos              # cmake --preset headless
+ninja -C build-macos mbgl-render  # ninja -C build mbgl-render
+
+OUT="$PWD/renders/annapolis.png" LAT=38.978 LON=-76.482 ZOOM=14 RATIO=2 \
+  bash scripts/chartshot.sh        # chartshot.sh finds whichever build dir exists
+```
+
+### 3b. Interactive window → pan/zoom
+
+```sh
+# macOS (Metal):                          Linux (Wayland):
+cmake --preset macos-desktop              # cmake --preset desktop
+ninja -C build-macos-desktop mbgl-glfw    # ninja -C build-desktop mbgl-glfw
+
+# run it (path is <build>/vendor/maplibre-native/platform/glfw/mbgl-glfw):
+build-macos-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw \
   -s style/chart-day.json -x -76.482 -y 38.978 -z 14
 ```
+
+Drag pans, scroll zooms. Swap `chart-day.json` for `chart-dusk.json` /
+`chart-night.json`. The first `mbgl-core` build is large (~15 min on 8 cores;
+`ccache` makes rebuilds fast).
