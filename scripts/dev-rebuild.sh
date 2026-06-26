@@ -13,8 +13,15 @@ for d in build build-macos build-desktop build-macos-desktop; do
   [[ -d "$ROOT/$d" ]] && BUILD="$d" && break
 done
 
-echo "==> regenerating styles" >&2
-"$ROOT/scripts/gen-style.sh"
+# Reference data (tiles + assets) is gitignored and regenerated per machine. If
+# it's missing, generate it from the Go binary; otherwise just refresh styles.
+if [[ ! -f "$ROOT/reference/assets/colortables.json" ]]; then
+  echo "==> reference data missing — generating tiles + assets (needs ../chartplotter-go)" >&2
+  "$ROOT/scripts/gen-reference.sh"
+else
+  echo "==> regenerating styles" >&2
+  "$ROOT/scripts/gen-style.sh"
+fi
 
 if [[ -n "$BUILD" ]]; then
   echo "==> reconfiguring (picks up CMake/new-file changes)" >&2
