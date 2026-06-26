@@ -66,9 +66,10 @@ if(ZIG_EXECUTABLE)
   # stale after a pull. Running unconditionally is cheap and always correct.
   add_custom_target(tilegen_lib ALL
     BYPRODUCTS ${TILEGEN_LIB}
-    COMMAND ${ZIG_EXECUTABLE} build -Doptimize=ReleaseFast
-    WORKING_DIRECTORY ${TILEGEN_DIR}
-    COMMENT "Building libtilegen.a (zig build, self-cached)"
+    COMMAND ${CMAKE_COMMAND} -E env "ZIG=${ZIG_EXECUTABLE}"
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/zig-build-lib.sh ReleaseFast
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Building libtilegen.a (zig build + macOS archive re-pack)"
     VERBATIM)
 
   add_executable(chartshot-zig app/zig_render.cpp app/zig_tile_source.cpp)
