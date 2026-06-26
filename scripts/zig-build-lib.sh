@@ -16,6 +16,10 @@ LIB="$ROOT/tilegen/zig-out/lib/libtilegen.a"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "==> re-packing $LIB for macOS ld alignment" >&2
+  if command -v nm >/dev/null; then
+    echo "  [diag] pre-repack symbols (zig-built archive):" >&2
+    nm "$LIB" 2>/dev/null | grep -iE 'tg_open_bytes|tg_close|tg_lua_version' | head >&2 || echo "  (none)" >&2
+  fi
   # Apple's ld64 rejects archive members that aren't 8-byte aligned, and Zig's
   # archive isn't. Feeding the archive back to libtool only copies the bad
   # members (it warns + drops them). The fix is to EXTRACT the objects and
