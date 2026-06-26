@@ -119,27 +119,44 @@ the full FeatureCatalogue.xml + all classes.
 
 ## Live-generation layer parity (status 2026-06-26)
 
-The headless + GLFW hosts work; the live path (`tilegen/src/s57_mvt.zig`
-`generateTile`/`emitFromInstr`) currently emits **4 of the 11** MVT layers the Go
-baker produces, so a live-rendered cell is sparser than a Go-baked one.
+The live path (`tilegen/src/s57_mvt.zig`) now emits **areas, area_patterns,
+lines, point_symbols, soundings, text** — the visible content roughly matches a
+Go-baked render (depth shading, soundings at correct size, symbols, dashed
+leading lines, patterned dredged/foul areas). The remaining `_scamin` /
+`complex_lines_scamin` source-layers are SCAMIN *declutter* splits, not missing
+data: those features still render via the base layers (decluttering is the
+deferred SCAMIN-gating item).
 
-Emitted live: `areas`, `lines`, `point_symbols`, `text`.
-Missing live (Go baker has them): `soundings`, `sector_lines`, `area_patterns`,
-`areas_scamin`, `lines_scamin`, `complex_lines_scamin` (+ `area_patterns_scamin`).
+**Fixed 2026-06-26 (this session):**
+- Geometry assembly (`Cell.lineGeometryParts`) — disjoint rings/parts were
+  joined by a spurious straight jump (CTNARE etc.) drawn as long crossing lines.
+  Now split into connected parts (reverse-aware).
+- Line styling — complex/named line styles (NAVLNE/RECTRC leading lines, CTNARE
+  limits) now render dashed, not bold solid.
+- Soundings — SOUNDG multipoint depths (SNDFRM04 digit composition). See item 1.
+- Area fill patterns — AreaFillReference -> `area_patterns` layer.
+- Symbol/sounding scale — was `0.08` (icon-size 1.0, ~2.8x too big); now the
+  baker's `SYMBOL_SCALE` (0.02834627777, icon-size ~0.354).
+- Test cells re-fetchable: `https://charts.noaa.gov/ENCs/US5MD1MC.zip` (+ US4MD81M).
 
-**Fixed 2026-06-26:** area/line geometry assembly (`Cell.lineGeometryParts`) —
-disjoint rings/parts were joined by a spurious straight jump (CTNARE caution
-areas etc.) drawn as long lines crossing the chart. Now split into connected
-parts (reverse-aware). Verified against `US5MD1MC.000` (re-fetchable from
-`https://charts.noaa.gov/ENCs/US5MD1MC.zip`; also US4MD81M).
+**BIGGEST REMAINING GAP — feature-name text.** Only ~41/3156 features emit any
+TextInstruction; the rest are *names*, which come from the `featureName` COMPLEX
+attribute the adapter doesn't synthesize. The framework's contract (reverse-
+engineered from PortrayalAPI.lua LookupAttributeValue):
+  1. `featureName` must be in the feature's TypeInfo `AttributeBindings`
+     (catalogue: `HostGetFeatureTypeInfo`) AND known as a complex attribute with
+     a `name` sub-attribute (`HostGetComplexAttributeTypeInfo`).
+  2. `HostFeatureGetComplexAttributeCount(id, '', 'featureName')` -> 1 when the
+     feature has OBJNAM (code 116).
+  3. `HostFeatureGetSimpleAttribute(id, 'featureName:1', 'name')` -> the OBJNAM
+     value (path is `AttributeCode:Index` of the parent complex value).
+Implement in `s101_adapt` (synthesize a featureName complex attr from OBJNAM) +
+`lua_shim.c` (`lp_feature_complex_*`, currently `HostFeatureGetComplexAttribute
+Count` = l_zero) + ensure `catalogue.json` binds `featureName`. Also drives
+light characteristics and other name-derived labels.
 
 Next live-gen work, ranked by visual impact:
-0. **NAVLNE/RECTRC styling + symbol scale** (visible now in live renders):
-   navigation lines (objl 85) + recommended tracks (objl 109) are real long
-   leading lines but render as bold solid strokes — S-52 wants thin dashed.
-   Live point symbols hardcode `scale=0.08` in `s57_mvt.emitFromInstr`, so every
-   icon draws at size 1.0; use the PointInstruction's own scale instead (live
-   buoys look oversized vs the Go baker).
+0. **feature-name text** — see "BIGGEST REMAINING GAP" above.
 1. **soundings** — DONE 2026-06-26. `s57.Cell.soundingsFor` gathers a SOUNDG
    feature's SG3D multipoint; `s57_mvt.sndfrmSyms` ports SNDFRM04's core digit
    composition; each sounding is emitted into the `soundings` layer with
