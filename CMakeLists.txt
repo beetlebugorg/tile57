@@ -2,6 +2,16 @@ cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
 
 project(chartplotter_native LANGUAGES C CXX)
 
+# On Apple, the Metal backend + GLFW Metal glue (glfw_metal_backend.mm,
+# metal_backend.mm, glfw_apple_init.mm) are Objective-C++. The top-level
+# project() language set governs the whole tree, so enable OBJC/OBJCXX here or
+# CMake has no rule to compile .mm files (CMAKE_OBJCXX_COMPILE_OBJECT unset).
+# Linux is untouched (it compiles the .cpp GL backend, no .mm).
+if(APPLE)
+  enable_language(OBJC)
+  enable_language(OBJCXX)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
