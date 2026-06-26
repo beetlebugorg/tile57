@@ -16,8 +16,8 @@ real-world navigation.** See [Known limitations](./limitations.md).
 
 :::
 
-**chartplotter-native** is a native desktop marine chart canvas. A **Zig tile
-generator** turns official NOAA S-57 ENC cells into S-52 vector tiles, and
+**chartplotter-native** generates **marine chart tiles** natively. A **Zig tile
+generator** turns official NOAA S-57 ENC cells into S-52 marine chart tiles, and
 **[MapLibre Native](https://github.com/maplibre/maplibre-native)** (the C++
 renderer) draws them in a real window — Metal on macOS, OpenGL/EGL on Linux.
 

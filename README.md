@@ -1,8 +1,8 @@
 <h1 align="center">chartplotter-native</h1>
 
 <p align="center">
-  <b>⚓ A native marine chart canvas — Zig tiles, MapLibre Native.</b><br>
-  Render official NOAA S-57 ENC charts in a desktop window, generated live by a Zig tile engine.
+  <b>⚓ Marine chart tiles, generated natively in Zig.</b><br>
+  A Zig engine turns NOAA S-57 ENC cells into S-52 marine chart tiles, drawn live by MapLibre Native (Metal / OpenGL) in a desktop window.
 </p>
 
 <p align="center">
@@ -22,13 +22,14 @@
 
 ---
 
-**chartplotter-native** draws S-52 nautical charts in a real desktop window.
-A **Zig tile generator** (`libchartplotter.a`) turns NOAA **S-57** ENC cells into
-S-52 vector tiles — running the official IHO **S-101 Portrayal Catalogue** in
-embedded Lua — and **[MapLibre Native](https://github.com/maplibre/maplibre-native)**
-draws them (Metal on macOS, OpenGL/EGL on Linux). Tiles are generated live and
-in-process behind a custom MapLibre `FileSource`, so it renders straight from a raw
-`.000` cell; reading a pre-baked PMTiles archive works too.
+**chartplotter-native** generates **marine chart tiles** natively and draws them
+in a real desktop window. A **Zig tile generator** (`libchartplotter.a`) turns
+NOAA **S-57** ENC cells into S-52 marine chart tiles — running the official IHO
+**S-101 Portrayal Catalogue** in embedded Lua — and
+**[MapLibre Native](https://github.com/maplibre/maplibre-native)** draws them
+(Metal on macOS, OpenGL/EGL on Linux). Tiles are generated live and in-process
+behind a custom MapLibre `FileSource`, so it renders straight from a raw `.000`
+cell; reading a pre-baked PMTiles archive works too.
 
 It is the native sibling of
 [**chartplotter-go**](https://github.com/beetlebugorg/chartplotter), which bakes the

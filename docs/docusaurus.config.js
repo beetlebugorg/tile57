@@ -4,7 +4,7 @@ import {themes as prismThemes} from 'prism-react-renderer';
 /** @type {import('@docusaurus/types').Config} */
 const config = {
   title: 'chartplotter-native',
-  tagline: '⚓ An S-52 marine chart canvas — Zig tiles, MapLibre Native.',
+  tagline: '⚓ Marine chart tiles, generated natively in Zig.',
 
   url: 'https://beetlebugorg.github.io',
   baseUrl: '/chartplotter-native/',
