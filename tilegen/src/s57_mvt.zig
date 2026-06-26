@@ -24,7 +24,7 @@ fn classify(objl: u16) Class {
         119 => .{ .kind = .area, .name = "BUAARE", .color = "CHBRN" }, // built-up area
         30 => .{ .kind = .line, .name = "COALNE", .color = "CSTLN" }, // coastline
         122 => .{ .kind = .line, .name = "SLCONS", .color = "CSTLN" }, // shoreline construction
-        74 => .{ .kind = .line, .name = "DEPCNT", .color = "DEPCN", .dash = "solid" }, // depth contour
+        43 => .{ .kind = .line, .name = "DEPCNT", .color = "DEPCN", .dash = "solid" }, // depth contour (74 is LNDMRK)
         53 => .{ .kind = .line, .name = "DYKCON", .color = "CSTLN" },
         else => .{ .kind = .skip, .name = "", .color = "" },
     };
@@ -49,28 +49,50 @@ fn geomBounds(g: []const s57.LonLat) [4]f64 {
 /// ColorFill become `areas` polygons (color_token already depth-resolved by the
 /// rule); curves with LineInstructions become `lines`. (Patterns / points /
 /// text grow here next.)
-fn emitFromInstr(
-    a: Allocator,
-    cell: s57.Cell,
-    f: s57.Feature,
-    instr: []const u8,
-    z: u8,
-    x: u32,
-    y: u32,
-    tb: [4]f64,
-    box: tile.Box,
+const Layers = struct {
     areas: *std.ArrayList(mvt.Feature),
     lines: *std.ArrayList(mvt.Feature),
-) !void {
+    points: *std.ArrayList(mvt.Feature),
+    texts: *std.ArrayList(mvt.Feature),
+};
+
+fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     const p = try s101.parse(a, instr);
+
+    // Point features (buoys/beacons/lights/landmarks/soundings): symbols + text
+    // placed at the feature's node.
+    if (f.prim == 1) {
+        const pg = cell.pointGeometry(f) orelse return;
+        if (pg.lon < tb[0] or pg.lon > tb[2] or pg.lat < tb[1] or pg.lat > tb[3]) return;
+        const pt = tile.project(pg.lon, pg.lat, z, x, y, tile.EXTENT);
+        const parts = try a.alloc([]const mvt.Point, 1);
+        const single = try a.alloc(mvt.Point, 1);
+        single[0] = pt;
+        parts[0] = single;
+        for (p.points) |sym| {
+            const props = try a.alloc(mvt.Prop, 3);
+            props[0] = .{ .key = "symbol_name", .value = .{ .string = sym.symbol } };
+            props[1] = .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } };
+            props[2] = .{ .key = "scale", .value = .{ .double = 0.08 } };
+            try L.points.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+        }
+        for (p.texts) |t| {
+            const props = try a.alloc(mvt.Prop, 3);
+            props[0] = .{ .key = "text", .value = .{ .string = t.text } };
+            props[1] = .{ .key = "color_token", .value = .{ .string = t.color } };
+            props[2] = .{ .key = "font_size_px", .value = .{ .double = 11 } };
+            try L.texts.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+        }
+        return;
+    }
+
+    // Line/area features.
     const g = cell.lineGeometry(a, f) catch return;
     if (g.len < 2) return;
     if (!overlaps(geomBounds(g), tb)) return;
-
     const proj = try a.alloc(mvt.Point, g.len);
     for (g, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
 
-    // Surface fill.
     if (f.prim == 3) {
         if (p.fill_token) |token| {
             const ring = try tile.clipPolygon(a, proj, box);
@@ -79,11 +101,10 @@ fn emitFromInstr(
                 parts[0] = ring;
                 const props = try a.alloc(mvt.Prop, 1);
                 props[0] = .{ .key = "color_token", .value = .{ .string = token } };
-                try areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
+                try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
             }
         }
     }
-    // Line work (boundaries for surfaces, the line itself for curves).
     for (p.lines) |ln| {
         const sub = try tile.clipLine(a, proj, box);
         if (sub.len == 0) continue;
@@ -93,7 +114,7 @@ fn emitFromInstr(
         props[0] = .{ .key = "color_token", .value = .{ .string = ln.color } };
         props[1] = .{ .key = "width_px", .value = .{ .double = ln.width } };
         props[2] = .{ .key = "dash", .value = .{ .string = "solid" } };
-        try lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
+        try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
     }
 }
 
@@ -111,12 +132,15 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
 
     var areas = std.ArrayList(mvt.Feature).empty;
     var lines = std.ArrayList(mvt.Feature).empty;
+    var points = std.ArrayList(mvt.Feature).empty;
+    var texts = std.ArrayList(mvt.Feature).empty;
+    const layers_ctx = Layers{ .areas = &areas, .lines = &lines, .points = &points, .texts = &texts };
 
     for (cell.features, 0..) |f, fi| {
         // S-101 portrayal path: style this feature from its instruction stream.
         if (portrayal) |pp| {
             if (fi < pp.len) if (pp[fi]) |instr| {
-                try emitFromInstr(a, cell.*, f, instr, z, x, y, tb, box, &areas, &lines);
+                try emitFromInstr(a, cell.*, f, instr, z, x, y, tb, box, layers_ctx);
                 continue;
             };
         }
@@ -159,6 +183,8 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
     var layers = std.ArrayList(mvt.Layer).empty;
     if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
     if (lines.items.len > 0) try layers.append(a, .{ .name = "lines", .features = lines.items });
+    if (points.items.len > 0) try layers.append(a, .{ .name = "point_symbols", .features = points.items });
+    if (texts.items.len > 0) try layers.append(a, .{ .name = "text", .features = texts.items });
     if (layers.items.len == 0) return gpa.alloc(u8, 0); // empty tile
 
     return mvt.encode(gpa, .{ .layers = layers.items });
