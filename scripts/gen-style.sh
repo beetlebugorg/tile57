@@ -10,9 +10,11 @@ COLORS="${COLORS:-$ROOT/reference/assets/colortables.json}"
 GLYPHS="${GLYPHS:-$ROOT/reference/assets/glyphs}"
 SPRITE="${SPRITE:-$ROOT/reference/assets/sprite-mln}"
 
-# Build the MapLibre-format sprite sheet from the Go-emitted atlas if missing.
+# Build the MapLibre-format sprite sheet (symbols + area patterns) if missing.
 if [[ ! -f "$SPRITE.json" && -f "$ROOT/reference/assets/sprite.json" ]]; then
-  python3 "$ROOT/scripts/build_sprite.py" --sprite "$ROOT/reference/assets/sprite.json" -o "$SPRITE"
+  python3 "$ROOT/scripts/build_sprite.py" \
+    --sprite "$ROOT/reference/assets/sprite.json" \
+    --patterns "$ROOT/reference/assets/patterns.json" -o "$SPRITE"
 fi
 
 for scheme in day dusk night; do

@@ -173,6 +173,14 @@ def build(pmtiles_path, palette, scheme, glyphs_dir=None, sprite_base=None):
             "paint": {"fill-color": areas_fill_color(palette), "fill-antialias": True},
         })
 
+    # area fill patterns (sprite required): tiled DRGARE/FOUL/quality fills.
+    if sprite_base:
+        for sl in ("area_patterns", "area_patterns_scamin"):
+            layers.append({
+                "id": "fillpat-" + sl, "type": "fill", "source": "chart", "source-layer": sl,
+                "paint": {"fill-pattern": ["concat", "pat:", ["coalesce", ["get", "pattern_name"], ""]]},
+            })
+
     # lines: solid / dashed / dotted, each over base + _scamin source-layers.
     line_specs = [
         ("solid", ["==", ["coalesce", ["get", "dash"], "solid"], "solid"], None),

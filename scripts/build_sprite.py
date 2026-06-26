@@ -57,9 +57,15 @@ def pack(images, pad=1, atlas_w=2048):
     return atlas, meta
 
 
+# Area fill patterns are registered at this pixel ratio in the web app:
+#   _patternPixelRatio = atlasPpu / FEATURE_SCALE = 0.08 / (0.01/0.35278)
+PATTERN_PIXEL_RATIO = 0.08 / (0.01 / 0.35278)  # ~= 2.822
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sprite", required=True, help="emitted sprite.json (png alongside)")
+    ap.add_argument("--patterns", help="emitted patterns.json (png alongside); added as pat:<name>")
     ap.add_argument("-o", "--out", required=True, help="output base path (writes .png + .json)")
     ap.add_argument("--ctr", action="store_true", default=True,
                     help="also emit ctr:<name> bbox-centred variants")
@@ -69,7 +75,8 @@ def main():
     png = os.path.join(os.path.dirname(a.sprite), "sprite.png")
     img = Image.open(png).convert("RGBA")
 
-    images = []
+    images = []          # (id, PIL.Image)
+    ratios = {}          # id -> pixelRatio override (default 1)
     for name, cell in sj.items():
         if name == "_meta" or not isinstance(cell, dict) or "w" not in cell:
             continue
@@ -77,8 +84,23 @@ def main():
         if a.ctr:
             images.append(("ctr:" + name, centred(cell, img, by_pivot=False)))
 
+    # Area fill patterns: raw cells, keyed "pat:<name>" (matches the style's
+    # PAT_PREFIX), at the pattern pixel ratio so they tile at the right size.
+    if a.patterns:
+        pj = json.load(open(a.patterns))
+        ppng = os.path.join(os.path.dirname(a.patterns), "patterns.png")
+        pimg = Image.open(ppng).convert("RGBA")
+        for name, cell in pj.items():
+            if name == "_meta" or not isinstance(cell, dict) or "w" not in cell:
+                continue
+            pid = "pat:" + name
+            images.append((pid, centred(cell, pimg, by_pivot=False)))
+            ratios[pid] = PATTERN_PIXEL_RATIO
+
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     atlas, meta = pack(images)
+    for k, e in meta.items():
+        e["pixelRatio"] = ratios.get(k, 1)
 
     # MapLibre requests @2x when the map pixel ratio is high (retina / desktop
     # HiDPI), so an @2x sheet must exist or the WHOLE sprite fails to load. We
