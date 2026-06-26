@@ -167,13 +167,16 @@ Only ~41/3156 features emit text. By feature code: LightAllAround (lights),
 DredgedArea, MagneticVariation. The big visible gaps + 83 portrayal errors:
 
 1. **Light characteristic text** ("Fl R 4s 10M") — biggest visible gap. LIGHTS
-   now classify as LightAllAround (was LightAirObstruction) and the rule calls
-   the description builder, but `AddTextInstruction` returns early on empty text:
-   the light attrs (lightCharacteristic, colour, signalGroup/Period, VALNMR) map
-   and are provided, BUT they're **enumerations** — the LITDSN02 builder needs
-   the enum value->label mapping (e.g. LITCHR 2 -> "Fl") from
-   `HostGetSimpleAttributeTypeInfo`'s ListedValues, which `lp_simple_info`
-   doesn't supply. Provide enumeration definitions from the catalogue.
+   now classify as LightAllAround and the rule calls LITDSN02. LITDSN02
+   *hardcodes* the value->abbreviation maps (LITCHR 2 -> "Fl", COLOUR 3 -> "R"),
+   so it does NOT need catalogue enum labels — it reads the parsed attribute
+   *value*. The description comes out empty, so this is the SAME root cause as
+   the errors below: simple-attribute values aren't being parsed into the
+   framework's value model (`.Value`). lp_simple_info reports ValueType, but the
+   value wrapping (HostFeatureGetSimpleAttribute returns `{string}`; the
+   framework must turn it into `{Value=number/enum, ...}` per ValueType) isn't
+   yielding a usable `.Value`. Fix the value model and lights + many errors
+   resolve together.
 2. **Portrayal errors (83)** — `S100Scripting.lua:264 arithmetic on nil 'Value'`
    for Obstruction/Wreck/UnderwaterAwashRock (VALSOU/depth ScaledDecimal not
    provided); `SpanOpening` nil `verticalClearanceClosed`; `NavigationLine` nil
