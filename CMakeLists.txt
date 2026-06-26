@@ -137,7 +137,12 @@ if(ZIG_EXECUTABLE)
       target_sources(chart-glfw-zig PRIVATE
         ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
         ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm)
-      target_link_libraries(chart-glfw-zig PRIVATE mbgl-vendor-metal-cpp)
+      # QuartzCore provides CATransaction / CAMetalLayer (our metal_backend.mm
+      # uses [CATransaction flush] + the CAMetalLayer.presentsWithTransaction
+      # property directly). Metal-cpp covers the C++ side but not these Obj-C
+      # class symbols.
+      target_link_libraries(chart-glfw-zig PRIVATE mbgl-vendor-metal-cpp
+        "-framework QuartzCore" "-framework Metal" "-framework Foundation")
     endif()
     if(MLN_WITH_EGL)
       target_compile_definitions(chart-glfw-zig PRIVATE MBGL_WITH_EGL=1)
