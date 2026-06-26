@@ -107,6 +107,17 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         std.debug.print("  assembled: {d} line/area features ({d} verts), {d} point features; sample in-bounds={}\n", .{ line_feats, line_verts, pt_feats, sample_ok });
+
+        // Confirm DRVAL1/DRVAL2 attribute codes on a sample DEPARE.
+        for (cell.features) |f| {
+            if (f.objl == 42 and f.attrs.len > 0) {
+                std.debug.print("  sample DEPARE attrs: ", .{});
+                for (f.attrs) |x| std.debug.print("[{d}]={s} ", .{ x.code, x.value });
+                if (f.attrFloat(tilegen.s57.ATTR_DRVAL1)) |d| std.debug.print("-> DRVAL1={d:.1}", .{d});
+                std.debug.print("\n", .{});
+                break;
+            }
+        }
         return;
     }
 

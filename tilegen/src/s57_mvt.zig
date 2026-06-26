@@ -67,24 +67,27 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32) ![]u
         const proj = try a.alloc(mvt.Point, g.len);
         for (g, 0..) |p, i| proj[i] = tile.project(p.lon, p.lat, z, x, y, tile.EXTENT);
 
-        const props = try a.alloc(mvt.Prop, 2);
-        props[0] = .{ .key = "class", .value = .{ .string = cls.name } };
-        props[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
-
         if (cls.kind == .area) {
             const ring = try tile.clipPolygon(a, proj, box);
             if (ring.len < 3) continue;
             const parts = try a.alloc([]const mvt.Point, 1);
             parts[0] = ring;
-            try areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
+            // Depth areas carry DRVAL1/DRVAL2 so the style's SEABED01 shading
+            // applies (areasFillColor keys on `drval1`).
+            var aprops = std.ArrayList(mvt.Prop).empty;
+            try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
+            try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
+            if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
+            if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
+            try areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
         } else {
             const sub = try tile.clipLine(a, proj, box);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
             for (sub, 0..) |s, i| parts[i] = s;
             const lprops = try a.alloc(mvt.Prop, 3);
-            lprops[0] = props[0];
-            lprops[1] = props[1];
+            lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
+            lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
             lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
             try lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
         }

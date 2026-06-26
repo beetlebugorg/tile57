@@ -43,12 +43,32 @@ pub const VectorRecord = struct {
     end_node: u32 = 0, // VRPT TOPI=2 (edges)
 };
 
+// S-57 attribute codes (Appendix A) used by portrayal.
+pub const ATTR_DRVAL1: u16 = 87;
+pub const ATTR_DRVAL2: u16 = 88;
+pub const ATTR_VALSOU: u16 = 179;
+pub const ATTR_VALDCO: u16 = 174;
+pub const ATTR_OBJNAM: u16 = 116;
+
+pub const Attr = struct { code: u16, value: []const u8 };
+
 pub const Feature = struct {
     rcnm: u8,
     rcid: u32,
     prim: u8, // 1=point, 2=line, 3=area, 255=none
     objl: u16, // S-57 object class code
     refs: []SpatialRef = &.{}, // FSPT spatial pointers
+    attrs: []Attr = &.{}, // ATTF attributes
+
+    pub fn attr(self: Feature, code: u16) ?[]const u8 {
+        for (self.attrs) |x| if (x.code == code) return x.value;
+        return null;
+    }
+
+    pub fn attrFloat(self: Feature, code: u16) ?f64 {
+        const v = self.attr(code) orelse return null;
+        return std.fmt.parseFloat(f64, std.mem.trim(u8, v, " ")) catch null;
+    }
 };
 
 pub const Cell = struct {
@@ -178,6 +198,22 @@ fn parseVRPT(v: *VectorRecord, data: []const u8) void {
     }
 }
 
+/// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are
+/// copied into `a` (the source field bytes are not retained).
+fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
+    var list = std.ArrayList(Attr).empty;
+    var off: usize = 0;
+    while (off + 2 <= data.len) {
+        const code = u16le(data, off);
+        off += 2;
+        var end = off;
+        while (end < data.len and data[end] != iso.UT) end += 1;
+        try list.append(a, .{ .code = code, .value = try a.dupe(u8, data[off..end]) });
+        off = end + 1; // skip UT
+    }
+    return list.items;
+}
+
 /// FSPT: repeated 8-byte entries NAME(5)+ORNT(1)+USAG(1)+MASK(1).
 fn parseFSPT(a: Allocator, data: []const u8) ![]SpatialRef {
     const n = data.len / 8;
@@ -241,6 +277,7 @@ pub fn parseCell(gpa: Allocator, bytes: []const u8) !Cell {
             // RCNM(1) RCID(4) PRIM(1)@5 GRUP(1)@6 OBJL(2)@7
             var f = Feature{ .rcnm = frid[0], .rcid = u32le(frid, 1), .prim = frid[5], .objl = u16le(frid, 7) };
             if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
+            if (rec.field("ATTF")) |at| f.attrs = try parseATTF(a, at);
             try features.append(a, f);
         }
     }
