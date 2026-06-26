@@ -12,12 +12,23 @@ const std = @import("std");
 const pmtiles = @import("pmtiles.zig");
 const s57 = @import("s57.zig");
 const s57_mvt = @import("s57_mvt.zig");
+const portray = @import("portray.zig");
 
 const gpa = std.heap.page_allocator;
 
+// Env access lives in C (Zig 0.16 puts env behind Io); returns the S-101 rules
+// dir or null.
+extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
+
+const CellBackend = struct {
+    cell: s57.Cell,
+    portrayal: ?[]?[]const u8 = null, // per-feature S-101 instruction stream
+    portray_arena: ?*std.heap.ArenaAllocator = null,
+};
+
 const Backend = union(enum) {
     reader: pmtiles.Reader,
-    cell: s57.Cell,
+    cell: CellBackend,
 };
 
 const Source = struct {
@@ -51,7 +62,24 @@ export fn tg_open_cell_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c
         c.deinit();
         return null;
     };
-    src.* = .{ .backend = .{ .cell = cell }, .data = null };
+    src.* = .{ .backend = .{ .cell = .{ .cell = cell } }, .data = null };
+
+    // Optional S-101 portrayal: if a rules directory is set, run the rules once
+    // and cache per-feature instruction streams. Falls back to classify() if
+    // unset or on error.
+    if (tg_env_rules()) |dirz| {
+        const dir = std.mem.span(dirz);
+        const pa = gpa.create(std.heap.ArenaAllocator) catch return src;
+        pa.* = std.heap.ArenaAllocator.init(gpa);
+        const cb = &src.backend.cell;
+        if (portray.portrayCell(pa.allocator(), &cb.cell, dir)) |res| {
+            cb.portrayal = res;
+            cb.portray_arena = pa;
+        } else |_| {
+            pa.deinit();
+            gpa.destroy(pa);
+        }
+    }
     return src;
 }
 
@@ -59,7 +87,13 @@ export fn tg_close(src: ?*Source) callconv(.c) void {
     const s = src orelse return;
     switch (s.backend) {
         .reader => |*r| r.deinit(),
-        .cell => |*c| c.deinit(),
+        .cell => |*cb| {
+            cb.cell.deinit();
+            if (cb.portray_arena) |pa| {
+                pa.deinit();
+                gpa.destroy(pa);
+            }
+        },
     }
     if (s.data) |d| gpa.free(d);
     gpa.destroy(s);
@@ -94,7 +128,7 @@ export fn tg_get_tile(
     const s = src orelse return -1;
     const bytes = switch (s.backend) {
         .reader => |*r| (r.getTile(gpa, z, x, y) catch return -2) orelse return 0,
-        .cell => |*c| s57_mvt.generateTile(gpa, c, z, x, y) catch return -2,
+        .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -2,
     };
     if (bytes.len == 0) {
         gpa.free(bytes);

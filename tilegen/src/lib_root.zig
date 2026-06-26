@@ -8,7 +8,9 @@
 
 pub const tilegen = @import("root.zig");
 pub const capi = @import("capi.zig");
+pub const portray = @import("portray.zig");
 
 comptime {
     _ = capi; // force the C ABI export fns into the archive
+    _ = portray; // force the tgp_* accessors into the archive
 }

@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const s57 = @import("s57.zig");
 const tile = @import("tile.zig");
 const mvt = @import("mvt.zig");
+const s101 = @import("s101_instr.zig");
 
 const Kind = enum { area, line, skip };
 const Class = struct { kind: Kind, name: []const u8, color: []const u8, dash: []const u8 = "solid" };
@@ -44,8 +45,63 @@ fn geomBounds(g: []const s57.LonLat) [4]f64 {
     return b;
 }
 
+/// Emit a feature styled by its S-101 instruction stream. Surfaces with a
+/// ColorFill become `areas` polygons (color_token already depth-resolved by the
+/// rule); curves with LineInstructions become `lines`. (Patterns / points /
+/// text grow here next.)
+fn emitFromInstr(
+    a: Allocator,
+    cell: s57.Cell,
+    f: s57.Feature,
+    instr: []const u8,
+    z: u8,
+    x: u32,
+    y: u32,
+    tb: [4]f64,
+    box: tile.Box,
+    areas: *std.ArrayList(mvt.Feature),
+    lines: *std.ArrayList(mvt.Feature),
+) !void {
+    const p = try s101.parse(a, instr);
+    const g = cell.lineGeometry(a, f) catch return;
+    if (g.len < 2) return;
+    if (!overlaps(geomBounds(g), tb)) return;
+
+    const proj = try a.alloc(mvt.Point, g.len);
+    for (g, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+
+    // Surface fill.
+    if (f.prim == 3) {
+        if (p.fill_token) |token| {
+            const ring = try tile.clipPolygon(a, proj, box);
+            if (ring.len >= 3) {
+                const parts = try a.alloc([]const mvt.Point, 1);
+                parts[0] = ring;
+                const props = try a.alloc(mvt.Prop, 1);
+                props[0] = .{ .key = "color_token", .value = .{ .string = token } };
+                try areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props });
+            }
+        }
+    }
+    // Line work (boundaries for surfaces, the line itself for curves).
+    for (p.lines) |ln| {
+        const sub = try tile.clipLine(a, proj, box);
+        if (sub.len == 0) continue;
+        const parts = try a.alloc([]const mvt.Point, sub.len);
+        for (sub, 0..) |s, i| parts[i] = s;
+        const props = try a.alloc(mvt.Prop, 3);
+        props[0] = .{ .key = "color_token", .value = .{ .string = ln.color } };
+        props[1] = .{ .key = "width_px", .value = .{ .double = ln.width } };
+        props[2] = .{ .key = "dash", .value = .{ .string = "solid" } };
+        try lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
+    }
+}
+
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from `cell`.
-pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32) ![]u8 {
+/// `portrayal`, if given, is indexed by feature index and holds each feature's
+/// S-101 instruction stream (from the Lua engine); features with an instruction
+/// stream are styled by it, the rest fall back to classify().
+pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, portrayal: ?[]const ?[]const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -56,7 +112,14 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32) ![]u
     var areas = std.ArrayList(mvt.Feature).empty;
     var lines = std.ArrayList(mvt.Feature).empty;
 
-    for (cell.features) |f| {
+    for (cell.features, 0..) |f, fi| {
+        // S-101 portrayal path: style this feature from its instruction stream.
+        if (portrayal) |pp| {
+            if (fi < pp.len) if (pp[fi]) |instr| {
+                try emitFromInstr(a, cell.*, f, instr, z, x, y, tb, box, &areas, &lines);
+                continue;
+            };
+        }
         const cls = classify(f.objl);
         if (cls.kind == .skip) continue;
         const g = cell.lineGeometry(a, f) catch continue;
@@ -113,7 +176,7 @@ test "generate a tile from a cell is well-formed MVT" {
         .arena = std.heap.ArenaAllocator.init(gpa),
     };
     defer cell.deinit();
-    const out = try generateTile(gpa, &cell, 14, 4711, 6262);
+    const out = try generateTile(gpa, &cell, 14, 4711, 6262, null);
     defer gpa.free(out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
 }

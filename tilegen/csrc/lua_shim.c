@@ -10,7 +10,15 @@
 #include "lauxlib.h"
 #include "lualib.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* Accessors implemented in Zig (portray.zig) over the adapted cell features. */
+extern size_t tgp_count(void);
+extern const char *tgp_code(size_t i, size_t *len);
+extern const char *tgp_primitive(size_t i, size_t *len);
+extern const char *tgp_attr(size_t i, const char *name, size_t nlen, size_t *len);
+extern void tgp_emit(size_t i, const char *instr, size_t len);
 
 /* Run a trivial Lua chunk and return its integer result, or a negative error.
  * Used to verify the embedded interpreter end to end. */
@@ -30,6 +38,10 @@ long tg_lua_selftest(void) {
 
 /* The embedded Lua version string (e.g. "Lua 5.4"). */
 const char *tg_lua_version(void) { return LUA_VERSION; }
+
+/* Value of the TG_S101_RULES env var (S-101 rules dir), or NULL. (Zig 0.16's
+ * env access is behind Io; reading it here keeps tg_open_cell_bytes simple.) */
+const char *tg_env_rules(void) { return getenv("TG_S101_RULES"); }
 
 /* Stub Host* callbacks (used to prove the framework EXECUTES, not just loads).
  * The real ones, backed by the Zig S-57 cell + catalogue, replace these. */
@@ -298,6 +310,212 @@ int tg_lua_portray_demo(const char *dir) {
     fprintf(stderr, "[s101] DepthArea portrayal -> %s\n", lua_tostring(L, -1));
     lua_close(L);
     return 0;
+}
+
+/* ---- cell-driven portrayal (Host* backed by the Zig adapted features) ---- */
+
+/* Supported S-101 classes + the attributes the rules read. Over-bind every
+ * attribute on every class (a missing one then reads as nil, not an error) plus
+ * a few "guaranteed" attrs some rules read unguarded. Grows as classes land. */
+static const char *PORTRAY_CLASSES[] = {
+    "DepthArea", "DredgedArea", "LandArea", "BuiltUpArea",
+    "Coastline", "ShorelineConstruction", "DepthContour", "Sounding", 0};
+static const char *PORTRAY_ATTRS_REAL[] = {
+    "depthRangeMinimumValue", "depthRangeMaximumValue",
+    "valueOfSounding", "valueOfDepthContour", "orientationValue", 0};
+static const char *PORTRAY_ATTRS_BOOL[] = {"inTheWater", 0};
+
+static int lp_feature_codes(lua_State *L) {
+    lua_newtable(L);
+    for (int i = 0; PORTRAY_CLASSES[i]; i++) {
+        lua_pushstring(L, PORTRAY_CLASSES[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+static int lp_simple_codes(lua_State *L) {
+    lua_newtable(L);
+    int n = 0;
+    for (int i = 0; PORTRAY_ATTRS_REAL[i]; i++) {
+        lua_pushstring(L, PORTRAY_ATTRS_REAL[i]);
+        lua_rawseti(L, -2, ++n);
+    }
+    for (int i = 0; PORTRAY_ATTRS_BOOL[i]; i++) {
+        lua_pushstring(L, PORTRAY_ATTRS_BOOL[i]);
+        lua_rawseti(L, -2, ++n);
+    }
+    return 1;
+}
+static void bind_all(lua_State *L) { /* AttributeBindings table at top */
+    for (int i = 0; PORTRAY_ATTRS_REAL[i]; i++) push_binding(L, PORTRAY_ATTRS_REAL[i]);
+    for (int i = 0; PORTRAY_ATTRS_BOOL[i]; i++) push_binding(L, PORTRAY_ATTRS_BOOL[i]);
+}
+static int lp_feature_info(lua_State *L) { /* HostGetFeatureTypeInfo(code) */
+    const char *code = luaL_checkstring(L, 1);
+    lua_newtable(L);
+    lua_pushstring(L, "FeatureTypeInfo");
+    lua_setfield(L, -2, "Type");
+    lua_pushstring(L, code);
+    lua_setfield(L, -2, "Code");
+    lua_newtable(L);
+    bind_all(L);
+    lua_setfield(L, -2, "AttributeBindings");
+    return 1;
+}
+static int lp_simple_info(lua_State *L) { /* HostGetSimpleAttributeTypeInfo(code) */
+    const char *code = luaL_checkstring(L, 1);
+    const char *vt = "real";
+    for (int i = 0; PORTRAY_ATTRS_BOOL[i]; i++)
+        if (strcmp(code, PORTRAY_ATTRS_BOOL[i]) == 0) vt = "boolean";
+    lua_newtable(L);
+    lua_pushstring(L, "SimpleAttributeInfo");
+    lua_setfield(L, -2, "Type");
+    lua_pushstring(L, code);
+    lua_setfield(L, -2, "Code");
+    lua_pushstring(L, vt);
+    lua_setfield(L, -2, "ValueType");
+    return 1;
+}
+static int lp_feature_ids(lua_State *L) {
+    lua_newtable(L);
+    size_t n = tgp_count();
+    for (size_t i = 0; i < n; i++) {
+        char id[24];
+        snprintf(id, sizeof id, "%zu", i);
+        lua_pushstring(L, id);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    return 1;
+}
+static int lp_feature_code(lua_State *L) {
+    size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    size_t len = 0;
+    const char *s = tgp_code(i, &len);
+    lua_pushlstring(L, s, len);
+    return 1;
+}
+static int lp_feature_primitive(lua_State *L) {
+    size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    size_t len = 0;
+    const char *s = tgp_primitive(i, &len);
+    lua_pushlstring(L, s, len);
+    return 1;
+}
+static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value} */
+    size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    const char *code = luaL_checkstring(L, 3);
+    size_t len = 0;
+    const char *v = tgp_attr(i, code, strlen(code), &len);
+    lua_newtable(L);
+    if (v) {
+        lua_pushlstring(L, v, len);
+        lua_rawseti(L, -2, 1);
+    }
+    return 1;
+}
+static int lp_store(lua_State *L) { /* tg_store(index, instr) */
+    size_t i = (size_t)luaL_checkinteger(L, 1);
+    size_t len = 0;
+    const char *s = lua_tolstring(L, 2, &len);
+    tgp_emit(i, s ? s : "", len);
+    return 0;
+}
+
+/* Run the S-101 rules over the adapted cell features (tgp_*), storing each
+ * feature's instruction stream via tgp_emit. Returns 0 on success. */
+int tg_portray_run(const char *dir, size_t dir_len) {
+    char dbuf[4096];
+    if (dir_len >= sizeof dbuf) return -1;
+    memcpy(dbuf, dir, dir_len);
+    dbuf[dir_len] = 0;
+
+    lua_State *L = luaL_newstate();
+    if (!L) return -100;
+    luaL_openlibs(L);
+    char buf[8192];
+    snprintf(buf, sizeof buf, "package.path = '%s/?.lua;' .. package.path", dbuf);
+    if (luaL_dostring(L, buf) != LUA_OK) {
+        fprintf(stderr, "[s101] package.path: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return -1;
+    }
+
+    lua_register(L, "HostGetFeatureTypeCodes", lp_feature_codes);
+    lua_register(L, "HostGetSimpleAttributeTypeCodes", lp_simple_codes);
+    lua_register(L, "HostGetFeatureTypeInfo", lp_feature_info);
+    lua_register(L, "HostGetSimpleAttributeTypeInfo", lp_simple_info);
+    lua_register(L, "HostGetFeatureIDs", lp_feature_ids);
+    lua_register(L, "HostFeatureGetCode", lp_feature_code);
+    lua_register(L, "_HostFeaturePrimitive", lp_feature_primitive);
+    lua_register(L, "_HostFeaturePoints", l_empty_table);
+    lua_register(L, "HostFeatureGetSimpleAttribute", lp_feature_simple_attr);
+    lua_register(L, "HostFeatureGetComplexAttributeCount", l_zero);
+    lua_register(L, "HostPortrayalEmit", l_true);
+    lua_register(L, "HostDebuggerEntry", l_noop);
+    lua_register(L, "tg_store", lp_store);
+    /* empty catalogue tables */
+    lua_register(L, "HostGetInformationTypeCodes", l_empty_table);
+    lua_register(L, "HostGetComplexAttributeTypeCodes", l_empty_table);
+    lua_register(L, "HostGetRoleTypeCodes", l_empty_table);
+    lua_register(L, "HostGetInformationAssociationTypeCodes", l_empty_table);
+    lua_register(L, "HostGetFeatureAssociationTypeCodes", l_empty_table);
+    lua_register(L, "HostFeatureGetAssociatedFeatureIDs", l_empty_table);
+    lua_register(L, "HostFeatureGetAssociatedInformationIDs", l_empty_table);
+    lua_register(L, "HostSpatialGetAssociatedFeatureIDs", l_empty_table);
+    lua_register(L, "HostSpatialGetAssociatedInformationIDs", l_empty_table);
+    lua_register(L, "HostInformationTypeGetCode", l_empty_string);
+    lua_register(L, "HostInformationTypeGetSimpleAttribute", l_empty_table);
+    lua_register(L, "HostInformationTypeGetComplexAttributeCount", l_zero);
+
+    if (luaL_dostring(L,
+            "require 'S100Scripting'; require 'PortrayalModel'; "
+            "require 'PortrayalAPI'; require 'Default'; require 'main'") != LUA_OK) {
+        fprintf(stderr, "[s101] framework load: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return -2;
+    }
+    static const char *glue =
+        "function HostFeatureGetSpatialAssociations(fid)\n"
+        "  local pt=_HostFeaturePrimitive(fid); if pt=='' then return nil end\n"
+        "  local arr={Type='array:SpatialAssociation'}\n"
+        "  arr[1]=CreateSpatialAssociation(pt, fid..'#'..string.sub(pt,1,1), Orientation.Forward)\n"
+        "  return arr\nend\n"
+        "function HostGetSpatial(sid)\n"
+        "  if string.sub(sid,-2)=='#S' then\n"
+        "    local fid=string.sub(sid,1,-3)\n"
+        "    local ext=CreateSpatialAssociation('Curve', fid..'#exterior', Orientation.Forward)\n"
+        "    return CreateSurface(ext, {})\n  end\n"
+        "  return nil\nend\n";
+    if (luaL_dostring(L, glue) != LUA_OK) {
+        fprintf(stderr, "[s101] glue: %s\n", lua_tostring(L, -1));
+        lua_close(L);
+        return -3;
+    }
+    static const char *driver =
+        "local cps={Type='array:ContextParameter'}\n"
+        "local function cp(n,t,d) table.insert(cps, PortrayalCreateContextParameter(n,t,d)) end\n"
+        "cp('RadarOverlay','boolean','false'); cp('PlainBoundaries','boolean','false')\n"
+        "cp('SimplifiedSymbols','boolean','false'); cp('FourShades','boolean','true')\n"
+        "cp('FullLightLines','boolean','false'); cp('IgnoreScaleMinimum','boolean','false')\n"
+        "cp('ShallowWaterDangers','boolean','false'); cp('SafetyContour','real','30')\n"
+        "cp('SafetyDepth','real','30'); cp('ShallowContour','real','2')\n"
+        "cp('DeepContour','real','30'); cp('SafetyHeight','real','0')\n"
+        "cp('PreferredLanguage','text','eng')\n"
+        "PortrayalInitializeContextParameters(cps)\n"
+        "local ctx=portrayalContext.ContextParameters\n"
+        "for _,item in ipairs(portrayalContext.FeaturePortrayalItems) do\n"
+        "  local feature=item.Feature\n"
+        "  local fp=item:NewFeaturePortrayal()\n"
+        "  local ok,err=pcall(function() require(feature.Code); _G[feature.Code](feature,fp,ctx) end)\n"
+        "  local instr = ok and table.concat(fp.DrawingInstructions, ';') or ('ERROR:'..tostring(err))\n"
+        "  tg_store(tonumber(feature.ID), instr)\nend\n";
+    int rc = 0;
+    if (luaL_dostring(L, driver) != LUA_OK) {
+        fprintf(stderr, "[s101] dispatch: %s\n", lua_tostring(L, -1));
+        rc = -4;
+    }
+    lua_close(L);
+    return rc;
 }
 
 /* Compatibility check: with `dir` as the S-101 Rules directory, set package.path
