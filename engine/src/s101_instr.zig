@@ -20,6 +20,11 @@ pub const Portrayal = struct {
     lines: []const Line = &.{},
     points: []const Point = &.{},
     texts: []const Text = &.{},
+    // S-52 DrawingPriority for the feature = the MAX priority over its draw
+    // instructions (mirrors the Go s101build feature DisplayPriority). 0 when the
+    // stream carries no DrawingPriority. Surfaced as the MVT `draw_prio` property
+    // so the style can paint area fills in S-52 display order (DEPARE 3 < LNDARE 12).
+    draw_prio: i64 = 0,
 };
 
 fn nthCsv(s: []const u8, n: usize) []const u8 {
@@ -41,6 +46,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var texts = std.ArrayList(Text).empty;
 
     var fill_token: ?[]const u8 = null;
+    var draw_prio: i64 = 0; // feature DrawingPriority = max seen in the stream
     // running state set by modifier instructions, applied at the next verb
     var cur_width: f64 = 1;
     var cur_color: []const u8 = "CHBLK";
@@ -84,9 +90,15 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             cur_font = val;
         } else if (std.mem.eql(u8, key, "TextInstruction")) {
             try texts.append(a, .{ .text = val, .color = cur_font });
+        } else if (std.mem.eql(u8, key, "DrawingPriority")) {
+            // S-52 display priority. A feature draws across several viewing groups,
+            // each with its own DrawingPriority; the feature's priority is the MAX
+            // (matches Go s101build's `priority = max(c.Priority)`).
+            const v = std.fmt.parseInt(i64, std.mem.trim(u8, val, " "), 10) catch continue;
+            if (v > draw_prio) draw_prio = v;
         }
-        // ViewingGroup / DrawingPriority / DisplayPlane / AlertReference / etc.
-        // are display metadata we don't need for the MVT mapping yet.
+        // ViewingGroup / DisplayPlane / AlertReference / etc. are display metadata
+        // we don't need for the MVT mapping yet.
     }
 
     return .{
@@ -95,6 +107,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         .lines = lines.items,
         .points = points.items,
         .texts = texts.items,
+        .draw_prio = draw_prio,
     };
 }
 
@@ -112,6 +125,8 @@ test "parse the real DEPARE03 instruction stream" {
     try std.testing.expectEqualStrings("DEPMS", p.fill_token.?);
     try std.testing.expectEqual(@as(usize, 1), p.patterns.len);
     try std.testing.expectEqualStrings("DIAMOND1", p.patterns[0]);
+    // draw_prio = max(3, 9) over the two viewing-group sections.
+    try std.testing.expectEqual(@as(i64, 9), p.draw_prio);
 }
 
 test "parse line + point + text instructions" {
@@ -119,10 +134,15 @@ test "parse line + point + text instructions" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const line = try parse(a, "ViewingGroup:32050;LineStyle:_simple_,,0.96,CHGRD;LineInstruction:_simple_");
+    const line = try parse(a, "ViewingGroup:32050;DrawingPriority:9;LineStyle:_simple_,,0.96,CHGRD;LineInstruction:_simple_");
     try std.testing.expectEqual(@as(usize, 1), line.lines.len);
     try std.testing.expectApproxEqAbs(@as(f64, 0.96), line.lines[0].width, 1e-9);
     try std.testing.expectEqualStrings("CHGRD", line.lines[0].color);
+    try std.testing.expectEqual(@as(i64, 9), line.draw_prio);
+
+    // No DrawingPriority in the stream -> default 0.
+    const nopri = try parse(a, "FontColor:CHBLK;TextInstruction:foo");
+    try std.testing.expectEqual(@as(i64, 0), nopri.draw_prio);
 
     const pt = try parse(a, "LocalOffset:1,-2;Rotation:45;PointInstruction:BCNCAR01");
     try std.testing.expectEqual(@as(usize, 1), pt.points.len);
