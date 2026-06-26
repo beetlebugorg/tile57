@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("catalogue_json", .{ .root_source_file = b.path("vendor/s101/catalogue.json") });
     mod.addAnonymousImport("s57codes_json", .{ .root_source_file = b.path("vendor/s101/s57codes.json") });
 
-    // Static library (libchartplotter.a): C ABI + embedded Lua. Its own root so
+    // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
     // never in a Zig-linked exe.
     const lib_mod = b.createModule(.{
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
         .files = &lua_sources,
         .flags = &.{ "-std=gnu99", "-DLUA_USE_POSIX", "-O2" },
     });
-    const lib = b.addLibrary(.{ .name = "chartplotter", .linkage = .static, .root_module = lib_mod });
+    const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
 
     // The offline baker / inspector CLI (pure Zig). Source stays at tools/bake.zig.

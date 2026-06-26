@@ -2,13 +2,13 @@
 // ENC_ROOT directory.
 //
 // The library owns no filesystem access (Zig 0.16 gates fs behind std.Io), so the
-// host does the directory walk here and hands the bytes to libchartplotter:
-//   - a file       -> chartplotter_source_open (PMTiles or one S-57 cell, AUTO)
-//   - a directory  -> chartplotter_source_open_cells: scan for every <CELL>.000
+// host does the directory walk here and hands the bytes to libtile57:
+//   - a file       -> tile57_source_open (PMTiles or one S-57 cell, AUTO)
+//   - a directory  -> tile57_source_open_cells: scan for every <CELL>.000
 //                     base cell plus its sequential .001… update files, overlaid.
 #pragma once
 
-#include "chartplotter.h"
+#include "tile57.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -24,13 +24,13 @@
 namespace cpn {
 
 // Resolve the S-101 portrayal rules directory robustly so a host works when run
-// from outside the repo root: CHARTPLOTTER_S101_RULES if set, else search for the
+// from outside the repo root: TILE57_S101_RULES if set, else search for the
 // vendored catalogue relative to the CWD and to the executable, walking up
 // parents. Returns "" if not found (the caller then passes NULL and the library
 // falls back to its relative default).
 inline std::string resolveRulesDir(const char *argv0) {
     namespace fs = std::filesystem;
-    if (const char *env = std::getenv("CHARTPLOTTER_S101_RULES"); env && *env) return env;
+    if (const char *env = std::getenv("TILE57_S101_RULES"); env && *env) return env;
     const fs::path suffix = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
     std::error_code ec;
     std::vector<fs::path> starts;
@@ -54,7 +54,7 @@ inline std::string readFileBytes(const std::filesystem::path &p) {
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
-inline chartplotter_source *openPath(const std::string &path, const char *rules_dir) {
+inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
     namespace fs = std::filesystem;
     std::error_code ec;
 
@@ -62,8 +62,8 @@ inline chartplotter_source *openPath(const std::string &path, const char *rules_
     if (!fs::is_directory(path, ec)) {
         const std::string bytes = readFileBytes(path);
         if (bytes.empty()) return nullptr;
-        return chartplotter_source_open(reinterpret_cast<const uint8_t *>(bytes.data()),
-                                        bytes.size(), CHARTPLOTTER_FORMAT_AUTO, rules_dir);
+        return tile57_source_open(reinterpret_cast<const uint8_t *>(bytes.data()),
+                                        bytes.size(), TILE57_FORMAT_AUTO, rules_dir);
     }
 
     // An ENC_ROOT: collect every base cell (*.000), in sorted order.
@@ -78,12 +78,12 @@ inline chartplotter_source *openPath(const std::string &path, const char *rules_
 
     // Read each base + its sequential updates. Bytes live in `blobs` (a deque, so
     // element addresses are stable as we keep pushing); the per-cell update
-    // pointer/length arrays live in deques for the same reason. libchartplotter
+    // pointer/length arrays live in deques for the same reason. libtile57
     // copies everything, so these can be freed once open_cells returns.
     std::deque<std::string> blobs;
     std::deque<std::vector<const uint8_t *>> updPtrs;
     std::deque<std::vector<size_t>> updLens;
-    std::vector<chartplotter_cell_input> inputs;
+    std::vector<tile57_cell_input> inputs;
 
     for (const auto &base : bases) {
         blobs.push_back(readFileBytes(base));
@@ -112,7 +112,7 @@ inline chartplotter_source *openPath(const std::string &path, const char *rules_
             ulen.push_back(blobs.back().size());
         }
 
-        chartplotter_cell_input ci{};
+        tile57_cell_input ci{};
         ci.base = reinterpret_cast<const uint8_t *>(baseBytes.data());
         ci.base_len = baseBytes.size();
         ci.updates = uptr.empty() ? nullptr : uptr.data();
@@ -121,7 +121,7 @@ inline chartplotter_source *openPath(const std::string &path, const char *rules_
         inputs.push_back(ci);
     }
     if (inputs.empty()) return nullptr;
-    return chartplotter_source_open_cells(inputs.data(), inputs.size(), rules_dir);
+    return tile57_source_open_cells(inputs.data(), inputs.size(), rules_dir);
 }
 
 } // namespace cpn

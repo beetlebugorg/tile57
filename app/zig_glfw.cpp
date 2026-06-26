@@ -1,5 +1,5 @@
 // chartplotter — interactive window host. Opens a real GLFW window with pan/zoom
-// (MapLibre Native's GLFWView) whose vector tiles are served by libchartplotter
+// (MapLibre Native's GLFWView) whose vector tiles are served by libtile57
 // (the Zig tile generator) through ChartTileSource. This is the M3 deliverable: the
 // headless chartplotter-render proved the Zig -> MapLibre pipeline; this makes it
 // a live, pannable chart.
@@ -12,7 +12,7 @@
 //
 // Usage: chartplotter <archive.pmtiles|cell.000> <style.json> [lat lon zoom]
 
-#include "chartplotter.h"
+#include "tile57.h"
 #include "chart_tile_source.hpp"
 #include "enc_root.hpp"
 
@@ -38,9 +38,9 @@
 
 // g_src lives for the whole process: the Map (which holds ChartTileSource
 // instances via the resource loader) outlives main()'s cleanup, so we never
-// chartplotter_source_close() it — doing so would be a use-after-free during Map teardown
+// tile57_source_close() it — doing so would be a use-after-free during Map teardown
 // (same rationale as app/zig_render.cpp).
-static chartplotter_source *g_src = nullptr;
+static tile57_source *g_src = nullptr;
 
 static std::string readFile(const char *path) {
     std::ifstream f(path, std::ios::binary);
@@ -79,10 +79,10 @@ int main(int argc, char **argv) {
 
     // Open the path: a file (PMTiles or one S-57 cell, auto-detected) or an
     // ENC_ROOT directory (all base cells + their updates, overlaid). The host
-    // reads the bytes; libchartplotter copies what it keeps.
+    // reads the bytes; libtile57 copies what it keeps.
     const std::string rulesDir = cpn::resolveRulesDir(argv[0]);
     if (rulesDir.empty())
-        std::cerr << "warning: S-101 rules not found — set CHARTPLOTTER_S101_RULES, run from the "
+        std::cerr << "warning: S-101 rules not found — set TILE57_S101_RULES, run from the "
                      "repo root, or `git submodule update --init`\n";
     g_src = cpn::openPath(archive, rulesDir.empty() ? nullptr : rulesDir.c_str());
     if (!g_src) {
@@ -90,16 +90,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *mode = std::filesystem::is_directory(archive) ? "ENC_ROOT (live generation)"
-                       : chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES
+                       : tile57_source_format(g_src) == TILE57_FORMAT_PMTILES
                            ? "pmtiles"
                            : "s57-cell (live generation)";
     uint8_t minZoom = 0, maxZoom = 0;
-    chartplotter_source_zoom_range(g_src, &minZoom, &maxZoom);
+    tile57_source_zoom_range(g_src, &minZoom, &maxZoom);
     std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";
 
     // Source bounds (for framing the camera once the Map/window size is known).
     double bw = 0, bs = 0, be = 0, bn = 0;
-    const bool haveBounds = chartplotter_source_bounds(g_src, &bw, &bs, &be, &bn);
+    const bool haveBounds = tile57_source_bounds(g_src, &bw, &bs, &be, &bn);
 
     mbgl::ResourceOptions resourceOptions;
     resourceOptions.withCachePath(":memory:").withAssetPath(".");
@@ -163,6 +163,6 @@ int main(int argc, char **argv) {
     // 5) Blocking interactive loop (drives rendering off GLFWView's RunLoop).
     view.run();
 
-    // g_src intentionally NOT chartplotter_source_close()'d (see note above).
+    // g_src intentionally NOT tile57_source_close()'d (see note above).
     return 0;
 }

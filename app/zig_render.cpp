@@ -1,12 +1,12 @@
 // chartplotter-render — headless host that renders the chart with vector tiles
-// served by libchartplotter (the Zig tile generator) through ChartTileSource.
+// served by libtile57 (the Zig tile generator) through ChartTileSource.
 // This proves the full Zig -> MapLibre Native integration (custom FileSource over
 // the C ABI) and is the render-to-PNG verification path on headless boxes.
 //
 // Usage: chartplotter-render <archive.pmtiles|cell.000> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]
 
-#include "chartplotter.h"
-#include "chartplotter_diag.h"
+#include "tile57.h"
+#include "tile57_diag.h"
 #include "chart_tile_source.hpp"
 #include "enc_root.hpp"
 
@@ -27,7 +27,7 @@
 #include <sstream>
 #include <string>
 
-static chartplotter_source *g_src = nullptr;
+static tile57_source *g_src = nullptr;
 
 static std::string readFile(const char *path) {
     std::ifstream f(path, std::ios::binary);
@@ -39,18 +39,18 @@ static std::string readFile(const char *path) {
 int main(int argc, char **argv) {
     // S-101 Lua compatibility check: chartplotter-render --s101check <rules-dir>
     if (argc >= 3 && std::string(argv[1]) == "--s101check") {
-        std::cerr << "embedded " << chartplotter_diag_lua_version() << "\n";
-        int rc = chartplotter_diag_check_rules(argv[2]);
+        std::cerr << "embedded " << tile57_diag_lua_version() << "\n";
+        int rc = tile57_diag_check_rules(argv[2]);
         std::cerr << (rc == 0 ? "S-101 framework: load OK\n" : "S-101 framework: load FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc >= 3 && std::string(argv[1]) == "--s101run") {
-        int rc = chartplotter_diag_run_framework(argv[2]);
+        int rc = tile57_diag_run_framework(argv[2]);
         std::cerr << (rc == 0 ? "S-101 framework: run OK\n" : "S-101 framework: run FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc >= 3 && std::string(argv[1]) == "--s101portray") {
-        int rc = chartplotter_diag_portray_demo(argv[2]);
+        int rc = tile57_diag_portray_demo(argv[2]);
         std::cerr << (rc == 0 ? "S-101 portray: OK\n" : "S-101 portray: FAILED\n");
         return rc == 0 ? 0 : 1;
     }
@@ -70,10 +70,10 @@ int main(int argc, char **argv) {
 
     // Open the path: a file (PMTiles or one S-57 cell, auto-detected) or an
     // ENC_ROOT directory (all base cells + their updates, overlaid). The host
-    // reads the bytes; libchartplotter copies what it keeps.
+    // reads the bytes; libtile57 copies what it keeps.
     const std::string rulesDir = cpn::resolveRulesDir(argv[0]);
     if (rulesDir.empty())
-        std::cerr << "warning: S-101 rules not found — set CHARTPLOTTER_S101_RULES, run from the "
+        std::cerr << "warning: S-101 rules not found — set TILE57_S101_RULES, run from the "
                      "repo root, or `git submodule update --init`\n";
     g_src = cpn::openPath(archive, rulesDir.empty() ? nullptr : rulesDir.c_str());
     if (!g_src) {
@@ -81,13 +81,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *mode = std::filesystem::is_directory(archive) ? "ENC_ROOT (live generation)"
-                       : chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES
+                       : tile57_source_format(g_src) == TILE57_FORMAT_PMTILES
                            ? "pmtiles"
                            : "s57-cell (live generation)";
     uint8_t minZoom = 0, maxZoom = 0;
-    chartplotter_source_zoom_range(g_src, &minZoom, &maxZoom);
+    tile57_source_zoom_range(g_src, &minZoom, &maxZoom);
     std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";
-    std::cerr << "embedded " << chartplotter_diag_lua_version() << " self-test: " << chartplotter_diag_lua_selftest()
+    std::cerr << "embedded " << tile57_diag_lua_version() << " self-test: " << tile57_diag_lua_selftest()
               << " (expect 42)\n";
 
     // Register the Zig source in the (unused) Mbtiles slot BEFORE the Map builds
@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
         rc = 1;
     }
     // Note: g_src outlives the Map (which holds ChartTileSource instances via the
-    // resource loader); we intentionally do NOT chartplotter_source_close here. The process
+    // resource loader); we intentionally do NOT tile57_source_close here. The process
     // is exiting, so the OS reclaims it — closing first would be a use-after-free
     // during Map teardown.
     return rc;
