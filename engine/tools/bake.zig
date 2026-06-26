@@ -1,23 +1,42 @@
-//! engine CLI.
+//! chartplotter-bake — the offline S-57 -> PMTiles baker / inspector CLI.
 //!
-//!   bake inspect <file.pmtiles> [z x y]
+//! Subcommands:
+//!   bake <cell.000> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N] [update.001 ...]
+//!       Decode an S-57 base cell (applying any update files), portray it, and
+//!       pre-bake every web-mercator MVT tile covering the cell's bounds across
+//!       the requested zoom range into a clustered PMTiles archive.
+//!   inspect <file.pmtiles> [z x y]
 //!       Parse a PMTiles archive (header + directory) and, if z/x/y is given,
-//!       read+gunzip+decode that tile and list its MVT layers. Used to validate
-//!       the Zig reader against the Go reference archive.
-//!
-//! Baking from S-57 cells lands at M6 (decode -> portrayal -> tile).
+//!       read+gunzip+decode that tile and list its MVT layers.
+//!   cell <file.000>
+//!       Decode + summarise an S-57 cell (record tally, bounds, topology).
+//!   version
+//!       Print the baker version.
+//!   help
+//!       Print usage.
 
 const std = @import("std");
 const engine = @import("engine");
+
+const VERSION = "chartplotter-bake 0.1.0";
+
+const DEFAULT_MINZOOM: u8 = 8;
+const DEFAULT_MAXZOOM: u8 = 16;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
 
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "inspect")) {
+    const sub: []const u8 = if (args.len >= 2) args[1] else "help";
+
+    if (std.mem.eql(u8, sub, "bake")) {
+        return runBake(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "inspect")) {
         if (args.len < 3) {
-            std.debug.print("usage: bake inspect <file.pmtiles> [z x y]\n", .{});
+            std.debug.print("usage: chartplotter-bake inspect <file.pmtiles> [z x y]\n", .{});
             return;
         }
         const path = args[2];
@@ -44,7 +63,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "cell")) {
+    if (std.mem.eql(u8, sub, "cell")) {
+        if (args.len < 3) {
+            std.debug.print("usage: chartplotter-bake cell <file.000>\n", .{});
+            return;
+        }
         const path = args[2];
         const data = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
         var file = try engine.iso8211.parse(arena, data);
@@ -165,9 +188,162 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, sub, "version") or std.mem.eql(u8, sub, "--version")) {
+        std.debug.print("{s}\n", .{VERSION});
+        return;
+    }
+
+    printUsage();
+}
+
+// ---- bake ---------------------------------------------------------------
+
+/// `bake <cell.000> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N] [update.001 ...]`
+fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var base: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var rules: ?[]const u8 = null;
+    var minzoom: u8 = DEFAULT_MINZOOM;
+    var maxzoom: u8 = DEFAULT_MAXZOOM;
+    var updates = std.ArrayList([]const u8).empty;
+
+    var i: usize = 2; // skip exe + "bake"
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for -o/--output");
+            out = args[i];
+        } else if (std.mem.eql(u8, arg, "--rules")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --rules");
+            rules = args[i];
+        } else if (std.mem.eql(u8, arg, "--minzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --minzoom");
+            minzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--minzoom must be an integer");
+        } else if (std.mem.eql(u8, arg, "--maxzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --maxzoom");
+            maxzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            std.debug.print("error: unknown flag '{s}'\n\n", .{arg});
+            return printUsage();
+        } else if (base == null) {
+            base = arg;
+        } else {
+            try updates.append(a, arg);
+        }
+    }
+
+    const base_path = base orelse return usageErr("missing <cell.000> input");
+    const out_path = out orelse return usageErr("missing -o/--output <out.pmtiles>");
+    if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
+    if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
+
+    // Read the base cell + any updates listed on the command line.
+    const base_bytes = try std.Io.Dir.cwd().readFileAlloc(io, base_path, a, .unlimited);
+    const update_bytes = try a.alloc([]const u8, updates.items.len);
+    for (updates.items, 0..) |u, ui| {
+        update_bytes[ui] = try std.Io.Dir.cwd().readFileAlloc(io, u, a, .unlimited);
+    }
+
+    var cell = try engine.s57.parseCellWithUpdates(a, base_bytes, update_bytes);
+    defer cell.deinit();
+
+    // S-101 portrayal runs in the embedded-Lua rule engine, which lives in
+    // libchartplotter.a (lib_root.zig) — deliberately NOT linked into this
+    // pure-Zig baker (see src/root.zig). With no portrayal stream, generateTile
+    // falls back to the built-in classify() styling, which is exactly the
+    // fallback the design calls for when rules are unavailable.
+    const portrayal: ?[]const ?[]const u8 = null;
+    if (rules) |dir| {
+        std.debug.print(
+            "note: --rules {s} ignored in this offline build (portrayal engine is lib-only); baking with classify() fallback\n",
+            .{dir},
+        );
+    }
+
+    const b = cell.bounds() orelse {
+        std.debug.print("error: {s} has no geometry to bake\n", .{base_path});
+        return;
+    };
+    // bounds() -> [min_lon, min_lat, max_lon, max_lat] (west, south, east, north).
+
+    var tiles = std.ArrayList(engine.pmtiles.InputTile).empty;
+    var z: u8 = minzoom;
+    while (z <= maxzoom) : (z += 1) {
+        // North-west corner -> (min x, min y); south-east corner -> (max x, max y).
+        const nw = lonLatToTile(b[0], b[3], z);
+        const se = lonLatToTile(b[2], b[1], z);
+        var ty = nw[1];
+        while (ty <= se[1]) : (ty += 1) {
+            var tx = nw[0];
+            while (tx <= se[0]) : (tx += 1) {
+                const tile_mvt = try engine.s57_mvt.generateTile(a, &cell, z, tx, ty, portrayal);
+                if (tile_mvt.len == 0) continue; // empty tile: nothing covered here
+                try tiles.append(a, .{ .z = z, .x = tx, .y = ty, .mvt = tile_mvt });
+            }
+        }
+    }
+
+    if (tiles.items.len == 0) {
+        std.debug.print("warning: no non-empty tiles produced for zoom {d}..{d}\n", .{ minzoom, maxzoom });
+    }
+
+    const opts = engine.pmtiles.WriteOptions{
+        .min_lon_e7 = toE7(b[0]),
+        .min_lat_e7 = toE7(b[1]),
+        .max_lon_e7 = toE7(b[2]),
+        .max_lat_e7 = toE7(b[3]),
+    };
+    const archive = try engine.pmtiles.write(a, tiles.items, opts);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = archive });
+
     std.debug.print(
-        "engine — usage:\n  bake inspect <file.pmtiles> [z x y]\n  bake cell <file.000>\n" ++
-            "(baking from S-57 cells comes at M6)\n",
-        .{},
+        "baked {d} cell ({d} update file(s) applied) -> {s}\n  {d} tiles written, zoom {d}..{d}\n  output {d} bytes ({d:.1} MB)\n",
+        .{
+            @as(usize, 1),         updates.items.len, out_path,
+            tiles.items.len,       minzoom,           maxzoom,
+            archive.len,           @as(f64, @floatFromInt(archive.len)) / (1024.0 * 1024.0),
+        },
     );
+}
+
+/// lon/lat (deg) -> web-mercator tile (x, y) at zoom z, clamped to the valid range.
+fn lonLatToTile(lon: f64, lat: f64, z: u8) [2]u32 {
+    const w = engine.tile.lonLatToWorld(lon, lat); // normalised [0,1], y down
+    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+    const max_idx: f64 = scale - 1.0;
+    const fx = std.math.clamp(@floor(w[0] * scale), 0.0, max_idx);
+    const fy = std.math.clamp(@floor(w[1] * scale), 0.0, max_idx);
+    return .{ @intFromFloat(fx), @intFromFloat(fy) };
+}
+
+/// Degrees -> PMTiles E7 fixed-point.
+fn toE7(v: f64) i32 {
+    return @intFromFloat(@round(v * 1e7));
+}
+
+fn usageErr(msg: []const u8) void {
+    std.debug.print("error: {s}\n\n", .{msg});
+    printUsage();
+}
+
+fn printUsage() void {
+    std.debug.print(
+        \\{s} — offline S-57 -> PMTiles baker / inspector
+        \\
+        \\usage:
+        \\  chartplotter-bake bake <cell.000> -o <out.pmtiles> [options] [update.001 ...]
+        \\      -o, --output PATH   output PMTiles archive (required)
+        \\      --rules DIR         S-101 portrayal rules directory (optional)
+        \\      --minzoom N         lowest zoom to bake (default {d})
+        \\      --maxzoom N         highest zoom to bake (default {d})
+        \\  chartplotter-bake inspect <file.pmtiles> [z x y]
+        \\  chartplotter-bake cell <file.000>
+        \\  chartplotter-bake version
+        \\  chartplotter-bake help
+        \\
+    , .{ VERSION, DEFAULT_MINZOOM, DEFAULT_MAXZOOM });
 }
