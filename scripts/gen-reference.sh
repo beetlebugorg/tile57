@@ -46,15 +46,36 @@ if [[ -z "$BIN" || ! -x "$BIN" ]]; then
 fi
 echo "using Go binary: $BIN   (Go repo: $GO)" >&2
 
-# Always point emit-assets/bake at the on-disk S-101 catalogue when present
-# (harmless override for _s101 builds; required for plain builds). emit-assets
-# takes only --s101 <PortrayalCatalog>; bake also takes --s101-fc <FC.xml>.
+# Locate the PortrayalCatalog dir and FeatureCatalogue.xml. They may live in
+# different directories, so find each independently (override with S101_PC /
+# S101_FC). emit-assets takes only --s101 <PortrayalCatalog>; bake also takes
+# --s101-fc <FC.xml>. Always passed when found (required for a plain build,
+# harmless override for an _s101 build).
+find_one() { find "$GO" \( -name .git -o -name worktrees -o -name node_modules \) -prune -o "$@" -print 2>/dev/null | head -1; }
+# The PortrayalCatalog is the directory that CONTAINS LineStyles/ColorProfiles/
+# Symbols/Rules (anchor on LineStyles, which emit-assets requires). FC is found
+# independently (it may live in a different directory).
+PC="${S101_PC:-}"
+if [[ -z "$PC" ]]; then
+  ls_dir="$(find_one -type d -name LineStyles)"
+  [[ -n "$ls_dir" ]] && PC="$(cd "$(dirname "$ls_dir")" && pwd)"
+fi
+FC="${S101_FC:-$(find_one -type f -name FeatureCatalogue.xml)}"
+echo "  PortrayalCatalog: ${PC:-<not found>}" >&2
+echo "  FeatureCatalogue: ${FC:-<not found>}" >&2
+
 EMIT_S101=()
 BAKE_S101=()
-CATDIR="$GO/internal/engine/s101catalog/catalog"
-if [[ -d "$CATDIR/PortrayalCatalog" ]]; then
-  EMIT_S101=(--s101 "$CATDIR/PortrayalCatalog")
-  BAKE_S101=(--s101 "$CATDIR/PortrayalCatalog" --s101-fc "$CATDIR/FeatureCatalogue.xml")
+[[ -n "$PC" ]] && EMIT_S101=(--s101 "$PC")
+if [[ -n "$PC" && -n "$FC" ]]; then
+  BAKE_S101=(--s101 "$PC" --s101-fc "$FC")
+elif [[ -n "$PC" ]]; then
+  BAKE_S101=(--s101 "$PC")
+fi
+if [[ "$BIN" != *_s101 && -z "$PC" ]]; then
+  echo "No PortrayalCatalog found under $GO. Set S101_PC=/path/to/PortrayalCatalog" >&2
+  echo "(and S101_FC=/path/to/FeatureCatalogue.xml), or use an _s101 binary." >&2
+  exit 1
 fi
 
 mkdir -p "$ROOT/reference/tiles" "$ROOT/reference/assets"
