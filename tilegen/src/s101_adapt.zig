@@ -17,6 +17,7 @@ pub const Adapted = struct {
     code: []const u8, // S-101 feature class name (== rule file name)
     primitive: []const u8, // "Point" | "Curve" | "Surface"
     attrs: []NameVal, // S-101 attribute name -> value
+    name: []const u8 = "", // OBJNAM -> synthesized featureName[1].name (text labels)
 };
 
 /// S-57 object class (OBJL) -> S-101 feature class code, via the Feature
@@ -44,11 +45,13 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         const prim = primitiveName(f.prim);
         if (prim.len == 0) continue;
         var attrs = std.ArrayList(NameVal).empty;
+        var name: []const u8 = "";
         for (f.attrs) |at| {
-            if (catalogue.resolveAttrByCode(at.code)) |name|
-                try attrs.append(a, .{ .name = name, .value = at.value });
+            if (at.code == s57.ATTR_OBJNAM) name = at.value; // OBJNAM -> featureName
+            if (catalogue.resolveAttrByCode(at.code)) |aname|
+                try attrs.append(a, .{ .name = aname, .value = at.value });
         }
-        try out.append(a, .{ .feature_index = i, .code = code, .primitive = prim, .attrs = attrs.items });
+        try out.append(a, .{ .feature_index = i, .code = code, .primitive = prim, .attrs = attrs.items, .name = name });
     }
     return out.items;
 }

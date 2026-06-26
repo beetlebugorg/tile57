@@ -18,6 +18,8 @@ extern size_t tgp_count(void);
 extern const char *tgp_code(size_t i, size_t *len);
 extern const char *tgp_primitive(size_t i, size_t *len);
 extern const char *tgp_attr(size_t i, const char *name, size_t nlen, size_t *len);
+extern const char *tgp_name(size_t i, size_t *len);
+extern size_t tgp_complex_count(size_t i, const char *name, size_t nlen);
 extern void tgp_emit(size_t i, const char *instr, size_t len);
 
 /* Catalogue accessors implemented in Zig (catalogue.zig). */
@@ -455,14 +457,29 @@ static int lp_feature_primitive(lua_State *L) {
 }
 static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value} */
     size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    const char *path = lua_tostring(L, 2);
     const char *code = luaL_checkstring(L, 3);
     size_t len = 0;
-    const char *v = tgp_attr(i, code, strlen(code), &len);
+    const char *v;
+    /* featureName[1].name: the framework reads the `name` sub-attribute with
+     * attributePath "featureName:1". Serve it from the synthesized name. */
+    if (path && strstr(path, "featureName") && strcmp(code, "name") == 0) {
+        v = tgp_name(i, &len);
+    } else {
+        v = tgp_attr(i, code, strlen(code), &len);
+    }
     lua_newtable(L);
     if (v) {
         lua_pushlstring(L, v, len);
         lua_rawseti(L, -2, 1);
     }
+    return 1;
+}
+static int lp_feature_complex_count(lua_State *L) { /* (id, path, code) -> count */
+    size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    const char *code = luaL_checkstring(L, 3);
+    size_t c = tgp_complex_count(i, code, strlen(code));
+    lua_pushinteger(L, (lua_Integer)c);
     return 1;
 }
 static int lp_store(lua_State *L) { /* tg_store(index, instr) */
@@ -501,7 +518,7 @@ int tg_portray_run(const char *dir, size_t dir_len) {
     lua_register(L, "_HostFeaturePrimitive", lp_feature_primitive);
     lua_register(L, "_HostFeaturePoints", l_empty_table);
     lua_register(L, "HostFeatureGetSimpleAttribute", lp_feature_simple_attr);
-    lua_register(L, "HostFeatureGetComplexAttributeCount", l_zero);
+    lua_register(L, "HostFeatureGetComplexAttributeCount", lp_feature_complex_count);
     lua_register(L, "HostPortrayalEmit", l_true);
     lua_register(L, "HostDebuggerEntry", l_noop);
     lua_register(L, "tg_store", lp_store);

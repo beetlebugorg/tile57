@@ -54,6 +54,23 @@ export fn tgp_attr(i: usize, name_ptr: [*]const u8, name_len: usize, out_len: *u
     return null;
 }
 
+/// The feature's name (from OBJNAM), exposed as the S-101 `featureName[1].name`
+/// complex sub-attribute; null/empty if the feature is unnamed.
+export fn tgp_name(i: usize, out_len: *usize) callconv(.c) ?[*]const u8 {
+    const s = g_ctx.?.adapted[i].name;
+    if (s.len == 0) return null;
+    out_len.* = s.len;
+    return s.ptr;
+}
+
+/// Count for a complex attribute on feature i. Only `featureName` is synthesized
+/// (1 when the feature has a name, else 0); all other complex attrs report 0.
+export fn tgp_complex_count(i: usize, name_ptr: [*]const u8, name_len: usize) callconv(.c) usize {
+    const name = name_ptr[0..name_len];
+    if (std.mem.eql(u8, name, "featureName") and g_ctx.?.adapted[i].name.len > 0) return 1;
+    return 0;
+}
+
 /// C calls this with each feature's joined instruction stream.
 export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(.c) void {
     const c = g_ctx orelse return;
