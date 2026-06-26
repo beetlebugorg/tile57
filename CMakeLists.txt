@@ -131,9 +131,12 @@ if(ZIG_EXECUTABLE)
       target_sources(chart-glfw-zig PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
     endif()
     if(MLN_WITH_METAL)
+      # Use our patched metal_backend.mm (nextDrawable nil-check + no-timeout, to
+      # stop the whole-screen blank/flicker on fast pan/zoom) instead of the
+      # vendored one; metal_backend.h is reused unchanged.
       target_sources(chart-glfw-zig PRIVATE
         ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
-        ${MLN_DIR}/platform/glfw/metal_backend.mm)
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm)
       target_link_libraries(chart-glfw-zig PRIVATE mbgl-vendor-metal-cpp)
     endif()
     if(MLN_WITH_EGL)
