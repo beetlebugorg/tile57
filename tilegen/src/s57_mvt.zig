@@ -119,6 +119,10 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
         }
     }
     for (p.lines) |ln| {
+        // _simple_ -> solid; any named/complex line style (NAVLNE/RECTRC leading
+        // lines, CTNARE limits, …) is approximated as dashed rather than a bold
+        // solid stroke (full along-line symbology is a later step).
+        const dash: []const u8 = if (std.mem.eql(u8, ln.style, "solid")) "solid" else "dashed";
         for (projected.items) |proj| {
             const sub = try tile.clipLine(a, proj, box);
             if (sub.len == 0) continue;
@@ -127,7 +131,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
             const props = try a.alloc(mvt.Prop, 3);
             props[0] = .{ .key = "color_token", .value = .{ .string = ln.color } };
             props[1] = .{ .key = "width_px", .value = .{ .double = ln.width } };
-            props[2] = .{ .key = "dash", .value = .{ .string = "solid" } };
+            props[2] = .{ .key = "dash", .value = .{ .string = dash } };
             try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props });
         }
     }
