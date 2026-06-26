@@ -127,7 +127,19 @@ Emitted live: `areas`, `lines`, `point_symbols`, `text`.
 Missing live (Go baker has them): `soundings`, `sector_lines`, `area_patterns`,
 `areas_scamin`, `lines_scamin`, `complex_lines_scamin` (+ `area_patterns_scamin`).
 
+**Fixed 2026-06-26:** area/line geometry assembly (`Cell.lineGeometryParts`) —
+disjoint rings/parts were joined by a spurious straight jump (CTNARE caution
+areas etc.) drawn as long lines crossing the chart. Now split into connected
+parts (reverse-aware). Verified against `US5MD1MC.000` (re-fetchable from
+`https://charts.noaa.gov/ENCs/US5MD1MC.zip`; also US4MD81M).
+
 Next live-gen work, ranked by visual impact:
+0. **NAVLNE/RECTRC styling + symbol scale** (visible now in live renders):
+   navigation lines (objl 85) + recommended tracks (objl 109) are real long
+   leading lines but render as bold solid strokes — S-52 wants thin dashed.
+   Live point symbols hardcode `scale=0.08` in `s57_mvt.emitFromInstr`, so every
+   icon draws at size 1.0; use the PointInstruction's own scale instead (live
+   buoys look oversized vs the Go baker).
 1. **soundings** — multipoint geometry (`s57.Sounding`/SG3D, fed via
    `_HostFeaturePoints`); emit one point per sounding into a `soundings` layer
    with the depth value so `soundings_image()` (SNDFRM04 digit glyphs) renders.
