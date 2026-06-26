@@ -30,3 +30,6 @@ __pycache__/
 
 # Python venv (auto-managed by scripts/py.sh)
 /.venv/
+
+# Local engineering notes (not version-controlled)
+/specs/
