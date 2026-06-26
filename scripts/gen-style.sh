@@ -25,7 +25,9 @@ for scheme in day dusk night; do
     --scheme "$scheme" -o "$ROOT/style/chart-$scheme.json"
 done
 
-# A day style whose chart source is served by the Zig FileSource (chartshot-zig).
+# A day style whose chart source is served by the Zig FileSource (ChartTileSource,
+# used by chartplotter / chartplotter-render). The zigtiles:// scheme is the
+# internal routing key matched by ChartTileSource::canRequest.
 "$PY" "$ROOT/style/build_style.py" \
   --pmtiles "$PMTILES" --colortables "$COLORS" --glyphs "$GLYPHS" --sprite "$SPRITE" \
   --scheme day --source-tiles "zigtiles://{z}/{x}/{y}" --minzoom 9 --maxzoom 16 \

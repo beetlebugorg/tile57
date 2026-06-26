@@ -1,12 +1,13 @@
-//! C ABI for libtilegen.a — what the C++ MapLibre host links against.
+//! C ABI for libchartplotter.a — what the C++ MapLibre host links against.
 //!
 //! A source is one of two backends behind the same tile API:
-//!   - tg_open_bytes:      a PMTiles archive (Zig reader)            [M5]
-//!   - tg_open_cell_bytes: a raw S-57 cell, tiles generated live     [M6c]
-//! The C++ ZigTileSource doesn't care which — it just calls tg_get_tile.
+//!   - CP_FORMAT_PMTILES:  a PMTiles archive (Zig reader)            [M5]
+//!   - CP_FORMAT_S57_CELL: a raw S-57 cell, tiles generated live     [M6c]
+//! CP_FORMAT_AUTO sniffs PMTiles first, then falls back to S-57. The C++
+//! ChartTileSource doesn't care which — it just calls cp_tile_get.
 //!
-//! Contract: POD across the seam (ptr/len + error codes); Zig errors, slices
-//! and optionals stay inside Zig. Header: ../../include/tilegen.h.
+//! Contract: POD across the seam (ptr/len + status codes); Zig errors, slices
+//! and optionals stay inside Zig. Public header: ../../include/chartplotter.h.
 
 const std = @import("std");
 const pmtiles = @import("pmtiles.zig");
@@ -17,8 +18,14 @@ const portray = @import("portray.zig");
 const gpa = std.heap.page_allocator;
 
 // Env access lives in C (Zig 0.16 puts env behind Io); returns the S-101 rules
-// dir or null.
+// dir from CHARTPLOTTER_S101_RULES or null.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
+
+// Keep in sync with the CHARTPLOTTER_VERSION_* macros in chartplotter.h.
+const version_string = "0.1.0";
+
+// Mirrors cp_format in chartplotter.h.
+const Format = enum(c_int) { auto = 0, pmtiles = 1, s57_cell = 2 };
 
 const CellBackend = struct {
     cell: s57.Cell,
@@ -37,7 +44,7 @@ const Source = struct {
     // In-memory tile cache (key = z<<48|x<<24|y -> MVT bytes). The host renders
     // continuously and MapLibre re-requests tiles, so without this every frame
     // would re-decode (PMTiles) or re-generate (cell) the same tiles. Values are
-    // owned here; tg_get_tile returns a fresh copy the caller frees.
+    // owned here; cp_tile_get returns a fresh copy the caller frees.
     cache: std.AutoHashMap(u64, []u8),
 };
 
@@ -45,9 +52,14 @@ fn tileKey(z: u8, x: u32, y: u32) u64 {
     return (@as(u64, z) << 48) | (@as(u64, x) << 24) | @as(u64, y);
 }
 
-/// Open a PMTiles archive from in-memory bytes. Returns a handle or null.
-export fn tg_open_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*Source {
-    const copy = gpa.dupe(u8, data_ptr[0..data_len]) catch return null;
+/// Return the library version string ("0.1.0").
+export fn cp_version() callconv(.c) [*:0]const u8 {
+    return version_string;
+}
+
+// Open a PMTiles archive from owned bytes (takes ownership on success, frees on
+// failure). Returns null if the bytes are not a valid PMTiles archive.
+fn openPmtiles(copy: []u8) ?*Source {
     const reader = pmtiles.Reader.init(gpa, copy) catch {
         gpa.free(copy);
         return null;
@@ -62,10 +74,10 @@ export fn tg_open_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*S
     return src;
 }
 
-/// Open a raw S-57 cell; tiles are generated live. Returns a handle or null.
-/// The bytes are only read during this call (the cell model copies what it keeps).
-export fn tg_open_cell_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c) ?*Source {
-    const cell = s57.parseCell(gpa, data_ptr[0..data_len]) catch return null;
+// Open a raw S-57 cell (reads `bytes` but does not take ownership — the cell
+// model copies what it keeps). Returns null if the bytes are not a valid cell.
+fn openCell(bytes: []const u8, rules_dir: ?[*:0]const u8) ?*Source {
+    const cell = s57.parseCell(gpa, bytes) catch return null;
     const src = gpa.create(Source) catch {
         var c = cell;
         c.deinit();
@@ -73,14 +85,14 @@ export fn tg_open_cell_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c
     };
     src.* = .{ .backend = .{ .cell = .{ .cell = cell } }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
 
-    // Optional S-101 portrayal: if a rules directory is set, run the rules once
-    // and cache per-feature instruction streams. Falls back to classify() if
-    // unset or on error.
-    // S-101 portrayal: rules dir from TG_S101_RULES, else the vendored official
-    // catalogue submodule (works when run from the repo root). Falls back to
-    // classify() if the rules aren't found.
+    // Optional S-101 portrayal: run the rules once and cache per-feature
+    // instruction streams. Rules dir precedence: explicit rules_dir argument,
+    // else CHARTPLOTTER_S101_RULES, else the vendored official catalogue
+    // (works when run from the repo root). Falls back to classify() on error.
     {
-        const dir: []const u8 = if (tg_env_rules()) |dirz|
+        const dir: []const u8 = if (rules_dir) |d|
+            std.mem.span(d)
+        else if (tg_env_rules()) |dirz|
             std.mem.span(dirz)
         else
             "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
@@ -98,7 +110,42 @@ export fn tg_open_cell_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c
     return src;
 }
 
-export fn tg_close(src: ?*Source) callconv(.c) void {
+/// Open a chart tile source from in-memory bytes. `format` selects the backend
+/// (CP_FORMAT_AUTO sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir
+/// for cells (null = default). Bytes are copied. Returns a handle or null.
+export fn cp_source_open(
+    data_ptr: [*]const u8,
+    data_len: usize,
+    format: c_int,
+    rules_dir: ?[*:0]const u8,
+) callconv(.c) ?*Source {
+    const fmt: Format = switch (format) {
+        @intFromEnum(Format.pmtiles) => .pmtiles,
+        @intFromEnum(Format.s57_cell) => .s57_cell,
+        else => .auto,
+    };
+    const bytes = data_ptr[0..data_len];
+
+    if (fmt == .pmtiles or fmt == .auto) {
+        const copy = gpa.dupe(u8, bytes) catch return null;
+        if (openPmtiles(copy)) |src| return src; // openPmtiles freed `copy` on failure
+        if (fmt == .pmtiles) return null;
+    }
+    // AUTO fallback or explicit S-57 cell. openCell does not take ownership, so
+    // it reads the caller's bytes directly (no copy needed).
+    return openCell(bytes, rules_dir);
+}
+
+/// The resolved backend format (after a CP_FORMAT_AUTO sniff).
+export fn cp_source_format(src: ?*Source) callconv(.c) c_int {
+    const s = src orelse return @intFromEnum(Format.auto);
+    return switch (s.backend) {
+        .reader => @intFromEnum(Format.pmtiles),
+        .cell => @intFromEnum(Format.s57_cell),
+    };
+}
+
+export fn cp_source_close(src: ?*Source) callconv(.c) void {
     const s = src orelse return;
     switch (s.backend) {
         .reader => |*r| r.deinit(),
@@ -117,26 +164,30 @@ export fn tg_close(src: ?*Source) callconv(.c) void {
     gpa.destroy(s);
 }
 
-export fn tg_min_zoom(src: ?*Source) callconv(.c) u8 {
-    const s = src orelse return 0;
-    return switch (s.backend) {
-        .reader => |r| r.header.min_zoom,
-        .cell => 0,
+/// Min/max zoom served by the source (PMTiles: archive range; cell: 0..18).
+export fn cp_source_zoom_range(src: ?*Source, min_z: *u8, max_z: *u8) callconv(.c) void {
+    const s = src orelse {
+        min_z.* = 0;
+        max_z.* = 0;
+        return;
     };
-}
-export fn tg_max_zoom(src: ?*Source) callconv(.c) u8 {
-    const s = src orelse return 0;
-    return switch (s.backend) {
-        .reader => |r| r.header.max_zoom,
-        .cell => 18,
-    };
+    switch (s.backend) {
+        .reader => |r| {
+            min_z.* = r.header.min_zoom;
+            max_z.* = r.header.max_zoom;
+        },
+        .cell => {
+            min_z.* = 0;
+            max_z.* = 18;
+        },
+    }
 }
 
 /// Geographic bounds of the source (west,south,east,north degrees); returns true
 /// when known. Lets a host frame the data with its own fit-to-window logic
 /// (MapLibre's cameraForLatLngBounds) rather than a guessed center+zoom.
 /// PMTiles -> the archive's stored bounds; cell -> the data extent.
-export fn tg_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(.c) bool {
+export fn cp_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(.c) bool {
     const so = src orelse return false;
     var b: [4]f64 = undefined; // [west, south, east, north]
     switch (so.backend) {
@@ -163,9 +214,9 @@ export fn tg_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(
 }
 
 /// Fetch tile (z,x,y) as MVT bytes (PMTiles: decompressed; cell: generated).
-/// Returns 1 + out/out_len (free with tg_free) if non-empty, 0 if empty/absent,
-/// negative on error.
-export fn tg_get_tile(
+/// Returns CP_TILE_OK (1) + out/out_len (free with cp_tile_free) if non-empty,
+/// CP_TILE_EMPTY (0) if empty/absent, CP_TILE_ERROR (-1) on error.
+export fn cp_tile_get(
     src: ?*Source,
     z: u8,
     x: u32,
@@ -179,7 +230,7 @@ export fn tg_get_tile(
     // Cache hit: hand back a fresh copy (empty slice cached == empty tile).
     if (s.cache.get(key)) |cached| {
         if (cached.len == 0) return 0;
-        const dup = gpa.dupe(u8, cached) catch return -2;
+        const dup = gpa.dupe(u8, cached) catch return -1;
         out.* = dup.ptr;
         out_len.* = dup.len;
         return 1;
@@ -188,18 +239,26 @@ export fn tg_get_tile(
     // Miss: generate/decode once, then cache the canonical bytes (even empty, so
     // empty tiles aren't recomputed every frame).
     const bytes: []u8 = switch (s.backend) {
-        .reader => |*r| (r.getTile(gpa, z, x, y) catch return -2) orelse (gpa.alloc(u8, 0) catch return -2),
-        .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -2,
+        .reader => |*r| (r.getTile(gpa, z, x, y) catch return -1) orelse (gpa.alloc(u8, 0) catch return -1),
+        .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -1,
     };
     s.cache.put(key, bytes) catch {}; // best-effort; cache owns `bytes` on success
     if (bytes.len == 0) return 0;
-    const dup = gpa.dupe(u8, bytes) catch return -2;
+    const dup = gpa.dupe(u8, bytes) catch return -1;
     out.* = dup.ptr;
     out_len.* = dup.len;
     return 1;
 }
 
-export fn tg_free(ptr: ?[*]u8, len: usize) callconv(.c) void {
+export fn cp_tile_free(ptr: ?[*]u8, len: usize) callconv(.c) void {
     const p = ptr orelse return;
     gpa.free(p[0..len]);
+}
+
+/// Drop the in-memory tile cache (bounds memory in long-running hosts).
+export fn cp_source_clear_cache(src: ?*Source) callconv(.c) void {
+    const s = src orelse return;
+    var it = s.cache.valueIterator();
+    while (it.next()) |v| gpa.free(v.*);
+    s.cache.clearRetainingCapacity();
 }

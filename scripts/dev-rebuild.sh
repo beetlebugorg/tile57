@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # One-shot "after a git pull" refresh. Regenerates the styles (they're generated,
 # not version-controlled, so `git pull` never updates them) and rebuilds our host
-# targets: the headless `chartshot-zig` and, when the build dir has GLFW enabled,
-# the interactive window `chart-glfw-zig`. Both render the same in-process Zig
-# tile pipeline. (MapLibre's own `mbgl-glfw` is unrelated to our code.)
+# targets: the headless `chartplotter-render` and, when the build dir has GLFW
+# enabled, the interactive window `chartplotter`. Both render the same in-process
+# Zig tile pipeline. (MapLibre's own `mbgl-glfw` is unrelated to our code.)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -27,17 +27,17 @@ fi
 if [[ -n "$BUILD" ]]; then
   echo "==> reconfiguring (picks up CMake/new-file changes)" >&2
   cmake -S "$ROOT" -B "$ROOT/$BUILD" >/dev/null
-  echo "==> building chartshot-zig in $BUILD" >&2
-  ninja -C "$ROOT/$BUILD" chartshot-zig
+  echo "==> building chartplotter-render in $BUILD" >&2
+  ninja -C "$ROOT/$BUILD" chartplotter-render
   # The interactive window only exists when this build dir has GLFW enabled.
   WIN=""
-  if grep -q 'chart-glfw-zig' "$ROOT/$BUILD/build.ninja" 2>/dev/null; then
-    echo "==> building chart-glfw-zig (interactive window) in $BUILD" >&2
-    ninja -C "$ROOT/$BUILD" chart-glfw-zig
-    WIN="$BUILD/chart-glfw-zig"
+  if grep -q 'chartplotter\b' "$ROOT/$BUILD/build.ninja" 2>/dev/null; then
+    echo "==> building chartplotter (interactive window) in $BUILD" >&2
+    ninja -C "$ROOT/$BUILD" chartplotter
+    WIN="$BUILD/chartplotter"
   fi
   echo "done."
-  echo "  headless PNG:  $BUILD/chartshot-zig reference/tiles/annapolis.pmtiles style/chart-zig-day.json 38.978 -76.487 14 out.png"
+  echo "  headless PNG:  $BUILD/chartplotter-render reference/tiles/annapolis.pmtiles style/chart-zig-day.json 38.978 -76.487 14 out.png"
   if [[ -n "$WIN" ]]; then
     echo "  interactive:   $WIN reference/tiles/annapolis.pmtiles style/chart-zig-day.json"
     echo "                 (drag to pan, scroll to zoom; pass a .000 cell for live generation)"

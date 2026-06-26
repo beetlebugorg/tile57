@@ -1,5 +1,5 @@
-#include "zig_tile_source.hpp"
-#include "tilegen.h"
+#include "chart_tile_source.hpp"
+#include "chartplotter.h"
 
 #include <mbgl/actor/actor_ref.hpp>
 #include <mbgl/storage/file_source_request.hpp>
@@ -20,7 +20,7 @@ namespace cpn {
 static constexpr const char *PREFIX = "zigtiles://";
 
 // Fill `response` with the tile for a zigtiles:// request (shared by the sync
-// and worker paths). Pure read of the Zig source; safe to call off the main
+// and worker paths). Pure read of the chart source; safe to call off the main
 // thread.
 //
 // Conditional-request support is what stops the flicker: our tiles are
@@ -29,7 +29,7 @@ static constexpr const char *PREFIX = "zigtiles://";
 // bytes — MapLibre then KEEPS its already-parsed tile (loadedData skips setData)
 // instead of re-parsing it every time. Without this MapLibre re-parses on every
 // re-request (15-60x/sec), which is the flicker.
-static void fillResponse(tg_source *src, const mbgl::Resource &resource, mbgl::Response &response) {
+static void fillResponse(cp_source *src, const mbgl::Resource &resource, mbgl::Response &response) {
     int z = 0;
     unsigned x = 0, y = 0;
     const char *rest = resource.url.c_str() + std::strlen(PREFIX);
@@ -54,23 +54,23 @@ static void fillResponse(tg_source *src, const mbgl::Resource &resource, mbgl::R
 
     uint8_t *out = nullptr;
     size_t len = 0;
-    const int rc = tg_get_tile(src, static_cast<uint8_t>(z), x, y, &out, &len);
-    if (rc == 1) {
+    const cp_tile_status rc = cp_tile_get(src, static_cast<uint8_t>(z), x, y, &out, &len);
+    if (rc == CP_TILE_OK) {
         response.data = std::make_shared<std::string>(reinterpret_cast<const char *>(out), len);
-        tg_free(out, len);
-    } else if (rc == 0) {
+        cp_tile_free(out, len);
+    } else if (rc == CP_TILE_EMPTY) {
         response.noContent = true; // empty tile
     } else {
         response.error = std::make_unique<mbgl::Response::Error>(
-            mbgl::Response::Error::Reason::Other, "tilegen error");
+            mbgl::Response::Error::Reason::Other, "chart tile error");
     }
 }
 
 // Worker that generates tiles off the render thread and delivers the response
 // back to the request's mailbox (on the originating loop). Used when CHART_ASYNC.
-class ZigTileSource::Impl {
+class ChartTileSource::Impl {
 public:
-    Impl(const mbgl::ActorRef<Impl> &, tg_source *src_) : src(src_) {}
+    Impl(const mbgl::ActorRef<Impl> &, cp_source *src_) : src(src_) {}
     void request(const mbgl::Resource &resource, const mbgl::ActorRef<mbgl::FileSourceRequest> &req) {
         mbgl::Response response;
         fillResponse(src, resource, response);
@@ -78,22 +78,22 @@ public:
     }
 
 private:
-    tg_source *src;
+    cp_source *src;
 };
 
-ZigTileSource::ZigTileSource(tg_source *s) : src(s) {
+ChartTileSource::ChartTileSource(cp_source *s) : src(s) {
     if (std::getenv("CHART_ASYNC")) {
-        worker = std::make_unique<mbgl::util::Thread<Impl>>("ZigTileSource", s);
+        worker = std::make_unique<mbgl::util::Thread<Impl>>("ChartTileSource", s);
     }
 }
 
-ZigTileSource::~ZigTileSource() = default;
+ChartTileSource::~ChartTileSource() = default;
 
-bool ZigTileSource::canRequest(const mbgl::Resource &resource) const {
+bool ChartTileSource::canRequest(const mbgl::Resource &resource) const {
     return resource.url.rfind(PREFIX, 0) == 0;
 }
 
-std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource &resource, Callback callback) {
+std::unique_ptr<mbgl::AsyncRequest> ChartTileSource::request(const mbgl::Resource &resource, Callback callback) {
     auto req = std::make_unique<mbgl::FileSourceRequest>(std::move(callback));
     if (worker) {
         worker->actor().invoke(&Impl::request, resource, req->actor());
@@ -105,12 +105,12 @@ std::unique_ptr<mbgl::AsyncRequest> ZigTileSource::request(const mbgl::Resource 
     return req;
 }
 
-void ZigTileSource::setResourceOptions(mbgl::ResourceOptions) {}
-mbgl::ResourceOptions ZigTileSource::getResourceOptions() {
+void ChartTileSource::setResourceOptions(mbgl::ResourceOptions) {}
+mbgl::ResourceOptions ChartTileSource::getResourceOptions() {
     return mbgl::ResourceOptions{};
 }
-void ZigTileSource::setClientOptions(mbgl::ClientOptions) {}
-mbgl::ClientOptions ZigTileSource::getClientOptions() {
+void ChartTileSource::setClientOptions(mbgl::ClientOptions) {}
+mbgl::ClientOptions ChartTileSource::getClientOptions() {
     return mbgl::ClientOptions{};
 }
 

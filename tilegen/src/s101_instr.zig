@@ -103,7 +103,7 @@ test "parse the real DEPARE03 instruction stream" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The actual output from chartshot-zig --s101portray (DepthArea, 5-10 m).
+    // The actual output from chartplotter-render --s101portray (DepthArea, 5-10 m).
     const stream =
         "ViewingGroup:13030;DrawingPriority:3;DisplayPlane:UnderRadar;" ++
         "AlertReference:SafetyContour;ColorFill:DEPMS;" ++

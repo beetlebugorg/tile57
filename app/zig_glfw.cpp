@@ -1,8 +1,8 @@
-// chart-glfw-zig — interactive window host. Opens a real GLFW window with
-// pan/zoom (MapLibre Native's GLFWView) whose vector tiles are served by the
-// Zig tile generator (libtilegen.a) through ZigTileSource. This is the M3
-// deliverable: the headless chartshot-zig proved the Zig -> MapLibre pipeline;
-// this makes it a live, pannable chart.
+// chartplotter — interactive window host. Opens a real GLFW window with pan/zoom
+// (MapLibre Native's GLFWView) whose vector tiles are served by libchartplotter
+// (the Zig tile generator) through ChartTileSource. This is the M3 deliverable: the
+// headless chartplotter-render proved the Zig -> MapLibre pipeline; this makes it
+// a live, pannable chart.
 //
 // It mirrors vendor/maplibre-native/platform/glfw/main.cpp but: (1) registers
 // our custom FileSource in the (unused) Mbtiles slot BEFORE the Map builds its
@@ -10,10 +10,10 @@
 // JSON via loadJSON (so absolute glyph/sprite paths resolve); (3) opens either
 // a PMTiles archive or a raw S-57 cell (live generation) as the tile backend.
 //
-// Usage: chart-glfw-zig <archive.pmtiles|cell.000> <style.json> [lat lon zoom]
+// Usage: chartplotter <archive.pmtiles|cell.000> <style.json> [lat lon zoom]
 
-#include "tilegen.h"
-#include "zig_tile_source.hpp"
+#include "chartplotter.h"
+#include "chart_tile_source.hpp"
 
 #include "glfw_renderer_frontend.hpp"
 #include "glfw_view.hpp"
@@ -35,11 +35,11 @@
 #include <sstream>
 #include <string>
 
-// g_src lives for the whole process: the Map (which holds ZigTileSource
+// g_src lives for the whole process: the Map (which holds ChartTileSource
 // instances via the resource loader) outlives main()'s cleanup, so we never
-// tg_close() it — doing so would be a use-after-free during Map teardown
+// cp_source_close() it — doing so would be a use-after-free during Map teardown
 // (same rationale as app/zig_render.cpp).
-static tg_source *g_src = nullptr;
+static cp_source *g_src = nullptr;
 
 static std::string readFile(const char *path) {
     std::ifstream f(path, std::ios::binary);
@@ -69,7 +69,7 @@ private:
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        std::cerr << "usage: chart-glfw-zig <archive.pmtiles|cell.000> <style.json> [lat lon zoom]\n";
+        std::cerr << "usage: chartplotter <archive.pmtiles|cell.000> <style.json> [lat lon zoom]\n";
         return 2;
     }
     const std::string archive = argv[1];
@@ -84,22 +84,19 @@ int main(int argc, char **argv) {
         return 1;
     }
     const auto *raw = reinterpret_cast<const uint8_t *>(bytes.data());
-    g_src = tg_open_bytes(raw, bytes.size());
-    const char *mode = "pmtiles";
-    if (!g_src) {
-        g_src = tg_open_cell_bytes(raw, bytes.size());
-        mode = "s57-cell (live generation)";
-    }
+    g_src = cp_source_open(raw, bytes.size(), CP_FORMAT_AUTO, nullptr);
     if (!g_src) {
         std::cerr << "could not open as PMTiles or S-57 cell: " << archive << "\n";
         return 1;
     }
-    std::cerr << "tilegen source opened [" << mode << "]: zoom " << int(tg_min_zoom(g_src))
-              << ".." << int(tg_max_zoom(g_src)) << "\n";
+    const char *mode = cp_source_format(g_src) == CP_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
+    uint8_t minZoom = 0, maxZoom = 0;
+    cp_source_zoom_range(g_src, &minZoom, &maxZoom);
+    std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";
 
     // Source bounds (for framing the camera once the Map/window size is known).
     double bw = 0, bs = 0, be = 0, bn = 0;
-    const bool haveBounds = tg_bounds(g_src, &bw, &bs, &be, &bn);
+    const bool haveBounds = cp_source_bounds(g_src, &bw, &bs, &be, &bn);
 
     mbgl::ResourceOptions resourceOptions;
     resourceOptions.withCachePath(":memory:").withAssetPath(".");
@@ -119,7 +116,7 @@ int main(int argc, char **argv) {
     mbgl::FileSourceManager::get()->registerFileSourceFactory(
         mbgl::FileSourceType::Mbtiles,
         [](const mbgl::ResourceOptions &, const mbgl::ClientOptions &) -> std::unique_ptr<mbgl::FileSource> {
-            return std::make_unique<cpn::ZigTileSource>(g_src);
+            return std::make_unique<cpn::ChartTileSource>(g_src);
         });
 
     // 4) Map in the default (Continuous) MapMode for interactivity. Observer:
@@ -163,6 +160,6 @@ int main(int argc, char **argv) {
     // 5) Blocking interactive loop (drives rendering off GLFWView's RunLoop).
     view.run();
 
-    // g_src intentionally NOT tg_close()'d (see note above).
+    // g_src intentionally NOT cp_source_close()'d (see note above).
     return 0;
 }

@@ -62,33 +62,34 @@ set(MLN_WITH_QT       OFF CACHE BOOL "")
 add_subdirectory(vendor/maplibre-native)
 
 # ---------------------------------------------------------------------------
-# Zig tile generator (libtilegen.a), built by its own `zig build`, linked into
-# the C++ host. This is the C ABI seam (include/tilegen.h) for live in-process
-# tile generation.
+# Zig tile generator (libchartplotter.a), built by its own `zig build`, linked
+# into the C++ host. This is the public C ABI seam (include/chartplotter.h) for
+# live in-process tile generation. The Zig sources live under tilegen/ (the
+# implementation keeps the descriptive "tile generator" name).
 # ---------------------------------------------------------------------------
 find_program(ZIG_EXECUTABLE zig HINTS "$ENV{HOME}/.local/bin" "$ENV{HOME}/.local/share/zig-0.16.0")
 if(ZIG_EXECUTABLE)
   set(TILEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tilegen)
-  set(TILEGEN_LIB ${TILEGEN_DIR}/zig-out/lib/libtilegen.a)
+  set(CHARTPLOTTER_LIB ${TILEGEN_DIR}/zig-out/lib/libchartplotter.a)
   # Always invoke `zig build` (Zig's own cache makes it a no-op when nothing
   # changed). A glob of src/*.zig is evaluated at configure time and misses new
   # files / the C shim / vendored Lua, so relying on it for deps left the lib
   # stale after a pull. Running unconditionally is cheap and always correct.
-  add_custom_target(tilegen_lib ALL
-    BYPRODUCTS ${TILEGEN_LIB}
+  add_custom_target(chartplotter_lib ALL
+    BYPRODUCTS ${CHARTPLOTTER_LIB}
     COMMAND ${CMAKE_COMMAND} -E env "ZIG=${ZIG_EXECUTABLE}"
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/zig-build-lib.sh ReleaseFast
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "Building libtilegen.a (zig build + macOS archive re-pack)"
+    COMMENT "Building libchartplotter.a (zig build + macOS archive re-pack)"
     VERBATIM)
 
-  add_executable(chartshot-zig app/zig_render.cpp app/zig_tile_source.cpp)
-  add_dependencies(chartshot-zig tilegen_lib)
-  target_include_directories(chartshot-zig PRIVATE
+  add_executable(chartplotter-render app/zig_render.cpp app/chart_tile_source.cpp)
+  add_dependencies(chartplotter-render chartplotter_lib)
+  target_include_directories(chartplotter-render PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/app
     ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native/platform/default/include)
-  target_link_libraries(chartshot-zig PRIVATE mbgl-compiler-options mbgl-core ${TILEGEN_LIB})
+  target_link_libraries(chartplotter-render PRIVATE mbgl-compiler-options mbgl-core ${CHARTPLOTTER_LIB})
 
   # -------------------------------------------------------------------------
   # Interactive GLFW window host (M3): the same in-process Zig tile source,
@@ -109,52 +110,52 @@ if(ZIG_EXECUTABLE)
       pkg_search_module(GLFW glfw3 REQUIRED)
     endif()
 
-    add_executable(chart-glfw-zig
+    add_executable(chartplotter
       app/zig_glfw.cpp
-      app/zig_tile_source.cpp
+      app/chart_tile_source.cpp
       ${MLN_DIR}/platform/glfw/glfw_view.cpp
       ${MLN_DIR}/platform/glfw/glfw_renderer_frontend.cpp
       ${MLN_DIR}/platform/glfw/test_writer.cpp
       ${MLN_DIR}/platform/glfw/example_custom_drawable_style_layer.cpp
       ${MLN_DIR}/platform/default/src/mbgl/map/map_snapshotter.cpp)
-    add_dependencies(chart-glfw-zig tilegen_lib)
+    add_dependencies(chartplotter chartplotter_lib)
 
     # GLFWView bakes a default asset path in at compile time.
     set_property(SOURCE ${MLN_DIR}/platform/glfw/glfw_view.cpp
       PROPERTY COMPILE_DEFINITIONS MLN_ASSETS_PATH="${MLN_DIR}/platform/glfw/assets/")
 
     if(APPLE)
-      target_sources(chart-glfw-zig PRIVATE ${MLN_DIR}/platform/glfw/glfw_apple_init.mm)
+      target_sources(chartplotter PRIVATE ${MLN_DIR}/platform/glfw/glfw_apple_init.mm)
     endif()
     if(MLN_WITH_OPENGL)
       find_package(OpenGL REQUIRED)
-      target_sources(chart-glfw-zig PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
+      target_sources(chartplotter PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
     endif()
     if(MLN_WITH_METAL)
       # Use our patched metal_backend.mm (nextDrawable nil-check + no-timeout, to
       # stop the whole-screen blank/flicker on fast pan/zoom) instead of the
       # vendored one; metal_backend.h is reused unchanged.
-      target_sources(chart-glfw-zig PRIVATE
+      target_sources(chartplotter PRIVATE
         ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
         ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm)
       # QuartzCore provides CATransaction / CAMetalLayer (our metal_backend.mm
       # uses [CATransaction flush] + the CAMetalLayer.presentsWithTransaction
       # property directly). Metal-cpp covers the C++ side but not these Obj-C
       # class symbols.
-      target_link_libraries(chart-glfw-zig PRIVATE mbgl-vendor-metal-cpp
+      target_link_libraries(chartplotter PRIVATE mbgl-vendor-metal-cpp
         "-framework QuartzCore" "-framework Metal" "-framework Foundation")
     endif()
     if(MLN_WITH_EGL)
-      target_compile_definitions(chart-glfw-zig PRIVATE MBGL_WITH_EGL=1)
+      target_compile_definitions(chartplotter PRIVATE MBGL_WITH_EGL=1)
     endif()
     if(DEFINED MLN_WITH_X11 AND MLN_WITH_X11)
-      target_compile_definitions(chart-glfw-zig PRIVATE MLN_WITH_X11=1)
+      target_compile_definitions(chartplotter PRIVATE MLN_WITH_X11=1)
     endif()
     if(DEFINED MLN_WITH_WAYLAND AND MLN_WITH_WAYLAND)
-      target_compile_definitions(chart-glfw-zig PRIVATE MLN_WITH_WAYLAND=1)
+      target_compile_definitions(chartplotter PRIVATE MLN_WITH_WAYLAND=1)
     endif()
 
-    target_include_directories(chart-glfw-zig PRIVATE
+    target_include_directories(chartplotter PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include
       ${CMAKE_CURRENT_SOURCE_DIR}/app
       ${MLN_DIR}/platform/glfw
@@ -162,15 +163,15 @@ if(ZIG_EXECUTABLE)
       ${MLN_DIR}/platform/default/include
       ${GLFW_INCLUDE_DIRS})
 
-    target_link_libraries(chart-glfw-zig PRIVATE
+    target_link_libraries(chartplotter PRIVATE
       Mapbox::Map mbgl-compiler-options mbgl-vendor-rapidjson
       MapLibreNative::Base::cheap-ruler-cpp tinyobjloader
       $<$<BOOL:${GLFW_LIBRARY_DIRS}>:-L${GLFW_LIBRARY_DIRS}> ${GLFW_LIBRARIES}
-      ${TILEGEN_LIB})
+      ${CHARTPLOTTER_LIB})
     if(NOT WIN32 AND MLN_WITH_OPENGL)
-      target_link_libraries(chart-glfw-zig PRIVATE OpenGL::GL)
+      target_link_libraries(chartplotter PRIVATE OpenGL::GL)
     endif()
   endif()
 else()
-  message(STATUS "zig not found; skipping chartshot-zig (Zig tile source host)")
+  message(STATUS "zig not found; skipping chartplotter / chartplotter-render (Zig tile source hosts)")
 endif()

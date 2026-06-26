@@ -1,12 +1,13 @@
-// chartshot-zig — headless host that renders the chart with vector tiles served
-// by the Zig tile generator (libtilegen.a) through ZigTileSource. This proves
-// the full Zig -> MapLibre Native integration (custom FileSource over the C ABI)
-// before live S-57 generation replaces the PMTiles-reader backend (M6).
+// chartplotter-render — headless host that renders the chart with vector tiles
+// served by libchartplotter (the Zig tile generator) through ChartTileSource.
+// This proves the full Zig -> MapLibre Native integration (custom FileSource over
+// the C ABI) and is the render-to-PNG verification path on headless boxes.
 //
-// Usage: chartshot-zig <archive.pmtiles> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]
+// Usage: chartplotter-render <archive.pmtiles|cell.000> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]
 
-#include "tilegen.h"
-#include "zig_tile_source.hpp"
+#include "chartplotter.h"
+#include "chartplotter_diag.h"
+#include "chart_tile_source.hpp"
 
 #include <mbgl/gfx/backend.hpp>
 #include <mbgl/gfx/headless_frontend.hpp>
@@ -25,7 +26,7 @@
 #include <sstream>
 #include <string>
 
-static tg_source *g_src = nullptr;
+static cp_source *g_src = nullptr;
 
 static std::string readFile(const char *path) {
     std::ifstream f(path, std::ios::binary);
@@ -35,25 +36,25 @@ static std::string readFile(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    // S-101 Lua compatibility check: chartshot-zig --s101check <rules-dir>
+    // S-101 Lua compatibility check: chartplotter-render --s101check <rules-dir>
     if (argc >= 3 && std::string(argv[1]) == "--s101check") {
-        std::cerr << "embedded " << tg_lua_version() << "\n";
-        int rc = tg_lua_check_rules(argv[2]);
+        std::cerr << "embedded " << cp_diag_lua_version() << "\n";
+        int rc = cp_diag_check_rules(argv[2]);
         std::cerr << (rc == 0 ? "S-101 framework: load OK\n" : "S-101 framework: load FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc >= 3 && std::string(argv[1]) == "--s101run") {
-        int rc = tg_lua_run_framework(argv[2]);
+        int rc = cp_diag_run_framework(argv[2]);
         std::cerr << (rc == 0 ? "S-101 framework: run OK\n" : "S-101 framework: run FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc >= 3 && std::string(argv[1]) == "--s101portray") {
-        int rc = tg_lua_portray_demo(argv[2]);
+        int rc = cp_diag_portray_demo(argv[2]);
         std::cerr << (rc == 0 ? "S-101 portray: OK\n" : "S-101 portray: FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc < 7) {
-        std::cerr << "usage: chartshot-zig <archive.pmtiles> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]\n";
+        std::cerr << "usage: chartplotter-render <archive.pmtiles|cell.000> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]\n";
         return 2;
     }
     const std::string archive = argv[1];
@@ -66,28 +67,24 @@ int main(int argc, char **argv) {
     const uint32_t height = argc > 8 ? std::strtoul(argv[8], nullptr, 10) : 768;
     const float ratio = argc > 9 ? std::strtof(argv[9], nullptr) : 1.0f;
 
-    // Open the archive in Zig (host owns the bytes).
+    // Read the archive bytes; libchartplotter copies what it keeps.
     const std::string bytes = readFile(archive.c_str());
     if (bytes.empty()) {
         std::cerr << "could not read archive: " << archive << "\n";
         return 1;
     }
-    // Try a PMTiles archive first; if it's not one (e.g. a raw .000 cell),
-    // open it as an S-57 cell and generate tiles live.
+    // AUTO: the library sniffs PMTiles, else opens it as an S-57 cell (live gen).
     const auto *raw = reinterpret_cast<const uint8_t *>(bytes.data());
-    g_src = tg_open_bytes(raw, bytes.size());
-    const char *mode = "pmtiles";
-    if (!g_src) {
-        g_src = tg_open_cell_bytes(raw, bytes.size());
-        mode = "s57-cell (live generation)";
-    }
+    g_src = cp_source_open(raw, bytes.size(), CP_FORMAT_AUTO, nullptr);
     if (!g_src) {
         std::cerr << "could not open as PMTiles or S-57 cell\n";
         return 1;
     }
-    std::cerr << "tilegen source opened [" << mode << "]: zoom " << int(tg_min_zoom(g_src))
-              << ".." << int(tg_max_zoom(g_src)) << "\n";
-    std::cerr << "embedded " << tg_lua_version() << " self-test: " << tg_lua_selftest()
+    const char *mode = cp_source_format(g_src) == CP_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
+    uint8_t minZoom = 0, maxZoom = 0;
+    cp_source_zoom_range(g_src, &minZoom, &maxZoom);
+    std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";
+    std::cerr << "embedded " << cp_diag_lua_version() << " self-test: " << cp_diag_lua_selftest()
               << " (expect 42)\n";
 
     // Register the Zig source in the (unused) Mbtiles slot BEFORE the Map builds
@@ -95,7 +92,7 @@ int main(int argc, char **argv) {
     mbgl::FileSourceManager::get()->registerFileSourceFactory(
         mbgl::FileSourceType::Mbtiles,
         [](const mbgl::ResourceOptions &, const mbgl::ClientOptions &) -> std::unique_ptr<mbgl::FileSource> {
-            return std::make_unique<cpn::ZigTileSource>(g_src);
+            return std::make_unique<cpn::ChartTileSource>(g_src);
         });
 
     mbgl::util::RunLoop loop;
@@ -120,9 +117,9 @@ int main(int argc, char **argv) {
         std::cerr << "render error: " << e.what() << "\n";
         rc = 1;
     }
-    // Note: g_src outlives the Map (which holds ZigTileSource instances via the
-    // resource loader); we intentionally do NOT tg_close here. The process is
-    // exiting, so the OS reclaims it — closing first would be a use-after-free
+    // Note: g_src outlives the Map (which holds ChartTileSource instances via the
+    // resource loader); we intentionally do NOT cp_source_close here. The process
+    // is exiting, so the OS reclaims it — closing first would be a use-after-free
     // during Map teardown.
     return rc;
 }

@@ -1,9 +1,10 @@
-// ZigTileSource — an mbgl::FileSource that serves vector tiles from the Zig
-// tile generator (libtilegen.a) for URLs of the form zigtiles://{z}/{x}/{y}.
+// ChartTileSource — an mbgl::FileSource that serves vector tiles from
+// libchartplotter (the Zig tile generator) for URLs of the form
+// zigtiles://{z}/{x}/{y}.
 //
 // It is registered in the (unused) Mbtiles slot of MapLibre's MainResourceLoader
-// so tile requests route to it by canRequest(). Backed by a Zig PMTiles reader
-// or live-generated tiles, interchangeably.
+// so tile requests route to it by canRequest(). Backed by a PMTiles reader or
+// live-generated tiles, interchangeably.
 //
 // Generation runs synchronously on the request (render/runloop) thread by
 // default. Set CHART_ASYNC to run it on a dedicated worker thread instead (off
@@ -16,14 +17,14 @@
 
 #include <memory>
 
-struct tg_source;
+struct cp_source;
 
 namespace cpn {
 
-class ZigTileSource final : public mbgl::FileSource {
+class ChartTileSource final : public mbgl::FileSource {
 public:
-    explicit ZigTileSource(tg_source *src);
-    ~ZigTileSource() override;
+    explicit ChartTileSource(cp_source *src);
+    ~ChartTileSource() override;
 
     std::unique_ptr<mbgl::AsyncRequest> request(const mbgl::Resource &, Callback) override;
     bool canRequest(const mbgl::Resource &) const override;
@@ -35,7 +36,7 @@ public:
 
 private:
     class Impl;
-    tg_source *src;
+    cp_source *src;
     std::unique_ptr<mbgl::util::Thread<Impl>> worker; // null -> synchronous
 };
 
