@@ -12,6 +12,12 @@ const tile = @import("tile.zig");
 const mvt = @import("mvt.zig");
 const s101 = @import("s101_instr.zig");
 
+// S-52 symbol scale the Go baker emits for every point symbol / sounding. The
+// style's icon-size = scale / ATLAS_PPU (0.08), so this renders symbols at
+// ~0.354 — matching the reference. The live path previously used 0.08 (icon
+// size 1.0), i.e. ~2.8x too large.
+const SYMBOL_SCALE: f64 = 0.02834627777338028;
+
 const Kind = enum { area, line, skip };
 const Class = struct { kind: Kind, name: []const u8, color: []const u8, dash: []const u8 = "solid" };
 
@@ -77,10 +83,11 @@ fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y:
         const single = try a.alloc(mvt.Point, 1);
         single[0] = pt;
         parts[0] = single;
-        const props = try a.alloc(mvt.Prop, 3);
+        const props = try a.alloc(mvt.Prop, 4);
         props[0] = .{ .key = "sym_s", .value = .{ .string = sym_s } };
         props[1] = .{ .key = "sym_g", .value = .{ .string = sym_g } };
         props[2] = .{ .key = "depth", .value = .{ .double = s.depth } };
+        props[3] = .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } };
         try out.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
     }
 }
@@ -129,7 +136,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
             const props = try a.alloc(mvt.Prop, 3);
             props[0] = .{ .key = "symbol_name", .value = .{ .string = sym.symbol } };
             props[1] = .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } };
-            props[2] = .{ .key = "scale", .value = .{ .double = 0.08 } };
+            props[2] = .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } };
             try L.points.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
         }
         for (p.texts) |t| {
