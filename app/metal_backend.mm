@@ -105,6 +105,15 @@ public:
       commandBuffer->presentDrawable(surface.get());
     }
     commandBuffer->commit();
+    // *** PATCH (the real flicker fix): wait for the GPU to finish this frame
+    // before returning. The depth + stencil textures are a SINGLE shared
+    // instance (Texture2D::create() only reallocates on resize), but the
+    // on-screen GLFW backend never synchronized frames — so consecutive
+    // in-flight frames raced on that shared depth/stencil, garbling output in
+    // proportion to frame rate (flicker on fast pan / continuous render; fine
+    // when idle). MapLibre's own offscreen path waits here for the same reason.
+    // One frame in flight eliminates the race. ***
+    commandBuffer->waitUntilCompleted();
     commandBuffer.reset();
     renderPassDescriptor.reset();
     surface.reset();
