@@ -35,6 +35,13 @@ static std::string readFile(const char *path) {
 }
 
 int main(int argc, char **argv) {
+    // S-101 Lua compatibility check: chartshot-zig --s101check <rules-dir>
+    if (argc >= 3 && std::string(argv[1]) == "--s101check") {
+        std::cerr << "embedded " << tg_lua_version() << "\n";
+        int rc = tg_lua_check_rules(argv[2]);
+        std::cerr << (rc == 0 ? "S-101 framework: OK\n" : "S-101 framework: FAILED\n");
+        return rc == 0 ? 0 : 1;
+    }
     if (argc < 7) {
         std::cerr << "usage: chartshot-zig <archive.pmtiles> <style.json> <lat> <lon> <zoom> <out.png> [w h ratio]\n";
         return 2;

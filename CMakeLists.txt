@@ -60,15 +60,16 @@ find_program(ZIG_EXECUTABLE zig HINTS "$ENV{HOME}/.local/bin" "$ENV{HOME}/.local
 if(ZIG_EXECUTABLE)
   set(TILEGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tilegen)
   set(TILEGEN_LIB ${TILEGEN_DIR}/zig-out/lib/libtilegen.a)
-  file(GLOB TILEGEN_SRCS ${TILEGEN_DIR}/src/*.zig)
-  add_custom_command(
-    OUTPUT ${TILEGEN_LIB}
+  # Always invoke `zig build` (Zig's own cache makes it a no-op when nothing
+  # changed). A glob of src/*.zig is evaluated at configure time and misses new
+  # files / the C shim / vendored Lua, so relying on it for deps left the lib
+  # stale after a pull. Running unconditionally is cheap and always correct.
+  add_custom_target(tilegen_lib ALL
+    BYPRODUCTS ${TILEGEN_LIB}
     COMMAND ${ZIG_EXECUTABLE} build -Doptimize=ReleaseFast
     WORKING_DIRECTORY ${TILEGEN_DIR}
-    DEPENDS ${TILEGEN_SRCS} ${TILEGEN_DIR}/build.zig
-    COMMENT "Building libtilegen.a (zig build)"
+    COMMENT "Building libtilegen.a (zig build, self-cached)"
     VERBATIM)
-  add_custom_target(tilegen_lib DEPENDS ${TILEGEN_LIB})
 
   add_executable(chartshot-zig app/zig_render.cpp app/zig_tile_source.cpp)
   add_dependencies(chartshot-zig tilegen_lib)

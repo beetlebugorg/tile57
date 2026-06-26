@@ -47,6 +47,11 @@ void tg_free(uint8_t *ptr, size_t len);
 long tg_lua_selftest(void);
 const char *tg_lua_version(void);
 
+/* Load the S-101 framework (S100Scripting/PortrayalModel/PortrayalAPI/Default/
+ * main) from a Rules directory in embedded Lua. Returns 0 on success, negative
+ * on error (diagnostics to stderr). Validates Lua 5.4 compatibility. */
+int tg_lua_check_rules(const char *dir);
+
 #ifdef __cplusplus
 }
 #endif
