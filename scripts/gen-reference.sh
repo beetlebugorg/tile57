@@ -52,15 +52,20 @@ echo "using Go binary: $BIN   (Go repo: $GO)" >&2
 # --s101-fc <FC.xml>. Always passed when found (required for a plain build,
 # harmless override for an _s101 build).
 find_one() { find "$GO" \( -name .git -o -name worktrees -o -name node_modules \) -prune -o "$@" -print 2>/dev/null | head -1; }
-# The PortrayalCatalog is the directory that CONTAINS LineStyles/ColorProfiles/
-# Symbols/Rules (anchor on LineStyles, which emit-assets requires). FC is found
-# independently (it may live in a different directory).
+# Prefer the vendored official IHO catalogue (git submodules); else hunt the Go
+# repo (anchor the PortrayalCatalog on its LineStyles subdir; find FC.xml
+# independently). Override with S101_PC / S101_FC.
 PC="${S101_PC:-}"
+FC="${S101_FC:-}"
+VPC="$ROOT/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog"
+VFC="$ROOT/vendor/S-101-Documentation-and-FC/S-101FC/FeatureCatalogue.xml"
+[[ -z "$PC" && -d "$VPC/LineStyles" ]] && PC="$VPC"
+[[ -z "$FC" && -f "$VFC" ]] && FC="$VFC"
 if [[ -z "$PC" ]]; then
   ls_dir="$(find_one -type d -name LineStyles)"
   [[ -n "$ls_dir" ]] && PC="$(cd "$(dirname "$ls_dir")" && pwd)"
 fi
-FC="${S101_FC:-$(find_one -type f -name FeatureCatalogue.xml)}"
+[[ -z "$FC" ]] && FC="$(find_one -type f -name FeatureCatalogue.xml)"
 echo "  PortrayalCatalog: ${PC:-<not found>}" >&2
 echo "  FeatureCatalogue: ${FC:-<not found>}" >&2
 

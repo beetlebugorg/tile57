@@ -67,8 +67,14 @@ export fn tg_open_cell_bytes(data_ptr: [*]const u8, data_len: usize) callconv(.c
     // Optional S-101 portrayal: if a rules directory is set, run the rules once
     // and cache per-feature instruction streams. Falls back to classify() if
     // unset or on error.
-    if (tg_env_rules()) |dirz| {
-        const dir = std.mem.span(dirz);
+    // S-101 portrayal: rules dir from TG_S101_RULES, else the vendored official
+    // catalogue submodule (works when run from the repo root). Falls back to
+    // classify() if the rules aren't found.
+    {
+        const dir: []const u8 = if (tg_env_rules()) |dirz|
+            std.mem.span(dirz)
+        else
+            "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
         const pa = gpa.create(std.heap.ArenaAllocator) catch return src;
         pa.* = std.heap.ArenaAllocator.init(gpa);
         const cb = &src.backend.cell;
