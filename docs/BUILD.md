@@ -68,3 +68,27 @@ build-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw \
 
 Mouse drag pans, scroll zooms. On a Linux X11 session instead of Wayland,
 reconfigure with `-DMLN_WITH_WAYLAND=OFF -DMLN_WITH_X11=ON`.
+
+## macOS interactive rendering notes (`chart-glfw-zig`)
+
+Getting the GLFW window smooth on macOS (Apple Silicon / Metal / ProMotion) took
+some doing. What matters, and why:
+
+- **Conditional tile requests (the flicker fix).** `ZigTileSource` tags each tile
+  with an `etag` and returns `notModified` when MapLibre re-requests an unchanged
+  tile. Without this, MapLibre re-requested + **re-parsed** tiles 15-60×/sec, and
+  each re-parse re-uploaded to the GPU → constant flicker (even at 100-300fps).
+  See `app/zig_tile_source.cpp`.
+- **In-memory tile cache** (`tilegen/src/capi.zig`): generated/decoded tiles are
+  memoized (z<<48|x<<24|y), so re-requests never re-decode.
+- **Async present** (`app/metal_backend.mm`): `presentDrawable` + `commit`, like
+  MapLibre's own macOS SDK (`MLNMapView+Metal`). `presentsWithTransaction` +
+  `waitUntilScheduled`/`waitUntilCompleted` were tried and all stalled/flickered
+  on the GLFW (non-CADisplayLink) loop — don't reintroduce them.
+- **`nextDrawable` nil-guard + `setAllowsNextDrawableTimeout(false)`**: stops the
+  whole-screen blank when the drawable pool is briefly exhausted on fast pan.
+- **On-demand render** (default): pan/zoom changes the camera every frame so it
+  still presents every frame (smooth); idle stops (low CPU), last frame retained.
+
+Runtime escape hatches: `CHART_CONTINUOUS=1` (present every frame), `CHART_ASYNC=1`
+(generate tiles on a worker thread), `CHART_ONDEMAND` is now the default.
