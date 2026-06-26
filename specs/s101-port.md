@@ -68,7 +68,7 @@ US4MD81M.000: **6933 / 7216 features (~96%) portray** via their actual rules —
 land, coastlines, depth areas + contours, lit buoys (light flares +
 characteristics), beacons, daymarks, landmarks, mooring/anchor symbols, labels.
 
-Pass the rules dir as `cp_source_open`'s `rules_dir` argument (or set the
+Pass the rules dir as `chartplotter_source_open`'s `rules_dir` argument (or set the
 `CHARTPLOTTER_S101_RULES` env var as a fallback when it is NULL). It defaults to
 the vendored official catalogue at
 `vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`; otherwise the crude

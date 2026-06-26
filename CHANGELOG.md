@@ -8,20 +8,20 @@ C ABI is not yet frozen.
 
 ### Changed — public identity & C API (breaking, pre-1.0)
 - Library renamed `libtilegen.a` → **`libchartplotter.a`**; public header
-  `include/tilegen.h` → **`include/chartplotter.h`**; C ABI prefix `tg_` → `cp_`.
+  `include/tilegen.h` → **`include/chartplotter.h`**; C ABI prefix `tg_` → `chartplotter_`.
   The Zig sources and `tilegen/` dir keep their descriptive name.
 - Redesigned the C ABI for coherence (see `docs/API.md`):
-  - one opener `cp_source_open(data, len, cp_format, rules_dir)` with a
-    `CP_FORMAT_AUTO` sniff, replacing the two openers + the try/fallback both
-    hosts duplicated; `cp_source_format()` reports the resolved backend.
+  - one opener `chartplotter_source_open(data, len, chartplotter_format, rules_dir)` with a
+    `CHARTPLOTTER_FORMAT_AUTO` sniff, replacing the two openers + the try/fallback both
+    hosts duplicated; `chartplotter_source_format()` reports the resolved backend.
   - S-101 rules dir is now an argument (env `CHARTPLOTTER_S101_RULES`, renamed
     from `TG_S101_RULES`, is only a fallback when it is NULL).
-  - `cp_source_zoom_range()` folds the two zoom getters into one call;
-    `cp_tile_get` returns a named `cp_tile_status`.
-  - added `cp_source_clear_cache()`, `cp_version()` + `CHARTPLOTTER_VERSION_*`.
+  - `chartplotter_source_zoom_range()` folds the two zoom getters into one call;
+    `chartplotter_tile_get` returns a named `chartplotter_tile_status`.
+  - added `chartplotter_source_clear_cache()`, `chartplotter_version()` + `CHARTPLOTTER_VERSION_*`.
   - documented lifetime (must outlive the renderer) + threading (not internally
     synchronized) contracts in the header.
-  - moved the Lua/S-101 self-tests to `include/chartplotter_diag.h` (`cp_diag_*`).
+  - moved the Lua/S-101 self-tests to `include/chartplotter_diag.h` (`chartplotter_diag_*`).
 - App binaries renamed: `chart-glfw-zig` → **`chartplotter`** (interactive
   window), `chartshot-zig` → **`chartplotter-render`** (headless PNG host).
 - C++ FileSource adapter renamed `ZigTileSource` → **`ChartTileSource`**

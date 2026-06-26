@@ -12,25 +12,25 @@
 extern "C" {
 #endif
 
-/* Embedded Lua sanity checks. cp_diag_lua_selftest runs a trivial chunk and
- * returns 42 on success (negative on error); cp_diag_lua_version returns e.g.
+/* Embedded Lua sanity checks. chartplotter_diag_lua_selftest runs a trivial chunk and
+ * returns 42 on success (negative on error); chartplotter_diag_lua_version returns e.g.
  * "Lua 5.4". Together they prove the interpreter is embedded and linked. */
-long cp_diag_lua_selftest(void);
-const char *cp_diag_lua_version(void);
+long chartplotter_diag_lua_selftest(void);
+const char *chartplotter_diag_lua_version(void);
 
 /* Load the S-101 framework (S100Scripting/PortrayalModel/PortrayalAPI/Default/
  * main) from a Rules directory in embedded Lua. Returns 0 on success, negative
  * on error (diagnostics to stderr). Validates Lua 5.4 compatibility. */
-int cp_diag_check_rules(const char *dir);
+int chartplotter_diag_check_rules(const char *dir);
 
 /* Run the S-101 framework with stub Host callbacks + an empty feature set,
  * proving it executes (not just loads) in embedded Lua. Returns 0 on success. */
-int cp_diag_run_framework(const char *dir);
+int chartplotter_diag_run_framework(const char *dir);
 
 /* Run the real DepthArea rule against a synthetic feature with a minimal
  * hardcoded catalogue; prints the emitted S-101 instruction stream to stderr.
  * Returns 0 on success. Proof-of-portrayal before the full Host binding. */
-int cp_diag_portray_demo(const char *dir);
+int chartplotter_diag_portray_demo(const char *dir);
 
 #ifdef __cplusplus
 }

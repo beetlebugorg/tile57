@@ -37,9 +37,9 @@
 
 // g_src lives for the whole process: the Map (which holds ChartTileSource
 // instances via the resource loader) outlives main()'s cleanup, so we never
-// cp_source_close() it — doing so would be a use-after-free during Map teardown
+// chartplotter_source_close() it — doing so would be a use-after-free during Map teardown
 // (same rationale as app/zig_render.cpp).
-static cp_source *g_src = nullptr;
+static chartplotter_source *g_src = nullptr;
 
 static std::string readFile(const char *path) {
     std::ifstream f(path, std::ios::binary);
@@ -84,19 +84,19 @@ int main(int argc, char **argv) {
         return 1;
     }
     const auto *raw = reinterpret_cast<const uint8_t *>(bytes.data());
-    g_src = cp_source_open(raw, bytes.size(), CP_FORMAT_AUTO, nullptr);
+    g_src = chartplotter_source_open(raw, bytes.size(), CHARTPLOTTER_FORMAT_AUTO, nullptr);
     if (!g_src) {
         std::cerr << "could not open as PMTiles or S-57 cell: " << archive << "\n";
         return 1;
     }
-    const char *mode = cp_source_format(g_src) == CP_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
+    const char *mode = chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
     uint8_t minZoom = 0, maxZoom = 0;
-    cp_source_zoom_range(g_src, &minZoom, &maxZoom);
+    chartplotter_source_zoom_range(g_src, &minZoom, &maxZoom);
     std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";
 
     // Source bounds (for framing the camera once the Map/window size is known).
     double bw = 0, bs = 0, be = 0, bn = 0;
-    const bool haveBounds = cp_source_bounds(g_src, &bw, &bs, &be, &bn);
+    const bool haveBounds = chartplotter_source_bounds(g_src, &bw, &bs, &be, &bn);
 
     mbgl::ResourceOptions resourceOptions;
     resourceOptions.withCachePath(":memory:").withAssetPath(".");
@@ -160,6 +160,6 @@ int main(int argc, char **argv) {
     // 5) Blocking interactive loop (drives rendering off GLFWView's RunLoop).
     view.run();
 
-    // g_src intentionally NOT cp_source_close()'d (see note above).
+    // g_src intentionally NOT chartplotter_source_close()'d (see note above).
     return 0;
 }

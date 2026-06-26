@@ -37,7 +37,7 @@ extern const char *tgc_simple_valuetype(const char *code, size_t code_len, size_
 
 /* Run a trivial Lua chunk and return its integer result, or a negative error.
  * Used to verify the embedded interpreter end to end. */
-long cp_diag_lua_selftest(void) {
+long chartplotter_diag_lua_selftest(void) {
     lua_State *L = luaL_newstate();
     if (!L) return -1;
     luaL_openlibs(L);
@@ -52,11 +52,11 @@ long cp_diag_lua_selftest(void) {
 }
 
 /* The embedded Lua version string (e.g. "Lua 5.4"). */
-const char *cp_diag_lua_version(void) { return LUA_VERSION; }
+const char *chartplotter_diag_lua_version(void) { return LUA_VERSION; }
 
 /* Value of the CHARTPLOTTER_S101_RULES env var (S-101 rules dir), or NULL. (Zig
- * 0.16's env access is behind Io; reading it here keeps cp_source_open simple.)
- * Used only as a fallback when cp_source_open's rules_dir argument is NULL. */
+ * 0.16's env access is behind Io; reading it here keeps chartplotter_source_open simple.)
+ * Used only as a fallback when chartplotter_source_open's rules_dir argument is NULL. */
 const char *tg_env_rules(void) { return getenv("CHARTPLOTTER_S101_RULES"); }
 
 /* Stub Host* callbacks (used to prove the framework EXECUTES, not just loads).
@@ -93,7 +93,7 @@ static void register_host_stubs(lua_State *L) {
 /* Prove the framework EXECUTES in embedded Lua 5.4: with stub Host callbacks and
  * an empty feature set, initialize the portrayal context and report the
  * FeaturePortrayalItems count (0). Returns 0 on success, negative on error. */
-int cp_diag_run_framework(const char *dir) {
+int chartplotter_diag_run_framework(const char *dir) {
     lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);
@@ -234,7 +234,7 @@ static int l_empty_string(lua_State *L) {
 
 /* Run the REAL DepthArea rule against a synthetic feature; print the emitted
  * S-101 instruction stream. Proves the portrayal path end to end. */
-int cp_diag_portray_demo(const char *dir) {
+int chartplotter_diag_portray_demo(const char *dir) {
     lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);
@@ -601,7 +601,7 @@ int tg_portray_run(const char *dir, size_t dir_len) {
  * main) in embedded Lua 5.4. Returns 0 on success, negative on error (message to
  * stderr). This exercises the most complex framework files — strong evidence of
  * whether the 5.1-authored rules run under 5.4. */
-int cp_diag_check_rules(const char *dir) {
+int chartplotter_diag_check_rules(const char *dir) {
     lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);

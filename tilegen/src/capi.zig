@@ -1,10 +1,10 @@
 //! C ABI for libchartplotter.a — what the C++ MapLibre host links against.
 //!
 //! A source is one of two backends behind the same tile API:
-//!   - CP_FORMAT_PMTILES:  a PMTiles archive (Zig reader)            [M5]
-//!   - CP_FORMAT_S57_CELL: a raw S-57 cell, tiles generated live     [M6c]
-//! CP_FORMAT_AUTO sniffs PMTiles first, then falls back to S-57. The C++
-//! ChartTileSource doesn't care which — it just calls cp_tile_get.
+//!   - CHARTPLOTTER_FORMAT_PMTILES:  a PMTiles archive (Zig reader)            [M5]
+//!   - CHARTPLOTTER_FORMAT_S57_CELL: a raw S-57 cell, tiles generated live     [M6c]
+//! CHARTPLOTTER_FORMAT_AUTO sniffs PMTiles first, then falls back to S-57. The C++
+//! ChartTileSource doesn't care which — it just calls chartplotter_tile_get.
 //!
 //! Contract: POD across the seam (ptr/len + status codes); Zig errors, slices
 //! and optionals stay inside Zig. Public header: ../../include/chartplotter.h.
@@ -24,7 +24,7 @@ extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
 // Keep in sync with the CHARTPLOTTER_VERSION_* macros in chartplotter.h.
 const version_string = "0.1.0";
 
-// Mirrors cp_format in chartplotter.h.
+// Mirrors chartplotter_format in chartplotter.h.
 const Format = enum(c_int) { auto = 0, pmtiles = 1, s57_cell = 2 };
 
 const CellBackend = struct {
@@ -44,7 +44,7 @@ const Source = struct {
     // In-memory tile cache (key = z<<48|x<<24|y -> MVT bytes). The host renders
     // continuously and MapLibre re-requests tiles, so without this every frame
     // would re-decode (PMTiles) or re-generate (cell) the same tiles. Values are
-    // owned here; cp_tile_get returns a fresh copy the caller frees.
+    // owned here; chartplotter_tile_get returns a fresh copy the caller frees.
     cache: std.AutoHashMap(u64, []u8),
 };
 
@@ -53,7 +53,7 @@ fn tileKey(z: u8, x: u32, y: u32) u64 {
 }
 
 /// Return the library version string ("0.1.0").
-export fn cp_version() callconv(.c) [*:0]const u8 {
+export fn chartplotter_version() callconv(.c) [*:0]const u8 {
     return version_string;
 }
 
@@ -111,9 +111,9 @@ fn openCell(bytes: []const u8, rules_dir: ?[*:0]const u8) ?*Source {
 }
 
 /// Open a chart tile source from in-memory bytes. `format` selects the backend
-/// (CP_FORMAT_AUTO sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir
+/// (CHARTPLOTTER_FORMAT_AUTO sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir
 /// for cells (null = default). Bytes are copied. Returns a handle or null.
-export fn cp_source_open(
+export fn chartplotter_source_open(
     data_ptr: [*]const u8,
     data_len: usize,
     format: c_int,
@@ -136,8 +136,8 @@ export fn cp_source_open(
     return openCell(bytes, rules_dir);
 }
 
-/// The resolved backend format (after a CP_FORMAT_AUTO sniff).
-export fn cp_source_format(src: ?*Source) callconv(.c) c_int {
+/// The resolved backend format (after a CHARTPLOTTER_FORMAT_AUTO sniff).
+export fn chartplotter_source_format(src: ?*Source) callconv(.c) c_int {
     const s = src orelse return @intFromEnum(Format.auto);
     return switch (s.backend) {
         .reader => @intFromEnum(Format.pmtiles),
@@ -145,7 +145,7 @@ export fn cp_source_format(src: ?*Source) callconv(.c) c_int {
     };
 }
 
-export fn cp_source_close(src: ?*Source) callconv(.c) void {
+export fn chartplotter_source_close(src: ?*Source) callconv(.c) void {
     const s = src orelse return;
     switch (s.backend) {
         .reader => |*r| r.deinit(),
@@ -165,7 +165,7 @@ export fn cp_source_close(src: ?*Source) callconv(.c) void {
 }
 
 /// Min/max zoom served by the source (PMTiles: archive range; cell: 0..18).
-export fn cp_source_zoom_range(src: ?*Source, min_z: *u8, max_z: *u8) callconv(.c) void {
+export fn chartplotter_source_zoom_range(src: ?*Source, min_z: *u8, max_z: *u8) callconv(.c) void {
     const s = src orelse {
         min_z.* = 0;
         max_z.* = 0;
@@ -187,7 +187,7 @@ export fn cp_source_zoom_range(src: ?*Source, min_z: *u8, max_z: *u8) callconv(.
 /// when known. Lets a host frame the data with its own fit-to-window logic
 /// (MapLibre's cameraForLatLngBounds) rather than a guessed center+zoom.
 /// PMTiles -> the archive's stored bounds; cell -> the data extent.
-export fn cp_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(.c) bool {
+export fn chartplotter_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(.c) bool {
     const so = src orelse return false;
     var b: [4]f64 = undefined; // [west, south, east, north]
     switch (so.backend) {
@@ -214,9 +214,9 @@ export fn cp_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) ca
 }
 
 /// Fetch tile (z,x,y) as MVT bytes (PMTiles: decompressed; cell: generated).
-/// Returns CP_TILE_OK (1) + out/out_len (free with cp_tile_free) if non-empty,
-/// CP_TILE_EMPTY (0) if empty/absent, CP_TILE_ERROR (-1) on error.
-export fn cp_tile_get(
+/// Returns CHARTPLOTTER_TILE_OK (1) + out/out_len (free with chartplotter_tile_free) if non-empty,
+/// CHARTPLOTTER_TILE_EMPTY (0) if empty/absent, CHARTPLOTTER_TILE_ERROR (-1) on error.
+export fn chartplotter_tile_get(
     src: ?*Source,
     z: u8,
     x: u32,
@@ -250,13 +250,13 @@ export fn cp_tile_get(
     return 1;
 }
 
-export fn cp_tile_free(ptr: ?[*]u8, len: usize) callconv(.c) void {
+export fn chartplotter_tile_free(ptr: ?[*]u8, len: usize) callconv(.c) void {
     const p = ptr orelse return;
     gpa.free(p[0..len]);
 }
 
 /// Drop the in-memory tile cache (bounds memory in long-running hosts).
-export fn cp_source_clear_cache(src: ?*Source) callconv(.c) void {
+export fn chartplotter_source_clear_cache(src: ?*Source) callconv(.c) void {
     const s = src orelse return;
     var it = s.cache.valueIterator();
     while (it.next()) |v| gpa.free(v.*);

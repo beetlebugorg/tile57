@@ -33,15 +33,15 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   dump_syms() { # $1=label $2=archive-or-object
     command -v nm >/dev/null || return 0
     echo "  [diag] $1:" >&2
-    nm "$2" 2>/dev/null | grep -iE 'cp_source_open|cp_source_close|cp_diag_lua_version' | head >&2 \
-      || echo "    (no cp_* symbols)" >&2
+    nm "$2" 2>/dev/null | grep -iE 'chartplotter_source_open|chartplotter_source_close|chartplotter_diag_lua_version' | head >&2 \
+      || echo "    (no chartplotter_* symbols)" >&2
   }
   dump_syms "pre-repack (zig-built archive)" "$LIB"
 
   # Apple's ld64 rejects archive members whose offsets aren't 8-byte aligned,
   # and Zig's `ar` doesn't align them. Earlier attempts to re-archive the .o
   # members with libtool produced an aligned archive but lost the *global*
-  # export aliases (`T _cp_*`), keeping only the module-local `_capi.cp_*`.
+  # export aliases (`T _chartplotter_*`), keeping only the module-local `_capi.chartplotter_*`.
   #
   # Robust fix: partial-link all members into ONE relocatable object with
   # `ld -r`. That (a) removes per-member alignment from the equation entirely
@@ -74,8 +74,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   "$LIBTOOL" -static -o "$LIB" "$combined"
   dump_syms "post-repack (final archive)" "$LIB"
 
-  if command -v nm >/dev/null && ! nm "$LIB" 2>/dev/null | grep -qi 'cp_source_open'; then
-    echo "ERROR: cp_source_open missing after re-pack (see diag above)." >&2
+  if command -v nm >/dev/null && ! nm "$LIB" 2>/dev/null | grep -qi 'chartplotter_source_open'; then
+    echo "ERROR: chartplotter_source_open missing after re-pack (see diag above)." >&2
     exit 1
   fi
 fi

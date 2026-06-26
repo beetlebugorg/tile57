@@ -26,7 +26,7 @@
 #include <sstream>
 #include <string>
 
-static cp_source *g_src = nullptr;
+static chartplotter_source *g_src = nullptr;
 
 static std::string readFile(const char *path) {
     std::ifstream f(path, std::ios::binary);
@@ -38,18 +38,18 @@ static std::string readFile(const char *path) {
 int main(int argc, char **argv) {
     // S-101 Lua compatibility check: chartplotter-render --s101check <rules-dir>
     if (argc >= 3 && std::string(argv[1]) == "--s101check") {
-        std::cerr << "embedded " << cp_diag_lua_version() << "\n";
-        int rc = cp_diag_check_rules(argv[2]);
+        std::cerr << "embedded " << chartplotter_diag_lua_version() << "\n";
+        int rc = chartplotter_diag_check_rules(argv[2]);
         std::cerr << (rc == 0 ? "S-101 framework: load OK\n" : "S-101 framework: load FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc >= 3 && std::string(argv[1]) == "--s101run") {
-        int rc = cp_diag_run_framework(argv[2]);
+        int rc = chartplotter_diag_run_framework(argv[2]);
         std::cerr << (rc == 0 ? "S-101 framework: run OK\n" : "S-101 framework: run FAILED\n");
         return rc == 0 ? 0 : 1;
     }
     if (argc >= 3 && std::string(argv[1]) == "--s101portray") {
-        int rc = cp_diag_portray_demo(argv[2]);
+        int rc = chartplotter_diag_portray_demo(argv[2]);
         std::cerr << (rc == 0 ? "S-101 portray: OK\n" : "S-101 portray: FAILED\n");
         return rc == 0 ? 0 : 1;
     }
@@ -75,16 +75,16 @@ int main(int argc, char **argv) {
     }
     // AUTO: the library sniffs PMTiles, else opens it as an S-57 cell (live gen).
     const auto *raw = reinterpret_cast<const uint8_t *>(bytes.data());
-    g_src = cp_source_open(raw, bytes.size(), CP_FORMAT_AUTO, nullptr);
+    g_src = chartplotter_source_open(raw, bytes.size(), CHARTPLOTTER_FORMAT_AUTO, nullptr);
     if (!g_src) {
         std::cerr << "could not open as PMTiles or S-57 cell\n";
         return 1;
     }
-    const char *mode = cp_source_format(g_src) == CP_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
+    const char *mode = chartplotter_source_format(g_src) == CHARTPLOTTER_FORMAT_PMTILES ? "pmtiles" : "s57-cell (live generation)";
     uint8_t minZoom = 0, maxZoom = 0;
-    cp_source_zoom_range(g_src, &minZoom, &maxZoom);
+    chartplotter_source_zoom_range(g_src, &minZoom, &maxZoom);
     std::cerr << "chart source opened [" << mode << "]: zoom " << int(minZoom) << ".." << int(maxZoom) << "\n";
-    std::cerr << "embedded " << cp_diag_lua_version() << " self-test: " << cp_diag_lua_selftest()
+    std::cerr << "embedded " << chartplotter_diag_lua_version() << " self-test: " << chartplotter_diag_lua_selftest()
               << " (expect 42)\n";
 
     // Register the Zig source in the (unused) Mbtiles slot BEFORE the Map builds
@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
         rc = 1;
     }
     // Note: g_src outlives the Map (which holds ChartTileSource instances via the
-    // resource loader); we intentionally do NOT cp_source_close here. The process
+    // resource loader); we intentionally do NOT chartplotter_source_close here. The process
     // is exiting, so the OS reclaims it — closing first would be a use-after-free
     // during Map teardown.
     return rc;

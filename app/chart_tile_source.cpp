@@ -25,7 +25,7 @@ static constexpr const char *PREFIX = "zigtiles://";
 // bytes — MapLibre then KEEPS its already-parsed tile (loadedData skips setData)
 // instead of re-parsing it every time. Without this MapLibre re-parses on every
 // re-request (15-60x/sec), which is the flicker.
-static void fillResponse(cp_source *src, const mbgl::Resource &resource, mbgl::Response &response) {
+static void fillResponse(chartplotter_source *src, const mbgl::Resource &resource, mbgl::Response &response) {
     int z = 0;
     unsigned x = 0, y = 0;
     const char *rest = resource.url.c_str() + std::strlen(PREFIX);
@@ -50,11 +50,11 @@ static void fillResponse(cp_source *src, const mbgl::Resource &resource, mbgl::R
 
     uint8_t *out = nullptr;
     size_t len = 0;
-    const cp_tile_status rc = cp_tile_get(src, static_cast<uint8_t>(z), x, y, &out, &len);
-    if (rc == CP_TILE_OK) {
+    const chartplotter_tile_status rc = chartplotter_tile_get(src, static_cast<uint8_t>(z), x, y, &out, &len);
+    if (rc == CHARTPLOTTER_TILE_OK) {
         response.data = std::make_shared<std::string>(reinterpret_cast<const char *>(out), len);
-        cp_tile_free(out, len);
-    } else if (rc == CP_TILE_EMPTY) {
+        chartplotter_tile_free(out, len);
+    } else if (rc == CHARTPLOTTER_TILE_EMPTY) {
         response.noContent = true; // empty tile
     } else {
         response.error = std::make_unique<mbgl::Response::Error>(
@@ -62,7 +62,7 @@ static void fillResponse(cp_source *src, const mbgl::Resource &resource, mbgl::R
     }
 }
 
-ChartTileSource::ChartTileSource(cp_source *s) : src(s) {}
+ChartTileSource::ChartTileSource(chartplotter_source *s) : src(s) {}
 
 ChartTileSource::~ChartTileSource() = default;
 

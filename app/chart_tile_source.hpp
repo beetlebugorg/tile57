@@ -15,13 +15,13 @@
 
 #include <memory>
 
-struct cp_source;
+struct chartplotter_source;
 
 namespace cpn {
 
 class ChartTileSource final : public mbgl::FileSource {
 public:
-    explicit ChartTileSource(cp_source *src);
+    explicit ChartTileSource(chartplotter_source *src);
     ~ChartTileSource() override;
 
     std::unique_ptr<mbgl::AsyncRequest> request(const mbgl::Resource &, Callback) override;
@@ -33,7 +33,7 @@ public:
     mbgl::ClientOptions getClientOptions() override;
 
 private:
-    cp_source *src;
+    chartplotter_source *src;
 };
 
 } // namespace cpn
