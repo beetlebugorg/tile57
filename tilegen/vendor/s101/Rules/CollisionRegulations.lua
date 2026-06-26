@@ -1,0 +1,19 @@
+-- CollisionRegulations portrayal rules file.
+--
+-- ISSUES: PSWG #41, PC #109
+--
+-- Main entry point for feature type.
+function CollisionRegulations(feature, featurePortrayal, contextParameters)
+	local viewingGroup
+
+	if (feature.PrimitiveType == PrimitiveType.Surface or feature.PrimitiveType == PrimitiveType.Curve) then
+		viewingGroup = 25001
+
+		featurePortrayal:AddInstructions('ViewingGroup:25001;DrawingPriority:4;DisplayPlane:UnderRadar')
+		featurePortrayal:AddInstructions('LineInstruction:COLREG01')
+	else
+		error('Invalid primitive type or mariner settings passed to portrayal')
+	end
+
+	return viewingGroup
+end
