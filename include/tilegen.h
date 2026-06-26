@@ -11,6 +11,7 @@
 #ifndef TILEGEN_H
 #define TILEGEN_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -32,6 +33,11 @@ void tg_close(tg_source *src);
 
 uint8_t tg_min_zoom(tg_source *src);
 uint8_t tg_max_zoom(tg_source *src);
+
+/* Suggested camera: writes lon, lat and zoom and returns true so a host can
+ * frame the source without knowing its location: PMTiles -> archive center or
+ * bounds; cell -> data bounds center plus a fitting zoom. False if no extent. */
+bool tg_center(tg_source *src, double *lon, double *lat, double *zoom);
 
 /* Fetch tile (z,x,y) as decompressed MVT bytes.
  * Returns 1 and sets *out / *out_len (free with tg_free) when found,

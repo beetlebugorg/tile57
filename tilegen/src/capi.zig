@@ -120,6 +120,38 @@ export fn tg_max_zoom(src: ?*Source) callconv(.c) u8 {
     };
 }
 
+/// Suggested camera for the source: sets lon/lat/zoom and returns true.
+/// PMTiles -> the archive's stored center (or its bounds center); cell -> the
+/// data bounds center + a zoom that roughly fits the cell. Lets a host open any
+/// source and frame it without knowing its location.
+export fn tg_center(src: ?*Source, lon: *f64, lat: *f64, zoom: *f64) callconv(.c) bool {
+    const s = src orelse return false;
+    switch (s.backend) {
+        .reader => |r| {
+            const h = r.header;
+            if (h.center_lon_e7 != 0 or h.center_lat_e7 != 0) {
+                lon.* = @as(f64, @floatFromInt(h.center_lon_e7)) / 1e7;
+                lat.* = @as(f64, @floatFromInt(h.center_lat_e7)) / 1e7;
+                zoom.* = if (h.center_zoom != 0) @floatFromInt(h.center_zoom) else @floatFromInt(h.min_zoom);
+                return true;
+            }
+            if (h.min_lon_e7 == 0 and h.max_lon_e7 == 0) return false;
+            lon.* = (@as(f64, @floatFromInt(h.min_lon_e7)) + @as(f64, @floatFromInt(h.max_lon_e7))) / 2e7;
+            lat.* = (@as(f64, @floatFromInt(h.min_lat_e7)) + @as(f64, @floatFromInt(h.max_lat_e7))) / 2e7;
+            zoom.* = @floatFromInt(h.min_zoom);
+            return true;
+        },
+        .cell => |*cb| {
+            const b = cb.cell.bounds() orelse return false;
+            lon.* = (b[0] + b[2]) / 2.0;
+            lat.* = (b[1] + b[3]) / 2.0;
+            const span = @max(b[2] - b[0], b[3] - b[1]);
+            zoom.* = if (span > 0) std.math.clamp(std.math.log2(360.0 / span) - 1.0, 2.0, 16.0) else 12.0;
+            return true;
+        },
+    }
+}
+
 /// Fetch tile (z,x,y) as MVT bytes (PMTiles: decompressed; cell: generated).
 /// Returns 1 + out/out_len (free with tg_free) if non-empty, 0 if empty/absent,
 /// negative on error.

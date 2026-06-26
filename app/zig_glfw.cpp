@@ -53,10 +53,7 @@ int main(int argc, char **argv) {
     }
     const std::string archive = argv[1];
     const std::string stylePath = argv[2];
-    // Default to Annapolis harbor if no camera is given.
-    const double lat = argc > 3 ? std::atof(argv[3]) : 38.978;
-    const double lon = argc > 4 ? std::atof(argv[4]) : -76.487;
-    const double zoom = argc > 5 ? std::atof(argv[5]) : 13.0;
+    const bool cameraFromArgs = argc > 5;
 
     // Open the archive in Zig (host owns the bytes). Try PMTiles first; fall
     // back to a raw S-57 cell (live in-process generation).
@@ -78,6 +75,17 @@ int main(int argc, char **argv) {
     }
     std::cerr << "tilegen source opened [" << mode << "]: zoom " << int(tg_min_zoom(g_src))
               << ".." << int(tg_max_zoom(g_src)) << "\n";
+
+    // Camera: explicit args win; otherwise frame the source (so any cell/archive
+    // opens centered on its data), falling back to Annapolis.
+    double lat = 38.978, lon = -76.487, zoom = 13.0;
+    if (cameraFromArgs) {
+        lat = std::atof(argv[3]);
+        lon = std::atof(argv[4]);
+        zoom = std::atof(argv[5]);
+    } else if (tg_center(g_src, &lon, &lat, &zoom)) {
+        std::cerr << "centered on source: " << lat << ", " << lon << " z" << zoom << "\n";
+    }
 
     mbgl::ResourceOptions resourceOptions;
     resourceOptions.withCachePath(":memory:").withAssetPath(".");
