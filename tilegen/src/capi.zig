@@ -120,36 +120,34 @@ export fn tg_max_zoom(src: ?*Source) callconv(.c) u8 {
     };
 }
 
-/// Suggested camera for the source: sets lon/lat/zoom and returns true.
-/// PMTiles -> the archive's stored center (or its bounds center); cell -> the
-/// data bounds center + a zoom that roughly fits the cell. Lets a host open any
-/// source and frame it without knowing its location.
-export fn tg_center(src: ?*Source, lon: *f64, lat: *f64, zoom: *f64) callconv(.c) bool {
-    const s = src orelse return false;
-    switch (s.backend) {
+/// Geographic bounds of the source (west,south,east,north degrees); returns true
+/// when known. Lets a host frame the data with its own fit-to-window logic
+/// (MapLibre's cameraForLatLngBounds) rather than a guessed center+zoom.
+/// PMTiles -> the archive's stored bounds; cell -> the data extent.
+export fn tg_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(.c) bool {
+    const so = src orelse return false;
+    var b: [4]f64 = undefined; // [west, south, east, north]
+    switch (so.backend) {
         .reader => |r| {
             const h = r.header;
-            if (h.center_lon_e7 != 0 or h.center_lat_e7 != 0) {
-                lon.* = @as(f64, @floatFromInt(h.center_lon_e7)) / 1e7;
-                lat.* = @as(f64, @floatFromInt(h.center_lat_e7)) / 1e7;
-                zoom.* = if (h.center_zoom != 0) @floatFromInt(h.center_zoom) else @floatFromInt(h.min_zoom);
-                return true;
-            }
-            if (h.min_lon_e7 == 0 and h.max_lon_e7 == 0) return false;
-            lon.* = (@as(f64, @floatFromInt(h.min_lon_e7)) + @as(f64, @floatFromInt(h.max_lon_e7))) / 2e7;
-            lat.* = (@as(f64, @floatFromInt(h.min_lat_e7)) + @as(f64, @floatFromInt(h.max_lat_e7))) / 2e7;
-            zoom.* = @floatFromInt(h.min_zoom);
-            return true;
+            if (h.min_lon_e7 == 0 and h.max_lon_e7 == 0 and h.min_lat_e7 == 0 and h.max_lat_e7 == 0) return false;
+            b = .{
+                @as(f64, @floatFromInt(h.min_lon_e7)) / 1e7,
+                @as(f64, @floatFromInt(h.min_lat_e7)) / 1e7,
+                @as(f64, @floatFromInt(h.max_lon_e7)) / 1e7,
+                @as(f64, @floatFromInt(h.max_lat_e7)) / 1e7,
+            };
         },
-        .cell => |*cb| {
-            const b = cb.cell.bounds() orelse return false;
-            lon.* = (b[0] + b[2]) / 2.0;
-            lat.* = (b[1] + b[3]) / 2.0;
-            const span = @max(b[2] - b[0], b[3] - b[1]);
-            zoom.* = if (span > 0) std.math.clamp(std.math.log2(360.0 / span) - 1.0, 2.0, 16.0) else 12.0;
-            return true;
-        },
+        .cell => |*cb| b = cb.cell.bounds() orelse return false,
     }
+    // Reject degenerate (a point) or near-global bounds (likely unset/default).
+    if (b[2] - b[0] <= 1e-9 or b[3] - b[1] <= 1e-9) return false;
+    if (b[2] - b[0] >= 359.0 or b[3] - b[1] >= 179.0) return false;
+    w.* = b[0];
+    s.* = b[1];
+    e.* = b[2];
+    n.* = b[3];
+    return true;
 }
 
 /// Fetch tile (z,x,y) as MVT bytes (PMTiles: decompressed; cell: generated).

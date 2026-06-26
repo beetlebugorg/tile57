@@ -26,6 +26,7 @@
 #include <mbgl/storage/resource_options.hpp>
 #include <mbgl/style/style.hpp>
 #include <mbgl/util/client_options.hpp>
+#include <mbgl/util/geo.hpp>
 
 #include <cstdlib>
 #include <fstream>
@@ -76,16 +77,9 @@ int main(int argc, char **argv) {
     std::cerr << "tilegen source opened [" << mode << "]: zoom " << int(tg_min_zoom(g_src))
               << ".." << int(tg_max_zoom(g_src)) << "\n";
 
-    // Camera: explicit args win; otherwise frame the source (so any cell/archive
-    // opens centered on its data), falling back to Annapolis.
-    double lat = 38.978, lon = -76.487, zoom = 13.0;
-    if (cameraFromArgs) {
-        lat = std::atof(argv[3]);
-        lon = std::atof(argv[4]);
-        zoom = std::atof(argv[5]);
-    } else if (tg_center(g_src, &lon, &lat, &zoom)) {
-        std::cerr << "centered on source: " << lat << ", " << lon << " z" << zoom << "\n";
-    }
+    // Source bounds (for framing the camera once the Map/window size is known).
+    double bw = 0, bs = 0, be = 0, bn = 0;
+    const bool haveBounds = tg_bounds(g_src, &bw, &bs, &be, &bn);
 
     mbgl::ResourceOptions resourceOptions;
     resourceOptions.withCachePath(":memory:").withAssetPath(".");
@@ -116,7 +110,21 @@ int main(int argc, char **argv) {
 
     view.setMap(&map);
     view.setWindowTitle("chartplotter-native (Zig tiles)");
-    map.jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{lat, lon}).withZoom(zoom));
+
+    // Camera: explicit lat/lon/zoom args win; otherwise fit the source's bounds
+    // to the window (correct center + zoom via MapLibre's projection-aware fit),
+    // falling back to Annapolis if the source has no usable extent.
+    if (cameraFromArgs) {
+        map.jumpTo(mbgl::CameraOptions()
+                       .withCenter(mbgl::LatLng{std::atof(argv[3]), std::atof(argv[4])})
+                       .withZoom(std::atof(argv[5])));
+    } else if (haveBounds) {
+        const auto bounds = mbgl::LatLngBounds::hull(mbgl::LatLng{bs, bw}, mbgl::LatLng{bn, be});
+        map.jumpTo(map.cameraForLatLngBounds(bounds, mbgl::EdgeInsets{20, 20, 20, 20}));
+        std::cerr << "framed source bounds: [" << bs << "," << bw << " .. " << bn << "," << be << "]\n";
+    } else {
+        map.jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{38.978, -76.487}).withZoom(13.0));
+    }
     map.getStyle().loadJSON(readFile(stylePath.c_str()));
 
     // 5) Blocking interactive loop (drives rendering off GLFWView's RunLoop).

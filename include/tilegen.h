@@ -34,10 +34,10 @@ void tg_close(tg_source *src);
 uint8_t tg_min_zoom(tg_source *src);
 uint8_t tg_max_zoom(tg_source *src);
 
-/* Suggested camera: writes lon, lat and zoom and returns true so a host can
- * frame the source without knowing its location: PMTiles -> archive center or
- * bounds; cell -> data bounds center plus a fitting zoom. False if no extent. */
-bool tg_center(tg_source *src, double *lon, double *lat, double *zoom);
+/* Geographic bounds (west, south, east, north degrees), returns true when known,
+ * so a host can frame the data with its own fit-to-window logic. PMTiles ->
+ * archive bounds; cell -> data extent. False if degenerate / near-global. */
+bool tg_bounds(tg_source *src, double *w, double *s, double *e, double *n);
 
 /* Fetch tile (z,x,y) as decompressed MVT bytes.
  * Returns 1 and sets *out / *out_len (free with tg_free) when found,
