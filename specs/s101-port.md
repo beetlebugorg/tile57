@@ -59,7 +59,26 @@ re-port them. Lua 5.4 is embedded in `libtilegen.a` (proven working).
 6. Differential-test the emitted instructions against the Go engine for a sample
    of features.
 
-## Status
+## Status: CORE DONE
+
+Live S-101 portrayal works end to end — a raw S-57 cell renders as a real S-101
+ECDIS chart in MapLibre, generated entirely in Zig (decode -> adapt via the real
+Feature Catalogue -> embedded-Lua IHO rules -> instructions -> MVT). On
+US4MD81M.000: **6933 / 7216 features (~96%) portray** via their actual rules —
+land, coastlines, depth areas + contours, lit buoys (light flares +
+characteristics), beacons, daymarks, landmarks, mooring/anchor symbols, labels.
+
+Set `TG_S101_RULES=<rules dir>` (default vendored at tilegen/vendor/s101/Rules)
+to enable; otherwise the crude classify() fallback is used.
+
+Remaining (~4%, diminishing returns): Sounding (needs the SG3D multipoint
+geometry wired into _HostFeaturePoints), Obstruction/Wreck/UnderwaterAwashRock
+(VALSOU depth-value handling), SpanOpening (complex clearance synthesis —
+Go's `clearances` map), and attribute-dependent class aliasing (LIGHTS ->
+LightAllAround/Sectored, MORFAC by CATMOR). Also: differential-test instruction
+streams vs Go; wire live generation into the interactive GLFW window (M3).
+
+## History
 
 - Lua 5.4 embedded + self-test passing.
 - S-101 framework **loads** in 5.4 (`--s101check`).

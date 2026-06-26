@@ -20,8 +20,8 @@ MapLibre Native in a desktop window, with platform chrome (SwiftUI / GTK4) to co
 | M3 | Own minimal interactive window (clone GLFWView) | next |
 | M4 | Zig MVT + gzip + PMTiles + projection/clip, differential-tested vs Go | ✅ done |
 | M5 | Live in-process tile generation (`libtilegen.a` + custom `FileSource`) | ✅ done |
-| M6a–c | Zig ISO 8211 + S-57 decode + topology → **live cell→MVT→MapLibre** (crude portrayal) | ✅ done |
-| M6d | S-57 attributes (✅) + embedded-Lua (✅ Lua 5.4) **S-101 portrayal** → full S-52 from live gen | 🔄 in progress |
+| M6a–c | Zig ISO 8211 + S-57 decode + topology → **live cell→MVT→MapLibre** | ✅ done |
+| M6d | Embedded-Lua **S-101 portrayal** (real IHO rules + Feature Catalogue) → live S-101 ECDIS chart from a raw cell | ✅ core done (~96% of features; soundings/wrecks/clearances polish remain) |
 
 See **[docs/PLAN.md](docs/PLAN.md)** for the architecture and **[docs/BUILD.md](docs/BUILD.md)**
 for build/run instructions.
