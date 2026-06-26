@@ -53,6 +53,20 @@ The live cell→MVT path emits seven of the layers in the
 A pre-baked PMTiles archive from chartplotter-go does not have these gaps; they are
 specific to live in-process generation.
 
+## ENC_ROOT loading
+
+Pointing a host at an ENC_ROOT directory loads every base cell and applies its
+S-57 update files (`.001…`). Two caveats:
+
+- **Overlay, not best-available.** All cells are drawn on top of each other; there
+  is no per-zoom navigational-band selection yet, so overlapping cells of
+  different compilation scales both render. (Go's baker does best-available band
+  suppression at bake time; the live path does not.)
+- **Update merge gaps.** Feature/vector insert/delete/modify and the SGCC/FSPC
+  control fields (indexed coordinate / spatial-pointer edits) are applied; VRPC
+  (indexed edits to an edge's begin/end node pointers) is not modelled — a VRPT
+  update is taken as a full replacement.
+
 ## Native / platform
 
 - **No platform chrome yet.** The current hosts are a headless PNG renderer

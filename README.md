@@ -29,7 +29,8 @@ NOAA **S-57** ENC cells into S-52 marine chart tiles — running the official IH
 **[MapLibre Native](https://github.com/maplibre/maplibre-native)** draws them
 (Metal on macOS, OpenGL/EGL on Linux). Tiles are generated live and in-process
 behind a custom MapLibre `FileSource`, so it renders straight from a raw `.000`
-cell; reading a pre-baked PMTiles archive works too.
+cell — or a whole **ENC_ROOT** directory (every cell + its `.001…` updates,
+overlaid). Reading a pre-baked PMTiles archive works too.
 
 It is the native sibling of
 [**chartplotter-go**](https://github.com/beetlebugorg/chartplotter), which bakes the
@@ -67,7 +68,7 @@ scripts/gen-reference.sh                       # tiles + assets + styles (needs 
 cmake --preset headless                        # or: desktop / macos / macos-desktop
 ninja -C build chartplotter-render
 build/chartplotter-render \
-  ../chartplotter-go/testdata/US4MD81M.000 \   # a raw S-57 cell (or a .pmtiles)
+  ../chartplotter-go/testdata/US4MD81M.000 \   # a cell, a .pmtiles, or an ENC_ROOT dir
   style/chart-zig-day.json 38.97 -76.49 12 renders/from_cell.png
 ```
 

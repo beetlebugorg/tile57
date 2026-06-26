@@ -84,6 +84,32 @@ void           chartplotter_source_clear_cache(chartplotter_source *src);  /* bo
 - **`chartplotter_source_clear_cache`** drops the in-process tile cache; later `chartplotter_tile_get`
   calls regenerate/decode. Useful for long-running interactive hosts.
 
+## Opening an ENC_ROOT (multiple cells)
+
+`chartplotter_source_open` takes one file's bytes. To load a whole **ENC_ROOT**
+(many cells, each with update files), use `chartplotter_source_open_cells`: the
+host scans the directory and reads the files (the library has no filesystem
+access — Zig 0.16 gates it behind `std.Io`), then hands the bytes over. Each
+cell's base `.000` and its sequential `.001…` updates are passed together; the
+library applies the updates (S-57 §8.4) and overlays the cells per tile.
+
+```c
+typedef struct {
+    const uint8_t *base;            /* the .000 bytes */
+    size_t base_len;
+    const uint8_t *const *updates;  /* .001, .002, … in order (NULL if none) */
+    const size_t *update_lens;
+    size_t update_count;
+} chartplotter_cell_input;
+
+chartplotter_source *chartplotter_source_open_cells(
+    const chartplotter_cell_input *cells, size_t count, const char *rules_dir);
+```
+
+All bytes are copied, so the host can free its buffers once the call returns.
+`app/enc_root.hpp` (`cpn::openPath`) is the reference directory walk used by both
+bundled hosts.
+
 ## Minimal usage
 
 ```c

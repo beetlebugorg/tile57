@@ -48,10 +48,18 @@ C ABI is not yet frozen.
   target as the C++ host (`CMAKE_OSX_DEPLOYMENT_TARGET`, default 14.3).
 
 ### Added
+- **ENC_ROOT support**: point a host at a directory to load every base cell plus
+  its sequential `.001…` update files, overlaid. New
+  `chartplotter_source_open_cells` C API + a `cells` backend
+  (`s57_mvt.generateTileMulti`); the host walks the directory (`app/enc_root.hpp`).
+- **S-57 update application** (`parseCellWithUpdates`): record-level merge by FOID
+  / (RCNM,RCID) with RUIN insert/delete/modify and the SGCC/FSPC control fields.
 - M3 interactive pan/zoom window (`chartplotter`) serving live Zig tiles.
 - Live S-57 → MVT portrayal now emits soundings (SNDFRM04 glyphs), area fill
   patterns, and feature names (synthesized from OBJNAM).
+- Area labels placed at the true centroid when inside (Go sync `30db686`).
 - In-process tile cache in the generator (memoizes generated/decoded tiles).
-- Project docs: `docs/API.md` (C ABI reference), this changelog; `docs/BUILD.md`
-  now documents the project's own binaries and runtime knobs.
+- A **Docusaurus documentation site** under `docs/` (Introduction, Installation,
+  Getting Started, C API, Architecture, Tile Schema, Known Limitations),
+  deployed to GitHub Pages; this changelog; `specs/go-sync.md` Go-port plan.
 - MIT `LICENSE`.

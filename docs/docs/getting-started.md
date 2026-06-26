@@ -65,6 +65,30 @@ build/chartplotter-render \
 
 The format is auto-detected (`CHARTPLOTTER_FORMAT_AUTO`): PMTiles first, then S-57 cell.
 
+## Step 2b: Point at an ENC_ROOT (many cells + updates)
+
+If the path is a **directory**, it's treated as an ENC_ROOT: every `*.000` base
+cell under it is loaded and overlaid, and each cell's sequential update files
+(`.001`, `.002`, …) are applied. This is the usual shape of a NOAA ENC download
+(`ENC_ROOT/<CELL>/<CELL>.000` + updates).
+
+```sh
+build/chartplotter-render \
+  /path/to/ENC_ROOT \                  # a directory, not a file
+  style/chart-zig-day.json \
+  38.97 -76.45 11 renders/enc_root.png
+```
+
+Both hosts accept a directory anywhere a chart path is expected. The host walks
+the directory and reads the files; the library applies the updates and overlays
+the cells.
+
+:::note Overlay, not best-available
+Cells are overlaid (all drawn); there is no per-zoom "best-available" band
+selection yet, so overlapping cells of different scales both render. See
+[Known limitations](./limitations.md).
+:::
+
 ## Step 3: Open the interactive window
 
 `chartplotter` opens a real pannable/zoomable window. Drag to pan, scroll to

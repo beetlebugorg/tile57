@@ -48,8 +48,11 @@ Mapbox Vector Tile bytes  ─────────▶  MapLibre Native  (Char
 6. **Serve.** `chartplotter_tile_get` returns the tile's bytes; the `ChartTileSource`
    `FileSource` hands them to MapLibre for `zigtiles://{z}/{x}/{y}` requests.
 
-The same `chartplotter_*` API also reads a pre-baked **PMTiles** archive instead of
-generating from a cell — the renderer cannot tell the difference.
+The same `chartplotter_*` API also reads a pre-baked **PMTiles** archive instead
+of generating from a cell, or a whole **ENC_ROOT** directory — every base cell
+with its `.001…` updates applied (S-57 §8.4 record merge) and the cells overlaid
+per tile. The renderer cannot tell the difference. The host does the directory
+walk and file reads (`app/enc_root.hpp`); the library has no filesystem access.
 
 ## Design decisions
 
