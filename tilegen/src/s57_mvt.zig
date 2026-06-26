@@ -18,6 +18,80 @@ const s101 = @import("s101_instr.zig");
 // size 1.0), i.e. ~2.8x too large.
 const SYMBOL_SCALE: f64 = 0.02834627777338028;
 
+const LonLat = s57.LonLat;
+
+// Area representative point — where an area's label (and symbol) is placed.
+// Ported from chartplotter-go (30db686): S-52 PresLib §8.5.3 says the point is
+// the CENTRE OF GRAVITY (centroid) by default, using another point only when the
+// centroid falls outside the area. We previously used a naive vertex average,
+// which drifts toward dense vertex clusters and leaves a wide rectangle's label
+// off-centre. Now: the true area centroid when it lies inside, else fall back to
+// the vertex average (Go falls back to a polylabel pole-of-inaccessibility, which
+// we do not have; the vertex average is no worse than the previous behaviour for
+// concave / holed shapes).
+
+// Area centroid of a single ring via the shoelace formula; null for a degenerate
+// (zero-area) ring. Raw lon/lat — the cos(lat) skew is immaterial for a centring
+// point over a chart-sized area. The ring may be open or closed (edges wrap).
+fn ringCentroid(ring: []const LonLat) ?LonLat {
+    if (ring.len < 3) return null;
+    var area2: f64 = 0;
+    var cx: f64 = 0;
+    var cy: f64 = 0;
+    var i: usize = 0;
+    while (i < ring.len) : (i += 1) {
+        const j = (i + 1) % ring.len;
+        const cross = ring[i].lon * ring[j].lat - ring[j].lon * ring[i].lat;
+        area2 += cross;
+        cx += (ring[i].lon + ring[j].lon) * cross;
+        cy += (ring[i].lat + ring[j].lat) * cross;
+    }
+    if (@abs(area2) < 1e-12) return null;
+    const a6 = 3.0 * area2; // 6 * (signed area = area2 / 2)
+    return .{ .lon = cx / a6, .lat = cy / a6 };
+}
+
+// Even-odd point-in-polygon over the union of rings (exterior boundary + holes):
+// inside the exterior AND outside every hole.
+fn pointInRingsEvenOdd(lon: f64, lat: f64, rings: []const []LonLat) bool {
+    var inside = false;
+    for (rings) |ring| {
+        if (ring.len < 2) continue;
+        var j: usize = ring.len - 1;
+        var i: usize = 0;
+        while (i < ring.len) : (i += 1) {
+            const a = ring[i];
+            const b = ring[j];
+            if ((a.lat > lat) != (b.lat > lat) and
+                lon < (b.lon - a.lon) * (lat - a.lat) / (b.lat - a.lat) + a.lon)
+            {
+                inside = !inside;
+            }
+            j = i;
+        }
+    }
+    return inside;
+}
+
+// The representative point for an area's parts (first part treated as the
+// exterior ring, like the Go baker). Null if there are no usable vertices.
+fn areaRepresentativePoint(rings: []const []LonLat) ?LonLat {
+    if (rings.len == 0) return null;
+    if (ringCentroid(rings[0])) |c| {
+        if (pointInRingsEvenOdd(c.lon, c.lat, rings)) return c;
+    }
+    var clon: f64 = 0;
+    var clat: f64 = 0;
+    var n: usize = 0;
+    for (rings) |ring| for (ring) |q| {
+        clon += q.lon;
+        clat += q.lat;
+        n += 1;
+    };
+    if (n == 0) return null;
+    return .{ .lon = clon / @as(f64, @floatFromInt(n)), .lat = clat / @as(f64, @floatFromInt(n)) };
+}
+
 const Kind = enum { area, line, skip };
 const Class = struct { kind: Kind, name: []const u8, color: []const u8, dash: []const u8 = "solid" };
 
@@ -212,23 +286,13 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
         }
     }
 
-    // Area / line labels (TextInstruction): placed at the geometry centroid (a
-    // rough label point; the Go baker computes a proper one). Without this only
+    // Area / line labels (TextInstruction): placed at the area representative
+    // point (centre of gravity; see areaRepresentativePoint). Without this only
     // point-feature labels show, so area/channel/place names were missing.
     if (p.texts.len > 0) {
-        var clon: f64 = 0;
-        var clat: f64 = 0;
-        var n: usize = 0;
-        for (geo_parts) |gp| for (gp) |q| {
-            clon += q.lon;
-            clat += q.lat;
-            n += 1;
-        };
-        if (n > 0) {
-            const lon = clon / @as(f64, @floatFromInt(n));
-            const lat = clat / @as(f64, @floatFromInt(n));
-            if (lon >= tb[0] and lon <= tb[2] and lat >= tb[1] and lat <= tb[3]) {
-                const cpt = tile.project(lon, lat, z, x, y, tile.EXTENT);
+        if (areaRepresentativePoint(geo_parts)) |rp| {
+            if (rp.lon >= tb[0] and rp.lon <= tb[2] and rp.lat >= tb[1] and rp.lat <= tb[3]) {
+                const cpt = tile.project(rp.lon, rp.lat, z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
                 const single = try a.alloc(mvt.Point, 1);
                 single[0] = cpt;
@@ -339,6 +403,33 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0));
     try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6));
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0));
+}
+
+test "area representative point centres on the centroid when inside" {
+    const t = std.testing;
+    // A wide rectangle (0,0)-(10,2): the centre of gravity is dead-centre.
+    var rect = [_]LonLat{
+        .{ .lon = 0, .lat = 0 },  .{ .lon = 10, .lat = 0 },
+        .{ .lon = 10, .lat = 2 }, .{ .lon = 0, .lat = 2 },
+    };
+    var parts = [_][]LonLat{rect[0..]};
+    const rp = areaRepresentativePoint(parts[0..]).?;
+    try t.expectApproxEqAbs(@as(f64, 5), rp.lon, 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 1), rp.lat, 1e-9);
+
+    // Even-odd containment: centre inside, far point outside.
+    try t.expect(pointInRingsEvenOdd(5, 1, parts[0..]));
+    try t.expect(!pointInRingsEvenOdd(20, 1, parts[0..]));
+
+    // A triangle's centroid is the mean of its three vertices.
+    var tri = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 6, .lat = 0 }, .{ .lon = 0, .lat = 6 } };
+    const c = ringCentroid(tri[0..]).?;
+    try t.expectApproxEqAbs(@as(f64, 2), c.lon, 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 2), c.lat, 1e-9);
+
+    // A degenerate (collinear / 2-point) ring has no centroid.
+    var deg = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 1, .lat = 1 } };
+    try t.expect(ringCentroid(deg[0..]) == null);
 }
 
 test "generate a tile from a cell is well-formed MVT" {
