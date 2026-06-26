@@ -15,17 +15,24 @@ cd "$ROOT/tilegen"
 LIB="$ROOT/tilegen/zig-out/lib/libtilegen.a"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  echo "==> re-packing $LIB with Apple libtool (macOS ld alignment)" >&2
-  # Use Apple's libtool explicitly — Homebrew's GNU libtool may shadow it in
-  # PATH and its `-static -o` means something entirely different (it would drop
-  # the symbol table -> "Undefined symbols" at link). Feeding the archive back
-  # to Apple libtool re-aligns members and rebuilds the symbol table.
+  echo "==> re-packing $LIB for macOS ld alignment" >&2
+  # Apple's ld64 rejects archive members that aren't 8-byte aligned, and Zig's
+  # archive isn't. Feeding the archive back to libtool only copies the bad
+  # members (it warns + drops them). The fix is to EXTRACT the objects and
+  # re-archive them from the .o files (fresh members get aligned). Extract with
+  # Zig's own ar (reads its archive reliably); re-archive with Apple's libtool
+  # (NOT Homebrew's GNU libtool, whose `-static` is unrelated to archiving).
   LIBTOOL="${LIBTOOL:-/usr/bin/libtool}"
-  "$LIBTOOL" -static -o "$LIB.aligned" "$LIB"
-  mv -f "$LIB.aligned" "$LIB"
-  # Sanity check: the C ABI entry point must be present.
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  ( cd "$tmp" && "$ZIG" ar x "$LIB" )
+  if [[ -z "$(ls "$tmp"/*.o 2>/dev/null)" ]]; then
+    echo "ERROR: no objects extracted from $LIB" >&2
+    exit 1
+  fi
+  "$LIBTOOL" -static -o "$LIB" "$tmp"/*.o
   if command -v nm >/dev/null && ! nm "$LIB" 2>/dev/null | grep -q ' T _tg_open_bytes'; then
-    echo "ERROR: _tg_open_bytes missing after re-pack (wrong libtool?)" >&2
+    echo "ERROR: _tg_open_bytes missing after re-pack (libtool=$LIBTOOL — Apple's is /usr/bin/libtool)" >&2
     exit 1
   fi
 fi
