@@ -18,9 +18,10 @@ MapLibre Native in a desktop window, with platform chrome (SwiftUI / GTK4) to co
 | M1 | Annapolis chart renders from Go-baked PMTiles + ported style (areas + lines, Day/Dusk/Night) | ✅ done |
 | M2 | Full S-52 fidelity: symbols, glyphs+text, soundings, area patterns, depth-shading | ✅ done |
 | M3 | Own minimal interactive window (clone GLFWView) | next |
-| M4 | Zig offline MVT/PMTiles baker, validated vs Go | |
-| M5 | Live in-process tile generation (`libtilegen.a` + custom `FileSource`) | |
-| M6 | Full Zig pipeline: ISO8211 + S-57 decode → embedded-Lua S-101 portrayal → MVT | |
+| M4 | Zig MVT + gzip + PMTiles + projection/clip, differential-tested vs Go | ✅ done |
+| M5 | Live in-process tile generation (`libtilegen.a` + custom `FileSource`) | ✅ done |
+| M6a–c | Zig ISO 8211 + S-57 decode + topology → **live cell→MVT→MapLibre** (crude portrayal) | ✅ done |
+| M6d | S-57 attributes + embedded-Lua **S-101 portrayal** → full S-52 fidelity from live gen | next |
 
 See **[docs/PLAN.md](docs/PLAN.md)** for the architecture and **[docs/BUILD.md](docs/BUILD.md)**
 for build/run instructions.

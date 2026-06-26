@@ -51,9 +51,12 @@ Tiles carry **color tokens** (not RGB); the style resolves Day/Dusk/Night from
 | M1 | Pan/zoom the Annapolis chart from `reference/tiles/annapolis.pmtiles` + minimal ported `style.json` (areas + lines) | none | ✅ done |
 | M2 | S-52 fidelity: symbols, glyphs+text, soundings, area patterns, day/dusk/night, depth-shading | none | ✅ done |
 | M3 | Own minimal window (clone GLFWView); interactive pan/zoom | none | (mbgl-glfw works now) |
-| M4 | Zig offline baker (`tile`+`mvt`+`pmtiles`), validated vs Go | Zig CLI | 🔄 mvt done (encoder/decoder + parity test vs Go); next pmtiles + gzip + tile project/clip |
-| M5 | Live in-process generation via custom `FileSource` + C ABI | Zig lib + glue | |
-| M6 | Full Zig pipeline: ISO8211+S-57 decode -> embedded-Lua S-101 -> MVT | Zig | |
+| M4 | Zig encoder core: mvt + gzip + pmtiles + tile (project/clip), differential-tested vs Go | Zig CLI | ✅ done |
+| M5 | Live in-process generation via custom `FileSource` + C ABI | Zig lib + glue | ✅ done |
+| M6a | ISO 8211 decoder (parses real cells) | Zig | ✅ done |
+| M6b | S-57 model: dataset params, vectors, features | Zig | ✅ done |
+| M6c | Topology assembly + **live cell→MVT→MapLibre** (crude classify()) | Zig | ✅ done |
+| M6d | S-57 attributes (ATTF) + embedded-Lua S-101 portrayal -> full S-52 | Zig + Lua | next |
 
 ## Environment notes
 
