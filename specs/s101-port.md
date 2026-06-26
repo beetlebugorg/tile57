@@ -73,7 +73,25 @@ re-port them. Lua 5.4 is embedded in `libtilegen.a` (proven working).
 - classify() placeholder in s57_mvt.zig covers DEPARE/LNDARE/COALNE/DEPCNT/etc.
   with live depth shading.
 
-**Next (no remaining unknowns):** step 3 — implement the real Host* callbacks
-(C stubs in lua_shim.c -> back them with the Zig s57.Cell via small extern
-accessors) + step 4 (FeatureCatalogue.xml for type codes) + step 5 (instruction
--> MVT), then dispatch each cell feature through its rule.
+**Remaining (no unknowns; the connecting wire-up):**
+- **step 5 DONE:** `s101_instr.zig` parses an instruction stream into a Portrayal
+  (fill/patterns/lines/points/texts), tested on the real DEPARE03 output.
+- **resolveCode** (`complex.go`): most S-57 classes map to a same-NAMED S-101
+  class iff it exists in the catalogue, plus special aliasing (LIGHTS ->
+  LightAllAround/Sectored/…, ADMARE, MORFAC by CATMOR, sector lights, …).
+  Catalogue-driven.
+- **buildRoot** (`complex.go`): synthesize the S-101 attribute tree from S-57
+  attrs (acronym -> camelCase name aliasing, complex-attribute nesting,
+  clearances map, derived attrs like depthRange{Min,Max}Value, featureName).
+- **FeatureCatalogue.xml** parse -> FeatureTypes{bindings}, SimpleAttrs{valueType},
+  ComplexAttrs, InformationTypes (feeds HostGet*TypeInfo/TypeCodes). Or a
+  pragmatic per-class minimal catalogue to start (proven works for DepthArea).
+- **Cell-backed Host binding:** drive Lua from Zig (@cImport lua.h) so the Host*
+  read the live `s57.Cell` directly, OR a C accessor bridge. Run portrayal ONCE
+  per cell (cache featureID -> instruction stream), then per tile translate
+  (s101_instr) + emit geometry into MVT, replacing s57_mvt.classify().
+
+Recommended order: minimal per-class catalogue + resolveCode/buildRoot for
+DEPARE/COALNE/DEPCNT/SOUNDG -> Zig-driven Lua over real cell features ->
+s101_instr -> MVT (visible real-S-101 render of a few classes) -> then expand to
+the full FeatureCatalogue.xml + all classes.
