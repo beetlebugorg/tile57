@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,32 @@
 #include <vector>
 
 namespace cpn {
+
+// Resolve the S-101 portrayal rules directory robustly so a host works when run
+// from outside the repo root: CHARTPLOTTER_S101_RULES if set, else search for the
+// vendored catalogue relative to the CWD and to the executable, walking up
+// parents. Returns "" if not found (the caller then passes NULL and the library
+// falls back to its relative default).
+inline std::string resolveRulesDir(const char *argv0) {
+    namespace fs = std::filesystem;
+    if (const char *env = std::getenv("CHARTPLOTTER_S101_RULES"); env && *env) return env;
+    const fs::path suffix = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+    std::error_code ec;
+    std::vector<fs::path> starts;
+    starts.push_back(fs::current_path(ec));
+    if (argv0) {
+        const fs::path exe = fs::weakly_canonical(fs::path(argv0), ec);
+        if (!ec && exe.has_parent_path()) starts.push_back(exe.parent_path());
+    }
+    for (const auto &start : starts) {
+        for (fs::path p = start;; p = p.parent_path()) {
+            const fs::path cand = p / suffix;
+            if (fs::exists(cand / "S100Scripting.lua", ec)) return cand.string();
+            if (!p.has_parent_path() || p == p.parent_path()) break;
+        }
+    }
+    return std::string();
+}
 
 inline std::string readFileBytes(const std::filesystem::path &p) {
     std::ifstream f(p, std::ios::binary);

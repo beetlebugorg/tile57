@@ -80,7 +80,11 @@ int main(int argc, char **argv) {
     // Open the path: a file (PMTiles or one S-57 cell, auto-detected) or an
     // ENC_ROOT directory (all base cells + their updates, overlaid). The host
     // reads the bytes; libchartplotter copies what it keeps.
-    g_src = cpn::openPath(archive, nullptr);
+    const std::string rulesDir = cpn::resolveRulesDir(argv[0]);
+    if (rulesDir.empty())
+        std::cerr << "warning: S-101 rules not found — set CHARTPLOTTER_S101_RULES, run from the "
+                     "repo root, or `git submodule update --init`\n";
+    g_src = cpn::openPath(archive, rulesDir.empty() ? nullptr : rulesDir.c_str());
     if (!g_src) {
         std::cerr << "could not open as ENC_ROOT, PMTiles, or S-57 cell: " << archive << "\n";
         return 1;
