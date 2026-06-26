@@ -19,6 +19,11 @@
 #include <Metal/Metal.hpp>
 #include <QuartzCore/CAMetalLayer.hpp>
 
+// Obj-C QuartzCore, for the one property metal-cpp does not expose
+// (CAMetalLayer.presentsWithTransaction). The metal-cpp CA::MetalLayer* IS the
+// underlying Obj-C object, so a __bridge cast reaches it.
+#import <QuartzCore/QuartzCore.h>
+
 namespace mbgl {
 
 using namespace mtl;
@@ -31,9 +36,16 @@ public:
         swapchain(NS::TransferPtr(CA::MetalLayer::layer())) {
     swapchain->setDevice(backend.getDevice().get());
     // *** PATCH: block for a drawable instead of returning nil under load, so a
-    // missing drawable never blanks the frame (the flicker-on-fast-pan bug). ***
+    // missing drawable never blanks the frame. ***
     swapchain->setMaximumDrawableCount(3);
     swapchain->setAllowsNextDrawableTimeout(false);
+    // *** PATCH (the canonical macOS Metal flicker fix, per Apple's CAMetalLayer
+    // docs / "Glitchless Metal Window Resizing"): present the drawable
+    // SYNCHRONOUSLY within the CoreAnimation transaction instead of the async
+    // commandBuffer->presentDrawable(). Eliminates the tearing/flicker on fast
+    // pan/zoom and resize. The matching present sequence is in swap(). metal-cpp
+    // doesn't expose this property, so set it on the Obj-C CAMetalLayer. ***
+    ((__bridge CAMetalLayer *)swapchain.get()).presentsWithTransaction = YES;
   }
 
   void setBackendSize(mbgl::Size size_) {
@@ -100,20 +112,16 @@ public:
   }
 
   void swap() override {
-    // *** PATCH: only present if we actually acquired a drawable. ***
-    if (surface) {
-      commandBuffer->presentDrawable(surface.get());
-    }
+    // *** PATCH: presentsWithTransaction present sequence (Apple-documented Metal
+    // flicker fix). Do NOT use commandBuffer->presentDrawable() (that's the async
+    // path). Instead commit, wait until the command buffer is SCHEDULED, then
+    // present the drawable synchronously — so the swap happens inside the same
+    // CoreAnimation transaction as the layout, with no tearing/flicker. ***
     commandBuffer->commit();
-    // *** PATCH (the real flicker fix): wait for the GPU to finish this frame
-    // before returning. The depth + stencil textures are a SINGLE shared
-    // instance (Texture2D::create() only reallocates on resize), but the
-    // on-screen GLFW backend never synchronized frames — so consecutive
-    // in-flight frames raced on that shared depth/stencil, garbling output in
-    // proportion to frame rate (flicker on fast pan / continuous render; fine
-    // when idle). MapLibre's own offscreen path waits here for the same reason.
-    // One frame in flight eliminates the race. ***
-    commandBuffer->waitUntilCompleted();
+    if (surface) {
+      commandBuffer->waitUntilScheduled();
+      surface->present();
+    }
     commandBuffer.reset();
     renderPassDescriptor.reset();
     surface.reset();
