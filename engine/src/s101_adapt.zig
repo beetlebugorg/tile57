@@ -29,6 +29,11 @@ pub const Adapted = struct {
     primitive: []const u8, // "Point" | "Curve" | "Surface"
     attrs: []NameVal, // S-101 attribute name -> value
     complex: []ComplexAttr = &.{}, // synthesized complex attributes
+    // Point geometry (lon, lat, z) served to the rules via _HostFeaturePoints, so
+    // HostGetSpatial can return a real Point for `#P` features — the S-101
+    // framework's GetSpatial re-enters forever on a nil Point (the OBSTRN/WRECKS
+    // "C stack overflow"). One entry for a point feature; empty otherwise.
+    points: []const [3]f64 = &.{},
 };
 
 // --- Derived depth attributes (S-52 DEPVAL) --------------------------------
@@ -141,6 +146,10 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
     var out = std.ArrayList(Adapted).empty;
     const depth_index = DepthIndex{ .areas = try buildDepthIndex(a, cell) };
     for (cell.features, 0..) |f, i| {
+        // SOUNDG (objl 129) is emitted directly as a multipoint by s57_mvt
+        // (bypassing portrayal), so don't portray it — it would just error on the
+        // multipoint primitive the rule path doesn't model.
+        if (f.objl == 129) continue;
         var code = resolveCode(f.objl) orelse meta: {
             // Meta object classes (M_*) are absent from the numeric S-57 code
             // table, so resolveCode can't reach their catalogue alias. Map the one
@@ -210,7 +219,20 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         const q = cell.featureQuapos(f);
         if (q != 0) try attrs.append(a, .{ .name = "qualityOfHorizontalMeasurement", .value = try std.fmt.allocPrint(a, "{d}", .{q}) });
 
-        try out.append(a, .{ .feature_index = i, .code = code, .primitive = prim, .attrs = attrs.items, .complex = complex.items });
+        // Point geometry for `#P` spatial resolution: a point feature's node, with
+        // z = VALSOU (a sounding/danger depth) when present. The framework needs a
+        // real Point from HostGetSpatial or it recurses (see Adapted.points).
+        var points: []const [3]f64 = &.{};
+        if (f.prim == 1) {
+            if (cell.pointGeometry(f)) |pg| {
+                const z = f.attrFloat(s57.ATTR_VALSOU) orelse 0;
+                const arr = try a.alloc([3]f64, 1);
+                arr[0] = .{ pg.lon, pg.lat, z };
+                points = arr;
+            }
+        }
+
+        try out.append(a, .{ .feature_index = i, .code = code, .primitive = prim, .attrs = attrs.items, .complex = complex.items, .points = points });
     }
     return out.items;
 }

@@ -22,6 +22,8 @@ extern size_t tgp_complex_count(size_t i, const char *name, size_t nlen);
 extern const char *tgp_complex_attr(size_t i, const char *path, size_t plen,
                                     const char *code, size_t clen, size_t *len);
 extern void tgp_emit(size_t i, const char *instr, size_t len);
+extern size_t tgp_points_count(size_t i);
+extern void tgp_point(size_t i, size_t j, double *x, double *y, double *z);
 
 /* Catalogue accessors implemented in Zig (catalogue.zig). */
 extern size_t tgc_feature_count(void);
@@ -457,6 +459,32 @@ static int lp_feature_primitive(lua_State *L) {
     lua_pushlstring(L, s, len);
     return 1;
 }
+/* _HostFeaturePoints(fid) -> array of {x,y,z} string triples (CreatePoint takes
+ * strings). Backs the #P / #M spatial glue so HostGetSpatial returns a real
+ * Point/MultiPoint instead of nil (a nil Point makes the framework's GetSpatial
+ * recurse forever -> "C stack overflow"). */
+static int lp_feature_points(lua_State *L) {
+    size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    size_t n = tgp_points_count(i);
+    lua_newtable(L);
+    for (size_t j = 0; j < n; j++) {
+        double x = 0, y = 0, z = 0;
+        tgp_point(i, j, &x, &y, &z);
+        char b[32];
+        lua_newtable(L);
+        snprintf(b, sizeof b, "%.10g", x);
+        lua_pushstring(L, b);
+        lua_rawseti(L, -2, 1);
+        snprintf(b, sizeof b, "%.10g", y);
+        lua_pushstring(L, b);
+        lua_rawseti(L, -2, 2);
+        snprintf(b, sizeof b, "%.10g", z);
+        lua_pushstring(L, b);
+        lua_rawseti(L, -2, 3);
+        lua_rawseti(L, -2, (lua_Integer)(j + 1));
+    }
+    return 1;
+}
 static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value} */
     size_t i = (size_t)atol(luaL_checkstring(L, 1));
     const char *path = lua_tostring(L, 2);
@@ -521,7 +549,7 @@ int tg_portray_run(const char *dir, size_t dir_len) {
     lua_register(L, "HostGetFeatureIDs", lp_feature_ids);
     lua_register(L, "HostFeatureGetCode", lp_feature_code);
     lua_register(L, "_HostFeaturePrimitive", lp_feature_primitive);
-    lua_register(L, "_HostFeaturePoints", l_empty_table);
+    lua_register(L, "_HostFeaturePoints", lp_feature_points);
     lua_register(L, "HostFeatureGetSimpleAttribute", lp_feature_simple_attr);
     lua_register(L, "HostFeatureGetComplexAttributeCount", lp_feature_complex_count);
     lua_register(L, "HostPortrayalEmit", l_true);
@@ -549,6 +577,13 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         lua_close(L);
         return -2;
     }
+    // Spatial glue (installed after the framework loads so it can use the
+    // framework constructors). Each feature is one association of its primitive
+    // type; HostGetSpatial resolves it. A `#P` point MUST resolve to a real Point
+    // (never nil): the framework's GetSpatial does `self.Spatial = sa.Spatial`
+    // then re-reads `self.Spatial`, and a nil leaves the field absent so the
+    // re-read re-enters GetSpatial forever (the OBSTRN/WRECKS "C stack overflow").
+    // Line/area boundary geometry isn't read here — s57_mvt attaches it directly.
     static const char *glue =
         "function HostFeatureGetSpatialAssociations(fid)\n"
         "  local pt=_HostFeaturePrimitive(fid); if pt=='' then return nil end\n"
@@ -556,10 +591,22 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "  arr[1]=CreateSpatialAssociation(pt, fid..'#'..string.sub(pt,1,1), Orientation.Forward)\n"
         "  return arr\nend\n"
         "function HostGetSpatial(sid)\n"
-        "  if string.sub(sid,-2)=='#S' then\n"
+        "  local suf=string.sub(sid,-2)\n"
+        "  if suf=='#S' then\n"
         "    local fid=string.sub(sid,1,-3)\n"
         "    local ext=CreateSpatialAssociation('Curve', fid..'#exterior', Orientation.Forward)\n"
         "    return CreateSurface(ext, {})\n  end\n"
+        "  if suf=='#M' then\n"
+        "    local fid=string.sub(sid,1,-3)\n"
+        "    local pts=_HostFeaturePoints(fid)\n"
+        "    local sp={Type='array:Spatial'}\n"
+        "    for _,p in ipairs(pts) do sp[#sp+1]=CreatePoint(p[1],p[2],p[3]) end\n"
+        "    return CreateMultiPoint(sp)\n  end\n"
+        "  if suf=='#P' then\n"
+        "    local fid=string.sub(sid,1,-3)\n"
+        "    local pts=_HostFeaturePoints(fid)\n"
+        "    if pts[1] then return CreatePoint(pts[1][1],pts[1][2],pts[1][3]) end\n"
+        "    return CreatePoint('0','0',nil)\n  end\n"
         "  return nil\nend\n";
     if (luaL_dostring(L, glue) != LUA_OK) {
         fprintf(stderr, "[s101] glue: %s\n", lua_tostring(L, -1));

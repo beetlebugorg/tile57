@@ -88,6 +88,24 @@ export fn tgp_complex_attr(i: usize, path_ptr: [*]const u8, path_len: usize, cod
     return null;
 }
 
+/// Number of point-geometry vertices for feature i (1 for a point feature, 0
+/// otherwise). Backs `_HostFeaturePoints` so HostGetSpatial can build a real
+/// Point/MultiPoint for `#P`/`#M` spatials.
+export fn tgp_points_count(i: usize) callconv(.c) usize {
+    const c = g_ctx orelse return 0;
+    if (i >= c.adapted.len) return 0;
+    return c.adapted[i].points.len;
+}
+
+/// Vertex j (lon, lat, z) of feature i's point geometry. Caller must ensure
+/// j < tgp_points_count(i).
+export fn tgp_point(i: usize, j: usize, x: *f64, y: *f64, z: *f64) callconv(.c) void {
+    const p = g_ctx.?.adapted[i].points;
+    x.* = p[j][0];
+    y.* = p[j][1];
+    z.* = p[j][2];
+}
+
 /// C calls this with each feature's joined instruction stream.
 export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(.c) void {
     const c = g_ctx orelse return;
