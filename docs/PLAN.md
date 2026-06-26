@@ -28,12 +28,14 @@ Tiles carry **color tokens** (not RGB); the style resolves Day/Dusk/Night from
 
 - **Build topology:** CMake is the top-level integrator. MapLibre Native is
   embedded via `add_subdirectory(vendor/maplibre-native)` and built by its own
-  CMake. The Zig tile generator is a leaf static lib (`libtilegen.a`) exposing a
-  hand-written C ABI (`include/tilegen.h`), plus a standalone Zig CLI baker.
-- **Tile delivery: live in-process is the target.** `libtilegen.a` generates one
-  tile's MVT bytes on demand; a custom `mbgl::FileSource` (scheme `zigtiles://`)
-  hands them to MapLibre. Cache with an in-memory LRU + disk cache. The offline
-  CLI baker is kept too (cheap, and the differential-test driver vs Go).
+  CMake. The Zig tile generator is a leaf static lib (`libchartplotter.a`,
+  built from `tilegen/`) exposing a hand-written C ABI (`include/chartplotter.h`,
+  `cp_*`), plus a standalone Zig CLI baker.
+- **Tile delivery: live in-process is the target.** `libchartplotter.a` generates
+  one tile's MVT bytes on demand; the `ChartTileSource` `mbgl::FileSource` (scheme
+  `zigtiles://`) hands them to MapLibre. Tiles are memoized in an in-process cache
+  (`cp_source_clear_cache` bounds it). The offline CLI baker is kept too (cheap,
+  and the differential-test driver vs Go).
 - **MapLibre integration point:** custom `mbgl::FileSource` returning MVT bytes
   in `Response.data` (clone `pmtiles_file_source.cpp`). Native `pmtiles://` is
   the bootstrap/fallback and is what M0–M2 use against Go-baked archives.
@@ -50,20 +52,20 @@ Tiles carry **color tokens** (not RGB); the style resolves Day/Dusk/Night from
 | M0 | MapLibre `mbgl-render` builds (headless EGL) | none | ✅ done |
 | M1 | Pan/zoom the Annapolis chart from `reference/tiles/annapolis.pmtiles` + minimal ported `style.json` (areas + lines) | none | ✅ done |
 | M2 | S-52 fidelity: symbols, glyphs+text, soundings, area patterns, day/dusk/night, depth-shading | none | ✅ done |
-| M3 | Own minimal window (clone GLFWView); interactive pan/zoom | none | (mbgl-glfw works now) |
+| M3 | Own window (`chartplotter`, reuses GLFWView); interactive pan/zoom of live Zig tiles | C++ glue | ✅ done |
 | M4 | Zig encoder core: mvt + gzip + pmtiles + tile (project/clip), differential-tested vs Go | Zig CLI | ✅ done |
 | M5 | Live in-process generation via custom `FileSource` + C ABI | Zig lib + glue | ✅ done |
 | M6a | ISO 8211 decoder (parses real cells) | Zig | ✅ done |
 | M6b | S-57 model: dataset params, vectors, features | Zig | ✅ done |
 | M6c | Topology assembly + **live cell→MVT→MapLibre** (crude classify()) | Zig | ✅ done |
-| M6d | S-57 attributes (ATTF) + embedded-Lua S-101 portrayal -> full S-52 | Zig + Lua | next |
+| M6d | S-57 attributes (ATTF) + embedded-Lua S-101 portrayal -> full S-52 | Zig + Lua | ✅ core done (~96% of features; see specs/s101-port.md) |
 
 ## Environment notes
 
 - This dev box is a headless TTY with DRM render nodes (`/dev/dri/renderD128`)
   and Mesa EGL -> offscreen GPU rendering works (`scripts/chartshot.sh`).
-- Toolchain: cmake 4.3, clang 22, ninja. No ccache, no passwordless sudo.
-  **Zig 0.16.0** to be installed for M4+.
+- Toolchain: cmake 4.3, clang 22, ninja, **Zig 0.16.0** (installed; required for
+  the tile generator). `ccache` used if present.
 - `MLN_WITH_WERROR=OFF` (clang 22 is bleeding-edge), GLFW off in the headless
   build (enable with Wayland dev libs for the desktop window).
 
@@ -72,15 +74,17 @@ Tiles carry **color tokens** (not RGB); the style resolves Day/Dusk/Night from
 ```
 CMakeLists.txt              top-level integrator
 style/build_style.py        generates style/chart-*.json from colortables.json
-style/chart-day.json        M1 minimal static style (areas + lines, day palette)
-scripts/chartshot.sh        offscreen render -> renders/*.png (verify)
+style/chart-zig-day.json    S-52 style backed by the zigtiles:// source
+scripts/chartshot.sh        offscreen render -> renders/*.png (verify, via mbgl-render)
+scripts/dev-rebuild.sh      after-pull refresh: regen styles + rebuild our hosts
 reference/                  parity oracle (gitignored data)
-  chartplotter-go/          symlink to ../chartplotter-go
   tiles/annapolis.pmtiles   Go-baked chart (765 tiles)
   assets/                   colortables/linestyles/sprite/patterns (Go-emitted)
-vendor/maplibre-native/     embedded MapLibre Native (gitignored; submodule TODO)
-app/                        thin C++ host (M3+) + custom FileSource (M5)
-include/tilegen.h           C ABI shared Zig<->C++
-tilegen/                    Zig static lib + CLI baker (M4+)
-tests/mvt_parity/           Go-vs-Zig differential geometry tests (M4+)
+vendor/maplibre-native/     embedded MapLibre Native (git submodule)
+vendor/S-101_Portrayal-Catalogue/  official IHO S-101 rules (git submodule)
+app/                        C++ hosts (chartplotter, chartplotter-render) +
+                            ChartTileSource (the custom FileSource)
+include/chartplotter.h      public C ABI (cp_*); chartplotter_diag.h = dev self-tests
+tilegen/                    Zig tile generator -> libchartplotter.a + CLI baker
+tests/mvt_parity/           Go-vs-Zig differential geometry tests
 ```

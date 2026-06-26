@@ -3,7 +3,7 @@
 The S-101 portrayal (the successor to S-52) is an **executable specification**:
 216 Lua rule files (~15.3K LOC) under the IHO Portrayal Catalogue. The decision
 (see [[chartplotter-native-port]]) is to **embed Lua and run the rules**, not
-re-port them. Lua 5.4 is embedded in `libtilegen.a` (proven working).
+re-port them. Lua 5.4 is embedded in `libchartplotter.a` (proven working).
 
 ## How it works (from the Go reference, internal/engine/s101)
 
@@ -43,7 +43,7 @@ re-port them. Lua 5.4 is embedded in `libtilegen.a` (proven working).
 1. **[✅ validated] Lua 5.4 compatibility.** Go uses gopher-lua (Lua 5.1), but
    the full framework (S100Scripting/PortrayalModel/PortrayalAPI/Default/main —
    the most complex files) **loads cleanly in embedded Lua 5.4**
-   (`chartshot-zig --s101check <rules-dir>`). The 5.4 decision holds; no LuaJIT
+   (`chartplotter-render --s101check <rules-dir>`). The 5.4 decision holds; no LuaJIT
    needed. (Per-rule parse of all 216 is exercised lazily via `require` during
    dispatch; framework success is strong evidence they'll parse too.)
 2. Implement `require` via `package.path = '<dir>/?.lua'` (stock Lua searcher).
@@ -68,8 +68,11 @@ US4MD81M.000: **6933 / 7216 features (~96%) portray** via their actual rules —
 land, coastlines, depth areas + contours, lit buoys (light flares +
 characteristics), beacons, daymarks, landmarks, mooring/anchor symbols, labels.
 
-Set `TG_S101_RULES=<rules dir>` (default vendored at tilegen/vendor/s101/Rules)
-to enable; otherwise the crude classify() fallback is used.
+Pass the rules dir as `cp_source_open`'s `rules_dir` argument (or set the
+`CHARTPLOTTER_S101_RULES` env var as a fallback when it is NULL). It defaults to
+the vendored official catalogue at
+`vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`; otherwise the crude
+classify() fallback is used.
 
 Remaining (~4%, diminishing returns): Sounding (needs the SG3D multipoint
 geometry wired into _HostFeaturePoints), Obstruction/Wreck/UnderwaterAwashRock

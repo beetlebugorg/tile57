@@ -17,14 +17,15 @@ MapLibre Native in a desktop window, with platform chrome (SwiftUI / GTK4) to co
 | M0 | MapLibre Native builds; headless EGL render | ✅ done |
 | M1 | Annapolis chart renders from Go-baked PMTiles + ported style (areas + lines, Day/Dusk/Night) | ✅ done |
 | M2 | Full S-52 fidelity: symbols, glyphs+text, soundings, area patterns, depth-shading | ✅ done |
-| M3 | Interactive pan/zoom window serving live Zig tiles (`chart-glfw-zig`) | ✅ done |
+| M3 | Interactive pan/zoom window serving live Zig tiles (`chartplotter`) | ✅ done |
 | M4 | Zig MVT + gzip + PMTiles + projection/clip, differential-tested vs Go | ✅ done |
-| M5 | Live in-process tile generation (`libtilegen.a` + custom `FileSource`) | ✅ done |
+| M5 | Live in-process tile generation (`libchartplotter.a` + custom `FileSource`) | ✅ done |
 | M6a–c | Zig ISO 8211 + S-57 decode + topology → **live cell→MVT→MapLibre** | ✅ done |
-| M6d | Embedded-Lua **S-101 portrayal** (real IHO rules + Feature Catalogue) → live S-101 ECDIS chart from a raw cell | ✅ core done (~96% of features; soundings/wrecks/clearances polish remain) |
+| M6d | Embedded-Lua **S-101 portrayal** (real IHO rules + Feature Catalogue) → live S-101 ECDIS chart from a raw cell | ✅ core done (~96% of features; wrecks/clearances polish remain) |
 
-See **[docs/PLAN.md](docs/PLAN.md)** for the architecture and **[docs/BUILD.md](docs/BUILD.md)**
-for build/run instructions.
+See **[docs/PLAN.md](docs/PLAN.md)** for the architecture, **[docs/BUILD.md](docs/BUILD.md)**
+for build/run instructions, **[docs/API.md](docs/API.md)** for the
+`libchartplotter` C ABI, and **[CHANGELOG.md](CHANGELOG.md)** for recent changes.
 
 ## Build
 
@@ -65,11 +66,12 @@ sudo pacman -S --needed cmake ninja clang python-pillow \
 sudo pacman -S --needed ccache
 ```
 
-**Zig 0.16.0** — only needed for the Zig tile generator (`tilegen/`, used by the
-live-generation host `chartshot-zig`). Not required for the PMTiles paths above.
-Install from [ziglang.org/download](https://ziglang.org/download/) (pin 0.16.0)
-and put it on `PATH`; CMake finds it automatically. Lua 5.4 is vendored under
-`tilegen/vendor/lua` and built into `libtilegen.a` (no system Lua needed).
+**Zig 0.16.0** — required for the Zig tile generator (`tilegen/` →
+`libchartplotter.a`) and our hosts (`chartplotter`, `chartplotter-render`). Not
+needed for the upstream `mbgl-render`/`mbgl-glfw` PMTiles paths. Install from
+[ziglang.org/download](https://ziglang.org/download/) (pin 0.16.0) and put it on
+`PATH`; CMake finds it automatically. Lua 5.4 is vendored under
+`tilegen/vendor/lua` and built into `libchartplotter.a` (no system Lua needed).
 
 ### 2. Generate the reference data (tiles + assets + styles)
 
@@ -94,18 +96,18 @@ OUT="$PWD/renders/annapolis.png" LAT=38.978 LON=-76.482 ZOOM=14 RATIO=2 \
 
 ### 3b. Interactive window → pan/zoom (live Zig tiles)
 
-`chart-glfw-zig` (M3) opens a real pannable/zoomable window whose vector tiles
-come from the in-process Zig generator (`libtilegen.a`) — the same source the
-headless `chartshot-zig` uses, but interactive. It takes a PMTiles archive **or**
-a raw `.000` ENC cell (live generation).
+`chartplotter` (M3) opens a real pannable/zoomable window whose vector tiles come
+from the in-process Zig generator (`libchartplotter.a`) — the same source the
+headless `chartplotter-render` uses, but interactive. It takes a PMTiles archive
+**or** a raw `.000` ENC cell (live generation).
 
 ```sh
 # macOS (Metal):                          Linux (Wayland):
 cmake --preset macos-desktop              # cmake --preset desktop
-ninja -C build-macos-desktop chart-glfw-zig   # ninja -C build-desktop chart-glfw-zig
+ninja -C build-macos-desktop chartplotter   # ninja -C build-desktop chartplotter
 
-# run it (defaults to Annapolis if lat/lon/zoom omitted):
-build-macos-desktop/chart-glfw-zig \
+# run it (frames the data extent if lat/lon/zoom omitted):
+build-macos-desktop/chartplotter \
   reference/tiles/annapolis.pmtiles \     # or a raw .000 cell for live generation
   style/chart-zig-day.json 38.978 -76.487 13
 ```
@@ -113,26 +115,27 @@ build-macos-desktop/chart-glfw-zig \
 Drag pans, scroll zooms. The first `mbgl-core` build is large (~15 min on 8
 cores; `ccache` makes rebuilds fast). Requires Zig (see prerequisites).
 
-The upstream `mbgl-glfw` demo is still available for a plain online style:
+The upstream `mbgl-glfw` demo also builds, for rendering any style directly:
 `ninja -C build-desktop mbgl-glfw` then
-`build-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw -s style/chart-day.json -x -76.482 -y 38.978 -z 14`.
+`build-desktop/vendor/maplibre-native/platform/glfw/mbgl-glfw -s style/chart-zig-day.json -x -76.482 -y 38.978 -z 14`.
 
 ### 3c. Live Zig generation → PNG (tiles generated from a raw S-57 cell)
 
 Renders straight from a `.000` ENC cell — no pre-baked PMTiles — using the Zig
-tile generator (`libtilegen.a`) behind a custom MapLibre `FileSource`. Requires
-Zig (see prerequisites).
+tile generator (`libchartplotter.a`) behind a custom MapLibre `FileSource`.
+Requires Zig (see prerequisites).
 
 ```sh
-ninja -C build chartshot-zig        # or build-macos; builds libtilegen.a via zig
-build/chartshot-zig \
+ninja -C build chartplotter-render  # or build-macos; builds libchartplotter.a via zig
+build/chartplotter-render \
   ../chartplotter-go/testdata/US4MD81M.000 \  # a raw S-57 cell (or a .pmtiles)
   style/chart-zig-day.json \                  # zigtiles:// source
   38.97 -76.49 12 renders/from_cell.png
 ```
 
-`chartshot-zig` auto-detects a PMTiles archive vs a raw S-57 cell, and runs the
-embedded-Lua S-101 portrayal (real IHO rules) over the cell — depth areas,
-contours, coastline, symbols and text. The live path currently emits 4 of the
-11 MVT layers the Go baker produces (soundings / light sectors / area patterns /
-SCAMIN declutter variants are next — see `specs/s101-port.md`).
+`chartplotter-render` auto-detects a PMTiles archive vs a raw S-57 cell, and runs
+the embedded-Lua S-101 portrayal (real IHO rules) over the cell. The live path
+emits `areas`, `area_patterns`, `lines`, `complex_lines`, `point_symbols`,
+`soundings` and `text` — depth shading, contours, coastline, soundings, symbols
+and labels (light sectors / SCAMIN declutter variants are next — see
+`specs/s101-port.md`).
