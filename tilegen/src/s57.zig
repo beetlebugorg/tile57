@@ -57,8 +57,8 @@ pub const Feature = struct {
     rcid: u32,
     prim: u8, // 1=point, 2=line, 3=area, 255=none
     objl: u16, // S-57 object class code
-    refs: []SpatialRef = &.{}, // FSPT spatial pointers
-    attrs: []Attr = &.{}, // ATTF attributes
+    refs: []const SpatialRef = &.{}, // FSPT spatial pointers
+    attrs: []const Attr = &.{}, // ATTF attributes
 
     pub fn attr(self: Feature, code: u16) ?[]const u8 {
         for (self.attrs) |x| if (x.code == code) return x.value;
@@ -74,7 +74,7 @@ pub const Feature = struct {
 pub const Cell = struct {
     params: DatasetParams,
     vectors: []VectorRecord,
-    features: []Feature,
+    features: []const Feature,
     nodes: std.AutoHashMap(u64, LonLat), // (rcnm<<32|rcid) -> point (VI/VC)
     edges: std.AutoHashMap(u32, usize), // edge rcid -> index into vectors
     arena: std.heap.ArenaAllocator,
