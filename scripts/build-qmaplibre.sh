@@ -41,9 +41,11 @@ if [ ! -f "$TOOLCHAIN" ]; then
   exit 1
 fi
 
-# maplibre-native-qt vendors its own maplibre-native; fetch it (heavy, one-time).
-echo "==> fetching maplibre-native-qt's maplibre-native submodule (heavy, one-time)" >&2
-git -C "$SRC" submodule update --init --recursive vendor/maplibre-native
+# Recursively init maplibre-native-qt + its own maplibre-native (heavy, one-time).
+# Run from the repo root so the parent resets maplibre-native-qt to its pinned
+# commit and then recurses — more robust than poking the nested submodule directly.
+echo "==> fetching maplibre-native-qt + its maplibre-native submodule (heavy, one-time)" >&2
+git -C "$ROOT" submodule update --init --recursive vendor/maplibre-native-qt
 
 # Build + install QMapLibre. Only the Widgets component is needed (no Location /
 # Quick — those want Qt6Location/Qt6Quick). MLN_WITH_WERROR=OFF: maplibre-native's
