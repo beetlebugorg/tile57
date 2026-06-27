@@ -169,8 +169,9 @@ if(CHARTPLOTTER_WITH_QT)
     BUILD_ALWAYS OFF)
 
   # 2. The viewer (app/qt), find_package'd against the installed QMapLibre.
-  #    Installs to ${CMAKE_BINARY_DIR}/bin/chartplotter-qt.
-  ExternalProject_Add(chartplotter_qt
+  #    Installs to ${CMAKE_BINARY_DIR}/bin/chartplotter-qt. Target name matches the
+  #    binary (`ninja chartplotter-qt`).
+  ExternalProject_Add(chartplotter-qt
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/app/qt
     DEPENDS qmaplibre
     CMAKE_GENERATOR Ninja

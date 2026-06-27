@@ -42,8 +42,8 @@
   ],
   "buildPresets": [
     { "name": "headless", "configurePreset": "headless", "targets": ["chartplotter-render"] },
-    { "name": "desktop", "configurePreset": "desktop", "targets": ["chartplotter_qt"] },
+    { "name": "desktop", "configurePreset": "desktop", "targets": ["chartplotter-qt"] },
     { "name": "macos", "configurePreset": "macos", "targets": ["chartplotter-render"] },
-    { "name": "macos-desktop", "configurePreset": "macos-desktop", "targets": ["chartplotter_qt"] }
+    { "name": "macos-desktop", "configurePreset": "macos-desktop", "targets": ["chartplotter-qt"] }
   ]
 }
