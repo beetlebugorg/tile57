@@ -35,6 +35,14 @@ public:
   MetalRenderableResource(MetalBackend &backend_)
       : backend(backend_), delegate([[ChartMTKViewDelegate alloc] initWithResource:this]) {}
 
+  ~MetalRenderableResource() {
+    // Stop the display link from calling a dangling delegate after teardown.
+    if (mtlView) {
+      mtlView.paused = YES;
+      mtlView.delegate = nil;
+    }
+  }
+
   void bind() override {
     if (!commandQueue) {
       commandQueue = [mtlView.device newCommandQueue];
