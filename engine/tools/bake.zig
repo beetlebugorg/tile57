@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const engine = @import("engine");
+const assets = @import("assets");
 
 const VERSION = "chartplotter-bake 0.1.0";
 
@@ -49,6 +50,14 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "bake-root")) {
         return runBakeRoot(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "assets")) {
+        return runAssets(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "bundle")) {
+        return runBundle(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "inspect")) {
@@ -215,6 +224,79 @@ pub fn main(init: std.process.Init) !void {
 
 // ---- bake ---------------------------------------------------------------
 
+const BakeResult = struct { archive: []u8, bounds: [4]f64, tiles: usize };
+
+/// Decode a base cell (+ updates), run S-101 portrayal, and bake every
+/// web-mercator MVT tile covering its bounds across [minzoom,maxzoom] into a
+/// PMTiles archive. Returns the archive plus the cell bounds and tile count.
+/// Shared by `bake` (writes the archive) and `bundle` (wraps it with assets + a
+/// manifest). bounds() -> [west, south, east, north]; error.NoGeometry if the
+/// cell has nothing to bake.
+fn bakeCell(
+    io: std.Io,
+    a: std.mem.Allocator,
+    base_path: []const u8,
+    updates: []const []const u8,
+    rules_dir: []const u8,
+    minzoom: u8,
+    maxzoom: u8,
+) !BakeResult {
+    const base_bytes = try std.Io.Dir.cwd().readFileAlloc(io, base_path, a, .unlimited);
+    const update_bytes = try a.alloc([]const u8, updates.len);
+    for (updates, 0..) |u, ui| {
+        update_bytes[ui] = try std.Io.Dir.cwd().readFileAlloc(io, u, a, .unlimited);
+    }
+
+    var cell = try engine.s57.parseCellWithUpdates(a, base_bytes, update_bytes);
+    defer cell.deinit();
+
+    // S-101 portrayal: run the embedded-Lua rule engine over the cell's adapted
+    // features (same path the live library uses) so baked tiles carry full S-101
+    // styling. The arena `a` outlives tile generation, as portrayCell requires.
+    // Portrayal failure (e.g. rules dir not found) is non-fatal: generateTile
+    // then falls back to the built-in classify() styling.
+    const portrayal: ?[]const ?[]const u8 = if (engine.portray.portrayCell(a, &cell, rules_dir)) |res|
+        res
+    else |err| blk: {
+        std.debug.print(
+            "warning: S-101 portrayal failed ({s}) with rules dir '{s}'; baking with classify() fallback\n",
+            .{ @errorName(err), rules_dir },
+        );
+        break :blk null;
+    };
+
+    const b = cell.bounds() orelse return error.NoGeometry;
+
+    var tiles = std.ArrayList(engine.pmtiles.InputTile).empty;
+    var z: u8 = minzoom;
+    while (z <= maxzoom) : (z += 1) {
+        // North-west corner -> (min x, min y); south-east corner -> (max x, max y).
+        const nw = lonLatToTile(b[0], b[3], z);
+        const se = lonLatToTile(b[2], b[1], z);
+        var ty = nw[1];
+        while (ty <= se[1]) : (ty += 1) {
+            var tx = nw[0];
+            while (tx <= se[0]) : (tx += 1) {
+                // Generate with the page allocator, not the arena `a`: generateTile
+                // frees a per-tile child arena each call, which an arena backing
+                // would leak (tens of GB over a high-vertex cell).
+                const tile_mvt = try engine.s57_mvt.generateTile(std.heap.page_allocator, &cell, z, tx, ty, portrayal);
+                if (tile_mvt.len == 0) continue; // empty tile: nothing covered here
+                try tiles.append(a, .{ .z = z, .x = tx, .y = ty, .mvt = tile_mvt });
+            }
+        }
+    }
+
+    const opts = engine.pmtiles.WriteOptions{
+        .min_lon_e7 = toE7(b[0]),
+        .min_lat_e7 = toE7(b[1]),
+        .max_lon_e7 = toE7(b[2]),
+        .max_lat_e7 = toE7(b[3]),
+    };
+    const archive = try engine.pmtiles.write(a, tiles.items, opts);
+    return .{ .archive = archive, .bounds = b, .tiles = tiles.items.len };
+}
+
 /// `bake <cell.000> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N] [update.001 ...]`
 fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
@@ -258,78 +340,175 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
     if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
 
-    // Read the base cell + any updates listed on the command line.
-    const base_bytes = try std.Io.Dir.cwd().readFileAlloc(io, base_path, a, .unlimited);
-    const update_bytes = try a.alloc([]const u8, updates.items.len);
-    for (updates.items, 0..) |u, ui| {
-        update_bytes[ui] = try std.Io.Dir.cwd().readFileAlloc(io, u, a, .unlimited);
-    }
-
-    var cell = try engine.s57.parseCellWithUpdates(a, base_bytes, update_bytes);
-    defer cell.deinit();
-
-    // S-101 portrayal: run the embedded-Lua rule engine over the cell's adapted
-    // features (same path the live library uses) so baked tiles carry full S-101
-    // styling. The arena `a` outlives tile generation below, as portrayCell
-    // requires. Portrayal failure (e.g. rules dir not found) is non-fatal:
-    // generateTile then falls back to the built-in classify() styling.
-    const rules_dir = resolveRulesDir(rules);
-    const portrayal: ?[]const ?[]const u8 = if (engine.portray.portrayCell(a, &cell, rules_dir)) |res|
-        res
-    else |err| blk: {
-        std.debug.print(
-            "warning: S-101 portrayal failed ({s}) with rules dir '{s}'; baking with classify() fallback\n",
-            .{ @errorName(err), rules_dir },
-        );
-        break :blk null;
+    const res = bakeCell(io, a, base_path, updates.items, resolveRulesDir(rules), minzoom, maxzoom) catch |err| switch (err) {
+        error.NoGeometry => {
+            std.debug.print("error: {s} has no geometry to bake\n", .{base_path});
+            return;
+        },
+        else => return err,
     };
-
-    const b = cell.bounds() orelse {
-        std.debug.print("error: {s} has no geometry to bake\n", .{base_path});
-        return;
-    };
-    // bounds() -> [min_lon, min_lat, max_lon, max_lat] (west, south, east, north).
-
-    var tiles = std.ArrayList(engine.pmtiles.InputTile).empty;
-    var z: u8 = minzoom;
-    while (z <= maxzoom) : (z += 1) {
-        // North-west corner -> (min x, min y); south-east corner -> (max x, max y).
-        const nw = lonLatToTile(b[0], b[3], z);
-        const se = lonLatToTile(b[2], b[1], z);
-        var ty = nw[1];
-        while (ty <= se[1]) : (ty += 1) {
-            var tx = nw[0];
-            while (tx <= se[0]) : (tx += 1) {
-                // Generate with the page allocator, not the arena `a`:
-                // generateTile frees a per-tile child arena each call, which an
-                // arena backing would leak (tens of GB over a high-vertex cell).
-                const tile_mvt = try engine.s57_mvt.generateTile(std.heap.page_allocator, &cell, z, tx, ty, portrayal);
-                if (tile_mvt.len == 0) continue; // empty tile: nothing covered here
-                try tiles.append(a, .{ .z = z, .x = tx, .y = ty, .mvt = tile_mvt });
-            }
-        }
-    }
-
-    if (tiles.items.len == 0) {
+    if (res.tiles == 0) {
         std.debug.print("warning: no non-empty tiles produced for zoom {d}..{d}\n", .{ minzoom, maxzoom });
     }
-
-    const opts = engine.pmtiles.WriteOptions{
-        .min_lon_e7 = toE7(b[0]),
-        .min_lat_e7 = toE7(b[1]),
-        .max_lon_e7 = toE7(b[2]),
-        .max_lat_e7 = toE7(b[3]),
-    };
-    const archive = try engine.pmtiles.write(a, tiles.items, opts);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = archive });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = res.archive });
 
     std.debug.print(
         "baked {d} cell ({d} update file(s) applied) -> {s}\n  {d} tiles written, zoom {d}..{d}\n  output {d} bytes ({d:.1} MB)\n",
         .{
-            @as(usize, 1),         updates.items.len, out_path,
-            tiles.items.len,       minzoom,           maxzoom,
-            archive.len,           @as(f64, @floatFromInt(archive.len)) / (1024.0 * 1024.0),
+            @as(usize, 1),   updates.items.len, out_path,
+            res.tiles,       minzoom,           maxzoom,
+            res.archive.len, @as(f64, @floatFromInt(res.archive.len)) / (1024.0 * 1024.0),
         },
+    );
+}
+
+// ---- assets / bundle ----------------------------------------------------
+
+// colorProfile.xml relative to a PortrayalCatalog directory. The baker's default
+// rules dir is <catalog>/Rules; ColorProfiles is its sibling.
+const COLOR_PROFILE_REL = "ColorProfiles/colorProfile.xml";
+
+// Resolve the PortrayalCatalog directory: explicit arg, else the parent of the
+// resolved rules dir (…/PortrayalCatalog/Rules -> …/PortrayalCatalog).
+fn resolveCatalogDir(explicit: ?[]const u8) []const u8 {
+    if (explicit) |d| return d;
+    const rules = resolveRulesDir(null);
+    return std.fs.path.dirname(rules) orelse rules;
+}
+
+// Emit colortables.json from a catalog dir into out_dir. Returns the bytes (arena
+// owned) so `bundle` can reuse them without re-reading. Shared by assets/bundle.
+fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
+    const xml_path = try std.fs.path.join(a, &.{ catalog_dir, COLOR_PROFILE_REL });
+    const xml = try std.Io.Dir.cwd().readFileAlloc(io, xml_path, a, .unlimited);
+    const json = try assets.colorTablesJson(a, xml);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json });
+    return json;
+}
+
+/// `assets <portrayal-catalog-dir> -o <out-dir>` — emit the portrayal assets
+/// (colortables.json today; linestyles/sprites/glyphs to follow) for a catalogue.
+fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var catalog: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for -o/--output");
+            out = args[i];
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usageErr("unknown flag");
+        } else if (catalog == null) {
+            catalog = arg;
+        }
+    }
+    const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
+    const catalog_dir = resolveCatalogDir(catalog);
+
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    const ct_path = try std.fs.path.join(a, &.{ out_dir, "colortables.json" });
+    const json = try emitColorTables(io, a, catalog_dir, ct_path);
+    std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n", .{ catalog_dir, ct_path, json.len });
+}
+
+/// `bundle <cell.000> -o <out-dir> [--rules DIR] [--catalog DIR] [--minzoom N]
+///  [--maxzoom N] [--created ISO8601] [update.001 …]` — one bake emits a
+/// self-contained chart bundle: tiles/chart.pmtiles + assets/colortables.json +
+/// manifest.json (pins schema_version, couples tiles to portrayal).
+fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var base: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var rules: ?[]const u8 = null;
+    var catalog: ?[]const u8 = null;
+    var created: []const u8 = "";
+    var minzoom: u8 = DEFAULT_MINZOOM;
+    var maxzoom: u8 = DEFAULT_MAXZOOM;
+    var updates = std.ArrayList([]const u8).empty;
+
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for -o/--output");
+            out = args[i];
+        } else if (std.mem.eql(u8, arg, "--rules")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --rules");
+            rules = args[i];
+        } else if (std.mem.eql(u8, arg, "--catalog")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --catalog");
+            catalog = args[i];
+        } else if (std.mem.eql(u8, arg, "--created")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --created");
+            created = args[i];
+        } else if (std.mem.eql(u8, arg, "--minzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --minzoom");
+            minzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--minzoom must be an integer");
+        } else if (std.mem.eql(u8, arg, "--maxzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --maxzoom");
+            maxzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usageErr("unknown flag");
+        } else if (base == null) {
+            base = arg;
+        } else {
+            try updates.append(a, arg);
+        }
+    }
+
+    const base_path = base orelse return usageErr("missing <cell.000> input");
+    const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
+    if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
+    if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
+
+    // 1. tiles -> <out>/tiles/chart.pmtiles
+    const res = bakeCell(io, a, base_path, updates.items, resolveRulesDir(rules), minzoom, maxzoom) catch |err| switch (err) {
+        error.NoGeometry => {
+            std.debug.print("error: {s} has no geometry to bundle\n", .{base_path});
+            return;
+        },
+        else => return err,
+    };
+    const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
+    try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
+    const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tiles_path, .data = res.archive });
+
+    // 2. assets -> <out>/assets/colortables.json
+    const assets_dir = try std.fs.path.join(a, &.{ out_dir, "assets" });
+    try std.Io.Dir.cwd().createDirPath(io, assets_dir);
+    const ct_path = try std.fs.path.join(a, &.{ assets_dir, "colortables.json" });
+    _ = emitColorTables(io, a, resolveCatalogDir(catalog), ct_path) catch |err| {
+        std.debug.print("warning: colortables emit failed ({s}); bundle has tiles + manifest only\n", .{@errorName(err)});
+    };
+
+    // 3. manifest.json — pins schema_version, couples tiles <-> portrayal.
+    const b = res.bounds;
+    const cell_name = std.fs.path.stem(std.fs.path.basename(base_path));
+    const manifest = try assets.manifestJson(a, .{
+        .generator = VERSION,
+        .created = created,
+        .tiles_rel = "tiles/chart.pmtiles",
+        .colortables_rel = "assets/colortables.json",
+        .minzoom = minzoom,
+        .maxzoom = maxzoom,
+        .bbox = b,
+        .anchor = .{ (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0 },
+        .cells = &.{cell_name},
+    });
+    const manifest_path = try std.fs.path.join(a, &.{ out_dir, "manifest.json" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
+
+    std.debug.print(
+        "bundled {s} -> {s}/\n  tiles/chart.pmtiles ({d} tiles, {d:.1} MB)\n  assets/colortables.json + manifest.json (schema {s})\n",
+        .{ cell_name, out_dir, res.tiles, @as(f64, @floatFromInt(res.archive.len)) / (1024.0 * 1024.0), assets.SCHEMA_VERSION },
     );
 }
 
@@ -581,6 +760,15 @@ fn printUsage() void {
         \\      Bake a whole ENC_ROOT (every <CELL>.000 + updates) into one
         \\      archive, zoom-banded per cell by compilation scale.
         \\      -o/--output, --rules as above; --minzoom/--maxzoom clamp the bands.
+        \\  chartplotter-bake bundle <cell.000> -o <out-dir> [options] [update.001 ...]
+        \\      Emit a self-contained chart bundle: tiles/chart.pmtiles +
+        \\      assets/colortables.json + manifest.json (pins schema_version,
+        \\      couples tiles to portrayal). --rules/--minzoom/--maxzoom as above;
+        \\      --catalog DIR PortrayalCatalog (default: parent of --rules);
+        \\      --created ISO8601 stamps the manifest (no wall clock in-process).
+        \\  chartplotter-bake assets <portrayal-catalog-dir> -o <out-dir>
+        \\      Emit just the portrayal assets (colortables.json today) for a
+        \\      catalogue, independent of any cell.
         \\  chartplotter-bake inspect <file.pmtiles> [z x y]
         \\  chartplotter-bake cell <file.000>
         \\  chartplotter-bake version

@@ -21,6 +21,7 @@ pub const s101_instr = s100.s101_instr;
 pub const s101_adapt = s100.s101_adapt;
 pub const catalogue = s100.catalogue;
 pub const bake_enc = @import("bake_enc.zig"); // banded multi-cell ENC_ROOT -> PMTiles
+pub const assets = @import("assets"); // chart-bundle asset/manifest generation
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {
@@ -35,5 +36,6 @@ test {
     _ = s101_adapt;
     _ = catalogue;
     _ = bake_enc;
+    _ = assets;
     _ = @import("mvt_parity_test.zig");
 }

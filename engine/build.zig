@@ -62,6 +62,13 @@ pub fn build(b: *std.Build) void {
     });
     addCatalogueJson(b, s100_mod);
 
+    // Asset/style generation for the chart bundle (colortables, manifest, …).
+    // Pure + target-agnostic like the foundational packages, so it compiles
+    // under both the glibc tests and the static-musl baker. See src/assets/.
+    const assets_mod = b.addModule("assets", .{
+        .root_source_file = b.path("src/assets/assets.zig"),
+    });
+
     // Pure-Zig public module (no libc). Used by the unit tests so that
     // Zig-linked test binary doesn't pull in the system crt.
     const mod = b.addModule("engine", .{
@@ -70,6 +77,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addPkgs(mod, iso8211_mod, s57_mod, s100_mod);
+    mod.addImport("assets", assets_mod); // engine re-exports it; tests cover it
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -120,7 +128,10 @@ pub fn build(b: *std.Build) void {
             .target = bake_target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{.{ .name = "engine", .module = bake_engine }},
+            .imports = &.{
+                .{ .name = "engine", .module = bake_engine },
+                .{ .name = "assets", .module = assets_mod },
+            },
         }),
     });
     b.installArtifact(bake);
@@ -130,7 +141,18 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the bake CLI").dependOn(&run_bake.step);
 
     // Tests (pure Zig).
+    const test_step = b.step("test", "Run unit tests");
     const mod_tests = b.addTest(.{ .root_module = mod });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-    b.step("test", "Run unit tests").dependOn(&run_mod_tests.step);
+    test_step.dependOn(&b.addRunArtifact(mod_tests).step);
+
+    // assets is a standalone target-agnostic module (so it composes into the
+    // musl baker); give it a concrete-target view here purely so its own
+    // `test {}` blocks run under `zig build test` (root.zig's `_ = assets` alone
+    // doesn't pull a separate module's tests into the engine test binary).
+    const assets_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/assets/assets.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(assets_tests).step);
 }
