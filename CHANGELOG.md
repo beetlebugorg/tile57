@@ -7,6 +7,17 @@ C ABI is not yet frozen.
 ## [Unreleased]
 
 ### Added — offline baker + portrayal/style refinements
+- **Spatial / geometry Host binding**: `HostGetSpatial` now serves real point
+  geometry (`#P` points, `#M` multipoints, `#S` surfaces) to the S-101 rules via
+  `_HostFeaturePoints` (backed by per-feature point geometry). A `#P` point must be
+  a real Point or the framework's `GetSpatial` recurses forever — this was the
+  Obstruction/Wreck "C stack overflow". With it + derived depths + the
+  orientation/clearance complex attrs below, the test cells (US4MD81M, US5MD1MC)
+  now portray with **zero rule errors**.
+- **Orientation + clearance complex attributes** synthesized from S-57 simple
+  attrs (ORIENT, VERCCL/VERCLR/VERCOP, HORCLR) so NavigationLine / RecommendedTrack
+  / SpanOpening read `feature.<complex>.<value>` instead of crashing on a nil
+  complex (Go sync: the `clearances` map + orientation alias).
 - **`chartplotter-bake` CLI** (`engine/tools/bake.zig`): pre-bake a cell to a
   PMTiles archive — `chartplotter-bake bake <cell.000> -o out.pmtiles
   [--minzoom N --maxzoom N] [updates…]` — over the cell's bounds, plus `inspect`,
@@ -27,8 +38,10 @@ C ABI is not yet frozen.
 - QUAPOS quality-of-position is parsed + aggregated per feature (Go sync
   `1b04ebb`); the approximate-position dashed-line *application* is still to come.
 - Derived depth attrs (`defaultClearanceDepth`/`surroundingDepth`, Go sync
-  `a9c8afd`) are computed + supplied to dangers; the under/awash danger rules
-  still error pending mariner-settings binding work (a deeper portrayal gap).
+  `a9c8afd`) are computed + supplied to under/awash dangers; combined with the
+  spatial binding above this clears the danger-rule crashes. Blank S-57 attributes
+  are now treated as absent (they were served as `""`, building a malformed
+  `ScaledDecimal{Value=nil}` that crashed the depth comparison).
 
 ### Changed — two-library architecture + C APIs (breaking, pre-1.0)
 - The project is now two C libraries with distinct roles:

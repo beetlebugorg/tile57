@@ -6,30 +6,20 @@ sidebar_position: 7
 
 # Known Limitations
 
-chartplotter-native runs the official IHO S-101 Portrayal Catalogue, so most
-everyday ENC features draw correctly: depth areas and contours, soundings,
-coastline and land, buoys and beacons, lights, restricted/anchorage areas, and
-text labels. On a representative harbor cell (`US4MD81M.000`), about **96% of
-features** (≈6,900 of 7,200) portray via their real rules.
+chartplotter-native runs the official IHO S-101 Portrayal Catalogue, and on the
+test cells (`US4MD81M.000`, `US5MD1MC.000` + updates) **every feature now portrays
+with zero rule errors** — depth areas and contours, soundings, coastline and land,
+buoys and beacons, lights, dangers (obstructions / wrecks / rocks), data-quality
+zones, restricted/anchorage areas, and text labels.
 
-But the portrayal is **not complete**, and this project is an AI-built experiment
-and learning tool — **do not use it for navigation**. This page is an honest list
-of what does *not* render fully today, taken from the engine code.
+But "no rule errors" is not the same as "pixel-perfect S-52", and this project is
+an AI-built experiment and learning tool — **do not use it for navigation**. This
+page is an honest list of what is still incomplete, taken from the engine code.
 
 :::warning Not for navigation
 See the warning on the [introduction](./intro.md). NOAA ENC charts are U.S. public
 domain and not for navigation; this renderer adds its own gaps on top.
 :::
-
-## Features dropped on a rule error
-
-Some S-101 line and area rules need parts of the S-57 spatial topology that the
-portrayal host does not model yet. When such a rule errors, the feature is
-**suppressed** — drawn as nothing rather than as a placeholder — so it simply does
-not appear. This is the most significant gap: an affected feature is missing, not
-just mis-styled. The known offenders include Sounding edge cases,
-Obstruction/Wreck/UnderwaterAwashRock (VALSOU depth-value handling), and
-SpanOpening (complex clearance synthesis).
 
 ## Geometry-construction instructions
 
@@ -42,15 +32,11 @@ its symbol, fill, or label — still draws).
 ## Portrayal / live-path gaps
 
 The live cell→MVT path emits the layers in the [tile schema](./tile-schema.md)
-including the `*_scamin` declutter buckets and `draw_prio` ordering. Remaining
-gaps:
+including the `*_scamin` declutter buckets and `draw_prio` ordering. The spatial /
+geometry Host binding now serves real point geometry to the rules (so dangers and
+soundings portray without the earlier nil-depth crash / "C stack overflow"), and
+orientation + clearance complex attributes are synthesized. Remaining gaps:
 
-- **Under/awash danger depths.** Obstruction / Wreck / UnderwaterAwashRock of
-  unknown depth still error in the rules (the live render logs "arithmetic on a
-  nil value (field 'Value')") and are dropped. The derived `defaultClearanceDepth`
-  / `surroundingDepth` attributes are now computed and supplied to those features,
-  but the danger rules need the mariner-settings depth binding wired through the
-  portrayal context before they stop erroring — that is still outstanding.
 - **Approximate-position (QUAPOS) dashing.** QUAPOS is parsed and aggregated per
   feature, but the solid→dashed line-style switch for low-accuracy geometry is not
   applied yet.
