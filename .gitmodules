@@ -7,3 +7,6 @@
 [submodule "vendor/S-101-Documentation-and-FC"]
 	path = vendor/S-101-Documentation-and-FC
 	url = https://github.com/iho-ohi/S-101-Documentation-and-FC.git
+[submodule "vendor/maplibre-native-qt"]
+	path = vendor/maplibre-native-qt
+	url = https://github.com/maplibre/maplibre-native-qt.git

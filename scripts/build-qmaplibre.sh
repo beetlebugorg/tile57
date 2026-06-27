@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Build the Qt6 MapLibre chart viewer (chartplotter-qt).
+#
+# One-time heavy build of QMapLibre — the Qt6 MapLibre widget from
+# vendor/maplibre-native-qt — plus the viewer in app/qt. Outputs:
+#   build/qmaplibre        QMapLibre install (find_package prefix)
+#   build/qt/chartplotter-qt   the viewer binary
+#
+# Re-run after updating the maplibre-native-qt submodule. Needs cmake + ninja +
+# Qt6 (qmake6). Set QT_ROOT_DIR if Qt6 isn't under /usr.
+#
+# Then view a baked chart bundle (needs a display):
+#   chartplotter-bake bundle <cell.000> -o out
+#   build/qt/chartplotter-qt out/assets/style-day.json 38.97 -76.49 13
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$ROOT/vendor/maplibre-native-qt"
+export QT_ROOT_DIR="${QT_ROOT_DIR:-/usr}"
+TOOLCHAIN="$QT_ROOT_DIR/lib/cmake/Qt6/qt.toolchain.cmake"
+PREFIX="$ROOT/build/qmaplibre"
+
+[ -f "$TOOLCHAIN" ] || { echo "Qt6 toolchain not found at $TOOLCHAIN (set QT_ROOT_DIR)" >&2; exit 1; }
+
+# maplibre-native-qt vendors its own maplibre-native; fetch it (heavy, one-time).
+echo "==> fetching maplibre-native-qt's maplibre-native submodule (heavy, one-time)" >&2
+git -C "$SRC" submodule update --init --recursive vendor/maplibre-native
+
+# Build + install QMapLibre. Only the Widgets component is needed (no Location /
+# Quick — those want Qt6Location/Qt6Quick). MLN_WITH_WERROR=OFF: maplibre-native's
+# -Werror trips on warnings from very recent GCC/Clang.
+echo "==> building + installing QMapLibre (Widgets, OpenGL) -> $PREFIX" >&2
+cmake -S "$SRC" -B "$ROOT/build/qmaplibre-build" -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.19 \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+  -DQT_VERSION_MAJOR=6 \
+  -DMLN_WITH_OPENGL=ON \
+  -DMLN_QT_WITH_INTERNAL_ICU=ON \
+  -DMLN_QT_WITH_WIDGETS=ON \
+  -DMLN_QT_WITH_LOCATION=OFF \
+  -DMLN_QT_WITH_QUICK_PLUGIN=OFF \
+  -DMLN_WITH_WERROR=OFF
+cmake --build "$ROOT/build/qmaplibre-build"
+cmake --install "$ROOT/build/qmaplibre-build"
+
+# Build the viewer against the freshly-installed QMapLibre.
+echo "==> building chartplotter-qt -> build/qt" >&2
+cmake -S "$ROOT/app/qt" -B "$ROOT/build/qt" -GNinja \
+  -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+  -DCMAKE_PREFIX_PATH="$PREFIX"
+cmake --build "$ROOT/build/qt"
+
+echo >&2
+echo "done -> $ROOT/build/qt/chartplotter-qt" >&2
+echo "  view a bundle (needs a display):" >&2
+echo "  build/qt/chartplotter-qt <bundle>/assets/style-day.json [lat lon zoom]" >&2
