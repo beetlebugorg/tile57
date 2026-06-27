@@ -116,6 +116,12 @@ void tile57_source_zoom_range(tile57_source *src, uint8_t *min_z, uint8_t *max_z
 bool tile57_source_bounds(tile57_source *src,
                       double *west, double *south, double *east, double *north);
 
+/* A good initial camera (center lat/lon + zoom) on real data, for when fitting the
+ * whole source would zoom out uselessly (a continental ENC_ROOT). Returns true and
+ * sets the out-params for a lazy ENC_ROOT source; false otherwise (the caller
+ * should use fit-to-bounds). */
+bool tile57_source_anchor(tile57_source *src, double *lat, double *lon, double *zoom);
+
 /* Result of tile57_tile_get. */
 typedef enum {
     TILE57_TILE_OK = 1,     /* *out / *out_len set (free with tile57_tile_free) */

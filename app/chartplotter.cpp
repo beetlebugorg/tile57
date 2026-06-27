@@ -56,6 +56,29 @@ void registerChartSource() {
 
 extern "C" const char *chartplotter_version(void) { return "0.1.0"; }
 
+// Choose an initial camera for a source: fit the data bounds when that lands at a
+// usable zoom (a single cell / a regional ENC_ROOT); otherwise — a continental
+// ENC_ROOT whose union bbox would fit at ~z2 (below the style's source minzoom, so
+// nothing draws) — open on a representative data cell; else a sensible default.
+static void frameCamera(mbgl::Map &map, tile57_source *src) {
+    double bw = 0, bs = 0, be = 0, bn = 0;
+    if (tile57_source_bounds(src, &bw, &bs, &be, &bn)) {
+        const auto bounds = mbgl::LatLngBounds::hull(mbgl::LatLng{bs, bw}, mbgl::LatLng{bn, be});
+        const auto cam = map.cameraForLatLngBounds(bounds, mbgl::EdgeInsets{20, 20, 20, 20});
+        if (cam.zoom && *cam.zoom >= 8.0) {
+            map.jumpTo(cam);
+            return;
+        }
+    }
+    double alat = 0, alon = 0, azoom = 0;
+    if (tile57_source_anchor(src, &alat, &alon, &azoom)) {
+        map.jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{alat, alon}).withZoom(azoom));
+        std::fprintf(stderr, "[chart] opening at %.4f,%.4f z%.0f\n", alat, alon, azoom);
+        return;
+    }
+    map.jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{38.978, -76.487}).withZoom(13.0));
+}
+
 extern "C" int chartplotter_render_png(const char *chart_path, const char *style_path,
                                        const char *rules_dir, double lat, double lon, double zoom,
                                        uint32_t width, uint32_t height, float pixel_ratio,
@@ -77,7 +100,11 @@ extern "C" int chartplotter_render_png(const char *chart_path, const char *style
                       .withPixelRatio(pixel_ratio),
                   mbgl::ResourceOptions().withCachePath(":memory:").withAssetPath("."));
     map.getStyle().loadJSON(readFile(style_path));
-    map.jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{lat, lon}).withZoom(zoom));
+    // zoom <= 0: auto-frame (same path the window uses), so it can be tested here.
+    if (zoom > 0)
+        map.jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{lat, lon}).withZoom(zoom));
+    else
+        frameCamera(map, g_src);
 
     int rc = 0;
     try {
@@ -141,9 +168,6 @@ extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
         return nullptr;
     }
 
-    double bw = 0, bs = 0, be = 0, bn = 0;
-    const bool haveBounds = tile57_source_bounds(g_src, &bw, &bs, &be, &bn);
-
     mbgl::ResourceOptions resourceOptions;
     resourceOptions.withCachePath(":memory:").withAssetPath(".");
     mbgl::ClientOptions clientOptions;
@@ -172,15 +196,12 @@ extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
     v->view->setMap(v->map.get());
     v->view->setWindowTitle(opts->title ? opts->title : "chartplotter");
 
-    // Camera: explicit centre+zoom when zoom > 0; otherwise fit the data bounds.
-    if (opts->zoom > 0) {
+    // Camera: explicit centre+zoom when given; otherwise fit the data bounds, or
+    // open on a representative cell when the bounds are too large to fit usefully.
+    if (opts->zoom > 0)
         v->map->jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{opts->lat, opts->lon}).withZoom(opts->zoom));
-    } else if (haveBounds) {
-        const auto bounds = mbgl::LatLngBounds::hull(mbgl::LatLng{bs, bw}, mbgl::LatLng{bn, be});
-        v->map->jumpTo(v->map->cameraForLatLngBounds(bounds, mbgl::EdgeInsets{20, 20, 20, 20}));
-    } else {
-        v->map->jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{38.978, -76.487}).withZoom(13.0));
-    }
+    else
+        frameCamera(*v->map, g_src);
     v->map->getStyle().loadJSON(readFile(opts->style_path));
     return v;
 }

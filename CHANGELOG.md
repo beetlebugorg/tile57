@@ -17,6 +17,13 @@ C ABI is not yet frozen.
   renders a view by touching ~a dozen cells (≈5 GB transient at open, far less
   steady-state). Coverage gaps at a zoom are filled by overzooming the coarsest
   band present, so tiles aren't blank.
+- **Initial-view framing.** When no explicit camera is given, the host fits the
+  data bounds if that lands at a usable zoom (a single cell / a region); for a
+  continental ENC_ROOT — whose bounds would fit at ~z2, below the style's source
+  minzoom, i.e. blank — it instead opens on a representative harbour cell near the
+  data median (`tile57_source_anchor`), robust to scattered IHO test cells. Fixes
+  "the window comes up but I see nothing." `chartplotter-render` with zoom `0`
+  exercises the same path.
 - **Offline streaming banded baker** (`engine/src/bake_enc.zig`): for precomputing
   a shareable PMTiles archive. Groups cells into navigational bands by CSCL (Band,
   matching the Go reference), bakes finest → coarsest with best-band dedup, holding

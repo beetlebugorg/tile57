@@ -572,6 +572,74 @@ export fn tile57_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64
     return true;
 }
 
+/// A good initial camera (center lat/lon + zoom) sitting on real data, for when
+/// fitting the whole source would zoom out uselessly (a continental ENC_ROOT).
+/// Centers on the smallest chart cell near the data median (a harbour, over water
+/// with dense data) at a navigable zoom. true when set; false (PMTiles / single
+/// cell) → the caller uses fit-to-bounds.
+export fn tile57_source_anchor(src: ?*Source, lat: *f64, lon: *f64, zoom: *f64) callconv(.c) bool {
+    const so = src orelse return false;
+    switch (so.backend) {
+        .cells => |ls| {
+            // Consider only "sane" cells: a normal chart's bbox spans well under
+            // ~10°. This drops huge overview cells AND corrupt cells (an outlier
+            // SG2D coord blows the bbox up) / IHO test cells with junk coordinates.
+            var cnt: usize = 0;
+            for (ls.cells) |lc| {
+                if (lc.bbox[2] - lc.bbox[0] < 10.0 and lc.bbox[3] - lc.bbox[1] < 10.0) cnt += 1;
+            }
+            if (cnt == 0) return false;
+            // Median center of the sane cells — robust to scattered outliers, lands
+            // in the densest (real survey) cluster.
+            const lons = gpa.alloc(f64, cnt) catch return false;
+            defer gpa.free(lons);
+            const lats = gpa.alloc(f64, cnt) catch return false;
+            defer gpa.free(lats);
+            var i: usize = 0;
+            for (ls.cells) |lc| {
+                if (lc.bbox[2] - lc.bbox[0] >= 10.0 or lc.bbox[3] - lc.bbox[1] >= 10.0) continue;
+                lons[i] = (lc.bbox[0] + lc.bbox[2]) / 2;
+                lats[i] = (lc.bbox[1] + lc.bbox[3]) / 2;
+                i += 1;
+            }
+            std.mem.sort(f64, lons, {}, std.sort.asc(f64));
+            std.mem.sort(f64, lats, {}, std.sort.asc(f64));
+            const mlon = lons[cnt / 2];
+            const mlat = lats[cnt / 2];
+            // Within the dense cluster (near the median), open on the SMALLEST cell
+            // — the most-detailed chart, i.e. a harbour/berthing cell, which sits
+            // over water with dense data and fits at a high zoom (above the style's
+            // minzoom). Fall back to the nearest sane cell if none are close.
+            var bestArea: f64 = 1e30;
+            var best: ?[4]f64 = null;
+            var nbd: f64 = 1e30;
+            var nearest: ?[4]f64 = null;
+            for (ls.cells) |lc| {
+                if (lc.bbox[2] - lc.bbox[0] >= 10.0 or lc.bbox[3] - lc.bbox[1] >= 10.0) continue;
+                const cx = (lc.bbox[0] + lc.bbox[2]) / 2;
+                const cy = (lc.bbox[1] + lc.bbox[3]) / 2;
+                const d = (cx - mlon) * (cx - mlon) + (cy - mlat) * (cy - mlat);
+                if (d < nbd) {
+                    nbd = d;
+                    nearest = lc.bbox;
+                }
+                if (@abs(cx - mlon) > 3.0 or @abs(cy - mlat) > 3.0) continue;
+                const area = (lc.bbox[2] - lc.bbox[0]) * (lc.bbox[3] - lc.bbox[1]);
+                if (area < bestArea) {
+                    bestArea = area;
+                    best = lc.bbox;
+                }
+            }
+            const b = best orelse nearest orelse return false;
+            lon.* = (b[0] + b[2]) / 2;
+            lat.* = (b[1] + b[3]) / 2;
+            zoom.* = 12; // harbour-area view, above the style minzoom; over water
+            return true;
+        },
+        else => return false,
+    }
+}
+
 /// Fetch tile (z,x,y) as MVT bytes (PMTiles: decompressed; cell: generated).
 /// Returns TILE57_TILE_OK (1) + out/out_len (free with tile57_tile_free) if non-empty,
 /// TILE57_TILE_EMPTY (0) if empty/absent, TILE57_TILE_ERROR (-1) on error.
