@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 
 #ifdef CHARTPLOTTER_WITH_TILE57
 #include "tile_server.hpp"
@@ -168,8 +169,15 @@ void installZoomFloor(QMapLibre::MapWidget *widget, double floor) {
         auto *m = widget->map();
         if (!m) return; // not ready yet — keep polling
         poll->stop();
-        QObject::connect(m, &QMapLibre::Map::mapChanged, m, [m, floor](QMapLibre::Map::MapChange) {
-            if (m->zoom() < floor - 1e-3) m->setZoom(floor);
+        // Re-entrancy guard: setZoom() fires mapChanged again synchronously
+        // (onCameraWillChange) BEFORE the zoom updates, so an unguarded handler
+        // re-reads the still-below-floor zoom and recurses until the stack blows.
+        auto clamping = std::make_shared<bool>(false);
+        QObject::connect(m, &QMapLibre::Map::mapChanged, m, [m, floor, clamping](QMapLibre::Map::MapChange) {
+            if (*clamping || m->zoom() >= floor - 1e-3) return;
+            *clamping = true;
+            m->setZoom(floor);
+            *clamping = false;
         });
     });
     poll->start(50);
