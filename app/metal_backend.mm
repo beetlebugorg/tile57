@@ -19,8 +19,6 @@
 #include <Metal/Metal.hpp>
 #include <QuartzCore/CAMetalLayer.hpp>
 
-#include <dispatch/dispatch.h>
-
 namespace mbgl {
 
 using namespace mtl;
@@ -33,21 +31,12 @@ public:
         swapchain(NS::TransferPtr(CA::MetalLayer::layer())) {
     swapchain->setDevice(backend.getDevice().get());
     // Triple-buffered, async present — matches MapLibre's macOS SDK
-    // (MLNMapView+Metal). NOT presentsWithTransaction (stalls on a
-    // non-CADisplayLink loop) or per-frame GPU waits.
-    swapchain->setMaximumDrawableCount(kMaxFramesInFlight);
+    // (MLNMapView+Metal) and the Zed 120fps findings. Smoothness comes from
+    // presenting EVERY frame (the host renders continuously) so the ProMotion
+    // display holds a steady refresh, NOT from presentsWithTransaction (which
+    // stalls on a non-CADisplayLink loop) or per-frame GPU waits.
+    swapchain->setMaximumDrawableCount(3);
     swapchain->setAllowsNextDrawableTimeout(false);
-    // *** FRAME PACING — the missing half of triple buffering. ***
-    // setMaximumDrawableCount alone does NOT bound how many frames the CPU
-    // submits ahead of the GPU. Without a governor, a burst of frames (a zoom's
-    // cross-fade is the worst case) lets the CPU run ahead, exhausts the drawable
-    // pool, and then nextDrawable() (timeout disabled) blocks mid-burst -> stalls
-    // + present races = flicker. This semaphore is the canonical fix: it caps
-    // in-flight frames at the pool size. Waited once per frame in bind() (the
-    // drawable-acquisition point), signaled from the GPU completion handler in
-    // swap(). bind()/swap() are 1:1 per frame (one "main buffer" render pass +
-    // one present per frame in renderer_impl), so it can't drift or deadlock.
-    inFlight = dispatch_semaphore_create(kMaxFramesInFlight);
   }
 
   void setBackendSize(mbgl::Size size_) {
@@ -60,11 +49,6 @@ public:
   mbgl::Size getSize() const { return size; }
 
   void bind() override {
-    // Block until the GPU has finished a previous frame, so at most
-    // kMaxFramesInFlight are outstanding and the drawable pool never starves.
-    // Signaled in swap()'s completion handler. (Called once per frame: the
-    // single "main buffer" render pass on the default renderable.)
-    dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
     surface = NS::TransferPtr(swapchain->nextDrawable());
     auto texSize = mbgl::Size{static_cast<uint32_t>(swapchain->drawableSize().width),
                               static_cast<uint32_t>(swapchain->drawableSize().height)};
@@ -119,17 +103,10 @@ public:
   }
 
   void swap() override {
-    // Release one in-flight slot when the GPU finishes this frame (pairs with the
-    // dispatch_semaphore_wait in bind()). Registered before commit so the handler
-    // is attached when the buffer is scheduled. Capture the semaphore (not this)
-    // so a late callback can't touch a freed resource.
-    dispatch_semaphore_t sem = inFlight;
-    commandBuffer->addCompletedHandler(^(MTL::CommandBuffer*) { dispatch_semaphore_signal(sem); });
-
-    // Async present (presentDrawable + commit), like MapLibre's macOS
+    // Async present (presentDrawable + commit), exactly like MapLibre's macOS
     // MLNMapView+Metal swap(). No presentsWithTransaction / waitUntil* — those
-    // stall on the GLFW (non-CADisplayLink) loop. The semaphore (not per-frame
-    // waits) is what bounds the queue now.
+    // stall on the GLFW (non-CADisplayLink) loop. Display smoothness comes from
+    // the host presenting every frame.
     if (surface) {
       commandBuffer->presentDrawable(surface.get());
     }
@@ -154,14 +131,7 @@ public:
   const CAMetalLayerPtr& getSwapchain() const { return swapchain; }
 
 private:
-  // Drawable pool depth == max frames the CPU may queue ahead of the GPU.
-  static constexpr long kMaxFramesInFlight = 3;
-
   MetalBackend& rendererBackend;
-  // Bounds in-flight frames to the drawable-pool size (frame pacing). Created in
-  // the ctor; intentionally never dispatch_release'd — process-lifetime singleton
-  // (one window), ARC is off for this .mm.
-  dispatch_semaphore_t inFlight = nullptr;
   MTLCommandQueuePtr commandQueue;
   MTLCommandBufferPtr commandBuffer;
   MTLRenderPassDescriptorPtr renderPassDescriptor;
