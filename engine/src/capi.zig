@@ -124,6 +124,7 @@ const Source = struct {
     // would re-decode (PMTiles) or re-generate (cell) the same tiles. Values are
     // owned here; tile57_tile_get returns a fresh copy the caller frees.
     cache: std.AutoHashMap(u64, []u8),
+    cache_max: usize = 8192, // bound the in-memory tile cache (panning generates new tiles forever)
 };
 
 fn lazyFreeCell(lc: *LazyCell) void {
@@ -712,6 +713,15 @@ export fn tile57_tile_get(
             break :blk mvt;
         },
     };
+    // Bound memory: a long pan session generates new tiles indefinitely. Re-requests
+    // are short-circuited by the etag/notModified path before this, so dropping the
+    // cache only forces a (cheap, deterministic) regen of the rare non-priorEtag
+    // re-request — never a re-parse/flicker.
+    if (s.cache.count() >= s.cache_max) {
+        var cit = s.cache.valueIterator();
+        while (cit.next()) |v| gpa.free(v.*);
+        s.cache.clearRetainingCapacity();
+    }
     s.cache.put(key, bytes) catch {}; // best-effort; cache owns `bytes` on success
     if (bytes.len == 0) return 0;
     const dup = gpa.dupe(u8, bytes) catch return -1;
