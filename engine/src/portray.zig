@@ -7,8 +7,8 @@
 //! the tests/bake exe.
 
 const std = @import("std");
-const s57 = @import("s57.zig");
-const adapt = @import("s101_adapt.zig");
+const s57 = @import("s57");
+const adapt = @import("s100").s101_adapt;
 
 const Ctx = struct {
     adapted: []adapt.Adapted,

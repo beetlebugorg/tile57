@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const iso = @import("iso8211.zig");
+const iso = @import("iso8211");
 
 pub const LonLat = struct { lon: f64, lat: f64 };
 pub const Sounding = struct { lon: f64, lat: f64, depth: f64 };

@@ -31,9 +31,36 @@ fn addLua(b: *std.Build, mod: *std.Build.Module) void {
     });
 }
 
+// Re-import the foundational packages (iso8211/s57/s100) into a consumer module
+// (engine, libtile57.a, the baker). One place keeps the edge list in sync.
+fn addPkgs(mod: *std.Build.Module, iso8211_mod: *std.Build.Module, s57_mod: *std.Build.Module, s100_mod: *std.Build.Module) void {
+    mod.addImport("iso8211", iso8211_mod);
+    mod.addImport("s57", s57_mod);
+    mod.addImport("s100", s100_mod);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Foundational packages, mirroring the Go oracle's pkg/iso8211, pkg/s57,
+    // pkg/s100. Pure Zig (no libc/Lua) and target-agnostic: they omit target/
+    // optimize so the same module objects compile under both the glibc test/lib
+    // build and the static-musl baker build, inheriting each consumer's target.
+    // DAG: iso8211 <- s57 <- s100. The embedded catalogue JSON rides on s100
+    // (its only @embedFile user is s100/catalogue.zig). See specs/bundle-bake.md.
+    const iso8211_mod = b.addModule("iso8211", .{
+        .root_source_file = b.path("src/iso8211/iso8211.zig"),
+    });
+    const s57_mod = b.addModule("s57", .{
+        .root_source_file = b.path("src/s57/s57.zig"),
+        .imports = &.{.{ .name = "iso8211", .module = iso8211_mod }},
+    });
+    const s100_mod = b.addModule("s100", .{
+        .root_source_file = b.path("src/s100/s100.zig"),
+        .imports = &.{.{ .name = "s57", .module = s57_mod }},
+    });
+    addCatalogueJson(b, s100_mod);
 
     // Pure-Zig public module (no libc). Used by the unit tests so that
     // Zig-linked test binary doesn't pull in the system crt.
@@ -42,7 +69,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addCatalogueJson(b, mod);
+    addPkgs(mod, iso8211_mod, s57_mod, s100_mod);
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -54,7 +81,7 @@ pub fn build(b: *std.Build) void {
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
-    addCatalogueJson(b, lib_mod);
+    addPkgs(lib_mod, iso8211_mod, s57_mod, s100_mod);
     addLua(b, lib_mod);
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
@@ -83,7 +110,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true, // Lua needs the C runtime
     });
-    addCatalogueJson(b, bake_engine);
+    addPkgs(bake_engine, iso8211_mod, s57_mod, s100_mod);
     addLua(b, bake_engine);
 
     const bake = b.addExecutable(.{

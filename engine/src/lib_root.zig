@@ -9,7 +9,7 @@
 pub const engine = @import("root.zig");
 pub const capi = @import("capi.zig");
 pub const portray = @import("portray.zig");
-pub const catalogue = @import("catalogue.zig");
+pub const catalogue = @import("s100").catalogue;
 
 comptime {
     _ = capi; // force the C ABI export fns into the archive

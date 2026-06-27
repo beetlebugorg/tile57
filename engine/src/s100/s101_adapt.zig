@@ -7,7 +7,7 @@
 //! is attached when instructions are translated to MVT.
 
 const std = @import("std");
-const s57 = @import("s57.zig");
+const s57 = @import("s57");
 const catalogue = @import("catalogue.zig");
 
 pub const NameVal = struct { name: []const u8, value: []const u8 };

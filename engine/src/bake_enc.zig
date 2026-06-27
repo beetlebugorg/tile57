@@ -12,7 +12,7 @@
 //! tile immediately, so the accumulated tiles never reference cell memory.
 
 const std = @import("std");
-const s57 = @import("s57.zig");
+const s57 = @import("s57");
 const s57_mvt = @import("s57_mvt.zig");
 const pmtiles = @import("pmtiles.zig");
 const tile = @import("tile.zig");
