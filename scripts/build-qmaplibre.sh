@@ -16,7 +16,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/vendor/maplibre-native-qt"
-export QT_ROOT_DIR="${QT_ROOT_DIR:-/usr}"
+
+# Locate Qt6: $QT_ROOT_DIR wins; else Homebrew's qt prefix on macOS, else /usr.
+if [ -z "${QT_ROOT_DIR:-}" ]; then
+  if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+    QT_ROOT_DIR="$(brew --prefix qt 2>/dev/null || brew --prefix qt6 2>/dev/null || echo /usr)"
+  else
+    QT_ROOT_DIR=/usr
+  fi
+fi
+export QT_ROOT_DIR
 TOOLCHAIN="$QT_ROOT_DIR/lib/cmake/Qt6/qt.toolchain.cmake"
 PREFIX="$ROOT/build/qmaplibre"
 
