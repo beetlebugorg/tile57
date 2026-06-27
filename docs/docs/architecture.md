@@ -21,22 +21,24 @@ S-57 ENC cell (.000)
    │  decode the binary container     engine/src/iso8211/   (pkg: iso8211)
    ▼
 S-57 feature + geometry model         engine/src/s57/       (pkg: s57)
-   │  apply S-101 portrayal           engine/src/portray.zig + embedded Lua 5.4
+   │  apply S-101 portrayal           engine/src/portray/ (pkg) + embedded Lua 5.4
    ▼                                   (vendor/S-101_Portrayal-Catalogue)
 Primitive instruction stream
    │  adapt to drawing primitives     engine/src/s100/      (pkg: s100:
    ▼                                     catalogue, s101_adapt, s101_instr)
-web-mercator project + clip + encode  engine/src/s57_mvt.zig, mvt.zig, tile.zig
+web-mercator project + clip + encode  engine/src/{s57_mvt,mvt,tile}/ (packages)
    ▼
 Mapbox Vector Tile bytes  ─────────▶  MapLibre Native  (ChartTileSource FileSource)
 ```
 
-The first three stages are **standalone Zig packages** — `iso8211`, `s57`,
-`s100` — that mirror the Go oracle's `pkg/iso8211`, `pkg/s57`, `pkg/s100` one for
-one. They are pure (no libc/Lua) and target-agnostic, so the same modules compile
-into both the unit tests and the static-musl baker. The remaining stages
-(`portray`, `s57_mvt`, `mvt`, `pmtiles`, `tile`, `assets`, the baker) mirror the
-Go project's `internal/engine/*`.
+Every stage is a **standalone Zig package** mirroring the Go oracle: `iso8211`,
+`s57`, `s100` map to `pkg/iso8211`/`pkg/s57`/`pkg/s100`; `gzip`, `mvt`, `tile`,
+`pmtiles`, `s57_mvt`, `bake_enc`, `portray`, `assets` map to the relevant
+`internal/engine/*`. Most are pure (no libc/Lua) and target-agnostic, so the same
+modules compile into both the unit tests and the static-musl baker; only
+`portray` (the embedded-Lua runner) links libc, and it's never imported by the
+pure test build. What's left in the top-level `engine` module is just glue — the
+module roots, the `tile57_*` C-ABI (`capi`), and the MVT parity test.
 
 1. **Decode (ISO 8211).** S-57 cells use the ISO 8211 binary container format.
    The decoder reads the raw records and fields.
