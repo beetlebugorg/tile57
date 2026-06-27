@@ -184,7 +184,12 @@ extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
 
     registerChartSource(); // before the Map builds its resource loader
 
-    const bool continuous = std::getenv("CHART_CONTINUOUS") != nullptr;
+    // Continuous redraw by default: the on-demand path leaves the window blank when
+    // idle on some backends (the old CHART_CONTINUOUS escape hatch is now the
+    // default). The etag/notModified path already prevents re-parse, so continuous
+    // is smooth and flicker-free; set CHART_ONDEMAND=1 for the lower-idle-CPU
+    // on-demand mode where it works.
+    const bool continuous = std::getenv("CHART_ONDEMAND") == nullptr;
     v->contObserver = std::make_unique<ContinuousObserver>(*v->view);
     mbgl::MapObserver &observer = continuous ? static_cast<mbgl::MapObserver &>(*v->contObserver)
                                              : static_cast<mbgl::MapObserver &>(*v->view);

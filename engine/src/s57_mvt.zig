@@ -378,8 +378,11 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// (wrong primitive, unofficial stub, …); when portrayal yields nothing or errors,
 /// draw the Go reference's newObjectBuild placeholder — a dashed CHMGF (magenta)
 /// outline on the feature's line/area geometry. DrawingPriority 6.
-fn emitNewObjectFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
-    if (f.prim != 2 and f.prim != 3) return; // Go's newObjectBuild only strokes line/area
+/// Stroke a feature's line/area geometry as a dashed boundary in `color` — the
+/// shared shape of several native S-52 fallbacks (NEWOBJ box; an area-encoded
+/// RecommendedTrack whose Curve-only S-101 rule errors). DrawingPriority 6.
+fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, color: []const u8, width: f64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+    if (f.prim != 2 and f.prim != 3) return;
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
@@ -395,8 +398,8 @@ fn emitNewObjectFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
         var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHMGF" } });
-        try props.append(a, .{ .key = "width_px", .value = .{ .double = 1.5 } });
+        try props.append(a, .{ .key = "color_token", .value = .{ .string = color } });
+        try props.append(a, .{ .key = "width_px", .value = .{ .double = width } });
         try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
         try appendMeta(a, &props, 6, scamin);
         try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
@@ -509,8 +512,12 @@ fn appendCellFeatures(
             try emitSweptAreaFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
             continue;
         }
-        if (f.objl == 163) { // NEWOBJ — new-object box placeholder
-            try emitNewObjectFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
+        if (f.objl == 163) { // NEWOBJ — new-object box placeholder (dashed magenta)
+            try emitDashedBoundary(a, cell.*, f, fi, geo, "CHMGF", 1.5, z, x, y, tb, box, L);
+            continue;
+        }
+        if (f.objl == 109 and f.prim == 3) { // RECTRC area: Curve-only rule errors; draw the track limit
+            try emitDashedBoundary(a, cell.*, f, fi, geo, "CHBLK", 1.0, z, x, y, tb, box, L);
             continue;
         }
         if (errored) continue; // genuine rule error on a normal class → suppress
