@@ -17,4 +17,13 @@ find_package(QMapLibre REQUIRED COMPONENTS Widgets)
 qt_add_executable(chartplotter-qt main.cpp)
 target_link_libraries(chartplotter-qt PRIVATE QMapLibre::Widgets)
 
+# QMapLibre links as @rpath/QMapLibre*.framework but carries no absolute path, so
+# the binary needs an rpath to find it at runtime. The frameworks install to
+# <prefix>/lib, and QMapLibre_DIR is <prefix>/lib/cmake/QMapLibre — derive the lib
+# dir from it and bake it into the install rpath (Qt itself resolves via absolute
+# Homebrew paths, so only QMapLibre needs this).
+get_filename_component(QMAPLIBRE_LIBDIR "${QMapLibre_DIR}/../.." ABSOLUTE)
+set_target_properties(chartplotter-qt PROPERTIES
+  INSTALL_RPATH "${QMAPLIBRE_LIBDIR}")
+
 install(TARGETS chartplotter-qt RUNTIME DESTINATION bin)
