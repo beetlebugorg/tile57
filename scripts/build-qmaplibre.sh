@@ -47,24 +47,41 @@ fi
 echo "==> fetching maplibre-native-qt + its maplibre-native submodule (heavy, one-time)" >&2
 git -C "$ROOT" submodule update --init --recursive vendor/maplibre-native-qt
 
+# Renderer MUST match Qt's RHI backend: Metal on macOS (Qt RHI hands the widget a
+# Metal command buffer — an OpenGL mbgl crashes in createUniformBuffer), OpenGL on
+# Linux. Switching renderer needs a clean build dir, so wipe it when it changes.
+if [ "$(uname -s)" = "Darwin" ]; then
+  RENDERER=(-DMLN_WITH_METAL=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0)
+  RTAG=metal
+else
+  RENDERER=(-DMLN_WITH_OPENGL=ON)
+  RTAG=opengl
+fi
+BUILDDIR="$ROOT/build/qmaplibre-build"
+if [ -f "$BUILDDIR/.renderer" ] && [ "$(cat "$BUILDDIR/.renderer")" != "$RTAG" ]; then
+  echo "==> renderer changed -> clean rebuild" >&2
+  rm -rf "$BUILDDIR" "$PREFIX"
+fi
+
 # Build + install QMapLibre. Only the Widgets component is needed (no Location /
 # Quick — those want Qt6Location/Qt6Quick). MLN_WITH_WERROR=OFF: maplibre-native's
 # -Werror trips on warnings from very recent GCC/Clang.
-echo "==> building + installing QMapLibre (Widgets, OpenGL) -> $PREFIX" >&2
-cmake -S "$SRC" -B "$ROOT/build/qmaplibre-build" -GNinja \
+echo "==> building + installing QMapLibre (Widgets, $RTAG) -> $PREFIX" >&2
+cmake -S "$SRC" -B "$BUILDDIR" -GNinja \
   -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.19 \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
   -DQT_VERSION_MAJOR=6 \
-  -DMLN_WITH_OPENGL=ON \
+  "${RENDERER[@]}" \
   -DMLN_QT_WITH_INTERNAL_ICU=ON \
   -DMLN_QT_WITH_WIDGETS=ON \
   -DMLN_QT_WITH_LOCATION=OFF \
   -DMLN_QT_WITH_QUICK_PLUGIN=OFF \
   -DMLN_WITH_WERROR=OFF
-cmake --build "$ROOT/build/qmaplibre-build"
-cmake --install "$ROOT/build/qmaplibre-build"
+echo "$RTAG" > "$BUILDDIR/.renderer"
+cmake --build "$BUILDDIR"
+cmake --install "$BUILDDIR"
 
 # Build the viewer against the freshly-installed QMapLibre.
 echo "==> building chartplotter-qt -> build/qt" >&2
