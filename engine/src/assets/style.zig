@@ -1,54 +1,64 @@
 //! style.zig — MapLibre GL style.json generation for the chart bundle. Resolves
 //! each S-52 colour token to hex for a palette and emits the fill / line / symbol
-//! / text layer set as minified JSON. Ported from the chartplotter web frontend's
-//! s52-style.mjs / chart-style.mjs (and the now-removed style/build_style.py, kept
-//! in git history; it was verified layer-for-layer identical during the port).
-//! The sole style generator now. Part of the `assets` module.
-//! See ../../../specs/bundle-bake.md.
+//! / text layer set. Ported from the chartplotter web frontend's s52-style.mjs /
+//! chart-style.mjs (and the now-removed style/build_style.py, kept in git history;
+//! it was verified layer-for-layer identical during the port). The sole style
+//! generator now. Part of the `assets` module. See ../../../specs/bundle-bake.md.
+//!
+//! MapLibre expressions are written as Zig comptime tuples — `.{ "get", "drval1" }`
+//! serialises to `["get","drval1"]` — through std.json's Stringify write-stream,
+//! which owns all escaping, comma, and brace handling. No raw JSON in the source;
+//! the only hand-rolled fragment is the variable-length colour `match` (the palette
+//! is runtime data), and that goes through the same stream.
 
 const std = @import("std");
+const Stringify = std.json.Stringify;
 
 const FALLBACK = "#ff00ff";
-// Default mariner depth contours (S-52): shallow=2, safety=10, deep=30 m.
-const DPC = "30";
-const SFC = "10";
-const SHC = "2";
 // SCAMIN display-scale denominator at z0 (physical 512-tile scale).
-const DENOM_Z0 = "279541132.0";
-const FONT = "[\"Noto Sans Regular\"]";
+const DENOM_Z0 = 279541132.0;
+const FONT = .{"Noto Sans Regular"};
 
-// ["coalesce",["get","drval1"],-1] / ["coalesce",["get","drval2"],0]
-const D1 = "[\"coalesce\",[\"get\",\"drval1\"],-1]";
-const D2 = "[\"coalesce\",[\"get\",\"drval2\"],0]";
-fn band(comptime x: []const u8) []const u8 {
-    return "[\"all\",[\">=\"," ++ D1 ++ "," ++ x ++ "],[\">\"," ++ D2 ++ "," ++ x ++ "]]";
-}
+// ---- MapLibre expressions, as comptime tuples ----------------------------
+
+// Depth-area band edges: coalesce(get drvalN, default).
+const D1 = .{ "coalesce", .{ "get", "drval1" }, -1 };
+const D2 = .{ "coalesce", .{ "get", "drval2" }, 0 };
 // SEABED01 depth-band token (deepest first; case: first match wins).
-const SEABED = "[\"case\"," ++ band(DPC) ++ ",\"DEPDW\"," ++ band(SFC) ++ ",\"DEPMD\"," ++
-    band(SHC) ++ ",\"DEPMS\"," ++ band("0") ++ ",\"DEPVS\",\"DEPIT\"]";
+const SEABED = .{
+    "case",
+    .{ "all", .{ ">=", D1, 30 }, .{ ">", D2, 30 } }, "DEPDW",
+    .{ "all", .{ ">=", D1, 10 }, .{ ">", D2, 10 } }, "DEPMD",
+    .{ "all", .{ ">=", D1, 2 },  .{ ">", D2, 2 } },  "DEPMS",
+    .{ "all", .{ ">=", D1, 0 },  .{ ">", D2, 0 } },  "DEPVS",
+    "DEPIT",
+};
 
-const SCAMIN_FILTER = "[\">=\",[\"zoom\"],[\"log2\",[\"/\"," ++ DENOM_Z0 ++
-    ",[\"coalesce\",[\"get\",\"scamin\"]," ++ DENOM_Z0 ++ "]]]]";
+// Show a SCAMIN feature only at/above its 1:N display zoom.
+const SCAMIN_GATE = .{ ">=", .{"zoom"}, .{ "log2", .{ "/", DENOM_Z0, .{ "coalesce", .{ "get", "scamin" }, DENOM_Z0 } } } };
 
-const FILL_SORT = "[\"-\",[\"*\",[\"coalesce\",[\"get\",\"draw_prio\"],0],1000],[\"coalesce\",[\"get\",\"drval1\"],0]]";
+// S-52 DrawingPriority fill order: draw_prio*1000 - drval1.
+const FILL_SORT = .{ "-", .{ "*", .{ "coalesce", .{ "get", "draw_prio" }, 0 }, 1000 }, .{ "coalesce", .{ "get", "drval1" }, 0 } };
 
-// OBSTRN/WRECKS danger swap + pivot_center "ctr:" variant (s52-style pointSymbolImage).
-const SYM_NAME = "[\"case\",[\"all\",[\"has\",\"sym_deep\"],[\">\",[\"coalesce\",[\"get\",\"danger_depth\"],0]," ++
-    SFC ++ "]],[\"get\",\"sym_deep\"],[\"get\",\"symbol_name\"]]";
-const PSI = "[\"case\",[\"==\",[\"coalesce\",[\"get\",\"pivot_center\"],0],1],[\"concat\",\"ctr:\"," ++
-    SYM_NAME ++ "]," ++ SYM_NAME ++ "]";
-const ICON_SIZE = "[\"/\",[\"coalesce\",[\"get\",\"scale\"],0.08],0.08]";
-const SOUNDINGS_IMG = "[\"case\",[\"has\",\"sym_s\"],[\"case\",[\"<=\",[\"coalesce\",[\"get\",\"depth\"],0]," ++
-    SFC ++ "],[\"get\",\"sym_s\"],[\"get\",\"sym_g\"]],[\"get\",\"symbol_names\"]]";
+const FILT_SOLID = .{ "==", .{ "coalesce", .{ "get", "dash" }, "solid" }, "solid" };
+const FILT_DASHED = .{ "==", .{ "get", "dash" }, "dashed" };
+const FILT_DOTTED = .{ "==", .{ "get", "dash" }, "dotted" };
 
-const VROW = "[\"match\",[\"coalesce\",[\"get\",\"valign\"],\"middle\"],\"top\",\"top\",\"bottom\",\"bottom\",\"center\"]";
-const TEXT_ANCHOR = "[\"match\",[\"concat\"," ++ VROW ++ ",\"|\",[\"coalesce\",[\"get\",\"halign\"],\"center\"]]," ++
-    "\"center|left\",\"left\",\"center|right\",\"right\",\"center|center\",\"center\"," ++
-    "\"top|center\",\"top\",\"bottom|center\",\"bottom\"," ++
-    "\"top|left\",\"top-left\",\"top|right\",\"top-right\"," ++
-    "\"bottom|left\",\"bottom-left\",\"bottom|right\",\"bottom-right\",\"center\"]";
-const TEXT_SORT_KEY = "[\"-\",[\"match\",[\"coalesce\",[\"get\",\"tgrp\"],-1],11,0,[21,26,29],100,23,50,150]," ++
-    "[\"coalesce\",[\"get\",\"font_size_px\"],10]]";
+// OBSTRN/WRECKS danger swap (sym_deep beyond safety) + pivot_center "ctr:" variant.
+const SYM_NAME = .{ "case", .{ "all", .{ "has", "sym_deep" }, .{ ">", .{ "coalesce", .{ "get", "danger_depth" }, 0 }, 10 } }, .{ "get", "sym_deep" }, .{ "get", "symbol_name" } };
+const PSI = .{ "case", .{ "==", .{ "coalesce", .{ "get", "pivot_center" }, 0 }, 1 }, .{ "concat", "ctr:", SYM_NAME }, SYM_NAME };
+const ICON_SIZE = .{ "/", .{ "coalesce", .{ "get", "scale" }, 0.08 }, 0.08 };
+const SOUNDINGS_IMG = .{ "case", .{ "has", "sym_s" }, .{ "case", .{ "<=", .{ "coalesce", .{ "get", "depth" }, 0 }, 10 }, .{ "get", "sym_s" }, .{ "get", "sym_g" } }, .{ "get", "symbol_names" } };
+
+const VROW = .{ "match", .{ "coalesce", .{ "get", "valign" }, "middle" }, "top", "top", "bottom", "bottom", "center" };
+const TEXT_ANCHOR = .{
+    "match", .{ "concat", VROW, "|", .{ "coalesce", .{ "get", "halign" }, "center" } },
+    "center|left",   "left",       "center|right",  "right",        "center|center", "center",
+    "top|center",    "top",        "bottom|center", "bottom",
+    "top|left",      "top-left",   "top|right",     "top-right",
+    "bottom|left",   "bottom-left", "bottom|right", "bottom-right", "center",
+};
+const TEXT_SORT_KEY = .{ "-", .{ "match", .{ "coalesce", .{ "get", "tgrp" }, -1 }, 11, 0, .{ 21, 26, 29 }, 100, 23, 50, 150 }, .{ "coalesce", .{ "get", "font_size_px" }, 10 } };
 
 pub const StyleOpts = struct {
     scheme: []const u8, // "day" | "dusk" | "night"
@@ -61,169 +71,232 @@ pub const StyleOpts = struct {
     maxzoom: u32 = 16,
 };
 
-// Minimal append-only JSON writer over an ArrayList(u8).
-const W = struct {
-    out: *std.ArrayList(u8),
-    a: std.mem.Allocator,
-    fn s(w: W, t: []const u8) !void {
-        try w.out.appendSlice(w.a, t);
-    }
-};
-
 fn isScamin(sl: []const u8) bool {
     return std.mem.endsWith(u8, sl, "_scamin");
 }
 
-fn emitPalettePairs(w: W, palette: std.json.ObjectMap) !void {
+// ---- colour resolution (the one runtime-variable expression) -------------
+
+// After the array head + token expr, append TOK,hex pairs + fallback and close.
+fn finishColorMatch(js: *Stringify, palette: std.json.ObjectMap, fallback: []const u8) !void {
     for (palette.keys()) |k| {
-        try w.s(",\"");
-        try w.s(k);
-        try w.s("\",\"");
-        try w.s(palette.get(k).?.string);
-        try w.s("\"");
+        try js.write(k);
+        try js.write(palette.get(k).?.string);
     }
+    try js.write(fallback);
+    try js.endArray();
 }
 
-// ["match",<token_expr>, TOK,hex, …, fallback]
-fn emitColorMatch(w: W, token_expr: []const u8, palette: std.json.ObjectMap, fallback: []const u8) !void {
-    try w.s("[\"match\",");
-    try w.s(token_expr);
-    try emitPalettePairs(w, palette);
-    try w.s(",\"");
-    try w.s(fallback);
-    try w.s("\"]");
+// ["match",["coalesce",["get",prop],""], TOK,hex, …, fallback]
+fn colorExpr(js: *Stringify, prop: []const u8, palette: std.json.ObjectMap, fallback: []const u8) !void {
+    try js.beginArray();
+    try js.write("match");
+    try js.write(.{ "coalesce", .{ "get", prop }, "" });
+    try finishColorMatch(js, palette, fallback);
 }
 
-// color_expr(prop): match over ["coalesce",["get",prop],""]
-fn emitColorExpr(w: W, prop: []const u8, palette: std.json.ObjectMap, fallback: []const u8) !void {
-    var buf: [64]u8 = undefined;
-    const te = try std.fmt.bufPrint(&buf, "[\"coalesce\",[\"get\",\"{s}\"],\"\"]", .{prop});
-    try emitColorMatch(w, te, palette, fallback);
+// Depth areas (drval1) shade via SEABED01; everything else uses its colour_token.
+fn areasFillColor(js: *Stringify, palette: std.json.ObjectMap) !void {
+    try js.beginArray();
+    try js.write("case");
+    try js.write(.{ "has", "drval1" });
+    try js.beginArray(); // SEABED01 match
+    try js.write("match");
+    try js.write(SEABED);
+    try finishColorMatch(js, palette, FALLBACK);
+    try colorExpr(js, "color_token", palette, FALLBACK); // default arm
+    try js.endArray();
 }
 
-fn emitAreasFillColor(w: W, palette: std.json.ObjectMap) !void {
-    try w.s("[\"case\",[\"has\",\"drval1\"],");
-    try emitColorMatch(w, SEABED, palette, FALLBACK);
-    try w.s(",");
-    try emitColorExpr(w, "color_token", palette, FALLBACK);
-    try w.s("]");
-}
-
-fn emitLinePaint(w: W, palette: std.json.ObjectMap, dash: ?[]const u8) !void {
-    try w.s("{\"line-color\":");
-    try emitColorExpr(w, "color_token", palette, FALLBACK);
-    try w.s(",\"line-width\":[\"coalesce\",[\"get\",\"width_px\"],1]");
+fn linePaint(js: *Stringify, palette: std.json.ObjectMap, dash: ?[2]i64) !void {
+    try js.beginObject();
+    try js.objectField("line-color");
+    try colorExpr(js, "color_token", palette, FALLBACK);
+    try js.objectField("line-width");
+    try js.write(.{ "coalesce", .{ "get", "width_px" }, 1 });
     if (dash) |d| {
-        try w.s(",\"line-dasharray\":");
-        try w.s(d);
+        try js.objectField("line-dasharray");
+        try js.write(d);
     }
-    try w.s("}");
-}
-
-// Emit `,"filter":<expr>` for all_of(f1, f2): nothing if both null, the lone one
-// if one is null, else ["all",f1,f2]. Mirrors the web s52-style all_of/scamin_gate.
-fn emitFilter(w: W, f1: ?[]const u8, f2: ?[]const u8) !void {
-    if (f1 == null and f2 == null) return;
-    try w.s(",\"filter\":");
-    if (f1 != null and f2 != null) {
-        try w.s("[\"all\",");
-        try w.s(f1.?);
-        try w.s(",");
-        try w.s(f2.?);
-        try w.s("]");
-    } else {
-        try w.s(f1 orelse f2.?);
-    }
+    try js.endObject();
 }
 
 fn haloColor(scheme: []const u8) []const u8 {
-    return if (std.mem.eql(u8, scheme, "day")) "\"rgba(255,255,255,0.9)\"" else "\"rgba(0,0,0,0.85)\"";
+    return if (std.mem.eql(u8, scheme, "day")) "rgba(255,255,255,0.9)" else "rgba(0,0,0,0.85)";
 }
 
-fn emitTextColor(w: W, scheme: []const u8, palette: std.json.ObjectMap) !void {
+fn textColor(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap) !void {
     if (std.mem.eql(u8, scheme, "day")) {
-        try emitColorExpr(w, "color_token", palette, "#000000");
-    } else if (std.mem.eql(u8, scheme, "night")) {
-        try w.s("\"#aab7bf\"");
+        try colorExpr(js, "color_token", palette, "#000000");
     } else {
-        try w.s("\"#dde7ec\"");
+        try js.write(if (std.mem.eql(u8, scheme, "night")) "#aab7bf" else "#dde7ec");
     }
 }
 
-fn emitContourLabelColor(w: W, scheme: []const u8, palette: std.json.ObjectMap) !void {
-    if (!std.mem.eql(u8, scheme, "day")) return emitTextColor(w, scheme, palette);
-    const c = if (palette.get("CHGRD")) |v|
-        v.string
-    else if (palette.get("CHBLK")) |v|
-        v.string
-    else
-        "#000000";
-    try w.s("\"");
-    try w.s(c);
-    try w.s("\"");
+fn contourLabelColor(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap) !void {
+    if (!std.mem.eql(u8, scheme, "day")) return textColor(js, scheme, palette);
+    const c = if (palette.get("CHGRD")) |v| v.string else if (palette.get("CHBLK")) |v| v.string else "#000000";
+    try js.write(c);
 }
 
-fn emitPointSymbolLayers(w: W, sl: []const u8, extra: ?[]const u8) !void {
-    const common = ",\"icon-size\":" ++ ICON_SIZE ++ ",\"icon-rotate\":[\"coalesce\",[\"get\",\"rotation_deg\"],0]," ++
-        "\"icon-allow-overlap\":true,\"icon-ignore-placement\":true,\"symbol-z-order\":\"source\"";
-    try w.s(",{\"id\":\"");
-    try w.s(sl);
-    try w.s("\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"");
-    try w.s(sl);
-    try w.s("\"");
-    try emitFilter(w, "[\"!=\",[\"coalesce\",[\"get\",\"rot_north\"],0],1]", extra);
-    try w.s(",\"layout\":{\"icon-image\":" ++ PSI ++ common ++ ",\"icon-rotation-alignment\":\"viewport\"}}");
-    try w.s(",{\"id\":\"");
-    try w.s(sl);
-    try w.s("-north\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"");
-    try w.s(sl);
-    try w.s("\"");
-    try emitFilter(w, "[\"==\",[\"coalesce\",[\"get\",\"rot_north\"],0],1]", extra);
-    try w.s(",\"layout\":{\"icon-image\":" ++ PSI ++ common ++ ",\"icon-rotation-alignment\":\"map\"}}");
+// ---- layer building blocks ----------------------------------------------
+
+fn layerHead(js: *Stringify, id: []const u8, kind: []const u8, source_layer: []const u8) !void {
+    try js.objectField("id");
+    try js.write(id);
+    try js.objectField("type");
+    try js.write(kind);
+    try js.objectField("source");
+    try js.write("chart");
+    try js.objectField("source-layer");
+    try js.write(source_layer);
 }
 
-fn emitTextLayers(w: W, scheme: []const u8, palette: std.json.ObjectMap, sl: []const u8, extra: ?[]const u8) !void {
+// `,"filter": base` — or `["all", base, SCAMIN_GATE]` when gated. (all_of)
+fn gatedFilter(js: *Stringify, base: anytype, gated: bool) !void {
+    try js.objectField("filter");
+    if (gated) {
+        try js.beginArray();
+        try js.write("all");
+        try js.write(base);
+        try js.write(SCAMIN_GATE);
+        try js.endArray();
+    } else {
+        try js.write(base);
+    }
+}
+
+fn lineLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, name: []const u8, filt: anytype, dash: ?[2]i64, gated: bool) !void {
+    var buf: [64]u8 = undefined;
+    const id = try std.fmt.bufPrint(&buf, "{s}-{s}", .{ sl, name });
+    try js.beginObject();
+    try layerHead(js, id, "line", sl);
+    try gatedFilter(js, filt, gated);
+    try js.objectField("paint");
+    try linePaint(js, palette, dash);
+    try js.endObject();
+}
+
+// solid / dashed / dotted line layers for one source-layer.
+fn lineLayers(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, gated: bool) !void {
+    try lineLayer(js, palette, sl, "solid", FILT_SOLID, null, gated);
+    try lineLayer(js, palette, sl, "dashed", FILT_DASHED, .{ 4, 3 }, gated);
+    try lineLayer(js, palette, sl, "dotted", FILT_DOTTED, .{ 1, 2 }, gated);
+}
+
+fn pointLayout(js: *Stringify, alignment: []const u8) !void {
+    try js.beginObject();
+    try js.objectField("icon-image");
+    try js.write(PSI);
+    try js.objectField("icon-size");
+    try js.write(ICON_SIZE);
+    try js.objectField("icon-rotate");
+    try js.write(.{ "coalesce", .{ "get", "rotation_deg" }, 0 });
+    try js.objectField("icon-allow-overlap");
+    try js.write(true);
+    try js.objectField("icon-ignore-placement");
+    try js.write(true);
+    try js.objectField("symbol-z-order");
+    try js.write("source");
+    try js.objectField("icon-rotation-alignment");
+    try js.write(alignment);
+    try js.endObject();
+}
+
+fn pointSymbolLayers(js: *Stringify, sl: []const u8, gated: bool) !void {
+    var buf: [64]u8 = undefined;
+    // viewport-aligned (screen-up)
+    try js.beginObject();
+    try layerHead(js, sl, "symbol", sl);
+    try gatedFilter(js, .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, gated);
+    try js.objectField("layout");
+    try pointLayout(js, "viewport");
+    try js.endObject();
+    // map-aligned (true-north)
+    const nid = try std.fmt.bufPrint(&buf, "{s}-north", .{sl});
+    try js.beginObject();
+    try layerHead(js, nid, "symbol", sl);
+    try gatedFilter(js, .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, gated);
+    try js.objectField("layout");
+    try pointLayout(js, "map");
+    try js.endObject();
+}
+
+fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, sl: []const u8, gated: bool) !void {
+    var buf: [64]u8 = undefined;
     const suffix = if (std.mem.eql(u8, sl, "text")) "" else "-scamin";
-    // light-text<suffix>
-    try w.s(",{\"id\":\"light-text");
-    try w.s(suffix);
-    try w.s("\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"");
-    try w.s(sl);
-    try w.s("\"");
-    try emitFilter(w, "[\"==\",[\"get\",\"class\"],\"LIGHTS\"]", extra);
-    try w.s(",\"layout\":{\"text-field\":[\"coalesce\",[\"get\",\"text\"],\"\"],\"text-font\":" ++ FONT ++
-        ",\"text-size\":[\"coalesce\",[\"get\",\"font_size_px\"],10],\"text-anchor\":\"top\",\"text-offset\":[0,0.4]," ++
-        "\"text-justify\":\"left\",\"symbol-sort-key\":[\"-\",0,[\"coalesce\",[\"get\",\"font_size_px\"],10]]," ++
-        "\"text-allow-overlap\":false,\"text-optional\":true},\"paint\":{\"text-color\":");
-    try emitTextColor(w, scheme, palette);
-    try w.s(",\"text-halo-color\":");
-    try w.s(haloColor(scheme));
-    try w.s(",\"text-halo-width\":1.4,\"text-halo-blur\":0.5}}");
-    // text<suffix>
-    try w.s(",{\"id\":\"text");
-    try w.s(suffix);
-    try w.s("\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"");
-    try w.s(sl);
-    try w.s("\"");
-    try emitFilter(w, "[\"!=\",[\"get\",\"class\"],\"LIGHTS\"]", extra);
-    try w.s(",\"layout\":{\"text-field\":[\"coalesce\",[\"get\",\"text\"],\"\"],\"text-font\":" ++ FONT ++
-        ",\"text-size\":[\"coalesce\",[\"get\",\"font_size_px\"],11],\"text-anchor\":" ++ TEXT_ANCHOR ++
-        ",\"symbol-sort-key\":" ++ TEXT_SORT_KEY ++ ",\"text-allow-overlap\":false,\"text-optional\":true}," ++
-        "\"paint\":{\"text-color\":");
-    try emitTextColor(w, scheme, palette);
-    try w.s(",\"text-halo-color\":");
-    try w.s(haloColor(scheme));
-    try w.s(",\"text-halo-width\":1.4,\"text-halo-blur\":0.5}}");
+
+    // light-text<suffix> — always-on LIGHTS characteristics, top-anchored.
+    const lid = try std.fmt.bufPrint(&buf, "light-text{s}", .{suffix});
+    try js.beginObject();
+    try layerHead(js, lid, "symbol", sl);
+    try gatedFilter(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, gated);
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("text-field");
+    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
+    try js.objectField("text-font");
+    try js.write(FONT);
+    try js.objectField("text-size");
+    try js.write(.{ "coalesce", .{ "get", "font_size_px" }, 10 });
+    try js.objectField("text-anchor");
+    try js.write("top");
+    try js.objectField("text-offset");
+    try js.write(.{ 0, 0.4 });
+    try js.objectField("text-justify");
+    try js.write("left");
+    try js.objectField("symbol-sort-key");
+    try js.write(.{ "-", 0, .{ "coalesce", .{ "get", "font_size_px" }, 10 } });
+    try js.objectField("text-allow-overlap");
+    try js.write(false);
+    try js.objectField("text-optional");
+    try js.write(true);
+    try js.endObject();
+    try textPaint(js, scheme, palette, 1.4);
+    try js.endObject();
+
+    // text<suffix> — general collidable labels.
+    var buf2: [64]u8 = undefined;
+    const tid = try std.fmt.bufPrint(&buf2, "text{s}", .{suffix});
+    try js.beginObject();
+    try layerHead(js, tid, "symbol", sl);
+    try gatedFilter(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, gated);
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("text-field");
+    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
+    try js.objectField("text-font");
+    try js.write(FONT);
+    try js.objectField("text-size");
+    try js.write(.{ "coalesce", .{ "get", "font_size_px" }, 11 });
+    try js.objectField("text-anchor");
+    try js.write(TEXT_ANCHOR);
+    try js.objectField("symbol-sort-key");
+    try js.write(TEXT_SORT_KEY);
+    try js.objectField("text-allow-overlap");
+    try js.write(false);
+    try js.objectField("text-optional");
+    try js.write(true);
+    try js.endObject();
+    try textPaint(js, scheme, palette, 1.4);
+    try js.endObject();
 }
 
-const LineSpec = struct { name: []const u8, filt: []const u8, dash: ?[]const u8 };
-const line_specs = [_]LineSpec{
-    .{ .name = "solid", .filt = "[\"==\",[\"coalesce\",[\"get\",\"dash\"],\"solid\"],\"solid\"]", .dash = null },
-    .{ .name = "dashed", .filt = "[\"==\",[\"get\",\"dash\"],\"dashed\"]", .dash = "[4,3]" },
-    .{ .name = "dotted", .filt = "[\"==\",[\"get\",\"dash\"],\"dotted\"]", .dash = "[1,2]" },
-};
+fn textPaint(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, halo_width: f64) !void {
+    try js.objectField("paint");
+    try js.beginObject();
+    try js.objectField("text-color");
+    try textColor(js, scheme, palette);
+    try js.objectField("text-halo-color");
+    try js.write(haloColor(scheme));
+    try js.objectField("text-halo-width");
+    try js.write(halo_width);
+    try js.objectField("text-halo-blur");
+    try js.write(0.5);
+    try js.endObject();
+}
 
-/// Emit a MapLibre style.json (minified) for `opts.scheme`. Returns owned bytes.
+/// Emit a MapLibre style.json for `opts.scheme`. Returns allocator-owned bytes.
 pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, opts.colortables_json, .{}) catch
         return error.BadColortables;
@@ -237,147 +310,194 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         else => return error.BadColortables,
     };
     const sprite_on = opts.sprite != null;
-
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(alloc);
-    const w = W{ .out = &out, .a = alloc };
-
     const sea = if (palette.get("DEPDW")) |v| v.string else "#93aebb";
 
-    try w.s("{\"version\":8,\"name\":\"chartplotter-native (");
-    try w.s(opts.scheme);
-    try w.s(", M2)\",\"sources\":{\"chart\":");
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var stringify: Stringify = .{ .writer = &aw.writer };
+    const js = &stringify;
+
+    try js.beginObject();
+    try js.objectField("version");
+    try js.write(8);
+    var namebuf: [64]u8 = undefined;
+    try js.objectField("name");
+    try js.write(try std.fmt.bufPrint(&namebuf, "chartplotter-native ({s}, M2)", .{opts.scheme}));
+
+    try js.objectField("sources");
+    try js.beginObject();
+    try js.objectField("chart");
+    try js.beginObject();
+    try js.objectField("type");
+    try js.write("vector");
     if (opts.source_tiles) |t| {
-        try w.s("{\"type\":\"vector\",\"tiles\":[\"");
-        try w.s(t);
-        var zb: [64]u8 = undefined;
-        try w.s(try std.fmt.bufPrint(&zb, "\"],\"minzoom\":{d},\"maxzoom\":{d}}}", .{ opts.minzoom, opts.maxzoom }));
+        try js.objectField("tiles");
+        try js.beginArray();
+        try js.write(t);
+        try js.endArray();
+        try js.objectField("minzoom");
+        try js.write(opts.minzoom);
+        try js.objectField("maxzoom");
+        try js.write(opts.maxzoom);
     } else {
-        try w.s("{\"type\":\"vector\",\"url\":\"");
-        try w.s(opts.pmtiles_url);
-        try w.s("\"}");
+        try js.objectField("url");
+        try js.write(opts.pmtiles_url);
     }
-    try w.s("},\"layers\":[");
+    try js.endObject(); // chart
+    try js.endObject(); // sources
+
+    try js.objectField("layers");
+    try js.beginArray();
 
     // 1. background
-    try w.s("{\"id\":\"background\",\"type\":\"background\",\"paint\":{\"background-color\":\"");
-    try w.s(sea);
-    try w.s("\"}}");
+    try js.beginObject();
+    try js.objectField("id");
+    try js.write("background");
+    try js.objectField("type");
+    try js.write("background");
+    try js.objectField("paint");
+    try js.beginObject();
+    try js.objectField("background-color");
+    try js.write(sea);
+    try js.endObject();
+    try js.endObject();
 
     // 2. area fills + SCAMIN clone
     for ([_][]const u8{ "areas", "areas_scamin" }) |sl| {
-        const gate: ?[]const u8 = if (isScamin(sl)) SCAMIN_FILTER else null;
-        try w.s(",{\"id\":\"fill-");
-        try w.s(sl);
-        try w.s("\",\"type\":\"fill\",\"source\":\"chart\",\"source-layer\":\"");
-        try w.s(sl);
-        try w.s("\",\"layout\":{\"fill-sort-key\":" ++ FILL_SORT ++ "},\"paint\":{\"fill-color\":");
-        try emitAreasFillColor(w, palette);
-        try w.s(",\"fill-antialias\":true}");
-        try emitFilter(w, gate, null);
-        try w.s("}");
+        var buf: [64]u8 = undefined;
+        try js.beginObject();
+        try layerHead(js, try std.fmt.bufPrint(&buf, "fill-{s}", .{sl}), "fill", sl);
+        try js.objectField("layout");
+        try js.beginObject();
+        try js.objectField("fill-sort-key");
+        try js.write(FILL_SORT);
+        try js.endObject();
+        try js.objectField("paint");
+        try js.beginObject();
+        try js.objectField("fill-color");
+        try areasFillColor(js, palette);
+        try js.objectField("fill-antialias");
+        try js.write(true);
+        try js.endObject();
+        if (isScamin(sl)) {
+            try js.objectField("filter");
+            try js.write(SCAMIN_GATE);
+        }
+        try js.endObject();
     }
 
     // 3. area fill patterns (sprite required)
     if (sprite_on) {
         for ([_][]const u8{ "area_patterns", "area_patterns_scamin" }) |sl| {
-            const gate: ?[]const u8 = if (isScamin(sl)) SCAMIN_FILTER else null;
-            try w.s(",{\"id\":\"fillpat-");
-            try w.s(sl);
-            try w.s("\",\"type\":\"fill\",\"source\":\"chart\",\"source-layer\":\"");
-            try w.s(sl);
-            try w.s("\",\"paint\":{\"fill-pattern\":[\"concat\",\"pat:\",[\"coalesce\",[\"get\",\"pattern_name\"],\"\"]]}");
-            try emitFilter(w, gate, null);
-            try w.s("}");
+            var buf: [64]u8 = undefined;
+            try js.beginObject();
+            try layerHead(js, try std.fmt.bufPrint(&buf, "fillpat-{s}", .{sl}), "fill", sl);
+            try js.objectField("paint");
+            try js.beginObject();
+            try js.objectField("fill-pattern");
+            try js.write(.{ "concat", "pat:", .{ "coalesce", .{ "get", "pattern_name" }, "" } });
+            try js.endObject();
+            if (isScamin(sl)) {
+                try js.objectField("filter");
+                try js.write(SCAMIN_GATE);
+            }
+            try js.endObject();
         }
     }
 
     // 4. lines: solid/dashed/dotted over base + _scamin
     for ([_][]const u8{ "lines", "lines_scamin" }) |sl| {
-        const gate: ?[]const u8 = if (isScamin(sl)) SCAMIN_FILTER else null;
-        for (line_specs) |ls| {
-            try w.s(",{\"id\":\"");
-            try w.s(sl);
-            try w.s("-");
-            try w.s(ls.name);
-            try w.s("\",\"type\":\"line\",\"source\":\"chart\",\"source-layer\":\"");
-            try w.s(sl);
-            try w.s("\"");
-            try emitFilter(w, ls.filt, gate);
-            try w.s(",\"paint\":");
-            try emitLinePaint(w, palette, ls.dash);
-            try w.s("}");
-        }
+        try lineLayers(js, palette, sl, isScamin(sl));
     }
 
     // 5. complex (symbolised) lines
     for ([_][]const u8{ "complex_lines", "complex_lines_scamin" }) |sl| {
-        const gate: ?[]const u8 = if (isScamin(sl)) SCAMIN_FILTER else null;
-        try w.s(",{\"id\":\"complex-");
-        try w.s(sl);
-        try w.s("\",\"type\":\"line\",\"source\":\"chart\",\"source-layer\":\"");
-        try w.s(sl);
-        try w.s("\",\"paint\":");
-        try emitLinePaint(w, palette, null);
-        try emitFilter(w, gate, null);
-        try w.s("}");
+        var buf: [64]u8 = undefined;
+        try js.beginObject();
+        try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}", .{sl}), "line", sl);
+        try js.objectField("paint");
+        try linePaint(js, palette, null);
+        if (isScamin(sl)) {
+            try js.objectField("filter");
+            try js.write(SCAMIN_GATE);
+        }
+        try js.endObject();
     }
 
     // 6. light sector limit lines
-    for (line_specs) |ls| {
-        try w.s(",{\"id\":\"sector_lines-");
-        try w.s(ls.name);
-        try w.s("\",\"type\":\"line\",\"source\":\"chart\",\"source-layer\":\"sector_lines\"");
-        try emitFilter(w, ls.filt, null);
-        try w.s(",\"paint\":");
-        try emitLinePaint(w, palette, ls.dash);
-        try w.s("}");
-    }
+    try lineLayers(js, palette, "sector_lines", false);
 
     // 7. contour value labels (DEPCNT VALDCO)
     for ([_][]const u8{ "lines", "lines_scamin" }) |sl| {
-        const gate: ?[]const u8 = if (isScamin(sl)) SCAMIN_FILTER else null;
-        try w.s(",{\"id\":\"contour-labels-");
-        try w.s(sl);
-        try w.s("\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"");
-        try w.s(sl);
-        try w.s("\"");
-        try emitFilter(w, "[\"has\",\"valdco\"]", gate);
-        try w.s(",\"layout\":{\"symbol-placement\":\"line-center\",\"text-field\":[\"to-string\",[\"get\",\"valdco\"]]," ++
-            "\"text-font\":" ++ FONT ++ ",\"text-size\":10,\"text-max-angle\":30,\"text-allow-overlap\":false," ++
-            "\"text-optional\":true},\"paint\":{\"text-color\":");
-        try emitContourLabelColor(w, opts.scheme, palette);
-        try w.s(",\"text-halo-color\":");
-        try w.s(haloColor(opts.scheme));
-        try w.s(",\"text-halo-width\":1.2,\"text-halo-blur\":0.5}}");
+        var buf: [64]u8 = undefined;
+        try js.beginObject();
+        try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}", .{sl}), "symbol", sl);
+        try gatedFilter(js, .{ "has", "valdco" }, isScamin(sl));
+        try js.objectField("layout");
+        try js.beginObject();
+        try js.objectField("symbol-placement");
+        try js.write("line-center");
+        try js.objectField("text-field");
+        try js.write(.{ "to-string", .{ "get", "valdco" } });
+        try js.objectField("text-font");
+        try js.write(FONT);
+        try js.objectField("text-size");
+        try js.write(10);
+        try js.objectField("text-max-angle");
+        try js.write(30);
+        try js.objectField("text-allow-overlap");
+        try js.write(false);
+        try js.objectField("text-optional");
+        try js.write(true);
+        try js.endObject();
+        try js.objectField("paint");
+        try js.beginObject();
+        try js.objectField("text-color");
+        try contourLabelColor(js, opts.scheme, palette);
+        try js.objectField("text-halo-color");
+        try js.write(haloColor(opts.scheme));
+        try js.objectField("text-halo-width");
+        try js.write(1.2);
+        try js.objectField("text-halo-blur");
+        try js.write(0.5);
+        try js.endObject();
+        try js.endObject();
     }
 
     // 8. point symbols + soundings (sprite required)
     if (sprite_on) {
-        try emitPointSymbolLayers(w, "point_symbols", null);
-        try emitPointSymbolLayers(w, "point_symbols_scamin", SCAMIN_FILTER);
-        try w.s(",{\"id\":\"soundings\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"soundings\"," ++
-            "\"layout\":{\"icon-image\":" ++ SOUNDINGS_IMG ++ ",\"icon-size\":" ++ ICON_SIZE ++
-            ",\"icon-allow-overlap\":false}}");
+        try pointSymbolLayers(js, "point_symbols", false);
+        try pointSymbolLayers(js, "point_symbols_scamin", true);
+        try js.beginObject();
+        try layerHead(js, "soundings", "symbol", "soundings");
+        try js.objectField("layout");
+        try js.beginObject();
+        try js.objectField("icon-image");
+        try js.write(SOUNDINGS_IMG);
+        try js.objectField("icon-size");
+        try js.write(ICON_SIZE);
+        try js.objectField("icon-allow-overlap");
+        try js.write(false);
+        try js.endObject();
+        try js.endObject();
     }
 
     // 9. text labels
-    try emitTextLayers(w, opts.scheme, palette, "text", null);
-    try emitTextLayers(w, opts.scheme, palette, "text_scamin", SCAMIN_FILTER);
+    try textLayers(js, opts.scheme, palette, "text", false);
+    try textLayers(js, opts.scheme, palette, "text_scamin", true);
 
-    try w.s("]");
+    try js.endArray(); // layers
+
     if (opts.glyphs) |g| {
-        try w.s(",\"glyphs\":\"");
-        try w.s(g);
-        try w.s("\"");
+        try js.objectField("glyphs");
+        try js.write(g);
     }
     if (opts.sprite) |sp| {
-        try w.s(",\"sprite\":\"");
-        try w.s(sp);
-        try w.s("\"");
+        try js.objectField("sprite");
+        try js.write(sp);
     }
-    try w.s("}");
-    return out.toOwnedSlice(alloc);
+    try js.endObject();
+    return aw.toOwnedSlice();
 }
 
 test "styleJson: valid JSON, expected layers, palette-resolved colour" {
@@ -397,11 +517,9 @@ test "styleJson: valid JSON, expected layers, palette-resolved colour" {
     defer parsed.deinit();
     const layers = parsed.value.object.get("layers").?.array;
     try std.testing.expect(layers.items.len > 15);
-    // background uses the DEPDW sea colour
     try std.testing.expectEqualStrings("background", layers.items[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("#c9edff", layers.items[0].object.get("paint").?.object.get("background-color").?.string);
-    // sprite/glyphs present (enabled)
     try std.testing.expect(parsed.value.object.get("sprite") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"fill-areas\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"#c9edff\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "#c9edff") != null);
 }
