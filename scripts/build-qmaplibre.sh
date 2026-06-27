@@ -17,19 +17,29 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/vendor/maplibre-native-qt"
 
-# Locate Qt6: $QT_ROOT_DIR wins; else Homebrew's qt prefix on macOS, else /usr.
+# Locate Qt6: $QT_ROOT_DIR wins; else qmake6, else Homebrew's qt prefix, else /usr.
 if [ -z "${QT_ROOT_DIR:-}" ]; then
-  if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
-    QT_ROOT_DIR="$(brew --prefix qt 2>/dev/null || brew --prefix qt6 2>/dev/null || echo /usr)"
-  else
-    QT_ROOT_DIR=/usr
+  if command -v qmake6 >/dev/null 2>&1; then
+    QT_ROOT_DIR="$(qmake6 -query QT_INSTALL_PREFIX 2>/dev/null || true)"
   fi
+  if [ -z "${QT_ROOT_DIR:-}" ] && [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+    QT_ROOT_DIR="$(brew --prefix qt 2>/dev/null || brew --prefix qt6 2>/dev/null || true)"
+  fi
+  QT_ROOT_DIR="${QT_ROOT_DIR:-/usr}"
 fi
 export QT_ROOT_DIR
 TOOLCHAIN="$QT_ROOT_DIR/lib/cmake/Qt6/qt.toolchain.cmake"
 PREFIX="$ROOT/build/qmaplibre"
 
-[ -f "$TOOLCHAIN" ] || { echo "Qt6 toolchain not found at $TOOLCHAIN (set QT_ROOT_DIR)" >&2; exit 1; }
+if [ ! -f "$TOOLCHAIN" ]; then
+  echo "Qt6 toolchain not found at: $TOOLCHAIN" >&2
+  echo "Point QT_ROOT_DIR at your Qt6 prefix and re-run, e.g.:" >&2
+  echo "  macOS (Homebrew):    brew install qt   # then:" >&2
+  echo "                       QT_ROOT_DIR=\"\$(brew --prefix qt)\" $0" >&2
+  echo "  Qt online installer: QT_ROOT_DIR=~/Qt/6.7.0/macos $0" >&2
+  echo "  Linux:               install qt6-base (QT_ROOT_DIR=/usr)" >&2
+  exit 1
+fi
 
 # maplibre-native-qt vendors its own maplibre-native; fetch it (heavy, one-time).
 echo "==> fetching maplibre-native-qt's maplibre-native submodule (heavy, one-time)" >&2
