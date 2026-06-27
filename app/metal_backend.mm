@@ -6,6 +6,7 @@
 // inside that callback (where currentDrawable/currentRenderPassDescriptor are
 // valid), forwarding to a render callback wired by chartplotter.cpp.
 #include "metal_backend.h"
+#include "metal_render_hook.h"
 
 #include <mbgl/mtl/renderable_resource.hpp>
 
@@ -154,4 +155,9 @@ mbgl::Size MetalBackend::getSize() const {
 
 void MetalBackend::setRenderCallback(std::function<void()> cb) {
   getResource<mbgl::MetalRenderableResource>().setRenderCallback(std::move(cb));
+}
+
+// Cocoa-free hook (declared in metal_render_hook.h) for chartplotter.cpp.
+void chartSetMetalRenderCallback(mbgl::gfx::RendererBackend &backend, std::function<void()> cb) {
+  static_cast<MetalBackend &>(backend).setRenderCallback(std::move(cb));
 }
