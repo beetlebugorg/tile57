@@ -81,6 +81,24 @@ typedef struct {
 tile57_source *tile57_source_open_cells(
     const tile57_cell_input *cells, size_t count, const char *rules_dir);
 
+/* Progress callback for tile57_bake_cells. stage 0 = loading/portraying cells,
+ * stage 1 = baking tiles; done/total count cells (stage 0) or tiles (stage 1). */
+typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, size_t total);
+
+/* Bake a whole ENC_ROOT (the same cells as tile57_source_open_cells) into ONE
+ * PMTiles archive, zoom-banded per cell by compilation scale, so the result opens
+ * cheaply (tile57_source_open with TILE57_FORMAT_PMTILES) instead of holding every
+ * cell live. minzoom/maxzoom clamp the per-cell bands (pass 0/24 for no clamp).
+ * `progress` may be NULL. On success returns 1 with the archive in *out and
+ * *out_len (free with tile57_tile_free); 0 if nothing covered; -1 on error. Like
+ * the live open, this parses + portrays every cell, so peak memory tracks the
+ * ENC_ROOT size; run it once and cache the archive. */
+int tile57_bake_cells(
+    const tile57_cell_input *cells, size_t count, const char *rules_dir,
+    uint8_t minzoom, uint8_t maxzoom,
+    tile57_bake_progress progress, void *user,
+    uint8_t **out, size_t *out_len);
+
 /* The resolved backend format (meaningful after a TILE57_FORMAT_AUTO open). */
 tile57_format tile57_source_format(tile57_source *src);
 

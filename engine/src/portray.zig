@@ -16,13 +16,25 @@ const Ctx = struct {
     arena: std.mem.Allocator,
 };
 
-// Single in-flight portrayal (portrayal runs serially, once per cell open).
-var g_ctx: ?*Ctx = null;
+// One in-flight portrayal per thread. The tgp_* accessors below run on the same
+// thread that called portrayCell (the C shim's Lua callbacks are synchronous), so
+// making this thread-local lets the baker portray many cells in parallel — each
+// thread its own context — while the single-threaded live path is unaffected.
+threadlocal var g_ctx: ?*Ctx = null;
 
 // Implemented in C (lua_shim.c): loads the framework + rules from `dir`,
 // dispatches every feature exposed by the tgp_* accessors, and calls tgp_emit
 // for each. Returns 0 on success.
 extern fn tg_portray_run(dir_ptr: [*]const u8, dir_len: usize) callconv(.c) c_int;
+
+// Suppress the per-cell "[s101] portrayed …" stderr summary (extern in lua_shim.c).
+extern fn tg_set_quiet(q: c_int) callconv(.c) void;
+
+/// Silence the per-cell portrayal stderr summary — set before a parallel bake so
+/// concurrent threads don't garble progress output.
+pub fn setQuiet(quiet: bool) void {
+    tg_set_quiet(if (quiet) 1 else 0);
+}
 
 // ---- accessors the C Host* callbacks read --------------------------------
 

@@ -446,6 +446,22 @@ pub fn parseCell(gpa: Allocator, bytes: []const u8) !Cell {
     return parseCellWithUpdates(gpa, bytes, &.{});
 }
 
+/// Cheaply read a cell's compilation scale (CSCL, 1:N) without assembling any
+/// geometry — just the ISO-8211 records and the DSPM field. Used to band cells for
+/// the streaming baker so it can group them before the expensive full parse +
+/// portrayal. Returns null if the scale is absent/unparseable.
+pub fn peekScale(gpa: Allocator, bytes: []const u8) ?i32 {
+    var file = iso.parse(gpa, bytes) catch return null;
+    defer file.deinit();
+    for (file.records) |rec| {
+        if (rec.field("DSPM")) |dspm| {
+            const p = parseDSPM(dspm);
+            if (p.cscl != 0) return p.cscl;
+        }
+    }
+    return null;
+}
+
 const vkey = struct {
     fn of(rcnm: u8, rcid: u32) u64 {
         return (@as(u64, rcnm) << 32) | rcid;

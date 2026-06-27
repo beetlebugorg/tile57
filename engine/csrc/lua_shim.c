@@ -62,6 +62,12 @@ const char *tile57_diag_lua_version(void) { return LUA_VERSION; }
  * Used only as a fallback when tile57_source_open's rules_dir argument is NULL. */
 const char *tg_env_rules(void) { return getenv("TILE57_S101_RULES"); }
 
+/* Suppress the per-cell "[s101] portrayed …" stderr summary. Set once before a
+ * parallel bake (many threads would otherwise garble the progress output); read
+ * read-only by tg_portray_run thereafter. */
+static int g_portray_quiet = 0;
+void tg_set_quiet(int q) { g_portray_quiet = q; }
+
 /* Stub Host* callbacks (used to prove the framework EXECUTES, not just loads).
  * The real ones, backed by the Zig S-57 cell + catalogue, replace these. */
 static int l_empty_table(lua_State *L) {
@@ -658,8 +664,12 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "    errs[feature.Code]=(errs[feature.Code] or (tostring(err)..' [prim='..(feature.PrimitiveType and feature.PrimitiveType.Name or '?')..']')) end\n"
         "  if instr and instr:find('TextInstruction') then ntext=ntext+1 end\n"
         "  tg_store(tonumber(feature.ID), instr)\nend\n"
-        "io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors, '..nskip..' unportrayed, '..ntext..' with text\\n')\n"
-        "for code,e in pairs(errs) do io.stderr:write('  '..code..': '..e..'\\n') end\n";
+        "if not QUIET then\n"
+        "  io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors, '..nskip..' unportrayed, '..ntext..' with text\\n')\n"
+        "  for code,e in pairs(errs) do io.stderr:write('  '..code..': '..e..'\\n') end\n"
+        "end\n";
+    lua_pushboolean(L, g_portray_quiet);
+    lua_setglobal(L, "QUIET");
     int rc = 0;
     if (luaL_dostring(L, driver) != LUA_OK) {
         fprintf(stderr, "[s101] dispatch: %s\n", lua_tostring(L, -1));

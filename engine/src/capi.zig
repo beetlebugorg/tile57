@@ -14,6 +14,8 @@ const pmtiles = @import("pmtiles.zig");
 const s57 = @import("s57.zig");
 const s57_mvt = @import("s57_mvt.zig");
 const portray = @import("portray.zig");
+const bake_enc = @import("bake_enc.zig");
+const catalogue = @import("catalogue.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -175,6 +177,148 @@ export fn tile57_source_open_cells(
     };
     src.* = .{ .backend = .{ .cells = owned }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
     return src;
+}
+
+// Progress callback for tile57_bake_cells: stage 0 = loading/portraying cells,
+// stage 1 = baking tiles. Matches bake_enc.Progress + the header typedef.
+const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void;
+
+// One cell's bytes for the parallel bake worker — base + update slices into the
+// host's buffers (valid for the whole tile57_bake_cells call).
+const BakeSource = struct { base: []const u8, updates: []const []const u8 };
+
+// Parallel parse+portray worker. Each index is independent: a fresh cell + its own
+// portrayal arena + a per-thread Lua state (portray.zig g_ctx is thread-local).
+// Uses the page allocator (thread-safe); the catalogue is warmed before the loop.
+const BakeWork = struct {
+    sources: []const BakeSource,
+    outs: []?bake_enc.Backend,
+    arenas: []?*std.heap.ArenaAllocator,
+    rules_dir: []const u8,
+
+    fn run(uptr: *anyopaque, i: usize) void {
+        const c: *BakeWork = @ptrCast(@alignCast(uptr));
+        const src = c.sources[i];
+        var cell = s57.parseCellWithUpdates(gpa, src.base, src.updates) catch return;
+        const b = cell.bounds() orelse {
+            cell.deinit();
+            return;
+        };
+        var pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
+        var portrayal: ?[]const ?[]const u8 = null;
+        if (pa) |p| {
+            p.* = std.heap.ArenaAllocator.init(gpa);
+            if (portray.portrayCell(p.allocator(), &cell, c.rules_dir)) |res| {
+                portrayal = res;
+            } else |_| {
+                p.deinit();
+                gpa.destroy(p);
+                pa = null;
+            }
+        }
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .bounds = b };
+        c.arenas[i] = pa;
+    }
+};
+
+/// Bake an ENC_ROOT (the same CellInput[] as open_cells) into ONE PMTiles archive,
+/// zoom-banded per cell by compilation scale. On success returns 1 with the archive
+/// bytes in out/out_len (free with tile57_tile_free); 0 if nothing was covered; -1
+/// on error. `progress` (nullable) is called during the load+portray phase (stage
+/// 0) and the tile-bake phase (stage 1). Streams band-by-band (finest → coarsest,
+/// best-band dedup), holding only one band's parsed cells at a time — peak memory
+/// tracks the largest single band, not the whole catalogue. The host still owns
+/// all the input bytes for the duration of the call.
+export fn tile57_bake_cells(
+    cells_ptr: [*]const CellInput,
+    count: usize,
+    rules_dir: ?[*:0]const u8,
+    minzoom: u8,
+    maxzoom: u8,
+    progress: BakeProgress,
+    user: ?*anyopaque,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const dir = resolveRulesDir(rules_dir);
+    const inputs = cells_ptr[0..count];
+
+    // Group input indices by navigational band (cheap CSCL peek; no geometry).
+    var band_idx: [bake_enc.bands_fine_to_coarse.len]std.ArrayList(usize) = undefined;
+    for (&band_idx) |*bi| bi.* = std.ArrayList(usize).empty;
+    defer for (&band_idx) |*bi| bi.deinit(gpa);
+    for (inputs, 0..) |in, i| {
+        const cscl = s57.peekScale(gpa, in.base[0..in.base_len]) orelse 0;
+        band_idx[@intFromEnum(bake_enc.bandOf(cscl))].append(gpa, i) catch return -1;
+    }
+
+    catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
+    portray.setQuiet(true); // many threads -> suppress the per-cell stderr
+    var baker = bake_enc.Baker.init(gpa, minzoom, maxzoom);
+    defer baker.deinit();
+
+    // Bake band-by-band, finest → coarsest. Parse + portray a band's cells in
+    // parallel, bake, then free them before the next band so peak memory is one
+    // band's worth and portrayal runs across all cores.
+    var loaded: usize = 0;
+    for (bake_enc.bands_fine_to_coarse) |band| {
+        const idxs = band_idx[@intFromEnum(band)].items;
+        if (idxs.len == 0) continue;
+
+        // Materialize this band's sources (base + update slices into host buffers).
+        var sources = std.ArrayList(BakeSource).empty;
+        defer {
+            for (sources.items) |s| gpa.free(s.updates);
+            sources.deinit(gpa);
+        }
+        sources.ensureTotalCapacity(gpa, idxs.len) catch continue;
+        for (idxs) |i| {
+            const in = inputs[i];
+            var ups = std.ArrayList([]const u8).empty;
+            if (in.updates) |uptr| if (in.update_lens) |ulen| {
+                var k: usize = 0;
+                while (k < in.update_count) : (k += 1) ups.append(gpa, uptr[k][0..ulen[k]]) catch break;
+            };
+            sources.appendAssumeCapacity(.{ .base = in.base[0..in.base_len], .updates = ups.toOwnedSlice(gpa) catch &.{} });
+        }
+
+        const outs = gpa.alloc(?bake_enc.Backend, sources.items.len) catch continue;
+        defer gpa.free(outs);
+        @memset(outs, null);
+        const pas = gpa.alloc(?*std.heap.ArenaAllocator, sources.items.len) catch continue;
+        defer gpa.free(pas);
+        @memset(pas, null);
+        var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir };
+        bake_enc.parallelFor(sources.items.len, &bw, BakeWork.run);
+        loaded += idxs.len;
+        if (progress) |cb| cb(user, 0, loaded, count);
+
+        var backs = std.ArrayList(bake_enc.Backend).empty;
+        var band_arenas = std.ArrayList(?*std.heap.ArenaAllocator).empty;
+        backs.ensureTotalCapacity(gpa, outs.len) catch {};
+        band_arenas.ensureTotalCapacity(gpa, outs.len) catch {};
+        for (outs, pas) |o, pa| if (o) |be| {
+            backs.appendAssumeCapacity(be);
+            band_arenas.appendAssumeCapacity(pa);
+        };
+        baker.bakeBand(band, backs.items, progress, user) catch {};
+        for (backs.items) |*be| be.cell.deinit();
+        for (band_arenas.items) |pa| if (pa) |p| {
+            p.deinit();
+            gpa.destroy(p);
+        };
+        backs.deinit(gpa);
+        band_arenas.deinit(gpa);
+    }
+
+    const archive = baker.finish() catch return -1;
+    if (archive.len == 0) {
+        gpa.free(archive);
+        return 0;
+    }
+    out.* = archive.ptr;
+    out_len.* = archive.len;
+    return 1;
 }
 
 /// Open a chart tile source from in-memory bytes. `format` selects the backend

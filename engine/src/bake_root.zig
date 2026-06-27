@@ -25,5 +25,6 @@ pub const s57_mvt = root.s57_mvt;
 pub const s101_instr = root.s101_instr;
 pub const s101_adapt = root.s101_adapt;
 pub const catalogue = root.catalogue;
+pub const bake_enc = root.bake_enc;
 
 pub const portray = @import("portray.zig");

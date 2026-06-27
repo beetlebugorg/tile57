@@ -47,6 +47,10 @@ pub fn main(init: std.process.Init) !void {
         return runBake(io, arena, args);
     }
 
+    if (std.mem.eql(u8, sub, "bake-root")) {
+        return runBakeRoot(io, arena, args);
+    }
+
     if (std.mem.eql(u8, sub, "inspect")) {
         if (args.len < 3) {
             std.debug.print("usage: chartplotter-bake inspect <file.pmtiles> [z x y]\n", .{});
@@ -296,7 +300,10 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         while (ty <= se[1]) : (ty += 1) {
             var tx = nw[0];
             while (tx <= se[0]) : (tx += 1) {
-                const tile_mvt = try engine.s57_mvt.generateTile(a, &cell, z, tx, ty, portrayal);
+                // Generate with the page allocator, not the arena `a`:
+                // generateTile frees a per-tile child arena each call, which an
+                // arena backing would leak (tens of GB over a high-vertex cell).
+                const tile_mvt = try engine.s57_mvt.generateTile(std.heap.page_allocator, &cell, z, tx, ty, portrayal);
                 if (tile_mvt.len == 0) continue; // empty tile: nothing covered here
                 try tiles.append(a, .{ .z = z, .x = tx, .y = ty, .mvt = tile_mvt });
             }
@@ -323,6 +330,221 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             tiles.items.len,       minzoom,           maxzoom,
             archive.len,           @as(f64, @floatFromInt(archive.len)) / (1024.0 * 1024.0),
         },
+    );
+}
+
+// ---- bake-root (whole ENC_ROOT -> one banded PMTiles) ------------------
+
+/// Console progress for bake-root: stage 0 = loading/portraying cells, 1 = tiles.
+/// `total` 0 (tile stage) prints just the running count.
+fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void {
+    _ = ctx;
+    const label = if (stage == 0) "loading cells " else "baking tiles  ";
+    if (total == 0) {
+        std.debug.print("\r  {s} {d}    ", .{ label, done });
+    } else {
+        std.debug.print("\r  {s} {d}/{d}    ", .{ label, done, total });
+        if (done == total) std.debug.print("\n", .{});
+    }
+}
+
+// One cell's raw bytes (base + sequential updates), read on the main thread and
+// handed to a worker to parse + portray in parallel.
+const CellSource = struct { base: []const u8, updates: []const []const u8 };
+
+// Parallel parse+portray worker context. Each index is independent: a fresh cell
+// + its own portrayal arena + a per-thread Lua state (portray.zig g_ctx is
+// thread-local). Workers use the page allocator (thread-safe); the shared
+// catalogue is warmed before the loop. Results land in distinct out[i]/arenas[i].
+const PortrayWork = struct {
+    sources: []const CellSource,
+    outs: []?engine.bake_enc.Backend,
+    arenas: []?*std.heap.ArenaAllocator,
+    rules_dir: []const u8,
+    gpa: std.mem.Allocator,
+
+    fn run(uptr: *anyopaque, i: usize) void {
+        const c: *PortrayWork = @ptrCast(@alignCast(uptr));
+        const src = c.sources[i];
+        var cell = engine.s57.parseCellWithUpdates(c.gpa, src.base, src.updates) catch return;
+        const b = cell.bounds() orelse {
+            cell.deinit();
+            return;
+        };
+        var pa: ?*std.heap.ArenaAllocator = c.gpa.create(std.heap.ArenaAllocator) catch null;
+        var portrayal: ?[]const ?[]const u8 = null;
+        if (pa) |p| {
+            p.* = std.heap.ArenaAllocator.init(c.gpa);
+            if (engine.portray.portrayCell(p.allocator(), &cell, c.rules_dir)) |res| {
+                portrayal = res;
+            } else |_| {
+                p.deinit();
+                c.gpa.destroy(p);
+                pa = null;
+            }
+        }
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .bounds = b };
+        c.arenas[i] = pa;
+    }
+};
+
+/// `bake-root <ENC_ROOT> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N]`
+/// Walk an ENC_ROOT for every `<CELL>.000` base cell (+ its sequential `.001…`
+/// updates), parse + portray each, and bake them into ONE PMTiles archive with
+/// per-cell zoom banding by compilation scale (engine.bake_enc). Holds every cell
+/// in memory at once (v1).
+fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var root: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var rules: ?[]const u8 = null;
+    var minzoom: u8 = 0;
+    var maxzoom: u8 = 18;
+
+    var i: usize = 2; // skip exe + "bake-root"
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for -o/--output");
+            out = args[i];
+        } else if (std.mem.eql(u8, arg, "--rules")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --rules");
+            rules = args[i];
+        } else if (std.mem.eql(u8, arg, "--minzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --minzoom");
+            minzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--minzoom must be an integer");
+        } else if (std.mem.eql(u8, arg, "--maxzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --maxzoom");
+            maxzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            std.debug.print("error: unknown flag '{s}'\n\n", .{arg});
+            return printUsage();
+        } else if (root == null) {
+            root = arg;
+        }
+    }
+
+    const root_path = root orelse return usageErr("missing <ENC_ROOT> input");
+    const out_path = out orelse return usageErr("missing -o/--output <out.pmtiles>");
+    if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
+    if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
+    const rules_dir = resolveRulesDir(rules);
+
+    const page = std.heap.page_allocator;
+    var dir = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch {
+        std.debug.print("error: cannot open ENC_ROOT directory '{s}'\n", .{root_path});
+        return;
+    };
+    defer dir.close(io);
+
+    // Pass 1: walk for base cells and group their paths by navigational band
+    // (a cheap CSCL peek — no geometry). Bands let the baker hold only one band's
+    // cells at a time. Paths live in the process arena `a` (small, kept).
+    const Bands = engine.bake_enc;
+    var band_paths: [Bands.bands_fine_to_coarse.len]std.ArrayList([]const u8) = undefined;
+    for (&band_paths) |*bp| bp.* = std.ArrayList([]const u8).empty;
+    var total_cells: usize = 0;
+    {
+        var walker = try dir.walk(a);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
+            const path = try a.dupe(u8, entry.path);
+            const bytes = dir.readFileAlloc(io, path, page, .unlimited) catch continue;
+            const cscl = engine.s57.peekScale(page, bytes) orelse 0;
+            page.free(bytes);
+            try band_paths[@intFromEnum(Bands.bandOf(cscl))].append(a, path);
+            total_cells += 1;
+        }
+    }
+    if (total_cells == 0) {
+        std.debug.print("error: no <CELL>.000 cells found under '{s}'\n", .{root_path});
+        return;
+    }
+    std.debug.print("baking {d} cells from {s} -> {s} (rules: {s})\n", .{ total_cells, root_path, out_path, rules_dir });
+
+    engine.catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
+    engine.portray.setQuiet(true); // many threads -> suppress the per-cell stderr
+
+    var baker = Bands.Baker.init(page, minzoom, maxzoom);
+    defer baker.deinit();
+
+    // Pass 2: bake band-by-band, finest → coarsest (best-band dedup). Read a band's
+    // files (serial IO), parse + portray them in parallel, bake, then free — so
+    // peak memory is one band's cells and the portrayal runs across all cores.
+    var loaded: usize = 0;
+    for (Bands.bands_fine_to_coarse) |band| {
+        const paths = band_paths[@intFromEnum(band)].items;
+        if (paths.len == 0) continue;
+
+        // Read this band's raw bytes on the main thread (IO isn't thread-safe here).
+        var sources = std.ArrayList(CellSource).empty;
+        for (paths) |bpath| {
+            const base_bytes = dir.readFileAlloc(io, bpath, page, .unlimited) catch continue;
+            const stem = bpath[0 .. bpath.len - 4];
+            var ups = std.ArrayList([]const u8).empty;
+            var k: u32 = 1;
+            while (k <= 999) : (k += 1) {
+                const upn = std.fmt.allocPrint(page, "{s}.{d:0>3}", .{ stem, k }) catch break;
+                defer page.free(upn);
+                const ub = dir.readFileAlloc(io, upn, page, .unlimited) catch break;
+                ups.append(page, ub) catch break;
+            }
+            const updates = ups.toOwnedSlice(page) catch &.{};
+            sources.append(page, .{ .base = base_bytes, .updates = updates }) catch {};
+        }
+
+        // Parse + portray in parallel.
+        const outs = page.alloc(?Bands.Backend, sources.items.len) catch continue;
+        defer page.free(outs);
+        @memset(outs, null);
+        const pas = page.alloc(?*std.heap.ArenaAllocator, sources.items.len) catch continue;
+        defer page.free(pas);
+        @memset(pas, null);
+        var pw = PortrayWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = rules_dir, .gpa = page };
+        Bands.parallelFor(sources.items.len, &pw, PortrayWork.run);
+
+        // The cells copied what they keep — free this band's raw bytes now.
+        for (sources.items) |s| {
+            page.free(s.base);
+            for (s.updates) |u| page.free(u);
+            page.free(s.updates);
+        }
+        sources.deinit(page);
+        loaded += paths.len;
+        cliProgress(null, 0, loaded, total_cells);
+
+        // Collect the successful Backends (single owner) aligned with their arenas.
+        var backends = std.ArrayList(Bands.Backend).empty;
+        var band_arenas = std.ArrayList(?*std.heap.ArenaAllocator).empty;
+        backends.ensureTotalCapacity(page, outs.len) catch {};
+        band_arenas.ensureTotalCapacity(page, outs.len) catch {};
+        for (outs, pas) |o, pa| if (o) |be| {
+            backends.appendAssumeCapacity(be);
+            band_arenas.appendAssumeCapacity(pa);
+        };
+
+        baker.bakeBand(band, backends.items, cliProgress, null) catch {};
+
+        for (backends.items) |*be| be.cell.deinit();
+        for (band_arenas.items) |pa| if (pa) |p| {
+            p.deinit();
+            page.destroy(p);
+        };
+        backends.deinit(page);
+        band_arenas.deinit(page);
+    }
+
+    const archive = try baker.finish();
+    defer page.free(archive);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = archive });
+    std.debug.print(
+        "\nbaked {d} cells -> {s}\n  output {d} bytes ({d:.1} MB)\n",
+        .{ total_cells, out_path, archive.len, @as(f64, @floatFromInt(archive.len)) / (1024.0 * 1024.0) },
     );
 }
 
@@ -356,6 +578,10 @@ fn printUsage() void {
         \\      --rules DIR         S-101 portrayal rules directory (optional)
         \\      --minzoom N         lowest zoom to bake (default {d})
         \\      --maxzoom N         highest zoom to bake (default {d})
+        \\  chartplotter-bake bake-root <ENC_ROOT> -o <out.pmtiles> [options]
+        \\      Bake a whole ENC_ROOT (every <CELL>.000 + updates) into one
+        \\      archive, zoom-banded per cell by compilation scale.
+        \\      -o/--output, --rules as above; --minzoom/--maxzoom clamp the bands.
         \\  chartplotter-bake inspect <file.pmtiles> [z x y]
         \\  chartplotter-bake cell <file.000>
         \\  chartplotter-bake version

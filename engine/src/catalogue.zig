@@ -65,6 +65,13 @@ fn parseBindings(a: std.mem.Allocator, v: std.json.Value) []Binding {
     return list.items;
 }
 
+/// Parse + cache the embedded catalogue now (idempotent). Call once before using
+/// the tgc_*/resolve* accessors from multiple threads: the lazy load itself isn't
+/// thread-safe, but once warmed the cached tables are read-only.
+pub fn warmUp() void {
+    ensureLoaded();
+}
+
 fn ensureLoaded() void {
     if (g_cat != null) return;
     const a = std.heap.page_allocator; // process-lifetime

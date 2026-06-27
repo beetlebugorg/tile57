@@ -19,6 +19,7 @@ pub const s57_mvt = @import("s57_mvt.zig");
 pub const s101_instr = @import("s101_instr.zig");
 pub const s101_adapt = @import("s101_adapt.zig");
 pub const catalogue = @import("catalogue.zig");
+pub const bake_enc = @import("bake_enc.zig"); // banded multi-cell ENC_ROOT -> PMTiles
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {
@@ -32,5 +33,6 @@ test {
     _ = s101_instr;
     _ = s101_adapt;
     _ = catalogue;
+    _ = bake_enc;
     _ = @import("mvt_parity_test.zig");
 }
