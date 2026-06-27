@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Find mbgl-render in whichever build dir exists (Linux headless or macOS).
 RENDER="${RENDER:-}"
 if [[ -z "$RENDER" ]]; then
-  for d in build build-macos build-desktop build-macos-desktop; do
+  for d in build build-macos; do
     cand="$ROOT/$d/vendor/maplibre-native/bin/mbgl-render"
     [[ -x "$cand" ]] && { RENDER="$cand"; break; }
   done

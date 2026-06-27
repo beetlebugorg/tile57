@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # One-shot "after a git pull" refresh. Regenerates the styles (they're generated,
-# not version-controlled, so `git pull` never updates them) and rebuilds our host
-# targets: the headless `chartplotter-render` and, when the build dir has GLFW
-# enabled, the interactive window `chartplotter`. Both render the same in-process
-# Zig tile pipeline. (MapLibre's own `mbgl-glfw` is unrelated to our code.)
+# not version-controlled, so `git pull` never updates them) and rebuilds the
+# headless render host `chartplotter-render`.
+#
+# The interactive window is now a separate Qt6 app, `chartplotter-qt` — build it
+# with scripts/build-qmaplibre.sh (not part of the main CMake build).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Pick whichever build dir exists, preferring the GLFW/desktop dirs (a superset:
-# they build both the headless host and the interactive window).
+# Pick whichever render build dir exists (headless / macOS).
 BUILD=""
-for d in build-macos-desktop build-desktop build-macos build; do
+for d in build-macos build; do
   [[ -d "$ROOT/$d" ]] && BUILD="$d" && break
 done
 
@@ -29,22 +29,10 @@ if [[ -n "$BUILD" ]]; then
   cmake -S "$ROOT" -B "$ROOT/$BUILD" >/dev/null
   echo "==> building chartplotter-render in $BUILD" >&2
   ninja -C "$ROOT/$BUILD" chartplotter-render
-  # The interactive window only exists when this build dir has GLFW enabled.
-  WIN=""
-  if grep -q 'chartplotter\b' "$ROOT/$BUILD/build.ninja" 2>/dev/null; then
-    echo "==> building chartplotter (interactive window) in $BUILD" >&2
-    ninja -C "$ROOT/$BUILD" chartplotter
-    WIN="$BUILD/chartplotter"
-  fi
   echo "done."
   echo "  headless PNG:  $BUILD/chartplotter-render reference/tiles/annapolis.pmtiles style/chart-zig-day.json 38.978 -76.487 14 out.png"
-  if [[ -n "$WIN" ]]; then
-    echo "  interactive:   $WIN reference/tiles/annapolis.pmtiles style/chart-zig-day.json"
-    echo "                 (drag to pan, scroll to zoom; pass a .000 cell for live generation)"
-  else
-    echo "  (no interactive window in this build dir — use a desktop preset:"
-    echo "   cmake --preset macos-desktop   # or: desktop   on Linux)"
-  fi
+  echo "  interactive:   the Qt window is chartplotter-qt — build it once with scripts/build-qmaplibre.sh,"
+  echo "                 then: build/qt/chartplotter-qt <bundle>/assets/style-day.json [lat lon zoom]"
 else
-  echo "no build dir found; run 'cmake --preset <headless|desktop|macos|macos-desktop>' first" >&2
+  echo "no build dir found; run 'cmake --preset headless' (or 'macos') first" >&2
 fi
