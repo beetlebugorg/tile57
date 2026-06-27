@@ -4,7 +4,7 @@
   "configurePresets": [
     {
       "name": "headless",
-      "displayName": "Linux headless EGL (mbgl-render -> PNG)",
+      "displayName": "Linux headless EGL (chart -> PNG)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
@@ -14,18 +14,8 @@
       }
     },
     {
-      "name": "desktop",
-      "displayName": "Linux desktop GLFW + Wayland window (mbgl-glfw)",
-      "inherits": "headless",
-      "binaryDir": "${sourceDir}/build-desktop",
-      "cacheVariables": {
-        "MLN_WITH_GLFW": "ON",
-        "MLN_WITH_WAYLAND": "ON"
-      }
-    },
-    {
       "name": "macos",
-      "displayName": "macOS headless Metal (mbgl-render -> PNG)",
+      "displayName": "macOS headless Metal (chart -> PNG)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-macos",
       "cacheVariables": {
@@ -34,21 +24,10 @@
         "CMAKE_OSX_DEPLOYMENT_TARGET": "14.3"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
-    },
-    {
-      "name": "macos-desktop",
-      "displayName": "macOS desktop GLFW + Metal window (mbgl-glfw)",
-      "inherits": "macos",
-      "binaryDir": "${sourceDir}/build-macos-desktop",
-      "cacheVariables": {
-        "MLN_WITH_GLFW": "ON"
-      }
     }
   ],
   "buildPresets": [
-    { "name": "headless", "configurePreset": "headless", "targets": ["mbgl-render"] },
-    { "name": "desktop", "configurePreset": "desktop", "targets": ["mbgl-glfw", "chart-glfw-zig"] },
-    { "name": "macos", "configurePreset": "macos", "targets": ["mbgl-render"] },
-    { "name": "macos-desktop", "configurePreset": "macos-desktop", "targets": ["mbgl-glfw", "chart-glfw-zig"] }
+    { "name": "headless", "configurePreset": "headless", "targets": ["chartplotter-render"] },
+    { "name": "macos", "configurePreset": "macos", "targets": ["chartplotter-render"] }
   ]
 }

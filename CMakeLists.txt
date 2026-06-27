@@ -2,16 +2,6 @@ cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
 
 project(chartplotter_native LANGUAGES C CXX)
 
-# On Apple, the Metal backend + GLFW Metal glue (glfw_metal_backend.mm,
-# metal_backend.mm, glfw_apple_init.mm) are Objective-C++. The top-level
-# project() language set governs the whole tree, so enable OBJC/OBJCXX here or
-# CMake has no rule to compile .mm files (CMAKE_OBJCXX_COMPILE_OBJECT unset).
-# Linux is untouched (it compiles the .cpp GL backend, no .mm).
-if(APPLE)
-  enable_language(OBJC)
-  enable_language(OBJCXX)
-endif()
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -29,15 +19,16 @@ if(CCACHE_PROGRAM)
 endif()
 
 # ---------------------------------------------------------------------------
-# MapLibre Native (embedded as a subdirectory; built by its own CMake).
+# MapLibre Native (embedded as a subdirectory; built by its own CMake) — the
+# offscreen render path only (chartplotter-render -> PNG). The interactive window
+# is a separate Qt6 app (app/qt, built via scripts/build-qmaplibre.sh) that links
+# QMapLibre instead of mbgl directly.
 #
 # Renderer is platform-specific:
 #   - Apple  -> Metal
 #   - Linux  -> OpenGL via EGL (surfaceless headless backend works displayless)
 #
-# Build configs (see CMakePresets.json): a headless one (GLFW off -> mbgl-render
-# to PNG) and a desktop one (GLFW on -> mbgl-glfw interactive window). All
-# defaults below are plain CACHE entries (no FORCE) so a preset or -D... wins.
+# Defaults below are plain CACHE entries (no FORCE) so a preset or -D... wins.
 # ---------------------------------------------------------------------------
 if(APPLE)
   set(MLN_WITH_METAL    ON  CACHE BOOL "")   # Metal is the macOS/iOS backend
@@ -48,14 +39,11 @@ else()
   set(MLN_WITH_OPENGL   ON  CACHE BOOL "")
   set(MLN_WITH_EGL      ON  CACHE BOOL "")   # surfaceless headless backend
   set(MLN_WITH_METAL    OFF CACHE BOOL "")
-  set(MLN_WITH_X11      OFF CACHE BOOL "")
-  set(MLN_WITH_WAYLAND  OFF CACHE BOOL "")   # desktop preset turns this ON (Linux)
 endif()
 
 set(MLN_WITH_VULKAN   OFF CACHE BOOL "")
-set(MLN_WITH_PMTILES  ON  CACHE BOOL "")   # native pmtiles:// source (M1)
-set(MLN_WITH_GLFW     OFF CACHE BOOL "")   # desktop preset turns this ON
-set(MLN_WITH_WERROR   OFF CACHE BOOL "")   # clang 22 is bleeding-edge
+set(MLN_WITH_PMTILES  ON  CACHE BOOL "")   # native pmtiles:// source
+set(MLN_WITH_WERROR   OFF CACHE BOOL "")   # clang/gcc are bleeding-edge here
 set(MLN_WITH_NODE     OFF CACHE BOOL "")
 set(MLN_WITH_QT       OFF CACHE BOOL "")
 
@@ -84,17 +72,11 @@ if(ZIG_EXECUTABLE)
     VERBATIM)
 
   # -------------------------------------------------------------------------
-  # libchartplotter — the embeddable chart-widget library (CMake target
+  # libchartplotter — the headless chart-render library (CMake target
   # `chartplotter_widget`, artifact libchartplotter.a). It wraps MapLibre Native
   # + libtile57 behind the C API in include/chartplotter.h: render a chart to a
-  # PNG offscreen (always), and — when built with GLFW (the desktop presets) —
-  # open an interactive window (chartplotter_view_*). The exes are thin mains.
-  #
-  # There is no reusable mbgl-glfw *library* (platform/glfw only builds the
-  # mbgl-glfw exe), so the window half compiles MapLibre's GLFW view/backend
-  # source set into this library, guarded by CHARTPLOTTER_WITH_GLFW. (tinyobjloader
-  # / cheap-ruler are existing targets from MapLibre's glfw subdir — just link
-  # them; do NOT re-include vendor/tinyobjloader.cmake.)
+  # PNG offscreen (ChartTileSource serves tiles from libtile57). chartplotter-render
+  # is a thin main over it. The interactive window is the Qt6 app in app/qt.
   # -------------------------------------------------------------------------
   set(MLN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native)
 
@@ -108,80 +90,11 @@ if(ZIG_EXECUTABLE)
   target_link_libraries(chartplotter_widget PUBLIC mbgl-core ${TILE57_LIB})
   target_link_libraries(chartplotter_widget PRIVATE mbgl-compiler-options)
 
-  if(MLN_WITH_GLFW)
-    if(NOT WIN32)
-      find_package(PkgConfig REQUIRED)
-      pkg_search_module(GLFW glfw3 REQUIRED)
-    endif()
-    target_compile_definitions(chartplotter_widget PRIVATE CHARTPLOTTER_WITH_GLFW=1)
-    target_sources(chartplotter_widget PRIVATE
-      ${MLN_DIR}/platform/glfw/glfw_view.cpp
-      ${MLN_DIR}/platform/glfw/glfw_renderer_frontend.cpp
-      ${MLN_DIR}/platform/glfw/test_writer.cpp
-      ${MLN_DIR}/platform/glfw/example_custom_drawable_style_layer.cpp
-      ${MLN_DIR}/platform/default/src/mbgl/map/map_snapshotter.cpp)
-    # GLFWView bakes a default asset path in at compile time.
-    set_property(SOURCE ${MLN_DIR}/platform/glfw/glfw_view.cpp
-      PROPERTY COMPILE_DEFINITIONS MLN_ASSETS_PATH="${MLN_DIR}/platform/glfw/assets/")
-    if(APPLE)
-      target_sources(chartplotter_widget PRIVATE ${MLN_DIR}/platform/glfw/glfw_apple_init.mm)
-    endif()
-    if(MLN_WITH_OPENGL)
-      find_package(OpenGL REQUIRED)
-      target_sources(chartplotter_widget PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
-    endif()
-    if(MLN_WITH_METAL)
-      # Our MTKView-based metal_backend.mm (app/metal_backend.h, ported from
-      # MapLibre's own MLNMapView+Metal.mm) replaces the GLFW example's hand-rolled
-      # CAMetalLayer backend: MTKView's internal CVDisplayLink drives rendering at
-      # vsync (fixes the present-timing flicker + blank-on-idle). CHARTPLOTTER_METAL
-      # switches the host (chartplotter.cpp) onto the MTKView render path +
-      # ChartRendererFrontend. metal-cpp is header-only and mbgl-core links Metal
-      # PRIVATE, so we link the Apple frameworks here (QuartzCore + Metal +
-      # Foundation for the metal-cpp objects/CAMetalLayer, MetalKit for MTKView).
-      target_compile_definitions(chartplotter_widget PRIVATE CHARTPLOTTER_METAL=1)
-      target_sources(chartplotter_widget PRIVATE
-        ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
-        ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm
-        ${CMAKE_CURRENT_SOURCE_DIR}/app/chart_renderer_frontend.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/app/chart_native_host.mm)
-      # Cocoa for the native window host (NSWindow/NSApplication/NSEvent);
-      # MetalKit for MTKView; QuartzCore/Metal/Foundation for metal-cpp/CAMetalLayer.
-      target_link_libraries(chartplotter_widget PUBLIC mbgl-vendor-metal-cpp
-        "-framework QuartzCore" "-framework Metal" "-framework Foundation"
-        "-framework MetalKit" "-framework Cocoa")
-    endif()
-    if(MLN_WITH_EGL)
-      target_compile_definitions(chartplotter_widget PRIVATE MBGL_WITH_EGL=1)
-    endif()
-    if(DEFINED MLN_WITH_X11 AND MLN_WITH_X11)
-      target_compile_definitions(chartplotter_widget PRIVATE MLN_WITH_X11=1)
-    endif()
-    if(DEFINED MLN_WITH_WAYLAND AND MLN_WITH_WAYLAND)
-      target_compile_definitions(chartplotter_widget PRIVATE MLN_WITH_WAYLAND=1)
-    endif()
-    target_include_directories(chartplotter_widget PRIVATE
-      ${MLN_DIR}/platform/glfw ${MLN_DIR}/src ${GLFW_INCLUDE_DIRS})
-    target_link_libraries(chartplotter_widget PUBLIC
-      Mapbox::Map mbgl-vendor-rapidjson MapLibreNative::Base::cheap-ruler-cpp tinyobjloader
-      $<$<BOOL:${GLFW_LIBRARY_DIRS}>:-L${GLFW_LIBRARY_DIRS}> ${GLFW_LIBRARIES})
-    if(NOT WIN32 AND MLN_WITH_OPENGL)
-      target_link_libraries(chartplotter_widget PUBLIC OpenGL::GL)
-    endif()
-  endif()
-
-  # Thin exes over libchartplotter.
+  # Thin exe: chart -> PNG (headless EGL / Metal).
   add_executable(chartplotter-render app/chartplotter_render_main.cpp)
   target_include_directories(chartplotter-render PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/app)
   target_link_libraries(chartplotter-render PRIVATE chartplotter_widget mbgl-compiler-options)
-
-  if(MLN_WITH_GLFW)
-    add_executable(chartplotter app/chartplotter_main.cpp)
-    target_include_directories(chartplotter PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/app)
-    target_link_libraries(chartplotter PRIVATE chartplotter_widget mbgl-compiler-options)
-  endif()
 else()
-  message(STATUS "zig not found; skipping chartplotter / chartplotter-render (Zig tile source hosts)")
+  message(STATUS "zig not found; skipping chartplotter-render (needs libtile57)")
 endif()

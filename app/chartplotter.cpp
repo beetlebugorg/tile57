@@ -1,11 +1,10 @@
-// libchartplotter — the embeddable chart-widget library. Implements the C API in
-// include/chartplotter.h: open a window and draw S-52 charts with MapLibre
-// Native (sourcing tiles from libtile57 via ChartTileSource), or render a chart
-// to a PNG offscreen.
+// libchartplotter — renders an S-52 chart to a PNG offscreen with MapLibre
+// Native, sourcing vector tiles from libtile57 (the S-57 tile generator) via
+// ChartTileSource. Implements chartplotter_render_png in include/chartplotter.h.
 //
-// The window half is compiled only when built with GLFW (CHARTPLOTTER_WITH_GLFW,
-// set by CMake in the desktop presets); a headless build still provides
-// chartplotter_render_png and stubs the window calls.
+// The interactive window now lives in a separate Qt6 app (app/qt, the
+// QMapLibre-based chartplotter-qt); this library is the headless render path
+// (used by chartplotter-render for parity/verification).
 #include "chartplotter.h"
 
 #include "chart_tile_source.hpp"
@@ -31,8 +30,8 @@
 namespace {
 
 // The MapLibre FileSource factory is process-global, so the chart source it hands
-// to ChartTileSource is too: one active chart at a time (one window or one render
-// in flight). Set before each Map is constructed.
+// to ChartTileSource is too: one active chart at a time (one render in flight).
+// Set before each Map is constructed.
 tile57_source *g_src = nullptr;
 
 std::string readFile(const char *path) {
@@ -120,209 +119,3 @@ extern "C" int chartplotter_render_png(const char *chart_path, const char *style
     // process reclaims it. (One render per process for the headless path.)
     return rc;
 }
-
-#if defined(CHARTPLOTTER_METAL)
-
-// macOS: native window host, no GLFW. Per the project's platform split, window
-// management is per-platform while the mbgl style/render core stays shared.
-// See chart_native_host.{h,mm}.
-#include "chart_native_host.h"
-#include "chart_renderer_frontend.hpp"
-
-#include <mbgl/renderer/renderer.hpp>
-#include <mbgl/renderer/renderer_frontend.hpp>
-#include <mbgl/util/geo.hpp>
-
-#include <memory>
-
-struct chartplotter_view {
-    tile57_source *src = nullptr;
-    std::unique_ptr<ChartNativeHost> host;
-    std::unique_ptr<mbgl::RendererFrontend> frontend;
-    std::unique_ptr<mbgl::Map> map;
-};
-
-extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
-                                                     const chartplotter_view_options *opts) {
-    if (!chart_path || !opts || !opts->style_path) return nullptr;
-
-    g_src = cpn::openPath(chart_path, opts->rules_dir);
-    if (!g_src) {
-        std::fprintf(stderr, "could not open chart: %s\n", chart_path);
-        return nullptr;
-    }
-
-    mbgl::ResourceOptions resourceOptions;
-    resourceOptions.withCachePath(":memory:").withAssetPath(".");
-    mbgl::ClientOptions clientOptions;
-
-    auto *v = new chartplotter_view();
-    v->src = g_src;
-
-    // Native host first: window + MetalBackend (MTKView) + mbgl RunLoop.
-    v->host = std::make_unique<ChartNativeHost>(opts->title ? opts->title : "chartplotter", 1024, 768);
-
-    // MTKView's display link (vsync) is the sole render driver; the frontend just
-    // stores the latest update and renders on the per-vsync callback.
-    {
-        auto fe = std::make_unique<ChartRendererFrontend>(
-            std::make_unique<mbgl::Renderer>(v->host->getRendererBackend(), v->host->getPixelRatio()),
-            v->host->getRendererBackend());
-        v->host->setRenderCallback([p = fe.get()] { p->render(); });
-        v->frontend = std::move(fe);
-    }
-
-    registerChartSource(); // before the Map builds its resource loader
-
-    v->map = std::make_unique<mbgl::Map>(
-        *v->frontend, mbgl::MapObserver::nullObserver(),
-        mbgl::MapOptions().withSize(v->host->getSize()).withPixelRatio(v->host->getPixelRatio()),
-        resourceOptions, clientOptions);
-
-    v->host->setMap(v->map.get());
-
-    // Clamp navigation to the chart scale range ~1:10,000,000 .. 1:4,000.
-    v->map->setBounds(mbgl::BoundOptions().withMinZoom(5.8).withMaxZoom(17.1));
-    if (opts->zoom > 0)
-        v->map->jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{opts->lat, opts->lon}).withZoom(opts->zoom));
-    else
-        frameCamera(*v->map, g_src);
-    v->map->getStyle().loadJSON(readFile(opts->style_path));
-    return v;
-}
-
-extern "C" void chartplotter_view_run(chartplotter_view *view) {
-    if (view && view->host) view->host->run();
-}
-
-extern "C" void chartplotter_view_close(chartplotter_view *view) {
-    if (!view) return;
-    // map (holds ChartTileSource) before frontend before host (owns the backend).
-    view->map.reset();
-    view->frontend.reset();
-    view->host.reset();
-    delete view;
-}
-
-#elif defined(CHARTPLOTTER_WITH_GLFW)
-
-#include "glfw_renderer_frontend.hpp"
-#include "glfw_view.hpp"
-
-#include <mbgl/gfx/backend.hpp>
-#include <mbgl/renderer/renderer.hpp>
-#include <mbgl/util/geo.hpp>
-
-#include <cstdlib>
-#include <memory>
-
-namespace {
-// Continuous-render observer (opt-in via CHART_CONTINUOUS): re-invalidate each
-// frame / on idle so the view keeps presenting on displays where the layer goes
-// blank when drawing stops. On-demand (the bare GLFWView) is the default.
-class ContinuousObserver final : public mbgl::MapObserver {
-public:
-    explicit ContinuousObserver(GLFWView &v) : view(v) {}
-    void onWillStartRenderingFrame() override { view.onWillStartRenderingFrame(); }
-    void onDidFinishLoadingStyle() override { view.onDidFinishLoadingStyle(); }
-    void onDidFinishRenderingFrame(const RenderFrameStatus &) override { view.invalidate(); }
-    void onDidBecomeIdle() override { view.invalidate(); }
-
-private:
-    GLFWView &view;
-};
-} // namespace
-
-struct chartplotter_view {
-    tile57_source *src = nullptr;
-    std::unique_ptr<GLFWView> view;
-    std::unique_ptr<GLFWRendererFrontend> frontend;
-    std::unique_ptr<ContinuousObserver> contObserver;
-    std::unique_ptr<mbgl::Map> map;
-};
-
-extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
-                                                     const chartplotter_view_options *opts) {
-    if (!chart_path || !opts || !opts->style_path) return nullptr;
-
-    g_src = cpn::openPath(chart_path, opts->rules_dir);
-    if (!g_src) {
-        std::fprintf(stderr, "could not open chart: %s\n", chart_path);
-        return nullptr;
-    }
-
-    mbgl::ResourceOptions resourceOptions;
-    resourceOptions.withCachePath(":memory:").withAssetPath(".");
-    mbgl::ClientOptions clientOptions;
-
-    auto *v = new chartplotter_view();
-    v->src = g_src;
-
-    // GLFWView first: it creates the window + backend and owns the RunLoop.
-    v->view = std::make_unique<GLFWView>(/*fullscreen*/ false, /*benchmark*/ false,
-                                         resourceOptions, clientOptions);
-    v->frontend = std::make_unique<GLFWRendererFrontend>(
-        std::make_unique<mbgl::Renderer>(v->view->getRendererBackend(), v->view->getPixelRatio()),
-        *v->view);
-
-    registerChartSource(); // before the Map builds its resource loader
-
-    // Continuous redraw by default: the on-demand path leaves the window blank when
-    // idle on some backends (the old CHART_CONTINUOUS escape hatch is now the
-    // default). The etag/notModified path already prevents re-parse, so continuous
-    // is smooth and flicker-free; set CHART_ONDEMAND=1 for the lower-idle-CPU
-    // on-demand mode where it works.
-    const bool continuous = std::getenv("CHART_ONDEMAND") == nullptr;
-    v->contObserver = std::make_unique<ContinuousObserver>(*v->view);
-    mbgl::MapObserver &observer = continuous ? static_cast<mbgl::MapObserver &>(*v->contObserver)
-                                             : static_cast<mbgl::MapObserver &>(*v->view);
-    v->map = std::make_unique<mbgl::Map>(
-        *v->frontend, observer,
-        mbgl::MapOptions().withSize(v->view->getSize()).withPixelRatio(v->view->getPixelRatio()),
-        resourceOptions, clientOptions);
-
-    v->view->setMap(v->map.get());
-    v->view->setWindowTitle(opts->title ? opts->title : "chartplotter");
-
-    // Clamp navigation to the chart scale range ~1:10,000,000 .. 1:4,000
-    // (Web-Mercator z = log2(559082264 / scaleDenominator)).
-    v->map->setBounds(mbgl::BoundOptions().withMinZoom(5.8).withMaxZoom(17.1));
-
-    // Camera: explicit centre+zoom when given; otherwise fit the data bounds, or
-    // open on a representative cell when the bounds are too large to fit usefully.
-    if (opts->zoom > 0)
-        v->map->jumpTo(mbgl::CameraOptions().withCenter(mbgl::LatLng{opts->lat, opts->lon}).withZoom(opts->zoom));
-    else
-        frameCamera(*v->map, g_src);
-    v->map->getStyle().loadJSON(readFile(opts->style_path));
-    return v;
-}
-
-extern "C" void chartplotter_view_run(chartplotter_view *view) {
-    if (view && view->view) view->view->run();
-}
-
-extern "C" void chartplotter_view_close(chartplotter_view *view) {
-    if (!view) return;
-    // Destruction order: map (holds ChartTileSource) before frontend/view. The
-    // chart source is intentionally not closed (UAF during Map teardown).
-    view->map.reset();
-    view->frontend.reset();
-    view->contObserver.reset();
-    view->view.reset();
-    delete view;
-}
-
-#else // no window backend (neither Metal nor GLFW) — headless: window calls are no-ops.
-
-struct chartplotter_view {
-    int unused;
-};
-extern "C" chartplotter_view *chartplotter_view_open(const char *, const chartplotter_view_options *) {
-    std::fprintf(stderr, "chartplotter built without window support (no GLFW)\n");
-    return nullptr;
-}
-extern "C" void chartplotter_view_run(chartplotter_view *) {}
-extern "C" void chartplotter_view_close(chartplotter_view *) {}
-
-#endif
