@@ -40,16 +40,12 @@ C ABI is not yet frozen.
   per-error log prints the primitive's name (`Point`/`Curve`/`Surface`) instead
   of a useless `table: 0x…` address. (Shared `csrc/lua_shim.c` driver, so the
   live path benefits too.)
-
-### Fixed
-- **Guaranteed attribute bindings no longer clobber the catalogue's multiplicity.**
-  `inTheWater`/`orientationValue`/`topmark` were bound unconditionally (Upper=1)
-  *after* the catalogue bindings, overwriting a feature type's real multiplicity —
-  e.g. RadioCallingInPoint's array-valued `orientationValue` (Upper=2), so the rule
-  crashed indexing `feature.orientationValue[1]`. Now added only when the catalogue
-  doesn't already bind them (matches Go's `withGuaranteed`). Clears the
-  RadioCallingInPoint errors on real NOAA cells; the directional RDOCAL symbols and
-  labels now portray. (`engine/csrc/lua_shim.c`.)
+- **Native S-52 fallback for SweptArea (SWPARE).** The S-101 catalogue ships no
+  SweptArea rule (an IHO gap), so the Lua engine emits nothing for it. The MVT
+  layer now draws the Go reference's `sweptAreaBuild` fallback directly: a dashed
+  `CHGRD` boundary on each ring, the `SWPARE51` swept-depth bracket at the area's
+  representative point, and a `swept to <DRVAL1>` label. (`engine/src/s57_mvt.zig`,
+  shared by the baker and the live path.)
 - **SCAMIN decluttering**: the live path now routes features carrying SCAMIN
   (attr 133) into `*_scamin` MVT buckets, and `build_style.py` gives those layers
   a per-feature `minzoom` derived from the SCAMIN 1:N denominator, so minor
@@ -68,6 +64,16 @@ C ABI is not yet frozen.
   spatial binding above this clears the danger-rule crashes. Blank S-57 attributes
   are now treated as absent (they were served as `""`, building a malformed
   `ScaledDecimal{Value=nil}` that crashed the depth comparison).
+
+### Fixed
+- **Guaranteed attribute bindings no longer clobber the catalogue's multiplicity.**
+  `inTheWater`/`orientationValue`/`topmark` were bound unconditionally (Upper=1)
+  *after* the catalogue bindings, overwriting a feature type's real multiplicity —
+  e.g. RadioCallingInPoint's array-valued `orientationValue` (Upper=2), so the rule
+  crashed indexing `feature.orientationValue[1]`. Now added only when the catalogue
+  doesn't already bind them (matches Go's `withGuaranteed`). Clears the
+  RadioCallingInPoint errors on real NOAA cells; the directional RDOCAL symbols and
+  labels now portray. (`engine/csrc/lua_shim.c`.)
 
 ### Changed — two-library architecture + C APIs (breaking, pre-1.0)
 - The project is now two C libraries with distinct roles:

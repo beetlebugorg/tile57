@@ -290,6 +290,66 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
     }
 }
 
+/// Native S-52 fallback for SweptArea (SWPARE, objl 134). The S-101 Portrayal
+/// Catalogue ships no SweptArea rule (an IHO gap), so the Lua engine emits
+/// nothing for it. Mirror the Go reference's sweptAreaBuild: a dashed CHGRD
+/// boundary on every ring, the SWPARE51 swept-depth bracket at the area's
+/// representative point, and a "swept to <DRVAL1>" label there. DrawingPriority 6.
+fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+    const geo_parts = cell.lineGeometryParts(a, f) catch return;
+    if (geo_parts.len == 0) return;
+
+    const scamin = featureScamin(f);
+    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
+    const points_l = if (scamin != null) L.points_scamin else L.points;
+    const texts_l = if (scamin != null) L.texts_scamin else L.texts;
+    const prio: i64 = 6;
+
+    // Dashed CHGRD boundary on each ring (clipped to the tile).
+    for (geo_parts) |gp| {
+        if (gp.len < 2) continue;
+        if (!overlaps(geomBounds(gp), tb)) continue;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+        const sub = try tile.clipLine(a, proj, box);
+        if (sub.len == 0) continue;
+        const parts = try a.alloc([]const mvt.Point, sub.len);
+        for (sub, 0..) |s, i| parts[i] = s;
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHGRD" } });
+        try props.append(a, .{ .key = "width_px", .value = .{ .double = 1 } });
+        try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
+        try appendMeta(a, &props, prio, scamin);
+        try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
+    }
+
+    // SWPARE51 bracket + "swept to <DRVAL1>" label at the representative point.
+    const rp = s57.areaRepresentativePoint(geo_parts) orelse return;
+    if (rp.lon < tb[0] or rp.lon > tb[2] or rp.lat < tb[1] or rp.lat > tb[3]) return;
+    const cpt = tile.project(rp.lon, rp.lat, z, x, y, tile.EXTENT);
+    const parts = try a.alloc([]const mvt.Point, 1);
+    const single = try a.alloc(mvt.Point, 1);
+    single[0] = cpt;
+    parts[0] = single;
+
+    var sprops = std.ArrayList(mvt.Prop).empty;
+    try sprops.append(a, .{ .key = "symbol_name", .value = .{ .string = "SWPARE51" } });
+    try sprops.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
+    try sprops.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+    try appendMeta(a, &sprops, prio, scamin);
+    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = sprops.items });
+
+    if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| {
+        const label = try std.fmt.allocPrint(a, "swept to {d}", .{d1});
+        var tprops = std.ArrayList(mvt.Prop).empty;
+        try tprops.append(a, .{ .key = "text", .value = .{ .string = label } });
+        try tprops.append(a, .{ .key = "color_token", .value = .{ .string = "CHBLK" } });
+        try tprops.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
+        try appendMeta(a, &tprops, prio, scamin);
+        try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = tprops.items });
+    }
+}
+
 /// One cell plus its optional per-feature S-101 instruction streams.
 pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null };
 
@@ -383,6 +443,12 @@ fn appendCellFeatures(
                 try emitFromInstr(a, cell.*, f, instr, z, x, y, tb, box, L);
                 continue;
             };
+        }
+        // SweptArea (SWPARE) has no S-101 rule (IHO gap) so portrayal is empty;
+        // draw the native S-52 fallback instead of nothing. See emitSweptAreaFallback.
+        if (f.objl == 134) {
+            try emitSweptAreaFallback(a, cell.*, f, z, x, y, tb, box, L);
+            continue;
         }
         const cls = classify(f.objl);
         if (cls.kind == .skip) continue;

@@ -42,11 +42,11 @@ orientation + clearance complex attributes are synthesized. Remaining gaps:
   applied yet.
 - **Light sectors** — sectored/directional light legs and arcs are not yet emitted
   by the live path (they exist in the Go baker).
-- **Native S-52 fallbacks for unportrayed classes.** A handful of S-57 classes have
-  no usable S-101 rule output and the Go reference draws a native S-52 placeholder
-  for them: SweptArea/SWPARE (an IHO catalogue gap — no rule file), and the
-  new-object box for NEWOBJ-derived classes (e.g. VirtualAISAidToNavigation). The
-  native engine currently omits these features instead of drawing the fallback.
+- **Native S-52 fallbacks for unportrayed classes.** Some S-57 classes have no
+  usable S-101 rule output and the Go reference draws a native S-52 placeholder.
+  SweptArea/SWPARE (an IHO catalogue gap — no rule file) is now handled (dashed
+  CHGRD boundary + SWPARE51 bracket + "swept to" label); the new-object box for
+  NEWOBJ-derived classes (e.g. VirtualAISAidToNavigation) is still omitted.
 - **Single-primitive rules vs. non-conformant geometry.** Some S-101 rules handle
   only one primitive (e.g. RecommendedTrack is Curve-only); a cell that encodes the
   feature with another primitive (an area-encoded recommended track) errors in the
