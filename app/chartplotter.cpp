@@ -196,6 +196,10 @@ extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
     v->view->setMap(v->map.get());
     v->view->setWindowTitle(opts->title ? opts->title : "chartplotter");
 
+    // Clamp navigation to the chart scale range ~1:10,000,000 .. 1:4,000
+    // (Web-Mercator z = log2(559082264 / scaleDenominator)).
+    v->map->setBounds(mbgl::BoundOptions().withMinZoom(5.8).withMaxZoom(17.1));
+
     // Camera: explicit centre+zoom when given; otherwise fit the data bounds, or
     // open on a representative cell when the bounds are too large to fit usefully.
     if (opts->zoom > 0)

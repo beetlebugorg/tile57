@@ -17,6 +17,14 @@ C ABI is not yet frozen.
   renders a view by touching ~a dozen cells (≈5 GB transient at open, far less
   steady-state). Coverage gaps at a zoom are filled by overzooming the coarsest
   band present, so tiles aren't blank.
+- **No band-boundary tile gaps + scale-clamped navigation.** A tile now overlays
+  *all* overlapping cells whose band range includes the zoom (coarse→fine, finer on
+  top), so a finer cell that covers only part of a tile no longer blanks the coarser
+  fill (the earlier best-band single-pick left holes); a zoom in a coverage gap
+  overzooms the coarsest band. The window clamps navigation to the chart scale range
+  ~1:10,000,000 .. 1:4,000 (z≈5.8..17.1) and the vector source minzoom drops to 5
+  (`gen-style.sh`) so overview scales actually draw. LRU budget raised to 256 cells
+  for wide views.
 - **Initial-view framing.** When no explicit camera is given, the host fits the
   data bounds if that lands at a usable zoom (a single cell / a region); for a
   continental ENC_ROOT — whose bounds would fit at ~z2, below the style's source

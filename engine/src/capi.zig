@@ -56,7 +56,7 @@ const LazySource = struct {
     rules_dir: []u8, // owned (lazy portrayal needs it after open returns)
     tick: u64 = 0,
     loaded: usize = 0,
-    max_loaded: usize = 96, // LRU budget on parsed+portrayed cells
+    max_loaded: usize = 256, // LRU budget on parsed+portrayed cells (wide views)
 };
 
 const Backend = union(enum) {
@@ -670,30 +670,42 @@ export fn tile57_tile_get(
         .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -1,
         .cells => |*ls| blk: {
             const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
-            // Pick one band among the cells overlapping this tile: the finest band
-            // whose native range includes z (best-band, no coarser scale drawing
-            // under a finer one); if z falls in a coverage gap (e.g. only general
-            // charts exist where you've zoomed out to z6), overzoom the coarsest
-            // available band so the tile isn't blank.
-            var finest_incl: ?bake_enc.Band = null;
-            var coarsest_any: ?bake_enc.Band = null;
+            // Collect every overlapping cell whose native band range includes z, so
+            // a finer cell that covers only part of the tile doesn't blank out the
+            // coarser cell that fills the rest (a best-band single-pick left gaps).
+            // If no band's range includes z (a coverage gap — e.g. zoomed out below
+            // the finest band present), overzoom the coarsest overlapping band.
+            var any_incl = false;
+            var coarsest: ?bake_enc.Band = null;
             for (ls.cells) |lc| {
                 if (!bboxOverlap(lc.bbox, tb)) continue;
                 const zr = bake_enc.bandZooms(lc.band);
-                if (z >= zr.min and z <= zr.max) {
-                    if (finest_incl == null or @intFromEnum(lc.band) < @intFromEnum(finest_incl.?)) finest_incl = lc.band;
-                }
-                if (coarsest_any == null or @intFromEnum(lc.band) > @intFromEnum(coarsest_any.?)) coarsest_any = lc.band;
+                if (z >= zr.min and z <= zr.max) any_incl = true;
+                if (coarsest == null or @intFromEnum(lc.band) > @intFromEnum(coarsest.?)) coarsest = lc.band;
             }
-            const band = finest_incl orelse coarsest_any orelse break :blk (gpa.alloc(u8, 0) catch return -1);
+            const cband = coarsest orelse break :blk (gpa.alloc(u8, 0) catch return -1);
+
+            var idxs = std.ArrayList(u32).empty;
+            defer idxs.deinit(gpa);
+            for (ls.cells, 0..) |lc, i| {
+                if (!bboxOverlap(lc.bbox, tb)) continue;
+                const zr = bake_enc.bandZooms(lc.band);
+                const use = if (any_incl) (z >= zr.min and z <= zr.max) else (lc.band == cband);
+                if (use) idxs.append(gpa, @intCast(i)) catch {};
+            }
+            // Draw coarse -> fine so finer charts overlay coarser at band overlaps.
+            std.mem.sort(u32, idxs.items, ls, struct {
+                fn lt(l: *LazySource, a: u32, b: u32) bool {
+                    return @intFromEnum(l.cells[a].band) > @intFromEnum(l.cells[b].band);
+                }
+            }.lt);
 
             const keep_from = ls.tick + 1; // cells loaded for this tile aren't evicted below
             var refs = std.ArrayList(s57_mvt.CellRef).empty;
             defer refs.deinit(gpa);
-            for (ls.cells) |*lc| {
-                if (lc.band != band or !bboxOverlap(lc.bbox, tb)) continue;
-                lazyEnsureLoaded(ls, lc);
-                if (lc.cell) |*c| refs.append(gpa, .{ .cell = c, .portrayal = lc.portrayal }) catch {};
+            for (idxs.items) |i| {
+                lazyEnsureLoaded(ls, &ls.cells[i]);
+                if (ls.cells[i].cell) |*c| refs.append(gpa, .{ .cell = c, .portrayal = ls.cells[i].portrayal }) catch {};
             }
             const mvt = s57_mvt.generateTileMulti(gpa, refs.items, z, x, y) catch return -1;
             lazyEvict(ls, keep_from);

@@ -30,5 +30,5 @@ done
 # internal routing key matched by ChartTileSource::canRequest.
 "$PY" "$ROOT/style/build_style.py" \
   --pmtiles "$PMTILES" --colortables "$COLORS" --glyphs "$GLYPHS" --sprite "$SPRITE" \
-  --scheme day --source-tiles "zigtiles://{z}/{x}/{y}" --minzoom 9 --maxzoom 16 \
+  --scheme day --source-tiles "zigtiles://{z}/{x}/{y}" --minzoom 5 --maxzoom 16 \
   -o "$ROOT/style/chart-zig-day.json"
