@@ -60,6 +60,10 @@ pub fn main(init: std.process.Init) !void {
         return runBundle(io, arena, args);
     }
 
+    if (std.mem.eql(u8, sub, "style")) {
+        return runStyle(io, arena, args);
+    }
+
     if (std.mem.eql(u8, sub, "inspect")) {
         if (args.len < 3) {
             std.debug.print("usage: chartplotter-bake inspect <file.pmtiles> [z x y]\n", .{});
@@ -378,10 +382,14 @@ fn resolveCatalogDir(explicit: ?[]const u8) []const u8 {
 
 // Emit colortables.json from a catalog dir into out_dir. Returns the bytes (arena
 // owned) so `bundle` can reuse them without re-reading. Shared by assets/bundle.
-fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
+fn colorTablesBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]u8 {
     const xml_path = try std.fs.path.join(a, &.{ catalog_dir, COLOR_PROFILE_REL });
     const xml = try std.Io.Dir.cwd().readFileAlloc(io, xml_path, a, .unlimited);
-    const json = try assets.colorTablesJson(a, xml);
+    return assets.colorTablesJson(a, xml);
+}
+
+fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
+    const json = try colorTablesBytes(io, a, catalog_dir);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json });
     return json;
 }
@@ -481,13 +489,32 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tiles_path, .data = res.archive });
 
-    // 2. assets -> <out>/assets/colortables.json
+    // 2. assets -> <out>/assets/colortables.json + style-{day,dusk,night}.json
     const assets_dir = try std.fs.path.join(a, &.{ out_dir, "assets" });
     try std.Io.Dir.cwd().createDirPath(io, assets_dir);
     const ct_path = try std.fs.path.join(a, &.{ assets_dir, "colortables.json" });
-    _ = emitColorTables(io, a, resolveCatalogDir(catalog), ct_path) catch |err| {
-        std.debug.print("warning: colortables emit failed ({s}); bundle has tiles + manifest only\n", .{@errorName(err)});
-    };
+    var styles: ?assets.Manifest.Styles = null;
+    if (emitColorTables(io, a, resolveCatalogDir(catalog), ct_path)) |ct| {
+        // One style.json per palette, resolving colour tokens from the colortables.
+        // sprite/glyphs are omitted until those assets exist; areas + lines render.
+        var ok = true;
+        for ([_][]const u8{ "day", "dusk", "night" }) |sc| {
+            const sj = assets.styleJson(a, .{ .scheme = sc, .colortables_json = ct }) catch {
+                ok = false;
+                break;
+            };
+            const name = try std.fmt.allocPrint(a, "style-{s}.json", .{sc});
+            const sp = try std.fs.path.join(a, &.{ assets_dir, name });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = sj });
+        }
+        if (ok) styles = .{
+            .day = "assets/style-day.json",
+            .dusk = "assets/style-dusk.json",
+            .night = "assets/style-night.json",
+        };
+    } else |err| {
+        std.debug.print("warning: assets emit failed ({s}); bundle has tiles + manifest only\n", .{@errorName(err)});
+    }
 
     // 3. manifest.json — pins schema_version, couples tiles <-> portrayal.
     const b = res.bounds;
@@ -502,14 +529,72 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
         .bbox = b,
         .anchor = .{ (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0 },
         .cells = &.{cell_name},
+        .styles = styles,
     });
     const manifest_path = try std.fs.path.join(a, &.{ out_dir, "manifest.json" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
 
     std.debug.print(
-        "bundled {s} -> {s}/\n  tiles/chart.pmtiles ({d} tiles, {d:.1} MB)\n  assets/colortables.json + manifest.json (schema {s})\n",
+        "bundled {s} -> {s}/\n  tiles/chart.pmtiles ({d} tiles, {d:.1} MB)\n  assets/colortables.json + style-{{day,dusk,night}}.json + manifest.json (schema {s})\n",
         .{ cell_name, out_dir, res.tiles, @as(f64, @floatFromInt(res.archive.len)) / (1024.0 * 1024.0), assets.SCHEMA_VERSION },
     );
+}
+
+/// `style <portrayal-catalog-dir> --scheme S -o <out.json> [--source-tiles T]
+///  [--sprite BASE] [--glyphs TMPL] [--pmtiles-url URL] [--minzoom N] [--maxzoom N]`
+/// — emit one MapLibre style.json (palette resolved from the catalogue's colours).
+fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var catalog: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var scheme: []const u8 = "day";
+    var opts = assets.StyleOpts{ .scheme = "day", .colortables_json = "" };
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for -o/--output");
+            out = args[i];
+        } else if (std.mem.eql(u8, arg, "--scheme")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --scheme");
+            scheme = args[i];
+        } else if (std.mem.eql(u8, arg, "--source-tiles")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --source-tiles");
+            opts.source_tiles = args[i];
+        } else if (std.mem.eql(u8, arg, "--sprite")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --sprite");
+            opts.sprite = args[i];
+        } else if (std.mem.eql(u8, arg, "--glyphs")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --glyphs");
+            opts.glyphs = args[i];
+        } else if (std.mem.eql(u8, arg, "--pmtiles-url")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --pmtiles-url");
+            opts.pmtiles_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--minzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --minzoom");
+            opts.minzoom = std.fmt.parseInt(u32, args[i], 10) catch return usageErr("--minzoom must be an integer");
+        } else if (std.mem.eql(u8, arg, "--maxzoom")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --maxzoom");
+            opts.maxzoom = std.fmt.parseInt(u32, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usageErr("unknown flag");
+        } else if (catalog == null) {
+            catalog = arg;
+        }
+    }
+    const out_path = out orelse return usageErr("missing -o/--output <out.json>");
+    opts.scheme = scheme;
+    opts.colortables_json = try colorTablesBytes(io, a, resolveCatalogDir(catalog));
+    const style = try assets.styleJson(a, opts);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = style });
+    std.debug.print("wrote {s} ({s}, {d} bytes)\n", .{ out_path, scheme, style.len });
 }
 
 // ---- bake-root (whole ENC_ROOT -> one banded PMTiles) ------------------
@@ -769,6 +854,10 @@ fn printUsage() void {
         \\  chartplotter-bake assets <portrayal-catalog-dir> -o <out-dir>
         \\      Emit just the portrayal assets (colortables.json today) for a
         \\      catalogue, independent of any cell.
+        \\  chartplotter-bake style <portrayal-catalog-dir> --scheme day -o <out.json>
+        \\      Emit one MapLibre style.json (colours resolved from the catalogue).
+        \\      --scheme day|dusk|night; --source-tiles/--pmtiles-url pick the source;
+        \\      --sprite/--glyphs enable symbol/text layers; --minzoom/--maxzoom.
         \\  chartplotter-bake inspect <file.pmtiles> [z x y]
         \\  chartplotter-bake cell <file.000>
         \\  chartplotter-bake version

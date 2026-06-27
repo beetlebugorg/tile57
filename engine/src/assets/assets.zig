@@ -20,6 +20,10 @@ const std = @import("std");
 /// Bump on ANY change to layer names or feature property keys.
 pub const SCHEMA_VERSION = "tile57/1";
 
+// MapLibre style.json generation (port of style/build_style.py) lives in style.zig.
+pub const StyleOpts = @import("style.zig").StyleOpts;
+pub const styleJson = @import("style.zig").styleJson;
+
 // ---- colortables.json ----------------------------------------------------
 
 const Palette = struct { xml_name: []const u8, key: []const u8 };
@@ -131,6 +135,9 @@ pub const Manifest = struct {
     bbox: [4]f64,
     anchor: [2]f64,
     cells: []const []const u8,
+    styles: ?Styles = null, // per-palette style.json paths, if emitted
+
+    pub const Styles = struct { day: []const u8, dusk: []const u8, night: []const u8 };
 };
 
 /// Emit the bundle manifest.json. Loaded first by a renderer, which refuses a
@@ -145,6 +152,14 @@ pub fn manifestJson(alloc: std.mem.Allocator, m: Manifest) ![]u8 {
         try cells.appendSlice(alloc, c);
         try cells.appendSlice(alloc, if (i + 1 < m.cells.len) "\", " else "\"");
     }
+    // Optional per-palette styles block, appended after "colortables".
+    const styles_field: []const u8 = if (m.styles) |st|
+        try std.fmt.allocPrint(alloc,
+            \\,
+            \\    "styles": {{ "day": "{s}", "dusk": "{s}", "night": "{s}" }}
+        , .{ st.day, st.dusk, st.night })
+    else
+        "";
     return std.fmt.allocPrint(alloc,
         \\{{
         \\  "bundle_version": 1,
@@ -161,14 +176,14 @@ pub fn manifestJson(alloc: std.mem.Allocator, m: Manifest) ![]u8 {
         \\    "cells": [{s}]
         \\  }},
         \\  "portrayal": {{
-        \\    "colortables": "{s}"
+        \\    "colortables": "{s}"{s}
         \\  }}
         \\}}
     , .{
-        SCHEMA_VERSION,    m.generator, m.created,       m.catalogue_version,
-        m.tiles_rel,       m.minzoom,   m.maxzoom,       m.bbox[0],
-        m.bbox[1],         m.bbox[2],   m.bbox[3],       m.anchor[0],
-        m.anchor[1],       cells.items, m.colortables_rel,
+        SCHEMA_VERSION,    m.generator, m.created,         m.catalogue_version,
+        m.tiles_rel,       m.minzoom,   m.maxzoom,         m.bbox[0],
+        m.bbox[1],         m.bbox[2],   m.bbox[3],         m.anchor[0],
+        m.anchor[1],       cells.items, m.colortables_rel, styles_field,
     });
 }
 
