@@ -17,6 +17,20 @@ find_package(QMapLibre REQUIRED COMPONENTS Widgets)
 qt_add_executable(chartplotter-qt main.cpp)
 target_link_libraries(chartplotter-qt PRIVATE QMapLibre::Widgets)
 
+# Live ENC support: when the outer build passes TILE57_LIB (the Zig tile
+# generator), compile the localhost tile server and link libtile57 so the viewer
+# can open an ENC_ROOT / S-57 cell / PMTiles directly. The HTTP endpoint uses
+# Qt6::Network. Without TILE57_LIB the viewer still builds (style files only).
+if(TILE57_LIB)
+  find_package(Qt6 REQUIRED COMPONENTS Network)
+  target_sources(chartplotter-qt PRIVATE tile_server.cpp)
+  target_include_directories(chartplotter-qt PRIVATE
+    ${CHARTPLOTTER_INCLUDE_DIR}  # include/  -> tile57.h
+    ${CHARTPLOTTER_APP_DIR})     # app/      -> enc_root.hpp
+  target_link_libraries(chartplotter-qt PRIVATE ${TILE57_LIB} Qt6::Network)
+  target_compile_definitions(chartplotter-qt PRIVATE CHARTPLOTTER_WITH_TILE57)
+endif()
+
 # QMapLibre links as @rpath/QMapLibre*.framework but carries no absolute path, so
 # the binary needs an rpath to find it at runtime. The frameworks install to
 # <prefix>/lib, and QMapLibre_DIR is <prefix>/lib/cmake/QMapLibre — derive the lib

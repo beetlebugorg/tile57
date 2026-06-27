@@ -168,17 +168,31 @@ if(CHARTPLOTTER_WITH_QT)
       -DMLN_WITH_WERROR=OFF
     BUILD_ALWAYS OFF)
 
+  # Pass the Zig tile generator into the viewer so it can open an ENC_ROOT / S-57
+  # cell / PMTiles live (the localhost tile-server path in app/qt). Only when zig
+  # was found and libtile57 is being built; otherwise the viewer is style-only.
+  set(QT_TILE57_ARGS "")
+  set(QT_TILE57_DEPS "")
+  if(TARGET tile57_lib)
+    set(QT_TILE57_ARGS
+      -DTILE57_LIB=${TILE57_LIB}
+      -DCHARTPLOTTER_INCLUDE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/include
+      -DCHARTPLOTTER_APP_DIR=${CMAKE_CURRENT_SOURCE_DIR}/app)
+    set(QT_TILE57_DEPS tile57_lib)
+  endif()
+
   # 2. The viewer (app/qt), find_package'd against the installed QMapLibre.
   #    Installs to ${CMAKE_BINARY_DIR}/bin/chartplotter-qt. Target name matches the
   #    binary (`ninja chartplotter-qt`).
   ExternalProject_Add(chartplotter-qt
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/app/qt
-    DEPENDS qmaplibre
+    DEPENDS qmaplibre ${QT_TILE57_DEPS}
     CMAKE_GENERATOR Ninja
     CMAKE_ARGS
       -DCMAKE_TOOLCHAIN_FILE=${QT_TOOLCHAIN}
       -DCMAKE_PREFIX_PATH=${QMLB_PREFIX}
       -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}
+      ${QT_TILE57_ARGS}
     BUILD_ALWAYS ON)
 
   message(STATUS "chartplotter-qt: enabled -> ${CMAKE_BINARY_DIR}/bin/chartplotter-qt")

@@ -14,9 +14,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -50,8 +52,17 @@ inline std::string resolveRulesDir(const char *argv0) {
 }
 
 inline std::string readFileBytes(const std::filesystem::path &p) {
-    std::ifstream f(p, std::ios::binary);
-    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    // Bulk read (size then one read()) — NOT std::istreambuf_iterator, which copies
+    // byte-by-byte through the stream buffer and is ~10-50x slower over an ENC_ROOT.
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    const std::streamsize n = f.tellg();
+    if (n <= 0) return {};
+    std::string buf(static_cast<std::size_t>(n), '\0');
+    f.seekg(0);
+    f.read(buf.data(), n);
+    buf.resize(static_cast<std::size_t>(f.gcount()));
+    return buf;
 }
 
 // --- bake-on-open cache --------------------------------------------------------
@@ -88,27 +99,52 @@ inline void bakeProgress(void *, uint8_t stage, size_t done, size_t total) {
     std::fflush(stderr);
 }
 
-inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
+// Bake progress that also forwards to an OpenProgress sink (user = OpenProgress*),
+// so a GUI host gets the same loading/tiling counts the console does.
+inline void bakeProgressFwd(void *user, uint8_t stage, size_t done, size_t total) {
+    bakeProgress(nullptr, stage, done, total);
+    if (user)
+        (*static_cast<const std::function<void(const char *, std::size_t, std::size_t)> *>(user))(
+            stage == 0 ? "loading cells" : "baking tiles", done, total);
+}
+
+// Optional progress sink for openPath, so a host (e.g. the Qt viewer's splash) can
+// show what a large ENC_ROOT open is doing. `stage` is a short label ("scanning",
+// "reading cells", "baking tiles"); done/total count items (total 0 = unknown).
+using OpenProgress = std::function<void(const char *stage, std::size_t done, std::size_t total)>;
+
+inline tile57_source *openPath(const std::string &path, const char *rules_dir,
+                               const OpenProgress &progress = {}) {
     namespace fs = std::filesystem;
     std::error_code ec;
 
     // A plain file: PMTiles archive or a single S-57 cell (auto-detected).
     if (!fs::is_directory(path, ec)) {
+        if (progress) progress("reading chart", 0, 1);
         const std::string bytes = readFileBytes(path);
         if (bytes.empty()) return nullptr;
+        if (progress) progress("reading chart", 1, 1);
         return tile57_source_open(reinterpret_cast<const uint8_t *>(bytes.data()),
                                         bytes.size(), TILE57_FORMAT_AUTO, rules_dir);
     }
 
+    using clock = std::chrono::steady_clock;
+    auto secsSince = [](clock::time_point t0) {
+        return std::chrono::duration<double>(clock::now() - t0).count();
+    };
+
     // An ENC_ROOT: collect every base cell (*.000), in sorted order.
+    const auto tScan = clock::now();
     std::vector<fs::path> bases;
     for (auto it = fs::recursive_directory_iterator(path, ec);
          !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (it->is_regular_file(ec) && it->path().extension() == ".000")
             bases.push_back(it->path());
+        if (progress && (bases.size() & 0x3F) == 0) progress("scanning", bases.size(), 0);
     }
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) return nullptr;
+    std::fprintf(stderr, "[chart] scanned %zu cells in %.1fs\n", bases.size(), secsSince(tScan));
 
     // Read each base + its sequential updates. Bytes live in `blobs` (a deque, so
     // element addresses are stable as we keep pushing); the per-cell update
@@ -123,7 +159,10 @@ inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
     std::uint64_t sig = 1469598103934665603ull; // FNV-1a offset
     auto mix = [&sig](std::uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
 
+    const auto tRead = clock::now();
+    std::size_t readIdx = 0;
     for (const auto &base : bases) {
+        if (progress) progress("reading cells", ++readIdx, bases.size());
         blobs.push_back(readFileBytes(base));
         if (blobs.back().empty()) {
             blobs.pop_back();
@@ -161,13 +200,19 @@ inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
         inputs.push_back(ci);
     }
     if (inputs.empty()) return nullptr;
+    std::fprintf(stderr, "[chart] read %zu cells in %.1fs\n", inputs.size(), secsSince(tRead));
 
     // Default: lazy on-demand generation. tile57_source_open_cells builds a cheap
     // spatial index (band + bbox per cell) and parses + portrays only the cells a
     // requested tile needs, with an LRU — so the whole catalogue opens instantly
     // and holds almost no memory.
-    if (const char *bake = std::getenv("CHARTPLOTTER_BAKE"); !(bake && *bake))
-        return tile57_source_open_cells(inputs.data(), inputs.size(), rules_dir);
+    if (const char *bake = std::getenv("CHARTPLOTTER_BAKE"); !(bake && *bake)) {
+        if (progress) progress("indexing cells", 0, 0);
+        const auto tIndex = clock::now();
+        tile57_source *s = tile57_source_open_cells(inputs.data(), inputs.size(), rules_dir);
+        std::fprintf(stderr, "[chart] indexed %zu cells in %.1fs\n", inputs.size(), secsSince(tIndex));
+        return s;
+    }
 
     // Opt-in (CHARTPLOTTER_BAKE=1): bake the whole ENC_ROOT to one PMTiles archive
     // once, cached by content + max-zoom (smooth panning everywhere after a
@@ -191,7 +236,7 @@ inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
     std::size_t out_len = 0;
     const int rc = tile57_bake_cells(inputs.data(), inputs.size(), rules_dir,
                                      static_cast<uint8_t>(bakeMinZoom()), static_cast<uint8_t>(bakeMaxZoom()),
-                                     bakeProgress, nullptr, &out, &out_len);
+                                     bakeProgressFwd, const_cast<OpenProgress *>(&progress), &out, &out_len);
     std::fprintf(stderr, "\n");
     if (rc == 1 && out && out_len) {
         std::error_code wec;
