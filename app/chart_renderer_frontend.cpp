@@ -4,6 +4,8 @@
 #include <mbgl/gfx/backend_scope.hpp>
 #include <mbgl/gfx/renderer_backend.hpp>
 
+#include <cstdio>
+
 ChartRendererFrontend::ChartRendererFrontend(std::unique_ptr<mbgl::Renderer> renderer_,
                                              mbgl::gfx::RendererBackend &backend_)
     : renderer(std::move(renderer_)), backend(backend_) {}
@@ -19,6 +21,8 @@ void ChartRendererFrontend::setObserver(mbgl::RendererObserver &observer) {
 }
 
 void ChartRendererFrontend::update(std::shared_ptr<mbgl::UpdateParameters> params) {
+    static bool logged = false;
+    if (!logged) { std::fprintf(stderr, "[native] frontend.update() first call\n"); logged = true; }
     // Just stash it. No GLFW invalidate: MTKView's display link renders every
     // vsync and picks up the latest parameters in render() below.
     updateParameters = std::move(params);
@@ -29,7 +33,13 @@ const mbgl::TaggedScheduler &ChartRendererFrontend::getThreadPool() const {
 }
 
 void ChartRendererFrontend::render() {
-    if (!renderer || !updateParameters) return;
+    if (!renderer || !updateParameters) {
+        static bool logged = false;
+        if (!logged) { std::fprintf(stderr, "[native] render(): no updateParameters yet\n"); logged = true; }
+        return;
+    }
+    static bool logged = false;
+    if (!logged) { std::fprintf(stderr, "[native] render(): drawing first frame\n"); logged = true; }
 
     mbgl::gfx::BackendScope guard{backend, mbgl::gfx::BackendScope::ScopeType::Implicit};
 

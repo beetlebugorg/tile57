@@ -10,6 +10,8 @@
 
 #include <mbgl/mtl/renderable_resource.hpp>
 
+#include <cstdio>
+
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -88,9 +90,19 @@ public:
             static_cast<uint32_t>(mtlView.drawableSize.height)};
   }
 
-  // Called from the delegate's drawInMTKView: (vsync). Renders one frame.
+  // Called from the delegate's drawInMTKView: (vsync). Renders one frame, but
+  // only when a drawable is available (a nil descriptor -> renderer derefs nil).
   void onDraw() {
-    if (renderCallback) renderCallback();
+    static bool logged = false;
+    if (!logged) {
+      std::fprintf(stderr, "[native] drawInMTKView: cb=%d rpd=%d drawableSize=%.0fx%.0f\n",
+                   renderCallback ? 1 : 0, mtlView.currentRenderPassDescriptor != nil ? 1 : 0,
+                   (double)mtlView.drawableSize.width, (double)mtlView.drawableSize.height);
+      logged = true;
+    }
+    if (!renderCallback) return;
+    if (mtlView.currentRenderPassDescriptor == nil) return;
+    renderCallback();
   }
   void setRenderCallback(std::function<void()> cb) { renderCallback = std::move(cb); }
 
