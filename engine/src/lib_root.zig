@@ -8,7 +8,7 @@
 
 pub const engine = @import("root.zig");
 pub const capi = @import("capi.zig");
-pub const portray = @import("portray.zig");
+pub const portray = @import("portray");
 pub const catalogue = @import("s100").catalogue;
 
 comptime {

@@ -19,11 +19,11 @@ fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
 }
 
 // Attach the embedded Lua 5.4 interpreter + the portrayal C shim to a module.
-// Used for both libtile57.a (lib_root) and the bake CLI (bake_root); keeping it
-// in one place stops the library and the baker drifting apart.
+// Attached to the `portray` module — which both libtile57.a and the baker import
+// — so the Lua runtime is defined once and can't drift between them.
 fn addLua(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(b.path("vendor/lua/src"));
-    mod.addCSourceFile(.{ .file = b.path("csrc/lua_shim.c"), .flags = &.{"-DLUA_USE_POSIX"} });
+    mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = &.{"-DLUA_USE_POSIX"} });
     mod.addCSourceFiles(.{
         .root = b.path("vendor/lua/src"),
         .files = &lua_sources,
@@ -93,6 +93,23 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/mvt/mvt.zig"),
     });
 
+    // S-101 portrayal runner: drives the embedded Lua rule engine over a cell's
+    // adapted features (mirrors Go's internal/engine/portrayal). Owns the Lua
+    // attachment (the C shim + vendored Lua) so libc/Lua is encapsulated here,
+    // not spread across the lib + baker modules. pic so the same code links into
+    // both the PIE C++ host (libtile57.a) and the static baker. The pure engine
+    // module does NOT import it, so `zig build test` stays libc-free.
+    const portray_mod = b.addModule("portray", .{
+        .root_source_file = b.path("src/portray/portray.zig"),
+        .link_libc = true,
+        .pic = true,
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s100", .module = s100_mod },
+        },
+    });
+    addLua(b, portray_mod);
+
     // Asset/style generation for the chart bundle (colortables, manifest, …).
     // Pure + target-agnostic like the foundational packages, so it compiles
     // under both the glibc tests and the static-musl baker. See src/assets/.
@@ -121,7 +138,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true, // Lua needs the C runtime
     });
     addPkgs(lib_mod, iso8211_mod, s57_mod, s100_mod, mvt_mod);
-    addLua(b, lib_mod);
+    lib_mod.addImport("portray", portray_mod);
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
 
@@ -150,7 +167,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true, // Lua needs the C runtime
     });
     addPkgs(bake_engine, iso8211_mod, s57_mod, s100_mod, mvt_mod);
-    addLua(b, bake_engine);
+    bake_engine.addImport("portray", portray_mod);
 
     const bake = b.addExecutable(.{
         .name = "chartplotter-bake",

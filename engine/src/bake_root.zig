@@ -5,13 +5,13 @@
 //! than the classify() fallback. Kept separate from root.zig so the unit-test
 //! build (rooted at root.zig) stays pure Zig with no libc / Lua.
 //!
-//! root.zig and portray.zig are imported relatively here, so both — and the
-//! s57.zig each pulls in — belong to this one module instance and share a single
-//! `s57.Cell` type. That lets bake.zig hand the same parsed cell to both
+//! root.zig and the `portray` module both import the singleton `s57` module, so
+//! they share one `s57.Cell` type — bake.zig can hand the same parsed cell to
 //! s57.parseCellWithUpdates / s57_mvt.generateTile and portray.portrayCell.
 //!
-//! The C/Lua sources (csrc/lua_shim.c + vendored Lua) and link_libc are attached
-//! to this module in build.zig, exactly as for libtile57.a (lib_root.zig).
+//! The embedded Lua (the C shim + vendored Lua sources) and link_libc live on the
+//! `portray` module (src/portray/), which this module imports; the lib does the
+//! same, so the Lua attachment isn't duplicated across the two.
 
 const root = @import("root.zig");
 
@@ -27,4 +27,4 @@ pub const s101_adapt = root.s101_adapt;
 pub const catalogue = root.catalogue;
 pub const bake_enc = root.bake_enc;
 
-pub const portray = @import("portray.zig");
+pub const portray = @import("portray");
