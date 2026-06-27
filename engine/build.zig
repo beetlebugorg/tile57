@@ -108,6 +108,27 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ .{ .name = "gzip", .module = gzip_mod }, .{ .name = "mvt", .module = mvt_mod } },
     });
 
+    // S-57 -> MVT tile generation (s57_mvt) + the banded ENC_ROOT baker (bake_enc,
+    // mirrors the Go oracle's internal/engine/baker). Pure; s57_mvt <- bake_enc.
+    const s57_mvt_mod = b.addModule("s57_mvt", .{
+        .root_source_file = b.path("src/s57_mvt/s57_mvt.zig"),
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "mvt", .module = mvt_mod },
+            .{ .name = "tile", .module = tile_mod },
+        },
+    });
+    const bake_enc_mod = b.addModule("bake_enc", .{
+        .root_source_file = b.path("src/bake_enc/bake_enc.zig"),
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s57_mvt", .module = s57_mvt_mod },
+            .{ .name = "pmtiles", .module = pmtiles_mod },
+            .{ .name = "tile", .module = tile_mod },
+        },
+    });
+
     // S-101 portrayal runner: drives the embedded Lua rule engine over a cell's
     // adapted features (mirrors Go's internal/engine/portrayal). Owns the Lua
     // attachment (the C shim + vendored Lua) so libc/Lua is encapsulated here,
@@ -142,6 +163,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mvt", .module = mvt_mod },
         .{ .name = "tile", .module = tile_mod },
         .{ .name = "pmtiles", .module = pmtiles_mod },
+        .{ .name = "s57_mvt", .module = s57_mvt_mod },
+        .{ .name = "bake_enc", .module = bake_enc_mod },
         .{ .name = "assets", .module = assets_mod },
     };
 
@@ -241,5 +264,17 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mvt", .module = mvt_mod },
     });
     addMvtFixture(b, pmtiles_test); // pmtiles.zig's round-trip test embeds it
+    _ = addPkgTest(b, test_step, "src/s57_mvt/s57_mvt.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "mvt", .module = mvt_mod },
+        .{ .name = "tile", .module = tile_mod },
+    });
+    _ = addPkgTest(b, test_step, "src/bake_enc/bake_enc.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s57_mvt", .module = s57_mvt_mod },
+        .{ .name = "pmtiles", .module = pmtiles_mod },
+        .{ .name = "tile", .module = tile_mod },
+    });
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
 }

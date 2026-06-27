@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const s57 = @import("s57");
-const s57_mvt = @import("s57_mvt.zig");
+const s57_mvt = @import("s57_mvt");
 const pmtiles = @import("pmtiles");
 const tile = @import("tile");
 

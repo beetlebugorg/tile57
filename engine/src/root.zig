@@ -15,12 +15,12 @@ pub const pmtiles = @import("pmtiles");
 pub const tile = @import("tile");
 pub const iso8211 = @import("iso8211");
 pub const s57 = @import("s57");
-pub const s57_mvt = @import("s57_mvt.zig");
+pub const s57_mvt = @import("s57_mvt");
 pub const s100 = @import("s100");
 pub const s101_instr = s100.s101_instr;
 pub const s101_adapt = s100.s101_adapt;
 pub const catalogue = s100.catalogue;
-pub const bake_enc = @import("bake_enc.zig"); // banded multi-cell ENC_ROOT -> PMTiles
+pub const bake_enc = @import("bake_enc"); // banded multi-cell ENC_ROOT -> PMTiles
 pub const assets = @import("assets"); // chart-bundle asset/manifest generation
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
