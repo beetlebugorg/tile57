@@ -131,16 +131,22 @@ if(ZIG_EXECUTABLE)
       target_sources(chartplotter_widget PRIVATE ${MLN_DIR}/platform/glfw/glfw_gl_backend.cpp)
     endif()
     if(MLN_WITH_METAL)
-      # Our patched metal_backend.mm (nextDrawable nil-check + no-timeout) instead
-      # of the vendored one; metal_backend.h is reused unchanged. metal-cpp is
-      # header-only and mbgl-core links Metal PRIVATE, so we link the Apple
-      # frameworks here (QuartzCore for the CAMetalLayer/CALayer Obj-C symbols our
-      # bridge uses, plus Metal + Foundation for the metal-cpp objects).
+      # Our MTKView-based metal_backend.mm (app/metal_backend.h, ported from
+      # MapLibre's own MLNMapView+Metal.mm) replaces the GLFW example's hand-rolled
+      # CAMetalLayer backend: MTKView's internal CVDisplayLink drives rendering at
+      # vsync (fixes the present-timing flicker + blank-on-idle). CHARTPLOTTER_METAL
+      # switches the host (chartplotter.cpp) onto the MTKView render path +
+      # ChartRendererFrontend. metal-cpp is header-only and mbgl-core links Metal
+      # PRIVATE, so we link the Apple frameworks here (QuartzCore + Metal +
+      # Foundation for the metal-cpp objects/CAMetalLayer, MetalKit for MTKView).
+      target_compile_definitions(chartplotter_widget PRIVATE CHARTPLOTTER_METAL=1)
       target_sources(chartplotter_widget PRIVATE
         ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
-        ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm)
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/chart_renderer_frontend.cpp)
       target_link_libraries(chartplotter_widget PUBLIC mbgl-vendor-metal-cpp
-        "-framework QuartzCore" "-framework Metal" "-framework Foundation")
+        "-framework QuartzCore" "-framework Metal" "-framework Foundation"
+        "-framework MetalKit")
     endif()
     if(MLN_WITH_EGL)
       target_compile_definitions(chartplotter_widget PRIVATE MBGL_WITH_EGL=1)
