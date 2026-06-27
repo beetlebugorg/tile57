@@ -7,7 +7,7 @@
 const std = @import("std");
 const mvt = @import("mvt");
 
-const fixture = @embedFile("testdata/annapolis_z14.mvt");
+const fixture = @embedFile("mvt_fixture");
 
 fn findLayer(layers: []mvt.DecodedLayer, name: []const u8) mvt.DecodedLayer {
     for (layers) |L| if (std.mem.eql(u8, L.name, name)) return L;

@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const gzip = @import("gzip.zig");
+const gzip = @import("gzip");
 
 pub const HEADER_LEN = 127;
 const MAGIC = "PMTiles";
@@ -446,7 +446,7 @@ fn zoomOf(tid: u64) u8 {
 
 // ---- tests --------------------------------------------------------------
 
-const fixture = @embedFile("testdata/annapolis_z14.mvt");
+const fixture = @embedFile("mvt_fixture");
 
 test "hilbert tile id matches PMTiles reference values" {
     // From the spec's zxy<->tileid table.

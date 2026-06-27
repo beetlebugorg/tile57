@@ -31,13 +31,17 @@ fn addLua(b: *std.Build, mod: *std.Build.Module) void {
     });
 }
 
-// Re-import the foundational packages (iso8211/s57/s100/mvt) into a consumer
-// module (engine, libtile57.a, the baker). One place keeps the edge list in sync.
-fn addPkgs(mod: *std.Build.Module, iso8211_mod: *std.Build.Module, s57_mod: *std.Build.Module, s100_mod: *std.Build.Module, mvt_mod: *std.Build.Module) void {
-    mod.addImport("iso8211", iso8211_mod);
-    mod.addImport("s57", s57_mod);
-    mod.addImport("s100", s100_mod);
-    mod.addImport("mvt", mvt_mod);
+// Re-import the pure packages into a consumer module (engine, libtile57.a, the
+// baker). One list keeps the edge set in sync across all three.
+fn addPkgs(mod: *std.Build.Module, pkgs: []const std.Build.Module.Import) void {
+    for (pkgs) |p| mod.addImport(p.name, p.module);
+}
+
+// The shared MVT round-trip fixture (used by pmtiles + the mvt parity test). It
+// lives under src/testdata/, outside any single module root, so it rides as an
+// anonymous import rather than a relative @embedFile.
+fn addMvtFixture(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addAnonymousImport("mvt_fixture", .{ .root_source_file = b.path("src/testdata/annapolis_z14.mvt") });
 }
 
 // Add a `zig build test` artifact for a standalone package module. A split
@@ -87,10 +91,21 @@ pub fn build(b: *std.Build) void {
     });
     addCatalogueJson(b, s100_mod);
 
-    // MVT (Mapbox Vector Tile) encoder — pure, target-agnostic leaf, mirroring
-    // the Go oracle's internal/engine/mvt. Used by tile/pmtiles/s57_mvt.
+    // Tile-encoding packages (mirror the Go oracle's internal/engine/{mvt,tile,
+    // pmtiles}), pure + target-agnostic. DAG: gzip, mvt (leaves) <- tile, pmtiles.
     const mvt_mod = b.addModule("mvt", .{
         .root_source_file = b.path("src/mvt/mvt.zig"),
+    });
+    const gzip_mod = b.addModule("gzip", .{
+        .root_source_file = b.path("src/gzip/gzip.zig"),
+    });
+    const tile_mod = b.addModule("tile", .{
+        .root_source_file = b.path("src/tile/tile.zig"),
+        .imports = &.{.{ .name = "mvt", .module = mvt_mod }},
+    });
+    const pmtiles_mod = b.addModule("pmtiles", .{
+        .root_source_file = b.path("src/pmtiles/pmtiles.zig"),
+        .imports = &.{ .{ .name = "gzip", .module = gzip_mod }, .{ .name = "mvt", .module = mvt_mod } },
     });
 
     // S-101 portrayal runner: drives the embedded Lua rule engine over a cell's
@@ -117,6 +132,19 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/assets/assets.zig"),
     });
 
+    // All pure packages, imported by name into engine / libtile57.a / the baker.
+    // (portray is libc, wired separately into the lib + baker only.)
+    const pure_pkgs = [_]std.Build.Module.Import{
+        .{ .name = "iso8211", .module = iso8211_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "gzip", .module = gzip_mod },
+        .{ .name = "mvt", .module = mvt_mod },
+        .{ .name = "tile", .module = tile_mod },
+        .{ .name = "pmtiles", .module = pmtiles_mod },
+        .{ .name = "assets", .module = assets_mod },
+    };
+
     // Pure-Zig public module (no libc). Used by the unit tests so that
     // Zig-linked test binary doesn't pull in the system crt.
     const mod = b.addModule("engine", .{
@@ -124,8 +152,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addPkgs(mod, iso8211_mod, s57_mod, s100_mod, mvt_mod);
-    mod.addImport("assets", assets_mod); // engine re-exports it; tests cover it
+    addPkgs(mod, &pure_pkgs);
+    addMvtFixture(b, mod); // mvt_parity_test (in the engine module) embeds it
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -137,7 +165,7 @@ pub fn build(b: *std.Build) void {
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
-    addPkgs(lib_mod, iso8211_mod, s57_mod, s100_mod, mvt_mod);
+    addPkgs(lib_mod, &pure_pkgs);
     lib_mod.addImport("portray", portray_mod);
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
@@ -166,7 +194,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true, // Lua needs the C runtime
     });
-    addPkgs(bake_engine, iso8211_mod, s57_mod, s100_mod, mvt_mod);
+    addPkgs(bake_engine, &pure_pkgs);
     bake_engine.addImport("portray", portray_mod);
 
     const bake = b.addExecutable(.{
@@ -204,5 +232,14 @@ pub fn build(b: *std.Build) void {
     });
     addCatalogueJson(b, s100_test); // catalogue.zig @embedFile's the JSON
     _ = addPkgTest(b, test_step, "src/mvt/mvt.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/gzip/gzip.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/tile/tile.zig", target, optimize, &.{
+        .{ .name = "mvt", .module = mvt_mod },
+    });
+    const pmtiles_test = addPkgTest(b, test_step, "src/pmtiles/pmtiles.zig", target, optimize, &.{
+        .{ .name = "gzip", .module = gzip_mod },
+        .{ .name = "mvt", .module = mvt_mod },
+    });
+    addMvtFixture(b, pmtiles_test); // pmtiles.zig's round-trip test embeds it
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
 }

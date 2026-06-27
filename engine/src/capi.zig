@@ -10,13 +10,13 @@
 //! and optionals stay inside Zig. Public header: ../../include/tile57.h.
 
 const std = @import("std");
-const pmtiles = @import("pmtiles.zig");
+const pmtiles = @import("pmtiles");
 const s57 = @import("s57");
 const s57_mvt = @import("s57_mvt.zig");
 const portray = @import("portray");
 const bake_enc = @import("bake_enc.zig");
 const catalogue = @import("s100").catalogue;
-const tile = @import("tile.zig");
+const tile = @import("tile");
 
 const gpa = std.heap.page_allocator;
 

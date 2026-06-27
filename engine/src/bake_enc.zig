@@ -14,8 +14,8 @@
 const std = @import("std");
 const s57 = @import("s57");
 const s57_mvt = @import("s57_mvt.zig");
-const pmtiles = @import("pmtiles.zig");
-const tile = @import("tile.zig");
+const pmtiles = @import("pmtiles");
+const tile = @import("tile");
 
 /// A parsed + portrayed cell ready to bake. `portrayal` is the per-feature S-101
 /// instruction stream (null = bake with the classify() fallback); `bounds` is
