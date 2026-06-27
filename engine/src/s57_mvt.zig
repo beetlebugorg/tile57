@@ -128,7 +128,7 @@ const Layers = struct {
     texts: *std.ArrayList(mvt.Feature),
     // SCAMIN buckets: a feature carrying SCAMIN (s57 attr 133) routes here instead
     // of the base list, and carries a `scamin` property so the style gates its
-    // display below the feature's 1:N scale (see s57_mvt.ATTR_SCAMIN / build_style.py).
+    // display below the feature's 1:N scale (see s57_mvt.ATTR_SCAMIN / assets/style.zig).
     areas_scamin: *std.ArrayList(mvt.Feature),
     area_patterns_scamin: *std.ArrayList(mvt.Feature),
     lines_scamin: *std.ArrayList(mvt.Feature),

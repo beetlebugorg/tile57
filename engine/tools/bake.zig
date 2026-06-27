@@ -540,11 +540,13 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     );
 }
 
-/// `style <portrayal-catalog-dir> --scheme S -o <out.json> [--source-tiles T]
-///  [--sprite BASE] [--glyphs TMPL] [--pmtiles-url URL] [--minzoom N] [--maxzoom N]`
-/// — emit one MapLibre style.json (palette resolved from the catalogue's colours).
+/// `style <portrayal-catalog-dir> --scheme S -o <out.json> [--colortables FILE]
+///  [--source-tiles T] [--sprite BASE] [--glyphs TMPL] [--pmtiles-url URL]
+///  [--minzoom N] [--maxzoom N]` — emit one MapLibre style.json (colours from an
+/// explicit colortables.json or computed from the catalogue).
 fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var catalog: ?[]const u8 = null;
+    var colortables: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var scheme: []const u8 = "day";
     var opts = assets.StyleOpts{ .scheme = "day", .colortables_json = "" };
@@ -555,6 +557,10 @@ fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
             i += 1;
             if (i >= args.len) return usageErr("missing value for -o/--output");
             out = args[i];
+        } else if (std.mem.eql(u8, arg, "--colortables")) {
+            i += 1;
+            if (i >= args.len) return usageErr("missing value for --colortables");
+            colortables = args[i];
         } else if (std.mem.eql(u8, arg, "--scheme")) {
             i += 1;
             if (i >= args.len) return usageErr("missing value for --scheme");
@@ -591,7 +597,12 @@ fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     }
     const out_path = out orelse return usageErr("missing -o/--output <out.json>");
     opts.scheme = scheme;
-    opts.colortables_json = try colorTablesBytes(io, a, resolveCatalogDir(catalog));
+    // Colours come from an explicit --colortables JSON, else are computed from
+    // the catalogue's colorProfile.xml (identical output).
+    opts.colortables_json = if (colortables) |ctf|
+        try std.Io.Dir.cwd().readFileAlloc(io, ctf, a, .unlimited)
+    else
+        try colorTablesBytes(io, a, resolveCatalogDir(catalog));
     const style = try assets.styleJson(a, opts);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = style });
     std.debug.print("wrote {s} ({s}, {d} bytes)\n", .{ out_path, scheme, style.len });
@@ -855,9 +866,10 @@ fn printUsage() void {
         \\      Emit just the portrayal assets (colortables.json today) for a
         \\      catalogue, independent of any cell.
         \\  chartplotter-bake style <portrayal-catalog-dir> --scheme day -o <out.json>
-        \\      Emit one MapLibre style.json (colours resolved from the catalogue).
-        \\      --scheme day|dusk|night; --source-tiles/--pmtiles-url pick the source;
-        \\      --sprite/--glyphs enable symbol/text layers; --minzoom/--maxzoom.
+        \\      Emit one MapLibre style.json (colours from the catalogue, or
+        \\      --colortables FILE). --scheme day|dusk|night; --source-tiles/
+        \\      --pmtiles-url pick the source; --sprite/--glyphs enable symbol/text
+        \\      layers; --minzoom/--maxzoom.
         \\  chartplotter-bake inspect <file.pmtiles> [z x y]
         \\  chartplotter-bake cell <file.000>
         \\  chartplotter-bake version

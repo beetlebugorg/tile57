@@ -132,10 +132,11 @@ Baker subcommands (`chartplotter-bake`):
 | `inspect` / `cell` | inspect a PMTiles archive / summarise an S-57 cell |
 
 The `assets` module mirrors the Go oracle's `internal/engine/assets.EmitS101`.
-Colortables and the **style.json layer set** ship today — `assets/style.zig` is a
-port of `style/build_style.py`, verified layer-for-layer identical by
-`scripts/check-style-parity.sh`. Line styles, sprite/pattern atlases (SVG raster),
-and glyphs (SDF) — which light up the symbol/text layers — are in progress.
+Colortables and the **style.json layer set** ship today — `assets/style.zig`
+(ported from the web `s52-style.mjs` / `chart-style.mjs`) is the sole style
+generator, driven by `scripts/gen-style.sh`. Line styles, sprite/pattern atlases
+(SVG raster), and glyphs (SDF) — which light up the symbol/text layers — are in
+progress.
 
 ## macOS interactive rendering notes
 

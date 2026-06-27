@@ -7,11 +7,11 @@
 //! same shape as s100/catalogue.zig. RGB lives ONLY in colortables.json; the
 //! tiles stay colour *tokens*.
 //!
-//! Implemented now: colortables.json (token -> hex, per day/dusk/night palette)
-//! and manifest.json (pins schema_version; couples tiles <-> portrayal). TODO,
-//! tracked in specs/bundle-bake.md: linestyles.json, sprite/pattern atlases (SVG
-//! raster), glyphs (SDF), and the style.json layer set (port of build_style.py /
-//! web s52-style.mjs).
+//! Implemented now: colortables.json (token -> hex, per day/dusk/night palette),
+//! the MapLibre style.json layer set (style.zig), and manifest.json (pins
+//! schema_version; couples tiles <-> portrayal). TODO, tracked in
+//! specs/bundle-bake.md: linestyles.json, sprite/pattern atlases (SVG raster),
+//! and glyphs (SDF) — to light up the symbol/text/pattern layers.
 
 const std = @import("std");
 
@@ -20,7 +20,7 @@ const std = @import("std");
 /// Bump on ANY change to layer names or feature property keys.
 pub const SCHEMA_VERSION = "tile57/1";
 
-// MapLibre style.json generation (port of style/build_style.py) lives in style.zig.
+// MapLibre style.json generation lives in style.zig.
 pub const StyleOpts = @import("style.zig").StyleOpts;
 pub const styleJson = @import("style.zig").styleJson;
 

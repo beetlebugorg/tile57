@@ -26,12 +26,17 @@ C ABI is not yet frozen.
   day/dusk/night palette, parsed from `ColorProfiles/colorProfile.xml`) — **byte-
   identical to the Go oracle's output**.
 - **MapLibre `style.json` generation** (`assets/style.zig`, a port of
-  `style/build_style.py`): `chartplotter-bake style` emits one style per palette, and
-  `bundle` writes the three styles + references them in `manifest.portrayal.styles`,
-  so a bundle is **directly renderable**. Verified layer-for-layer identical to
-  `build_style.py` (27 layers × 3 palettes) by `scripts/check-style-parity.sh`. Line
-  styles, sprite/pattern atlases (SVG raster), and glyphs (SDF) — to light up the
-  symbol/text layers — are next.
+  ported from the web `s52-style.mjs`/`chart-style.mjs`): `chartplotter-bake style`
+  emits one style per palette, and `bundle` writes the three styles + references them
+  in `manifest.portrayal.styles`, so a bundle is **directly renderable**.
+
+### Removed
+- **The legacy Python style generator `style/build_style.py`** (and the
+  transitional `scripts/check-style-parity.sh`). `engine/src/assets/style.zig` is
+  now the sole style generator — verified full-file identical to `build_style.py`
+  (27 layers × 3 palettes) before removal — and `scripts/gen-style.sh` drives
+  `chartplotter-bake style`. Line styles, sprite/pattern atlases (SVG raster), and
+  glyphs (SDF) — to light up the symbol/text layers — are next.
 
 ### Added — on-demand ENC_ROOT + offline baker
 - **Lazy on-demand tile generation (the new default for an ENC_ROOT).** Pointing a
@@ -117,7 +122,7 @@ C ABI is not yet frozen.
   than being dropped. A genuine rule error on any *other* class is still suppressed
   (no output), matching the Go reference. (`engine/src/s57_mvt.zig`.)
 - **SCAMIN decluttering**: the live path now routes features carrying SCAMIN
-  (attr 133) into `*_scamin` MVT buckets, and `build_style.py` gives those layers
+  (attr 133) into `*_scamin` MVT buckets, and the generated style gives those layers
   a per-feature `minzoom` derived from the SCAMIN 1:N denominator, so minor
   features drop out below their scale (replacing the M1 "both shown" stub).
 - **S-52 draw priority**: `draw_prio` (from the S-101 instruction stream) is now

@@ -1,10 +1,10 @@
-//! style.zig — MapLibre GL style.json generation for the chart bundle. A faithful
-//! Zig port of style/build_style.py (itself a port of the web s52-style.mjs /
-//! chart-style.mjs): resolve each S-52 colour token to hex for a palette and emit
-//! the fill / line / symbol / text layer set. Output is minified JSON; it is
-//! compared layer-for-layer against build_style.py in the differential test
-//! (scripts/check-style-parity.sh). Part of the `assets` module; retires
-//! style/build_style.py. See ../../../specs/bundle-bake.md.
+//! style.zig — MapLibre GL style.json generation for the chart bundle. Resolves
+//! each S-52 colour token to hex for a palette and emits the fill / line / symbol
+//! / text layer set as minified JSON. Ported from the chartplotter web frontend's
+//! s52-style.mjs / chart-style.mjs (and the now-removed style/build_style.py, kept
+//! in git history; it was verified layer-for-layer identical during the port).
+//! The sole style generator now. Part of the `assets` module.
+//! See ../../../specs/bundle-bake.md.
 
 const std = @import("std");
 
@@ -13,7 +13,7 @@ const FALLBACK = "#ff00ff";
 const DPC = "30";
 const SFC = "10";
 const SHC = "2";
-// SCAMIN display-scale denominator at z0 (physical 512-tile scale); see build_style.py.
+// SCAMIN display-scale denominator at z0 (physical 512-tile scale).
 const DENOM_Z0 = "279541132.0";
 const FONT = "[\"Noto Sans Regular\"]";
 
@@ -121,7 +121,7 @@ fn emitLinePaint(w: W, palette: std.json.ObjectMap, dash: ?[]const u8) !void {
 }
 
 // Emit `,"filter":<expr>` for all_of(f1, f2): nothing if both null, the lone one
-// if one is null, else ["all",f1,f2]. Mirrors build_style.py's all_of/scamin_gate.
+// if one is null, else ["all",f1,f2]. Mirrors the web s52-style all_of/scamin_gate.
 fn emitFilter(w: W, f1: ?[]const u8, f2: ?[]const u8) !void {
     if (f1 == null and f2 == null) return;
     try w.s(",\"filter\":");
