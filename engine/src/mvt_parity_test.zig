@@ -5,7 +5,7 @@
 //! round-trip — validating the encoder on real-world feature shapes.
 
 const std = @import("std");
-const mvt = @import("mvt.zig");
+const mvt = @import("mvt");
 
 const fixture = @embedFile("testdata/annapolis_z14.mvt");
 

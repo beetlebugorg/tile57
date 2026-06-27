@@ -31,12 +31,13 @@ fn addLua(b: *std.Build, mod: *std.Build.Module) void {
     });
 }
 
-// Re-import the foundational packages (iso8211/s57/s100) into a consumer module
-// (engine, libtile57.a, the baker). One place keeps the edge list in sync.
-fn addPkgs(mod: *std.Build.Module, iso8211_mod: *std.Build.Module, s57_mod: *std.Build.Module, s100_mod: *std.Build.Module) void {
+// Re-import the foundational packages (iso8211/s57/s100/mvt) into a consumer
+// module (engine, libtile57.a, the baker). One place keeps the edge list in sync.
+fn addPkgs(mod: *std.Build.Module, iso8211_mod: *std.Build.Module, s57_mod: *std.Build.Module, s100_mod: *std.Build.Module, mvt_mod: *std.Build.Module) void {
     mod.addImport("iso8211", iso8211_mod);
     mod.addImport("s57", s57_mod);
     mod.addImport("s100", s100_mod);
+    mod.addImport("mvt", mvt_mod);
 }
 
 // Add a `zig build test` artifact for a standalone package module. A split
@@ -86,6 +87,12 @@ pub fn build(b: *std.Build) void {
     });
     addCatalogueJson(b, s100_mod);
 
+    // MVT (Mapbox Vector Tile) encoder — pure, target-agnostic leaf, mirroring
+    // the Go oracle's internal/engine/mvt. Used by tile/pmtiles/s57_mvt.
+    const mvt_mod = b.addModule("mvt", .{
+        .root_source_file = b.path("src/mvt/mvt.zig"),
+    });
+
     // Asset/style generation for the chart bundle (colortables, manifest, …).
     // Pure + target-agnostic like the foundational packages, so it compiles
     // under both the glibc tests and the static-musl baker. See src/assets/.
@@ -100,7 +107,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addPkgs(mod, iso8211_mod, s57_mod, s100_mod);
+    addPkgs(mod, iso8211_mod, s57_mod, s100_mod, mvt_mod);
     mod.addImport("assets", assets_mod); // engine re-exports it; tests cover it
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
@@ -113,7 +120,7 @@ pub fn build(b: *std.Build) void {
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
-    addPkgs(lib_mod, iso8211_mod, s57_mod, s100_mod);
+    addPkgs(lib_mod, iso8211_mod, s57_mod, s100_mod, mvt_mod);
     addLua(b, lib_mod);
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
@@ -142,7 +149,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true, // Lua needs the C runtime
     });
-    addPkgs(bake_engine, iso8211_mod, s57_mod, s100_mod);
+    addPkgs(bake_engine, iso8211_mod, s57_mod, s100_mod, mvt_mod);
     addLua(b, bake_engine);
 
     const bake = b.addExecutable(.{
@@ -179,5 +186,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
     });
     addCatalogueJson(b, s100_test); // catalogue.zig @embedFile's the JSON
+    _ = addPkgTest(b, test_step, "src/mvt/mvt.zig", target, optimize, &.{});
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
 }

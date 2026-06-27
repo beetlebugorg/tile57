@@ -9,7 +9,7 @@
 
 const std = @import("std");
 
-pub const mvt = @import("mvt.zig");
+pub const mvt = @import("mvt");
 pub const gzip = @import("gzip.zig");
 pub const pmtiles = @import("pmtiles.zig");
 pub const tile = @import("tile.zig");

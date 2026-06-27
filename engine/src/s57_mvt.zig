@@ -9,7 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const s57 = @import("s57");
 const tile = @import("tile.zig");
-const mvt = @import("mvt.zig");
+const mvt = @import("mvt");
 const s101 = @import("s100").s101_instr;
 
 // S-52 symbol scale the Go baker emits for every point symbol / sounding. The
