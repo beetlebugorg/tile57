@@ -44,9 +44,10 @@ orientation + clearance complex attributes are synthesized. Remaining gaps:
   by the live path (they exist in the Go baker).
 - **Native S-52 fallbacks for unportrayed classes.** Some S-57 classes have no
   usable S-101 rule output and the Go reference draws a native S-52 placeholder.
-  SweptArea/SWPARE (an IHO catalogue gap — no rule file) is now handled (dashed
-  CHGRD boundary + SWPARE51 bracket + "swept to" label); the new-object box for
-  NEWOBJ-derived classes (e.g. VirtualAISAidToNavigation) is still omitted.
+  SweptArea/SWPARE (dashed CHGRD boundary + SWPARE51 bracket + "swept to" label)
+  and the NEWOBJ new-object box (dashed CHMGF outline) are now drawn; the
+  navigational-system-of-marks boundary (M_NSYS, Go's `navSystemBuild`) is still
+  omitted.
 - **Single-primitive rules vs. non-conformant geometry.** Some S-101 rules handle
   only one primitive (e.g. RecommendedTrack is Curve-only); a cell that encodes the
   feature with another primitive (an area-encoded recommended track) errors in the

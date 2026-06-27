@@ -350,6 +350,36 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x:
     }
 }
 
+/// Native S-52 fallback for NEWOBJ (objl 163). NEWOBJ features map to S-101 classes
+/// (e.g. VirtualAISAidToNavigation) whose rule may not portray the encoded geometry
+/// (wrong primitive, unofficial stub, …); when portrayal yields nothing or errors,
+/// draw the Go reference's newObjectBuild placeholder — a dashed CHMGF (magenta)
+/// outline on the feature's line/area geometry. DrawingPriority 6.
+fn emitNewObjectFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+    if (f.prim != 2 and f.prim != 3) return; // Go's newObjectBuild only strokes line/area
+    const geo_parts = cell.lineGeometryParts(a, f) catch return;
+    if (geo_parts.len == 0) return;
+
+    const scamin = featureScamin(f);
+    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
+    for (geo_parts) |gp| {
+        if (gp.len < 2) continue;
+        if (!overlaps(geomBounds(gp), tb)) continue;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+        const sub = try tile.clipLine(a, proj, box);
+        if (sub.len == 0) continue;
+        const parts = try a.alloc([]const mvt.Point, sub.len);
+        for (sub, 0..) |s, i| parts[i] = s;
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHMGF" } });
+        try props.append(a, .{ .key = "width_px", .value = .{ .double = 1.5 } });
+        try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
+        try appendMeta(a, &props, 6, scamin);
+        try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
+    }
+}
+
 /// One cell plus its optional per-feature S-101 instruction streams.
 pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null };
 
@@ -437,19 +467,29 @@ fn appendCellFeatures(
             try emitSoundings(a, cell.*, f, z, x, y, tb, soundings);
             continue;
         }
-        // S-101 portrayal path: style this feature from its instruction stream.
-        if (portrayal) |pp| {
-            if (fi < pp.len) if (pp[fi]) |instr| {
-                try emitFromInstr(a, cell.*, f, instr, z, x, y, tb, box, L);
+        // S-101 portrayal stream for this feature: null = unmapped/unportrayed; an
+        // "ERROR:" marker = the rule raised. A usable stream styles the feature;
+        // otherwise fall through to the native S-52 fallbacks / classify().
+        const stream: ?[]const u8 = if (portrayal) |pp| (if (fi < pp.len) pp[fi] else null) else null;
+        const errored = stream != null and std.mem.startsWith(u8, stream.?, "ERROR:");
+        if (stream) |s| {
+            if (!errored) {
+                try emitFromInstr(a, cell.*, f, s, z, x, y, tb, box, L);
                 continue;
-            };
+            }
         }
-        // SweptArea (SWPARE) has no S-101 rule (IHO gap) so portrayal is empty;
-        // draw the native S-52 fallback instead of nothing. See emitSweptAreaFallback.
-        if (f.objl == 134) {
+        // No usable portrayal. Native S-52 fallbacks for classes the catalogue can't
+        // portray (mirrors Go's buildFeatureBody); any other class that errored is
+        // suppressed (drawn as nothing, as the Go reference does).
+        if (f.objl == 134) { // SWPARE — the catalogue ships no SweptArea rule (IHO gap)
             try emitSweptAreaFallback(a, cell.*, f, z, x, y, tb, box, L);
             continue;
         }
+        if (f.objl == 163) { // NEWOBJ — new-object box placeholder
+            try emitNewObjectFallback(a, cell.*, f, z, x, y, tb, box, L);
+            continue;
+        }
+        if (errored) continue; // genuine rule error on a normal class → suppress
         const cls = classify(f.objl);
         if (cls.kind == .skip) continue;
         const geo_parts = cell.lineGeometryParts(a, f) catch continue;

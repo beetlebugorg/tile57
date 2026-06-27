@@ -46,6 +46,12 @@ C ABI is not yet frozen.
   `CHGRD` boundary on each ring, the `SWPARE51` swept-depth bracket at the area's
   representative point, and a `swept to <DRVAL1>` label. (`engine/src/s57_mvt.zig`,
   shared by the baker and the live path.)
+- **Native S-52 fallback for NEWOBJ.** NEWOBJ-derived features (e.g.
+  VirtualAISAidToNavigation) whose S-101 rule doesn't portray the encoded geometry
+  — wrong primitive, unofficial stub — now draw the Go reference's `newObjectBuild`
+  placeholder, a dashed `CHMGF` (magenta) outline on the line/area geometry, rather
+  than being dropped. A genuine rule error on any *other* class is still suppressed
+  (no output), matching the Go reference. (`engine/src/s57_mvt.zig`.)
 - **SCAMIN decluttering**: the live path now routes features carrying SCAMIN
   (attr 133) into `*_scamin` MVT buckets, and `build_style.py` gives those layers
   a per-feature `minzoom` derived from the SCAMIN 1:N denominator, so minor
