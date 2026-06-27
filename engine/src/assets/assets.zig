@@ -144,47 +144,28 @@ pub const Manifest = struct {
 /// bundle whose schema_version it doesn't speak — turning tile/style coupling
 /// into a checked invariant. Returns allocator-owned bytes.
 pub fn manifestJson(alloc: std.mem.Allocator, m: Manifest) ![]u8 {
-    // Pre-build the cells array ("c1", "c2", …) so the body is one allocPrint.
-    var cells = std.ArrayList(u8).empty;
-    defer cells.deinit(alloc);
-    for (m.cells, 0..) |c, i| {
-        try cells.appendSlice(alloc, "\"");
-        try cells.appendSlice(alloc, c);
-        try cells.appendSlice(alloc, if (i + 1 < m.cells.len) "\", " else "\"");
-    }
-    // Optional per-palette styles block, appended after "colortables".
-    const styles_field: []const u8 = if (m.styles) |st|
-        try std.fmt.allocPrint(alloc,
-            \\,
-            \\    "styles": {{ "day": "{s}", "dusk": "{s}", "night": "{s}" }}
-        , .{ st.day, st.dusk, st.night })
-    else
-        "";
-    return std.fmt.allocPrint(alloc,
-        \\{{
-        \\  "bundle_version": 1,
-        \\  "schema_version": "{s}",
-        \\  "generator": "{s}",
-        \\  "created": "{s}",
-        \\  "catalogue_version": "{s}",
-        \\  "data": {{
-        \\    "tiles": "{s}",
-        \\    "minzoom": {d},
-        \\    "maxzoom": {d},
-        \\    "bbox": [{d:.6}, {d:.6}, {d:.6}, {d:.6}],
-        \\    "anchor": [{d:.6}, {d:.6}],
-        \\    "cells": [{s}]
-        \\  }},
-        \\  "portrayal": {{
-        \\    "colortables": "{s}"{s}
-        \\  }}
-        \\}}
-    , .{
-        SCHEMA_VERSION,    m.generator, m.created,         m.catalogue_version,
-        m.tiles_rel,       m.minzoom,   m.maxzoom,         m.bbox[0],
-        m.bbox[1],         m.bbox[2],   m.bbox[3],         m.anchor[0],
-        m.anchor[1],       cells.items, m.colortables_rel, styles_field,
-    });
+    // The manifest is plain data: describe it as a value and let std.json emit it.
+    // indent_2 keeps it human-readable; emit_null_optional_fields drops "styles"
+    // (the one optional) when absent.
+    return std.json.Stringify.valueAlloc(alloc, .{
+        .bundle_version = 1,
+        .schema_version = SCHEMA_VERSION,
+        .generator = m.generator,
+        .created = m.created,
+        .catalogue_version = m.catalogue_version,
+        .data = .{
+            .tiles = m.tiles_rel,
+            .minzoom = m.minzoom,
+            .maxzoom = m.maxzoom,
+            .bbox = m.bbox,
+            .anchor = m.anchor,
+            .cells = m.cells,
+        },
+        .portrayal = .{
+            .colortables = m.colortables_rel,
+            .styles = m.styles,
+        },
+    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
 }
 
 // ---- tests ---------------------------------------------------------------
@@ -233,11 +214,16 @@ test "manifestJson: pins schema_version and couples tiles to portrayal" {
         .cells = &.{ "US5MD1MC", "US4MD81M" },
     });
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"schema_version\": \"tile57/1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"tiles\": \"tiles/chart.pmtiles\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"colortables\": \"assets/colortables.json\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"US5MD1MC\", \"US4MD81M\"") != null);
-    // valid JSON round-trips
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
     defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("tile57/1", o.get("schema_version").?.string);
+    const data = o.get("data").?.object;
+    try std.testing.expectEqualStrings("tiles/chart.pmtiles", data.get("tiles").?.string);
+    try std.testing.expectEqual(@as(usize, 2), data.get("cells").?.array.items.len);
+    try std.testing.expectEqualStrings("US5MD1MC", data.get("cells").?.array.items[0].string);
+    const portrayal = o.get("portrayal").?.object;
+    try std.testing.expectEqualStrings("assets/colortables.json", portrayal.get("colortables").?.string);
+    // "styles" is omitted when not provided (emit_null_optional_fields = false)
+    try std.testing.expect(portrayal.get("styles") == null);
 }
