@@ -12,7 +12,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Line = struct { style: []const u8, width: f64, color: []const u8 };
 pub const Point = struct { symbol: []const u8, rotation: f64, offset_x: f64, offset_y: f64 };
-pub const Text = struct { text: []const u8, color: []const u8 };
+pub const Text = struct { text: []const u8, color: []const u8, group: i64 = 0 };
 
 pub const Portrayal = struct {
     fill_token: ?[]const u8 = null, // ColorFill (last wins)
@@ -74,6 +74,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var cur_ox: f64 = 0;
     var cur_oy: f64 = 0;
     var cur_font: []const u8 = "CHBLK";
+    var cur_tgrp: i64 = 0; // text group (S-52 §14.5) of the most recent ViewingGroup
 
     var it = std.mem.splitScalar(u8, stream, ';');
     while (it.next()) |item| {
@@ -108,7 +109,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         } else if (std.mem.eql(u8, key, "FontColor")) {
             cur_font = val;
         } else if (std.mem.eql(u8, key, "TextInstruction")) {
-            try texts.append(a, .{ .text = val, .color = cur_font });
+            try texts.append(a, .{ .text = val, .color = cur_font, .group = cur_tgrp });
         } else if (std.mem.eql(u8, key, "DrawingPriority")) {
             // S-52 display priority. A feature draws across several viewing groups,
             // each with its own DrawingPriority; the feature's priority is the MAX
@@ -121,6 +122,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // <drawVG>; arg 0 there is the small text-group number, which categoryRank
             // maps to -1 (no band), so it correctly never lowers the category.
             const vg = std.fmt.parseInt(i64, std.mem.trim(u8, nthCsv(val, 0), " "), 10) catch continue;
+            cur_tgrp = vg; // for a text instruction, arg 0 is its S-52 text group
             const rank = categoryRank(vg);
             if (rank >= 0 and (cat < 0 or rank < cat)) cat = rank;
         }

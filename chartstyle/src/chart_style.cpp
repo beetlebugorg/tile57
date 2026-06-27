@@ -131,6 +131,26 @@ json categoryFilter(const MarinerSettings &m) {
     return json::array({"all", inCat, json::array({"!", isQual})});
 }
 
+// S-52 §14.5 text-group selection: each text feature carries its `tgrp` tag; the
+// mariner toggles which groups show. Important text (11) is always on (safety-
+// critical clearances/bearings). Names = 21/26/29, light descriptions = 23, Other =
+// everything else. Returns false (hide all) if every group is disabled. Mirrors the
+// Go client's textGroupFilter.
+json textGroupFilter(const MarinerSettings &m) {
+    const json g = coalesce(get("tgrp"), -1);
+    const json named = json::array({"match", g, json::array({21, 26, 29}), true, false});
+    json clauses = json::array();
+    clauses.push_back(json::array({"==", g, 11})); // important — always on
+    if (m.textNames) clauses.push_back(named);
+    if (m.showLightDescriptions) clauses.push_back(json::array({"==", g, 23}));
+    if (m.textOther)
+        clauses.push_back(json::array({"all", json::array({"!=", g, 11}), json::array({"!=", g, 23}),
+                                       json::array({"match", g, json::array({21, 26, 29}), false, true})}));
+    json any = json::array({"any"}); // important text keeps this non-empty
+    for (auto &c : clauses) any.push_back(c);
+    return any;
+}
+
 // AND extra clauses into a layer's existing filter (clauses first, base last).
 void andInto(json &layer, const std::vector<json> &clauses) {
     json all = json::array({"all"});
@@ -199,6 +219,15 @@ std::string buildStyle(const std::string &templateJson, const MarinerSettings &m
             clauses.push_back(categoryFilter(m));
             if (!m.showInformCallouts) // INFORM01 "additional information" callouts off
                 clauses.push_back(json::array({"!=", coalesce(get("symbol_name"), ""), "INFORM01"}));
+            // Meta-object coverage/region boundary lines (cell boundaries), gated
+            // separately from "Other" (off by default).
+            if (!m.showMetaBounds)
+                clauses.push_back(json::array(
+                    {"!", json::array({"in", coalesce(get("class"), ""),
+                                       json::array({"literal", json::array({"M_NPUB", "M_NSYS", "M_COVR", "M_CSCL"})})})}));
+            // Text-group selection on the text layers.
+            if (isId(L, {"text", "light-text", "text-scamin", "light-text-scamin"}))
+                clauses.push_back(textGroupFilter(m));
             andInto(L, clauses);
         }
     }

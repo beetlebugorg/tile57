@@ -88,6 +88,22 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     depthForm->addRow(QStringLiteral("Safety depth"), safetyDepth_);
     root->addWidget(depthBox);
 
+    // -- Text (S-52 §14.5 text groups) --
+    auto *textBox = new QGroupBox(QStringLiteral("Text"));
+    auto *textCol = new QVBoxLayout(textBox);
+    textCol->setContentsMargins(12, 10, 12, 12);
+    textCol->setSpacing(8);
+    textNames_ = new QCheckBox(QStringLiteral("Names"));
+    textNames_->setChecked(s_.textNames);
+    textCol->addWidget(textNames_);
+    lightDescriptions_ = new QCheckBox(QStringLiteral("Light descriptions"));
+    lightDescriptions_->setChecked(s_.showLightDescriptions);
+    textCol->addWidget(lightDescriptions_);
+    textOther_ = new QCheckBox(QStringLiteral("Other text"));
+    textOther_->setChecked(s_.textOther);
+    textCol->addWidget(textOther_);
+    root->addWidget(textBox);
+
     // -- Overlays --
     auto *ovBox = new QGroupBox(QStringLiteral("Overlays"));
     auto *ovForm = new QVBoxLayout(ovBox);
@@ -99,6 +115,9 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     infoCallouts_ = new QCheckBox(QStringLiteral("Information callouts"));
     infoCallouts_->setChecked(s_.showInformCallouts);
     ovForm->addWidget(infoCallouts_);
+    metaBounds_ = new QCheckBox(QStringLiteral("Cell / coverage boundaries"));
+    metaBounds_->setChecked(s_.showMetaBounds);
+    ovForm->addWidget(metaBounds_);
     root->addWidget(ovBox);
 
     root->addStretch(1);
@@ -114,6 +133,10 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     connect(fourShades_, &QCheckBox::toggled, this, onCheck);
     connect(dataQuality_, &QCheckBox::toggled, this, onCheck);
     connect(infoCallouts_, &QCheckBox::toggled, this, onCheck);
+    connect(metaBounds_, &QCheckBox::toggled, this, onCheck);
+    connect(textNames_, &QCheckBox::toggled, this, onCheck);
+    connect(lightDescriptions_, &QCheckBox::toggled, this, onCheck);
+    connect(textOther_, &QCheckBox::toggled, this, onCheck);
     for (auto *b : {shallow_, safety_, deep_, safetyDepth_})
         connect(b, &QDoubleSpinBox::valueChanged, this, onSpin);
 }
@@ -130,6 +153,10 @@ void MarinerPanel::pull() {
     s_.safetyDepth = safetyDepth_->value();
     s_.dataQuality = dataQuality_->isChecked();
     s_.showInformCallouts = infoCallouts_->isChecked();
+    s_.showMetaBounds = metaBounds_->isChecked();
+    s_.textNames = textNames_->isChecked();
+    s_.showLightDescriptions = lightDescriptions_->isChecked();
+    s_.textOther = textOther_->isChecked();
     emit changed(s_);
 }
 

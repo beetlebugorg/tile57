@@ -42,8 +42,12 @@ private:
     QDoubleSpinBox *safety_ = nullptr;
     QDoubleSpinBox *deep_ = nullptr;
     QDoubleSpinBox *safetyDepth_ = nullptr;
+    QCheckBox *textNames_ = nullptr;
+    QCheckBox *lightDescriptions_ = nullptr;
+    QCheckBox *textOther_ = nullptr;
     QCheckBox *dataQuality_ = nullptr;
     QCheckBox *infoCallouts_ = nullptr;
+    QCheckBox *metaBounds_ = nullptr;
 };
 
 } // namespace cpn

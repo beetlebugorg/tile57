@@ -213,6 +213,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
             try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
             try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
+            try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
             try appendMeta(a, &props, prio, cat, scamin);
             try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         }
@@ -308,6 +309,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
                     try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
                     try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
                     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
+                    try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
                     try appendMeta(a, &props, prio, cat, scamin);
                     try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
                 }
