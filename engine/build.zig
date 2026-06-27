@@ -39,6 +39,30 @@ fn addPkgs(mod: *std.Build.Module, iso8211_mod: *std.Build.Module, s57_mod: *std
     mod.addImport("s100", s100_mod);
 }
 
+// Add a `zig build test` artifact for a standalone package module. A split
+// module's `test {}` blocks do NOT run via the engine test binary (importing a
+// module doesn't pull its tests in), so each package is tested through its own
+// root with a concrete target. `imports` wire its dependency modules (the
+// target-agnostic package objects, which inherit this target). Returns the test
+// module so the caller can attach extra inputs (e.g. addCatalogueJson).
+fn addPkgTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    src: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    imports: []const std.Build.Module.Import,
+) *std.Build.Module {
+    const tm = b.createModule(.{
+        .root_source_file = b.path(src),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    });
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tm })).step);
+    return tm;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -140,19 +164,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bake.addArgs(args);
     b.step("run", "Run the bake CLI").dependOn(&run_bake.step);
 
-    // Tests (pure Zig).
+    // Tests. The engine module (root.zig) covers its own files — the relative-
+    // imported gzip/pmtiles/tile/s57_mvt/bake_enc + the MVT parity test. Each
+    // standalone package is tested through its own root (addPkgTest), since a
+    // module import does NOT pull another module's `test {}` blocks in.
     const test_step = b.step("test", "Run unit tests");
-    const mod_tests = b.addTest(.{ .root_module = mod });
-    test_step.dependOn(&b.addRunArtifact(mod_tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
 
-    // assets is a standalone target-agnostic module (so it composes into the
-    // musl baker); give it a concrete-target view here purely so its own
-    // `test {}` blocks run under `zig build test` (root.zig's `_ = assets` alone
-    // doesn't pull a separate module's tests into the engine test binary).
-    const assets_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("src/assets/assets.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
-    test_step.dependOn(&b.addRunArtifact(assets_tests).step);
+    _ = addPkgTest(b, test_step, "src/iso8211/iso8211.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{
+        .{ .name = "iso8211", .module = iso8211_mod },
+    });
+    const s100_test = addPkgTest(b, test_step, "src/s100/s100.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+    });
+    addCatalogueJson(b, s100_test); // catalogue.zig @embedFile's the JSON
+    _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
 }
