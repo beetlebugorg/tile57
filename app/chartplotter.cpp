@@ -126,8 +126,16 @@ extern "C" int chartplotter_render_png(const char *chart_path, const char *style
 #include "glfw_renderer_frontend.hpp"
 #include "glfw_view.hpp"
 
+#if defined(CHARTPLOTTER_METAL)
+// Metal: render via an MTKView (display-link/vsync driven) instead of GLFW's
+// timer loop. These are Cocoa-free headers, safe to include in this .cpp.
+#include "chart_renderer_frontend.hpp"
+#include "metal_render_hook.h"
+#endif
+
 #include <mbgl/gfx/backend.hpp>
 #include <mbgl/renderer/renderer.hpp>
+#include <mbgl/renderer/renderer_frontend.hpp>
 #include <mbgl/util/geo.hpp>
 
 #include <cstdlib>
@@ -153,8 +161,8 @@ private:
 struct chartplotter_view {
     tile57_source *src = nullptr;
     std::unique_ptr<GLFWView> view;
-    std::unique_ptr<GLFWRendererFrontend> frontend;
-    std::unique_ptr<ContinuousObserver> contObserver;
+    std::unique_ptr<mbgl::RendererFrontend> frontend; // GLFW- or Chart- (Metal) RendererFrontend
+    std::unique_ptr<ContinuousObserver> contObserver; // non-Metal only
     std::unique_ptr<mbgl::Map> map;
 };
 
@@ -178,6 +186,28 @@ extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
     // GLFWView first: it creates the window + backend and owns the RunLoop.
     v->view = std::make_unique<GLFWView>(/*fullscreen*/ false, /*benchmark*/ false,
                                          resourceOptions, clientOptions);
+#if defined(CHARTPLOTTER_METAL)
+    // Metal: the MTKView inside MetalBackend drives rendering off its internal
+    // CVDisplayLink (vsync), mirroring MapLibre's own macOS host. Use a frontend
+    // that does NOT poke GLFW's dirty flag and do NOT call setRenderFrontend — so
+    // GLFW never renders and MTKView is the sole, vsync-phase-locked driver (this
+    // is the fix for the timer-vs-refresh flicker + blank-on-idle). Wire MTKView's
+    // per-vsync draw to the frontend.
+    {
+        auto fe = std::make_unique<ChartRendererFrontend>(
+            std::make_unique<mbgl::Renderer>(v->view->getRendererBackend(), v->view->getPixelRatio()),
+            v->view->getRendererBackend());
+        chartSetMetalRenderCallback(v->view->getRendererBackend(), [p = fe.get()] { p->render(); });
+        v->frontend = std::move(fe);
+    }
+
+    registerChartSource(); // before the Map builds its resource loader
+
+    v->map = std::make_unique<mbgl::Map>(
+        *v->frontend, mbgl::MapObserver::nullObserver(),
+        mbgl::MapOptions().withSize(v->view->getSize()).withPixelRatio(v->view->getPixelRatio()),
+        resourceOptions, clientOptions);
+#else
     v->frontend = std::make_unique<GLFWRendererFrontend>(
         std::make_unique<mbgl::Renderer>(v->view->getRendererBackend(), v->view->getPixelRatio()),
         *v->view);
@@ -197,6 +227,7 @@ extern "C" chartplotter_view *chartplotter_view_open(const char *chart_path,
         *v->frontend, observer,
         mbgl::MapOptions().withSize(v->view->getSize()).withPixelRatio(v->view->getPixelRatio()),
         resourceOptions, clientOptions);
+#endif
 
     v->view->setMap(v->map.get());
     v->view->setWindowTitle(opts->title ? opts->title : "chartplotter");
@@ -221,6 +252,12 @@ extern "C" void chartplotter_view_run(chartplotter_view *view) {
 
 extern "C" void chartplotter_view_close(chartplotter_view *view) {
     if (!view) return;
+#if defined(CHARTPLOTTER_METAL)
+    // Clear the MTKView render callback before the frontend dies, so a display-link
+    // draw can't call into a freed ChartRendererFrontend. (Same thread, so no
+    // in-flight draw races this.)
+    if (view->view) chartSetMetalRenderCallback(view->view->getRendererBackend(), {});
+#endif
     // Destruction order: map (holds ChartTileSource) before frontend/view. The
     // chart source is intentionally not closed (UAF during Map teardown).
     view->map.reset();
