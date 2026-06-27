@@ -154,6 +154,17 @@ static void push_binding(lua_State *L, const char *name) {
     lua_setfield(L, -2, "LowerMultiplicity");
     lua_setfield(L, -2, name); /* bindings[name] = {...} (bindings table at -2) */
 }
+/* Add a guaranteed binding ONLY if the catalogue didn't already bind it (the
+ * AttributeBindings table is at the stack top). Mirrors Go's withGuaranteed: a
+ * blind push would clobber the catalogue's real multiplicity — e.g. it would
+ * overwrite RadioCallingInPoint's array-valued orientationValue (Upper=2) with a
+ * scalar (Upper=1), so the rule's feature.orientationValue[1] indexes a nil. */
+static void push_binding_if_absent(lua_State *L, const char *name) {
+    lua_getfield(L, -1, name); /* AttributeBindings[name] */
+    int absent = lua_isnil(L, -1);
+    lua_pop(L, 1);
+    if (absent) push_binding(L, name);
+}
 static int l_feature_type_info(lua_State *L) { /* HostGetFeatureTypeInfo(code) */
     const char *code = luaL_checkstring(L, 1);
     lua_newtable(L);
@@ -400,10 +411,12 @@ static int lp_feature_info(lua_State *L) { /* HostGetFeatureTypeInfo(code) */
     bindings_from_cat(L, 0, code, clen);
     /* Guaranteed attrs (mirror Go's withGuaranteed): some rules read these
      * without the nil-safe '!' on feature types the catalogue doesn't bind them
-     * to. Binding them makes such a read return nil instead of erroring. */
-    push_binding(L, "inTheWater");
-    push_binding(L, "orientationValue");
-    push_binding(L, "topmark");
+     * to. Binding them makes such a read return nil instead of erroring — but
+     * only when the catalogue itself doesn't bind them, so we don't override a
+     * real (e.g. array-valued) multiplicity. */
+    push_binding_if_absent(L, "inTheWater");
+    push_binding_if_absent(L, "orientationValue");
+    push_binding_if_absent(L, "topmark");
     lua_setfield(L, -2, "AttributeBindings");
     return 1;
 }
@@ -625,18 +638,27 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "cp('PreferredLanguage','text','eng')\n"
         "PortrayalInitializeContextParameters(cps)\n"
         "local ctx=portrayalContext.ContextParameters\n"
-        "local nok,nerr,ntext,errs=0,0,0,{}\n"
+        "local nok,nerr,nskip,ntext,errs=0,0,0,0,{}\n"
         "for _,item in ipairs(portrayalContext.FeaturePortrayalItems) do\n"
         "  local feature=item.Feature\n"
         "  local fp=item:NewFeaturePortrayal()\n"
         "  local ok,err=pcall(function() require(feature.Code); _G[feature.Code](feature,fp,ctx) end)\n"
         "  local instr\n"
         "  if ok then nok=nok+1; instr=table.concat(fp.DrawingInstructions, ';')\n"
+        // A feature whose own class has no rule file is NOT an error: the catalogue
+        // simply doesn't portray it (e.g. SweptArea/SWPARE — an IHO gap). Leave
+        // instr nil so it falls back to classify(), and tally it apart from real
+        // rule errors. Matches the Go reference, which suppresses these silently.
+        // The match is on feature.Code so a *different* missing require inside a
+        // rule (a real bug) still counts as an error.
+        "  elseif tostring(err):find(\"module '\"..feature.Code..\"' not found\", 1, true) then nskip=nskip+1\n"
         "  else nerr=nerr+1; instr='ERROR:'..tostring(err)\n"
-        "    errs[feature.Code]=(errs[feature.Code] or (tostring(err)..' [prim='..tostring(feature.PrimitiveType)..']')) end\n"
+        // PrimitiveType is a PortrayalAPI enum *table*; print its .Name (Point/
+        // Curve/Surface) rather than the useless "table: 0x..." address.
+        "    errs[feature.Code]=(errs[feature.Code] or (tostring(err)..' [prim='..(feature.PrimitiveType and feature.PrimitiveType.Name or '?')..']')) end\n"
         "  if instr and instr:find('TextInstruction') then ntext=ntext+1 end\n"
         "  tg_store(tonumber(feature.ID), instr)\nend\n"
-        "io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors, '..ntext..' with text\\n')\n"
+        "io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors, '..nskip..' unportrayed, '..ntext..' with text\\n')\n"
         "for code,e in pairs(errs) do io.stderr:write('  '..code..': '..e..'\\n') end\n";
     int rc = 0;
     if (luaL_dostring(L, driver) != LUA_OK) {

@@ -20,10 +20,36 @@ C ABI is not yet frozen.
   complex (Go sync: the `clearances` map + orientation alias).
 - **`chartplotter-bake` CLI** (`engine/tools/bake.zig`): pre-bake a cell to a
   PMTiles archive — `chartplotter-bake bake <cell.000> -o out.pmtiles
-  [--minzoom N --maxzoom N] [updates…]` — over the cell's bounds, plus `inspect`,
-  `cell`, and `version`. The precache path that mirrors chartplotter-go's `bake`.
-  (Bakes with the `classify()` fallback styling for now; full S-101 portrayal in
-  the baker needs the embedded Lua linked into the exe — tracked as follow-up.)
+  [--rules DIR] [--minzoom N --maxzoom N] [updates…]` — over the cell's bounds,
+  plus `inspect`, `cell`, and `version`. The precache path that mirrors
+  chartplotter-go's `bake`.
+- **Full S-101 portrayal in the baker.** `chartplotter-bake` now runs the same
+  embedded-Lua S-101 rule engine as the live library (not the `classify()`
+  fallback), so baked tiles carry the full S-101 layer set
+  (areas/area_patterns/lines/point_symbols/soundings/text + `*_scamin` declutter
+  buckets). The baker's engine module (`src/bake_root.zig`) adds `portray.zig` +
+  the C/Lua sources on top of the pure `root.zig`; the unit-test build stays pure
+  Zig. On a glibc Linux host the baker links against Zig's own static musl (the
+  self-hosted ELF linker rejects a modern glibc `crt1.o`'s `.sframe`
+  relocations). Portrayal failure (e.g. rules dir not found) falls back to
+  `classify()` as before. Default rules dir resolves like the C++ host
+  (`--rules`, else `TILE57_S101_RULES`, else the vendored catalogue).
+- **Honest portrayal diagnostics.** A feature whose S-101 class has no rule file
+  (e.g. SweptArea/SWPARE — an IHO catalogue gap) is now counted as *unportrayed*
+  rather than an *error*, matching the Go reference's silent suppression; the
+  per-error log prints the primitive's name (`Point`/`Curve`/`Surface`) instead
+  of a useless `table: 0x…` address. (Shared `csrc/lua_shim.c` driver, so the
+  live path benefits too.)
+
+### Fixed
+- **Guaranteed attribute bindings no longer clobber the catalogue's multiplicity.**
+  `inTheWater`/`orientationValue`/`topmark` were bound unconditionally (Upper=1)
+  *after* the catalogue bindings, overwriting a feature type's real multiplicity —
+  e.g. RadioCallingInPoint's array-valued `orientationValue` (Upper=2), so the rule
+  crashed indexing `feature.orientationValue[1]`. Now added only when the catalogue
+  doesn't already bind them (matches Go's `withGuaranteed`). Clears the
+  RadioCallingInPoint errors on real NOAA cells; the directional RDOCAL symbols and
+  labels now portray. (`engine/csrc/lua_shim.c`.)
 - **SCAMIN decluttering**: the live path now routes features carrying SCAMIN
   (attr 133) into `*_scamin` MVT buckets, and `build_style.py` gives those layers
   a per-feature `minzoom` derived from the SCAMIN 1:N denominator, so minor

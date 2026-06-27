@@ -134,10 +134,12 @@ The archive then renders through the same hosts (`chartplotter charts.pmtiles
 style/chart-zig-day.json`).
 
 :::note Baker portrayal
-The baker currently emits the `classify()` fallback styling, not the full S-101
-portrayal (running the embedded Lua rules from the baker needs them linked into
-the exe — tracked as a follow-up). For full-S-52 output today, render live from a
-cell/ENC_ROOT.
+The baker runs the full embedded-Lua S-101 portrayal — the same rule engine as the
+live library — so baked archives carry the full S-101 layer set, not the
+`classify()` fallback. The rules directory resolves from `--rules`, else
+`TILE57_S101_RULES`, else the vendored catalogue relative to the working
+directory; if the rules can't be loaded the baker falls back to `classify()` and
+says so on stderr.
 :::
 
 ## S-101 self-tests

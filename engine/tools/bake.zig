@@ -23,6 +23,19 @@ const VERSION = "chartplotter-bake 0.1.0";
 const DEFAULT_MINZOOM: u8 = 8;
 const DEFAULT_MAXZOOM: u8 = 16;
 
+// Env access lives in the Lua C shim (Zig 0.16 gates env behind std.Io);
+// returns the S-101 rules dir from TILE57_S101_RULES or null. Mirrors capi.zig.
+extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
+
+// Resolve the S-101 rules directory: explicit --rules, else TILE57_S101_RULES,
+// else the vendored official catalogue relative to the CWD (works when the baker
+// is run from the repo root, as the render host's resolveRulesDir also expects).
+fn resolveRulesDir(explicit: ?[]const u8) []const u8 {
+    if (explicit) |d| return d;
+    if (tg_env_rules()) |dirz| return std.mem.span(dirz);
+    return "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -251,18 +264,21 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var cell = try engine.s57.parseCellWithUpdates(a, base_bytes, update_bytes);
     defer cell.deinit();
 
-    // S-101 portrayal runs in the embedded-Lua rule engine, which lives in
-    // libchartplotter.a (lib_root.zig) — deliberately NOT linked into this
-    // pure-Zig baker (see src/root.zig). With no portrayal stream, generateTile
-    // falls back to the built-in classify() styling, which is exactly the
-    // fallback the design calls for when rules are unavailable.
-    const portrayal: ?[]const ?[]const u8 = null;
-    if (rules) |dir| {
+    // S-101 portrayal: run the embedded-Lua rule engine over the cell's adapted
+    // features (same path the live library uses) so baked tiles carry full S-101
+    // styling. The arena `a` outlives tile generation below, as portrayCell
+    // requires. Portrayal failure (e.g. rules dir not found) is non-fatal:
+    // generateTile then falls back to the built-in classify() styling.
+    const rules_dir = resolveRulesDir(rules);
+    const portrayal: ?[]const ?[]const u8 = if (engine.portray.portrayCell(a, &cell, rules_dir)) |res|
+        res
+    else |err| blk: {
         std.debug.print(
-            "note: --rules {s} ignored in this offline build (portrayal engine is lib-only); baking with classify() fallback\n",
-            .{dir},
+            "warning: S-101 portrayal failed ({s}) with rules dir '{s}'; baking with classify() fallback\n",
+            .{ @errorName(err), rules_dir },
         );
-    }
+        break :blk null;
+    };
 
     const b = cell.bounds() orelse {
         std.debug.print("error: {s} has no geometry to bake\n", .{base_path});

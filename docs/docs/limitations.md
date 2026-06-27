@@ -42,11 +42,22 @@ orientation + clearance complex attributes are synthesized. Remaining gaps:
   applied yet.
 - **Light sectors** — sectored/directional light legs and arcs are not yet emitted
   by the live path (they exist in the Go baker).
-- **Baker portrayal.** `chartplotter-bake` emits the `classify()` fallback styling,
-  not full S-101 portrayal (the embedded Lua isn't linked into that exe yet).
+- **Native S-52 fallbacks for unportrayed classes.** A handful of S-57 classes have
+  no usable S-101 rule output and the Go reference draws a native S-52 placeholder
+  for them: SweptArea/SWPARE (an IHO catalogue gap — no rule file), and the
+  new-object box for NEWOBJ-derived classes (e.g. VirtualAISAidToNavigation). The
+  native engine currently omits these features instead of drawing the fallback.
+- **Single-primitive rules vs. non-conformant geometry.** Some S-101 rules handle
+  only one primitive (e.g. RecommendedTrack is Curve-only); a cell that encodes the
+  feature with another primitive (an area-encoded recommended track) errors in the
+  rule and the feature is suppressed — the Go reference behaves identically.
 
 A pre-baked PMTiles archive from chartplotter-go does not have these gaps; they are
 specific to live in-process generation / the native baker.
+
+`chartplotter-bake` runs the same full S-101 portrayal as the live library, so its
+output matches live generation (it no longer emits only the `classify()`
+fallback).
 
 ## ENC_ROOT loading
 
