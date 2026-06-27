@@ -25,7 +25,25 @@ pub const Portrayal = struct {
     // stream carries no DrawingPriority. Surfaced as the MVT `draw_prio` property
     // so the style can paint area fills in S-52 display order (DEPARE 3 < LNDARE 12).
     draw_prio: i64 = 0,
+    // S-52 display-category rank (§10.3.4): 0=base, 1=standard, 2=other. The feature
+    // takes the MOST-VISIBLE (lowest) band over its instructions' viewing groups;
+    // standard (1) when none carries a category band. Surfaced as the MVT `cat`
+    // property so the mariner's Base/Standard/Other selection filters client-side.
+    cat: i64 = 1,
 };
+
+/// Display-category rank for a viewing group, from its leading digit (S-52 §10.3.4):
+/// 1xxxx Base, 2xxxx Standard, 3xxxx/9xxxx Other. Anything else (text-group
+/// selectors, <10000) carries no category band -> -1. Mirrors the Go
+/// displayCategoryForViewingGroup (internal/engine/portrayal/s101build.go).
+fn categoryRank(vg: i64) i64 {
+    return switch (@divTrunc(vg, 10000)) {
+        1 => 0, // Display Base
+        2 => 1, // Display Standard
+        3, 9 => 2, // Display Other (incl. 9xxxx quality/CATZOC overlays)
+        else => -1, // no display-category band
+    };
+}
 
 fn nthCsv(s: []const u8, n: usize) []const u8 {
     var it = std.mem.splitScalar(u8, s, ',');
@@ -47,6 +65,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
 
     var fill_token: ?[]const u8 = null;
     var draw_prio: i64 = 0; // feature DrawingPriority = max seen in the stream
+    var cat: i64 = -1; // most-visible display-category rank; -1 until a banded VG is seen
     // running state set by modifier instructions, applied at the next verb
     var cur_width: f64 = 1;
     var cur_color: []const u8 = "CHBLK";
@@ -96,9 +115,16 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // (matches Go s101build's `priority = max(c.Priority)`).
             const v = std.fmt.parseInt(i64, std.mem.trim(u8, val, " "), 10) catch continue;
             if (v > draw_prio) draw_prio = v;
+        } else if (std.mem.eql(u8, key, "ViewingGroup")) {
+            // The feature's display category is the most-visible (lowest-rank) band
+            // over its instructions. Text instructions carry ViewingGroup:<textGroup>,
+            // <drawVG>; arg 0 there is the small text-group number, which categoryRank
+            // maps to -1 (no band), so it correctly never lowers the category.
+            const vg = std.fmt.parseInt(i64, std.mem.trim(u8, nthCsv(val, 0), " "), 10) catch continue;
+            const rank = categoryRank(vg);
+            if (rank >= 0 and (cat < 0 or rank < cat)) cat = rank;
         }
-        // ViewingGroup / DisplayPlane / AlertReference / etc. are display metadata
-        // we don't need for the MVT mapping yet.
+        // DisplayPlane / AlertReference / etc. are display metadata we don't map yet.
     }
 
     return .{
@@ -108,6 +134,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         .points = points.items,
         .texts = texts.items,
         .draw_prio = draw_prio,
+        .cat = if (cat < 0) 1 else cat, // no banded VG -> Standard
     };
 }
 
@@ -127,6 +154,18 @@ test "parse the real DEPARE03 instruction stream" {
     try std.testing.expectEqualStrings("DIAMOND1", p.patterns[0]);
     // draw_prio = max(3, 9) over the two viewing-group sections.
     try std.testing.expectEqual(@as(i64, 9), p.draw_prio);
+    // Display category = most visible over {13030 -> Base, 90000 -> Other} = Base.
+    try std.testing.expectEqual(@as(i64, 0), p.cat);
+}
+
+test "display category defaults to Standard when no banded viewing group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A text-only stream: ViewingGroup carries a text-group number (no category band).
+    const p = try parse(a, "ViewingGroup:21,26070;DrawingPriority:24;FontColor:CHBLK;TextInstruction:Foo");
+    try std.testing.expectEqual(@as(i64, 1), p.cat); // Standard
+    try std.testing.expectEqual(@as(usize, 1), p.texts.len);
 }
 
 test "parse line + point + text instructions" {
