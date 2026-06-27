@@ -23,6 +23,20 @@ pub const ComplexAttr = struct {
     subs: []NameVal, // simple sub-attribute name -> value (one instance)
 };
 
+// S-57 simple attributes the S-101 catalogue models as a single-instance complex
+// attribute wrapping one *Value sub-attribute. The DRAFT rules index these
+// complexes directly (e.g. feature.verticalClearanceClosed.verticalClearanceValue,
+// feature.orientation.orientationValue), so synthesize them when the S-57 attr is
+// present. Ported from chartplotter-go's `clearances` map + the orientation alias.
+const ComplexFromSimple = struct { code: u16, complex: []const u8, sub: []const u8 };
+const complex_from_simple = [_]ComplexFromSimple{
+    .{ .code = s57.ATTR_ORIENT, .complex = "orientation", .sub = "orientationValue" },
+    .{ .code = s57.ATTR_VERCCL, .complex = "verticalClearanceClosed", .sub = "verticalClearanceValue" },
+    .{ .code = s57.ATTR_VERCLR, .complex = "verticalClearanceFixed", .sub = "verticalClearanceValue" },
+    .{ .code = s57.ATTR_VERCOP, .complex = "verticalClearanceOpen", .sub = "verticalClearanceValue" },
+    .{ .code = s57.ATTR_HORCLR, .complex = "horizontalClearanceFixed", .sub = "horizontalClearanceValue" },
+};
+
 pub const Adapted = struct {
     feature_index: usize, // index into cell.features (for geometry)
     code: []const u8, // S-101 feature class name (== rule file name)
@@ -202,6 +216,26 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             const subs = try a.alloc(NameVal, 1);
             subs[0] = .{ .name = "categoryOfZoneOfConfidenceInData", .value = catzoc };
             try complex.append(a, .{ .name = "zoneOfConfidence", .subs = subs });
+        }
+        // orientation / clearance complexes from their S-57 simple attrs, so the
+        // route + bridge rules (NavigationLine, RecommendedTrack, SpanOpening) can
+        // index feature.<complex>.<value> instead of erroring on a nil complex.
+        for (complex_from_simple) |m| {
+            const raw = f.attr(m.code) orelse continue;
+            const v = std.mem.trim(u8, raw, " ");
+            if (v.len == 0) continue;
+            const subs = try a.alloc(NameVal, 1);
+            subs[0] = .{ .name = m.sub, .value = v };
+            try complex.append(a, .{ .name = m.complex, .subs = subs });
+        }
+        // SpanOpening (opening bridges) indexes feature.verticalClearanceClosed
+        // unconditionally (a draft-rule bug), so guarantee the complex exists —
+        // empty when the bridge carries no VERCCL — and the rule reads a nil value
+        // instead of crashing on a nil complex.
+        if (std.mem.eql(u8, code, "SpanOpening")) {
+            const vc = f.attr(s57.ATTR_VERCCL);
+            const present = vc != null and std.mem.trim(u8, vc.?, " ").len > 0;
+            if (!present) try complex.append(a, .{ .name = "verticalClearanceClosed", .subs = &.{} });
         }
 
         // Derived depth attributes for under/awash dangers (S-52 DEPVAL): supply

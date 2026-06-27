@@ -147,6 +147,11 @@ pub const ATTR_VALDCO: u16 = 174;
 pub const ATTR_OBJNAM: u16 = 116;
 pub const ATTR_CATZOC: u16 = 72; // M_QUAL category of zone of confidence
 pub const ATTR_QUAPOS: u16 = 402; // spatial-level quality of position (ATTV on edges/nodes)
+pub const ATTR_ORIENT: u16 = 117; // orientation -> S-101 complex `orientation`
+pub const ATTR_HORCLR: u16 = 98; // horizontal clearance -> horizontalClearanceFixed
+pub const ATTR_VERCLR: u16 = 181; // vertical clearance -> verticalClearanceFixed
+pub const ATTR_VERCCL: u16 = 182; // vertical clearance closed -> verticalClearanceClosed
+pub const ATTR_VERCOP: u16 = 183; // vertical clearance open -> verticalClearanceOpen
 
 /// True for a QUAPOS that means "low accuracy" — S-52 draws such geometry DASHED
 /// (approximate-position line style). I.e. present and not surveyed (1), precisely
