@@ -6,6 +6,19 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Changed — interactive window is now Qt6 (QMapLibre)
+- **Replaced the GLFW / macOS-Metal MapLibre Native window with a Qt6 viewer**,
+  `chartplotter-qt` (`app/qt`), built on the QMapLibre widget (maplibre-native-qt,
+  vendored as a submodule + built by `scripts/build-qmaplibre.sh`). It loads a baked
+  chart bundle's `style.json` (PMTiles + portrayal assets) into a
+  `QMapLibre::MapWidget` — no mbgl internals, no custom FileSource.
+- **Removed** the GLFW + Metal/native-host window code (`app/chartplotter_main.cpp`,
+  `chart_native_host`, `metal_backend`, `chart_renderer_frontend`), the
+  `MLN_WITH_GLFW` CMake path + the `chartplotter` exe, the desktop/macos-desktop
+  presets, and the `chartplotter_view_*` C API. `libchartplotter` is now the headless
+  renderer (`chartplotter_render_png` + `chartplotter-render`); ChartTileSource /
+  enc_root and the offline baker are unchanged.
+
 ### Changed — engine reshaped into foundational packages
 - **`iso8211`, `s57`, `s100` are now standalone Zig packages** (`engine/src/{iso8211,
   s57,s100}/`), mirroring the Go oracle's `pkg/iso8211`, `pkg/s57`, `pkg/s100` one

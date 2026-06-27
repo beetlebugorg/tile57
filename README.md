@@ -58,8 +58,10 @@ The foundational stages are standalone Zig packages — **`iso8211`**, **`s57`**
 two implementations line up package for package.
 
 Two libraries: **`libtile57`** is the tile pipeline (`tile57_*`,
-`include/tile57.h`); **`libchartplotter`** is the embeddable chart widget that
-opens a window and draws the tiles (`chartplotter_*`, `include/chartplotter.h`).
+`include/tile57.h`); **`libchartplotter`** is the headless chart renderer
+(`chartplotter_*`, `include/chartplotter.h`) that draws a chart to a PNG. The
+interactive window is a separate **Qt6** app — `chartplotter-qt` (`app/qt`), built
+on the [QMapLibre](https://github.com/maplibre/maplibre-native-qt) widget.
 See the [C APIs](https://beetlebugorg.github.io/chartplotter-native/c-api).
 
 ## Build
@@ -71,7 +73,7 @@ Needs CMake, Ninja, a C++20 compiler, and **Zig 0.16**. Fetch the submodules
 git submodule update --init --recursive
 scripts/gen-reference.sh                       # tiles + assets + styles (needs ../chartplotter-go)
 
-cmake --preset headless                        # or: desktop / macos / macos-desktop
+cmake --preset headless                        # or: macos
 ninja -C build chartplotter-render
 build/chartplotter-render \
   ../chartplotter-go/testdata/US4MD81M.000 \   # a cell, a .pmtiles, or an ENC_ROOT dir
@@ -85,10 +87,10 @@ Full instructions are in the
 
 | Target | What it is |
 |--------|-----------|
-| `libchartplotter.a` | the embeddable chart **widget** (window + render), `chartplotter_*` |
+| `libchartplotter.a` | the headless chart **renderer** (chart → PNG), `chartplotter_*` |
 | `libtile57.a` | the Zig S-57 **tile generator** + its `tile57_*` C ABI |
-| `chartplotter` | interactive GLFW window over libchartplotter (desktop presets) |
 | `chartplotter-render` | headless host: chart → PNG (PMTiles, an S-57 cell, or an ENC_ROOT) |
+| `chartplotter-qt` | interactive **Qt6** chart window (QMapLibre); build via `scripts/build-qmaplibre.sh` |
 | `chartplotter-bake` | offline CLI: bake a cell/ENC_ROOT to PMTiles, or emit a self-contained **chart bundle** (tiles + portrayal assets + manifest) |
 
 ## Documentation

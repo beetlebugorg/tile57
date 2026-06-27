@@ -88,19 +88,24 @@ A few choices shape the whole project:
 - **Renderer is platform-native.** Metal on macOS, OpenGL via surfaceless **EGL**
   on Linux (headless render-to-PNG works displayless).
 
-## The widget + hosts
+## The renderer + the Qt viewer
 
-`libchartplotter` (`app/chartplotter.cpp`) holds the MapLibre glue — it registers
-`ChartTileSource` in the unused Mbtiles slot, builds the `Map`, and exposes:
+`libchartplotter` (`app/chartplotter.cpp`) holds the MapLibre glue for the
+**headless render path** — it registers `ChartTileSource` in the unused Mbtiles
+slot, builds an `mbgl::Map` on a `HeadlessFrontend`, and exposes
+`chartplotter_render_png(...)`. The thin exe `chartplotter-render`
+(`app/chartplotter_render_main.cpp`) wraps it.
 
-- `chartplotter_render_png(...)` — headless, via MapLibre's `HeadlessFrontend`.
-- `chartplotter_view_open/run/close(...)` — an interactive window, reusing
-  MapLibre's `GLFWView` (compiled in only with GLFW; the desktop presets).
+The **interactive window** is a separate Qt6 app, `chartplotter-qt` (`app/qt`),
+built on [QMapLibre](https://github.com/maplibre/maplibre-native-qt) — the Qt6
+MapLibre widget (`vendor/maplibre-native-qt`, built by
+`scripts/build-qmaplibre.sh`). It loads a baked chart **bundle**'s `style.json`
+(PMTiles + portrayal assets) into a `QMapLibre::MapWidget`; it links QMapLibre, not
+mbgl/libtile57 directly. (It replaced an earlier GLFW/macOS-Metal MapLibre Native
+window.)
 
-The executables are thin mains over it: `chartplotter-render`
-(`app/chartplotter_render_main.cpp`) and `chartplotter`
-(`app/chartplotter_main.cpp`). `chartplotter-bake` (`engine/tools/bake.zig`) is a
-separate pure-Zig CLI over the engine for the offline path (precache + bundles).
+`chartplotter-bake` (`engine/tools/bake.zig`) is the pure-Zig CLI over the engine
+for the offline path (tiles, bundles, styles).
 
 ## The offline chart bundle
 
@@ -140,26 +145,17 @@ generator, driven by `scripts/gen-style.sh`. Line styles, sprite/pattern atlases
 (SVG raster), and glyphs (SDF) — which light up the symbol/text layers — are in
 progress.
 
-## macOS interactive rendering notes
+## Live tile source (the render path)
 
-Getting the GLFW window smooth on macOS (Apple Silicon / Metal / ProMotion) took
-some doing. What matters, and why:
+`ChartTileSource` (`app/chart_tile_source.cpp`) backs `chartplotter-render`: it
+serves `zigtiles://{z}/{x}/{y}` straight from libtile57, generated in-process.
+Two things make that cheap: tiles carry a stable `etag` so MapLibre returns
+`notModified` and keeps its parsed tile on a re-request (no re-parse), and
+libtile57 memoizes generated/decoded tiles (`engine/src/capi.zig`, key
+`z<<48|x<<24|y`) so re-requests never re-decode. The Qt viewer doesn't use this
+path — it renders a pre-baked bundle (PMTiles) through QMapLibre.
 
-- **Conditional tile requests (the flicker fix).** `ChartTileSource`
-  (`app/chart_tile_source.cpp`) tags each tile with an `etag` and returns
-  `notModified` when MapLibre re-requests an unchanged tile. Without this, MapLibre
-  re-requested **and re-parsed** tiles 15–60×/sec, and each re-parse re-uploaded to
-  the GPU → constant flicker (even at 100–300 fps).
-- **In-process tile cache** (`engine/src/capi.zig`): generated/decoded tiles are
-  memoized (`z<<48|x<<24|y`), so re-requests never re-decode.
-- **Async present** (`app/metal_backend.mm`): `presentDrawable` + `commit`, like
-  MapLibre's own macOS SDK (`MLNMapView+Metal`). `presentsWithTransaction` +
-  `waitUntilScheduled`/`waitUntilCompleted` were all tried and all stalled or
-  flickered on the GLFW (non-`CADisplayLink`) loop — do not reintroduce them.
-- **`nextDrawable` nil-guard + `setAllowsNextDrawableTimeout(false)`**: stops the
-  whole-screen blank when the drawable pool is briefly exhausted on fast pan.
-- **On-demand render** (default): pan/zoom changes the camera every frame so it
-  still presents every frame (smooth); idle stops (low CPU), last frame retained.
-  `CHART_CONTINUOUS=1` forces present-every-frame if a display needs it.
+(The earlier GLFW / macOS-Metal interactive window — and its present-timing
+saga — is retired; QMapLibre owns rendering for the window now.)
 
 See the [**Tile Schema**](./tile-schema.md) for the vector-tile layer contract.

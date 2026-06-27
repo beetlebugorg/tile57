@@ -8,10 +8,10 @@ sidebar_position: 4
 
 chartplotter-native is two C libraries:
 
-- **`libchartplotter`** — the embeddable chart **widget**. Opens a window and
-  draws S-52 charts (MapLibre Native), or renders a chart to a PNG offscreen.
-  Header [`include/chartplotter.h`](../../include/chartplotter.h), prefix
-  `chartplotter_`.
+- **`libchartplotter`** — the headless chart **renderer**. Draws an S-52 chart to
+  a PNG offscreen with MapLibre Native. Header
+  [`include/chartplotter.h`](../../include/chartplotter.h), prefix `chartplotter_`.
+  (The interactive window is a separate Qt6 app — see below.)
 - **`libtile57`** — the S-57 **tile generator** underneath it. Opens a chart
   source (PMTiles / S-57 cell / ENC_ROOT) and serves Mapbox Vector Tiles by
   `(z, x, y)`. Header [`include/tile57.h`](../../include/tile57.h), prefix
@@ -20,7 +20,7 @@ chartplotter-native is two C libraries:
 Most embedders want `libchartplotter` (it pulls in `libtile57` + MapLibre). Reach
 for `libtile57` directly only if you have your own MVT renderer.
 
-## libchartplotter — the chart widget
+## libchartplotter — the chart renderer
 
 ```c
 #include "chartplotter.h"
@@ -35,37 +35,21 @@ int chartplotter_render_png(const char *chart_path, const char *style_path,
                             double lat, double lon, double zoom,
                             uint32_t width, uint32_t height, float pixel_ratio,
                             const char *out_png);
-
-typedef struct chartplotter_view chartplotter_view;
-typedef struct {
-    int width, height;       /* 0 -> default */
-    const char *title;       /* NULL -> default */
-    const char *style_path;  /* MapLibre style JSON (required) */
-    const char *rules_dir;   /* S-101 rules dir; NULL -> auto-resolve */
-    double lat, lon, zoom;   /* initial camera; zoom <= 0 fits the data bounds */
-} chartplotter_view_options;
-
-chartplotter_view *chartplotter_view_open(const char *chart_path,
-                                          const chartplotter_view_options *opts);
-void chartplotter_view_run(chartplotter_view *view);   /* blocks until the window closes */
-void chartplotter_view_close(chartplotter_view *view);
 ```
 
-- **Threading**: drive a `chartplotter_view` only from the thread that opened it
-  (it owns a window + run loop). `chartplotter_view_run` blocks.
-- **Window support** is compiled in only with GLFW (the desktop build presets); a
-  headless build still provides `chartplotter_render_png` and `chartplotter_view_open`
-  returns NULL.
 - One chart is active per process (the MapLibre FileSource factory is global).
 
 ```c
-/* Pop a window on an ENC_ROOT, fit to its data, run until closed. */
-chartplotter_view_options opts = {0};
-opts.style_path = "style/chart-zig-day.json";
-opts.title = "chartplotter";   /* rules_dir NULL -> auto; zoom 0 -> fit bounds */
-chartplotter_view *v = chartplotter_view_open("/path/to/ENC_ROOT", &opts);
-if (v) { chartplotter_view_run(v); chartplotter_view_close(v); }
+/* Render an ENC_ROOT to a PNG, fitting the data bounds (zoom 0 -> fit). */
+chartplotter_render_png("/path/to/ENC_ROOT", "style/chart-zig-day.json",
+                        /*rules_dir*/ NULL, 0, 0, /*zoom*/ 0,
+                        2048, 1536, 1.0f, "chart.png");
 ```
+
+The interactive window is a separate **Qt6** app — `chartplotter-qt` (`app/qt`,
+built via `scripts/build-qmaplibre.sh`) — that loads a baked chart bundle's
+`style.json` into a [QMapLibre](https://github.com/maplibre/maplibre-native-qt)
+widget; it links QMapLibre, not `libchartplotter`/mbgl directly.
 
 ## libtile57 — the tile generator
 
@@ -76,7 +60,7 @@ ABI is renderer-agnostic.
 
 :::warning Lifetime: the source must outlive the renderer
 A `tile57_source` must outlive every renderer/adapter still holding it; in the
-widget the source is captured by a long-lived `FileSource` and is closed only at
+renderer the source is captured by a long-lived `FileSource` and is closed only at
 process exit (closing it earlier is a use-after-free during `Map` teardown).
 :::
 
@@ -120,7 +104,7 @@ void               tile57_source_clear_cache(tile57_source *src);
 
 The host (not the library) walks an ENC_ROOT directory and reads the files — Zig
 0.16 gates filesystem access behind `std.Io`. `app/enc_root.hpp` (`cpn::openPath`)
-is the reference implementation; both bundled hosts use it.
+is the reference implementation, used by `chartplotter-render`.
 
 ## Diagnostics header
 

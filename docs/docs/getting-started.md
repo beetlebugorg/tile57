@@ -6,9 +6,9 @@ sidebar_position: 3
 
 # Getting Started
 
-This guide builds the project and renders a chart — first to a PNG, then in an
-interactive window. It assumes you have finished [Installation](./installation.md)
-(submodules, toolchain, reference data).
+This guide builds the project and renders a chart to a PNG. (The interactive
+window is a separate Qt6 app, `chartplotter-qt` — see below.) It assumes you have
+finished [Installation](./installation.md) (submodules, toolchain, reference data).
 
 ## What the build produces
 
@@ -17,22 +17,21 @@ Built only when Zig 0.16 is found:
 | Target | Kind | What it is |
 |--------|------|-----------|
 | `libtile57.a` | static lib | the Zig S-57 tile generator + its `tile57_*` [C ABI](./c-api.md). |
-| `libchartplotter.a` | static lib | the chart **widget** (window + render) over MapLibre + libtile57; `chartplotter_*` [C API](./c-api.md). |
+| `libchartplotter.a` | static lib | the headless chart **renderer** (chart → PNG) over MapLibre + libtile57; `chartplotter_*` [C API](./c-api.md). |
 | `chartplotter-render` | executable | headless host: renders a chart to a PNG (PMTiles, an S-57 cell, or an ENC_ROOT). |
-| `chartplotter` | executable | interactive GLFW window over libchartplotter. Only built with the desktop presets. |
-| `chartplotter-bake` | executable | offline CLI: pre-bake a cell to a PMTiles archive. |
+| `chartplotter-bake` | executable | offline CLI: bake a cell/ENC_ROOT to PMTiles or a self-contained chart bundle. |
 
-MapLibre Native's own demo tools (`mbgl-render`, `mbgl-glfw`) also build, but they
-are not part of our code.
+The interactive **Qt6 window** (`chartplotter-qt`, `app/qt`) is built separately
+via `scripts/build-qmaplibre.sh` — it links the [QMapLibre](https://github.com/maplibre/maplibre-native-qt)
+widget and shows a baked chart bundle. MapLibre Native's own demo tools
+(`mbgl-render`) also build, but they are not part of our code.
 
 ## Presets
 
 | Preset | Build dir | Renderer | Our binaries |
 |--------|-----------|----------|--------------|
 | `headless` | `build/` | Linux surfaceless EGL | `chartplotter-render` |
-| `desktop`  | `build-desktop/` | Linux OpenGL + GLFW + Wayland | `chartplotter`, `chartplotter-render` |
 | `macos`    | `build-macos/` | macOS Metal (headless) | `chartplotter-render` |
-| `macos-desktop` | `build-macos-desktop/` | macOS Metal + GLFW | `chartplotter`, `chartplotter-render` |
 
 ## Step 1: Render a chart to a PNG (headless)
 
@@ -91,26 +90,24 @@ selection yet, so overlapping cells of different scales both render. See
 [Known limitations](./limitations.md).
 :::
 
-## Step 3: Open the interactive window
+## Step 3: Open the interactive window (Qt6)
 
-`chartplotter` opens a real pannable/zoomable window. Drag to pan, scroll to
-zoom. It takes a PMTiles archive **or** a raw `.000` cell.
+`chartplotter-qt` opens a real pannable/zoomable window over a baked chart
+**bundle**, on the [QMapLibre](https://github.com/maplibre/maplibre-native-qt)
+widget. Build it once (a heavy build of QMapLibre), then point it at a bundle's
+style:
 
 ```sh
-# Linux (Wayland):                         macOS (Metal):
-cmake --preset desktop                     # cmake --preset macos-desktop
-ninja -C build-desktop chartplotter        # ninja -C build-macos-desktop chartplotter
+scripts/build-qmaplibre.sh                 # -> build/qt/chartplotter-qt (needs Qt6)
 
-# frames the data extent if lat/lon/zoom are omitted:
-build-desktop/chartplotter \
-  reference/tiles/annapolis.pmtiles \
-  style/chart-zig-day.json 38.978 -76.487 13
+# bake a bundle, then view it (needs a display):
+engine/zig-out/bin/chartplotter-bake bundle \
+  ../chartplotter-go/testdata/US5MD1MC.000 -o out
+build/qt/chartplotter-qt out/assets/style-day.json 38.97 -76.49 13
 ```
 
-:::note Linux X11
-On an X11 session instead of Wayland, reconfigure with
-`-DMLN_WITH_WAYLAND=OFF -DMLN_WITH_X11=ON`.
-:::
+Drag to pan, scroll to zoom. The viewer renders the bundle's PMTiles through
+QMapLibre — independent of libtile57/mbgl.
 
 ## Pre-baking tiles to PMTiles
 
@@ -130,8 +127,8 @@ chartplotter-bake inspect charts.pmtiles  # zoom range + tile counts
 chartplotter-bake version
 ```
 
-The archive then renders through the same hosts (`chartplotter charts.pmtiles
-style/chart-zig-day.json`).
+The archive then renders through `chartplotter-render`; a baked **bundle** also
+renders in the Qt window (`chartplotter-qt`).
 
 :::note Baker portrayal
 The baker runs the full embedded-Lua S-101 portrayal — the same rule engine as the
@@ -158,9 +155,6 @@ build/chartplotter-render --s101portray <rules-dir>   # a real DepthArea rule em
   cells. A fallback only: it applies when the host passes `NULL` for
   the `rules_dir` argument (the hosts auto-resolve + pass it). Defaults to the vendored
   catalogue at `vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.
-- `CHART_CONTINUOUS=1` (interactive window) — present every frame instead of the
-  default on-demand rendering. An escape hatch for displays where the on-demand
-  path goes idle-blank; not normally needed.
 
-See [**Architecture → macOS rendering notes**](./architecture.md#macos-interactive-rendering-notes)
-for why the interactive window is set up the way it is.
+See the [**Architecture**](./architecture.md) page for how the renderer, the Qt
+viewer, and the offline baker fit together.

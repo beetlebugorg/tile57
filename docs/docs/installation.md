@@ -37,10 +37,14 @@ Metal works out of the box.
 ### Linux (Arch shown; adapt for your distro)
 
 ```sh
-sudo pacman -S --needed cmake ninja clang python-pillow \
-  glfw wayland libxkbcommon libepoxy   # glfw + wayland only for the window
+sudo pacman -S --needed cmake ninja clang python-pillow libepoxy
+sudo pacman -S --needed qt6-base       # for the interactive Qt window (chartplotter-qt)
 sudo pacman -S --needed ccache         # optional, for fast rebuilds
 ```
+
+The Qt window (`chartplotter-qt`) is built separately via
+`scripts/build-qmaplibre.sh`, which builds [QMapLibre](https://github.com/maplibre/maplibre-native-qt)
+from the `vendor/maplibre-native-qt` submodule against your system Qt6.
 
 ### Zig 0.16.0 (required)
 

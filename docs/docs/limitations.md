@@ -84,9 +84,10 @@ LRU). The catalogue opens in seconds; memory stays bounded. Caveats:
 ## Native / platform
 
 - **No platform chrome yet.** The current hosts are a headless PNG renderer
-  (`chartplotter-render`) and a bare GLFW window (`chartplotter`). Real
-  application chrome (SwiftUI on macOS, GTK4 on Linux) is future work.
-- **macOS idle-blank escape hatch.** The interactive window renders on-demand by
-  default. On displays where the layer goes blank when drawing stops, set
-  `CHART_CONTINUOUS=1` to present every frame (see
-  [Architecture → macOS rendering notes](./architecture.md#macos-interactive-rendering-notes)).
+  (`chartplotter-render`) and a bare Qt6 map window (`chartplotter-qt`, built on
+  the QMapLibre widget). Real application chrome (menus, chart library, instrument
+  panels) is future work.
+- **The Qt window renders a pre-baked bundle**, not live tiles. `chartplotter-qt`
+  loads a chart bundle's PMTiles via QMapLibre; producing the bundle
+  (`chartplotter-bake bundle`) is a separate offline step. Live in-process
+  generation (`zigtiles://`) currently only backs the headless PNG renderer.
