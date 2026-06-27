@@ -30,6 +30,12 @@ pub const Portrayal = struct {
     // standard (1) when none carries a category band. Surfaced as the MVT `cat`
     // property so the mariner's Base/Standard/Other selection filters client-side.
     cat: i64 = 1,
+    // Date-dependent validity (S-52 §10.4.1.1), from the feature-level `Date:start,
+    // end` instruction. S-100 truncated dates: a "--" prefix marks a recurring
+    // month-day bound. Empty when the feature is undated. Surfaced as the MVT
+    // date_start/date_end/date_recurring properties.
+    date_start: []const u8 = "",
+    date_end: []const u8 = "",
 };
 
 /// Display-category rank for a viewing group, from its leading digit (S-52 §10.3.4):
@@ -66,6 +72,8 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var fill_token: ?[]const u8 = null;
     var draw_prio: i64 = 0; // feature DrawingPriority = max seen in the stream
     var cat: i64 = -1; // most-visible display-category rank; -1 until a banded VG is seen
+    var date_start: []const u8 = "";
+    var date_end: []const u8 = "";
     // running state set by modifier instructions, applied at the next verb
     var cur_width: f64 = 1;
     var cur_color: []const u8 = "CHBLK";
@@ -125,6 +133,10 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             cur_tgrp = vg; // for a text instruction, arg 0 is its S-52 text group
             const rank = categoryRank(vg);
             if (rank >= 0 and (cat < 0 or rank < cat)) cat = rank;
+        } else if (std.mem.eql(u8, key, "Date")) {
+            // Feature-level validity period "start,end" (either bound may be empty).
+            date_start = std.mem.trim(u8, nthCsv(val, 0), " ");
+            date_end = std.mem.trim(u8, nthCsv(val, 1), " ");
         }
         // DisplayPlane / AlertReference / etc. are display metadata we don't map yet.
     }
@@ -137,6 +149,8 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         .texts = texts.items,
         .draw_prio = draw_prio,
         .cat = if (cat < 0) 1 else cat, // no banded VG -> Standard
+        .date_start = date_start,
+        .date_end = date_end,
     };
 }
 

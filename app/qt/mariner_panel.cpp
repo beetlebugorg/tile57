@@ -118,7 +118,23 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     metaBounds_ = new QCheckBox(QStringLiteral("Cell / coverage boundaries"));
     metaBounds_->setChecked(s_.showMetaBounds);
     ovForm->addWidget(metaBounds_);
+    isoDangersShallow_ = new QCheckBox(QStringLiteral("Isolated dangers in shallow water"));
+    isoDangersShallow_->setChecked(s_.showIsolatedDangersShallow);
+    ovForm->addWidget(isoDangersShallow_);
     root->addWidget(ovBox);
+
+    // -- Date-dependent display (S-52 §10.4.1.1) --
+    auto *dateBox = new QGroupBox(QStringLiteral("Dates"));
+    auto *dateCol = new QVBoxLayout(dateBox);
+    dateCol->setContentsMargins(12, 10, 12, 12);
+    dateCol->setSpacing(8);
+    dateDependent_ = new QCheckBox(QStringLiteral("Hide features out of date"));
+    dateDependent_->setChecked(s_.dateDependent);
+    dateCol->addWidget(dateDependent_);
+    highlightDate_ = new QCheckBox(QStringLiteral("Highlight date-dependent"));
+    highlightDate_->setChecked(s_.highlightDateDependent);
+    dateCol->addWidget(highlightDate_);
+    root->addWidget(dateBox);
 
     root->addStretch(1);
 
@@ -134,6 +150,9 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     connect(dataQuality_, &QCheckBox::toggled, this, onCheck);
     connect(infoCallouts_, &QCheckBox::toggled, this, onCheck);
     connect(metaBounds_, &QCheckBox::toggled, this, onCheck);
+    connect(isoDangersShallow_, &QCheckBox::toggled, this, onCheck);
+    connect(dateDependent_, &QCheckBox::toggled, this, onCheck);
+    connect(highlightDate_, &QCheckBox::toggled, this, onCheck);
     connect(textNames_, &QCheckBox::toggled, this, onCheck);
     connect(lightDescriptions_, &QCheckBox::toggled, this, onCheck);
     connect(textOther_, &QCheckBox::toggled, this, onCheck);
@@ -154,6 +173,9 @@ void MarinerPanel::pull() {
     s_.dataQuality = dataQuality_->isChecked();
     s_.showInformCallouts = infoCallouts_->isChecked();
     s_.showMetaBounds = metaBounds_->isChecked();
+    s_.showIsolatedDangersShallow = isoDangersShallow_->isChecked();
+    s_.dateDependent = dateDependent_->isChecked();
+    s_.highlightDateDependent = highlightDate_->isChecked();
     s_.textNames = textNames_->isChecked();
     s_.showLightDescriptions = lightDescriptions_->isChecked();
     s_.textOther = textOther_->isChecked();

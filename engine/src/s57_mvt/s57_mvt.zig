@@ -143,13 +143,33 @@ fn featureScamin(f: s57.Feature) ?i64 {
     return if (n > 0) n else null;
 }
 
-/// Append the metadata tags shared by every emitFromInstr feature: the S-52 draw
-/// priority + display-category rank (always) and, for SCAMIN-gated features, the
-/// 1:N denominator.
-fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), draw_prio: i64, cat: i64, scamin: ?i64) !void {
-    try props.append(a, .{ .key = "draw_prio", .value = .{ .int = draw_prio } });
-    try props.append(a, .{ .key = "cat", .value = .{ .int = cat } });
-    if (scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
+/// Feature-level metadata shared by every primitive a feature emits.
+const Meta = struct {
+    prio: i64,
+    cat: i64,
+    scamin: ?i64,
+    date_start: []const u8 = "",
+    date_end: []const u8 = "",
+};
+
+/// Append the shared metadata tags: S-52 draw priority + display-category rank
+/// (always), the SCAMIN 1:N denominator (when gated), and the date-dependent
+/// validity tags (when dated).
+fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
+    try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
+    try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
+    if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
+    // Date-dependent display (S-52 §10.4.1.1): recurring iff a "--" month-day prefix;
+    // strip it so the client compares MMDD (recurring) / YYYYMMDD (fixed).
+    if (m.date_start.len > 0 or m.date_end.len > 0) {
+        const recurring: i64 = if (std.mem.startsWith(u8, m.date_start, "--") or
+            std.mem.startsWith(u8, m.date_end, "--")) 1 else 0;
+        try props.append(a, .{ .key = "date_recurring", .value = .{ .int = recurring } });
+        const ds = std.mem.trimStart(u8, m.date_start, "-");
+        const de = std.mem.trimStart(u8, m.date_end, "-");
+        if (ds.len > 0) try props.append(a, .{ .key = "date_start", .value = .{ .string = ds } });
+        if (de.len > 0) try props.append(a, .{ .key = "date_end", .value = .{ .string = de } });
+    }
 }
 
 /// Per-feature cached line/area geometry for a cell (indexed by feature index;
@@ -177,13 +197,12 @@ fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.
 
 fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, instr: []const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     const p = try s101.parse(a, instr);
-    const prio = p.draw_prio;
-    const cat = p.cat;
 
     // Route each feature into its base layer or the *_scamin bucket depending on
     // whether it carries a SCAMIN (1:N) display limit. Same geometry/properties
     // either way; the bucket lets the style gate the feature below its scale.
     const scamin = featureScamin(f);
+    const meta = Meta{ .prio = p.draw_prio, .cat = p.cat, .scamin = scamin, .date_start = p.date_start, .date_end = p.date_end };
     const areas_l = if (scamin != null) L.areas_scamin else L.areas;
     const apat_l = if (scamin != null) L.area_patterns_scamin else L.area_patterns;
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
@@ -205,7 +224,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
             try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
             try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-            try appendMeta(a, &props, prio, cat, scamin);
+            try appendMeta(a, &props, meta);
             try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         }
         for (p.texts) |t| {
@@ -214,7 +233,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
             try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
             try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
-            try appendMeta(a, &props, prio, cat, scamin);
+            try appendMeta(a, &props, meta);
             try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         }
         return;
@@ -251,7 +270,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
                 parts[0] = ring;
                 var props = std.ArrayList(mvt.Prop).empty;
                 try props.append(a, .{ .key = "color_token", .value = .{ .string = token } });
-                try appendMeta(a, &props, prio, cat, scamin);
+                try appendMeta(a, &props, meta);
                 try areas_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
             }
         }
@@ -262,7 +281,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
                 parts[0] = ring;
                 var props = std.ArrayList(mvt.Prop).empty;
                 try props.append(a, .{ .key = "pattern_name", .value = .{ .string = pat } });
-                try appendMeta(a, &props, prio, cat, scamin);
+                try appendMeta(a, &props, meta);
                 try apat_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
             }
         }
@@ -288,7 +307,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             try props.append(a, .{ .key = "width_px", .value = .{ .double = ln.width } });
             try props.append(a, .{ .key = "dash", .value = .{ .string = dash } });
             if (valdco) |v| try props.append(a, .{ .key = "valdco", .value = .{ .double = v } });
-            try appendMeta(a, &props, prio, cat, scamin);
+            try appendMeta(a, &props, meta);
             try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
         }
     }
@@ -310,7 +329,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
                     try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
                     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
                     try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
-                    try appendMeta(a, &props, prio, cat, scamin);
+                    try appendMeta(a, &props, meta);
                     try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
                 }
             }
@@ -331,8 +350,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
     const points_l = if (scamin != null) L.points_scamin else L.points;
     const texts_l = if (scamin != null) L.texts_scamin else L.texts;
-    const prio: i64 = 6;
-    const cat: i64 = 1; // native fallback (no portrayal) -> Standard display
+    const meta = Meta{ .prio = 6, .cat = 1, .scamin = scamin }; // native fallback (no portrayal)
 
     // Dashed CHGRD boundary on each ring (clipped to the tile).
     for (geo_parts) |gp| {
@@ -348,7 +366,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHGRD" } });
         try props.append(a, .{ .key = "width_px", .value = .{ .double = 1 } });
         try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
-        try appendMeta(a, &props, prio, cat, scamin);
+        try appendMeta(a, &props, meta);
         try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 
@@ -365,7 +383,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     try sprops.append(a, .{ .key = "symbol_name", .value = .{ .string = "SWPARE51" } });
     try sprops.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
     try sprops.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-    try appendMeta(a, &sprops, prio, cat, scamin);
+    try appendMeta(a, &sprops, meta);
     try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = sprops.items });
 
     if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| {
@@ -374,7 +392,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         try tprops.append(a, .{ .key = "text", .value = .{ .string = label } });
         try tprops.append(a, .{ .key = "color_token", .value = .{ .string = "CHBLK" } });
         try tprops.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
-        try appendMeta(a, &tprops, prio, cat, scamin);
+        try appendMeta(a, &tprops, meta);
         try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = tprops.items });
     }
 }
@@ -394,7 +412,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 
     const scamin = featureScamin(f);
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const cat: i64 = 1; // native fallback (no portrayal) -> Standard display
+    const meta = Meta{ .prio = 6, .cat = 1, .scamin = scamin }; // native fallback (no portrayal)
     for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
@@ -408,7 +426,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         try props.append(a, .{ .key = "color_token", .value = .{ .string = color } });
         try props.append(a, .{ .key = "width_px", .value = .{ .double = width } });
         try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
-        try appendMeta(a, &props, 6, cat, scamin);
+        try appendMeta(a, &props, meta);
         try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 }

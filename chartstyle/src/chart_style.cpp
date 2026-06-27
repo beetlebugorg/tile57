@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdio>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -151,6 +153,45 @@ json textGroupFilter(const MarinerSettings &m) {
     return any;
 }
 
+// Date-dependent display (S-52 §10.4.1.1): a dated feature shows only when the
+// viewing date falls in its validity period. Undated features (no date_recurring)
+// always show. Recurring ranges compare MMDD with year-wrap; fixed ranges compare
+// YYYYMMDD. Mirrors the Go client's dateFilter. `today` is "YYYYMMDD".
+json dateFilter(const std::string &today) {
+    const std::string mmdd = today.size() >= 8 ? today.substr(4) : today;
+    const json T = json::array({"case", json::array({"==", coalesce(get("date_recurring"), 0), 1}), mmdd, today});
+    const json varT = json::array({"var", "T"}), varS = json::array({"var", "S"}), varE = json::array({"var", "E"});
+    const json hasS = json::array({"has", "date_start"}), hasE = json::array({"has", "date_end"});
+    const json geTS = json::array({">=", varT, varS}), leTE = json::array({"<=", varT, varE});
+    // Both bounds: normal range S<=T<=E, or (wrapped, S>E) T>=S OR T<=E.
+    const json inRange = json::array({"case", json::array({"<=", varS, varE}),
+                                      json::array({"all", geTS, leTE}), json::array({"any", geTS, leTE})});
+    const json body = json::array({"case", json::array({"all", hasS, hasE}), inRange, hasS, geTS, hasE, leTE, true});
+    const json letExpr = json::array({"let", "T", T, "S", coalesce(get("date_start"), ""), "E",
+                                      coalesce(get("date_end"), ""), body});
+    // Undated (no date_recurring) always shows; else evaluate the period.
+    return json::array({"any", json::array({"!", json::array({"has", "date_recurring"})}), letExpr});
+}
+
+// The viewing date "YYYYMMDD": the mariner's pinned date if set, else today.
+std::string viewingDate(const MarinerSettings &m) {
+    if (m.dateView.size() == 8) {
+        bool digits = true;
+        for (char c : m.dateView) digits = digits && (c >= '0' && c <= '9');
+        if (digits) return m.dateView;
+    }
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[9];
+    std::snprintf(buf, sizeof buf, "%04d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return std::string(buf);
+}
+
 // AND extra clauses into a layer's existing filter (clauses first, base last).
 void andInto(json &layer, const std::vector<json> &clauses) {
     json all = json::array({"all"});
@@ -219,6 +260,10 @@ std::string buildStyle(const std::string &templateJson, const MarinerSettings &m
             clauses.push_back(categoryFilter(m));
             if (!m.showInformCallouts) // INFORM01 "additional information" callouts off
                 clauses.push_back(json::array({"!=", coalesce(get("symbol_name"), ""), "INFORM01"}));
+            if (!m.highlightDateDependent) // CHDATD01 date-dependent highlight (opt-in)
+                clauses.push_back(json::array({"!=", coalesce(get("symbol_name"), ""), "CHDATD01"}));
+            if (m.dateDependent) // hide features outside their validity period
+                clauses.push_back(dateFilter(viewingDate(m)));
             // Meta-object coverage/region boundary lines (cell boundaries), gated
             // separately from "Other" (off by default).
             if (!m.showMetaBounds)

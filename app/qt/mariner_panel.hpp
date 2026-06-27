@@ -48,6 +48,9 @@ private:
     QCheckBox *dataQuality_ = nullptr;
     QCheckBox *infoCallouts_ = nullptr;
     QCheckBox *metaBounds_ = nullptr;
+    QCheckBox *isoDangersShallow_ = nullptr;
+    QCheckBox *dateDependent_ = nullptr;
+    QCheckBox *highlightDate_ = nullptr;
 };
 
 } // namespace cpn
