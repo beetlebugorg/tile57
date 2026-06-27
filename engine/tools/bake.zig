@@ -37,6 +37,36 @@ fn resolveRulesDir(explicit: ?[]const u8) []const u8 {
     return "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
 }
 
+// Flag cursor shared by the subcommands: walk argv[2..], pull a value (or an int)
+// for a flag, and on a missing/bad value print usage and yield null so the caller
+// can `orelse return`. next() pre-increments, so its first call returns argv[2].
+const Flags = struct {
+    args: []const [:0]const u8,
+    i: usize = 1,
+
+    fn next(f: *Flags) ?[]const u8 {
+        f.i += 1;
+        return if (f.i < f.args.len) f.args[f.i] else null;
+    }
+    fn val(f: *Flags, flag: []const u8) ?[]const u8 {
+        f.i += 1;
+        if (f.i >= f.args.len) {
+            std.debug.print("error: missing value for {s}\n\n", .{flag});
+            printUsage();
+            return null;
+        }
+        return f.args[f.i];
+    }
+    fn int(f: *Flags, comptime T: type, flag: []const u8) ?T {
+        const v = f.val(flag) orelse return null;
+        return std.fmt.parseInt(T, v, 10) catch {
+            std.debug.print("error: {s} must be an integer\n\n", .{flag});
+            printUsage();
+            return null;
+        };
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -310,25 +340,16 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var maxzoom: u8 = DEFAULT_MAXZOOM;
     var updates = std.ArrayList([]const u8).empty;
 
-    var i: usize = 2; // skip exe + "bake"
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for -o/--output");
-            out = args[i];
+            out = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--rules")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --rules");
-            rules = args[i];
+            rules = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--minzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --minzoom");
-            minzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--minzoom must be an integer");
+            minzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--maxzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --maxzoom");
-            maxzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+            maxzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("error: unknown flag '{s}'\n\n", .{arg});
             return printUsage();
@@ -399,13 +420,10 @@ fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, ou
 fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var catalog: ?[]const u8 = null;
     var out: ?[]const u8 = null;
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for -o/--output");
-            out = args[i];
+            out = f.val(arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (catalog == null) {
@@ -435,33 +453,20 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     var maxzoom: u8 = DEFAULT_MAXZOOM;
     var updates = std.ArrayList([]const u8).empty;
 
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for -o/--output");
-            out = args[i];
+            out = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--rules")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --rules");
-            rules = args[i];
+            rules = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--catalog")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --catalog");
-            catalog = args[i];
+            catalog = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--created")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --created");
-            created = args[i];
+            created = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--minzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --minzoom");
-            minzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--minzoom must be an integer");
+            minzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--maxzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --maxzoom");
-            maxzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+            maxzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -550,45 +555,26 @@ fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     var out: ?[]const u8 = null;
     var scheme: []const u8 = "day";
     var opts = assets.StyleOpts{ .scheme = "day", .colortables_json = "" };
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for -o/--output");
-            out = args[i];
+            out = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--colortables")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --colortables");
-            colortables = args[i];
+            colortables = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--scheme")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --scheme");
-            scheme = args[i];
+            scheme = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--source-tiles")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --source-tiles");
-            opts.source_tiles = args[i];
+            opts.source_tiles = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--sprite")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --sprite");
-            opts.sprite = args[i];
+            opts.sprite = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--glyphs")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --glyphs");
-            opts.glyphs = args[i];
+            opts.glyphs = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--pmtiles-url")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --pmtiles-url");
-            opts.pmtiles_url = args[i];
+            opts.pmtiles_url = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--minzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --minzoom");
-            opts.minzoom = std.fmt.parseInt(u32, args[i], 10) catch return usageErr("--minzoom must be an integer");
+            opts.minzoom = f.int(u32, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--maxzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --maxzoom");
-            opts.maxzoom = std.fmt.parseInt(u32, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+            opts.maxzoom = f.int(u32, arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (catalog == null) {
@@ -674,25 +660,16 @@ fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !vo
     var minzoom: u8 = 0;
     var maxzoom: u8 = 18;
 
-    var i: usize = 2; // skip exe + "bake-root"
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for -o/--output");
-            out = args[i];
+            out = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--rules")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --rules");
-            rules = args[i];
+            rules = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--minzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --minzoom");
-            minzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--minzoom must be an integer");
+            minzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--maxzoom")) {
-            i += 1;
-            if (i >= args.len) return usageErr("missing value for --maxzoom");
-            maxzoom = std.fmt.parseInt(u8, args[i], 10) catch return usageErr("--maxzoom must be an integer");
+            maxzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("error: unknown flag '{s}'\n\n", .{arg});
             return printUsage();
