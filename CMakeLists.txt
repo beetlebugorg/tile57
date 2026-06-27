@@ -143,10 +143,13 @@ if(ZIG_EXECUTABLE)
       target_sources(chartplotter_widget PRIVATE
         ${MLN_DIR}/platform/glfw/glfw_metal_backend.mm
         ${CMAKE_CURRENT_SOURCE_DIR}/app/metal_backend.mm
-        ${CMAKE_CURRENT_SOURCE_DIR}/app/chart_renderer_frontend.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/chart_renderer_frontend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/app/chart_native_host.mm)
+      # Cocoa for the native window host (NSWindow/NSApplication/NSEvent);
+      # MetalKit for MTKView; QuartzCore/Metal/Foundation for metal-cpp/CAMetalLayer.
       target_link_libraries(chartplotter_widget PUBLIC mbgl-vendor-metal-cpp
         "-framework QuartzCore" "-framework Metal" "-framework Foundation"
-        "-framework MetalKit")
+        "-framework MetalKit" "-framework Cocoa")
     endif()
     if(MLN_WITH_EGL)
       target_compile_definitions(chartplotter_widget PRIVATE MBGL_WITH_EGL=1)
