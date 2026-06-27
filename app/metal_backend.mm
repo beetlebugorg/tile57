@@ -155,8 +155,10 @@ MetalBackend::MetalBackend(NSWindow *window)
   view.paused = NO;
   resource.mtlView = view;
 
-  window.contentView.wantsLayer = YES;
-  [window.contentView addSubview:view];
+  // Make the MTKView the window's content view. A bare added subview can render
+  // (display link fires, drawable is valid) yet never composite to screen =
+  // blank window; being the contentView avoids that and auto-sizes to the window.
+  window.contentView = view;
 }
 
 mbgl::gfx::Renderable &MetalBackend::getDefaultRenderable() { return *this; }
