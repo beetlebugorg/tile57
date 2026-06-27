@@ -11,6 +11,7 @@
 #include <mbgl/mtl/renderable_resource.hpp>
 
 #include <cstdio>
+#include <cstdlib>
 
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
@@ -100,9 +101,31 @@ public:
                    (double)mtlView.drawableSize.width, (double)mtlView.drawableSize.height);
       logged = true;
     }
+    // Isolation test (CHART_TEST_CLEAR=1): clear to red + present, bypassing
+    // mbgl. Red window => MTKView presentation works and the blank is mbgl's
+    // render target/handoff; still blank => MTKView itself isn't presenting.
+    if (std::getenv("CHART_TEST_CLEAR")) {
+      MTLRenderPassDescriptor *rpd = mtlView.currentRenderPassDescriptor;
+      if (rpd) {
+        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rpd.colorAttachments[0].clearColor = MTLClearColorMake(1.0, 0.0, 0.0, 1.0);
+        id<MTLCommandBuffer> cb = [testQueue() commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+        [enc endEncoding];
+        if (mtlView.currentDrawable) [cb presentDrawable:mtlView.currentDrawable];
+        [cb commit];
+      }
+      return;
+    }
     if (!renderCallback) return;
     if (mtlView.currentRenderPassDescriptor == nil) return;
     renderCallback();
+  }
+
+  // Lazily-created queue for the CHART_TEST_CLEAR isolation path only.
+  id<MTLCommandQueue> testQueue() {
+    if (!testCommandQueue) testCommandQueue = [mtlView.device newCommandQueue];
+    return testCommandQueue;
   }
   void setRenderCallback(std::function<void()> cb) { renderCallback = std::move(cb); }
 
@@ -110,6 +133,7 @@ public:
   ChartMTKViewDelegate *delegate = nil;
   MTKView *mtlView = nil;
   id<MTLCommandQueue> commandQueue = nil;
+  id<MTLCommandQueue> testCommandQueue = nil; // CHART_TEST_CLEAR only
   id<MTLCommandBuffer> commandBuffer = nil;
   mtl::MTLCommandBufferPtr commandBufferPtr;
   mutable mtl::MTLRenderPassDescriptorPtr cachedRenderPassDescriptor;
