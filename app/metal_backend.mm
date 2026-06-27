@@ -19,6 +19,8 @@
 #include <Metal/Metal.hpp>
 #include <QuartzCore/CAMetalLayer.hpp>
 
+#include <cstdlib>
+
 namespace mbgl {
 
 using namespace mtl;
@@ -37,6 +39,17 @@ public:
     // stalls on a non-CADisplayLink loop) or per-frame GPU waits.
     swapchain->setMaximumDrawableCount(3);
     swapchain->setAllowsNextDrawableTimeout(false);
+    // Optional frame pacing. The GLFW host renders on a free-running 60Hz libuv
+    // timer that is NOT phase-locked to the panel's vsync, so on a fixed-refresh
+    // display (esp. 144Hz) presents drift across refresh windows -> random
+    // dropped/duplicated frames = flicker. CHART_FPS=<hz> paces each present to
+    // one frame per refresh interval via presentDrawableAfterMinimumDuration,
+    // evening out the cadence. Unset = current behaviour (plain presentDrawable).
+    // Tunable live (no rebuild): try your refresh (e.g. 144), and half/double it.
+    if (const char* fps = std::getenv("CHART_FPS")) {
+      const double hz = std::atof(fps);
+      if (hz > 0.0) minPresentDuration = 1.0 / hz;
+    }
   }
 
   void setBackendSize(mbgl::Size size_) {
@@ -103,12 +116,17 @@ public:
   }
 
   void swap() override {
-    // Async present (presentDrawable + commit), exactly like MapLibre's macOS
+    // Async present (presentDrawable + commit), like MapLibre's macOS
     // MLNMapView+Metal swap(). No presentsWithTransaction / waitUntil* — those
-    // stall on the GLFW (non-CADisplayLink) loop. Display smoothness comes from
-    // the host presenting every frame.
+    // stall on the GLFW (non-CADisplayLink) loop. With CHART_FPS set, pace each
+    // present to a minimum on-screen duration to smooth the cadence; otherwise
+    // present as soon as the frame is ready (unchanged default).
     if (surface) {
-      commandBuffer->presentDrawable(surface.get());
+      if (minPresentDuration > 0.0) {
+        commandBuffer->presentDrawableAfterMinimumDuration(surface.get(), minPresentDuration);
+      } else {
+        commandBuffer->presentDrawable(surface.get());
+      }
     }
     commandBuffer->commit();
     commandBuffer.reset();
@@ -141,6 +159,9 @@ private:
   gfx::Texture2DPtr stencilTexture;
   mbgl::Size size;
   bool buffersInvalid = true;
+  // >0 -> presentDrawableAfterMinimumDuration(this) for frame pacing; 0 -> plain
+  // present. Set from CHART_FPS (= 1.0 / hz) in the ctor.
+  double minPresentDuration = 0.0;
 };
 
 }  // namespace mbgl
