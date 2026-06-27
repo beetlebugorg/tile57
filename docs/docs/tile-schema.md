@@ -10,7 +10,8 @@ The vector tiles use a fixed set of layers and fields. The style depends on this
 schema, so the names are a contract — it matches
 [chartplotter-go's schema](https://beetlebugorg.github.io/chartplotter/tile-schema)
 so the same generated S-52 style works against either. Do not rename a layer or a
-field without updating `style/build_style.py` to match **and bumping the schema
+field without updating the style generator (`engine/src/assets/style.zig`, with
+`style/build_style.py` kept as its parity oracle) to match **and bumping the schema
 version**.
 
 This vocabulary is versioned as **`tile57/1`**. A

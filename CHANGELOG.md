@@ -16,16 +16,22 @@ C ABI is not yet frozen.
 ### Added — offline chart-bundle baker
 - **`chartplotter-bake bundle <cell> -o <dir>`** emits a self-contained,
   relocatable **chart bundle**: `tiles/chart.pmtiles` + `assets/colortables.json` +
-  `manifest.json`. The tiles carry S-52 colour *tokens* (palette-independent); the
-  assets carry the RGB. Both halves come from the same S-101 catalogue and are
-  stamped with a `schema_version` (`tile57/1`) so a renderer can refuse a mismatched
-  bundle.
+  `assets/style-{day,dusk,night}.json` + `manifest.json`. The tiles carry S-52 colour
+  *tokens* (palette-independent); the assets carry the RGB and the style layers. Both
+  halves come from the same S-101 catalogue and are stamped with a `schema_version`
+  (`tile57/1`) so a renderer can refuse a mismatched bundle.
 - **New `assets` module** (mirrors the Go oracle's `internal/engine/assets.EmitS101`)
   and **`chartplotter-bake assets <catalog-dir> -o <dir>`** emit the portrayal
   assets independent of a cell. First artifact: `colortables.json` (token → hex per
   day/dusk/night palette, parsed from `ColorProfiles/colorProfile.xml`) — **byte-
-  identical to the Go oracle's output**. Line styles, sprite/pattern atlases, glyphs,
-  and the `style.json` layer set (port of `build_style.py`/`s52-style.mjs`) are next.
+  identical to the Go oracle's output**.
+- **MapLibre `style.json` generation** (`assets/style.zig`, a port of
+  `style/build_style.py`): `chartplotter-bake style` emits one style per palette, and
+  `bundle` writes the three styles + references them in `manifest.portrayal.styles`,
+  so a bundle is **directly renderable**. Verified layer-for-layer identical to
+  `build_style.py` (27 layers × 3 palettes) by `scripts/check-style-parity.sh`. Line
+  styles, sprite/pattern atlases (SVG raster), and glyphs (SDF) — to light up the
+  symbol/text layers — are next.
 
 ### Added — on-demand ENC_ROOT + offline baker
 - **Lazy on-demand tile generation (the new default for an ENC_ROOT).** Pointing a

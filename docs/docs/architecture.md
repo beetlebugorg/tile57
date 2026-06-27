@@ -108,9 +108,10 @@ portrayal that renders them travel together:
 
 ```
 chart-bundle/
-  manifest.json          pins schema_version + couples the two halves
-  tiles/chart.pmtiles    the DATA half — semantic colour *tokens*, palette-independent
-  assets/colortables.json the PORTRAYAL half — token -> hex per day/dusk/night (the only RGB)
+  manifest.json             pins schema_version + couples the two halves
+  tiles/chart.pmtiles       the DATA half — semantic colour *tokens*, palette-independent
+  assets/colortables.json   the PORTRAYAL half — token -> hex per day/dusk/night (the only RGB)
+  assets/style-{day,dusk,night}.json  the MapLibre style layers, colours pre-resolved per palette
 ```
 
 This works because the tiles carry S-52 colour **tokens**, never RGB. The two
@@ -125,13 +126,16 @@ Baker subcommands (`chartplotter-bake`):
 |-----------|--------------|
 | `bake <cell> -o out.pmtiles` | one cell → a PMTiles archive |
 | `bake-root <ENC_ROOT> -o out.pmtiles` | a whole ENC_ROOT, zoom-banded per cell |
-| `bundle <cell> -o dir/` | a self-contained bundle (tiles + assets + manifest) |
-| `assets <catalog-dir> -o dir/` | just the portrayal assets, independent of a cell |
+| `bundle <cell> -o dir/` | a self-contained bundle (tiles + assets + styles + manifest) |
+| `assets <catalog-dir> -o dir/` | just the portrayal assets (colortables), independent of a cell |
+| `style <catalog-dir> --scheme S -o f.json` | one MapLibre style.json, colours resolved per palette |
 | `inspect` / `cell` | inspect a PMTiles archive / summarise an S-57 cell |
 
 The `assets` module mirrors the Go oracle's `internal/engine/assets.EmitS101`.
-Colortables ship today; the style.json layer set, line styles, sprite/pattern
-atlases, and glyphs are in progress.
+Colortables and the **style.json layer set** ship today — `assets/style.zig` is a
+port of `style/build_style.py`, verified layer-for-layer identical by
+`scripts/check-style-parity.sh`. Line styles, sprite/pattern atlases (SVG raster),
+and glyphs (SDF) — which light up the symbol/text layers — are in progress.
 
 ## macOS interactive rendering notes
 
