@@ -18,18 +18,25 @@ A chart cell flows through these stages, all inside `libtile57`:
 
 ```
 S-57 ENC cell (.000)
-   │  decode the binary container     engine/src/iso8211.zig
+   │  decode the binary container     engine/src/iso8211/   (pkg: iso8211)
    ▼
-S-57 feature + geometry model         engine/src/s57.zig
+S-57 feature + geometry model         engine/src/s57/       (pkg: s57)
    │  apply S-101 portrayal           engine/src/portray.zig + embedded Lua 5.4
    ▼                                   (vendor/S-101_Portrayal-Catalogue)
 Primitive instruction stream
-   │  adapt to drawing primitives     engine/src/s101_adapt.zig, s101_instr.zig
-   ▼
+   │  adapt to drawing primitives     engine/src/s100/      (pkg: s100:
+   ▼                                     catalogue, s101_adapt, s101_instr)
 web-mercator project + clip + encode  engine/src/s57_mvt.zig, mvt.zig, tile.zig
    ▼
 Mapbox Vector Tile bytes  ─────────▶  MapLibre Native  (ChartTileSource FileSource)
 ```
+
+The first three stages are **standalone Zig packages** — `iso8211`, `s57`,
+`s100` — that mirror the Go oracle's `pkg/iso8211`, `pkg/s57`, `pkg/s100` one for
+one. They are pure (no libc/Lua) and target-agnostic, so the same modules compile
+into both the unit tests and the static-musl baker. The remaining stages
+(`portray`, `s57_mvt`, `mvt`, `pmtiles`, `tile`, `assets`, the baker) mirror the
+Go project's `internal/engine/*`.
 
 1. **Decode (ISO 8211).** S-57 cells use the ISO 8211 binary container format.
    The decoder reads the raw records and fields.
@@ -91,7 +98,40 @@ A few choices shape the whole project:
 The executables are thin mains over it: `chartplotter-render`
 (`app/chartplotter_render_main.cpp`) and `chartplotter`
 (`app/chartplotter_main.cpp`). `chartplotter-bake` (`engine/tools/bake.zig`) is a
-separate pure-Zig CLI over `libtile57` for the offline precache path.
+separate pure-Zig CLI over the engine for the offline path (precache + bundles).
+
+## The offline chart bundle
+
+The same engine also runs offline as a **chart-bundle baker**. One `bundle`
+command emits a self-contained, relocatable directory in which the tiles and the
+portrayal that renders them travel together:
+
+```
+chart-bundle/
+  manifest.json          pins schema_version + couples the two halves
+  tiles/chart.pmtiles    the DATA half — semantic colour *tokens*, palette-independent
+  assets/colortables.json the PORTRAYAL half — token -> hex per day/dusk/night (the only RGB)
+```
+
+This works because the tiles carry S-52 colour **tokens**, never RGB. The two
+halves are emitted from the *same* S-101 catalogue, so they can't drift, and the
+manifest stamps both with a `schema_version` (`tile57/1` — the
+[tile-schema](./tile-schema.md) layer/property vocabulary) that a renderer checks
+before loading. `assets/colortables.json` is byte-identical to the Go oracle's.
+
+Baker subcommands (`chartplotter-bake`):
+
+| Subcommand | What it does |
+|-----------|--------------|
+| `bake <cell> -o out.pmtiles` | one cell → a PMTiles archive |
+| `bake-root <ENC_ROOT> -o out.pmtiles` | a whole ENC_ROOT, zoom-banded per cell |
+| `bundle <cell> -o dir/` | a self-contained bundle (tiles + assets + manifest) |
+| `assets <catalog-dir> -o dir/` | just the portrayal assets, independent of a cell |
+| `inspect` / `cell` | inspect a PMTiles archive / summarise an S-57 cell |
+
+The `assets` module mirrors the Go oracle's `internal/engine/assets.EmitS101`.
+Colortables ship today; the style.json layer set, line styles, sprite/pattern
+atlases, and glyphs are in progress.
 
 ## macOS interactive rendering notes
 

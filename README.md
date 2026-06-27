@@ -42,16 +42,20 @@ Zig pipeline mirrors it stage for stage.
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                 engine/src/iso8211.zig
+   │  ISO 8211 decode                 engine/src/iso8211/   (pkg: iso8211)
    ▼
-S-57 feature + geometry model         engine/src/s57.zig
-   │  S-101 portrayal (embedded Lua)  engine/src/portray.zig
+S-57 feature + geometry model         engine/src/s57/       (pkg: s57)
+   │  S-101 portrayal (embedded Lua)  engine/src/portray.zig + engine/src/s100/ (pkg: s100)
    ▼
 Primitive instruction stream
    │  project + clip + encode         engine/src/{s57_mvt,tile,mvt}.zig
    ▼
 Mapbox Vector Tiles  ─────────────▶   MapLibre Native  (ChartTileSource FileSource)
 ```
+
+The foundational stages are standalone Zig packages — **`iso8211`**, **`s57`**,
+**`s100`** — mirroring the Go oracle's `pkg/iso8211`, `pkg/s57`, `pkg/s100`, so the
+two implementations line up package for package.
 
 Two libraries: **`libtile57`** is the tile pipeline (`tile57_*`,
 `include/tile57.h`); **`libchartplotter`** is the embeddable chart widget that
@@ -85,7 +89,7 @@ Full instructions are in the
 | `libtile57.a` | the Zig S-57 **tile generator** + its `tile57_*` C ABI |
 | `chartplotter` | interactive GLFW window over libchartplotter (desktop presets) |
 | `chartplotter-render` | headless host: chart → PNG (PMTiles, an S-57 cell, or an ENC_ROOT) |
-| `chartplotter-bake` | offline CLI: pre-bake a cell to a PMTiles archive (the precache path) |
+| `chartplotter-bake` | offline CLI: bake a cell/ENC_ROOT to PMTiles, or emit a self-contained **chart bundle** (tiles + portrayal assets + manifest) |
 
 ## Documentation
 

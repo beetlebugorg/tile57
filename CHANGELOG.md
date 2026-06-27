@@ -6,6 +6,27 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Changed — engine reshaped into foundational packages
+- **`iso8211`, `s57`, `s100` are now standalone Zig packages** (`engine/src/{iso8211,
+  s57,s100}/`), mirroring the Go oracle's `pkg/iso8211`, `pkg/s57`, `pkg/s100` one
+  for one. They are pure (no libc/Lua) and target-agnostic, so the same modules
+  compile into both the unit tests (glibc) and the static-musl baker. Pure refactor
+  — behavior identical; the C ABI (`tile57_*`) is unchanged.
+
+### Added — offline chart-bundle baker
+- **`chartplotter-bake bundle <cell> -o <dir>`** emits a self-contained,
+  relocatable **chart bundle**: `tiles/chart.pmtiles` + `assets/colortables.json` +
+  `manifest.json`. The tiles carry S-52 colour *tokens* (palette-independent); the
+  assets carry the RGB. Both halves come from the same S-101 catalogue and are
+  stamped with a `schema_version` (`tile57/1`) so a renderer can refuse a mismatched
+  bundle.
+- **New `assets` module** (mirrors the Go oracle's `internal/engine/assets.EmitS101`)
+  and **`chartplotter-bake assets <catalog-dir> -o <dir>`** emit the portrayal
+  assets independent of a cell. First artifact: `colortables.json` (token → hex per
+  day/dusk/night palette, parsed from `ColorProfiles/colorProfile.xml`) — **byte-
+  identical to the Go oracle's output**. Line styles, sprite/pattern atlases, glyphs,
+  and the `style.json` layer set (port of `build_style.py`/`s52-style.mjs`) are next.
+
 ### Added — on-demand ENC_ROOT + offline baker
 - **Lazy on-demand tile generation (the new default for an ENC_ROOT).** Pointing a
   host at an ENC_ROOT used to parse + portray *every* cell at open and hold them all

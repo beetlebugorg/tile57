@@ -10,7 +10,14 @@ The vector tiles use a fixed set of layers and fields. The style depends on this
 schema, so the names are a contract — it matches
 [chartplotter-go's schema](https://beetlebugorg.github.io/chartplotter/tile-schema)
 so the same generated S-52 style works against either. Do not rename a layer or a
-field without updating `style/build_style.py` to match.
+field without updating `style/build_style.py` to match **and bumping the schema
+version**.
+
+This vocabulary is versioned as **`tile57/1`**. A
+[chart bundle](./architecture.md#the-offline-chart-bundle) stamps both halves —
+the tiles and the portrayal assets — with that `schema_version` in its
+`manifest.json`, so a renderer can refuse a bundle whose schema it doesn't speak.
+Any change to a layer name or field key bumps it.
 
 Every tile uses an extent of **4096** and a buffer of **64**.
 
