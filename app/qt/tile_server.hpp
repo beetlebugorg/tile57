@@ -23,7 +23,6 @@
 
 class QTcpServer;
 class QTcpSocket;
-class QTemporaryFile;
 
 namespace cpn {
 
@@ -42,7 +41,10 @@ public slots:
 
 signals:
     void progress(const QString &stage, quint64 done, quint64 total);
-    void ready(const QString &styleUrl, double lat, double lon, double zoom, double minZoomFloor);
+    // The raw (tile-URL-rewritten) style template + S-52 colortables, handed to the
+    // UI thread, which owns the MarinerSettings and (re)builds the style live.
+    void ready(const QString &templateJson, const QString &colortablesJson, double lat, double lon,
+               double zoom, double minZoomFloor);
     void failed(const QString &reason);
     // Live tile activity for a loading indicator (cross-thread, queued).
     void activity(int inflight, quint64 served);
@@ -62,7 +64,6 @@ private:
 
     tile57_source *src_ = nullptr;
     QTcpServer *server_ = nullptr;
-    QTemporaryFile *styleFile_ = nullptr;
     int inflight_ = 0;
     quint64 served_ = 0;
     QHash<QTcpSocket *, QByteArray> buffers_; // per-connection request accumulation

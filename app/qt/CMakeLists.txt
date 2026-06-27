@@ -23,7 +23,7 @@ target_link_libraries(chartplotter-qt PRIVATE QMapLibre::Widgets)
 # Qt6::Network. Without TILE57_LIB the viewer still builds (style files only).
 if(TILE57_LIB)
   find_package(Qt6 REQUIRED COMPONENTS Network)
-  target_sources(chartplotter-qt PRIVATE tile_server.cpp)
+  target_sources(chartplotter-qt PRIVATE tile_server.cpp mariner_panel.cpp)
   target_include_directories(chartplotter-qt PRIVATE
     ${CHARTPLOTTER_INCLUDE_DIR}  # include/  -> tile57.h
     ${CHARTPLOTTER_APP_DIR})     # app/      -> enc_root.hpp

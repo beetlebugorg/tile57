@@ -2,16 +2,9 @@
 
 #include "enc_root.hpp" // cpn::openPath, cpn::resolveRulesDir
 
-#ifdef CHARTPLOTTER_WITH_CHARTSTYLE
-#include "chartstyle/chart_style.hpp" // chartstyle::buildStyle
-#include "chartstyle/mariner.hpp"     // chartstyle::MarinerSettings
-#endif
-
-#include <QDir>
 #include <QFileInfo>
 #include <QTcpServer>
 #include <QTcpSocket>
-#include <QTemporaryFile>
 
 #include <chrono>
 #include <cmath>
@@ -151,36 +144,19 @@ void TileServer::run() {
     ss << f.rdbuf();
     std::string json = ss.str();
 
-#ifdef CHARTPLOTTER_WITH_CHARTSTYLE
-    // Apply the (default, Go-matching) mariner settings client-side: data-quality
-    // and info-callout ("flyout") overlays off, live SEABED01 depth shading, sounding
-    // bold/faint split, danger-symbol safety swap, contour-label units. (A live UI
-    // will drive these via QMapLibre restyle in a later phase.)
-    {
-        const std::string cts = readWhole(findRepoFile(exePath_.toStdString(), "reference/assets/colortables.json"));
-        json = chartstyle::buildStyle(json, chartstyle::MarinerSettings{}, cts);
-    }
-#endif
-
     const double minZoomFloor = styleSourceMinZoom(json, 0.0);
     const std::string fromUrl = "zigtiles://{z}/{x}/{y}";
     const std::string toUrl = "http://127.0.0.1:" + std::to_string(port) + "/{z}/{x}/{y}";
     for (size_t i = json.find(fromUrl); i != std::string::npos; i = json.find(fromUrl, i + toUrl.size()))
         json.replace(i, fromUrl.size(), toUrl);
 
-    // Stage the rewritten JSON in a temp file (the template's sprite/glyphs are
-    // absolute file:// URLs, so its location doesn't matter). Kept for process life.
-    styleFile_ = new QTemporaryFile(QDir::tempPath() + QStringLiteral("/chartplotter-qt-XXXXXX.json"), this);
-    if (!styleFile_->open()) {
-        emit failed(QStringLiteral("could not stage style file"));
-        return;
-    }
-    styleFile_->write(json.data(), static_cast<qint64>(json.size()));
-    styleFile_->flush();
+    // Hand the raw (URL-rewritten) template + S-52 colortables to the UI thread; it
+    // owns the MarinerSettings and (re)builds the style via chartstyle::buildStyle.
+    const std::string cts = readWhole(findRepoFile(exePath_.toStdString(), "reference/assets/colortables.json"));
 
     std::fprintf(stderr, "[chart] serving %s on http://127.0.0.1:%u\n",
                  chartPath_.toUtf8().constData(), port);
-    emit ready(QStringLiteral("file://") + styleFile_->fileName(), lat, lon, zoom, minZoomFloor);
+    emit ready(QString::fromStdString(json), QString::fromStdString(cts), lat, lon, zoom, minZoomFloor);
 }
 
 void TileServer::onNewConnection() {

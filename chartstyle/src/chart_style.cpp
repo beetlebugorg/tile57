@@ -35,14 +35,39 @@ json seabedTokenExpr(const MarinerSettings &m) {
 }
 
 // Resolve a colour-token-valued expression to an RGB for the active scheme.
-json colorMatch(const json &tokenExpr, const json &palette) {
+json colorMatch(const json &tokenExpr, const json &palette, const char *fallback = FALLBACK) {
     json m = json::array({"match", tokenExpr});
     for (auto it = palette.begin(); it != palette.end(); ++it) {
         m.push_back(it.key());
         m.push_back(it.value());
     }
-    m.push_back(FALLBACK);
+    m.push_back(fallback);
     return m;
+}
+
+// A single resolved colour token for the scheme (concrete value, not an expression).
+std::string token(const json &palette, const char *name, const char *fallback) {
+    auto it = palette.find(name);
+    return (it != palette.end() && it->is_string()) ? it->get<std::string>() : std::string(fallback);
+}
+
+// line-color for the S-52 line layers: the feature's baked colour token resolved
+// against the active scheme's palette.
+json lineColor(const json &palette) { return colorMatch(coalesce(get("color_token"), ""), palette); }
+
+// Text ink. Day uses the per-feature S-52 ink; dusk/night use a bright neutral so
+// labels stay legible on the dark palette (matches the Go client).
+json textColor(Scheme s, const json &palette) {
+    if (s == Scheme::Day) return colorMatch(coalesce(get("color_token"), ""), palette, "#000000");
+    return json(s == Scheme::Night ? "#aab7bf" : "#dde7ec");
+}
+json textHaloColor(Scheme s) {
+    return json(s == Scheme::Day ? "rgba(255,255,255,0.9)" : "rgba(0,0,0,0.85)");
+}
+// Contour (depth) labels: CHGRD by day, bright neutral at dusk/night.
+json contourLabelColor(Scheme s, const json &palette) {
+    if (s == Scheme::Day) return json(token(palette, "CHGRD", "#5a5a44"));
+    return json(s == Scheme::Night ? "#aab7bf" : "#dde7ec");
 }
 
 // Fill colour for the `areas` layer: depth areas (carry drval1) shade live via
@@ -119,10 +144,23 @@ std::string buildStyle(const std::string &templateJson, const MarinerSettings &m
     const json palette = cts.contains(schemeKey) ? cts[schemeKey] : json::object();
 
     for (json &L : style["layers"]) {
-        // Depth shading is only regenerated when a palette is available; otherwise
-        // keep the template's baked colours (avoids an all-magenta fallback).
-        if (!palette.empty() && isId(L, {"fill-areas", "fill-areas_scamin"}))
-            L["paint"]["fill-color"] = areasFillColor(palette, m);
+        // -- colour scheme (Day/Dusk/Night): regenerate every palette-driven colour
+        // from the active scheme. Only when a palette is available, else keep the
+        // template's baked colours (avoids an all-magenta fallback). --
+        if (!palette.empty()) {
+            const bool isContourLabel = isId(L, {"contour-labels-lines", "contour-labels-lines_scamin"});
+            if (isId(L, {"background"}))
+                L["paint"]["background-color"] = token(palette, "DEPDW", "#c9edff");
+            if (isId(L, {"fill-areas", "fill-areas_scamin"}))
+                L["paint"]["fill-color"] = areasFillColor(palette, m);
+            if (L.contains("paint") && L["paint"].contains("line-color"))
+                L["paint"]["line-color"] = lineColor(palette);
+            if (L.contains("paint") && L["paint"].contains("text-color"))
+                L["paint"]["text-color"] = isContourLabel ? contourLabelColor(m.scheme, palette)
+                                                          : textColor(m.scheme, palette);
+            if (L.contains("paint") && L["paint"].contains("text-halo-color"))
+                L["paint"]["text-halo-color"] = textHaloColor(m.scheme);
+        }
         if (isId(L, {"soundings"}))
             L["layout"]["icon-image"] = soundingsIconImage(m);
         if (isId(L, {"point_symbols", "point_symbols_scamin", "point_symbols-north",

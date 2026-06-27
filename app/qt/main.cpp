@@ -36,14 +36,24 @@
 #include <memory>
 
 #ifdef CHARTPLOTTER_WITH_TILE57
+#include "mariner_panel.hpp"
 #include "tile_server.hpp"
+
+#include "chartstyle/chart_style.hpp"
+#include "chartstyle/mariner.hpp"
 
 #include <QColor>
 #include <QCoreApplication>
+#include <QDir>
+#include <QDockWidget>
 #include <QLabel>
+#include <QMainWindow>
 #include <QPixmap>
 #include <QSplashScreen>
+#include <QTemporaryFile>
 #include <QThread>
+
+#include <string>
 #endif
 
 namespace {
@@ -132,8 +142,9 @@ private:
     quint64 lastT_ = 0;
 };
 
-// Open a MapWidget on a style URL with an initial camera. Shared by both modes.
-QMapLibre::MapWidget *makeWidget(const QString &styleUrl, double lat, double lon, double zoom) {
+// Create a MapWidget on a style URL with an initial camera + inertial panning. The
+// caller sizes/shows it (directly, or inside a QMainWindow). Shared by both modes.
+QMapLibre::MapWidget *makeMapWidget(const QString &styleUrl, double lat, double lon, double zoom) {
     QMapLibre::Styles styles;
     styles.emplace_back(styleUrl, QStringLiteral("Chart"));
 
@@ -143,10 +154,7 @@ QMapLibre::MapWidget *makeWidget(const QString &styleUrl, double lat, double lon
     settings.setDefaultZoom(zoom);
 
     auto *widget = new QMapLibre::MapWidget(settings);
-    widget->resize(1024, 768);
-    widget->setWindowTitle(QStringLiteral("chartplotter-qt"));
     new MapFling(widget); // inertial panning; parented to the widget
-    widget->show();
     return widget;
 }
 
@@ -206,6 +214,31 @@ void installTileIndicator(QMapLibre::MapWidget *widget, cpn::TileServer *backend
                              hideTimer->start(700); // hide ~0.7s after the last tile
                          }
                      });
+}
+
+// Build the concrete style from the template + mariner settings (client-side, via
+// the cross-platform chartstyle module). Without chartstyle, the template is used
+// as-is.
+std::string styledJson(const QString &templateJson, const chartstyle::MarinerSettings &s,
+                       const QString &colortables) {
+#ifdef CHARTPLOTTER_WITH_CHARTSTYLE
+    return chartstyle::buildStyle(templateJson.toStdString(), s, colortables.toStdString());
+#else
+    (void)s;
+    (void)colortables;
+    return templateJson.toStdString();
+#endif
+}
+
+// Stage a style JSON string in a temp file and return its file:// URL (the only way
+// to hand QMapLibre::Settings an inline style for the initial load; live updates use
+// Map::setStyleJson). The file persists for the process lifetime.
+QString stageStyleFile(const std::string &json) {
+    auto *tmp = new QTemporaryFile(QDir::tempPath() + QStringLiteral("/chartplotter-qt-XXXXXX.json"));
+    if (!tmp->open()) return {};
+    tmp->write(json.data(), static_cast<qint64>(json.size()));
+    tmp->flush();
+    return QStringLiteral("file://") + tmp->fileName();
 }
 #endif // CHARTPLOTTER_WITH_TILE57
 
@@ -272,15 +305,40 @@ int main(int argc, char *argv[]) {
                              std::fprintf(stderr, "%s\n", why.toUtf8().constData());
                              QCoreApplication::exit(1);
                          });
-        QObject::connect(backend, &cpn::TileServer::ready, qApp,
-                         [splash, backend](const QString &styleUrl, double lat, double lon,
-                                           double zoom, double minZoomFloor) {
-                             auto *widget = makeWidget(styleUrl, lat, lon, zoom);
-                             splash->finish(widget);
-                             splash->deleteLater();
-                             installZoomFloor(widget, minZoomFloor);
-                             installTileIndicator(widget, backend);
-                         });
+        QObject::connect(
+            backend, &cpn::TileServer::ready, qApp,
+            [splash, backend](const QString &templateJson, const QString &colortables, double lat,
+                              double lon, double zoom, double minZoomFloor) {
+                const chartstyle::MarinerSettings initial; // Go-matching defaults
+                const QString initialUrl = stageStyleFile(styledJson(templateJson, initial, colortables));
+                auto *widget = makeMapWidget(initialUrl, lat, lon, zoom);
+
+                // Host the map in a window with a docked mariner-settings panel.
+                auto *win = new QMainWindow;
+                win->setWindowTitle(QStringLiteral("chartplotter-qt"));
+                win->setCentralWidget(widget);
+                auto *dock = new QDockWidget(QStringLiteral("Mariner settings"), win);
+                auto *panel = new cpn::MarinerPanel(initial, dock);
+                dock->setWidget(panel);
+                dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+                win->addDockWidget(Qt::RightDockWidgetArea, dock);
+                win->resize(1280, 800);
+                win->show();
+
+                splash->finish(win);
+                splash->deleteLater();
+                installZoomFloor(widget, minZoomFloor);
+                installTileIndicator(widget, backend);
+
+                // Live restyle: rebuild the style from the new settings and apply it
+                // without touching the camera or the tile source.
+                QObject::connect(panel, &cpn::MarinerPanel::changed, widget,
+                                 [widget, templateJson, colortables](const chartstyle::MarinerSettings &s) {
+                                     if (auto *m = widget->map())
+                                         m->setStyleJson(QString::fromStdString(
+                                             styledJson(templateJson, s, colortables)));
+                                 });
+            });
 
         thread->start();
         return app.exec();
@@ -300,6 +358,9 @@ int main(int argc, char *argv[]) {
     if (!style.contains(QStringLiteral("://")))
         style = QStringLiteral("file://") + QFileInfo(style).absoluteFilePath();
 
-    makeWidget(style, lat, lon, zoom);
+    auto *widget = makeMapWidget(style, lat, lon, zoom);
+    widget->resize(1024, 768);
+    widget->setWindowTitle(QStringLiteral("chartplotter-qt"));
+    widget->show();
     return app.exec();
 }
