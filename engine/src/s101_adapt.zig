@@ -174,10 +174,17 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         var name: []const u8 = "";
         var catzoc: []const u8 = "";
         for (f.attrs) |at| {
-            if (at.code == s57.ATTR_OBJNAM) name = at.value; // OBJNAM -> featureName
-            if (at.code == s57.ATTR_CATZOC) catzoc = at.value; // CATZOC -> zoneOfConfidence
+            // A present-but-blank S-57 attribute (e.g. an unknown VALSOU, all
+            // spaces) means "absent": serving "" would make the framework build a
+            // malformed ScaledDecimal{Value=nil} for a 'real' attr (tonumber("")
+            // == nil), which crashes the danger depth comparison. Skip it, and
+            // serve the trimmed value so numeric strings parse cleanly.
+            const v = std.mem.trim(u8, at.value, " ");
+            if (v.len == 0) continue;
+            if (at.code == s57.ATTR_OBJNAM) name = v; // OBJNAM -> featureName
+            if (at.code == s57.ATTR_CATZOC) catzoc = v; // CATZOC -> zoneOfConfidence
             if (catalogue.resolveAttrByCode(at.code)) |aname|
-                try attrs.append(a, .{ .name = aname, .value = at.value });
+                try attrs.append(a, .{ .name = aname, .value = v });
         }
 
         // featureName[1].name from OBJNAM (text labels).
