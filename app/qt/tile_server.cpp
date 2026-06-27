@@ -2,6 +2,11 @@
 
 #include "enc_root.hpp" // cpn::openPath, cpn::resolveRulesDir
 
+#ifdef CHARTPLOTTER_WITH_CHARTSTYLE
+#include "chartstyle/chart_style.hpp" // chartstyle::buildStyle
+#include "chartstyle/mariner.hpp"     // chartstyle::MarinerSettings
+#endif
+
 #include <QDir>
 #include <QFileInfo>
 #include <QTcpServer>
@@ -22,10 +27,10 @@ namespace {
 
 // Find the live-chart style template: CHARTPLOTTER_STYLE if set, else search for
 // style/chart-zig-day.json relative to the CWD and the executable, walking up.
-std::string resolveStyleTemplate(const std::string &exePath) {
+// Find a repo-relative file (e.g. "style/chart-zig-day.json",
+// "reference/assets/colortables.json") by walking up from the CWD and the exe dir.
+std::string findRepoFile(const std::string &exePath, const std::string &suffix) {
     namespace fs = std::filesystem;
-    if (const char *env = std::getenv("CHARTPLOTTER_STYLE"); env && *env) return env;
-    const fs::path suffix = "style/chart-zig-day.json";
     std::error_code ec;
     std::vector<fs::path> starts;
     starts.push_back(fs::current_path(ec));
@@ -41,6 +46,19 @@ std::string resolveStyleTemplate(const std::string &exePath) {
         }
     }
     return std::string();
+}
+
+std::string resolveStyleTemplate(const std::string &exePath) {
+    if (const char *env = std::getenv("CHARTPLOTTER_STYLE"); env && *env) return env;
+    return findRepoFile(exePath, "style/chart-zig-day.json");
+}
+
+std::string readWhole(const std::string &path) {
+    if (path.empty()) return {};
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
 
 // WebMercator zoom that fits [west,south,east,north] into a wxh pixel viewport.
@@ -132,6 +150,18 @@ void TileServer::run() {
     std::ostringstream ss;
     ss << f.rdbuf();
     std::string json = ss.str();
+
+#ifdef CHARTPLOTTER_WITH_CHARTSTYLE
+    // Apply the (default, Go-matching) mariner settings client-side: data-quality
+    // and info-callout ("flyout") overlays off, live SEABED01 depth shading, sounding
+    // bold/faint split, danger-symbol safety swap, contour-label units. (A live UI
+    // will drive these via QMapLibre restyle in a later phase.)
+    {
+        const std::string cts = readWhole(findRepoFile(exePath_.toStdString(), "reference/assets/colortables.json"));
+        json = chartstyle::buildStyle(json, chartstyle::MarinerSettings{}, cts);
+    }
+#endif
+
     const double minZoomFloor = styleSourceMinZoom(json, 0.0);
     const std::string fromUrl = "zigtiles://{z}/{x}/{y}";
     const std::string toUrl = "http://127.0.0.1:" + std::to_string(port) + "/{z}/{x}/{y}";
