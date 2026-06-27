@@ -33,6 +33,9 @@ private:
     chartstyle::MarinerSettings s_;
 
     QComboBox *scheme_ = nullptr;
+    QCheckBox *displayBase_ = nullptr;
+    QCheckBox *displayStandard_ = nullptr;
+    QCheckBox *displayOther_ = nullptr;
     QComboBox *depthUnit_ = nullptr;
     QCheckBox *fourShades_ = nullptr;
     QDoubleSpinBox *shallow_ = nullptr;

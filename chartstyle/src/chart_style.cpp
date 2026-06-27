@@ -110,6 +110,27 @@ json contourLabelField(const MarinerSettings &m) {
     return json::array({"case", json::array({"has", "valdco"}), json::array({"to-string", v}), ""});
 }
 
+// Display category (S-52 §10.3.4), client-side + multi-select: each feature is
+// baked with its category rank `cat` (0 base, 1 standard, 2 other); the mariner
+// independently toggles each. Folds in the M_QUAL data-quality overlay (its own
+// toggle, independent of "Other"). Mirrors the Go client's categoryFilter.
+json categoryFilter(const MarinerSettings &m) {
+    json en = json::array();
+    if (m.displayBase) en.push_back(0);
+    if (m.displayStandard) en.push_back(1);
+    if (m.displayOther) en.push_back(2);
+    // Isolated dangers (ISODGR01): Base normally, Standard when "isolated dangers in
+    // shallow water" is on. Every other feature uses its baked cat (default standard).
+    const int isoCat = m.showIsolatedDangersShallow ? 1 : 0;
+    const json cat = json::array({"case", json::array({"==", get("symbol_name"), "ISODGR01"}),
+                                  isoCat, coalesce(get("cat"), 1)});
+    const json inCat = json::array({"in", cat, json::array({"literal", en})});
+    const json isQual = json::array({"==", get("class"), "M_QUAL"});
+    if (m.dataQuality)
+        return json::array({"any", isQual, json::array({"all", inCat, json::array({"!", isQual})})});
+    return json::array({"all", inCat, json::array({"!", isQual})});
+}
+
 // AND extra clauses into a layer's existing filter (clauses first, base last).
 void andInto(json &layer, const std::vector<json> &clauses) {
     json all = json::array({"all"});
@@ -169,15 +190,16 @@ std::string buildStyle(const std::string &templateJson, const MarinerSettings &m
         if (isId(L, {"contour-labels-lines", "contour-labels-lines_scamin"}))
             L["layout"]["text-field"] = contourLabelField(m);
 
-        // Toggles applied to every chart-source layer. coalesce keeps features that
-        // lack the property (so a missing class/symbol_name is never hidden).
+        // Client-side display portrayal, AND-ed onto each chart-source layer's own
+        // filter: display category (+ data-quality overlay), then the info-callout
+        // ("flyout") toggle. The boundary/point-style/sector/text-group/date axes
+        // join here once the engine bakes their per-feature tags.
         if (L.value("source", std::string()) == "chart") {
             std::vector<json> clauses;
-            if (!m.dataQuality) // M_QUAL / CATZOC data-quality overlay off
-                clauses.push_back(json::array({"!=", coalesce(get("class"), ""), "M_QUAL"}));
+            clauses.push_back(categoryFilter(m));
             if (!m.showInformCallouts) // INFORM01 "additional information" callouts off
                 clauses.push_back(json::array({"!=", coalesce(get("symbol_name"), ""), "INFORM01"}));
-            if (!clauses.empty()) andInto(L, clauses);
+            andInto(L, clauses);
         }
     }
     return style.dump();

@@ -49,6 +49,24 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     palForm->addRow(QStringLiteral("Colour scheme"), scheme_);
     root->addWidget(palBox);
 
+    // -- Display category (S-52 §10.3.4, multi-select) --
+    auto *catBox = new QGroupBox(QStringLiteral("Display category"));
+    auto *catCol = new QVBoxLayout(catBox);
+    catCol->setContentsMargins(12, 10, 12, 12);
+    catCol->setSpacing(8);
+    displayBase_ = new QCheckBox(QStringLiteral("Base"));
+    displayBase_->setChecked(s_.displayBase);
+    displayBase_->setEnabled(false); // base is always shown
+    displayBase_->setToolTip(QStringLiteral("Display Base is always shown"));
+    catCol->addWidget(displayBase_);
+    displayStandard_ = new QCheckBox(QStringLiteral("Standard"));
+    displayStandard_->setChecked(s_.displayStandard);
+    catCol->addWidget(displayStandard_);
+    displayOther_ = new QCheckBox(QStringLiteral("Other"));
+    displayOther_->setChecked(s_.displayOther);
+    catCol->addWidget(displayOther_);
+    root->addWidget(catBox);
+
     // -- Depth --
     auto *depthBox = new QGroupBox(QStringLiteral("Depth"));
     auto *depthForm = new QFormLayout(depthBox);
@@ -91,6 +109,8 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     const auto onSpin = [this](double) { pull(); };
     connect(scheme_, &QComboBox::currentIndexChanged, this, onCombo);
     connect(depthUnit_, &QComboBox::currentIndexChanged, this, onCombo);
+    connect(displayStandard_, &QCheckBox::toggled, this, onCheck);
+    connect(displayOther_, &QCheckBox::toggled, this, onCheck);
     connect(fourShades_, &QCheckBox::toggled, this, onCheck);
     connect(dataQuality_, &QCheckBox::toggled, this, onCheck);
     connect(infoCallouts_, &QCheckBox::toggled, this, onCheck);
@@ -100,6 +120,8 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
 
 void MarinerPanel::pull() {
     s_.scheme = static_cast<chartstyle::Scheme>(scheme_->currentIndex());
+    s_.displayStandard = displayStandard_->isChecked();
+    s_.displayOther = displayOther_->isChecked();
     s_.depthUnit = static_cast<chartstyle::DepthUnit>(depthUnit_->currentIndex());
     s_.fourShadeWater = fourShades_->isChecked();
     s_.shallowContour = shallow_->value();
