@@ -7,6 +7,8 @@
 #include <mbgl/map/map.hpp>
 #include <mbgl/util/run_loop.hpp>
 
+#include <optional>
+
 struct ChartNativeHost::Impl {
     // Created on the main thread first: mbgl's Darwin RunLoop is CFRunLoop-backed,
     // so its async source attaches to the main run loop that [NSApp run] pumps.
@@ -80,7 +82,7 @@ void ChartNativeHost::setMap(mbgl::Map *map) {
                                      handler:^NSEvent *(NSEvent *event) {
                                        if (m) {
                                            const double dy = event.scrollingDeltaY;
-                                           if (dy != 0.0) m->scaleBy(dy > 0 ? 1.06 : (1.0 / 1.06));
+                                           if (dy != 0.0) m->scaleBy(dy > 0 ? 1.06 : (1.0 / 1.06), std::nullopt);
                                        }
                                        return event;
                                      }];
