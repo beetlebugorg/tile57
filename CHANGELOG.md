@@ -6,6 +6,28 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Added — on-demand ENC_ROOT + offline baker
+- **Lazy on-demand tile generation (the new default for an ENC_ROOT).** Pointing a
+  host at an ENC_ROOT used to parse + portray *every* cell at open and hold them all
+  (≈34 GB for the ~7400-cell NOAA catalogue — a blue, never-finishing window). Now
+  `tile57_source_open_cells` builds a cheap spatial index (per cell: compilation-
+  scale band + bbox, via `s57.peekMeta`, in parallel) and parses + portrays only
+  the cells a *requested tile* needs, choosing the best-available scale band per
+  tile and keeping recent cells in an LRU. The full catalogue opens in seconds and
+  renders a view by touching ~a dozen cells (≈5 GB transient at open, far less
+  steady-state). Coverage gaps at a zoom are filled by overzooming the coarsest
+  band present, so tiles aren't blank.
+- **Offline streaming banded baker** (`engine/src/bake_enc.zig`): for precomputing
+  a shareable PMTiles archive. Groups cells into navigational bands by CSCL (Band,
+  matching the Go reference), bakes finest → coarsest with best-band dedup, holding
+  one band at a time. Portrayal + per-tile MVT generation run across all cores
+  (`parallelFor`; thread-local Lua context, warmed catalogue, quiet flag); per-cell
+  geometry is assembled once (`buildGeoCache`) and reused. CLI `chartplotter-bake
+  bake-root <ENC_ROOT> -o out.pmtiles`; C ABI `tile57_bake_cells`. The app can use
+  it on open via `CHARTPLOTTER_BAKE=1` (cached under `$XDG_CACHE_HOME/chartplotter`,
+  `CHARTPLOTTER_BAKE_MIN/MAXZOOM` to set the range) for smooth-everywhere offline
+  use; the default is lazy.
+
 ### Added — offline baker + portrayal/style refinements
 - **Spatial / geometry Host binding**: `HostGetSpatial` now serves real point
   geometry (`#P` points, `#M` multipoints, `#S` surfaces) to the S-101 rules via

@@ -62,13 +62,20 @@ fallback).
 
 ## ENC_ROOT loading
 
-Pointing a host at an ENC_ROOT directory loads every base cell and applies its
-S-57 update files (`.001…`). Two caveats:
+Pointing a host at an ENC_ROOT directory builds a cheap spatial index (band + bbox
+per cell) and generates tiles **on demand**, parsing + portraying only the cells a
+requested tile needs (best-available scale band per tile, recent cells held in an
+LRU). The catalogue opens in seconds; memory stays bounded. Caveats:
 
-- **Overlay, not best-available.** All cells are drawn on top of each other; there
-  is no per-zoom navigational-band selection yet, so overlapping cells of
-  different compilation scales both render. (Go's baker does best-available band
-  suppression at bake time; the live path does not.)
+- **First-view latency.** The first tile over a fresh area parses + portrays its
+  1–4 cells (tens of ms), then they're cached. Opening the whole NOAA catalogue
+  also pays a one-time index scan (a few seconds, parsing every cell header).
+- **Offline bake (opt-in).** `CHARTPLOTTER_BAKE=1` instead bakes the ENC_ROOT to a
+  cached PMTiles for smooth panning everywhere (`CHARTPLOTTER_BAKE_MAXZOOM`,
+  default 14; the client overzooms past it). The whole catalogue is a multi-minute
+  one-time bake; a region is far quicker.
+- **Low zoom is style-gated.** The vector source's `minzoom` (9 in the bundled
+  styles) means nothing draws below it regardless of the data.
 - **Update merge gaps.** Feature/vector insert/delete/modify and the SGCC/FSPC
   control fields (indexed coordinate / spatial-pointer edits) are applied; VRPC
   (indexed edits to an edge's begin/end node pointers) is not modelled — a VRPT

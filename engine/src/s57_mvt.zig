@@ -150,7 +150,30 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), draw_prio: i64, sca
     if (scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
 }
 
-fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+/// Per-feature cached line/area geometry for a cell (indexed by feature index;
+/// null = a point/sounding feature, or one that failed to assemble). The baker
+/// builds this once per cell (buildGeoCache) so each of the cell's many tiles
+/// projects + clips instead of re-resolving edges/nodes; the live single-tile
+/// path leaves it null and assembles on demand.
+pub const GeoParts = []const ?[][]s57.LonLat;
+
+/// Assemble every line/area feature's geometry once into `a`. Used by the baker.
+pub fn buildGeoCache(a: Allocator, cell: *const s57.Cell) !GeoParts {
+    const parts = try a.alloc(?[][]s57.LonLat, cell.features.len);
+    for (cell.features, 0..) |f, i| {
+        parts[i] = if (f.prim == 2 or f.prim == 3) (cell.lineGeometryParts(a, f) catch null) else null;
+    }
+    return parts;
+}
+
+/// The feature's assembled line/area parts: the baker's cached copy if present,
+/// else assembled now (the live path).
+fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.Feature) ![][]s57.LonLat {
+    if (geo) |g| if (fi < g.len) if (g[fi]) |p| return p;
+    return cell.lineGeometryParts(a, f);
+}
+
+fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, instr: []const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     const p = try s101.parse(a, instr);
     const prio = p.draw_prio;
 
@@ -195,7 +218,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
 
     // Line/area features: assemble into connected parts (rings / chains) so
     // disjoint geometry isn't joined by a spurious straight jump across the cell.
-    const geo_parts = cell.lineGeometryParts(a, f) catch return;
+    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
     // Project each usable part; quick-reject if none overlap the tile.
@@ -295,8 +318,8 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, instr: []const u8
 /// nothing for it. Mirror the Go reference's sweptAreaBuild: a dashed CHGRD
 /// boundary on every ring, the SWPARE51 swept-depth bracket at the area's
 /// representative point, and a "swept to <DRVAL1>" label there. DrawingPriority 6.
-fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
-    const geo_parts = cell.lineGeometryParts(a, f) catch return;
+fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
     const scamin = featureScamin(f);
@@ -355,9 +378,9 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x:
 /// (wrong primitive, unofficial stub, …); when portrayal yields nothing or errors,
 /// draw the Go reference's newObjectBuild placeholder — a dashed CHMGF (magenta)
 /// outline on the feature's line/area geometry. DrawingPriority 6.
-fn emitNewObjectFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+fn emitNewObjectFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     if (f.prim != 2 and f.prim != 3) return; // Go's newObjectBuild only strokes line/area
-    const geo_parts = cell.lineGeometryParts(a, f) catch return;
+    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
     const scamin = featureScamin(f);
@@ -381,7 +404,7 @@ fn emitNewObjectFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x:
 }
 
 /// One cell plus its optional per-feature S-101 instruction streams.
-pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null };
+pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null, geo: ?GeoParts = null };
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
 /// `portrayal`, if given, is indexed by feature index and holds each feature's
@@ -427,7 +450,7 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
         .texts_scamin = &texts_scamin,
     };
 
-    for (cells) |cr| try appendCellFeatures(a, layers_ctx, &soundings, cr.cell, cr.portrayal, z, x, y, tb, box);
+    for (cells) |cr| try appendCellFeatures(a, layers_ctx, &soundings, cr.cell, cr.portrayal, cr.geo, z, x, y, tb, box);
 
     var layers = std.ArrayList(mvt.Layer).empty;
     if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
@@ -453,6 +476,7 @@ fn appendCellFeatures(
     soundings: *std.ArrayList(mvt.Feature),
     cell: *s57.Cell,
     portrayal: ?[]const ?[]const u8,
+    geo: ?GeoParts,
     z: u8,
     x: u32,
     y: u32,
@@ -474,7 +498,7 @@ fn appendCellFeatures(
         const errored = stream != null and std.mem.startsWith(u8, stream.?, "ERROR:");
         if (stream) |s| {
             if (!errored) {
-                try emitFromInstr(a, cell.*, f, s, z, x, y, tb, box, L);
+                try emitFromInstr(a, cell.*, f, fi, geo, s, z, x, y, tb, box, L);
                 continue;
             }
         }
@@ -482,17 +506,17 @@ fn appendCellFeatures(
         // portray (mirrors Go's buildFeatureBody); any other class that errored is
         // suppressed (drawn as nothing, as the Go reference does).
         if (f.objl == 134) { // SWPARE — the catalogue ships no SweptArea rule (IHO gap)
-            try emitSweptAreaFallback(a, cell.*, f, z, x, y, tb, box, L);
+            try emitSweptAreaFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
             continue;
         }
         if (f.objl == 163) { // NEWOBJ — new-object box placeholder
-            try emitNewObjectFallback(a, cell.*, f, z, x, y, tb, box, L);
+            try emitNewObjectFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
             continue;
         }
         if (errored) continue; // genuine rule error on a normal class → suppress
         const cls = classify(f.objl);
         if (cls.kind == .skip) continue;
-        const geo_parts = cell.lineGeometryParts(a, f) catch continue;
+        const geo_parts = featureParts(a, cell.*, geo, fi, f) catch continue;
         if (geo_parts.len == 0) continue;
 
         for (geo_parts) |gp| {
@@ -597,7 +621,7 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
     };
-    try emitFromInstr(a, cell, f_sc, "DrawingPriority:7;PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f_sc, 0, null, "DrawingPriority:7;PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
     try std.testing.expectEqual(@as(usize, 0), points.items.len);
     try std.testing.expectEqual(@as(usize, 1), points_s.items.len);
     try std.testing.expectEqual(@as(i64, 7), findProp(points_s.items[0].properties, "draw_prio").?.int);
@@ -608,7 +632,7 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .rcnm = 0, .rcid = 2, .prim = 1, .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try emitFromInstr(a, cell, f_base, "PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f_base, 0, null, "PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
     try std.testing.expectEqual(@as(usize, 1), points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "draw_prio").?.int);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "scamin"));

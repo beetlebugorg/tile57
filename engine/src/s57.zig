@@ -462,6 +462,49 @@ pub fn peekScale(gpa: Allocator, bytes: []const u8) ?i32 {
     return null;
 }
 
+pub const CellMeta = struct { cscl: i32 = 0, bounds: ?[4]f64 = null };
+
+/// Cheaply read a cell's compilation scale + coordinate bounding box
+/// ([west, south, east, north]) WITHOUT assembling topology — just the ISO-8211
+/// records, DSPM, and the raw SG2D coordinates. For the lazy ENC_ROOT index
+/// (band + bbox per cell), so the source can decide which cells a tile needs
+/// before paying for a full parse + portrayal. Returns null if unparseable.
+pub fn peekMeta(gpa: Allocator, bytes: []const u8) ?CellMeta {
+    var file = iso.parse(gpa, bytes) catch return null;
+    defer file.deinit();
+    var m = CellMeta{};
+    var comf: f64 = 10_000_000;
+    for (file.records) |rec| {
+        if (rec.field("DSPM")) |dspm| {
+            const p = parseDSPM(dspm);
+            m.cscl = p.cscl;
+            comf = @floatFromInt(p.comf);
+            break;
+        }
+    }
+    var w: f64 = 1e18;
+    var s: f64 = 1e18;
+    var e: f64 = -1e18;
+    var n: f64 = -1e18;
+    var have = false;
+    for (file.records) |rec| {
+        const sg = rec.field("SG2D") orelse continue;
+        const cnt = sg.len / 8;
+        var i: usize = 0;
+        while (i < cnt) : (i += 1) {
+            const lat = @as(f64, @floatFromInt(i32le(sg, i * 8))) / comf;
+            const lon = @as(f64, @floatFromInt(i32le(sg, i * 8 + 4))) / comf;
+            w = @min(w, lon);
+            e = @max(e, lon);
+            s = @min(s, lat);
+            n = @max(n, lat);
+            have = true;
+        }
+    }
+    if (have) m.bounds = .{ w, s, e, n };
+    return m;
+}
+
 const vkey = struct {
     fn of(rcnm: u8, rcid: u32) u64 {
         return (@as(u64, rcnm) << 32) | rcid;

@@ -23,6 +23,7 @@ const tile = @import("tile.zig");
 pub const Backend = struct {
     cell: s57.Cell,
     portrayal: ?[]const ?[]const u8 = null,
+    geo: ?s57_mvt.GeoParts = null, // line/area geometry assembled once (buildGeoCache)
     bounds: [4]f64,
 };
 
@@ -58,6 +59,14 @@ pub fn bandZooms(band: Band) ZoomRange {
         .general => .{ .min = 7, .max = 9 },
         .overview => .{ .min = 0, .max = 7 },
     };
+}
+
+/// Whether to cache assembled geometry for a band. The fine bands have many small
+/// cells that each span several tiles (big reuse, modest memory); the coarse bands
+/// (general/overview) have few but huge cells (little reuse, large memory), so skip
+/// caching there to keep peak memory bounded.
+pub fn cacheGeoForBand(band: Band) bool {
+    return @intFromEnum(band) <= @intFromEnum(Band.coastal);
 }
 
 /// Progress callback. stage 0 = loading/portraying cells (driven by the caller),
@@ -134,7 +143,7 @@ const TileGenCtx = struct {
         const idxs = c.idx_lists[i];
         const refs = c.gpa.alloc(s57_mvt.CellRef, idxs.len) catch return;
         defer c.gpa.free(refs);
-        for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal };
+        for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .geo = c.backends[idx].geo };
         const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y) catch return;
         if (mvt_bytes.len > 0) c.results[i] = mvt_bytes else c.gpa.free(mvt_bytes);
     }

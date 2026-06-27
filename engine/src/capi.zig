@@ -16,6 +16,7 @@ const s57_mvt = @import("s57_mvt.zig");
 const portray = @import("portray.zig");
 const bake_enc = @import("bake_enc.zig");
 const catalogue = @import("catalogue.zig");
+const tile = @import("tile.zig");
 
 const gpa = std.heap.page_allocator;
 
@@ -35,11 +36,85 @@ const CellBackend = struct {
     portray_arena: ?*std.heap.ArenaAllocator = null,
 };
 
+// One cell in the lazy ENC_ROOT index: its owned bytes + cheap metadata (bbox +
+// navigational band), parsed + portrayed ON DEMAND the first time a requested tile
+// needs it, then kept until evicted by the LRU. Lets a host open the whole NOAA
+// catalogue instantly and pay only for the cells under the current view.
+const LazyCell = struct {
+    base: []u8,
+    updates: [][]u8,
+    bbox: [4]f64, // [west, south, east, north]
+    band: bake_enc.Band,
+    cell: ?s57.Cell = null,
+    portrayal: ?[]const ?[]const u8 = null,
+    arena: ?*std.heap.ArenaAllocator = null,
+    tick: u64 = 0, // LRU: last tile that used this cell
+};
+
+const LazySource = struct {
+    cells: []LazyCell,
+    rules_dir: []u8, // owned (lazy portrayal needs it after open returns)
+    tick: u64 = 0,
+    loaded: usize = 0,
+    max_loaded: usize = 96, // LRU budget on parsed+portrayed cells
+};
+
 const Backend = union(enum) {
     reader: pmtiles.Reader,
     cell: CellBackend,
-    cells: []CellBackend, // ENC_ROOT: several cells, overlaid per tile
+    cells: LazySource, // ENC_ROOT: lazy spatial index, parsed/portrayed on demand
 };
+
+fn bboxOverlap(a_: [4]f64, b_: [4]f64) bool {
+    return a_[0] <= b_[2] and a_[2] >= b_[0] and a_[1] <= b_[3] and a_[3] >= b_[1];
+}
+
+// Parse + portray a lazy cell if not already loaded, and stamp its LRU tick.
+fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
+    ls.tick += 1;
+    lc.tick = ls.tick;
+    if (lc.cell != null) return;
+    var cell = s57.parseCellWithUpdates(gpa, lc.base, lc.updates) catch return;
+    if (gpa.create(std.heap.ArenaAllocator)) |p| {
+        p.* = std.heap.ArenaAllocator.init(gpa);
+        if (portray.portrayCell(p.allocator(), &cell, ls.rules_dir)) |res| {
+            lc.portrayal = res;
+            lc.arena = p;
+        } else |_| {
+            p.deinit();
+            gpa.destroy(p);
+        }
+    } else |_| {}
+    lc.cell = cell;
+    ls.loaded += 1;
+}
+
+fn lazyUnload(lc: *LazyCell) void {
+    if (lc.cell) |*c| c.deinit();
+    lc.cell = null;
+    lc.portrayal = null;
+    if (lc.arena) |p| {
+        p.deinit();
+        gpa.destroy(p);
+        lc.arena = null;
+    }
+}
+
+// Evict least-recently-used loaded cells down to the budget, never touching cells
+// used by the tile currently being generated (tick >= keep_from).
+fn lazyEvict(ls: *LazySource, keep_from: u64) void {
+    while (ls.loaded > ls.max_loaded) {
+        var victim: ?*LazyCell = null;
+        for (ls.cells) |*lc| {
+            if (lc.cell == null or lc.tick >= keep_from) continue;
+            if (victim == null or lc.tick < victim.?.tick) victim = lc;
+        }
+        if (victim) |v| {
+            lazyUnload(v);
+            ls.loaded -= 1;
+        } else break;
+    }
+}
 
 const Source = struct {
     backend: Backend,
@@ -49,6 +124,50 @@ const Source = struct {
     // would re-decode (PMTiles) or re-generate (cell) the same tiles. Values are
     // owned here; tile57_tile_get returns a fresh copy the caller frees.
     cache: std.AutoHashMap(u64, []u8),
+};
+
+fn lazyFreeCell(lc: *LazyCell) void {
+    lazyUnload(lc);
+    gpa.free(lc.base);
+    for (lc.updates) |u| gpa.free(u);
+    if (lc.updates.len > 0) gpa.free(lc.updates);
+}
+
+// Parallel open worker: peek each cell's band + bbox and copy its bytes into a
+// LazyCell. peekMeta + dupes use the (thread-safe) page allocator; cells with no
+// geometry / unparseable headers are left ok=false and dropped.
+const OpenWork = struct {
+    inputs: []const CellInput,
+    out: []LazyCell,
+    ok: []bool,
+
+    fn run(uptr: *anyopaque, i: usize) void {
+        const c: *OpenWork = @ptrCast(@alignCast(uptr));
+        const in = c.inputs[i];
+        const meta = s57.peekMeta(gpa, in.base[0..in.base_len]) orelse return;
+        const bbox = meta.bounds orelse return;
+        const base = gpa.dupe(u8, in.base[0..in.base_len]) catch return;
+        var ups: [][]u8 = &.{};
+        const ucount: usize = if (in.updates != null and in.update_lens != null) in.update_count else 0;
+        if (ucount > 0) {
+            const arr = gpa.alloc([]u8, ucount) catch {
+                gpa.free(base);
+                return;
+            };
+            var k: usize = 0;
+            while (k < ucount) : (k += 1) {
+                arr[k] = gpa.dupe(u8, in.updates.?[k][0..in.update_lens.?[k]]) catch {
+                    for (arr[0..k]) |u| gpa.free(u);
+                    gpa.free(arr);
+                    gpa.free(base);
+                    return;
+                };
+            }
+            ups = arr;
+        }
+        c.out[i] = .{ .base = base, .updates = ups, .bbox = bbox, .band = bake_enc.bandOf(meta.cscl) };
+        c.ok[i] = true;
+    }
 };
 
 fn tileKey(z: u8, x: u32, y: u32) u64 {
@@ -143,39 +262,59 @@ export fn tile57_source_open_cells(
     count: usize,
     rules_dir: ?[*:0]const u8,
 ) callconv(.c) ?*Source {
+    if (count == 0) return null;
     const dir = resolveRulesDir(rules_dir);
-    var list = std.ArrayList(CellBackend).empty;
+    const dir_copy = gpa.dupe(u8, dir) catch return null;
     const inputs = cells_ptr[0..count];
-    for (inputs) |in| {
-        // Collect this cell's update buffers (.001…) into a slice for the parser.
-        var ups = std.ArrayList([]const u8).empty;
-        defer ups.deinit(gpa);
-        if (in.updates) |uptr| if (in.update_lens) |ulen| {
-            var k: usize = 0;
-            while (k < in.update_count) : (k += 1) ups.append(gpa, uptr[k][0..ulen[k]]) catch break;
-        };
-        if (buildCellBackend(in.base[0..in.base_len], ups.items, dir)) |cb| {
-            list.append(gpa, cb) catch {
-                var c = cb;
-                freeCellBackend(&c);
-            };
-        }
-    }
-    if (list.items.len == 0) {
-        list.deinit(gpa);
-        return null;
-    }
-    const owned = list.toOwnedSlice(gpa) catch {
-        for (list.items) |*cb| freeCellBackend(cb);
-        list.deinit(gpa);
+
+    // Build the spatial index in parallel: peek each cell's band + bbox and copy
+    // its bytes. No geometry assembly, no portrayal — that happens lazily per tile.
+    const tmp = gpa.alloc(LazyCell, count) catch {
+        gpa.free(dir_copy);
         return null;
     };
+    defer gpa.free(tmp);
+    const ok = gpa.alloc(bool, count) catch {
+        gpa.free(dir_copy);
+        return null;
+    };
+    defer gpa.free(ok);
+    @memset(ok, false);
+
+    var ow = OpenWork{ .inputs = inputs, .out = tmp, .ok = ok };
+    bake_enc.parallelFor(count, &ow, OpenWork.run);
+
+    var valid: usize = 0;
+    for (ok) |k| {
+        if (k) valid += 1;
+    }
+    if (valid == 0) {
+        gpa.free(dir_copy);
+        return null;
+    }
+
+    const cells = gpa.alloc(LazyCell, valid) catch {
+        for (tmp, ok) |*lc, k| if (k) lazyFreeCell(lc);
+        gpa.free(dir_copy);
+        return null;
+    };
+    var j: usize = 0;
+    for (tmp, ok) |lc, k| if (k) {
+        cells[j] = lc;
+        j += 1;
+    };
+
     const src = gpa.create(Source) catch {
-        for (owned) |*cb| freeCellBackend(cb);
-        gpa.free(owned);
+        for (cells) |*lc| lazyFreeCell(lc);
+        gpa.free(cells);
+        gpa.free(dir_copy);
         return null;
     };
-    src.* = .{ .backend = .{ .cells = owned }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    src.* = .{
+        .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy } },
+        .data = null,
+        .cache = std.AutoHashMap(u64, []u8).init(gpa),
+    };
     return src;
 }
 
@@ -195,6 +334,7 @@ const BakeWork = struct {
     outs: []?bake_enc.Backend,
     arenas: []?*std.heap.ArenaAllocator,
     rules_dir: []const u8,
+    build_geo: bool,
 
     fn run(uptr: *anyopaque, i: usize) void {
         const c: *BakeWork = @ptrCast(@alignCast(uptr));
@@ -204,19 +344,17 @@ const BakeWork = struct {
             cell.deinit();
             return;
         };
-        var pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
+        // One arena per cell holds both the portrayal streams and the assembled
+        // geometry cache, freed together when the band is done.
         var portrayal: ?[]const ?[]const u8 = null;
+        var geo: ?s57_mvt.GeoParts = null;
+        const pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(gpa);
-            if (portray.portrayCell(p.allocator(), &cell, c.rules_dir)) |res| {
-                portrayal = res;
-            } else |_| {
-                p.deinit();
-                gpa.destroy(p);
-                pa = null;
-            }
+            portrayal = portray.portrayCell(p.allocator(), &cell, c.rules_dir) catch null;
+            if (c.build_geo) geo = s57_mvt.buildGeoCache(p.allocator(), &cell) catch null;
         }
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .bounds = b };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .geo = geo, .bounds = b };
         c.arenas[i] = pa;
     }
 };
@@ -288,7 +426,7 @@ export fn tile57_bake_cells(
         const pas = gpa.alloc(?*std.heap.ArenaAllocator, sources.items.len) catch continue;
         defer gpa.free(pas);
         @memset(pas, null);
-        var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir };
+        var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir, .build_geo = bake_enc.cacheGeoForBand(band) };
         bake_enc.parallelFor(sources.items.len, &bw, BakeWork.run);
         loaded += idxs.len;
         if (progress) |cb| cb(user, 0, loaded, count);
@@ -361,9 +499,10 @@ export fn tile57_source_close(src: ?*Source) callconv(.c) void {
     switch (s.backend) {
         .reader => |*r| r.deinit(),
         .cell => |*cb| freeCellBackend(cb),
-        .cells => |cbs| {
-            for (cbs) |*cb| freeCellBackend(cb);
-            gpa.free(cbs);
+        .cells => |*ls| {
+            for (ls.cells) |*lc| lazyFreeCell(lc);
+            gpa.free(ls.cells);
+            gpa.free(ls.rules_dir);
         },
     }
     var it = s.cache.valueIterator();
@@ -411,18 +550,15 @@ export fn tile57_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64
             };
         },
         .cell => |*cb| b = cb.cell.bounds() orelse return false,
-        .cells => |cbs| {
-            var have = false;
+        .cells => |ls| {
+            if (ls.cells.len == 0) return false;
             var u: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }; // [w,s,e,n]
-            for (cbs) |*cb| {
-                const cbnd = cb.cell.bounds() orelse continue;
-                u[0] = @min(u[0], cbnd[0]);
-                u[1] = @min(u[1], cbnd[1]);
-                u[2] = @max(u[2], cbnd[2]);
-                u[3] = @max(u[3], cbnd[3]);
-                have = true;
+            for (ls.cells) |lc| { // from the cheap index bboxes — no parse
+                u[0] = @min(u[0], lc.bbox[0]);
+                u[1] = @min(u[1], lc.bbox[1]);
+                u[2] = @max(u[2], lc.bbox[2]);
+                u[3] = @max(u[3], lc.bbox[3]);
             }
-            if (!have) return false;
             b = u;
         },
     }
@@ -464,11 +600,36 @@ export fn tile57_tile_get(
     const bytes: []u8 = switch (s.backend) {
         .reader => |*r| (r.getTile(gpa, z, x, y) catch return -1) orelse (gpa.alloc(u8, 0) catch return -1),
         .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -1,
-        .cells => |cbs| blk: {
-            const refs = gpa.alloc(s57_mvt.CellRef, cbs.len) catch return -1;
-            defer gpa.free(refs);
-            for (cbs, 0..) |*cb, i| refs[i] = .{ .cell = &cb.cell, .portrayal = cb.portrayal };
-            break :blk s57_mvt.generateTileMulti(gpa, refs, z, x, y) catch return -1;
+        .cells => |*ls| blk: {
+            const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
+            // Pick one band among the cells overlapping this tile: the finest band
+            // whose native range includes z (best-band, no coarser scale drawing
+            // under a finer one); if z falls in a coverage gap (e.g. only general
+            // charts exist where you've zoomed out to z6), overzoom the coarsest
+            // available band so the tile isn't blank.
+            var finest_incl: ?bake_enc.Band = null;
+            var coarsest_any: ?bake_enc.Band = null;
+            for (ls.cells) |lc| {
+                if (!bboxOverlap(lc.bbox, tb)) continue;
+                const zr = bake_enc.bandZooms(lc.band);
+                if (z >= zr.min and z <= zr.max) {
+                    if (finest_incl == null or @intFromEnum(lc.band) < @intFromEnum(finest_incl.?)) finest_incl = lc.band;
+                }
+                if (coarsest_any == null or @intFromEnum(lc.band) > @intFromEnum(coarsest_any.?)) coarsest_any = lc.band;
+            }
+            const band = finest_incl orelse coarsest_any orelse break :blk (gpa.alloc(u8, 0) catch return -1);
+
+            const keep_from = ls.tick + 1; // cells loaded for this tile aren't evicted below
+            var refs = std.ArrayList(s57_mvt.CellRef).empty;
+            defer refs.deinit(gpa);
+            for (ls.cells) |*lc| {
+                if (lc.band != band or !bboxOverlap(lc.bbox, tb)) continue;
+                lazyEnsureLoaded(ls, lc);
+                if (lc.cell) |*c| refs.append(gpa, .{ .cell = c, .portrayal = lc.portrayal }) catch {};
+            }
+            const mvt = s57_mvt.generateTileMulti(gpa, refs.items, z, x, y) catch return -1;
+            lazyEvict(ls, keep_from);
+            break :blk mvt;
         },
     };
     s.cache.put(key, bytes) catch {}; // best-effort; cache owns `bytes` on success

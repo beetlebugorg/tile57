@@ -54,6 +54,40 @@ inline std::string readFileBytes(const std::filesystem::path &p) {
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
+// --- bake-on-open cache --------------------------------------------------------
+// An ENC_ROOT is baked to ONE PMTiles archive on first open and cached, so later
+// opens are instant and the running app holds no per-cell memory. Cache lives in
+// $XDG_CACHE_HOME/chartplotter (else ~/.cache/chartplotter), keyed by a content
+// signature + the bake max-zoom. Env overrides: CHARTPLOTTER_BAKE_MIN/MAXZOOM
+// (default 0..14; the client overzooms past the cap for harbour close-ups) and
+// CHARTPLOTTER_LIVE=1 to skip the bake and generate tiles in-process.
+
+inline std::filesystem::path bakeCacheDir() {
+    namespace fs = std::filesystem;
+    if (const char *x = std::getenv("XDG_CACHE_HOME"); x && *x) return fs::path(x) / "chartplotter";
+    if (const char *h = std::getenv("HOME"); h && *h) return fs::path(h) / ".cache" / "chartplotter";
+    return fs::temp_directory_path() / "chartplotter";
+}
+
+inline int bakeMinZoom() {
+    const char *e = std::getenv("CHARTPLOTTER_BAKE_MINZOOM");
+    return e ? std::atoi(e) : 0;
+}
+inline int bakeMaxZoom() {
+    const char *e = std::getenv("CHARTPLOTTER_BAKE_MAXZOOM");
+    return e ? std::atoi(e) : 14;
+}
+
+// Console progress for the on-open bake. stage 0 = loading/portraying, 1 = tiles.
+inline void bakeProgress(void *, uint8_t stage, size_t done, size_t total) {
+    const char *label = stage == 0 ? "loading cells" : "baking tiles ";
+    if (total)
+        std::fprintf(stderr, "\r[chart] %s %zu/%zu    ", label, done, total);
+    else
+        std::fprintf(stderr, "\r[chart] %s %zu    ", label, done);
+    std::fflush(stderr);
+}
+
 inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -85,6 +119,10 @@ inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
     std::deque<std::vector<size_t>> updLens;
     std::vector<tile57_cell_input> inputs;
 
+    // Content signature for the cache key: mix each base cell's size + mtime.
+    std::uint64_t sig = 1469598103934665603ull; // FNV-1a offset
+    auto mix = [&sig](std::uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+
     for (const auto &base : bases) {
         blobs.push_back(readFileBytes(base));
         if (blobs.back().empty()) {
@@ -92,6 +130,8 @@ inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
             continue;
         }
         const std::string &baseBytes = blobs.back();
+        mix(baseBytes.size());
+        if (auto t = fs::last_write_time(base, ec); !ec) mix(static_cast<std::uint64_t>(t.time_since_epoch().count()));
 
         updPtrs.emplace_back();
         updLens.emplace_back();
@@ -121,6 +161,48 @@ inline tile57_source *openPath(const std::string &path, const char *rules_dir) {
         inputs.push_back(ci);
     }
     if (inputs.empty()) return nullptr;
+
+    // Default: lazy on-demand generation. tile57_source_open_cells builds a cheap
+    // spatial index (band + bbox per cell) and parses + portrays only the cells a
+    // requested tile needs, with an LRU — so the whole catalogue opens instantly
+    // and holds almost no memory.
+    if (const char *bake = std::getenv("CHARTPLOTTER_BAKE"); !(bake && *bake))
+        return tile57_source_open_cells(inputs.data(), inputs.size(), rules_dir);
+
+    // Opt-in (CHARTPLOTTER_BAKE=1): bake the whole ENC_ROOT to one PMTiles archive
+    // once, cached by content + max-zoom (smooth panning everywhere after a
+    // one-time wait — good for offline use).
+    char sigbuf[48];
+    std::snprintf(sigbuf, sizeof sigbuf, "%016llx-z%d", static_cast<unsigned long long>(sig), bakeMaxZoom());
+    const fs::path cache = bakeCacheDir() / (fs::path(path).filename().string() + "-" + sigbuf + ".pmtiles");
+
+    if (fs::exists(cache, ec)) {
+        const std::string bytes = readFileBytes(cache);
+        if (!bytes.empty()) {
+            std::fprintf(stderr, "[chart] using cached tiles: %s\n", cache.string().c_str());
+            return tile57_source_open(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size(),
+                                      TILE57_FORMAT_PMTILES, rules_dir);
+        }
+    }
+
+    std::fprintf(stderr, "[chart] baking %zu cells to %s (first run; cached after)\n",
+                 inputs.size(), cache.string().c_str());
+    std::uint8_t *out = nullptr;
+    std::size_t out_len = 0;
+    const int rc = tile57_bake_cells(inputs.data(), inputs.size(), rules_dir,
+                                     static_cast<uint8_t>(bakeMinZoom()), static_cast<uint8_t>(bakeMaxZoom()),
+                                     bakeProgress, nullptr, &out, &out_len);
+    std::fprintf(stderr, "\n");
+    if (rc == 1 && out && out_len) {
+        std::error_code wec;
+        fs::create_directories(cache.parent_path(), wec);
+        if (std::ofstream f(cache, std::ios::binary); f)
+            f.write(reinterpret_cast<const char *>(out), static_cast<std::streamsize>(out_len));
+        tile57_source *src = tile57_source_open(out, out_len, TILE57_FORMAT_PMTILES, rules_dir);
+        tile57_tile_free(out, out_len);
+        return src;
+    }
+    std::fprintf(stderr, "[chart] bake produced no tiles; using live in-process generation\n");
     return tile57_source_open_cells(inputs.data(), inputs.size(), rules_dir);
 }
 

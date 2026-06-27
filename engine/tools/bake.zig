@@ -362,6 +362,7 @@ const PortrayWork = struct {
     arenas: []?*std.heap.ArenaAllocator,
     rules_dir: []const u8,
     gpa: std.mem.Allocator,
+    build_geo: bool,
 
     fn run(uptr: *anyopaque, i: usize) void {
         const c: *PortrayWork = @ptrCast(@alignCast(uptr));
@@ -371,19 +372,17 @@ const PortrayWork = struct {
             cell.deinit();
             return;
         };
-        var pa: ?*std.heap.ArenaAllocator = c.gpa.create(std.heap.ArenaAllocator) catch null;
+        // One arena per cell holds both the portrayal streams and the assembled
+        // geometry cache, freed together when the band is done.
         var portrayal: ?[]const ?[]const u8 = null;
+        var geo: ?engine.s57_mvt.GeoParts = null;
+        const pa: ?*std.heap.ArenaAllocator = c.gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(c.gpa);
-            if (engine.portray.portrayCell(p.allocator(), &cell, c.rules_dir)) |res| {
-                portrayal = res;
-            } else |_| {
-                p.deinit();
-                c.gpa.destroy(p);
-                pa = null;
-            }
+            portrayal = engine.portray.portrayCell(p.allocator(), &cell, c.rules_dir) catch null;
+            if (c.build_geo) geo = engine.s57_mvt.buildGeoCache(p.allocator(), &cell) catch null;
         }
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .bounds = b };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .geo = geo, .bounds = b };
         c.arenas[i] = pa;
     }
 };
@@ -505,7 +504,7 @@ fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !vo
         const pas = page.alloc(?*std.heap.ArenaAllocator, sources.items.len) catch continue;
         defer page.free(pas);
         @memset(pas, null);
-        var pw = PortrayWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = rules_dir, .gpa = page };
+        var pw = PortrayWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = rules_dir, .gpa = page, .build_geo = Bands.cacheGeoForBand(band) };
         Bands.parallelFor(sources.items.len, &pw, PortrayWork.run);
 
         // The cells copied what they keep — free this band's raw bytes now.
