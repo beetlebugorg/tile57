@@ -189,6 +189,49 @@ int tile57_build_style(const char *template_json, size_t template_len,
  * them). date_view is set to "" (today). */
 void tile57_mariner_defaults(tile57_mariner *m);
 
+/* ---- portrayal asset generation -----------------------------------------
+ *
+ * Generate the S-101 portrayal assets at runtime from in-memory S-101 Portrayal
+ * Catalogue bytes — the host reads the catalogue files; tile57 never touches the
+ * filesystem. All outputs are owned by the library; free each buffer with
+ * tile57_tile_free (same length). The offline `tile57` CLI emits the same files.
+ */
+
+/* A named blob: a NUL-terminated id (e.g. a file stem) + its bytes. */
+typedef struct {
+    const char *id;
+    const uint8_t *data;
+    size_t len;
+} tile57_named_bytes;
+
+/* colortables.json (S-52 colour token -> hex per day/dusk/night palette) from a
+ * ColorProfiles/colorProfile.xml. Returns 1 with *out/*out_len, 0 on error. */
+int tile57_colortables(const uint8_t *xml, size_t xml_len,
+                       uint8_t **out, size_t *out_len);
+
+/* linestyles.json (dash patterns + placed symbols) from the S-101 LineStyles
+ * (each `id` = the XML file stem). Returns 1 with *out/*out_len, 0 on error. */
+int tile57_linestyles(const tile57_named_bytes *line_styles, size_t count,
+                      uint8_t **out, size_t *out_len);
+
+/* Sprite atlas: rasterize the S-101 Symbols/*.svg against a palette stylesheet
+ * (css = a *SvgStyle.css's content) and pack them. Returns 1 with the sprite.json
+ * in *out_json/*out_json_len and the atlas PNG in *out_png/*out_png_len (free each
+ * with tile57_tile_free); 0 on error. */
+int tile57_sprite_atlas(const tile57_named_bytes *svgs, size_t count,
+                        const uint8_t *css, size_t css_len,
+                        uint8_t **out_json, size_t *out_json_len,
+                        uint8_t **out_png, size_t *out_png_len);
+
+/* Area-fill pattern atlas: tile each S-101 AreaFills/*.xml's referenced symbol on
+ * its v1/v2 lattice. `symbols` are the Symbols/*.svg the fills reference. Returns
+ * 1 with patterns.json + patterns.png (free each with tile57_tile_free); 0 on error. */
+int tile57_pattern_atlas(const tile57_named_bytes *fills, size_t fill_count,
+                         const tile57_named_bytes *symbols, size_t symbol_count,
+                         const uint8_t *css, size_t css_len,
+                         uint8_t **out_json, size_t *out_json_len,
+                         uint8_t **out_png, size_t *out_png_len);
+
 #ifdef __cplusplus
 }
 #endif

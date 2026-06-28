@@ -218,6 +218,7 @@ pub fn build(b: *std.Build) void {
     });
     addPkgs(tile57_mod, &pure_pkgs);
     tile57_mod.addImport("portray", portray_mod);
+    tile57_mod.addImport("sprite", sprite_mod); // sprite/pattern atlas generation
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -231,6 +232,7 @@ pub fn build(b: *std.Build) void {
     });
     addPkgs(lib_mod, &pure_pkgs);
     lib_mod.addImport("portray", portray_mod);
+    lib_mod.addImport("sprite", sprite_mod); // C ABI: sprite/pattern atlas generation
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
 

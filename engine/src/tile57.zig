@@ -44,6 +44,7 @@ pub const style = struct {
 
 // ---- portrayal asset + style generation ----------------------------------
 pub const assets = @import("assets"); // colortables / linestyles / style / manifest
+pub const sprite = @import("sprite"); // S-101 sprite + area-fill pattern atlases
 pub const chartstyle = @import("chartstyle"); // mariner-driven MapLibre style patching
 
 // ---- tiling / encoding ---------------------------------------------------
