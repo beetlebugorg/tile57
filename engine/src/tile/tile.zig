@@ -24,7 +24,13 @@ pub fn lonLatToWorld(lon: f64, lat: f64) [2]f64 {
 /// Project lon/lat to tile-local MVT coordinates for tile (z,x,y) at `extent`.
 /// Values are not clipped; they may fall outside [0,extent].
 pub fn project(lon: f64, lat: f64, z: u8, tx: u32, ty: u32, extent: i32) mvt.Point {
-    const w = lonLatToWorld(lon, lat);
+    return worldToTile(lonLatToWorld(lon, lat), z, tx, ty, extent);
+}
+
+/// Project a normalised web-mercator world coord (`lonLatToWorld` output, [0,1])
+/// to tile-local MVT coordinates — the cheap part of `project` (no transcendentals),
+/// so a baker can compute world once per point and reproject it across tiles fast.
+pub fn worldToTile(w: [2]f64, z: u8, tx: u32, ty: u32, extent: i32) mvt.Point {
     const scale = @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
     const ext: f64 = @floatFromInt(extent);
     const px = (w[0] * scale - @as(f64, @floatFromInt(tx))) * ext;

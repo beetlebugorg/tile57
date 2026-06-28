@@ -1062,6 +1062,7 @@ const CellPortray = struct {
 const CellGeom = struct {
     cell: engine.s57.Cell, // cell.arena owns the geometry
     geo: ?engine.s57_mvt.GeoParts,
+    geo_world: ?engine.s57_mvt.GeoWorld = null, // precomputed world coords (in geo_arena)
     geo_arena: ?*std.heap.ArenaAllocator,
     feat_bbox: []const ?[4]f64 = &.{}, // per-feature bbox for the per-tile cull (in geo_arena)
 };
@@ -1086,7 +1087,6 @@ const LoadWork = struct {
     geom: []?CellGeom, // (re)built every load
     rules_dir: []const u8,
     gpa: std.mem.Allocator,
-    build_geo: bool,
 
     fn run(uptr: *anyopaque, j: usize) void {
         const c: *LoadWork = @ptrCast(@alignCast(uptr));
@@ -1100,15 +1100,21 @@ const LoadWork = struct {
             return;
         };
         var geo: ?engine.s57_mvt.GeoParts = null;
+        var geo_world: ?engine.s57_mvt.GeoWorld = null;
         var geo_arena: ?*std.heap.ArenaAllocator = null;
         var feat_bbox: []const ?[4]f64 = &.{};
         if (c.gpa.create(std.heap.ArenaAllocator)) |ga| {
             ga.* = std.heap.ArenaAllocator.init(c.gpa);
-            if (c.build_geo) geo = engine.s57_mvt.buildGeoCache(ga.allocator(), &cell) catch null;
+            // Assemble line/area geometry once + its world coords, so every tile
+            // reprojects cheaply (no per-point tan/log) — the bake's biggest cost.
+            if (engine.s57_mvt.buildGeoCache(ga.allocator(), &cell)) |g| {
+                geo = g;
+                geo_world = engine.s57_mvt.buildGeoWorld(ga.allocator(), g) catch null;
+            } else |_| {}
             feat_bbox = engine.s57_mvt.buildFeatBBox(ga.allocator(), &cell, geo) catch &.{};
             geo_arena = ga;
         } else |_| {}
-        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_arena = geo_arena, .feat_bbox = feat_bbox };
+        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_world = geo_world, .geo_arena = geo_arena, .feat_bbox = feat_bbox };
 
         if (c.portray[ci] != null) return; // already portrayed — reuse it (the speed win)
         const sticky = c.gpa.create(std.heap.ArenaAllocator) catch return;
@@ -1365,7 +1371,6 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         @memset(gave_up, false);
         var n_geom: usize = 0; // loaded-geometry count (the LRU target)
         var tick: u64 = 0;
-        const build_geo = Bands.cacheGeoForBand(band);
 
         for (stkeys, 0..) |stk, st_i| {
             g_prog.st = st_i + 1;
@@ -1397,7 +1402,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     }
                     src[j] = .{ .base = base_bytes, .updates = ups.toOwnedSlice(page) catch &.{} };
                 }
-                var lw = LoadWork{ .cells = miss.items, .sources = src, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = page, .build_geo = build_geo };
+                var lw = LoadWork{ .cells = miss.items, .sources = src, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = page };
                 Bands.parallelFor(miss.items.len, &lw, LoadWork.run);
                 for (miss.items, 0..) |ci, j| {
                     if (src[j].base.len > 0) page.free(src[j].base);
@@ -1421,6 +1426,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     .portrayal_plain = if (p) |pp| pp.plain else null,
                     .portrayal_simplified = if (p) |pp| pp.simplified else null,
                     .geo = g.geo,
+                    .geo_world = g.geo_world,
                     .feat_bbox = g.feat_bbox,
                     .bounds = if (p) |pp| pp.bounds else entries[ci].bbox,
                 }) catch {};

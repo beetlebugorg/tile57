@@ -26,6 +26,7 @@ pub const Backend = struct {
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     geo: ?s57_mvt.GeoParts = null, // line/area geometry assembled once (buildGeoCache)
+    geo_world: ?s57_mvt.GeoWorld = null, // world coords parallel to geo (cheap reprojection)
     feat_bbox: ?[]const ?[4]f64 = null, // per-feature bbox for the per-tile spatial cull
     bounds: [4]f64,
 };
@@ -185,7 +186,7 @@ const TileGenCtx = struct {
         const idxs = c.idx_lists[i];
         const refs = c.gpa.alloc(s57_mvt.CellRef, idxs.len) catch return;
         defer c.gpa.free(refs);
-        for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo, .feat_bbox = c.backends[idx].feat_bbox };
+        for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo, .geo_world = c.backends[idx].geo_world, .feat_bbox = c.backends[idx].feat_bbox };
         const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y) catch return;
         if (mvt_bytes.len > 0) c.results[i] = mvt_bytes else c.gpa.free(mvt_bytes);
         if (c.done) |d| {

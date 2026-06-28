@@ -352,6 +352,29 @@ pub fn buildFeatBBox(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts) ![]?[4
     return out;
 }
 
+/// World coords (web-mercator [0,1]) parallel to a geo cache: each line/area
+/// point's tile-independent projection, computed ONCE per cell so the baker
+/// reprojects cheaply per tile (tile.worldToTile, no tan/log) instead of running
+/// the transcendental projection for every tile a feature touches. Built from the
+/// assembled geo cache, so [fi][part][i] lines up with GeoParts.
+pub const GeoWorld = []const ?[][][2]f64;
+
+pub fn buildGeoWorld(a: Allocator, geo: GeoParts) !GeoWorld {
+    const out = try a.alloc(?[][][2]f64, geo.len);
+    for (geo, 0..) |maybe_parts, i| {
+        out[i] = null;
+        const parts = maybe_parts orelse continue;
+        const wparts = a.alloc([][2]f64, parts.len) catch continue;
+        for (parts, 0..) |part, pi| {
+            const wp = try a.alloc([2]f64, part.len);
+            for (part, 0..) |pt, j| wp[j] = tile.lonLatToWorld(pt.lon(), pt.lat());
+            wparts[pi] = wp;
+        }
+        out[i] = wparts;
+    }
+    return out;
+}
+
 /// The feature's assembled line/area parts: the baker's cached copy if present,
 /// else assembled now (the live path).
 fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.Feature) ![][]s57.LonLat {
@@ -379,36 +402,36 @@ fn variantDiffers(base: []const u8, variant: ?[]const u8) bool {
 ///   - everything else (including features whose variant stream is identical) stays
 ///     a single common pass (bnd=pts=2, tags omitted).
 /// SOUNDG bypasses this path (emitted as a multipoint earlier), so it never doubles.
-fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     const base = try s101.parse(a, instr);
 
     // Point-symbol style (pts): a point feature whose simplified-symbol stream
     // differs is emitted twice (paper pts=0 + simplified pts=1); else common.
     if (f.prim == 1) {
         if (variantDiffers(instr, simplified)) {
-            try emitParsed(a, cell, f, fi, geo, base, 2, 0, z, x, y, tb, box, L);
+            try emitParsed(a, cell, f, fi, geo, geo_world, base, 2, 0, z, x, y, tb, box, L);
             const sp = try s101.parse(a, simplified.?);
-            try emitParsed(a, cell, f, fi, geo, sp, 2, 1, z, x, y, tb, box, L);
+            try emitParsed(a, cell, f, fi, geo, geo_world, sp, 2, 1, z, x, y, tb, box, L);
         } else {
-            try emitParsed(a, cell, f, fi, geo, base, 2, 2, z, x, y, tb, box, L);
+            try emitParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, L);
         }
         return;
     }
     // Boundary symbolization (bnd): an area feature whose plain-boundary stream
     // differs is emitted twice (symbolized bnd=1 + plain bnd=0); else common.
     if (f.prim == 3 and variantDiffers(instr, plain)) {
-        try emitParsed(a, cell, f, fi, geo, base, 1, 2, z, x, y, tb, box, L);
+        try emitParsed(a, cell, f, fi, geo, geo_world, base, 1, 2, z, x, y, tb, box, L);
         const pl = try s101.parse(a, plain.?);
-        try emitParsed(a, cell, f, fi, geo, pl, 0, 2, z, x, y, tb, box, L);
+        try emitParsed(a, cell, f, fi, geo, geo_world, pl, 0, 2, z, x, y, tb, box, L);
         return;
     }
     // Lines, and any feature whose variant is absent/identical: one common pass.
-    try emitParsed(a, cell, f, fi, geo, base, 2, 2, z, x, y, tb, box, L);
+    try emitParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, L);
 }
 
 /// Emit one parsed portrayal pass `p`, stamping every primitive with the pass's
 /// boundary (`bnd`) and point-style (`pts`) variant tags.
-fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     // Route each feature into its base layer or the *_scamin bucket depending on
     // whether it carries a SCAMIN (1:N) display limit. Same geometry/properties
     // either way; the bucket lets the style gate the feature below its scale.
@@ -465,14 +488,22 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
-    // Project each usable part; quick-reject if none overlap the tile.
+    // Project each usable part; quick-reject if none overlap the tile. Reproject
+    // from the cell's precomputed world coords (cheap; no per-point tan/log) when
+    // the baker supplied them, else project lon/lat directly (the live path).
+    const wparts: ?[]const [][2]f64 = if (geo_world) |gw| (if (fi < gw.len) gw[fi] else null) else null;
     var projected = std.ArrayList([]mvt.Point).empty;
     var any_overlap = false;
-    for (geo_parts) |gp| {
+    for (geo_parts, 0..) |gp, pi| {
         if (gp.len < 2) continue;
         if (overlaps(geomBounds(gp), tb)) any_overlap = true;
         const proj = try a.alloc(mvt.Point, gp.len);
-        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+        const wp: ?[]const [2]f64 = if (wparts) |wps| (if (pi < wps.len and wps[pi].len == gp.len) wps[pi] else null) else null;
+        if (wp) |w| {
+            for (w, 0..) |ww, i| proj[i] = tile.worldToTile(ww, z, x, y, tile.EXTENT);
+        } else {
+            for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+        }
         try projected.append(a, proj);
     }
     if (!any_overlap or projected.items.len == 0) return;
@@ -663,6 +694,9 @@ pub const CellRef = struct {
     portrayal_plain: ?[]const ?[]const u8 = null,
     portrayal_simplified: ?[]const ?[]const u8 = null,
     geo: ?GeoParts = null,
+    /// World coords parallel to `geo` (precomputed projection) — lets the baker
+    /// reproject line/area geometry per tile without per-point tan/log.
+    geo_world: ?GeoWorld = null,
     /// Per-feature lon/lat bbox [w,s,e,n] (parallel to cell.features), precomputed
     /// once per cell so a tile can SKIP features it doesn't overlap instead of
     /// projecting + clipping every feature of every cell (the baker's spatial cull).
@@ -723,7 +757,7 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
         Lc.band = cr.band; // so this cell's features carry its band for the sort key
         Lc.suppress_fills = cr.suppress_fills; // coarse band over finer M_COVR (whole-tile): drop fill
         Lc.suppress_patterns = cr.suppress_patterns; // coarse band over finer M_COVR (centre): drop pattern
-        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 
     var layers = std.ArrayList(mvt.Layer).empty;
@@ -753,6 +787,7 @@ fn appendCellFeatures(
     portrayal_plain: ?[]const ?[]const u8,
     portrayal_simplified: ?[]const ?[]const u8,
     geo: ?GeoParts,
+    geo_world: ?GeoWorld,
     feat_bbox: ?[]const ?[4]f64,
     z: u8,
     x: u32,
@@ -788,7 +823,7 @@ fn appendCellFeatures(
                 // into two passes only when the variant actually differs.
                 const plain: ?[]const u8 = if (portrayal_plain) |pp| (if (fi < pp.len) pp[fi] else null) else null;
                 const simplified: ?[]const u8 = if (portrayal_simplified) |pp| (if (fi < pp.len) pp[fi] else null) else null;
-                try emitFromInstr(a, cell.*, f, fi, geo, s, plain, simplified, z, x, y, tb, box, L);
+                try emitFromInstr(a, cell.*, f, fi, geo, geo_world, s, plain, simplified, z, x, y, tb, box, L);
                 continue;
             }
         }
@@ -975,7 +1010,7 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
     };
-    try emitFromInstr(a, cell, f_sc, 0, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
     try std.testing.expectEqual(@as(usize, 0), points.items.len);
     try std.testing.expectEqual(@as(usize, 1), points_s.items.len);
     try std.testing.expectEqual(@as(i64, 7), findProp(points_s.items[0].properties, "draw_prio").?.int);
@@ -986,7 +1021,7 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .rcnm = 0, .rcid = 2, .prim = 1, .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try emitFromInstr(a, cell, f_base, 0, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
     try std.testing.expectEqual(@as(usize, 1), points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "draw_prio").?.int);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "scamin"));
@@ -1043,7 +1078,7 @@ test "emitFromInstr tags pts 0/1 when a point's simplified symbol differs" {
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
     // Paper -> BOYLAT01; simplified -> BOYLAT11. Two passes: pts=0 then pts=1.
-    try emitFromInstr(a, cell, f, 0, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f, 0, null, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", 0, 0, 0, tb, box, L);
     try std.testing.expectEqual(@as(usize, 2), points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "pts").?.int);
     try std.testing.expectEqualStrings("BOYLAT01", findProp(points.items[0].properties, "symbol_name").?.string);
@@ -1106,7 +1141,7 @@ test "emitFromInstr tags bnd 1/0 when an area's plain boundary differs" {
     // Symbolized boundary draws a complex line; plain draws a simple stroke.
     const symbolized = "ColorFill:DEPMS;LineStyle:CTNARE51,,1,CHMGD;LineInstruction:CTNARE51";
     const plain = "ColorFill:DEPMS;LineStyle:_simple_,,1,CHMGD;LineInstruction:_simple_";
-    try emitFromInstr(a, cell, f, 0, geo_one, symbolized, plain, null, 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f, 0, geo_one, null, symbolized, plain, null, 0, 0, 0, tb, box, L);
     // Both passes emit the fill: one tagged bnd=1 (symbolized), one bnd=0 (plain).
     try std.testing.expectEqual(@as(usize, 2), areas.items.len);
     try std.testing.expectEqual(@as(i64, 1), findProp(areas.items[0].properties, "bnd").?.int);
