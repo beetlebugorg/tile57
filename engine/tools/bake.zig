@@ -418,6 +418,37 @@ fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, ou
     return json;
 }
 
+// LineStyles/*.xml live under a PortrayalCatalog dir, alongside ColorProfiles.
+const LINESTYLES_REL = "LineStyles";
+
+// Read every LineStyles/*.xml under catalog_dir and emit linestyles.json (dash
+// patterns + placed symbols). Returns the bytes (arena owned). Shared by
+// assets/bundle. Mirrors the Go oracle's EmitS101 linestyles step.
+fn linestylesBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]u8 {
+    const ls_dir_path = try std.fs.path.join(a, &.{ catalog_dir, LINESTYLES_REL });
+    var dir = try std.Io.Dir.cwd().openDir(io, ls_dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var srcs = std.ArrayList(assets.LineStyleSrc).empty;
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".xml")) continue;
+        const path = try a.dupe(u8, entry.path);
+        const xml = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
+        const id = std.fs.path.stem(std.fs.path.basename(path));
+        try srcs.append(a, .{ .id = id, .xml = xml });
+    }
+    return assets.linestylesJson(a, srcs.items);
+}
+
+fn emitLinestyles(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
+    const json = try linestylesBytes(io, a, catalog_dir);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json });
+    return json;
+}
+
 /// `assets <portrayal-catalog-dir> -o <out-dir>` — emit the portrayal assets
 /// (colortables.json today; linestyles/sprites/glyphs to follow) for a catalogue.
 fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -439,7 +470,9 @@ fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
     const ct_path = try std.fs.path.join(a, &.{ out_dir, "colortables.json" });
     const json = try emitColorTables(io, a, catalog_dir, ct_path);
-    std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n", .{ catalog_dir, ct_path, json.len });
+    const ls_path = try std.fs.path.join(a, &.{ out_dir, "linestyles.json" });
+    const ls = try emitLinestyles(io, a, catalog_dir, ls_path);
+    std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalog_dir, ct_path, json.len, ls_path, ls.len });
 }
 
 /// `bundle <cell.000> -o <out-dir> [--rules DIR] [--catalog DIR] [--minzoom N]
@@ -501,6 +534,9 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const assets_dir = try std.fs.path.join(a, &.{ out_dir, "assets" });
     try std.Io.Dir.cwd().createDirPath(io, assets_dir);
     const ct_path = try std.fs.path.join(a, &.{ assets_dir, "colortables.json" });
+    const ls_path = try std.fs.path.join(a, &.{ assets_dir, "linestyles.json" });
+    _ = emitLinestyles(io, a, resolveCatalogDir(catalog), ls_path) catch |err|
+        std.debug.print("warning: linestyles emit failed ({s})\n", .{@errorName(err)});
     var styles: ?assets.Manifest.Styles = null;
     if (emitColorTables(io, a, resolveCatalogDir(catalog), ct_path)) |ct| {
         // One style.json per palette, resolving colour tokens from the colortables.

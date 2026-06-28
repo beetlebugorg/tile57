@@ -120,6 +120,276 @@ pub fn colorTablesJson(alloc: std.mem.Allocator, xml: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+// ---- linestyles.json -----------------------------------------------------
+//
+// Port of the Go oracle's internal/engine/assets.LinestylesJSONS101 (+ the
+// pkg/s100/catalog LineStyles XML loader). Parses each S-101 LineStyles/*.xml
+// definition into a dash pattern + placed symbols and emits linestyles.json,
+// matching the client schema: per id, period_px, a flat [on,off,…] dash array,
+// the pen colour token + width, and the symbols placed along the period.
+// Verified byte-identical to reference/assets/linestyles.json.
+
+// DefaultPxPerSymbolUnit is screen px per 0.01-mm PresLib symbol unit (Go:
+// internal/engine/portrayal.DefaultPxPerSymbolUnit, a float32). linestyle_px_per_mm
+// converts mm dimensions to screen px (×100: 1 mm = 100 symbol units). The f32→f64
+// promotion must match Go's `float64(DefaultPxPerSymbolUnit)` to stay byte-exact.
+const default_px_per_symbol_unit: f32 = 0.01 / 0.26458;
+const linestyle_px_per_mm: f64 = @as(f64, default_px_per_symbol_unit) * 100.0;
+
+/// One raw LineStyles/*.xml input: `id` is the file stem, `xml` the file bytes.
+pub const LineStyleSrc = struct { id: []const u8, xml: []const u8 };
+
+const Dash = struct { start: f64, length: f64 };
+const PlacedSym = struct { reference: []const u8, position: f64 };
+const ParsedLine = struct {
+    interval_length: f64 = 0,
+    pen_width: f64 = 0,
+    pen_color: []const u8 = "",
+    dashes: []Dash = &.{},
+    symbols: []PlacedSym = &.{},
+};
+
+const OnRun = struct { lo: f64, hi: f64 };
+fn lessRun(_: void, a: OnRun, b: OnRun) bool {
+    return a.lo < b.lo;
+}
+
+fn clampf(v: f64, lo: f64, hi: f64) f64 {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// Read the float inside the first <tag>…</tag> within `s`, or null if absent.
+fn tagFloat(s: []const u8, comptime tag: []const u8) ?f64 {
+    const open = "<" ++ tag ++ ">";
+    const i = std.mem.indexOf(u8, s, open) orelse return null;
+    const rest = s[i + open.len ..];
+    const close = std.mem.indexOfScalar(u8, rest, '<') orelse return null;
+    const num = std.mem.trim(u8, rest[0..close], " \t\r\n");
+    return std.fmt.parseFloat(f64, num) catch null;
+}
+
+// Read the text inside the first <tag>…</tag> within `s`, or "" if absent.
+fn tagText(s: []const u8, comptime tag: []const u8) []const u8 {
+    const open = "<" ++ tag ++ ">";
+    const i = std.mem.indexOf(u8, s, open) orelse return "";
+    const rest = s[i + open.len ..];
+    const close = std.mem.indexOfScalar(u8, rest, '<') orelse return "";
+    return std.mem.trim(u8, rest[0..close], " \t\r\n");
+}
+
+// Read the value of attribute `attr="…"` after the first occurrence of `attr=`.
+fn attrText(s: []const u8, comptime attr: []const u8) ?[]const u8 {
+    const needle = attr ++ "=\"";
+    const i = std.mem.indexOf(u8, s, needle) orelse return null;
+    const rest = s[i + needle.len ..];
+    const q = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    return rest[0..q];
+}
+
+// The body slice of one LineStyles XML to read fields from. A simple lineStyle
+// root (<ls:lineStyle …>) is bounded by its </ls:lineStyle> close — stopping
+// there drops the trailing HTML-comment variants some files carry (e.g.
+// CBLOHD01). A compositeLineStyle has no </ls:lineStyle>; its first component
+// <lineStyle>…</lineStyle> is the primary the client schema emits, so we take
+// up to the first </lineStyle> close.
+fn lineBody(xml: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, xml, "</ls:lineStyle>")) |e| return xml[0..e];
+    if (std.mem.indexOf(u8, xml, "</lineStyle>")) |e| return xml[0..e];
+    return xml;
+}
+
+fn parseLineStyle(a: std.mem.Allocator, xml: []const u8) !ParsedLine {
+    const body = lineBody(xml);
+    var p = ParsedLine{
+        .interval_length = tagFloat(body, "intervalLength") orelse 0,
+        .pen_color = tagText(body, "color"),
+    };
+    if (attrText(body, "width")) |w| p.pen_width = std.fmt.parseFloat(f64, w) catch 0;
+
+    var dashes = std.ArrayList(Dash).empty;
+    var rest = body;
+    while (std.mem.indexOf(u8, rest, "<dash>")) |di| {
+        const after = rest[di + "<dash>".len ..];
+        const end = std.mem.indexOf(u8, after, "</dash>") orelse after.len;
+        const block = after[0..end];
+        try dashes.append(a, .{
+            .start = tagFloat(block, "start") orelse 0,
+            .length = tagFloat(block, "length") orelse 0,
+        });
+        rest = after[end..];
+    }
+    p.dashes = dashes.items;
+
+    var syms = std.ArrayList(PlacedSym).empty;
+    rest = body;
+    while (std.mem.indexOf(u8, rest, "<symbol ")) |si| {
+        const after = rest[si..];
+        const end = std.mem.indexOf(u8, after, "</symbol>") orelse after.len;
+        const block = after[0..end];
+        if (attrText(block, "reference")) |ref| {
+            try syms.append(a, .{ .reference = ref, .position = tagFloat(block, "position") orelse 0 });
+        }
+        rest = after[end..];
+    }
+    p.symbols = syms.items;
+    return p;
+}
+
+const LsPattern = struct {
+    period_px: f64,
+    runs: []OnRun,
+    symbols: []PlacedSym,
+    color_token: []const u8,
+    width_px: f64,
+};
+
+// s101Pattern: convert one parsed line style into its analysed dash pattern.
+// Returns null when there is no interval to tile (a pure-symbol style), matching
+// the Go oracle (those ids are dropped from linestyles.json, e.g. INDHLT02).
+fn analysePattern(a: std.mem.Allocator, p: ParsedLine) !?LsPattern {
+    const period = p.interval_length * linestyle_px_per_mm;
+    if (period < 0.5) return null;
+
+    var runs = std.ArrayList(OnRun).empty;
+    if (p.dashes.len == 0) {
+        try runs.append(a, .{ .lo = 0, .hi = period }); // solid pen
+    } else {
+        for (p.dashes) |d| {
+            const lo = clampf(d.start * linestyle_px_per_mm, 0, period);
+            const hi = clampf((d.start + d.length) * linestyle_px_per_mm, 0, period);
+            if (hi - lo > 1e-6) try runs.append(a, .{ .lo = lo, .hi = hi });
+        }
+        std.sort.insertion(OnRun, runs.items, {}, lessRun); // stable, matches SliceStable
+    }
+    return .{
+        .period_px = period,
+        .runs = runs.items,
+        .symbols = p.symbols,
+        .color_token = p.pen_color,
+        .width_px = p.pen_width * linestyle_px_per_mm,
+    };
+}
+
+// dashArray: sorted on-runs over [0, period] -> flat [on,off,on,off,…] starting
+// with an "on" entry (leading 0 when the pattern opens with a gap), padded to an
+// even length so it tiles cleanly. Direct port of the Go oracle.
+fn dashArray(a: std.mem.Allocator, p: LsPattern) ![]f64 {
+    var out = std.ArrayList(f64).empty;
+    var pos: f64 = 0; // end of the last consumed run
+
+    const Flush = struct {
+        fn call(al: std.mem.Allocator, o: *std.ArrayList(f64), cur: *f64, lo: f64, hi: f64) !void {
+            if (lo > cur.* + 1e-6) {
+                if (o.items.len == 0) try o.append(al, 0); // leading gap -> 0 "on"
+                try o.append(al, lo - cur.*); // off
+            }
+            try o.append(al, hi - lo); // on
+            cur.* = hi;
+        }
+    };
+
+    var have_prev = false;
+    var prev_lo: f64 = 0;
+    var prev_hi: f64 = 0;
+    for (p.runs) |run| {
+        if (!have_prev) {
+            have_prev = true;
+            prev_lo = run.lo;
+            prev_hi = run.hi;
+            continue;
+        }
+        if (run.lo <= prev_hi + 1e-6) {
+            prev_hi = @max(prev_hi, run.hi); // overlap/adjacent -> merge
+        } else {
+            try Flush.call(a, &out, &pos, prev_lo, prev_hi);
+            prev_lo = run.lo;
+            prev_hi = run.hi;
+        }
+    }
+    if (have_prev) try Flush.call(a, &out, &pos, prev_lo, prev_hi);
+
+    if (p.period_px - pos > 1e-6) { // trailing gap to period end
+        if (out.items.len == 0) try out.append(a, 0); // pure-gap pattern
+        try out.append(a, p.period_px - pos); // off
+    }
+    if (out.items.len % 2 == 1) try out.append(a, 0); // even length tiles cleanly
+    if (out.items.len == 0) {
+        try out.append(a, 0);
+        try out.append(a, p.period_px);
+    }
+    return out.items;
+}
+
+fn appendF3(out: *std.ArrayList(u8), a: std.mem.Allocator, v: f64) !void {
+    var buf: [32]u8 = undefined;
+    try out.appendSlice(a, try std.fmt.bufPrint(&buf, "{d:.3}", .{v}));
+}
+
+/// Emit linestyles.json from the S-101 LineStyles XML sources. ids are sorted
+/// (stable, diff-friendly); pure-symbol styles with no interval are dropped.
+/// Returns allocator-owned bytes. Mirrors the Go oracle's LinestylesJSONS101.
+pub fn linestylesJson(alloc: std.mem.Allocator, srcs: []const LineStyleSrc) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var ids = std.ArrayList([]const u8).empty;
+    for (srcs) |s| try ids.append(a, s.id);
+    std.mem.sort([]const u8, ids.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\n");
+    var first = true;
+    for (ids.items) |id| {
+        // Find the source with this id (srcs is small).
+        var xml: []const u8 = "";
+        for (srcs) |s| if (std.mem.eql(u8, s.id, id)) {
+            xml = s.xml;
+            break;
+        };
+        const parsed = try parseLineStyle(a, xml);
+        const pat = (try analysePattern(a, parsed)) orelse continue;
+        const dash = try dashArray(a, pat);
+
+        if (!first) try out.appendSlice(alloc, ",\n");
+        first = false;
+        try out.appendSlice(alloc, "  \"");
+        try out.appendSlice(alloc, id);
+        try out.appendSlice(alloc, "\": { \"period_px\": ");
+        try appendF3(&out, alloc, pat.period_px);
+        try out.appendSlice(alloc, ", \"dash\": [");
+        for (dash, 0..) |v, i| {
+            if (i > 0) try out.appendSlice(alloc, ", ");
+            try appendF3(&out, alloc, v);
+        }
+        try out.appendSlice(alloc, "], \"color_token\": \"");
+        try out.appendSlice(alloc, pat.color_token);
+        try out.appendSlice(alloc, "\", \"width_px\": ");
+        try appendF3(&out, alloc, pat.width_px);
+        try out.appendSlice(alloc, ", \"symbols\": [");
+        for (pat.symbols, 0..) |sym, i| {
+            if (i > 0) try out.appendSlice(alloc, ", ");
+            try out.appendSlice(alloc, "{ \"o\": ");
+            try appendF3(&out, alloc, sym.position * linestyle_px_per_mm);
+            try out.appendSlice(alloc, ", \"n\": \"");
+            try out.appendSlice(alloc, sym.reference);
+            try out.appendSlice(alloc, "\", \"r\": ");
+            try appendF3(&out, alloc, 0); // S-101 symbols carry no sub-rotation
+            try out.appendSlice(alloc, " }");
+        }
+        try out.appendSlice(alloc, "] }");
+    }
+    try out.appendSlice(alloc, "\n}\n");
+    return out.toOwnedSlice(alloc);
+}
+
 // ---- manifest.json -------------------------------------------------------
 
 /// Inputs for the bundle manifest. Relative paths only (the bundle is
@@ -197,6 +467,35 @@ test "colorTablesJson: sorted tokens, lowercase hex, all three palettes" {
         \\  }
         \\}
     ;
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "linestylesJson: dash pattern + placed symbols, sorted ids, skips no-interval" {
+    const achare =
+        \\<ls:lineStyle xmlns:ls="http://www.iho.int/S100LineStyle/5.2">
+        \\   <intervalLength>32.3</intervalLength>
+        \\   <pen width="0.32"><color>CHMGD</color></pen>
+        \\   <dash><start>2</start><length>6</length></dash>
+        \\   <dash><start>18.2</start><length>6</length></dash>
+        \\   <dash><start>26.2</start><length>6</length></dash>
+        \\   <symbol reference="EMAREMG1"><position>5</position></symbol>
+        \\</ls:lineStyle>
+    ;
+    // No <intervalLength> -> dropped from output (matches the Go oracle, e.g. INDHLT02).
+    const noint =
+        \\<ls:compositeLineStyle xmlns:ls="http://www.iho.int/S100LineStyle/5.2">
+        \\  <lineStyle><pen width="1.28"><color>BKAJ1</color></pen></lineStyle>
+        \\</ls:compositeLineStyle>
+    ;
+    const out = try linestylesJson(std.testing.allocator, &.{
+        .{ .id = "ZZNOINT", .xml = noint },
+        .{ .id = "ACHARE51", .xml = achare },
+    });
+    defer std.testing.allocator.free(out);
+    const expected =
+        "{\n" ++
+        "  \"ACHARE51\": { \"period_px\": 122.080, \"dash\": [0.000, 7.559, 22.677, 38.552, 22.677, 7.559, 22.677, 0.378], \"color_token\": \"CHMGD\", \"width_px\": 1.209, \"symbols\": [{ \"o\": 18.898, \"n\": \"EMAREMG1\", \"r\": 0.000 }] }\n" ++
+        "}\n";
     try std.testing.expectEqualStrings(expected, out);
 }
 
