@@ -15,6 +15,28 @@ const iso = @import("iso8211");
 pub const LonLat = struct { lon: f64, lat: f64 };
 pub const Sounding = struct { lon: f64, lat: f64, depth: f64 };
 
+/// Even-odd ray-cast: is (lon,lat) inside the polygon defined by `rings` (one
+/// outer ring plus any holes, all in lon/lat)? A point inside a hole counts as
+/// outside (the rings share one even-odd accumulator). Used for M_COVR
+/// data-coverage containment in best-band suppression (mirrors Go pointInRings).
+pub fn pointInRings(rings: []const []const LonLat, lon: f64, lat: f64) bool {
+    var inside = false;
+    for (rings) |ring| {
+        if (ring.len < 3) continue;
+        var j: usize = ring.len - 1;
+        for (ring, 0..) |p, i| {
+            const q = ring[j];
+            if ((p.lat > lat) != (q.lat > lat) and
+                lon < (q.lon - p.lon) * (lat - p.lat) / (q.lat - p.lat) + p.lon)
+            {
+                inside = !inside;
+            }
+            j = i;
+        }
+    }
+    return inside;
+}
+
 // --- Polygon geometry helpers (shared by MVT emission + portrayal) ----------
 
 /// Area centroid (centre of gravity) of a single ring via the shoelace formula;
@@ -786,4 +808,17 @@ test "parse SG2D coordinates to lon/lat" {
     try std.testing.expectEqual(@as(usize, 2), pts.len);
     try std.testing.expectApproxEqAbs(@as(f64, 38.9784), pts[0].lat, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f64, -76.4820), pts[0].lon, 1e-6);
+}
+
+test "pointInRings: inside, outside, and inside a hole" {
+    // A 0..10 square (outer) with a 4..6 square hole.
+    const outer = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 10, .lat = 0 }, .{ .lon = 10, .lat = 10 }, .{ .lon = 0, .lat = 10 } };
+    const hole = [_]LonLat{ .{ .lon = 4, .lat = 4 }, .{ .lon = 6, .lat = 4 }, .{ .lon = 6, .lat = 6 }, .{ .lon = 4, .lat = 6 } };
+    const rings = [_][]const LonLat{ outer[0..], hole[0..] };
+    try std.testing.expect(pointInRings(&rings, 1, 1)); // inside outer, outside hole
+    try std.testing.expect(!pointInRings(&rings, 5, 5)); // inside the hole -> outside
+    try std.testing.expect(!pointInRings(&rings, 20, 20)); // far outside
+    // A lone ring with no hole.
+    const just_outer = [_][]const LonLat{outer[0..]};
+    try std.testing.expect(pointInRings(&just_outer, 5, 5));
 }

@@ -237,6 +237,15 @@ const Layers = struct {
     // fill-sort-key draws finer-band area fills over coarser ones at band overlaps
     // (the live multi-cell path overlays all bands into one tile).
     band: u8 = 0,
+    // Best-band coverage suppression (live multi-cell path): this cell is a COARSER
+    // band overzoomed past its native range where a finer band's M_COVR coverage is
+    // present, so its AREA fills (suppress_fills) and/or patterns (suppress_patterns)
+    // are dropped — the finer cell carries the real data. Fills are suppressed only
+    // where a finer band covers the WHOLE tile (no seam gap; the finer fill occludes
+    // via the band sort-key); patterns, which draw above all fills, are suppressed by
+    // the tile centre so they can't lap over finer land. Lines/points/text unaffected.
+    suppress_fills: bool = false,
+    suppress_patterns: bool = false,
 };
 
 /// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
@@ -383,21 +392,24 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             const ring = try tile.clipPolygon(a, proj, box);
             if (ring.len >= 3) try rings.append(a, ring);
         }
+        // Best-band suppression: drop a coarser band's fill (where a finer band
+        // covers the whole tile) and/or its pattern (where a finer band covers the
+        // tile centre) so coarse water/shallow-pattern can't lap over finer land.
         if (rings.items.len > 0) {
             const parts = try orientAreaRings(a, rings.items);
-            if (p.fill_token) |token| {
+            if (!L.suppress_fills) if (p.fill_token) |token| {
                 var props = std.ArrayList(mvt.Prop).empty;
                 try props.append(a, .{ .key = "color_token", .value = .{ .string = token } });
                 try appendMeta(a, &props, meta);
                 try areas_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
-            }
+            };
             // AreaFillReference -> a tiled fill pattern (DRGARE/FOUL/quality fills).
-            for (p.patterns) |pat| {
+            if (!L.suppress_patterns) for (p.patterns) |pat| {
                 var props = std.ArrayList(mvt.Prop).empty;
                 try props.append(a, .{ .key = "pattern_name", .value = .{ .string = pat } });
                 try appendMeta(a, &props, meta);
                 try apat_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
-            }
+            };
         }
     }
     // DEPCNT depth-contour value (metres), incl. the 0 m drying/chart-datum line:
@@ -546,7 +558,16 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 }
 
 /// One cell plus its optional per-feature S-101 instruction streams.
-pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null, geo: ?GeoParts = null, band: u8 = 0 };
+pub const CellRef = struct {
+    cell: *s57.Cell,
+    portrayal: ?[]const ?[]const u8 = null,
+    geo: ?GeoParts = null,
+    band: u8 = 0,
+    /// Drop this coarser band cell's AREA fills / patterns where a finer band's
+    /// M_COVR data-coverage is present. See Layers.suppress_fills/suppress_patterns.
+    suppress_fills: bool = false,
+    suppress_patterns: bool = false,
+};
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
 /// `portrayal`, if given, is indexed by feature index and holds each feature's
@@ -595,6 +616,8 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
     for (cells) |cr| {
         var Lc = layers_ctx;
         Lc.band = cr.band; // so this cell's features carry its band for the sort key
+        Lc.suppress_fills = cr.suppress_fills; // coarse band over finer M_COVR (whole-tile): drop fill
+        Lc.suppress_patterns = cr.suppress_patterns; // coarse band over finer M_COVR (centre): drop pattern
         try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.geo, z, x, y, tb, box);
     }
 
@@ -670,6 +693,7 @@ fn appendCellFeatures(
         if (geo_parts.len == 0) continue;
 
         if (cls.kind == .area) {
+            if (L.suppress_fills) continue; // coarse band over finer M_COVR (whole tile): drop the fill
             // Collect the feature's clipped rings, then emit ONE multipolygon with
             // holes subtracted (see orientAreaRings) — same fix as the portrayal
             // path so a sea/depth hole over an island isn't filled.

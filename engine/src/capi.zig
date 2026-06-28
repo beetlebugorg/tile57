@@ -49,7 +49,54 @@ const LazyCell = struct {
     portrayal: ?[]const ?[]const u8 = null,
     arena: ?*std.heap.ArenaAllocator = null,
     tick: u64 = 0, // LRU: last tile that used this cell
+    // M_COVR(CATCOV=1) data-coverage polygons (each = a list of lon/lat rings),
+    // assembled once from `cell` for best-band suppression. Lives in cell.arena,
+    // so it's freed (and reset to null) when the cell is unloaded.
+    coverage: ?[]const []const []const s57.LonLat = null,
 };
+
+// The cell's M_COVR (OBJL 302, CATCOV=1) data-coverage polygons, assembled +
+// cached on first use. Each polygon is a list of lon/lat rings (exterior + holes).
+// Empty when the cell is unloaded or carries no coverage. Mirrors Go
+// bake.extractCoverage (which keys on the "M_COVR" class + CATCOV==1).
+fn lazyCellCoverage(lc: *LazyCell) []const []const []const s57.LonLat {
+    if (lc.coverage) |c| return c;
+    if (lc.cell) |*cell| {
+        const a = cell.arena.allocator();
+        var polys = std.ArrayList([]const []const s57.LonLat).empty;
+        for (cell.features) |f| {
+            if (f.objl != 302) continue; // M_COVR
+            const cv = f.attr(18) orelse continue; // CATCOV (S-57 attr 18)
+            const n = std.fmt.parseInt(i64, std.mem.trim(u8, cv, " "), 10) catch continue;
+            if (n != 1) continue; // 1 = coverage available (2 = no coverage)
+            const rings = cell.lineGeometryParts(a, f) catch continue;
+            if (rings.len > 0) polys.append(a, rings) catch {};
+        }
+        lc.coverage = polys.items;
+        return polys.items;
+    }
+    return &.{};
+}
+
+// Whether any of `polys` (M_COVR coverage) contains (lon,lat) — hole-aware per
+// polygon (a point in a hole is outside that polygon).
+fn coverageContains(polys: []const []const []const s57.LonLat, lon: f64, lat: f64) bool {
+    for (polys) |rings| if (s57.pointInRings(rings, lon, lat)) return true;
+    return false;
+}
+
+// The FINEST band (largest band-max zoom) among the indexed cells whose M_COVR
+// data-coverage contains (lon,lat); 0 = no coverage there. The "is a finer cell
+// actually here" test for best-band suppression (Go coverageBandAt).
+fn finestCoverageBand(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64) u8 {
+    var best: u8 = 0;
+    for (idxs) |i| {
+        const nm = bake_enc.bandMaxZoom(ls.cells[i].band);
+        if (nm <= best) continue; // can't raise the finest-covering band
+        if (coverageContains(lazyCellCoverage(&ls.cells[i]), lon, lat)) best = nm;
+    }
+    return best;
+}
 
 const LazySource = struct {
     cells: []LazyCell,
@@ -93,6 +140,7 @@ fn lazyUnload(lc: *LazyCell) void {
     if (lc.cell) |*c| c.deinit();
     lc.cell = null;
     lc.portrayal = null;
+    lc.coverage = null; // backing memory lived in cell.arena, freed by c.deinit()
     if (lc.arena) |p| {
         p.deinit();
         gpa.destroy(p);
@@ -702,11 +750,43 @@ export fn tile57_tile_get(
             }.lt);
 
             const keep_from = ls.tick + 1; // cells loaded for this tile aren't evicted below
+            for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
+
+            // Best-band coverage suppression (Go bake.go best-available rule). For
+            // each test point, finestCoverageBand finds the FINEST band whose
+            // M_COVR(CATCOV=1) coverage contains it; a coarser cell's areas then yield
+            // where a finer band is present. FILLS use the MIN over the tile centre +
+            // 4 corners (Go's whole-tile fill test): suppressed only where a finer band
+            // covers the WHOLE tile, so a seam keeps its coarse fill (gap-free) and the
+            // finer fill — drawn on top via the band sort-key — occludes it. PATTERNS,
+            // which draw above all fills, use the tile-centre band so a coarse pattern
+            // can't lap over finer land. No gaps; no cross-band water/pattern over land.
+            const w = tb[0];
+            const s_ = tb[1];
+            const e = tb[2];
+            const nlat = tb[3];
+            const clon = (w + e) / 2;
+            const clat = (s_ + nlat) / 2;
+            const cov_centre = finestCoverageBand(ls, idxs.items, clon, clat);
+            var cov_whole: u8 = cov_centre; // MIN of finest-covering band over centre + 4 corners
+            for ([_][2]f64{ .{ w, nlat }, .{ e, nlat }, .{ w, s_ }, .{ e, s_ } }) |corner| {
+                cov_whole = @min(cov_whole, finestCoverageBand(ls, idxs.items, corner[0], corner[1]));
+            }
+
             var refs = std.ArrayList(s57_mvt.CellRef).empty;
             defer refs.deinit(gpa);
             for (idxs.items) |i| {
-                lazyEnsureLoaded(ls, &ls.cells[i]);
-                if (ls.cells[i].cell) |*c| refs.append(gpa, .{ .cell = c, .portrayal = ls.cells[i].portrayal, .band = @intFromEnum(ls.cells[i].band) }) catch {};
+                const lc = &ls.cells[i];
+                if (lc.cell) |*c| {
+                    const nm = bake_enc.bandMaxZoom(lc.band);
+                    refs.append(gpa, .{
+                        .cell = c,
+                        .portrayal = lc.portrayal,
+                        .band = @intFromEnum(lc.band),
+                        .suppress_fills = bake_enc.coarseAreaSuppressed(nm, z, cov_whole),
+                        .suppress_patterns = bake_enc.coarseAreaSuppressed(nm, z, cov_centre),
+                    }) catch {};
+                }
             }
             const mvt = s57_mvt.generateTileMulti(gpa, refs.items, z, x, y) catch return -1;
             lazyEvict(ls, keep_from);
