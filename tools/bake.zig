@@ -1051,7 +1051,12 @@ fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
 // the compressed data + small directory are held, not the raw tiles). Returns the
 // union bounds + cell stems + sounding stacks. error.NoGeometry if no cell parses.
 fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat) !RootBake {
-    const page = std.heap.page_allocator;
+    // smp_allocator (Zig's fast thread-safe general-purpose allocator), not
+    // page_allocator: the bake makes many small, short-lived allocations across
+    // worker threads (per-tile gzip results, cell reads, index lists). page_allocator
+    // rounds every allocation up to a page and mmaps it, churning page faults;
+    // smp_allocator pools and reuses freed blocks.
+    const gpa = std.heap.smp_allocator;
     // Input may be a whole ENC_ROOT directory OR a single cell `.000` file; either
     // way the lazy super-tile bake below streams to disk through the SAME path. For
     // a single file the "dir" is its parent (the worker reads the cell + its `.001…`
@@ -1075,9 +1080,9 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     const via_catalog = if (single_file) sf: {
         // Single cell: one entry, band + bbox from a cheap peek (no dir scan).
         const base = std.fs.path.basename(root_path);
-        const bytes = dir.readFileAlloc(io, base, page, .unlimited) catch return error.NoGeometry;
-        defer page.free(bytes);
-        const m = engine.s57.peekMeta(page, bytes) orelse return error.NoGeometry;
+        const bytes = dir.readFileAlloc(io, base, gpa, .unlimited) catch return error.NoGeometry;
+        defer gpa.free(bytes);
+        const m = engine.s57.peekMeta(gpa, bytes) orelse return error.NoGeometry;
         const bb = m.bounds orelse return error.NoGeometry;
         ubox = bb;
         total_cells = 1;
@@ -1085,8 +1090,8 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         try band_cells[@intFromEnum(Bands.bandOf(m.cscl))].append(a, .{ .path = try a.dupe(u8, base), .bbox = bb });
         break :sf false;
     } else cat: {
-        const cbytes = dir.readFileAlloc(io, "CATALOG.031", page, .unlimited) catch break :cat false;
-        defer page.free(cbytes);
+        const cbytes = dir.readFileAlloc(io, "CATALOG.031", gpa, .unlimited) catch break :cat false;
+        defer gpa.free(cbytes);
         const entries = engine.s57.parseCatalog(a, cbytes) orelse break :cat false;
         var n_cells: usize = 0;
         for (entries) |e| {
@@ -1101,9 +1106,9 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             ubox[3] = @max(ubox[3], bb[3]);
             // Band from the name; for the rare non-NOAA name, peek that one cell.
             const band = bandFromStem(e.stem) orelse fb: {
-                const cb = dir.readFileAlloc(io, e.path, page, .unlimited) catch break :fb Bands.bandOf(0);
-                defer page.free(cb);
-                const m = engine.s57.peekMeta(page, cb);
+                const cb = dir.readFileAlloc(io, e.path, gpa, .unlimited) catch break :fb Bands.bandOf(0);
+                defer gpa.free(cb);
+                const m = engine.s57.peekMeta(gpa, cb);
                 break :fb Bands.bandOf(if (m) |mm| mm.cscl else 0);
             };
             try band_cells[@intFromEnum(band)].append(a, .{ .path = e.path, .bbox = bb });
@@ -1118,9 +1123,9 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
             const path = try a.dupe(u8, entry.path);
-            const bytes = dir.readFileAlloc(io, path, page, .unlimited) catch continue;
-            const meta = engine.s57.peekMeta(page, bytes);
-            page.free(bytes);
+            const bytes = dir.readFileAlloc(io, path, gpa, .unlimited) catch continue;
+            const meta = engine.s57.peekMeta(gpa, bytes);
+            gpa.free(bytes);
             try cell_names.append(a, try a.dupe(u8, std.fs.path.stem(std.fs.path.basename(path))));
             total_cells += 1;
             // A cell with no peek-bbox has no geometry to bake — skip it (it would
@@ -1150,13 +1155,13 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         data_file.close(io);
         std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
     }
-    var sw = engine.pmtiles.StreamWriter.initFile(page, io, data_file);
+    var sw = engine.pmtiles.StreamWriter.initFile(gpa, io, data_file);
     defer sw.deinit();
     var sounds = std.StringHashMap(void).init(a);
     // Sounding-stack collection decodes each tile as MVT, so it only applies to the
     // MVT output; for MLT the sprite-mln sounding composites are skipped (TODO).
-    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = page, .collect_sounds = collect_sounds and format == .mvt };
-    var baker = Bands.Baker.init(page, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
+    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = gpa, .collect_sounds = collect_sounds and format == .mvt };
+    var baker = Bands.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
     baker.format = format;
     defer baker.deinit();
 
@@ -1187,10 +1192,10 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         const zs: u8 = if (zlo >= super_dz) zlo - super_dz else 0;
 
         // Inverted index: super-tile (sx,sy at zs) → the cell indices overlapping it.
-        var stmap = std.AutoHashMap(u64, std.ArrayList(u32)).init(page);
+        var stmap = std.AutoHashMap(u64, std.ArrayList(u32)).init(gpa);
         defer {
             var vit = stmap.valueIterator();
-            while (vit.next()) |v| v.deinit(page);
+            while (vit.next()) |v| v.deinit(gpa);
             stmap.deinit();
         }
         for (entries, 0..) |e, i| {
@@ -1203,12 +1208,12 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     const k = (@as(u64, sy) << 32) | sx; // row-major (spatial locality)
                     const gop = try stmap.getOrPut(k);
                     if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
-                    try gop.value_ptr.append(page, @intCast(i));
+                    try gop.value_ptr.append(gpa, @intCast(i));
                 }
             }
         }
-        const stkeys = try page.alloc(u64, stmap.count());
-        defer page.free(stkeys);
+        const stkeys = try gpa.alloc(u64, stmap.count());
+        defer gpa.free(stkeys);
         {
             var kit = stmap.keyIterator();
             var j: usize = 0;
@@ -1227,17 +1232,17 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         // Per-band caches (index-aligned with `entries`): portrayal is RESIDENT
         // (computed once — the expensive Lua step — and cheap to keep); geometry is
         // the heavy part, held in an LRU and re-parsed (NOT re-portrayed) on demand.
-        const portray = try page.alloc(?CellPortray, entries.len);
-        defer page.free(portray);
+        const portray = try gpa.alloc(?CellPortray, entries.len);
+        defer gpa.free(portray);
         @memset(portray, null);
-        const geom = try page.alloc(?CellGeom, entries.len);
-        defer page.free(geom);
+        const geom = try gpa.alloc(?CellGeom, entries.len);
+        defer gpa.free(geom);
         @memset(geom, null);
-        const used = try page.alloc(u64, entries.len); // LRU tick per cell (geometry)
-        defer page.free(used);
+        const used = try gpa.alloc(u64, entries.len); // LRU tick per cell (geometry)
+        defer gpa.free(used);
         @memset(used, 0);
-        const gave_up = try page.alloc(bool, entries.len); // parse failed: don't retry
-        defer page.free(gave_up);
+        const gave_up = try gpa.alloc(bool, entries.len); // parse failed: don't retry
+        defer gpa.free(gave_up);
         @memset(gave_up, false);
         var n_geom: usize = 0; // loaded-geometry count (the LRU target)
         var tick: u64 = 0;
@@ -1253,11 +1258,11 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             // parallel, so cold reads aren't serialised. A cell already portrayed is
             // only re-parsed, never re-portrayed.
             var miss = std.ArrayList(u32).empty;
-            defer miss.deinit(page);
-            for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(page, ci) catch {};
+            defer miss.deinit(gpa);
+            for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(gpa, ci) catch {};
             if (miss.items.len > 0) {
-                var lw = LoadWork{ .cells = miss.items, .entries = entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = page };
-                Bands.parallelFor(page, miss.items.len, &lw, LoadWork.run);
+                var lw = LoadWork{ .cells = miss.items, .entries = entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = gpa };
+                Bands.parallelFor(gpa, miss.items.len, &lw, LoadWork.run);
                 for (miss.items) |ci| {
                     if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
                 }
@@ -1268,10 +1273,10 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             // Generate this super-tile's tiles from its loaded cells (clipped, parallel):
             // pair each cell's geometry with its resident portrayal.
             var subset = std.ArrayList(Bands.Backend).empty;
-            defer subset.deinit(page);
+            defer subset.deinit(gpa);
             for (cells) |ci| if (geom[ci]) |g| {
                 const p = portray[ci];
-                subset.append(page, .{
+                subset.append(gpa, .{
                     .cell = g.cell,
                     .portrayal = if (p) |pp| pp.base else null,
                     .portrayal_plain = if (p) |pp| pp.plain else null,
@@ -1301,7 +1306,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     g.cell.deinit();
                     if (g.geo_arena) |p| {
                         p.deinit();
-                        page.destroy(p);
+                        gpa.destroy(p);
                     }
                 }
                 geom[v] = null;
@@ -1315,13 +1320,13 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                 gg.cell.deinit();
                 if (gg.geo_arena) |p| {
                     p.deinit();
-                    page.destroy(p);
+                    gpa.destroy(p);
                 }
             }
         };
         for (portray, 0..) |p, ci| if (p != null) {
             portray[ci].?.arena.deinit();
-            page.destroy(portray[ci].?.arena);
+            gpa.destroy(portray[ci].?.arena);
         };
         const parses = g_parses.load(.monotonic) - parses0;
         const band_secs = nowSec() - band_start;
