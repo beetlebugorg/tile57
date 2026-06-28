@@ -10,7 +10,7 @@ tile57's vector tiles use a fixed set of layers and fields. The generated
 MapLibre style depends on this schema, so the names are a contract — it matches
 [chartplotter-go's schema](https://beetlebugorg.github.io/chartplotter/tile-schema)
 so the same generated S-52 style works against either. Do not rename a layer or a
-field without updating the style generator (`engine/src/assets/style.zig`) to match
+field without updating the style generator (`src/assets/style.zig`) to match
 **and bumping the schema version**.
 
 This vocabulary is versioned as **`tile57/1`**. A
@@ -23,7 +23,7 @@ Every tile uses an extent of **4096** and a buffer of **64**.
 
 :::note Live path coverage
 Whether the tiles come from a pre-baked PMTiles archive or are generated live from
-a raw S-57 cell, the schema is the same. The live path (`engine/src/s57_mvt/`)
+a raw S-57 cell, the schema is the same. The live path (`src/s57_mvt/`)
 emits `areas`, `area_patterns`, `lines`, `point_symbols`, `soundings`, and `text`,
 plus the `*_scamin` declutter buckets (features carrying SCAMIN, attr 133) and a
 `draw_prio` property for S-52 fill ordering. DEPCNT lines carry `valdco` (the

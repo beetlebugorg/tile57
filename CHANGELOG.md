@@ -6,6 +6,21 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Changed — repository split into the tile57 engine + the Qt demo
+- **chartplotter-native is now the standalone tile57 engine.** The Zig engine
+  moved from `engine/` to the repository root, so a top-level **`zig build`**
+  produces `zig-out/bin/tile57` (CLI) + `zig-out/lib/libtile57.a` (C ABI). A plain
+  `zig build` now defaults to **ReleaseFast** (a Debug bake is ~2.6x slower);
+  use `-Doptimize=Debug` for development.
+- **Removed the C++ render layer.** The headless renderer (`chartplotter-render` /
+  `libchartplotter`), its mbgl `FileSource` adapter, the vendored
+  `maplibre-native` submodule, `include/chartplotter.h`, the root CMake build, and
+  the PNG-render helper scripts are gone. The repo is now pure Zig
+  tile/style/asset generation behind the C ABI (`include/tile57.h` +
+  `tile57_diag.h`).
+- **The Qt6 viewer moved to a standalone repo, `tile57-demo`**, which consumes the
+  tile57 engine as a git submodule (built via `zig build`) and QMapLibre.
+
 ### Changed — interactive window is now Qt6 (QMapLibre)
 - **Replaced the GLFW / macOS-Metal MapLibre Native window with a Qt6 viewer**,
   `chartplotter-qt` (`app/qt`), built on the QMapLibre widget (maplibre-native-qt,

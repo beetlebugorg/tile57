@@ -46,13 +46,13 @@ It is **high-performance and low-memory** by design:
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                    engine/src/iso8211/   (pkg: iso8211)
+   │  ISO 8211 decode                    src/iso8211/   (pkg: iso8211)
    ▼
-S-57 feature + geometry model            engine/src/s57/       (pkg: s57)
-   │  S-101 portrayal (embedded Lua)     engine/src/portray/ + engine/src/s100/ (pkg: s100)
+S-57 feature + geometry model            src/s57/       (pkg: s57)
+   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/ (pkg: s100)
    ▼
 portrayal instruction stream
-   │  adapt + project + clip + encode    engine/src/{s57_mvt,tile,mvt,pmtiles}/
+   │  adapt + project + clip + encode    src/{s57_mvt,tile,mvt,pmtiles}/
    ▼
 Mapbox Vector Tiles  +  MapLibre style.json  +  colortables / linestyles / sprite / patterns
 ```
@@ -99,7 +99,7 @@ asset/atlas generators. See [the C API docs](docs/docs/c-api.md).
 The offline tool bakes charts and emits portrayal assets:
 
 ```sh
-cd engine && zig build                       # builds engine/zig-out/bin/tile57
+zig build                                    # builds zig-out/bin/tile57
 tile57 bundle CELL.000 -o out/               # tiles + style + assets + manifest
 tile57 bake-root ENC_ROOT -o chart.pmtiles   # band-streamed whole-catalogue bake
 tile57 assets   -o assets/                   # colortables + linestyles + sprite + patterns
@@ -112,7 +112,7 @@ The Zig engine + CLI need only **Zig 0.16**:
 
 ```sh
 git submodule update --init --recursive   # vendored S-101 catalogue
-cd engine && zig build && zig build test
+zig build && zig build test
 ```
 
 Full instructions: [docs/installation](docs/docs/installation.md).

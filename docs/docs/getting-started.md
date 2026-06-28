@@ -16,8 +16,8 @@ The `tile57` binary is the offline tool. It bakes ENC cells to PMTiles and emits
 the portrayal assets a renderer needs:
 
 ```sh
-cd engine && zig build                          # builds engine/zig-out/bin/tile57
-T=engine/zig-out/bin/tile57
+zig build                          # builds zig-out/bin/tile57
+T=zig-out/bin/tile57
 
 # A self-contained bundle: tiles + style + assets + manifest
 $T bundle CELL.000 -o out/

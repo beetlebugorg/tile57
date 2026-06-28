@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIG="${ZIG:-zig}"
 OPT="${1:-ReleaseFast}"
 
-cd "$ROOT/engine"
+cd "$ROOT"
 zbuild_args=("-Doptimize=$OPT")
 if [[ "$(uname -s)" == "Darwin" ]]; then
   # Build the archive for the SAME macOS deployment target the C++ host uses
@@ -25,7 +25,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 "$ZIG" build "${zbuild_args[@]}"
 
-LIB="$ROOT/engine/zig-out/lib/libtile57.a"
+LIB="$ROOT/zig-out/lib/libtile57.a"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   echo "==> re-packing $LIB for macOS ld alignment" >&2

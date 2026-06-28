@@ -8,7 +8,7 @@ sidebar_position: 4
 
 The engine is a real Zig package named **`tile57`** (v0.1.0, requires Zig 0.16).
 Add it as a dependency and `@import("tile57")` for the curated public surface
-(`engine/src/tile57.zig`). The [C ABI](./c-api.md) is a thin shim over this same
+(`src/tile57.zig`). The [C ABI](./c-api.md) is a thin shim over this same
 API.
 
 ## The high-level engine: `Source`

@@ -17,15 +17,15 @@ A chart cell flows through these stages, all inside the engine:
 
 ```
 S-57 ENC cell (.000)
-   │  decode the binary container     engine/src/iso8211/   (pkg: iso8211)
+   │  decode the binary container     src/iso8211/   (pkg: iso8211)
    ▼
-S-57 feature + geometry model         engine/src/s57/       (pkg: s57)
-   │  apply S-101 portrayal           engine/src/portray/ (pkg) + embedded Lua 5.4
-   ▼                            (engine/vendor/S-101_Portrayal-Catalogue)
+S-57 feature + geometry model         src/s57/       (pkg: s57)
+   │  apply S-101 portrayal           src/portray/ (pkg) + embedded Lua 5.4
+   ▼                            (vendor/S-101_Portrayal-Catalogue)
 portrayal instruction stream
-   │  adapt to drawing primitives     engine/src/s100/      (pkg: s100)
+   │  adapt to drawing primitives     src/s100/      (pkg: s100)
    ▼
-web-mercator project + clip + encode  engine/src/{s57_mvt,mvt,tile,pmtiles}/
+web-mercator project + clip + encode  src/{s57_mvt,mvt,tile,pmtiles}/
    ▼
 Mapbox Vector Tile bytes  +  MapLibre style.json  +  portrayal assets
 ```
@@ -66,8 +66,8 @@ target-agnostic:
 | `chartstyle` | mariner-driven MapLibre style patching |
 
 `portray` is the only package that links libc, and it is never imported by the
-pure test build. The top-level `tile57` module (`engine/src/tile57.zig`) is the
-curated public surface; the C ABI (`engine/src/capi.zig`) is a thin shim over the
+pure test build. The top-level `tile57` module (`src/tile57.zig`) is the
+curated public surface; the C ABI (`src/capi.zig`) is a thin shim over the
 same Zig API.
 
 ## The layering: Source / bake / style

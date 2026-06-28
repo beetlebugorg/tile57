@@ -1,6 +1,6 @@
 [submodule "vendor/S-101_Portrayal-Catalogue"]
-	path = engine/vendor/S-101_Portrayal-Catalogue
+	path = vendor/S-101_Portrayal-Catalogue
 	url = https://github.com/iho-ohi/S-101_Portrayal-Catalogue.git
 [submodule "vendor/S-101-Documentation-and-FC"]
-	path = engine/vendor/S-101-Documentation-and-FC
+	path = vendor/S-101-Documentation-and-FC
 	url = https://github.com/iho-ohi/S-101-Documentation-and-FC.git

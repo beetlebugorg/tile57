@@ -18,11 +18,11 @@ git submodule update --init --recursive
 ```
 
 The vendored **IHO S-101 Portrayal Catalogue** comes in as a submodule (under
-`engine/vendor/`). It is a **build-time** dependency: `zig build` embeds the
+`vendor/`). It is a **build-time** dependency: `zig build` embeds the
 catalogue (the Lua portrayal rules plus the symbols, line styles, area fills and
 colour profile) directly into the binary via `@embedFile`, so the resulting
 `tile57` needs no on-disk catalogue at runtime. Lua 5.4 is vendored under
-`engine/vendor/lua` and compiled in, so no system Lua is needed either.
+`vendor/lua` and compiled in, so no system Lua is needed either.
 
 ## 2. Zig 0.16.0 (required)
 
@@ -33,8 +33,7 @@ Install it from [ziglang.org/download](https://ziglang.org/download/) (pin
 ## 3. Build + test
 
 ```sh
-cd engine
-zig build         # builds engine/zig-out/bin/tile57 + libtile57.a
+zig build         # builds zig-out/bin/tile57 + libtile57.a
 zig build test    # runs the unit + parity tests
 ```
 
@@ -42,7 +41,7 @@ zig build test    # runs the unit + parity tests
 
 | Target | What it is |
 |--------|-----------|
-| `tile57` (`engine/zig-out/bin/tile57`) | the offline CLI: bake cells/ENC_ROOTs to PMTiles or a chart bundle, and emit portrayal assets. |
+| `tile57` (`zig-out/bin/tile57`) | the offline CLI: bake cells/ENC_ROOTs to PMTiles or a chart bundle, and emit portrayal assets. |
 | `libtile57.a` | the static library behind the [C ABI](./c-api.md) (`include/tile57.h`). |
 
 The engine is also a real Zig package named `tile57` (v0.1.0); a Zig consumer
