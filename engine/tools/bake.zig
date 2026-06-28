@@ -40,6 +40,13 @@ var g_parses = std.atomic.Value(usize).init(0);
 // returns the S-101 rules dir from TILE57_S101_RULES or null. Mirrors capi.zig.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
 
+// Wall-clock seconds (libc time(); std.time is behind std.Io in 0.16). For bake
+// progress timing only — coarse is fine.
+extern fn time(t: ?*c_long) callconv(.c) c_long;
+fn nowSec() i64 {
+    return @intCast(time(null));
+}
+
 // Resolve the S-101 rules directory: explicit --rules, else TILE57_S101_RULES,
 // else "" — which tells the portrayal engine to use the rules embedded in the
 // binary (rules_embed.zig), so tile57 needs no on-disk catalogue. A non-empty
@@ -1009,16 +1016,23 @@ fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
 
 // ---- bake-root (whole ENC_ROOT -> one banded PMTiles) ------------------
 
-/// Console progress for bake-root: stage 0 = loading/portraying cells, 1 = tiles.
-/// `total` 0 (tile stage) prints just the running count.
+// Live bake-root progress context (file-level so the C-ABI Progress callback can
+// read the current band + super-tile position alongside the running tile count).
+const ProgressCtx = struct { band: []const u8 = "?", st: usize = 0, st_total: usize = 0 };
+var g_prog: ProgressCtx = .{};
+var g_bake_start: i64 = 0;
+
+/// Console progress for bake-root: stage 0 = loading cells, 1 = baking tiles.
+/// Shows band, super-tile position, running tile count, throughput and elapsed.
 fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void {
     _ = ctx;
-    const label = if (stage == 0) "loading cells " else "baking tiles  ";
-    if (total == 0) {
-        std.debug.print("\r  {s} {d}    ", .{ label, done });
+    _ = total;
+    const secs = @as(f64, @floatFromInt(@max(nowSec() - g_bake_start, 1)));
+    const rate = @as(f64, @floatFromInt(done)) / secs;
+    if (stage == 0) {
+        std.debug.print("\r  {s}: loading {d} cells    ", .{ g_prog.band, done });
     } else {
-        std.debug.print("\r  {s} {d}/{d}    ", .{ label, done, total });
-        if (done == total) std.debug.print("\n", .{});
+        std.debug.print("\r  {s}: super-tile {d}/{d}  {d} tiles  ({d:.0}/s, {d:.0}s)    ", .{ g_prog.band, g_prog.st, g_prog.st_total, done, rate, secs });
     }
 }
 
@@ -1031,45 +1045,89 @@ const CellSource = struct { base: []const u8, updates: []const []const u8 };
 // without a full parse.
 const CellEntry = struct { path: []const u8, bbox: [4]f64 };
 
-// Parallel parse+portray worker context. Each index is independent: a fresh cell
-// + its own portrayal arena + a per-thread Lua state (portray.zig g_ctx is
-// thread-local). Workers use the page allocator (thread-safe); the shared
-// catalogue is warmed before the loop. Results land in distinct out[i]/arenas[i].
-const PortrayWork = struct {
+// A cell's portrayal: the per-feature S-101 instruction streams (+ display
+// variants), computed ONCE by the Lua engine and kept resident for the whole band
+// in `arena`. Compact relative to geometry, and the expensive thing to produce —
+// so it's never recomputed, even when the cell's geometry is evicted + re-parsed.
+const CellPortray = struct {
+    arena: *std.heap.ArenaAllocator, // sticky: owns the streams below
+    base: ?[]const ?[]const u8,
+    plain: ?[]const ?[]const u8,
+    simplified: ?[]const ?[]const u8,
+    bounds: [4]f64,
+};
+
+// A cell's parsed geometry (the heavy part): the S-57 model + assembled geo cache.
+// EVICTABLE under LRU pressure and re-parsed on demand (cheap — no re-portrayal).
+const CellGeom = struct {
+    cell: engine.s57.Cell, // cell.arena owns the geometry
+    geo: ?engine.s57_mvt.GeoParts,
+    geo_arena: ?*std.heap.ArenaAllocator,
+};
+
+// Copy per-feature instruction streams into `a` (the sticky portrayal arena) so
+// they outlive the transient portrayal arena. nulls (features with no stream) stay.
+fn copyStreams(a: std.mem.Allocator, src: []const ?[]const u8) ![]const ?[]const u8 {
+    const out = try a.alloc(?[]const u8, src.len);
+    for (src, 0..) |s, i| out[i] = if (s) |bytes| try a.dupe(u8, bytes) else null;
+    return out;
+}
+
+// Parallel cell loader. Each index parses one cell (a fresh per-thread Lua state;
+// page allocator is thread-safe), builds its geo cache (evictable), and — only the
+// first time the cell is loaded (portray[ci] == null) — runs the S-101 portrayal
+// and copies the streams into a sticky arena. Re-loads after a geometry eviction
+// re-parse only, reusing the resident portrayal. Distinct ci per j ⇒ race-free.
+const LoadWork = struct {
+    cells: []const u32, // cell indices, aligned with `sources`
     sources: []const CellSource,
-    outs: []?engine.bake_enc.Backend,
-    arenas: []?*std.heap.ArenaAllocator,
+    portray: []?CellPortray, // resident; produced only when null
+    geom: []?CellGeom, // (re)built every load
     rules_dir: []const u8,
     gpa: std.mem.Allocator,
     build_geo: bool,
 
-    fn run(uptr: *anyopaque, i: usize) void {
-        const c: *PortrayWork = @ptrCast(@alignCast(uptr));
-        const src = c.sources[i];
-        _ = g_parses.fetchAdd(1, .monotonic); // count parse+portray calls (re-parse diagnostics)
+    fn run(uptr: *anyopaque, j: usize) void {
+        const c: *LoadWork = @ptrCast(@alignCast(uptr));
+        const ci = c.cells[j];
+        const src = c.sources[j];
+        if (src.base.len == 0) return;
+        _ = g_parses.fetchAdd(1, .monotonic); // count parses (re-parse diagnostics)
         var cell = engine.s57.parseCellWithUpdates(c.gpa, src.base, src.updates) catch return;
         const b = cell.bounds() orelse {
             cell.deinit();
             return;
         };
-        // One arena per cell holds both the portrayal streams and the assembled
-        // geometry cache, freed together when the band is done.
-        var portrayal: ?[]const ?[]const u8 = null;
-        var portrayal_plain: ?[]const ?[]const u8 = null;
-        var portrayal_simplified: ?[]const ?[]const u8 = null;
         var geo: ?engine.s57_mvt.GeoParts = null;
-        const pa: ?*std.heap.ArenaAllocator = c.gpa.create(std.heap.ArenaAllocator) catch null;
-        if (pa) |p| {
-            p.* = std.heap.ArenaAllocator.init(c.gpa);
-            if (engine.portray.portrayCellVariants(p.allocator(), &cell, c.rules_dir)) |cp| {
-                portrayal = cp.base;
-                portrayal_plain = cp.plain;
-                portrayal_simplified = cp.simplified;
+        var geo_arena: ?*std.heap.ArenaAllocator = null;
+        if (c.build_geo) {
+            if (c.gpa.create(std.heap.ArenaAllocator)) |ga| {
+                ga.* = std.heap.ArenaAllocator.init(c.gpa);
+                geo = engine.s57_mvt.buildGeoCache(ga.allocator(), &cell) catch null;
+                geo_arena = ga;
             } else |_| {}
-            if (c.build_geo) geo = engine.s57_mvt.buildGeoCache(p.allocator(), &cell) catch null;
         }
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b };
-        c.arenas[i] = pa;
+        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_arena = geo_arena };
+
+        if (c.portray[ci] != null) return; // already portrayed — reuse it (the speed win)
+        const sticky = c.gpa.create(std.heap.ArenaAllocator) catch return;
+        sticky.* = std.heap.ArenaAllocator.init(c.gpa);
+        const sa = sticky.allocator();
+        var tmp = std.heap.ArenaAllocator.init(c.gpa);
+        defer tmp.deinit();
+        if (engine.portray.portrayCellVariants(tmp.allocator(), &cell, c.rules_dir)) |cp| {
+            c.portray[ci] = .{
+                .arena = sticky,
+                .base = copyStreams(sa, cp.base) catch null,
+                .plain = if (cp.plain) |p| (copyStreams(sa, p) catch null) else null,
+                .simplified = if (cp.simplified) |p| (copyStreams(sa, p) catch null) else null,
+                .bounds = b,
+            };
+        } else |_| {
+            // Portrayal failed: a resident entry with no streams (classify() fallback);
+            // marks the cell portrayed so it isn't retried.
+            c.portray[ci] = .{ .arena = sticky, .base = null, .plain = null, .simplified = null, .bounds = b };
+        }
     }
 };
 
@@ -1189,11 +1247,13 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // budget — not the whole band. Coarse bands have few (huge) cells and a tiny grid,
     // so they fall back to loading them together.
     std.debug.print("  (lazy bake: lru={d} cells, super-dz={d})\n", .{ lru_budget, super_dz });
+    g_bake_start = nowSec();
     var done_cells: usize = 0;
     for (Bands.bands_fine_to_coarse) |band| {
         const entries = band_cells[@intFromEnum(band)].items;
         if (entries.len == 0) continue;
         const parses0 = g_parses.load(.monotonic);
+        const band_start = nowSec();
 
         const zr = Bands.bandZooms(band);
         const zlo = @max(minzoom, zr.min);
@@ -1237,49 +1297,49 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                 return x < y;
             }
         }.lt);
+        g_prog.band = @tagName(band);
+        g_prog.st = 0;
+        g_prog.st_total = stkeys.len;
+        std.debug.print("\n  band {s}: {d} cells, {d} super-tiles (z{d}-{d}) — baking…\n", .{ @tagName(band), entries.len, stkeys.len, zlo, zhi });
 
-        // Per-band LRU cache of parsed cells (index-aligned with `entries`).
-        const cache = try page.alloc(?Bands.Backend, entries.len);
-        defer page.free(cache);
-        @memset(cache, null);
-        const cache_ar = try page.alloc(?*std.heap.ArenaAllocator, entries.len);
-        defer page.free(cache_ar);
-        @memset(cache_ar, null);
-        const used = try page.alloc(u64, entries.len); // LRU tick per cell
+        // Per-band caches (index-aligned with `entries`): portrayal is RESIDENT
+        // (computed once — the expensive Lua step — and cheap to keep); geometry is
+        // the heavy part, held in an LRU and re-parsed (NOT re-portrayed) on demand.
+        const portray = try page.alloc(?CellPortray, entries.len);
+        defer page.free(portray);
+        @memset(portray, null);
+        const geom = try page.alloc(?CellGeom, entries.len);
+        defer page.free(geom);
+        @memset(geom, null);
+        const used = try page.alloc(u64, entries.len); // LRU tick per cell (geometry)
         defer page.free(used);
         @memset(used, 0);
-        const gave_up = try page.alloc(bool, entries.len); // load failed: don't retry
+        const gave_up = try page.alloc(bool, entries.len); // parse failed: don't retry
         defer page.free(gave_up);
         @memset(gave_up, false);
-        var n_loaded: usize = 0;
+        var n_geom: usize = 0; // loaded-geometry count (the LRU target)
         var tick: u64 = 0;
         const build_geo = Bands.cacheGeoForBand(band);
 
-        for (stkeys) |stk| {
+        for (stkeys, 0..) |stk, st_i| {
+            g_prog.st = st_i + 1;
             const cells = stmap.get(stk).?.items;
             const sx: u32 = @intCast(stk & 0xFFFFFFFF);
             const sy: u32 = @intCast(stk >> 32);
 
-            // Load this super-tile's not-yet-loaded cells (read bytes serially, then
-            // parse + portray in parallel).
+            // (Re)load this super-tile's cells whose geometry isn't resident — read
+            // bytes serially (IO isn't thread-safe), then parse (+ portray once) in
+            // parallel. A cell already portrayed is only re-parsed, never re-portrayed.
             var miss = std.ArrayList(u32).empty;
             defer miss.deinit(page);
-            for (cells) |ci| if (cache[ci] == null and !gave_up[ci]) miss.append(page, ci) catch {};
+            for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(page, ci) catch {};
             if (miss.items.len > 0) {
                 const src = try page.alloc(CellSource, miss.items.len);
                 defer page.free(src);
-                const outs = try page.alloc(?Bands.Backend, miss.items.len);
-                defer page.free(outs);
-                const ars = try page.alloc(?*std.heap.ArenaAllocator, miss.items.len);
-                defer page.free(ars);
-                @memset(outs, null);
-                @memset(ars, null);
+                @memset(src, .{ .base = &.{}, .updates = &.{} });
                 for (miss.items, 0..) |ci, j| {
                     const bpath = entries[ci].path;
-                    const base_bytes = dir.readFileAlloc(io, bpath, page, .unlimited) catch {
-                        src[j] = .{ .base = &.{}, .updates = &.{} };
-                        continue;
-                    };
+                    const base_bytes = dir.readFileAlloc(io, bpath, page, .unlimited) catch continue;
                     const stem = bpath[0 .. bpath.len - 4];
                     var ups = std.ArrayList([]const u8).empty;
                     var u: u32 = 1;
@@ -1291,66 +1351,79 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     }
                     src[j] = .{ .base = base_bytes, .updates = ups.toOwnedSlice(page) catch &.{} };
                 }
-                var pw = PortrayWork{ .sources = src, .outs = outs, .arenas = ars, .rules_dir = rules_dir, .gpa = page, .build_geo = build_geo };
-                Bands.parallelFor(miss.items.len, &pw, PortrayWork.run);
+                var lw = LoadWork{ .cells = miss.items, .sources = src, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = page, .build_geo = build_geo };
+                Bands.parallelFor(miss.items.len, &lw, LoadWork.run);
                 for (miss.items, 0..) |ci, j| {
                     if (src[j].base.len > 0) page.free(src[j].base);
                     for (src[j].updates) |ub| page.free(ub);
                     if (src[j].updates.len > 0) page.free(src[j].updates);
-                    if (outs[j]) |be| {
-                        cache[ci] = be;
-                        cache_ar[ci] = ars[j];
-                        n_loaded += 1;
-                    } else gave_up[ci] = true;
+                    if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
                 }
             }
             tick += 1;
             for (cells) |ci| used[ci] = tick;
 
-            // Generate this super-tile's tiles from its loaded cells (clipped, parallel).
+            // Generate this super-tile's tiles from its loaded cells (clipped, parallel):
+            // pair each cell's geometry with its resident portrayal.
             var subset = std.ArrayList(Bands.Backend).empty;
             defer subset.deinit(page);
-            for (cells) |ci| if (cache[ci]) |be| subset.append(page, be) catch {};
+            for (cells) |ci| if (geom[ci]) |g| {
+                const p = portray[ci];
+                subset.append(page, .{
+                    .cell = g.cell,
+                    .portrayal = if (p) |pp| pp.base else null,
+                    .portrayal_plain = if (p) |pp| pp.plain else null,
+                    .portrayal_simplified = if (p) |pp| pp.simplified else null,
+                    .geo = g.geo,
+                    .bounds = if (p) |pp| pp.bounds else entries[ci].bbox,
+                }) catch {};
+            };
             baker.bakeBand(band, subset.items, .{ .zs = zs, .sx = sx, .sy = sy }, cliProgress, null) catch {};
 
-            // Evict least-recently-used cells beyond the budget (never this
-            // super-tile's, which carry the current tick).
-            while (n_loaded > lru_budget) {
+            // Evict least-recently-used GEOMETRY beyond the budget (never this
+            // super-tile's, which carry the current tick). Portrayal stays resident.
+            while (n_geom > lru_budget) {
                 var victim: ?usize = null;
                 var best: u64 = std.math.maxInt(u64);
-                for (cache, 0..) |c, ci| {
-                    if (c != null and used[ci] < best) {
+                for (geom, 0..) |g, ci| {
+                    if (g != null and used[ci] < best) {
                         best = used[ci];
                         victim = ci;
                     }
                 }
                 const v = victim orelse break;
                 if (used[v] == tick) break; // only the current super-tile's cells remain
-                if (cache[v]) |*be| be.cell.deinit();
-                if (cache_ar[v]) |p| {
-                    p.deinit();
-                    page.destroy(p);
-                    cache_ar[v] = null;
+                if (geom[v]) |*g| {
+                    g.cell.deinit();
+                    if (g.geo_arena) |p| {
+                        p.deinit();
+                        page.destroy(p);
+                    }
                 }
-                cache[v] = null;
-                n_loaded -= 1;
+                geom[v] = null;
+                n_geom -= 1;
             }
         }
 
-        // Free any cells still loaded at the end of the band.
-        for (cache, 0..) |c, ci| {
-            if (c != null) {
-                if (cache[ci]) |*be| be.cell.deinit();
-                if (cache_ar[ci]) |p| {
+        // Free remaining geometry + all resident portrayal at the end of the band.
+        for (geom, 0..) |g, ci| if (g != null) {
+            if (geom[ci]) |*gg| {
+                gg.cell.deinit();
+                if (gg.geo_arena) |p| {
                     p.deinit();
                     page.destroy(p);
                 }
             }
-        }
+        };
+        for (portray, 0..) |p, ci| if (p != null) {
+            portray[ci].?.arena.deinit();
+            page.destroy(portray[ci].?.arena);
+        };
         const parses = g_parses.load(.monotonic) - parses0;
+        const band_secs = nowSec() - band_start;
         std.debug.print(
-            "\n  band {s}: {d} cells, {d} super-tiles, {d} parses ({d:.2}x re-parse)\n",
-            .{ @tagName(band), entries.len, stkeys.len, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(entries.len, 1))) },
+            "\r  band {s} done: {d} cells, {d} super-tiles, {d} tiles total, {d} parses ({d:.2}x), {d}s\n",
+            .{ @tagName(band), entries.len, stkeys.len, baker.count, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(entries.len, 1))), band_secs },
         );
         done_cells += entries.len;
         cliProgress(null, 0, done_cells, total_cells);

@@ -167,6 +167,13 @@ const TileGenCtx = struct {
     results: []?[]u8,
     backends: []Backend,
     gpa: std.mem.Allocator,
+    // Live progress emitted from inside the parallel batch (so a big super-tile
+    // shows tiles flowing rather than appearing hung). `done` counts processed
+    // tiles; `base` is the emitted count before this batch.
+    progress: Progress = null,
+    pctx: ?*anyopaque = null,
+    base: usize = 0,
+    done: ?*std.atomic.Value(usize) = null,
 
     fn gen(uptr: *anyopaque, i: usize) void {
         const c: *TileGenCtx = @ptrCast(@alignCast(uptr));
@@ -180,6 +187,10 @@ const TileGenCtx = struct {
         for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo };
         const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y) catch return;
         if (mvt_bytes.len > 0) c.results[i] = mvt_bytes else c.gpa.free(mvt_bytes);
+        if (c.done) |d| {
+            const n = d.fetchAdd(1, .monotonic) + 1;
+            if (c.progress) |cb| if (n % 1024 == 0) cb(c.pctx, 1, c.base + n, 0);
+        }
     }
 };
 
@@ -299,7 +310,8 @@ pub const Baker = struct {
         defer self.gpa.free(results);
         @memset(results, null);
 
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa };
+        var done = std.atomic.Value(usize).init(0);
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .progress = progress, .pctx = ctx, .base = self.count, .done = &done };
         parallelFor(n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
