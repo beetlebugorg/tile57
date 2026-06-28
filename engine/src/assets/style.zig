@@ -507,7 +507,7 @@ test "styleJson: valid JSON, expected layers, palette-resolved colour" {
     const out = try styleJson(std.testing.allocator, .{
         .scheme = "day",
         .colortables_json = ct,
-        .source_tiles = "zigtiles://{z}/{x}/{y}",
+        .source_tiles = "tile57://{z}/{x}/{y}",
         .sprite = "sprite",
         .glyphs = "glyphs/{fontstack}/{range}.pbf",
     });

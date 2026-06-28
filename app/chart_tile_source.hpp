@@ -1,6 +1,6 @@
 // ChartTileSource — an mbgl::FileSource that serves vector tiles from
 // libtile57 (the Zig tile generator) for URLs of the form
-// zigtiles://{z}/{x}/{y}.
+// tile57://{z}/{x}/{y}.
 //
 // It is registered in the (unused) Mbtiles slot of MapLibre's MainResourceLoader
 // so tile requests route to it by canRequest(). Backed by a PMTiles reader or

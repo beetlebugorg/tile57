@@ -90,4 +90,4 @@ LRU). The catalogue opens in seconds; memory stays bounded. Caveats:
 - **The Qt window renders a pre-baked bundle**, not live tiles. `chartplotter-qt`
   loads a chart bundle's PMTiles via QMapLibre; producing the bundle
   (`tile57 bundle`) is a separate offline step. Live in-process
-  generation (`zigtiles://`) currently only backs the headless PNG renderer.
+  generation (`tile57://`) currently only backs the headless PNG renderer.

@@ -41,7 +41,7 @@ std::string readFile(const char *path) {
     return ss.str();
 }
 
-// Route zigtiles:// requests to our source by registering ChartTileSource in the
+// Route tile57:// requests to our source by registering ChartTileSource in the
 // (unused) Mbtiles slot, before any Map is built.
 void registerChartSource() {
     mbgl::FileSourceManager::get()->registerFileSourceFactory(

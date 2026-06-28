@@ -145,7 +145,7 @@ void TileServer::run() {
     std::string json = ss.str();
 
     const double minZoomFloor = styleSourceMinZoom(json, 0.0);
-    const std::string fromUrl = "zigtiles://{z}/{x}/{y}";
+    const std::string fromUrl = "tile57://{z}/{x}/{y}";
     const std::string toUrl = "http://127.0.0.1:" + std::to_string(port) + "/{z}/{x}/{y}";
     for (size_t i = json.find(fromUrl); i != std::string::npos; i = json.find(fromUrl, i + toUrl.size()))
         json.replace(i, fromUrl.size(), toUrl);

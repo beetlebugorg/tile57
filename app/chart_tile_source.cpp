@@ -15,9 +15,9 @@
 
 namespace cpn {
 
-static constexpr const char *PREFIX = "zigtiles://";
+static constexpr const char *PREFIX = "tile57://";
 
-// Fill `response` with the tile for a zigtiles:// request.
+// Fill `response` with the tile for a tile57:// request.
 //
 // Conditional-request support is what stops the flicker: our tiles are
 // deterministic, so each gets a stable etag. When MapLibre re-requests a tile it
@@ -31,7 +31,7 @@ static void fillResponse(tile57_source *src, const mbgl::Resource &resource, mbg
     const char *rest = resource.url.c_str() + std::strlen(PREFIX);
     if (std::sscanf(rest, "%d/%u/%u", &z, &x, &y) != 3) {
         response.error = std::make_unique<mbgl::Response::Error>(
-            mbgl::Response::Error::Reason::Other, "bad zigtiles url");
+            mbgl::Response::Error::Reason::Other, "bad tile57 url");
         return;
     }
 

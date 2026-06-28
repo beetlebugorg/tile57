@@ -37,7 +37,7 @@ for scheme in day dusk night; do
 done
 
 # A day style whose chart source is served by the Zig FileSource (ChartTileSource,
-# used by chartplotter / chartplotter-render). The zigtiles:// scheme is the
+# used by chartplotter / chartplotter-render). The tile57:// scheme is the
 # internal routing key matched by ChartTileSource::canRequest.
 gen day "$ROOT/style/chart-zig-day.json" \
-  --source-tiles "zigtiles://{z}/{x}/{y}" --minzoom 5 --maxzoom 16
+  --source-tiles "tile57://{z}/{x}/{y}" --minzoom 5 --maxzoom 16

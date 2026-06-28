@@ -55,7 +55,7 @@ module roots, the `tile57_*` C-ABI (`capi`), and the MVT parity test.
 5. **Project, clip, encode.** Each primitive is projected to web-mercator tile
    coordinates, clipped to the tile (extent 4096, buffer 64), and encoded as MVT.
 6. **Serve.** `tile57_tile_get` returns the tile's bytes; the `ChartTileSource`
-   `FileSource` hands them to MapLibre for `zigtiles://{z}/{x}/{y}` requests.
+   `FileSource` hands them to MapLibre for `tile57://{z}/{x}/{y}` requests.
 
 The same `chartplotter_*` API also reads a pre-baked **PMTiles** archive instead
 of generating from a cell, or a whole **ENC_ROOT** directory — every base cell
@@ -75,12 +75,12 @@ A few choices shape the whole project:
   have small [C APIs](./c-api.md).
 - **Live, in-process generation is the target.** `libtile57` generates one tile's
   MVT bytes on demand; the `ChartTileSource` `mbgl::FileSource` (scheme
-  `zigtiles://`, inside libchartplotter) hands them to MapLibre. Tiles are memoized
+  `tile57://`, inside libchartplotter) hands them to MapLibre. Tiles are memoized
   in an in-process cache. The offline CLI baker is kept too (cheap, and the
   differential-test driver).
 - **Register in the unused Mbtiles slot.** Rather than patch MapLibre, the host
   registers `ChartTileSource` as the factory for `FileSourceType::Mbtiles` *before*
-  the `Map` is constructed, so `zigtiles://` requests route to it.
+  the `Map` is constructed, so `tile57://` requests route to it.
 - **Embed Lua 5.4; do not port the rules.** The ~216 IHO Lua rule files are
   executable spec — they run as-is. Only the ~30 `Host*` query functions they call
   are implemented in Zig (and a small C shim, since Lua's macros are easiest from
@@ -148,7 +148,7 @@ progress.
 ## Live tile source (the render path)
 
 `ChartTileSource` (`app/chart_tile_source.cpp`) backs `chartplotter-render`: it
-serves `zigtiles://{z}/{x}/{y}` straight from libtile57, generated in-process.
+serves `tile57://{z}/{x}/{y}` straight from libtile57, generated in-process.
 Two things make that cheap: tiles carry a stable `etag` so MapLibre returns
 `notModified` and keeps its parsed tile on a re-request (no re-parse), and
 libtile57 memoizes generated/decoded tiles (`engine/src/capi.zig`, key
