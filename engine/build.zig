@@ -31,6 +31,15 @@ fn addLua(b: *std.Build, mod: *std.Build.Module) void {
     });
 }
 
+// Attach the vendored SVG rasterizer (nanosvg) + PNG encoder (stb_image_write)
+// behind svgraster.c to a module. Used by the `sprite` module (sprite/pattern
+// atlas generation in the bake tool). Single-header C libs; need libc.
+fn addSvgRaster(b: *std.Build, mod: *std.Build.Module) void {
+    mod.addIncludePath(b.path("vendor/nanosvg"));
+    mod.addIncludePath(b.path("vendor/stb"));
+    mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2" } });
+}
+
 // Re-import the pure packages into a consumer module (engine, libtile57.a, the
 // baker). One list keeps the edge set in sync across all three.
 fn addPkgs(mod: *std.Build.Module, pkgs: []const std.Build.Module.Import) void {
@@ -161,6 +170,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/chartstyle/chartstyle.zig"),
     });
 
+    // S-101 sprite/pattern atlas builder (nanosvg + stb PNG). libc (the C libs),
+    // target-less so it inherits the consumer's target (only the bake tool, which
+    // already links libc for Lua). Not in pure_pkgs — the tests stay libc-free.
+    const sprite_mod = b.addModule("sprite", .{
+        .root_source_file = b.path("src/sprite/sprite.zig"),
+        .link_libc = true,
+    });
+    addSvgRaster(b, sprite_mod);
+
     // All pure packages, imported by name into engine / libtile57.a / the baker.
     // (portray is libc, wired separately into the lib + baker only.)
     const pure_pkgs = [_]std.Build.Module.Import{
@@ -239,6 +257,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "engine", .module = bake_engine },
                 .{ .name = "assets", .module = assets_mod },
+                .{ .name = "sprite", .module = sprite_mod },
             },
         }),
     });

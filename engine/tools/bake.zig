@@ -18,6 +18,7 @@
 const std = @import("std");
 const engine = @import("engine");
 const assets = @import("assets");
+const sprite = @import("sprite");
 
 const VERSION = "chartplotter-bake 0.1.0";
 
@@ -84,6 +85,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "assets")) {
         return runAssets(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "sprite")) {
+        return runSprite(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "bundle")) {
@@ -449,6 +454,69 @@ fn emitLinestyles(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out
     return json;
 }
 
+// Symbols/*.svg live under a PortrayalCatalog dir; the palette stylesheet
+// (daySvgStyle.css etc.) lives alongside them.
+const SYMBOLS_REL = "Symbols";
+const DEFAULT_CSS = "daySvgStyle.css";
+
+// Read every Symbols/*.svg + the palette CSS and build the sprite atlas
+// (sprite.json + sprite.png). Mirrors the Go oracle's SpriteAtlasS101FS.
+fn spriteAtlasBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8) !sprite.Atlas {
+    const sym_dir_path = try std.fs.path.join(a, &.{ catalog_dir, SYMBOLS_REL });
+    var dir = try std.Io.Dir.cwd().openDir(io, sym_dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    const css_path = try std.fs.path.join(a, &.{ sym_dir_path, css_name });
+    const css = try std.Io.Dir.cwd().readFileAlloc(io, css_path, a, .unlimited);
+
+    var srcs = std.ArrayList(sprite.SvgSrc).empty;
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".svg")) continue;
+        const path = try a.dupe(u8, entry.path);
+        const svg = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
+        const id = std.fs.path.stem(std.fs.path.basename(path));
+        try srcs.append(a, .{ .id = id, .svg = svg });
+    }
+    return sprite.spriteAtlas(a, srcs.items, css);
+}
+
+fn emitSprites(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, json_path: []const u8, png_path: []const u8) !sprite.Atlas {
+    const atlas = try spriteAtlasBytes(io, a, catalog_dir, css_name);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = atlas.json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = png_path, .data = atlas.png });
+    return atlas;
+}
+
+/// `sprite <portrayal-catalog-dir> -o <out-dir> [--css daySvgStyle.css]` — emit
+/// the S-101 symbol atlas (sprite.json + sprite.png) for a palette.
+fn runSprite(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var catalog: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var css: []const u8 = DEFAULT_CSS;
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            out = f.val(arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--css")) {
+            css = f.val(arg) orelse return;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usageErr("unknown flag");
+        } else if (catalog == null) {
+            catalog = arg;
+        }
+    }
+    const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
+    const catalog_dir = resolveCatalogDir(catalog);
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    const json_path = try std.fs.path.join(a, &.{ out_dir, "sprite.json" });
+    const png_path = try std.fs.path.join(a, &.{ out_dir, "sprite.png" });
+    const atlas = try emitSprites(io, a, catalog_dir, css, json_path, png_path);
+    std.debug.print("emitted sprite atlas from {s} (css {s})\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalog_dir, css, json_path, atlas.json.len, png_path, atlas.png.len });
+}
+
 /// `assets <portrayal-catalog-dir> -o <out-dir>` — emit the portrayal assets
 /// (colortables.json today; linestyles/sprites/glyphs to follow) for a catalogue.
 fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -472,7 +540,10 @@ fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const json = try emitColorTables(io, a, catalog_dir, ct_path);
     const ls_path = try std.fs.path.join(a, &.{ out_dir, "linestyles.json" });
     const ls = try emitLinestyles(io, a, catalog_dir, ls_path);
-    std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalog_dir, ct_path, json.len, ls_path, ls.len });
+    const sj_path = try std.fs.path.join(a, &.{ out_dir, "sprite.json" });
+    const sp_path = try std.fs.path.join(a, &.{ out_dir, "sprite.png" });
+    const atlas = try emitSprites(io, a, catalog_dir, DEFAULT_CSS, sj_path, sp_path);
+    std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalog_dir, ct_path, json.len, ls_path, ls.len, sj_path, atlas.json.len, sp_path, atlas.png.len });
 }
 
 /// `bundle <cell.000> -o <out-dir> [--rules DIR] [--catalog DIR] [--minzoom N]
@@ -537,6 +608,10 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const ls_path = try std.fs.path.join(a, &.{ assets_dir, "linestyles.json" });
     _ = emitLinestyles(io, a, resolveCatalogDir(catalog), ls_path) catch |err|
         std.debug.print("warning: linestyles emit failed ({s})\n", .{@errorName(err)});
+    const sj_path = try std.fs.path.join(a, &.{ assets_dir, "sprite.json" });
+    const sp_path = try std.fs.path.join(a, &.{ assets_dir, "sprite.png" });
+    _ = emitSprites(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, sj_path, sp_path) catch |err|
+        std.debug.print("warning: sprite atlas emit failed ({s})\n", .{@errorName(err)});
     var styles: ?assets.Manifest.Styles = null;
     if (emitColorTables(io, a, resolveCatalogDir(catalog), ct_path)) |ct| {
         // One style.json per palette, resolving colour tokens from the colortables.
