@@ -352,23 +352,38 @@ pub fn buildFeatBBox(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts) ![]?[4
     return out;
 }
 
+/// One assembled line/area part: its tile-independent web-mercator coords plus its
+/// static lon/lat bbox [w,s,e,n]. The bbox is computed ONCE here so the baker's
+/// per-tile overlap cull reuses it instead of recomputing geomBounds for every tile
+/// a feature spans (that recompute was ~10% of the bake).
+pub const WPart = struct { pts: [][2]f64, bbox: [4]f64 };
+
 /// World coords (web-mercator [0,1]) parallel to a geo cache: each line/area
 /// point's tile-independent projection, computed ONCE per cell so the baker
 /// reprojects cheaply per tile (tile.worldToTile, no tan/log) instead of running
 /// the transcendental projection for every tile a feature touches. Built from the
-/// assembled geo cache, so [fi][part][i] lines up with GeoParts.
-pub const GeoWorld = []const ?[][][2]f64;
+/// assembled geo cache, so [fi][part] lines up with GeoParts.
+pub const GeoWorld = []const ?[]WPart;
 
 pub fn buildGeoWorld(a: Allocator, geo: GeoParts) !GeoWorld {
-    const out = try a.alloc(?[][][2]f64, geo.len);
+    const out = try a.alloc(?[]WPart, geo.len);
     for (geo, 0..) |maybe_parts, i| {
         out[i] = null;
         const parts = maybe_parts orelse continue;
-        const wparts = a.alloc([][2]f64, parts.len) catch continue;
+        const wparts = a.alloc(WPart, parts.len) catch continue;
         for (parts, 0..) |part, pi| {
             const wp = try a.alloc([2]f64, part.len);
-            for (part, 0..) |pt, j| wp[j] = tile.lonLatToWorld(pt.lon(), pt.lat());
-            wparts[pi] = wp;
+            var bb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+            for (part, 0..) |pt, j| {
+                const lo = pt.lon();
+                const la = pt.lat();
+                wp[j] = tile.lonLatToWorld(lo, la);
+                bb[0] = @min(bb[0], lo);
+                bb[1] = @min(bb[1], la);
+                bb[2] = @max(bb[2], lo);
+                bb[3] = @max(bb[3], la);
+            }
+            wparts[pi] = .{ .pts = wp, .bbox = bb };
         }
         out[i] = wparts;
     }
@@ -491,16 +506,18 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // Project each usable part; quick-reject if none overlap the tile. Reproject
     // from the cell's precomputed world coords (cheap; no per-point tan/log) when
     // the baker supplied them, else project lon/lat directly (the live path).
-    const wparts: ?[]const [][2]f64 = if (geo_world) |gw| (if (fi < gw.len) gw[fi] else null) else null;
+    const wparts: ?[]const WPart = if (geo_world) |gw| (if (fi < gw.len) gw[fi] else null) else null;
     var projected = std.ArrayList([]mvt.Point).empty;
     var any_overlap = false;
     for (geo_parts, 0..) |gp, pi| {
         if (gp.len < 2) continue;
-        if (overlaps(geomBounds(gp), tb)) any_overlap = true;
+        const wp: ?WPart = if (wparts) |wps| (if (pi < wps.len and wps[pi].pts.len == gp.len) wps[pi] else null) else null;
+        // Overlap cull: reuse the part's precomputed lon/lat bbox when the world
+        // cache is present (no per-tile geomBounds recompute), else compute it live.
+        if (overlaps(if (wp) |w| w.bbox else geomBounds(gp), tb)) any_overlap = true;
         const proj = try a.alloc(mvt.Point, gp.len);
-        const wp: ?[]const [2]f64 = if (wparts) |wps| (if (pi < wps.len and wps[pi].len == gp.len) wps[pi] else null) else null;
         if (wp) |w| {
-            for (w, 0..) |ww, i| proj[i] = tile.worldToTile(ww, z, x, y, tile.EXTENT);
+            for (w.pts, 0..) |ww, i| proj[i] = tile.worldToTile(ww, z, x, y, tile.EXTENT);
         } else {
             for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
         }
