@@ -1,14 +1,15 @@
-<h1 align="center">chartplotter-native</h1>
+<h1 align="center">tile57</h1>
 
 <p align="center">
-  <b>⚓ Marine chart tiles, generated natively in Zig.</b><br>
-  A Zig engine turns NOAA S-57 ENC cells into S-52 marine chart tiles, drawn live by MapLibre Native (Metal / OpenGL) in a desktop window.
+  <b>⚓ A high-performance, low-memory S-57 → MVT vector-tile + S-52 style engine.</b><br>
+  tile57 turns IHO S-57 ENC cells into Mapbox Vector Tiles plus a MapLibre S-52
+  style and its portrayal assets — embeddable from Zig or C.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
   &nbsp;·&nbsp;
-  📚 <b><a href="https://beetlebugorg.github.io/chartplotter-native/">Read the docs →</a></b>
+  📚 <b><a href="docs/docs/intro.md">Docs →</a></b>
 </p>
 
 ---
@@ -17,96 +18,114 @@
 > **Not for navigation.** This project is coded almost entirely with AI (Claude).
 > It is an experiment in building a large, complex specification (IHO S-101) with
 > AI, and a personal learning tool — not a certified or tested product. Do not rely
-> on it for real-world navigation. See
-> [Known limitations](https://beetlebugorg.github.io/chartplotter-native/limitations).
+> on it for real-world navigation. See [Known limitations](docs/docs/limitations.md).
 
 ---
 
-**chartplotter-native** generates **marine chart tiles** natively and draws them
-in a real desktop window. A **Zig tile generator** (`libtile57`) turns NOAA
-**S-57** ENC cells into S-52 marine chart tiles — running the official IHO
-**S-101 Portrayal Catalogue** in embedded Lua — and the **`libchartplotter`**
-widget draws them with
-**[MapLibre Native](https://github.com/maplibre/maplibre-native)** (Metal on
-macOS, OpenGL/EGL on Linux). Tiles are generated live and in-process behind a
-custom MapLibre `FileSource`, so it renders straight from a raw `.000` cell — or a
-whole **ENC_ROOT** directory (every cell + its `.001…` updates, overlaid).
-Reading a pre-baked PMTiles archive works too.
+**tile57** decodes NOAA/IHO **S-57** ENC cells and generates **Mapbox Vector
+Tiles** by `(z, x, y)`, running the official IHO **S-101 Portrayal Catalogue** in
+embedded Lua to produce S-52 nautical portrayal. Alongside the tiles it emits a
+**MapLibre GL style** and the portrayal **assets** it references — colour tables,
+line styles, and the sprite + area-fill pattern atlases — so a renderer like
+[MapLibre](https://github.com/maplibre/maplibre-native) can draw a chart directly.
 
-It is the native sibling of
-[**chartplotter-go**](https://github.com/beetlebugorg/chartplotter), which bakes the
-same charts into PMTiles for the browser. The Go project is the parity oracle; the
-Zig pipeline mirrors it stage for stage.
+It is **high-performance and low-memory** by design:
 
-## How it works
+- **Lazy, per-cell work.** A multi-cell ENC_ROOT is indexed cheaply (band + bbox);
+  cells are parsed and portrayed only when a requested tile needs them, then held
+  under an LRU bound. A **streaming** open reads a cell's bytes on demand (and
+  frees them on eviction), so a host holds only the working set — not the whole
+  catalogue.
+- **Band-streamed bakes.** Baking an ENC_ROOT to one PMTiles archive streams
+  band-by-band (finest → coarsest, best-band dedup), so peak memory tracks the
+  largest single band.
+- **Pure-Zig core.** The foundational format/encode packages have no libc; only
+  the Lua portrayal + sprite rasterizer pull in C.
+
+## Pipeline
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                 engine/src/iso8211/   (pkg: iso8211)
+   │  ISO 8211 decode                    engine/src/iso8211/   (pkg: iso8211)
    ▼
-S-57 feature + geometry model         engine/src/s57/       (pkg: s57)
-   │  S-101 portrayal (embedded Lua)  engine/src/portray/ (pkg) + engine/src/s100/ (pkg: s100)
+S-57 feature + geometry model            engine/src/s57/       (pkg: s57)
+   │  S-101 portrayal (embedded Lua)     engine/src/portray/ + engine/src/s100/ (pkg: s100)
    ▼
-Primitive instruction stream
-   │  project + clip + encode         engine/src/{s57_mvt,tile,mvt}/  (packages)
+portrayal instruction stream
+   │  adapt + project + clip + encode    engine/src/{s57_mvt,tile,mvt,pmtiles}/
    ▼
-Mapbox Vector Tiles  ─────────────▶   MapLibre Native  (ChartTileSource FileSource)
+Mapbox Vector Tiles  +  MapLibre style.json  +  colortables / linestyles / sprite / patterns
 ```
 
 The foundational stages are standalone Zig packages — **`iso8211`**, **`s57`**,
-**`s100`** — mirroring the Go oracle's `pkg/iso8211`, `pkg/s57`, `pkg/s100`, so the
-two implementations line up package for package.
+**`s100`** — so they compose independently and stay libc-free.
 
-Two libraries: **`libtile57`** is the tile pipeline (`tile57_*`,
-`include/tile57.h`); **`libchartplotter`** is the headless chart renderer
-(`chartplotter_*`, `include/chartplotter.h`) that draws a chart to a PNG. The
-interactive window is a separate **Qt6** app — `chartplotter-qt` (`app/qt`), built
-on the [QMapLibre](https://github.com/maplibre/maplibre-native-qt) widget.
-See the [C APIs](https://beetlebugorg.github.io/chartplotter-native/c-api).
+## Use it from Zig
+
+Add tile57 as a dependency, then `@import("tile57")`:
+
+```zig
+const tile57 = @import("tile57");
+
+var src = try tile57.Source.openBytes(cell_bytes, .auto, null); // PMTiles or S-57 cell
+defer src.deinit();
+if (try src.tile(z, x, y)) |mvt| {        // decompressed MVT bytes
+    defer tile57.freeBytes(mvt);
+    // … hand to your renderer …
+}
+```
+
+`Source.openCells` / `openCellsStreaming` open a whole ENC_ROOT; `bakeArchive`
+bakes one to PMTiles; `assets` + `sprite` generate the style assets.
+
+## Use it from C
+
+The same engine behind a thin C ABI ([`include/tile57.h`](include/tile57.h)):
+
+```c
+tile57_source *s = tile57_source_open(data, len, TILE57_FORMAT_AUTO, NULL);
+uint8_t *mvt; size_t n;
+if (tile57_tile_get(s, z, x, y, &mvt, &n) == TILE57_TILE_OK) {
+    /* … render mvt … */ tile57_tile_free(mvt, n);
+}
+tile57_source_close(s);
+```
+
+`libtile57.a` also exposes the ENC_ROOT bake, the MapLibre style builder, and the
+asset/atlas generators. See [the C API docs](docs/docs/c-api.md).
+
+## The `tile57` CLI
+
+The offline tool bakes charts and emits portrayal assets:
+
+```sh
+cd engine && zig build                       # builds engine/zig-out/bin/tile57
+tile57 bundle CELL.000 -o out/               # tiles + style + assets + manifest
+tile57 bake-root ENC_ROOT -o chart.pmtiles   # band-streamed whole-catalogue bake
+tile57 assets   PortrayalCatalog -o assets/  # colortables + linestyles + sprite + patterns
+tile57 sprite-mln PortrayalCatalog -o assets/# the MapLibre sprite sheet
+```
 
 ## Build
 
-Needs CMake, Ninja, a C++20 compiler, and **Zig 0.16**. Fetch the submodules
-(MapLibre Native + the IHO S-101 catalogue), then build:
+The Zig engine + CLI need only **Zig 0.16**:
 
 ```sh
-git submodule update --init --recursive
-scripts/gen-reference.sh                       # tiles + assets + styles (needs ../chartplotter-go)
-
-cmake --preset headless                        # or: macos
-ninja -C build chartplotter-render
-build/chartplotter-render \
-  ../chartplotter-go/testdata/US4MD81M.000 \   # a cell, a .pmtiles, or an ENC_ROOT dir
-  style/chart-zig-day.json 38.97 -76.49 12 renders/from_cell.png
+git submodule update --init --recursive   # vendored S-101 catalogue
+cd engine && zig build && zig build test
 ```
 
-Full instructions are in the
-[**docs**](https://beetlebugorg.github.io/chartplotter-native/installation).
-
-## What the build produces
-
-| Target | What it is |
-|--------|-----------|
-| `libchartplotter.a` | the headless chart **renderer** (chart → PNG), `chartplotter_*` |
-| `libtile57.a` | the Zig S-57 **tile generator** + its `tile57_*` C ABI |
-| `chartplotter-render` | headless host: chart → PNG (PMTiles, an S-57 cell, or an ENC_ROOT) |
-| `chartplotter-qt` | interactive **Qt6** chart window (QMapLibre); build via `scripts/build-qmaplibre.sh` |
-| `tile57` | offline CLI: bake a cell/ENC_ROOT to PMTiles, or emit a self-contained **chart bundle** (tiles + portrayal assets + manifest) |
+Full instructions: [docs/installation](docs/docs/installation.md).
 
 ## Documentation
 
-Full docs (built with Docusaurus, source in [`docs/`](docs/)) live at
-**[beetlebugorg.github.io/chartplotter-native](https://beetlebugorg.github.io/chartplotter-native/)**:
-[installation](https://beetlebugorg.github.io/chartplotter-native/installation),
-[getting started](https://beetlebugorg.github.io/chartplotter-native/getting-started),
-the [C API](https://beetlebugorg.github.io/chartplotter-native/c-api),
-the [architecture](https://beetlebugorg.github.io/chartplotter-native/architecture),
-and the [tile schema](https://beetlebugorg.github.io/chartplotter-native/tile-schema).
-
-See also [`CHANGELOG.md`](CHANGELOG.md).
+Docs source lives in [`docs/`](docs/): [intro](docs/docs/intro.md),
+[getting started](docs/docs/getting-started.md), the
+[C API](docs/docs/c-api.md), the [architecture](docs/docs/architecture.md), and the
+[tile schema](docs/docs/tile-schema.md). See also [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-chartplotter-native's own code is [MIT](LICENSE) © Jeremy Collins. It embeds
-MapLibre Native (BSD) and the IHO S-101 Portrayal Catalogue (© IHO). NOAA ENC
-charts are U.S. public domain and **not for navigation**.
+tile57's own code is [MIT](LICENSE) © Jeremy Collins. It embeds the IHO S-101
+Portrayal Catalogue (© IHO) and vendors nanosvg (zlib) + stb_image_write (public
+domain). NOAA ENC charts are U.S. public domain and **not for navigation**.

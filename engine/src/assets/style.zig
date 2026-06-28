@@ -326,7 +326,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     try js.write(8);
     var namebuf: [64]u8 = undefined;
     try js.objectField("name");
-    try js.write(try std.fmt.bufPrint(&namebuf, "chartplotter-native ({s}, M2)", .{opts.scheme}));
+    try js.write(try std.fmt.bufPrint(&namebuf, "tile57 ({s})", .{opts.scheme}));
 
     try js.objectField("sources");
     try js.beginObject();
