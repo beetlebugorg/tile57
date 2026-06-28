@@ -95,6 +95,10 @@ pub fn main(init: std.process.Init) !void {
         return runPattern(io, arena, args);
     }
 
+    if (std.mem.eql(u8, sub, "sprite-mln")) {
+        return runSpriteMln(io, arena, args);
+    }
+
     if (std.mem.eql(u8, sub, "bundle")) {
         return runBundle(io, arena, args);
     }
@@ -543,6 +547,73 @@ fn emitPatterns(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_n
     return atlas;
 }
 
+// Read every AreaFills/*.xml under catalog_dir (shared by pattern + sprite-mln).
+fn readFills(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]sprite.AreaFillSrc {
+    const af_dir_path = try std.fs.path.join(a, &.{ catalog_dir, AREAFILLS_REL });
+    var dir = try std.Io.Dir.cwd().openDir(io, af_dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var fills = std.ArrayList(sprite.AreaFillSrc).empty;
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".xml")) continue;
+        const path = try a.dupe(u8, entry.path);
+        const xml = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
+        try fills.append(a, .{ .id = std.fs.path.stem(std.fs.path.basename(path)), .xml = xml });
+    }
+    return fills.items;
+}
+
+// Build the MapLibre sprite (sprite-mln) directly from the catalogue's Symbols +
+// AreaFills + palette CSS. Mirrors the old scripts/build_sprite.py, in Zig.
+fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8) !sprite.Atlas {
+    const symbols = try readSymbols(io, a, catalog_dir);
+    const fills = try readFills(io, a, catalog_dir);
+    const css_path = try std.fs.path.join(a, &.{ catalog_dir, SYMBOLS_REL, css_name });
+    const css = try std.Io.Dir.cwd().readFileAlloc(io, css_path, a, .unlimited);
+    return sprite.spriteMln(a, symbols, fills, css);
+}
+
+// Emit sprite-mln.{json,png} + identical @2x copies (MapLibre requests @2x on
+// HiDPI; a missing @2x sheet fails the whole sprite load).
+fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, out_dir: []const u8, base: []const u8) !sprite.Atlas {
+    const atlas = try spriteMlnBytes(io, a, catalog_dir, css_name);
+    for ([_][]const u8{ "", "@2x" }) |suffix| {
+        const jn = try std.fmt.allocPrint(a, "{s}{s}.json", .{ base, suffix });
+        const pn = try std.fmt.allocPrint(a, "{s}{s}.png", .{ base, suffix });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, jn }), .data = atlas.json });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, pn }), .data = atlas.png });
+    }
+    return atlas;
+}
+
+/// `sprite-mln <portrayal-catalog-dir> -o <out-dir> [--css daySvgStyle.css]` —
+/// emit the MapLibre-ready sprite (sprite-mln.{json,png} + @2x): pivot-centred
+/// symbols, ctr: bbox-centred variants, and pat: area-fill patterns.
+fn runSpriteMln(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var catalog: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var css: []const u8 = DEFAULT_CSS;
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            out = f.val(arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--css")) {
+            css = f.val(arg) orelse return;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usageErr("unknown flag");
+        } else if (catalog == null) {
+            catalog = arg;
+        }
+    }
+    const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
+    const catalog_dir = resolveCatalogDir(catalog);
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    const atlas = try emitSpriteMln(io, a, catalog_dir, css, out_dir, "sprite-mln");
+    std.debug.print("emitted sprite-mln from {s} (css {s})\n  sprite-mln.json ({d} bytes) + .png ({d} bytes) + @2x\n", .{ catalog_dir, css, atlas.json.len, atlas.png.len });
+}
+
 /// `pattern <portrayal-catalog-dir> -o <out-dir> [--css daySvgStyle.css]` — emit
 /// the S-101 area-fill pattern atlas (patterns.json + patterns.png).
 fn runPattern(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -691,21 +762,22 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const ls_path = try std.fs.path.join(a, &.{ assets_dir, "linestyles.json" });
     _ = emitLinestyles(io, a, resolveCatalogDir(catalog), ls_path) catch |err|
         std.debug.print("warning: linestyles emit failed ({s})\n", .{@errorName(err)});
-    const sj_path = try std.fs.path.join(a, &.{ assets_dir, "sprite.json" });
-    const sp_path = try std.fs.path.join(a, &.{ assets_dir, "sprite.png" });
-    _ = emitSprites(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, sj_path, sp_path) catch |err|
-        std.debug.print("warning: sprite atlas emit failed ({s})\n", .{@errorName(err)});
-    const pj_path = try std.fs.path.join(a, &.{ assets_dir, "patterns.json" });
-    const pp_path = try std.fs.path.join(a, &.{ assets_dir, "patterns.png" });
-    _ = emitPatterns(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, pj_path, pp_path) catch |err|
-        std.debug.print("warning: pattern atlas emit failed ({s})\n", .{@errorName(err)});
+    // The bundle ships ONLY the MapLibre-ready sprite (sprite-mln): it already
+    // contains the pivot-centred symbols + ctr:/pat: variants, so the raw
+    // sprite.json/patterns.json (the web/oracle format) would be redundant here —
+    // they stay available via the standalone `tile57 sprite`/`pattern` commands.
+    // If sprite-mln emits, the styles get a `sprite` URL so symbols + patterns render.
+    const sprite_ok = if (emitSpriteMln(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, assets_dir, "sprite-mln")) |_| true else |err| blk: {
+        std.debug.print("warning: sprite-mln emit failed ({s})\n", .{@errorName(err)});
+        break :blk false;
+    };
     var styles: ?assets.Manifest.Styles = null;
     if (emitColorTables(io, a, resolveCatalogDir(catalog), ct_path)) |ct| {
         // One style.json per palette, resolving colour tokens from the colortables.
-        // sprite/glyphs are omitted until those assets exist; areas + lines render.
+        // sprite enables the symbol/pattern layers; glyphs (text) await SDF glyphs.
         var ok = true;
         for ([_][]const u8{ "day", "dusk", "night" }) |sc| {
-            const sj = assets.styleJson(a, .{ .scheme = sc, .colortables_json = ct }) catch {
+            const sj = assets.styleJson(a, .{ .scheme = sc, .colortables_json = ct, .sprite = if (sprite_ok) "sprite-mln" else null }) catch {
                 ok = false;
                 break;
             };

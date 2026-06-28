@@ -438,6 +438,173 @@ pub fn patternAtlas(a: std.mem.Allocator, fills: []const AreaFillSrc, symbols: [
     return packAtlas(a, ar, cells.items, sprite_atlas_width);
 }
 
+// ---- sprite-mln (the MapLibre-ready sprite) ------------------------------
+//
+// MapLibre always draws an icon centred on the point and consumes a sprite of
+// {x,y,width,height,pixelRatio}. We build it DIRECTLY from the rendered cells
+// (no raw→assemble round-trip): each symbol is pivot-centred into its cell; a
+// "ctr:"-prefixed bbox-centred copy is added for the pivot_center area-symbol
+// case; area-fill patterns are added as "pat:" at the tiling pixel ratio. Port
+// of scripts/build_sprite.py (now removed), applied to RenderedSym in memory.
+
+// Patterns are registered at this pixel ratio so the seamless tile repeats at the
+// right on-screen density: atlasPpu / FEATURE_SCALE = 0.08 / (0.01/0.35278).
+const pattern_pixel_ratio: f64 = px_per_unit / (0.01 / 0.35278); // ≈ 2.822
+
+const MlnCell = struct { name: []const u8, w: u32, h: u32, ratio: f64, rgba: []const u8 };
+
+/// A MapLibre sprite (sprite-mln.json + sprite-mln.png) assembled from the S-101
+/// symbols + area-fill patterns. Returns allocator-owned bytes. Soundings (the
+/// data-dependent comma-joined glyph stacks) are added separately from the tiles.
+pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8) !Atlas {
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const ar = arena_state.allocator();
+    var css = try loadCss(ar, css_data);
+
+    var cells = std.ArrayList(MlnCell).empty;
+
+    // Symbols, id order (deterministic packing).
+    const sym_ordered = try ar.dupe(SvgSrc, symbols);
+    std.mem.sort(SvgSrc, sym_ordered, {}, struct {
+        fn less(_: void, x: SvgSrc, y: SvgSrc) bool {
+            return std.mem.lessThan(u8, x.id, y.id);
+        }
+    }.less);
+    for (sym_ordered) |s| {
+        const sym = renderSym(ar, s.svg, &css) orelse continue;
+        if (sym.w > max_cell_side or sym.h > max_cell_side) continue;
+        const c = centredCanvas(ar, sym) orelse continue;
+        try cells.append(ar, .{ .name = s.id, .w = c.w, .h = c.h, .ratio = 1, .rgba = c.rgba });
+        // "ctr:" — the raw cell, bbox-centred by MapLibre (pivot ignored).
+        const ctr_name = try std.fmt.allocPrint(ar, "ctr:{s}", .{s.id});
+        try cells.append(ar, .{ .name = ctr_name, .w = sym.w, .h = sym.h, .ratio = 1, .rgba = sym.rgba });
+    }
+
+    // Area-fill patterns, id order, keyed "pat:<id>" at the pattern pixel ratio.
+    const fill_ordered = try ar.dupe(AreaFillSrc, fills);
+    std.mem.sort(AreaFillSrc, fill_ordered, {}, struct {
+        fn less(_: void, x: AreaFillSrc, y: AreaFillSrc) bool {
+            return std.mem.lessThan(u8, x.id, y.id);
+        }
+    }.less);
+    var sym_by_id = std.StringHashMap([]const u8).init(ar);
+    for (symbols) |s| try sym_by_id.put(s.id, s.svg);
+    for (fill_ordered) |f| {
+        const af = parseAreaFill(f.xml);
+        if (af.symbol_ref.len == 0) continue;
+        const svg = sym_by_id.get(af.symbol_ref) orelse continue;
+        const sym = renderSym(ar, svg, &css) orelse continue;
+        const t = seamlessTile(ar, sym, af) orelse continue;
+        const name = try std.fmt.allocPrint(ar, "pat:{s}", .{f.id});
+        try cells.append(ar, .{ .name = name, .w = t.w, .h = t.h, .ratio = pattern_pixel_ratio, .rgba = t.rgba });
+    }
+
+    return packMln(a, ar, cells.items, sprite_atlas_width);
+}
+
+// Pivot-centred canvas: move the S-52 pivot to the image centre so MapLibre's
+// centre-on-point draws the symbol correctly. null on degenerate size.
+const Canvas = struct { w: u32, h: u32, rgba: []u8 };
+fn centredCanvas(ar: std.mem.Allocator, sym: RenderedSym) ?Canvas {
+    const wf: f64 = @floatFromInt(sym.w);
+    const hf: f64 = @floatFromInt(sym.h);
+    const half_w = @max(sym.pivot_x, wf - sym.pivot_x);
+    const half_h = @max(sym.pivot_y, hf - sym.pivot_y);
+    const w: u32 = @max(1, @as(u32, @intFromFloat(@ceil(2 * half_w))));
+    const h: u32 = @max(1, @as(u32, @intFromFloat(@ceil(2 * half_h))));
+    const buf = ar.alloc(u8, @as(usize, w) * h * 4) catch return null;
+    @memset(buf, 0);
+    const ox: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(w)) / 2 - sym.pivot_x));
+    const oy: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(h)) / 2 - sym.pivot_y));
+    blitClipped(buf, w, h, sym.rgba, sym.w, sym.h, ox, oy);
+    return .{ .w = w, .h = h, .rgba = buf };
+}
+
+// Copy a w×h RGBA cell into dst at (dx,dy), clipped (all pixels, transparent incl.).
+fn blitClipped(dst: []u8, dw: u32, dh: u32, src: []const u8, sw: u32, sh: u32, dx: i32, dy: i32) void {
+    var sy: u32 = 0;
+    while (sy < sh) : (sy += 1) {
+        const y = dy + @as(i32, @intCast(sy));
+        if (y < 0 or y >= @as(i32, @intCast(dh))) continue;
+        var sx: u32 = 0;
+        while (sx < sw) : (sx += 1) {
+            const x = dx + @as(i32, @intCast(sx));
+            if (x < 0 or x >= @as(i32, @intCast(dw))) continue;
+            const si = (@as(usize, sy) * sw + sx) * 4;
+            const di = (@as(usize, @intCast(y)) * dw + @as(usize, @intCast(x))) * 4;
+            @memcpy(dst[di .. di + 4], src[si .. si + 4]);
+        }
+    }
+}
+
+fn lessMlnByHeight(_: void, a: MlnCell, b: MlnCell) bool {
+    return a.h > b.h;
+}
+
+// Shelf-pack MlnCells and emit the MapLibre sprite JSON {x,y,width,height,
+// pixelRatio} + atlas PNG. `cells_in` must already be in id order (stable ties).
+fn packMln(a: std.mem.Allocator, ar: std.mem.Allocator, cells_in: []MlnCell, width: u32) !Atlas {
+    std.sort.insertion(MlnCell, cells_in, {}, lessMlnByHeight);
+    const Placed = struct { x: u32, y: u32, w: u32, h: u32, ratio: f64 };
+    var placed = std.StringHashMap(Placed).init(ar);
+    var pen_x: u32 = 0;
+    var pen_y: u32 = 0;
+    var row_h: u32 = 0;
+    const pad: u32 = 1;
+    for (cells_in) |c| {
+        if (pen_x + c.w + pad > width) {
+            pen_x = 0;
+            pen_y += row_h + pad;
+            row_h = 0;
+        }
+        try placed.put(c.name, .{ .x = pen_x, .y = pen_y, .w = c.w, .h = c.h, .ratio = c.ratio });
+        pen_x += c.w + pad;
+        row_h = @max(row_h, c.h);
+    }
+    const height = pen_y + row_h + pad;
+
+    const rgba = try ar.alloc(u8, @as(usize, width) * height * 4);
+    @memset(rgba, 0);
+    for (cells_in) |c| {
+        const p = placed.get(c.name).?;
+        var row: u32 = 0;
+        while (row < c.h) : (row += 1) {
+            const src_off = @as(usize, row) * c.w * 4;
+            const dst_off = (@as(usize, p.y + row) * width + p.x) * 4;
+            @memcpy(rgba[dst_off .. dst_off + c.w * 4], c.rgba[src_off .. src_off + c.w * 4]);
+        }
+    }
+
+    var png_len: c_int = 0;
+    const png_ptr = tg_png_encode(rgba.ptr, @intCast(width), @intCast(height), &png_len) orelse return error.PngEncode;
+    defer tg_svg_free(png_ptr);
+    const png = try a.dupe(u8, png_ptr[0..@intCast(png_len)]);
+
+    // MapLibre sprite JSON: names sorted, {x,y,width,height,pixelRatio}.
+    var names = std.ArrayList([]const u8).empty;
+    var it = placed.keyIterator();
+    while (it.next()) |k| try names.append(ar, k.*);
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "{");
+    for (names.items, 0..) |n, i| {
+        const p = placed.get(n).?;
+        if (i > 0) try out.appendSlice(a, ", ");
+        var buf: [256]u8 = undefined;
+        const s = try std.fmt.bufPrint(&buf, "\"{s}\": {{\"x\": {d}, \"y\": {d}, \"width\": {d}, \"height\": {d}, \"pixelRatio\": {d}}}", .{ n, p.x, p.y, p.w, p.h, p.ratio });
+        try out.appendSlice(a, s);
+    }
+    try out.appendSlice(a, "}\n");
+    const json = try out.toOwnedSlice(a);
+    return .{ .json = json, .png = png };
+}
+
 const Tile = struct { w: u32, h: u32, rgba: []u8 };
 
 // Stamp the rendered symbol onto the v1/v2 lattice cell (px), wrapping at the

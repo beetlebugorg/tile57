@@ -310,6 +310,10 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         else => return error.BadColortables,
     };
     const sprite_on = opts.sprite != null;
+    // Text + contour-label layers need an SDF glyph source; emit them only when
+    // glyphs are available, so a sprite-only bundle still renders (a missing
+    // glyph source otherwise aborts the whole style load in MapLibre).
+    const glyphs_on = opts.glyphs != null;
     const sea = if (palette.get("DEPDW")) |v| v.string else "#93aebb";
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -427,8 +431,8 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     // 6. light sector limit lines
     try lineLayers(js, palette, "sector_lines", false);
 
-    // 7. contour value labels (DEPCNT VALDCO)
-    for ([_][]const u8{ "lines", "lines_scamin" }) |sl| {
+    // 7. contour value labels (DEPCNT VALDCO) — text, needs glyphs.
+    if (glyphs_on) for ([_][]const u8{ "lines", "lines_scamin" }) |sl| {
         var buf: [64]u8 = undefined;
         try js.beginObject();
         try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}", .{sl}), "symbol", sl);
@@ -462,7 +466,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         try js.write(0.5);
         try js.endObject();
         try js.endObject();
-    }
+    };
 
     // 8. point symbols + soundings (sprite required)
     if (sprite_on) {
@@ -482,9 +486,11 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         try js.endObject();
     }
 
-    // 9. text labels
-    try textLayers(js, opts.scheme, palette, "text", false);
-    try textLayers(js, opts.scheme, palette, "text_scamin", true);
+    // 9. text labels — need an SDF glyph source.
+    if (glyphs_on) {
+        try textLayers(js, opts.scheme, palette, "text", false);
+        try textLayers(js, opts.scheme, palette, "text_scamin", true);
+    }
 
     try js.endArray(); // layers
 
