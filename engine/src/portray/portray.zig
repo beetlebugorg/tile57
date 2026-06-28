@@ -24,8 +24,11 @@ threadlocal var g_ctx: ?*Ctx = null;
 
 // Implemented in C (lua_shim.c): loads the framework + rules from `dir`,
 // dispatches every feature exposed by the tgp_* accessors, and calls tgp_emit
-// for each. Returns 0 on success.
-extern fn tg_portray_run(dir_ptr: [*]const u8, dir_len: usize) callconv(.c) c_int;
+// for each. `plain_boundaries` / `simplified_symbols` (0/1) override the S-101
+// PlainBoundaries / SimplifiedSymbols context parameters so the caller can
+// portray the plain-boundary / simplified-point-symbol display variants (both 0
+// = the default pass). Returns 0 on success.
+extern fn tg_portray_run(dir_ptr: [*]const u8, dir_len: usize, plain_boundaries: c_int, simplified_symbols: c_int) callconv(.c) c_int;
 
 // Suppress the per-cell "[s101] portrayed …" stderr summary (extern in lua_shim.c).
 extern fn tg_set_quiet(q: c_int) callconv(.c) void;
@@ -127,11 +130,17 @@ export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(
 
 // ---- entry point ---------------------------------------------------------
 
-/// Portray a cell: returns an array indexed by cell.features index, each the
-/// feature's S-101 instruction stream (or null if the class is unmapped / it
-/// emitted nothing). Allocates into `arena` (must outlive tile generation).
-pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) ![]?[]const u8 {
-    const adapted = try adapt.adaptCell(arena, cell);
+/// S-101 context-parameter overrides for a portrayal pass. Both false is the
+/// default pass (symbolized boundaries + paper-chart point symbols).
+pub const Overrides = struct {
+    plain_boundaries: bool = false,
+    simplified_symbols: bool = false,
+};
+
+/// Run the S-101 rules over `adapted` with `ov`, returning a stream array indexed
+/// by cell.features index (null where the adapted subset doesn't cover a feature,
+/// or it emitted nothing). `features_len` is cell.features.len.
+fn runAdapted(arena: std.mem.Allocator, adapted: []adapt.Adapted, features_len: usize, rules_dir: []const u8, ov: Overrides) ![]?[]const u8 {
     const results = try arena.alloc([]const u8, adapted.len);
     for (results) |*r| r.* = "";
 
@@ -139,13 +148,64 @@ pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: [
     g_ctx = &ctx;
     defer g_ctx = null;
 
-    _ = tg_portray_run(rules_dir.ptr, rules_dir.len);
+    _ = tg_portray_run(rules_dir.ptr, rules_dir.len, @intFromBool(ov.plain_boundaries), @intFromBool(ov.simplified_symbols));
 
     // Re-key adapted-index results to cell feature index.
-    const by_feature = try arena.alloc(?[]const u8, cell.features.len);
+    const by_feature = try arena.alloc(?[]const u8, features_len);
     for (by_feature) |*b| b.* = null;
     for (adapted, 0..) |ad, i| {
         if (results[i].len > 0) by_feature[ad.feature_index] = results[i];
     }
     return by_feature;
+}
+
+/// Portray a cell: returns an array indexed by cell.features index, each the
+/// feature's S-101 instruction stream (or null if the class is unmapped / it
+/// emitted nothing). Allocates into `arena` (must outlive tile generation).
+pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) ![]?[]const u8 {
+    const adapted = try adapt.adaptCell(arena, cell);
+    return runAdapted(arena, adapted, cell.features.len, rules_dir, .{});
+}
+
+/// A cell's default portrayal plus its display-variant passes. `plain` is the
+/// PlainBoundaries=true pass over AREA features only (S-52 §8.6.1 boundary
+/// symbolization); `simplified` is the SimplifiedSymbols=true pass over (non-
+/// SOUNDG) POINT features only (§11.2.2). Both are indexed by cell.features index
+/// and non-null only for the relevant feature kind; either may be null if its pass
+/// failed (the axis then degrades to the default/common pass downstream).
+pub const CellPortrayal = struct {
+    base: []const ?[]const u8,
+    plain: ?[]const ?[]const u8 = null,
+    simplified: ?[]const ?[]const u8 = null,
+};
+
+/// Portray a cell three ways so the client can toggle boundary style (areas) and
+/// point-symbol style (points) live: the default pass, a PlainBoundaries pass over
+/// only the area features, and a SimplifiedSymbols pass over only the point
+/// features. The variant passes portray only the geometry kind whose display they
+/// vary (areas for bnd, points for pts) — lines/soundings never read either
+/// override — so the extra rule evaluation is bounded to the relevant features.
+pub fn portrayCellVariants(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) !CellPortrayal {
+    const adapted = try adapt.adaptCell(arena, cell);
+    const base = try runAdapted(arena, adapted, cell.features.len, rules_dir, .{});
+
+    // Partition the adapted features by the variant they can contribute. "Surface"
+    // → the plain-boundary variant; "Point" → the simplified-symbol variant
+    // (SOUNDG is already excluded from `adapted`, and "Curve" varies under neither).
+    var areas = std.ArrayList(adapt.Adapted).empty;
+    var points = std.ArrayList(adapt.Adapted).empty;
+    for (adapted) |ad| {
+        if (std.mem.eql(u8, ad.primitive, "Surface")) {
+            try areas.append(arena, ad);
+        } else if (std.mem.eql(u8, ad.primitive, "Point")) {
+            try points.append(arena, ad);
+        }
+    }
+
+    var cp = CellPortrayal{ .base = base };
+    if (areas.items.len > 0)
+        cp.plain = runAdapted(arena, areas.items, cell.features.len, rules_dir, .{ .plain_boundaries = true }) catch null;
+    if (points.items.len > 0)
+        cp.simplified = runAdapted(arena, points.items, cell.features.len, rules_dir, .{ .simplified_symbols = true }) catch null;
+    return cp;
 }

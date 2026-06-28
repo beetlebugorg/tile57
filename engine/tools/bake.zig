@@ -289,14 +289,16 @@ fn bakeCell(
     // styling. The arena `a` outlives tile generation, as portrayCell requires.
     // Portrayal failure (e.g. rules dir not found) is non-fatal: generateTile
     // then falls back to the built-in classify() styling.
-    const portrayal: ?[]const ?[]const u8 = if (engine.portray.portrayCell(a, &cell, rules_dir)) |res|
+    // Three passes (default + plain-boundary + simplified-symbol) so baked tiles
+    // carry the bnd/pts display-variant tags the client toggles live.
+    const cp: engine.portray.CellPortrayal = if (engine.portray.portrayCellVariants(a, &cell, rules_dir)) |res|
         res
     else |err| blk: {
         std.debug.print(
             "warning: S-101 portrayal failed ({s}) with rules dir '{s}'; baking with classify() fallback\n",
             .{ @errorName(err), rules_dir },
         );
-        break :blk null;
+        break :blk .{ .base = &.{} };
     };
 
     const b = cell.bounds() orelse return error.NoGeometry;
@@ -314,7 +316,8 @@ fn bakeCell(
                 // Generate with the page allocator, not the arena `a`: generateTile
                 // frees a per-tile child arena each call, which an arena backing
                 // would leak (tens of GB over a high-vertex cell).
-                const tile_mvt = try engine.s57_mvt.generateTile(std.heap.page_allocator, &cell, z, tx, ty, portrayal);
+                const one = [_]engine.s57_mvt.CellRef{.{ .cell = &cell, .portrayal = cp.base, .portrayal_plain = cp.plain, .portrayal_simplified = cp.simplified }};
+                const tile_mvt = try engine.s57_mvt.generateTileMulti(std.heap.page_allocator, &one, z, tx, ty);
                 if (tile_mvt.len == 0) continue; // empty tile: nothing covered here
                 try tiles.append(a, .{ .z = z, .x = tx, .y = ty, .mvt = tile_mvt });
             }
@@ -636,14 +639,20 @@ const PortrayWork = struct {
         // One arena per cell holds both the portrayal streams and the assembled
         // geometry cache, freed together when the band is done.
         var portrayal: ?[]const ?[]const u8 = null;
+        var portrayal_plain: ?[]const ?[]const u8 = null;
+        var portrayal_simplified: ?[]const ?[]const u8 = null;
         var geo: ?engine.s57_mvt.GeoParts = null;
         const pa: ?*std.heap.ArenaAllocator = c.gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(c.gpa);
-            portrayal = engine.portray.portrayCell(p.allocator(), &cell, c.rules_dir) catch null;
+            if (engine.portray.portrayCellVariants(p.allocator(), &cell, c.rules_dir)) |cp| {
+                portrayal = cp.base;
+                portrayal_plain = cp.plain;
+                portrayal_simplified = cp.simplified;
+            } else |_| {}
             if (c.build_geo) geo = engine.s57_mvt.buildGeoCache(p.allocator(), &cell) catch null;
         }
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .geo = geo, .bounds = b };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b };
         c.arenas[i] = pa;
     }
 };

@@ -88,6 +88,19 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     depthForm->addRow(QStringLiteral("Safety depth"), safetyDepth_);
     root->addWidget(depthBox);
 
+    // -- Symbolization (S-52 §8.6.1 boundaries, §11.2.2 point symbols) --
+    auto *symBox = new QGroupBox(QStringLiteral("Symbolization"));
+    auto *symForm = new QFormLayout(symBox);
+    tidyForm(symForm);
+    boundaryStyle_ = new QComboBox;
+    boundaryStyle_->addItems({QStringLiteral("Symbolized"), QStringLiteral("Plain")});
+    boundaryStyle_->setCurrentIndex(static_cast<int>(s_.boundaryStyle));
+    symForm->addRow(QStringLiteral("Boundaries"), boundaryStyle_);
+    simplifiedPoints_ = new QCheckBox(QStringLiteral("Simplified point symbols"));
+    simplifiedPoints_->setChecked(s_.simplifiedPoints);
+    symForm->addRow(simplifiedPoints_);
+    root->addWidget(symBox);
+
     // -- Text (S-52 §14.5 text groups) --
     auto *textBox = new QGroupBox(QStringLiteral("Text"));
     auto *textCol = new QVBoxLayout(textBox);
@@ -144,6 +157,8 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     const auto onSpin = [this](double) { pull(); };
     connect(scheme_, &QComboBox::currentIndexChanged, this, onCombo);
     connect(depthUnit_, &QComboBox::currentIndexChanged, this, onCombo);
+    connect(boundaryStyle_, &QComboBox::currentIndexChanged, this, onCombo);
+    connect(simplifiedPoints_, &QCheckBox::toggled, this, onCheck);
     connect(displayStandard_, &QCheckBox::toggled, this, onCheck);
     connect(displayOther_, &QCheckBox::toggled, this, onCheck);
     connect(fourShades_, &QCheckBox::toggled, this, onCheck);
@@ -165,6 +180,8 @@ void MarinerPanel::pull() {
     s_.displayStandard = displayStandard_->isChecked();
     s_.displayOther = displayOther_->isChecked();
     s_.depthUnit = static_cast<chartstyle::DepthUnit>(depthUnit_->currentIndex());
+    s_.boundaryStyle = static_cast<chartstyle::BoundaryStyle>(boundaryStyle_->currentIndex());
+    s_.simplifiedPoints = simplifiedPoints_->isChecked();
     s_.fourShadeWater = fourShades_->isChecked();
     s_.shallowContour = shallow_->value();
     s_.safetyContour = safety_->value();
