@@ -391,16 +391,11 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     // `bake` takes a single cell.000 OR an ENC_ROOT directory — same archive out.
     if (isDir(io, base_path)) {
         const rzoom_max: u8 = if (maxzoom == DEFAULT_MAXZOOM) 18 else maxzoom; // root default 18
-        const rb = bakeRoot(io, a, base_path, resolveRulesDir(rules), minzoom, rzoom_max) catch |err| {
+        const rb = bakeRoot(io, a, base_path, out_path, resolveRulesDir(rules), minzoom, rzoom_max) catch |err| {
             std.debug.print("error: cannot bake ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
             return;
         };
-        defer std.heap.page_allocator.free(rb.archive);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = rb.archive });
-        std.debug.print(
-            "\nbaked {d} cells -> {s}\n  output {d} bytes ({d:.1} MB)\n",
-            .{ rb.cells.len, out_path, rb.archive.len, @as(f64, @floatFromInt(rb.archive.len)) / (1024.0 * 1024.0) },
-        );
+        std.debug.print("\nbaked {d} cells -> {s}\n", .{ rb.cells.len, out_path });
         return;
     }
 
@@ -801,20 +796,23 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
     if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
 
-    // 1. tiles -> <out>/tiles/chart.pmtiles. The input may be a single cell.000 or
-    // a whole ENC_ROOT directory (band-streamed multi-cell bake).
-    var archive: []u8 = undefined;
+    // 1. tiles -> <out>/tiles/chart.pmtiles. Input may be a single cell.000 or a
+    // whole ENC_ROOT directory (band-streamed multi-cell bake, streamed to disk).
+    const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
+    try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
+    const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
     var bounds: [4]f64 = undefined;
     var cells: []const []const u8 = undefined;
+    var snd_stacks: []const []const u8 = &.{}; // sounding glyph stacks for sprite-mln
     if (isDir(io, base_path)) {
-        // ENC_ROOT: ignore update args (updates are auto-discovered per cell).
-        const rb = bakeRoot(io, a, base_path, resolveRulesDir(rules), minzoom, maxzoom) catch |err| {
+        // ENC_ROOT: streamed straight to tiles_path; updates auto-discovered per cell.
+        const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom) catch |err| {
             std.debug.print("error: cannot bundle ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
             return;
         };
-        archive = rb.archive;
         bounds = rb.bounds;
         cells = rb.cells;
+        snd_stacks = rb.sounds;
     } else {
         const res = bakeCell(io, a, base_path, updates.items, resolveRulesDir(rules), minzoom, maxzoom) catch |err| switch (err) {
             error.NoGeometry => {
@@ -823,16 +821,13 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
             },
             else => return err,
         };
-        archive = res.archive;
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tiles_path, .data = res.archive });
         bounds = res.bounds;
         const one = try a.alloc([]const u8, 1);
         one[0] = std.fs.path.stem(std.fs.path.basename(base_path));
         cells = one;
+        snd_stacks = collectSoundingStacks(io, a, res.archive, minzoom, maxzoom, res.bounds) catch &.{};
     }
-    const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
-    try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
-    const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tiles_path, .data = archive });
 
     // 2. assets -> <out>/assets/colortables.json + style-{day,dusk,night}.json
     const assets_dir = try std.fs.path.join(a, &.{ out_dir, "assets" });
@@ -845,10 +840,8 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     // contains the pivot-centred symbols + ctr:/pat: variants, so the raw
     // sprite.json/patterns.json (the web/oracle format) would be redundant here —
     // they stay available via the standalone `tile57 sprite`/`pattern` commands.
-    // If sprite-mln emits, the styles get a `sprite` URL so symbols + patterns render.
-    // Collect the bundle's sounding glyph stacks so sprite-mln carries a composite
-    // for each (the soundings layer references them by their comma-joined string).
-    const snd_stacks = collectSoundingStacks(io, a, archive, minzoom, maxzoom, bounds) catch &.{};
+    // If sprite-mln emits, the styles get a `sprite` URL so symbols + patterns
+    // render; snd_stacks (collected during the bake) gives it the sounding composites.
     const sprite_ok = if (emitSpriteMln(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, assets_dir, "sprite-mln", snd_stacks)) |_| true else |err| blk: {
         std.debug.print("warning: sprite-mln emit failed ({s})\n", .{@errorName(err)});
         break :blk false;
@@ -894,8 +887,8 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
 
     std.debug.print(
-        "bundled {d} cell(s) -> {s}/\n  tiles/chart.pmtiles ({d:.1} MB)\n  assets/colortables.json + sprite-mln + style-{{day,dusk,night}}.json + manifest.json (schema {s})\n",
-        .{ cells.len, out_dir, @as(f64, @floatFromInt(archive.len)) / (1024.0 * 1024.0), assets.SCHEMA_VERSION },
+        "bundled {d} cell(s) -> {s}/\n  tiles/chart.pmtiles + assets/colortables.json + sprite-mln + style-{{day,dusk,night}}.json + manifest.json (schema {s})\n",
+        .{ cells.len, out_dir, assets.SCHEMA_VERSION },
     );
 }
 
@@ -1013,14 +1006,49 @@ const PortrayWork = struct {
 /// updates), parse + portray each, and bake them into ONE PMTiles archive with
 /// per-cell zoom banding by compilation scale (engine.bake_enc). Holds every cell
 /// in memory at once (v1).
-// A whole-ENC_ROOT bake: the PMTiles archive (page-owned), the union bbox of the
-// cells, and their stems (for the bundle manifest). Shared by `bake-root` + `bundle`.
-const RootBake = struct { archive: []u8, bounds: [4]f64, cells: [][]const u8 };
+// A whole-ENC_ROOT bake result: the union bbox of the cells, their stems (for the
+// bundle manifest), and the distinct sounding glyph stacks collected while baking
+// (for sprite-mln). The archive itself is streamed straight to `out_path`. Shared
+// by `bake`/`bake-root`/`bundle`.
+const RootBake = struct { bounds: [4]f64, cells: []const []const u8, sounds: []const []const u8 };
 
-// Bake an ENC_ROOT directory into one band-streamed PMTiles archive. Mirrors the
-// per-band parse → portray → bake → free loop; returns the archive + union bounds
-// + cell stems. error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8) !RootBake {
+// Per-tile sink for the streaming bake: feed each tile into the PMTiles
+// StreamWriter (gzip+dedup, no raw-tile retention) and, in the same pass, collect
+// its soundings-layer glyph stacks (so sprite-mln gets composites without a
+// re-read). A per-tile scratch arena keeps the MVT decode from accumulating.
+const BakeSink = struct {
+    sw: *engine.pmtiles.StreamWriter,
+    sounds: *std.StringHashMap(void),
+    a: std.mem.Allocator, // persistent (sound-stack strings; returned to caller)
+    gpa: std.mem.Allocator, // scratch backing
+
+    fn run(ctx: ?*anyopaque, z: u8, x: u32, y: u32, mvt: []const u8) anyerror!void {
+        const self: *BakeSink = @ptrCast(@alignCast(ctx.?));
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        if (engine.mvt.decode(scratch.allocator(), mvt)) |layers| {
+            for (layers) |L| {
+                if (!std.mem.eql(u8, L.name, "soundings")) continue;
+                for (L.features) |feat| for (feat.properties) |p| {
+                    if (!std.mem.eql(u8, p.key, "sym_s") and !std.mem.eql(u8, p.key, "sym_g") and !std.mem.eql(u8, p.key, "symbol_names")) continue;
+                    switch (p.value) {
+                        .string => |sv| if (std.mem.indexOfScalar(u8, sv, ',') != null and !self.sounds.contains(sv)) {
+                            self.sounds.put(self.a.dupe(u8, sv) catch return, {}) catch {};
+                        },
+                        else => {},
+                    }
+                };
+            }
+        } else |_| {}
+        try self.sw.add(z, x, y, mvt);
+    }
+};
+
+// Bake an ENC_ROOT directory into one band-streamed PMTiles archive written
+// straight to `out_path` (the data section streams through a StreamWriter — only
+// the compressed data + small directory are held, not the raw tiles). Returns the
+// union bounds + cell stems + sounding stacks. error.NoGeometry if no cell parses.
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8) !RootBake {
     const page = std.heap.page_allocator;
     var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer dir.close(io);
@@ -1061,7 +1089,11 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, rules_dir: 
     engine.catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
     engine.portray.setQuiet(true); // many threads -> suppress the per-cell stderr
 
-    var baker = Bands.Baker.init(page, minzoom, maxzoom);
+    var sw = engine.pmtiles.StreamWriter.init(page);
+    defer sw.deinit();
+    var sounds = std.StringHashMap(void).init(a);
+    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = page };
+    var baker = Bands.Baker.init(page, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
     defer baker.deinit();
 
     // Pass 2: bake band-by-band, finest → coarsest (best-band dedup). Read a band's
@@ -1130,8 +1162,24 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, rules_dir: 
         band_arenas.deinit(page);
     }
 
-    const archive = try baker.finish();
-    return .{ .archive = archive, .bounds = ubox, .cells = cell_names.items };
+    // Stream the archive to out_path: the small prefix (header + directory +
+    // metadata) then the compressed data section — no whole-archive copy in RAM.
+    const opts = engine.pmtiles.WriteOptions{
+        .min_lon_e7 = toE7(ubox[0]),
+        .min_lat_e7 = toE7(ubox[1]),
+        .max_lon_e7 = toE7(ubox[2]),
+        .max_lat_e7 = toE7(ubox[3]),
+    };
+    const pre = try sw.prefix(a, opts);
+    var file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, pre);
+    try file.writeStreamingAll(io, sw.data.items);
+
+    var stacks = std.ArrayList([]const u8).empty;
+    var it = sounds.keyIterator();
+    while (it.next()) |k| try stacks.append(a, k.*);
+    return .{ .bounds = ubox, .cells = cell_names.items, .sounds = stacks.items };
 }
 
 /// `bake-root <ENC_ROOT> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N]`
@@ -1161,16 +1209,11 @@ fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !vo
     const out_path = out orelse return usageErr("missing -o/--output <out.pmtiles>");
     if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
     if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
-    const rb = bakeRoot(io, a, root_path, resolveRulesDir(rules), minzoom, maxzoom) catch |err| {
+    const rb = bakeRoot(io, a, root_path, out_path, resolveRulesDir(rules), minzoom, maxzoom) catch |err| {
         std.debug.print("error: {s} ({s})\n", .{ root_path, @errorName(err) });
         return;
     };
-    defer std.heap.page_allocator.free(rb.archive);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = rb.archive });
-    std.debug.print(
-        "\nbaked {d} cells -> {s}\n  output {d} bytes ({d:.1} MB)\n",
-        .{ rb.cells.len, out_path, rb.archive.len, @as(f64, @floatFromInt(rb.archive.len)) / (1024.0 * 1024.0) },
-    );
+    std.debug.print("\nbaked {d} cells -> {s}\n", .{ rb.cells.len, out_path });
 }
 
 /// lon/lat (deg) -> web-mercator tile (x, y) at zoom z, clamped to the valid range.

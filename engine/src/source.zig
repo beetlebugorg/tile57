@@ -789,7 +789,11 @@ pub fn bakeArchive(
 
     catalogue.warmUp();
     portray.setQuiet(true);
-    var baker = bake_enc.Baker.init(gpa, minzoom, maxzoom);
+    // Stream tiles into a StreamWriter (gzip+dedup, no raw-tile retention); the C
+    // ABI returns bytes, so serialize the whole archive at the end.
+    var sw = pmtiles.StreamWriter.init(gpa);
+    defer sw.deinit();
+    var baker = bake_enc.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sw, .func = streamSink });
     defer baker.deinit();
 
     var loaded: usize = 0;
@@ -838,10 +842,19 @@ pub fn bakeArchive(
         band_arenas.deinit(gpa);
     }
 
-    const archive = baker.finish() catch return error.BakeFailed;
-    if (archive.len == 0) {
-        gpa.free(archive);
-        return null;
-    }
-    return archive;
+    if (sw.num_addressed == 0) return null;
+    const ub = baker.unionBounds();
+    return try sw.finishBytes(.{
+        .min_lon_e7 = @intFromFloat(@round(ub[0] * 1e7)),
+        .min_lat_e7 = @intFromFloat(@round(ub[1] * 1e7)),
+        .max_lon_e7 = @intFromFloat(@round(ub[2] * 1e7)),
+        .max_lat_e7 = @intFromFloat(@round(ub[3] * 1e7)),
+    });
+}
+
+// Tile sink: feed each streamed tile into the StreamWriter (the Baker frees the
+// buffer after this returns; StreamWriter gzips+copies what it keeps).
+fn streamSink(ctx: ?*anyopaque, z: u8, x: u32, y: u32, mvt: []const u8) anyerror!void {
+    const sw: *pmtiles.StreamWriter = @ptrCast(@alignCast(ctx.?));
+    try sw.add(z, x, y, mvt);
 }

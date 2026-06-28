@@ -182,28 +182,43 @@ const TileGenCtx = struct {
 /// `gpa` MUST be a real freeing allocator (e.g. page_allocator), NOT an arena:
 /// generateTileMulti creates and frees a child arena per tile, which an arena
 /// backing would turn into a leak of every tile's working set.
+/// Receives each baked tile as it is produced. The Baker frees `mvt` right after
+/// the call, so the sink must consume/copy what it keeps. This keeps the bake
+/// streaming — tiles never accumulate in the Baker — so a low-memory consumer can
+/// write tile data straight to disk (see the CLI), while an in-RAM consumer can
+/// still collect them (see the C ABI bake). bake_enc stays pure (no fs); the sink
+/// owns any I/O.
+pub const TileSink = struct {
+    ctx: ?*anyopaque,
+    func: *const fn (ctx: ?*anyopaque, z: u8, x: u32, y: u32, mvt: []const u8) anyerror!void,
+};
+
 pub const Baker = struct {
     gpa: std.mem.Allocator,
     minzoom: u8,
     maxzoom: u8,
     emitted: std.AutoHashMap(u64, void),
-    tiles: std.ArrayList(pmtiles.InputTile),
+    sink: TileSink,
+    count: usize = 0, // tiles handed to the sink
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
 
-    pub fn init(gpa: std.mem.Allocator, minzoom: u8, maxzoom: u8) Baker {
+    pub fn init(gpa: std.mem.Allocator, minzoom: u8, maxzoom: u8, sink: TileSink) Baker {
         return .{
             .gpa = gpa,
             .minzoom = minzoom,
             .maxzoom = maxzoom,
             .emitted = std.AutoHashMap(u64, void).init(gpa),
-            .tiles = std.ArrayList(pmtiles.InputTile).empty,
+            .sink = sink,
         };
     }
 
     pub fn deinit(self: *Baker) void {
-        for (self.tiles.items) |t| self.gpa.free(t.mvt);
-        self.tiles.deinit(self.gpa);
         self.emitted.deinit();
+    }
+
+    /// Union bbox of the baked cells (w, s, e, n) — for the archive header.
+    pub fn unionBounds(self: *const Baker) [4]f64 {
+        return self.union_b;
     }
 
     /// Bake one band's already-parsed+portrayed cells. Tiles a finer band already
@@ -270,29 +285,13 @@ pub const Baker = struct {
 
         for (keys, results) |key, mvt_opt| {
             const mvt_bytes = mvt_opt orelse continue;
-            try self.tiles.append(self.gpa, .{
-                .z = @intCast(key >> 48),
-                .x = @intCast((key >> 24) & 0xFFFFFF),
-                .y = @intCast(key & 0xFFFFFF),
-                .mvt = mvt_bytes,
-            });
+            defer self.gpa.free(mvt_bytes); // streamed: the sink copies what it keeps
+            try self.sink.func(self.sink.ctx, @intCast(key >> 48), @intCast((key >> 24) & 0xFFFFFF), @intCast(key & 0xFFFFFF), mvt_bytes);
             try self.emitted.put(key, {});
-            if (progress) |cb| if (self.tiles.items.len % 256 == 0) cb(ctx, 1, self.tiles.items.len, 0);
+            self.count += 1;
+            if (progress) |cb| if (self.count % 256 == 0) cb(ctx, 1, self.count, 0);
         }
-        if (progress) |cb| cb(ctx, 1, self.tiles.items.len, 0);
-    }
-
-    /// Write the accumulated tiles as a PMTiles archive (owned by the caller; free
-    /// with `gpa`). A 0-length slice when nothing was baked.
-    pub fn finish(self: *Baker) ![]u8 {
-        if (self.tiles.items.len == 0) return self.gpa.alloc(u8, 0);
-        const opts = pmtiles.WriteOptions{
-            .min_lon_e7 = toE7(self.union_b[0]),
-            .min_lat_e7 = toE7(self.union_b[1]),
-            .max_lon_e7 = toE7(self.union_b[2]),
-            .max_lat_e7 = toE7(self.union_b[3]),
-        };
-        return pmtiles.write(self.gpa, self.tiles.items, opts);
+        if (progress) |cb| cb(ctx, 1, self.count, 0);
     }
 };
 

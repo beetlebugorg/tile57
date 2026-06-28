@@ -190,7 +190,7 @@ pub const Entry = struct {
     run_length: u32,
 };
 
-fn serializeDir(a: Allocator, entries: []const Entry) ![]u8 {
+pub fn serializeDir(a: Allocator, entries: []const Entry) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(a);
     try writeVarint(&out, a, entries.len);
@@ -322,6 +322,132 @@ pub const WriteOptions = struct {
     min_lat_e7: i32 = -850000000,
     max_lon_e7: i32 = 1800000000,
     max_lat_e7: i32 = 850000000,
+};
+
+/// Streaming archive writer: feed tiles one at a time (each gzipped + content-
+/// deduped into a growing data buffer; the raw MVT is NOT retained), then emit
+/// the archive. Lets a baker stream tiles instead of holding them all — the
+/// `prefix` (header + directory + metadata) is small, and the data buffer can be
+/// written straight to a file after it, so peak memory is the compressed data
+/// section, not the raw tiles + a whole-archive copy. Pure (no fs).
+pub const StreamWriter = struct {
+    gpa: Allocator,
+    data: std.ArrayList(u8) = .empty, // concatenated unique gzipped tiles
+    entries: std.ArrayList(Entry) = .empty, // one per addressed tile (pre-sort)
+    hash_to_off: std.AutoHashMap(u64, Off),
+    num_addressed: u64 = 0,
+    num_contents: u64 = 0,
+    min_z: u8 = 255,
+    max_z: u8 = 0,
+
+    const Off = struct { off: u64, len: u32 };
+
+    pub fn init(gpa: Allocator) StreamWriter {
+        return .{ .gpa = gpa, .hash_to_off = std.AutoHashMap(u64, Off).init(gpa) };
+    }
+    pub fn deinit(self: *StreamWriter) void {
+        self.data.deinit(self.gpa);
+        self.entries.deinit(self.gpa);
+        self.hash_to_off.deinit();
+    }
+
+    /// Add one tile (gzipped + deduped). Tiles may arrive in any order.
+    pub fn add(self: *StreamWriter, z: u8, x: u32, y: u32, mvt: []const u8) !void {
+        const comp = try gzip.compress(self.gpa, mvt);
+        defer self.gpa.free(comp);
+        self.min_z = @min(self.min_z, z);
+        self.max_z = @max(self.max_z, z);
+        const h = std.hash.Wyhash.hash(0, comp);
+        const slot = try self.hash_to_off.getOrPut(h);
+        var off: u64 = undefined;
+        var len: u32 = undefined;
+        if (slot.found_existing) {
+            off = slot.value_ptr.off;
+            len = slot.value_ptr.len;
+        } else {
+            off = self.data.items.len;
+            len = @intCast(comp.len);
+            try self.data.appendSlice(self.gpa, comp);
+            slot.value_ptr.* = .{ .off = off, .len = len };
+            self.num_contents += 1;
+        }
+        try self.entries.append(self.gpa, .{ .tile_id = zxyToTileId(z, x, y), .offset = off, .length = len, .run_length = 1 });
+        self.num_addressed += 1;
+    }
+
+    /// The archive prefix (header + root directory + metadata), allocator-owned.
+    /// The full archive is this prefix followed by `data.items` (the data buffer
+    /// is written/copied separately, in arrival order — header.clustered=0).
+    pub fn prefix(self: *StreamWriter, a: Allocator, opts: WriteOptions) ![]u8 {
+        std.mem.sort(Entry, self.entries.items, {}, struct {
+            fn lt(_: void, p: Entry, q: Entry) bool {
+                return p.tile_id < q.tile_id;
+            }
+        }.lt);
+        var merged = std.ArrayList(Entry).empty;
+        for (self.entries.items) |e| {
+            if (merged.items.len > 0) {
+                const prev = &merged.items[merged.items.len - 1];
+                if (prev.offset == e.offset and prev.tile_id + prev.run_length == e.tile_id) {
+                    prev.run_length += 1;
+                    continue;
+                }
+            }
+            try merged.append(a, e);
+        }
+        const root_dir = try serializeDir(a, merged.items);
+        const metadata = opts.metadata_json;
+        const root_off: u64 = HEADER_LEN;
+        const meta_off: u64 = root_off + root_dir.len;
+        const data_off: u64 = meta_off + metadata.len; // no leaf dirs
+        const min_z: u8 = if (self.num_addressed == 0) 0 else self.min_z;
+        const header = Header{
+            .root_dir_offset = root_off,
+            .root_dir_length = root_dir.len,
+            .metadata_offset = meta_off,
+            .metadata_length = metadata.len,
+            .leaf_dir_offset = data_off,
+            .leaf_dir_length = 0,
+            .tile_data_offset = data_off,
+            .tile_data_length = self.data.items.len,
+            .num_addressed_tiles = self.num_addressed,
+            .num_tile_entries = merged.items.len,
+            .num_tile_contents = self.num_contents,
+            .clustered = 0, // data in arrival order, not tile-id order
+            .internal_compression = .none,
+            .tile_compression = .gzip,
+            .tile_type = .mvt,
+            .min_zoom = min_z,
+            .max_zoom = self.max_z,
+            .min_lon_e7 = opts.min_lon_e7,
+            .min_lat_e7 = opts.min_lat_e7,
+            .max_lon_e7 = opts.max_lon_e7,
+            .max_lat_e7 = opts.max_lat_e7,
+            .center_zoom = min_z,
+            .center_lon_e7 = @divTrunc(opts.min_lon_e7 + opts.max_lon_e7, 2),
+            .center_lat_e7 = @divTrunc(opts.min_lat_e7 + opts.max_lat_e7, 2),
+        };
+        var hbuf: [HEADER_LEN]u8 = undefined;
+        header.serialize(&hbuf);
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(a);
+        try out.appendSlice(a, &hbuf);
+        try out.appendSlice(a, root_dir);
+        try out.appendSlice(a, metadata);
+        return out.toOwnedSlice(a);
+    }
+
+    /// The whole archive as one buffer (prefix ++ data). For consumers that need
+    /// bytes (the C ABI); the streaming CLI writes prefix + data to a file instead.
+    pub fn finishBytes(self: *StreamWriter, opts: WriteOptions) ![]u8 {
+        if (self.num_addressed == 0) return self.gpa.alloc(u8, 0);
+        const pre = try self.prefix(self.gpa, opts);
+        defer self.gpa.free(pre);
+        const out = try self.gpa.alloc(u8, pre.len + self.data.items.len);
+        @memcpy(out[0..pre.len], pre);
+        @memcpy(out[pre.len..], self.data.items);
+        return out;
+    }
 };
 
 /// Build a PMTiles archive from MVT tiles (gzipped + deduped). Caller owns it.
