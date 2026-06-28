@@ -132,10 +132,12 @@ fn clipEdge(a: Allocator, ring: []const mvt.Point, edge: Edge, b: Box, out: *std
 pub fn clipPolygon(a: Allocator, ring: []const mvt.Point, b: Box) ![]mvt.Point {
     var buf_a = std.ArrayList(mvt.Point).empty;
     var buf_b = std.ArrayList(mvt.Point).empty;
-    try buf_a.appendSlice(a, ring);
+    // Clip the first edge straight from the caller's ring (no copy into a working
+    // buffer first), then ping-pong the remaining three edges between buf_a/buf_b.
+    try clipEdge(a, ring, .left, b, &buf_a);
     var src = &buf_a;
     var dst = &buf_b;
-    for ([_]Edge{ .left, .right, .top, .bottom }) |edge| {
+    for ([_]Edge{ .right, .top, .bottom }) |edge| {
         try clipEdge(a, src.items, edge, b, dst);
         const tmp = src;
         src = dst;
