@@ -706,7 +706,7 @@ export fn tile57_tile_get(
             defer refs.deinit(gpa);
             for (idxs.items) |i| {
                 lazyEnsureLoaded(ls, &ls.cells[i]);
-                if (ls.cells[i].cell) |*c| refs.append(gpa, .{ .cell = c, .portrayal = ls.cells[i].portrayal }) catch {};
+                if (ls.cells[i].cell) |*c| refs.append(gpa, .{ .cell = c, .portrayal = ls.cells[i].portrayal, .band = @intFromEnum(ls.cells[i].band) }) catch {};
             }
             const mvt = s57_mvt.generateTileMulti(gpa, refs.items, z, x, y) catch return -1;
             lazyEvict(ls, keep_from);

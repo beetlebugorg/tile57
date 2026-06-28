@@ -232,6 +232,11 @@ const Layers = struct {
     lines_scamin: *std.ArrayList(mvt.Feature),
     points_scamin: *std.ArrayList(mvt.Feature),
     texts_scamin: *std.ArrayList(mvt.Feature),
+    // NOAA navigational band of the cell being appended (0=berthing/finest …
+    // 5=overview/coarsest). Emitted as the MVT `band` property so the style's
+    // fill-sort-key draws finer-band area fills over coarser ones at band overlaps
+    // (the live multi-cell path overlays all bands into one tile).
+    band: u8 = 0,
 };
 
 /// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
@@ -248,6 +253,7 @@ const Meta = struct {
     cat: i64 = 1, // display-category rank (0 base, 1 standard, 2 other)
     scamin: ?i64 = null,
     class: []const u8 = "", // S-57 object-class acronym (M_QUAL, LIGHTS, …)
+    band: u8 = 0, // NOAA band rank (0 finest … 5 coarsest)
     date_start: []const u8 = "",
     date_end: []const u8 = "",
 };
@@ -258,6 +264,7 @@ const Meta = struct {
 fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
     try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
+    try props.append(a, .{ .key = "band", .value = .{ .int = m.band } });
     if (m.class.len > 0) try props.append(a, .{ .key = "class", .value = .{ .string = m.class } });
     if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
     // Date-dependent display (S-52 §10.4.1.1): recurring iff a "--" month-day prefix,
@@ -308,6 +315,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
         .cat = p.cat,
         .scamin = scamin,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
+        .band = L.band,
         .date_start = p.date_start,
         .date_end = p.date_end,
     };
@@ -456,7 +464,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
     const points_l = if (scamin != null) L.points_scamin else L.points;
     const texts_l = if (scamin != null) L.texts_scamin else L.texts;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "" };
+    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .band = L.band };
 
     // Dashed CHGRD boundary on each ring (clipped to the tile).
     for (geo_parts) |gp| {
@@ -518,7 +526,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 
     const scamin = featureScamin(f);
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "" };
+    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .band = L.band };
     for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
@@ -538,7 +546,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 }
 
 /// One cell plus its optional per-feature S-101 instruction streams.
-pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null, geo: ?GeoParts = null };
+pub const CellRef = struct { cell: *s57.Cell, portrayal: ?[]const ?[]const u8 = null, geo: ?GeoParts = null, band: u8 = 0 };
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
 /// `portrayal`, if given, is indexed by feature index and holds each feature's
@@ -584,7 +592,11 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
         .texts_scamin = &texts_scamin,
     };
 
-    for (cells) |cr| try appendCellFeatures(a, layers_ctx, &soundings, cr.cell, cr.portrayal, cr.geo, z, x, y, tb, box);
+    for (cells) |cr| {
+        var Lc = layers_ctx;
+        Lc.band = cr.band; // so this cell's features carry its band for the sort key
+        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.geo, z, x, y, tb, box);
+    }
 
     var layers = std.ArrayList(mvt.Layer).empty;
     if (areas.items.len > 0) try layers.append(a, .{ .name = "areas", .features = areas.items });
@@ -677,6 +689,7 @@ fn appendCellFeatures(
             var aprops = std.ArrayList(mvt.Prop).empty;
             try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
             try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
+            try aprops.append(a, .{ .key = "band", .value = .{ .int = L.band } });
             if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
             if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
             try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
