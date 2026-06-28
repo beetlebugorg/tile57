@@ -128,6 +128,45 @@ fn representativePoint(a: std.mem.Allocator, cell: *const s57.Cell, f: s57.Featu
     return s57.areaRepresentativePoint(parts);
 }
 
+// --- TOPMAR folding (S-52 TOPMAR02) ----------------------------------------
+// S-57 encodes a buoy/beacon topmark as a SEPARATE TOPMAR point feature
+// co-located with its parent; S-101 models it as a complex attribute ON the
+// parent (read by the TOPMAR02 CSP). Index TOPMAR features by location so each
+// can be folded into its co-located parent, and drop the standalone TOPMAR
+// (it has no S-101 feature class and would portray as a magenta unknown mark).
+// Port of internal/engine/portrayal/s101topmark.go + s101/complex.go.
+
+const TopmarkData = struct { shape: []const u8, colour: []const u8 };
+
+// A stable location key for a point feature's vertex, quantized so a parent and
+// its topmark (which share the vertex) collide. Mirrors the Go pointLocKey
+// (7-decimal fixed format); the exact string only needs to be self-consistent.
+fn pointLocKey(a: std.mem.Allocator, pt: s57.LonLat) ![]const u8 {
+    return std.fmt.allocPrint(a, "{d:.7},{d:.7}", .{ pt.lon, pt.lat });
+}
+
+fn buildTopmarkIndex(a: std.mem.Allocator, cell: *const s57.Cell) !std.StringHashMap(TopmarkData) {
+    var idx = std.StringHashMap(TopmarkData).init(a);
+    for (cell.features) |f| {
+        if (f.objl != s57.OBJL_TOPMAR) continue;
+        const pt = cell.pointGeometry(f) orelse continue;
+        const shape = std.mem.trim(u8, f.attr(s57.ATTR_TOPSHP) orelse "", " ");
+        const colour = std.mem.trim(u8, f.attr(s57.ATTR_COLOUR) orelse "", " ");
+        if (shape.len == 0 and colour.len == 0) continue;
+        try idx.put(try pointLocKey(a, pt), .{ .shape = shape, .colour = colour });
+    }
+    return idx;
+}
+
+// A buoy/beacon (or light float) carries a topmark — its S-101 rule reads
+// feature.topmark. Matched by S-57 acronym, like the Go isTopmarkParent.
+fn isTopmarkParent(objl: u16) bool {
+    const acr = catalogue.acronymByObjl(objl) orelse return false;
+    return std.mem.startsWith(u8, acr, "BOY") or
+        std.mem.startsWith(u8, acr, "BCN") or
+        std.mem.eql(u8, acr, "LITFLT");
+}
+
 fn isDangerCode(code: []const u8) bool {
     return std.mem.eql(u8, code, "Obstruction") or
         std.mem.eql(u8, code, "Wreck") or
@@ -159,11 +198,17 @@ fn primitiveName(prim: u8) []const u8 {
 pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
     var out = std.ArrayList(Adapted).empty;
     const depth_index = DepthIndex{ .areas = try buildDepthIndex(a, cell) };
+    // TOPMAR features (built from the FULL feature set) fold into co-located
+    // buoys/beacons below; the standalone features are then skipped.
+    var topmark_index = try buildTopmarkIndex(a, cell);
     for (cell.features, 0..) |f, i| {
         // SOUNDG (objl 129) is emitted directly as a multipoint by s57_mvt
         // (bypassing portrayal), so don't portray it — it would just error on the
         // multipoint primitive the rule path doesn't model.
         if (f.objl == 129) continue;
+        // TOPMAR is folded into its co-located buoy/beacon as the topmark complex
+        // (below); the standalone feature has no S-101 class, so don't portray it.
+        if (f.objl == s57.OBJL_TOPMAR) continue;
         var code = resolveCode(f.objl) orelse meta: {
             // Meta object classes (M_*) are absent from the numeric S-57 code
             // table, so resolveCode can't reach their catalogue alias. Map the one
@@ -238,6 +283,21 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (!present) try complex.append(a, .{ .name = "verticalClearanceClosed", .subs = &.{} });
         }
 
+        // TOPMAR folding: a co-located TOPMAR's shape/colour -> the parent's
+        // S-101 `topmark` complex (read by the TOPMAR02 CSP, which picks the
+        // topmark symbol from topmarkDaymarkShape). Mirrors s101/complex.go.
+        if (isTopmarkParent(f.objl)) {
+            if (cell.pointGeometry(f)) |pt| {
+                const key = try pointLocKey(a, pt);
+                if (topmark_index.get(key)) |tm| {
+                    var subs = std.ArrayList(NameVal).empty;
+                    try subs.append(a, .{ .name = "topmarkDaymarkShape", .value = tm.shape });
+                    if (tm.colour.len > 0) try subs.append(a, .{ .name = "colour", .value = tm.colour });
+                    try complex.append(a, .{ .name = "topmark", .subs = subs.items });
+                }
+            }
+        }
+
         // Derived depth attributes for under/awash dangers (S-52 DEPVAL): supply
         // defaultClearanceDepth ALWAYS (else the rule errors on a nil depth) and
         // surroundingDepth ONLY when the danger sits in a depth area (its absence
@@ -310,6 +370,43 @@ test "adapt a depth area" {
     try std.testing.expectEqual(@as(usize, 2), adapted[0].attrs.len);
     try std.testing.expectEqualStrings("depthRangeMinimumValue", adapted[0].attrs[0].name);
     try std.testing.expectEqualStrings("5", adapted[0].attrs[0].value);
+}
+
+test "TOPMAR folds into co-located buoy as the topmark complex" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const topmar_attrs = [_]s57.Attr{.{ .code = s57.ATTR_TOPSHP, .value = "2" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 10, .prim = 1, .objl = 17, .refs = &node_ref }, // BOYLAT
+        .{ .rcnm = 100, .rcid = 11, .prim = 1, .objl = s57.OBJL_TOPMAR, .refs = &node_ref, .attrs = &topmar_attrs },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, .{ .lon = -76.5, .lat = 39.0 });
+
+    const adapted = try adaptCell(a, &cell);
+    // The standalone TOPMAR is dropped; only the buoy is adapted.
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    var found = false;
+    for (adapted[0].complex) |c| {
+        if (std.mem.eql(u8, c.name, "topmark")) {
+            found = true;
+            try std.testing.expectEqualStrings("topmarkDaymarkShape", c.subs[0].name);
+            try std.testing.expectEqualStrings("2", c.subs[0].value);
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "DepthIndex shoalest DRVAL1 lookup" {

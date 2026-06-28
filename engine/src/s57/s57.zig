@@ -174,6 +174,10 @@ pub const ATTR_HORCLR: u16 = 98; // horizontal clearance -> horizontalClearanceF
 pub const ATTR_VERCLR: u16 = 181; // vertical clearance -> verticalClearanceFixed
 pub const ATTR_VERCCL: u16 = 182; // vertical clearance closed -> verticalClearanceClosed
 pub const ATTR_VERCOP: u16 = 183; // vertical clearance open -> verticalClearanceOpen
+pub const ATTR_TOPSHP: u16 = 171; // topmark/daymark shape -> topmark.topmarkDaymarkShape
+pub const ATTR_COLOUR: u16 = 75; // colour -> topmark.colour (and the simple `colour`)
+
+pub const OBJL_TOPMAR: u16 = 144; // TOPMAR: folded into its co-located buoy/beacon
 
 /// True for a QUAPOS that means "low accuracy" — S-52 draws such geometry DASHED
 /// (approximate-position line style). I.e. present and not surveyed (1), precisely
