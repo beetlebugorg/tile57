@@ -317,6 +317,41 @@ pub fn buildGeoCache(a: Allocator, cell: *const s57.Cell) !GeoParts {
     return parts;
 }
 
+/// Per-feature lon/lat bbox [w,s,e,n] (point/line/area), computed once per cell so
+/// the baker can spatially cull features per tile. Only the (small) bboxes are
+/// retained in `a`; line/area geometry is taken from the geo cache when present,
+/// else assembled into a transient arena reused per feature (so coarse bands that
+/// skip the geo cache don't hold assembled geometry just for bboxes).
+pub fn buildFeatBBox(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts) ![]?[4]f64 {
+    const out = try a.alloc(?[4]f64, cell.features.len);
+    var tmp = std.heap.ArenaAllocator.init(a);
+    defer tmp.deinit();
+    for (cell.features, 0..) |f, i| {
+        out[i] = null;
+        if (f.prim == 1) {
+            if (cell.pointGeometry(f)) |p| out[i] = .{ p.lon(), p.lat(), p.lon(), p.lat() };
+            continue;
+        }
+        if (f.prim != 2 and f.prim != 3) continue;
+        const parts = featureParts(tmp.allocator(), cell.*, geo, i, f) catch continue;
+        var w: f64 = 1e18;
+        var s: f64 = 1e18;
+        var e: f64 = -1e18;
+        var n: f64 = -1e18;
+        var any = false;
+        for (parts) |part| for (part) |pt| {
+            w = @min(w, pt.lon());
+            e = @max(e, pt.lon());
+            s = @min(s, pt.lat());
+            n = @max(n, pt.lat());
+            any = true;
+        };
+        if (any) out[i] = .{ w, s, e, n };
+        _ = tmp.reset(.retain_capacity); // drop this feature's transient assembly
+    }
+    return out;
+}
+
 /// The feature's assembled line/area parts: the baker's cached copy if present,
 /// else assembled now (the live path).
 fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.Feature) ![][]s57.LonLat {
@@ -628,6 +663,10 @@ pub const CellRef = struct {
     portrayal_plain: ?[]const ?[]const u8 = null,
     portrayal_simplified: ?[]const ?[]const u8 = null,
     geo: ?GeoParts = null,
+    /// Per-feature lon/lat bbox [w,s,e,n] (parallel to cell.features), precomputed
+    /// once per cell so a tile can SKIP features it doesn't overlap instead of
+    /// projecting + clipping every feature of every cell (the baker's spatial cull).
+    feat_bbox: ?[]const ?[4]f64 = null,
     band: u8 = 0,
     /// Drop this coarser band cell's AREA fills / patterns where a finer band's
     /// M_COVR data-coverage is present. See Layers.suppress_fills/suppress_patterns.
@@ -684,7 +723,7 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
         Lc.band = cr.band; // so this cell's features carry its band for the sort key
         Lc.suppress_fills = cr.suppress_fills; // coarse band over finer M_COVR (whole-tile): drop fill
         Lc.suppress_patterns = cr.suppress_patterns; // coarse band over finer M_COVR (centre): drop pattern
-        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, z, x, y, tb, box);
+        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.feat_bbox, z, x, y, tb, box);
     }
 
     var layers = std.ArrayList(mvt.Layer).empty;
@@ -714,13 +753,22 @@ fn appendCellFeatures(
     portrayal_plain: ?[]const ?[]const u8,
     portrayal_simplified: ?[]const ?[]const u8,
     geo: ?GeoParts,
+    feat_bbox: ?[]const ?[4]f64,
     z: u8,
     x: u32,
     y: u32,
     tb: [4]f64,
     box: tile.Box,
 ) !void {
+    // Tile bbox expanded by the buffer zone, for the spatial cull (a feature whose
+    // bbox misses this would clip to nothing, so skipping it is output-preserving).
+    const mlon = (tb[2] - tb[0]) * @as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT));
+    const mlat = (tb[3] - tb[1]) * @as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT));
     for (cell.features, 0..) |f, fi| {
+        // Spatial cull: skip features whose precomputed bbox doesn't overlap the tile.
+        if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
+            if (b[2] < tb[0] - mlon or b[0] > tb[2] + mlon or b[3] < tb[1] - mlat or b[1] > tb[3] + mlat) continue;
+        };
         // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
         // the `soundings` layer (the flat S-101 instruction stream can't carry
         // per-sounding geometry). Bypasses the portrayal/classify dispatch.

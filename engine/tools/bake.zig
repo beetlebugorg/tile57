@@ -1063,6 +1063,7 @@ const CellGeom = struct {
     cell: engine.s57.Cell, // cell.arena owns the geometry
     geo: ?engine.s57_mvt.GeoParts,
     geo_arena: ?*std.heap.ArenaAllocator,
+    feat_bbox: []const ?[4]f64 = &.{}, // per-feature bbox for the per-tile cull (in geo_arena)
 };
 
 // Copy per-feature instruction streams into `a` (the sticky portrayal arena) so
@@ -1100,14 +1101,14 @@ const LoadWork = struct {
         };
         var geo: ?engine.s57_mvt.GeoParts = null;
         var geo_arena: ?*std.heap.ArenaAllocator = null;
-        if (c.build_geo) {
-            if (c.gpa.create(std.heap.ArenaAllocator)) |ga| {
-                ga.* = std.heap.ArenaAllocator.init(c.gpa);
-                geo = engine.s57_mvt.buildGeoCache(ga.allocator(), &cell) catch null;
-                geo_arena = ga;
-            } else |_| {}
-        }
-        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_arena = geo_arena };
+        var feat_bbox: []const ?[4]f64 = &.{};
+        if (c.gpa.create(std.heap.ArenaAllocator)) |ga| {
+            ga.* = std.heap.ArenaAllocator.init(c.gpa);
+            if (c.build_geo) geo = engine.s57_mvt.buildGeoCache(ga.allocator(), &cell) catch null;
+            feat_bbox = engine.s57_mvt.buildFeatBBox(ga.allocator(), &cell, geo) catch &.{};
+            geo_arena = ga;
+        } else |_| {}
+        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_arena = geo_arena, .feat_bbox = feat_bbox };
 
         if (c.portray[ci] != null) return; // already portrayed — reuse it (the speed win)
         const sticky = c.gpa.create(std.heap.ArenaAllocator) catch return;
@@ -1420,6 +1421,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     .portrayal_plain = if (p) |pp| pp.plain else null,
                     .portrayal_simplified = if (p) |pp| pp.simplified else null,
                     .geo = g.geo,
+                    .feat_bbox = g.feat_bbox,
                     .bounds = if (p) |pp| pp.bounds else entries[ci].bbox,
                 }) catch {};
             };
