@@ -10,6 +10,13 @@ const std = @import("std");
 const s57 = @import("s57");
 const adapt = @import("s100").s101_adapt;
 
+// The embedded S-101 rules accessor (tg_embedded_lua) — referenced so its C-ABI
+// exports land in the compiled module; the Lua `require` searcher in lua_shim.c
+// calls them to load rule modules from memory.
+comptime {
+    _ = @import("rules_embed.zig");
+}
+
 const Ctx = struct {
     adapted: []adapt.Adapted,
     results: [][]const u8, // per adapted index -> instruction stream (arena-owned)

@@ -62,6 +62,54 @@ fn addMvtFixture(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("mvt_fixture", .{ .root_source_file = b.path("src/testdata/annapolis_z14.mvt") });
 }
 
+// Embed every `ext` file under the build-root-relative `dir_rel` into a generated
+// Zig module that exposes:
+//     pub const Entry = struct { name: []const u8, bytes: []const u8 };
+//     pub const entries = [_]Entry{ ... };
+// where `name` is the file stem (the Lua `require` name / asset id) and `bytes`
+// is the file content, @embedFile'd. Each file rides as a tracked anonymous
+// import, so editing or adding a resource re-triggers the build. The directory is
+// walked at configure time (host fs) and the entries are sorted for a
+// reproducible build. Used to bake the S-101 portrayal catalogue (Rules, Symbols,
+// LineStyles, …) into the binary so tile57 needs no on-disk catalogue at runtime.
+fn embedDir(b: *std.Build, registry_name: []const u8, dir_rel: []const u8, ext: []const u8) *std.Build.Module {
+    const io = b.graph.io;
+    const abs = b.pathFromRoot(dir_rel);
+    var dir = std.Io.Dir.openDirAbsolute(io, abs, .{ .iterate = true }) catch |e|
+        std.debug.panic("embedDir: cannot open '{s}': {s} (run `git submodule update --init --recursive`?)", .{ abs, @errorName(e) });
+    defer dir.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch |e| std.debug.panic("embedDir: iterate '{s}': {s}", .{ abs, @errorName(e) })) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ext)) continue;
+        names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lt);
+
+    var src: std.ArrayList(u8) = .empty;
+    src.appendSlice(b.allocator, "pub const Entry = struct { name: []const u8, bytes: []const u8 };\n") catch @panic("OOM");
+    src.appendSlice(b.allocator, "pub const entries = [_]Entry{\n") catch @panic("OOM");
+    for (names.items) |fname| {
+        const stem = fname[0 .. fname.len - ext.len];
+        const line = b.fmt("    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n", .{ stem, fname });
+        src.appendSlice(b.allocator, line) catch @panic("OOM");
+    }
+    src.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+
+    const wf = b.addWriteFiles();
+    const reg_mod = b.createModule(.{ .root_source_file = wf.add(b.fmt("{s}.zig", .{registry_name}), src.items) });
+    for (names.items) |fname| {
+        reg_mod.addAnonymousImport(fname, .{ .root_source_file = b.path(b.pathJoin(&.{ dir_rel, fname })) });
+    }
+    return reg_mod;
+}
+
 // Add a `zig build test` artifact for a standalone package module. A split
 // module's `test {}` blocks do NOT run via the engine test binary (importing a
 // module doesn't pull its tests in), so each package is tested through its own
@@ -169,6 +217,10 @@ pub fn build(b: *std.Build) void {
         },
     });
     addLua(b, portray_mod, lua_posix);
+    // Embed the S-101 Lua rules (216 framework + feature-class files) so the Lua
+    // `require` searcher in lua_shim.c can load them from memory — tile57 portrays
+    // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
+    portray_mod.addImport("rules_registry", embedDir(b, "rules_registry", "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules", ".lua"));
 
     // Asset/style generation for the chart bundle (colortables, manifest, …).
     // Pure + target-agnostic like the foundational packages, so it compiles

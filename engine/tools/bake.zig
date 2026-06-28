@@ -30,12 +30,14 @@ const DEFAULT_MAXZOOM: u8 = 16;
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
 
 // Resolve the S-101 rules directory: explicit --rules, else TILE57_S101_RULES,
-// else the vendored official catalogue relative to the CWD (works when the baker
-// is run from the repo root, as the render host's resolveRulesDir also expects).
+// else "" — which tells the portrayal engine to use the rules embedded in the
+// binary (rules_embed.zig), so tile57 needs no on-disk catalogue. A non-empty
+// path is layered onto package.path ahead of the embedded searcher, so an
+// explicit dir always wins.
 fn resolveRulesDir(explicit: ?[]const u8) []const u8 {
     if (explicit) |d| return d;
     if (tg_env_rules()) |dirz| return std.mem.span(dirz);
-    return "engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+    return "";
 }
 
 // True if `path` is a directory (an ENC_ROOT) rather than a single cell.000 file.
@@ -423,12 +425,14 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 // rules dir is <catalog>/Rules; ColorProfiles is its sibling.
 const COLOR_PROFILE_REL = "ColorProfiles/colorProfile.xml";
 
-// Resolve the PortrayalCatalog directory: explicit arg, else the parent of the
-// resolved rules dir (…/PortrayalCatalog/Rules -> …/PortrayalCatalog).
+// The vendored PortrayalCatalog dir, relative to the repo root (the CWD the CLI
+// is run from). The asset commands (colortables / sprites / patterns / style)
+// still read these from disk; embedding them is a later step.
+const DEFAULT_CATALOG_DIR = "engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog";
+
+// Resolve the PortrayalCatalog directory: explicit arg, else the vendored catalogue.
 fn resolveCatalogDir(explicit: ?[]const u8) []const u8 {
-    if (explicit) |d| return d;
-    const rules = resolveRulesDir(null);
-    return std.fs.path.dirname(rules) orelse rules;
+    return explicit orelse DEFAULT_CATALOG_DIR;
 }
 
 // Emit colortables.json from a catalog dir into out_dir. Returns the bytes (arena
@@ -1084,7 +1088,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         }
     }
     if (total_cells == 0) return error.NoGeometry;
-    std.debug.print("baking {d} cells from {s} (rules: {s})\n", .{ total_cells, root_path, rules_dir });
+    std.debug.print("baking {d} cells from {s} (rules: {s})\n", .{ total_cells, root_path, if (rules_dir.len == 0) "embedded" else rules_dir });
 
     engine.catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
     engine.portray.setQuiet(true); // many threads -> suppress the per-cell stderr

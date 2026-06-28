@@ -38,6 +38,11 @@ extern void tgc_binding(unsigned char kind, const char *code, size_t code_len, s
                         const char **ref, size_t *ref_len, int *lower, int *upper);
 extern const char *tgc_simple_valuetype(const char *code, size_t code_len, size_t *len);
 
+/* Embedded S-101 Lua rule source by `require` name (rules_embed.zig). Returns the
+ * source bytes (or NULL if the module isn't embedded) so the rules can be loaded
+ * from memory with no on-disk catalogue. */
+extern const char *tg_embedded_lua(const char *name, size_t nlen, size_t *out_len);
+
 /* Run a trivial Lua chunk and return its integer result, or a negative error.
  * Used to verify the embedded interpreter end to end. */
 long tile57_diag_lua_selftest(void) {
@@ -99,6 +104,45 @@ static void register_host_stubs(lua_State *L) {
     for (int i = 0; noops[i]; i++) lua_register(L, noops[i], l_noop);
 }
 
+/* package.searchers entry that loads S-101 rule modules embedded in the binary
+ * (tg_embedded_lua) rather than from the filesystem. Installed as the LAST
+ * searcher, so an explicit on-disk rules dir (package.path, set from a --rules
+ * flag or the vendored catalogue) still wins; this serves the rules when no such
+ * directory is present — i.e. when tile57 runs as a standalone binary. Returns 2
+ * (loader chunk + the module name) on a hit, or 1 (an explanatory string Lua
+ * folds into the "module 'X' not found" message) on a miss. */
+static int embedded_lua_searcher(lua_State *L) {
+    size_t nlen = 0;
+    const char *name = luaL_checklstring(L, 1, &nlen);
+    size_t len = 0;
+    const char *src = tg_embedded_lua(name, nlen, &len);
+    if (!src) {
+        lua_pushfstring(L, "\n\tno embedded module '%s'", name);
+        return 1;
+    }
+    /* '@' prefix => Lua treats the chunk name as a file path in tracebacks. */
+    char chunk[160];
+    snprintf(chunk, sizeof chunk, "@%.140s.lua", name);
+    if (luaL_loadbuffer(L, src, len, chunk) != LUA_OK)
+        return luaL_error(L, "error loading embedded module '%s':\n\t%s", name, lua_tostring(L, -1));
+    lua_pushstring(L, name); /* passed to the loader as its 2nd arg, like the file searcher */
+    return 2;
+}
+
+/* Append embedded_lua_searcher to package.searchers (after the default
+ * filesystem searchers, so an on-disk rules dir takes precedence). Call once per
+ * state, after luaL_openlibs (which creates the package library). */
+static void install_embedded_searcher(lua_State *L) {
+    lua_getglobal(L, "package");
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    lua_getfield(L, -1, "searchers");
+    if (!lua_istable(L, -1)) { lua_pop(L, 2); return; }
+    lua_Integer n = (lua_Integer)lua_rawlen(L, -1);
+    lua_pushcfunction(L, embedded_lua_searcher);
+    lua_rawseti(L, -2, n + 1);
+    lua_pop(L, 2); /* searchers, package */
+}
+
 /* Prove the framework EXECUTES in embedded Lua 5.4: with stub Host callbacks and
  * an empty feature set, initialize the portrayal context and report the
  * FeaturePortrayalItems count (0). Returns 0 on success, negative on error. */
@@ -106,6 +150,7 @@ int tile57_diag_run_framework(const char *dir) {
     lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);
+    install_embedded_searcher(L); /* embedded rules fall back when `dir` has none */
     char buf[8192];
     snprintf(buf, sizeof buf, "package.path = '%s/?.lua;' .. package.path", dir);
     int rc = 0;
@@ -258,6 +303,7 @@ int tile57_diag_portray_demo(const char *dir) {
     lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);
+    install_embedded_searcher(L); /* embedded rules fall back when `dir` has none */
     char buf[8192];
     snprintf(buf, sizeof buf, "package.path = '%s/?.lua;' .. package.path", dir);
     if (luaL_dostring(L, buf) != LUA_OK) {
@@ -559,12 +605,18 @@ int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int si
     lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);
-    char buf[8192];
-    snprintf(buf, sizeof buf, "package.path = '%s/?.lua;' .. package.path", dbuf);
-    if (luaL_dostring(L, buf) != LUA_OK) {
-        fprintf(stderr, "[s101] package.path: %s\n", lua_tostring(L, -1));
-        lua_close(L);
-        return -1;
+    /* Embedded rules are always available (searcher fallback). An explicit rules
+     * dir (dir_len > 0) is added to package.path so it takes precedence; with no
+     * dir, the rules load straight from the binary — no on-disk catalogue. */
+    install_embedded_searcher(L);
+    if (dir_len > 0) {
+        char buf[8192];
+        snprintf(buf, sizeof buf, "package.path = '%s/?.lua;' .. package.path", dbuf);
+        if (luaL_dostring(L, buf) != LUA_OK) {
+            fprintf(stderr, "[s101] package.path: %s\n", lua_tostring(L, -1));
+            lua_close(L);
+            return -1;
+        }
     }
 
     lua_register(L, "HostGetFeatureTypeCodes", lp_feature_codes);
@@ -704,6 +756,7 @@ int tile57_diag_check_rules(const char *dir) {
     lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);
+    install_embedded_searcher(L); /* embedded rules fall back when `dir` has none */
     char buf[8192];
     snprintf(buf, sizeof buf, "package.path = '%s/?.lua;' .. package.path", dir);
     int rc = 0;
