@@ -205,6 +205,17 @@ pub fn build(b: *std.Build) void {
     addPkgs(mod, &pure_pkgs);
     addMvtFixture(b, mod); // mvt_parity_test (in the engine module) embeds it
 
+    // Public, consumable Zig library module: `@import("tile57")` after adding this
+    // package as a dependency. The curated public surface (src/tile57.zig). Phase 2
+    // adds the libc-linked Source/bake/style API (importing portray); for now it
+    // re-exports the pure format/encode/asset packages.
+    const tile57_mod = b.addModule("tile57", .{
+        .root_source_file = b.path("src/tile57.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addPkgs(tile57_mod, &pure_pkgs);
+
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
     // never in a Zig-linked exe.
@@ -306,4 +317,8 @@ pub fn build(b: *std.Build) void {
     });
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
+    // The public root: compile-check it (refAllDecls) so the curated surface
+    // can't rot. Mirrors the pure_pkgs import set (catalogue JSON already rides
+    // on s100_mod).
+    _ = addPkgTest(b, test_step, "src/tile57.zig", target, optimize, &pure_pkgs);
 }
