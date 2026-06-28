@@ -570,6 +570,77 @@ pub fn peekMeta(gpa: Allocator, bytes: []const u8) ?CellMeta {
     return m;
 }
 
+/// One CATD (catalogue-directory) record from an exchange-set catalogue.
+pub const CatalogEntry = struct {
+    stem: []const u8, // cell name without extension (e.g. "US5MD1MC"); allocator-owned
+    path: []const u8, // ENC_ROOT-relative path, '/'-normalised; allocator-owned
+    bbox: ?[4]f64, // [west, south, east, north]; null for non-cell / no coverage
+    is_cell: bool, // BIN .000 base cell
+};
+
+fn parseFloatOpt(s_in: []const u8) ?f64 {
+    const s = std.mem.trim(u8, s_in, " ");
+    if (s.len == 0) return null;
+    return std.fmt.parseFloat(f64, s) catch null;
+}
+
+// Decode one CATD field (S-57 App. B.1). ASCII, unit-terminator (0x1f) delimited:
+//   [0] RCNM(2 "CD") + RCID(digits) + FILE   [1] LFIL  [2] VOLM
+//   [3] IMPL(3 BIN/ASC/TXT) + SLAT  [4] WLON  [5] NLAT  [6] ELON  [7] CRCS  [8] COMT
+fn decodeCATD(a: Allocator, raw_in: []const u8) ?CatalogEntry {
+    var end = raw_in.len;
+    while (end > 0 and raw_in[end - 1] == 0x1e) end -= 1; // drop trailing field terminator(s)
+    const raw = raw_in[0..end];
+    var parts: [9][]const u8 = .{""} ** 9;
+    var np: usize = 0;
+    var it = std.mem.splitScalar(u8, raw, 0x1f);
+    while (it.next()) |p| : (np += 1) {
+        if (np >= parts.len) break;
+        parts[np] = p;
+    }
+    if (np < 4) return null;
+    const head = parts[0];
+    if (head.len < 2) return null;
+    var i: usize = 2; // drop RCNM ("CD")
+    while (i < head.len and head[i] >= '0' and head[i] <= '9') : (i += 1) {} // RCID digits
+    if (i >= head.len) return null;
+    const norm = a.dupe(u8, head[i..]) catch return null; // FILE
+    for (norm) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+    const base = std.fs.path.basename(norm);
+    const ext = std.fs.path.extension(base);
+    const stem = a.dupe(u8, base[0 .. base.len - ext.len]) catch return null;
+
+    var bbox: ?[4]f64 = null;
+    var is_cell = false;
+    if (parts[3].len >= 3) {
+        is_cell = std.mem.eql(u8, parts[3][0..3], "BIN") and std.mem.endsWith(u8, base, ".000");
+        if (parseFloatOpt(parts[3][3..])) |s|
+            if (parseFloatOpt(parts[4])) |w|
+                if (parseFloatOpt(parts[5])) |n|
+                    if (parseFloatOpt(parts[6])) |e2| {
+                        bbox = .{ w, s, e2, n };
+                    };
+    }
+    return .{ .stem = stem, .path = norm, .bbox = bbox, .is_cell = is_cell };
+}
+
+/// Parse an S-57 exchange-set catalogue (CATALOG.031): one CATD record per file,
+/// giving its path and — for base cells — coverage bbox. Lets a baker learn the
+/// whole set's inventory + per-cell extents from this ONE file instead of parsing
+/// every cell. Entries + their strings are allocated in `a`; null if unparseable.
+pub fn parseCatalog(a: Allocator, bytes: []const u8) ?[]CatalogEntry {
+    var file = iso.parse(a, bytes) catch return null;
+    defer file.deinit();
+    var out = std.ArrayList(CatalogEntry).empty;
+    for (file.records) |rec| {
+        const raw = rec.field("CATD") orelse continue;
+        if (decodeCATD(a, raw)) |e| out.append(a, e) catch {};
+    }
+    return out.toOwnedSlice(a) catch null;
+}
+
 const vkey = struct {
     fn of(rcnm: u8, rcid: u32) u64 {
         return (@as(u64, rcnm) << 32) | rcid;

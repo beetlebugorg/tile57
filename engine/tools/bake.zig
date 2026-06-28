@@ -1174,6 +1174,22 @@ const BakeSink = struct {
     }
 };
 
+// NOAA cell naming: a US ENC's 3rd char is its navigational-purpose digit
+// (1=overview … 6=berthing), so the catalogue fast-path can band a cell from its
+// name without parsing its CSCL header. Null for non-conforming names.
+fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
+    if (stem.len < 3 or (stem[0] != 'U' and stem[0] != 'u')) return null;
+    return switch (stem[2]) {
+        '6' => .berthing,
+        '5' => .harbor,
+        '4' => .approach,
+        '3' => .coastal,
+        '2' => .general,
+        '1' => .overview,
+        else => null,
+    };
+}
+
 // Bake an ENC_ROOT directory into one band-streamed PMTiles archive written
 // straight to `out_path` (the data section streams through a StreamWriter — only
 // the compressed data + small directory are held, not the raw tiles). Returns the
@@ -1183,16 +1199,45 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer dir.close(io);
 
-    // Pass 1: walk base cells, group by navigational band with a cheap peek (bbox +
-    // CSCL, no geometry/topology), recording each cell's path + bbox so pass 2 can
-    // load only the cells overlapping a given region. Also the union bbox + stems.
+    // Pass 1: learn each cell's band + bbox. Fast path: an exchange-set catalogue
+    // (CATALOG.031) gives every cell's coverage bbox in ONE file — band each from
+    // its NOAA name digit, no per-cell parse (matches the Go reference). Fallback
+    // (no catalogue): walk the dir and cheaply peek each cell (bbox + CSCL).
     const Bands = engine.bake_enc;
     var band_cells: [Bands.bands_fine_to_coarse.len]std.ArrayList(CellEntry) = undefined;
     for (&band_cells) |*bc| bc.* = std.ArrayList(CellEntry).empty;
     var cell_names = std.ArrayList([]const u8).empty;
     var ubox: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }; // [w,s,e,n]
     var total_cells: usize = 0;
-    {
+
+    const via_catalog = cat: {
+        const cbytes = dir.readFileAlloc(io, "CATALOG.031", page, .unlimited) catch break :cat false;
+        defer page.free(cbytes);
+        const entries = engine.s57.parseCatalog(a, cbytes) orelse break :cat false;
+        var n_cells: usize = 0;
+        for (entries) |e| {
+            if (!e.is_cell) continue;
+            n_cells += 1;
+            try cell_names.append(a, e.stem);
+            total_cells += 1;
+            const bb = e.bbox orelse continue;
+            ubox[0] = @min(ubox[0], bb[0]);
+            ubox[1] = @min(ubox[1], bb[1]);
+            ubox[2] = @max(ubox[2], bb[2]);
+            ubox[3] = @max(ubox[3], bb[3]);
+            // Band from the name; for the rare non-NOAA name, peek that one cell.
+            const band = bandFromStem(e.stem) orelse fb: {
+                const cb = dir.readFileAlloc(io, e.path, page, .unlimited) catch break :fb Bands.bandOf(0);
+                defer page.free(cb);
+                const m = engine.s57.peekMeta(page, cb);
+                break :fb Bands.bandOf(if (m) |mm| mm.cscl else 0);
+            };
+            try band_cells[@intFromEnum(band)].append(a, .{ .path = e.path, .bbox = bb });
+        }
+        break :cat n_cells > 0;
+    };
+
+    if (!via_catalog) {
         var walker = try dir.walk(a);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
@@ -1217,7 +1262,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         }
     }
     if (total_cells == 0) return error.NoGeometry;
-    std.debug.print("baking {d} cells from {s} (rules: {s})\n", .{ total_cells, root_path, if (rules_dir.len == 0) "embedded" else rules_dir });
+    std.debug.print("baking {d} cells from {s} ({s}, rules: {s})\n", .{ total_cells, root_path, if (via_catalog) "via CATALOG.031" else "scanned", if (rules_dir.len == 0) "embedded" else rules_dir });
 
     engine.catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
     engine.portray.setQuiet(true); // many threads -> suppress the per-cell stderr
