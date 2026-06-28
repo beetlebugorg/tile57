@@ -145,10 +145,22 @@ pub fn main(init: std.process.Init) !void {
             const x = try std.fmt.parseInt(u32, args[4], 10);
             const y = try std.fmt.parseInt(u32, args[5], 10);
             if (try r.getTile(arena, z, x, y)) |tile| {
-                const layers = try engine.mvt.decode(arena, tile);
-                std.debug.print("  tile {d}/{d}/{d}: {d} bytes, {d} layers:\n", .{ z, x, y, tile.len, layers.len });
-                for (layers) |L| {
-                    std.debug.print("    {s}: {d} features (extent {d})\n", .{ L.name, L.features.len, L.extent });
+                if (h.tile_type == .mlt) {
+                    // MLT isn't decodable here (no in-engine MLT decoder); dump the
+                    // decompressed bytes as hex so they can be fed to a reference
+                    // decoder. Cap the hex so a big tile doesn't flood the terminal.
+                    std.debug.print("  tile {d}/{d}/{d}: {d} bytes (MLT)\n", .{ z, x, y, tile.len });
+                    if (tile.len <= 8192) {
+                        std.debug.print("  hex:", .{});
+                        for (tile) |c| std.debug.print("{x:0>2}", .{c});
+                        std.debug.print("\n", .{});
+                    } else std.debug.print("  (>{d} bytes; re-bake a sparser tile for a hex dump)\n", .{@as(usize, 8192)});
+                } else {
+                    const layers = try engine.mvt.decode(arena, tile);
+                    std.debug.print("  tile {d}/{d}/{d}: {d} bytes, {d} layers:\n", .{ z, x, y, tile.len, layers.len });
+                    for (layers) |L| {
+                        std.debug.print("    {s}: {d} features (extent {d})\n", .{ L.name, L.features.len, L.extent });
+                    }
                 }
             } else std.debug.print("  tile {d}/{d}/{d}: not found\n", .{ z, x, y });
         }
