@@ -292,12 +292,14 @@ fn tileKey(z: u8, x: u32, y: u32) u64 {
     return (@as(u64, z) << 48) | (@as(u64, x) << 24) | @as(u64, y);
 }
 
-// Resolve the S-101 rules dir: explicit arg, else TILE57_S101_RULES, else the
-// vendored official catalogue (works when run from the repo root).
+// Resolve the S-101 rules dir: explicit arg, else TILE57_S101_RULES, else "" —
+// which uses the rules embedded in the binary (the Lua searcher in lua_shim.c),
+// so no on-disk catalogue is required. A non-empty path overrides the embedded
+// copy (read from disk).
 fn resolveRulesDir(rules_dir: ?[]const u8) []const u8 {
-    if (rules_dir) |d| return d;
+    if (rules_dir) |d| if (d.len > 0) return d;
     if (tg_env_rules()) |dirz| return std.mem.span(dirz);
-    return "engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+    return "";
 }
 
 // Open a PMTiles archive from owned bytes (takes ownership on success, frees on

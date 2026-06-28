@@ -102,8 +102,8 @@ The offline tool bakes charts and emits portrayal assets:
 cd engine && zig build                       # builds engine/zig-out/bin/tile57
 tile57 bundle CELL.000 -o out/               # tiles + style + assets + manifest
 tile57 bake-root ENC_ROOT -o chart.pmtiles   # band-streamed whole-catalogue bake
-tile57 assets   PortrayalCatalog -o assets/  # colortables + linestyles + sprite + patterns
-tile57 sprite-mln PortrayalCatalog -o assets/# the MapLibre sprite sheet
+tile57 assets   -o assets/                   # colortables + linestyles + sprite + patterns
+tile57 sprite-mln -o assets/                 # the MapLibre sprite sheet
 ```
 
 ## Build

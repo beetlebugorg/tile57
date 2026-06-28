@@ -45,9 +45,10 @@ if (try src.tile(z, x, y)) |mvt| {     // decompressed MVT bytes, or null if emp
 | `deinit()` | release the source and its cached tiles. |
 
 `tile57.Format` is `.auto` / `.pmtiles` / `.s57_cell`. `rules_dir` is the S-101
-portrayal rules directory for live S-57 cells; `null` uses the default
-(`TILE57_S101_RULES` or the vendored catalogue). Free any bytes returned by
-`tile` / `bakeArchive` with `tile57.freeBytes`.
+portrayal rules directory for live S-57 cells; `null` (or `""`) uses the rules
+embedded in the binary (or `TILE57_S101_RULES` if set), so no on-disk catalogue
+is required; a path overrides with an on-disk catalogue. Free any bytes returned
+by `tile` / `bakeArchive` with `tile57.freeBytes`.
 
 The streaming open uses the extern types `tile57.CellMeta` (bbox + `cscl`),
 `tile57.CellBytes` (the cell's base + updates, ownership transferred to the

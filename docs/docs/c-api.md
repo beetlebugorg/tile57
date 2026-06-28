@@ -34,8 +34,9 @@ typedef enum {
     TILE57_FORMAT_S57_CELL = 2, /* raw .000; tiles generated live */
 } tile57_format;
 
-/* Open from in-memory bytes. rules_dir = S-101 rules for cells (NULL -> default,
- * i.e. TILE57_S101_RULES or the vendored catalogue). NULL on error. */
+/* Open from in-memory bytes. rules_dir = S-101 rules for cells (NULL/"" -> the
+ * rules embedded in the binary, or TILE57_S101_RULES if set; a path overrides
+ * with an on-disk catalogue). NULL on error. */
 tile57_source *tile57_source_open(const uint8_t *data, size_t len,
                                   tile57_format format, const char *rules_dir);
 

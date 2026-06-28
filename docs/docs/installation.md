@@ -18,8 +18,11 @@ git submodule update --init --recursive
 ```
 
 The vendored **IHO S-101 Portrayal Catalogue** comes in as a submodule (under
-`engine/vendor/`); the engine portrays against it at runtime. Lua 5.4 is vendored
-under `engine/vendor/lua` and compiled in, so no system Lua is needed.
+`engine/vendor/`). It is a **build-time** dependency: `zig build` embeds the
+catalogue (the Lua portrayal rules plus the symbols, line styles, area fills and
+colour profile) directly into the binary via `@embedFile`, so the resulting
+`tile57` needs no on-disk catalogue at runtime. Lua 5.4 is vendored under
+`engine/vendor/lua` and compiled in, so no system Lua is needed either.
 
 ## 2. Zig 0.16.0 (required)
 
@@ -49,9 +52,12 @@ API](./zig-api.md).
 ## Runtime knob
 
 - `TILE57_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57 cells.
-  A fallback only: it applies when a caller passes `NULL`/`null` for the
-  `rules_dir` argument. Defaults to the vendored catalogue under
-  `engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.
+  An **override**: the rules are embedded in the binary by default, so this is
+  only needed to portray against a different on-disk catalogue (it applies when a
+  caller passes `NULL`/`null` for the `rules_dir` argument). The CLI accepts the
+  same override per-command via `--rules <dir>` (portrayal) and `--catalog <dir>`
+  / a positional catalogue path (assets); an explicit path takes precedence over
+  the embedded copy.
 
 Next: [**Getting Started**](./getting-started.md) bakes a chart and fetches a
 tile.

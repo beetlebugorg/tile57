@@ -25,9 +25,10 @@ $T bundle CELL.000 -o out/
 # A whole ENC_ROOT, band-streamed into one PMTiles archive
 $T bake-root /path/to/ENC_ROOT -o chart.pmtiles
 
-# Just the portrayal assets from a Portrayal Catalogue
-$T assets   /path/to/PortrayalCatalog -o assets/   # colortables (+ linestyles)
-$T sprite-mln /path/to/PortrayalCatalog -o assets/ # the MapLibre sprite sheet
+# Just the portrayal assets (from the embedded catalogue — no path needed)
+$T assets     -o assets/   # colortables + linestyles + sprite + patterns
+$T sprite-mln -o assets/   # the MapLibre sprite sheet
+# (pass a /path/to/PortrayalCatalog to use an on-disk catalogue instead)
 
 # Inspect / summarise
 $T inspect chart.pmtiles        # zoom range + tile counts
