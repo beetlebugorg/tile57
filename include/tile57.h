@@ -81,6 +81,44 @@ typedef struct {
 tile57_source *tile57_source_open_cells(
     const tile57_cell_input *cells, size_t count, const char *rules_dir);
 
+/* ---- streaming ENC_ROOT (low memory) ------------------------------------
+ *
+ * Like tile57_source_open_cells, but the host does NOT hand over every cell's
+ * bytes up front. Instead it supplies cheap per-cell metadata (bbox + scale) and
+ * a reader callback; a cell's bytes are read only when a tile needs them and are
+ * freed again on LRU eviction. The host therefore holds only the working set's
+ * bytes, not the whole catalogue — the right choice for a large ENC_ROOT. */
+
+/* Pre-peeked metadata for one cell (the host computes/knows these). */
+typedef struct {
+    double west, south, east, north; /* geographic bounds, degrees */
+    int32_t cscl;                    /* compilation scale denominator (1:cscl) */
+} tile57_cell_meta;
+
+/* Cell bytes returned by a reader. The reader transfers OWNERSHIP of malloc()'d
+ * buffers — base, each updates[i], and the updates/update_lens arrays — and the
+ * library free()s them once the cell is parsed. update_count = 0 (NULL arrays)
+ * for a base-only cell. */
+typedef struct {
+    const uint8_t *base;
+    size_t base_len;
+    const uint8_t *const *updates;
+    const size_t *update_lens;
+    size_t update_count;
+} tile57_cell_bytes;
+
+/* Read cell `index`'s bytes into *out (malloc'd; the library frees them).
+ * Return true on success, false to skip the cell. Called on demand (and again
+ * after eviction); must be safe to call from the thread that calls tile57_tile_get. */
+typedef bool (*tile57_cell_read_fn)(void *user, size_t index, tile57_cell_bytes *out);
+
+/* Open a streaming ENC_ROOT: `metas`/`count` describe the cells; `read`/`user`
+ * fetch bytes on demand. No bytes are read here. Returns an opaque handle or
+ * NULL. Close with tile57_source_close. */
+tile57_source *tile57_source_open_cells_streaming(
+    const tile57_cell_meta *metas, size_t count,
+    tile57_cell_read_fn read, void *user, const char *rules_dir);
+
 /* Progress callback for tile57_bake_cells. stage 0 = loading/portraying cells,
  * stage 1 = baking tiles; done/total count cells (stage 0) or tiles (stage 1). */
 typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, size_t total);
@@ -205,26 +243,26 @@ typedef struct {
 } tile57_named_bytes;
 
 /* colortables.json (S-52 colour token -> hex per day/dusk/night palette) from a
- * ColorProfiles/colorProfile.xml. Returns 1 with *out/*out_len, 0 on error. */
+ * ColorProfiles colorProfile.xml. Returns 1 with out/out_len set, 0 on error. */
 int tile57_colortables(const uint8_t *xml, size_t xml_len,
                        uint8_t **out, size_t *out_len);
 
 /* linestyles.json (dash patterns + placed symbols) from the S-101 LineStyles
- * (each `id` = the XML file stem). Returns 1 with *out/*out_len, 0 on error. */
+ * (each `id` = the XML file stem). Returns 1 with out/out_len set, 0 on error. */
 int tile57_linestyles(const tile57_named_bytes *line_styles, size_t count,
                       uint8_t **out, size_t *out_len);
 
-/* Sprite atlas: rasterize the S-101 Symbols/*.svg against a palette stylesheet
- * (css = a *SvgStyle.css's content) and pack them. Returns 1 with the sprite.json
- * in *out_json/*out_json_len and the atlas PNG in *out_png/*out_png_len (free each
+/* Sprite atlas: rasterize the S-101 Symbols (SVG) against a palette stylesheet
+ * (css = a SvgStyle.css's content) and pack them. Returns 1 with the sprite.json
+ * in out_json/out_json_len and the atlas PNG in out_png/out_png_len (free each
  * with tile57_tile_free); 0 on error. */
 int tile57_sprite_atlas(const tile57_named_bytes *svgs, size_t count,
                         const uint8_t *css, size_t css_len,
                         uint8_t **out_json, size_t *out_json_len,
                         uint8_t **out_png, size_t *out_png_len);
 
-/* Area-fill pattern atlas: tile each S-101 AreaFills/*.xml's referenced symbol on
- * its v1/v2 lattice. `symbols` are the Symbols/*.svg the fills reference. Returns
+/* Area-fill pattern atlas: tile each S-101 AreaFills XML's referenced symbol on
+ * its v1/v2 lattice. `symbols` are the Symbols (SVG) the fills reference. Returns
  * 1 with patterns.json + patterns.png (free each with tile57_tile_free); 0 on error. */
 int tile57_pattern_atlas(const tile57_named_bytes *fills, size_t fill_count,
                          const tile57_named_bytes *symbols, size_t symbol_count,

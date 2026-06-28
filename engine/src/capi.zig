@@ -98,6 +98,20 @@ export fn tile57_source_open_cells(
     return Source.openCells(cells, spanOpt(rules_dir)) catch null;
 }
 
+/// Open a streaming ENC_ROOT source: host supplies per-cell metadata + a reader
+/// that returns a cell's bytes on demand (read on first tile use, freed on LRU
+/// eviction). See tile57.h. `metas`/`read`/`user` map to source.openCellsStreaming.
+export fn tile57_source_open_cells_streaming(
+    metas: [*]const source.CellMeta,
+    count: usize,
+    read: source.CellReadFn,
+    user: ?*anyopaque,
+    rules_dir: ?[*:0]const u8,
+) callconv(.c) ?*Source {
+    if (count == 0) return null;
+    return Source.openCellsStreaming(metas[0..count], read, user, spanOpt(rules_dir)) catch null;
+}
+
 // Progress callback for tile57_bake_cells (matches the header typedef + source.Progress).
 const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void;
 

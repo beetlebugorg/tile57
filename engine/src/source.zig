@@ -45,6 +45,35 @@ pub const CellInput = struct {
 /// stage 1 = baking tiles. C-callconv so a C host can pass one directly.
 pub const Progress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void;
 
+/// Pre-peeked metadata for one cell in a streaming open: its geographic extent
+/// and compilation scale (1:cscl). The host supplies these (cheap to compute, or
+/// already known) so the source opens without reading any cell bytes.
+pub const CellMeta = extern struct {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    cscl: i32,
+};
+
+/// Cell bytes returned by a streaming reader. The reader transfers OWNERSHIP of
+/// malloc-allocated buffers (base + each update); the engine frees them with
+/// libc free() once the cell is parsed. update arrays are parallel, length
+/// update_count (0 / null for a base-only cell).
+pub const CellBytes = extern struct {
+    base: [*]const u8 = undefined,
+    base_len: usize = 0,
+    updates: ?[*]const [*]const u8 = null,
+    update_lens: ?[*]const usize = null,
+    update_count: usize = 0,
+};
+
+/// Streaming cell reader: fill `out` with cell `index`'s malloc'd bytes (the
+/// engine frees them), returning true on success. Called on demand the first
+/// time a tile needs the cell (and again after the cell is LRU-evicted), so the
+/// host holds only the working set's bytes — not the whole ENC_ROOT.
+pub const CellReadFn = *const fn (user: ?*anyopaque, index: usize, out: *CellBytes) callconv(.c) bool;
+
 /// Free bytes returned by `Source.tile` / `bakeArchive` (page-allocator owned).
 pub fn freeBytes(bytes: []u8) void {
     gpa.free(bytes);
@@ -77,6 +106,11 @@ const LazyCell = struct {
     // M_COVR(CATCOV=1) coverage polygons, assembled once from `cell` for best-band
     // suppression. Lives in cell.arena, freed (and reset) when the cell unloads.
     coverage: ?[]const []const []const s57.LonLat = null,
+    // Streaming: when the source has a reader, `base`/`updates` are empty until the
+    // cell is first needed (read on demand into gpa, freed on eviction), so only
+    // the LRU working set's bytes are held. `index` is passed to the reader.
+    streaming: bool = false,
+    index: usize = 0,
 };
 
 const LazySource = struct {
@@ -85,6 +119,8 @@ const LazySource = struct {
     tick: u64 = 0,
     loaded: usize = 0,
     max_loaded: usize = 256, // LRU budget on parsed+portrayed cells (wide views)
+    reader: ?CellReadFn = null, // streaming: read a cell's bytes on demand
+    reader_user: ?*anyopaque = null,
 };
 
 const Backend = union(enum) {
@@ -135,11 +171,60 @@ fn bboxOverlap(a_: [4]f64, b_: [4]f64) bool {
     return a_[0] <= b_[2] and a_[2] >= b_[0] and a_[1] <= b_[3] and a_[3] >= b_[1];
 }
 
+// Free the host-malloc'd buffers a streaming reader transferred to us (libc free).
+fn freeCellBytes(cb: *CellBytes) void {
+    if (cb.base_len != 0) std.c.free(@constCast(@ptrCast(cb.base)));
+    if (cb.updates) |ups| {
+        var k: usize = 0;
+        while (k < cb.update_count) : (k += 1) std.c.free(@constCast(@ptrCast(ups[k])));
+        std.c.free(@constCast(@ptrCast(ups)));
+    }
+    if (cb.update_lens) |ul| std.c.free(@constCast(@ptrCast(ul)));
+}
+
+// Read a streaming cell's bytes via the host reader into gpa-owned base/updates
+// (freeing the host's originals). Returns false if the reader declines/fails.
+fn streamRead(ls: *LazySource, lc: *LazyCell) bool {
+    const rd = ls.reader orelse return false;
+    var cb: CellBytes = .{};
+    if (!rd(ls.reader_user, lc.index, &cb)) return false;
+    const base = gpa.dupe(u8, cb.base[0..cb.base_len]) catch {
+        freeCellBytes(&cb);
+        return false;
+    };
+    var ups: [][]u8 = &.{};
+    if (cb.update_count > 0 and cb.updates != null and cb.update_lens != null) {
+        const arr = gpa.alloc([]u8, cb.update_count) catch {
+            gpa.free(base);
+            freeCellBytes(&cb);
+            return false;
+        };
+        var k: usize = 0;
+        while (k < cb.update_count) : (k += 1) {
+            arr[k] = gpa.dupe(u8, cb.updates.?[k][0..cb.update_lens.?[k]]) catch {
+                for (arr[0..k]) |u| gpa.free(u);
+                gpa.free(arr);
+                gpa.free(base);
+                freeCellBytes(&cb);
+                return false;
+            };
+        }
+        ups = arr;
+    }
+    freeCellBytes(&cb);
+    lc.base = base;
+    lc.updates = ups;
+    return true;
+}
+
 // Parse + portray a lazy cell if not already loaded, and stamp its LRU tick.
 fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
     ls.tick += 1;
     lc.tick = ls.tick;
     if (lc.cell != null) return;
+    if (lc.streaming and lc.base.len == 0) {
+        if (!streamRead(ls, lc)) return;
+    }
     var cell = s57.parseCellWithUpdates(gpa, lc.base, lc.updates) catch return;
     if (gpa.create(std.heap.ArenaAllocator)) |p| {
         p.* = std.heap.ArenaAllocator.init(gpa);
@@ -169,6 +254,15 @@ fn lazyUnload(lc: *LazyCell) void {
         gpa.destroy(p);
         lc.arena = null;
     }
+    // Streaming cells free their on-demand bytes on unload (reload re-reads), so
+    // only the resident working set holds bytes.
+    if (lc.streaming) {
+        if (lc.base.len > 0) gpa.free(lc.base);
+        for (lc.updates) |u| gpa.free(u);
+        if (lc.updates.len > 0) gpa.free(lc.updates);
+        lc.base = &.{};
+        lc.updates = &.{};
+    }
 }
 
 // Evict LRU loaded cells down to budget, never touching cells used by the tile
@@ -188,8 +282,8 @@ fn lazyEvict(ls: *LazySource, keep_from: u64) void {
 }
 
 fn lazyFreeCell(lc: *LazyCell) void {
-    lazyUnload(lc);
-    gpa.free(lc.base);
+    lazyUnload(lc); // streaming cells are already emptied here
+    if (lc.base.len > 0) gpa.free(lc.base);
     for (lc.updates) |u| gpa.free(u);
     if (lc.updates.len > 0) gpa.free(lc.updates);
 }
@@ -355,6 +449,38 @@ pub const Source = struct {
         };
         src.* = .{
             .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy } },
+            .cache = std.AutoHashMap(u64, []u8).init(gpa),
+        };
+        return src;
+    }
+
+    /// Open an ENC_ROOT as a streaming multi-cell source: the host supplies cheap
+    /// per-cell metadata (bbox + scale) up front and a `reader` callback that
+    /// returns a cell's bytes on demand. Cell bytes are read only when a tile
+    /// needs them and freed on LRU eviction, so the host holds the working set's
+    /// bytes — not the whole ENC_ROOT. No bytes are read at open. Errors if empty.
+    pub fn openCellsStreaming(metas: []const CellMeta, reader: CellReadFn, user: ?*anyopaque, rules_dir: ?[]const u8) !*Source {
+        if (metas.len == 0) return error.OpenFailed;
+        const dir = resolveRulesDir(rules_dir);
+        const dir_copy = try gpa.dupe(u8, dir);
+        errdefer gpa.free(dir_copy);
+        const cells = gpa.alloc(LazyCell, metas.len) catch return error.OpenFailed;
+        for (metas, 0..) |m, i| {
+            cells[i] = .{
+                .base = &.{},
+                .updates = &.{},
+                .bbox = .{ m.west, m.south, m.east, m.north },
+                .band = bake_enc.bandOf(m.cscl),
+                .streaming = true,
+                .index = i,
+            };
+        }
+        const src = gpa.create(Source) catch {
+            gpa.free(cells);
+            return error.OpenFailed;
+        };
+        src.* = .{
+            .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy, .reader = reader, .reader_user = user } },
             .cache = std.AutoHashMap(u64, []u8).init(gpa),
         };
         return src;

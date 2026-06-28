@@ -31,6 +31,11 @@ pub const Source = source.Source;
 pub const Format = source.Format;
 pub const CellInput = source.CellInput;
 pub const Progress = source.Progress;
+// Streaming ENC_ROOT open (read cell bytes on demand, low memory): see
+// Source.openCellsStreaming.
+pub const CellMeta = source.CellMeta;
+pub const CellBytes = source.CellBytes;
+pub const CellReadFn = source.CellReadFn;
 /// Bake an ENC_ROOT into one band-streamed PMTiles archive.
 pub const bakeArchive = source.bakeArchive;
 /// Free bytes returned by `Source.tile` / `bakeArchive`.
