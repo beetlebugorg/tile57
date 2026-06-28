@@ -171,6 +171,32 @@ pub fn resolveFeatureByObjl(objl: u16) ?[]const u8 {
     return resolveFeature(acr);
 }
 
+/// S-57 OBJL (numeric) -> S-57 acronym (e.g. 75 -> "LIGHTS", 308 -> "M_QUAL").
+/// Used to tag MVT features with `class` so the client's S-52 portrayal filters
+/// (data quality, meta boundaries, light text) can select by object class. The
+/// s57codes table omits the meta object classes (M_*, OBJL >= 300), so fall back
+/// to a small table of the ones the client filters on.
+pub fn acronymByObjl(objl: u16) ?[]const u8 {
+    ensureLoaded();
+    if (g_cat) |*c| if (c.obj_acronym.get(objl)) |acr| return acr;
+    return switch (objl) {
+        300 => "M_ACCY",
+        301 => "M_HOPA",
+        302 => "M_COVR",
+        303 => "M_CSCL",
+        304 => "M_HDAT",
+        305 => "M_NPUB",
+        306 => "M_NSYS",
+        307 => "M_PROD",
+        308 => "M_QUAL",
+        309 => "M_SDAT",
+        310 => "M_SREL",
+        311 => "M_UNIT",
+        312 => "M_VDAT",
+        else => null,
+    };
+}
+
 /// S-57 ATTL (numeric) -> S-101 attribute code, via acronym.
 pub fn resolveAttrByCode(attl: u16) ?[]const u8 {
     ensureLoaded();
