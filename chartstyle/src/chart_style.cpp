@@ -133,6 +133,28 @@ json categoryFilter(const MarinerSettings &m) {
     return json::array({"all", inCat, json::array({"!", isQual})});
 }
 
+// Boundary symbolization (S-52 §8.6.1), client-side: each area primitive is baked
+// with a `bnd` tag — 2 = style-independent (always shown), 0 = plain-boundary, 1 =
+// symbolized-boundary. Show common (2) + the active style. A missing `bnd` (non-area
+// / unvarying / stale tile) coalesces to 2 → always shown. Default SYMBOLIZED (rank
+// 1) per the IMO/S-52 default (the engine's default pass is symbolized). Mirrors the
+// Go client's boundaryFilter.
+json boundaryFilter(const MarinerSettings &m) {
+    const int rank = m.boundaryStyle == BoundaryStyle::Plain ? 0 : 1;
+    return json::array({"in", coalesce(get("bnd"), 2), json::array({"literal", json::array({2, rank})})});
+}
+
+// Point-symbol style (S-52 §11.2.2), client-side: point features that resolve
+// differently under the simplified vs paper-chart symbol lookup are baked twice,
+// tagged `pts` — 2 = style-independent (always shown), 0 = paper-chart, 1 =
+// simplified. Show common (2) + the active style. A missing `pts` (non-point /
+// identical-in-both / stale tile) coalesces to 2 → always shown. Default PAPER (rank
+// 0) per the engine default. Mirrors the Go client's pointStyleFilter.
+json pointStyleFilter(const MarinerSettings &m) {
+    const int rank = m.simplifiedPoints ? 1 : 0;
+    return json::array({"in", coalesce(get("pts"), 2), json::array({"literal", json::array({2, rank})})});
+}
+
 // S-52 §14.5 text-group selection: each text feature carries its `tgrp` tag; the
 // mariner toggles which groups show. Important text (11) is always on (safety-
 // critical clearances/bearings). Names = 21/26/29, light descriptions = 23, Other =
@@ -258,6 +280,10 @@ std::string buildStyle(const std::string &templateJson, const MarinerSettings &m
         if (L.value("source", std::string()) == "chart") {
             std::vector<json> clauses;
             clauses.push_back(categoryFilter(m));
+            // Boundary symbolization (areas) + point-symbol style (points): each
+            // shows the style-independent (2) primitives plus the active style's.
+            clauses.push_back(boundaryFilter(m));
+            clauses.push_back(pointStyleFilter(m));
             if (!m.showInformCallouts) // INFORM01 "additional information" callouts off
                 clauses.push_back(json::array({"!=", coalesce(get("symbol_name"), ""), "INFORM01"}));
             if (!m.highlightDateDependent) // CHDATD01 date-dependent highlight (opt-in)

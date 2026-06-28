@@ -33,3 +33,6 @@ __pycache__/
 
 # Local engineering notes (not version-controlled)
 /specs/
+
+# Claude Code agent worktrees / session data
+.claude/

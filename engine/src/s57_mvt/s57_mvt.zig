@@ -265,17 +265,29 @@ const Meta = struct {
     band: u8 = 0, // NOAA band rank (0 finest … 5 coarsest)
     date_start: []const u8 = "",
     date_end: []const u8 = "",
+    // S-52 boundary symbolization (§8.6.1) and point-symbol style (§11.2.2) tags
+    // the client's boundaryFilter / pointStyleFilter key off: 2 = style-independent
+    // (always shown — omitted from the tile, the client coalesces a missing tag to
+    // 2), 0/1 = the plain/symbolized boundary or paper/simplified point pass.
+    bnd: i64 = 2,
+    pts: i64 = 2,
 };
 
-/// Append the shared metadata tags: S-52 draw priority + display category (always),
-/// the object-class acronym (for data-quality/meta/light filters), the SCAMIN 1:N
-/// denominator (when gated), and the date-dependent validity tags (when dated).
+/// Append the shared metadata tags: S-52 draw priority + display category + band
+/// (always), the object-class acronym (data-quality/meta/light filters), the SCAMIN
+/// 1:N denominator (when gated), the boundary/point-style variant tags (only when
+/// style-dependent), and the date-dependent validity tags (when dated).
 fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
     try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
     try props.append(a, .{ .key = "band", .value = .{ .int = m.band } });
     if (m.class.len > 0) try props.append(a, .{ .key = "class", .value = .{ .string = m.class } });
     if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
+    // bnd/pts are emitted only for the style-variant passes (0/1); the common case
+    // (2) is left off so the client coalesces to 2 (always shown) — keeping every
+    // unvarying feature's tile footprint unchanged.
+    if (m.bnd != 2) try props.append(a, .{ .key = "bnd", .value = .{ .int = m.bnd } });
+    if (m.pts != 2) try props.append(a, .{ .key = "pts", .value = .{ .int = m.pts } });
     // Date-dependent display (S-52 §10.4.1.1): recurring iff a "--" month-day prefix,
     // stripped so the client compares MMDD (recurring) / YYYYMMDD (fixed).
     if (m.date_start.len > 0 or m.date_end.len > 0) {
@@ -312,9 +324,56 @@ fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.
     return cell.lineGeometryParts(a, f);
 }
 
-fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, instr: []const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
-    const p = try s101.parse(a, instr);
+/// True when `variant` is a usable display-variant stream that genuinely differs
+/// from the default `base` stream — i.e. this feature's portrayal actually changes
+/// under the override, so it needs a two-pass (rank 0/1) split. An absent, errored,
+/// or byte-identical variant means the feature is style-independent: it stays a
+/// single common pass (rank 2), keeping its tile footprint unchanged.
+fn variantDiffers(base: []const u8, variant: ?[]const u8) bool {
+    const v = variant orelse return false;
+    if (std.mem.startsWith(u8, v, "ERROR:")) return false;
+    return !std.mem.eql(u8, base, v);
+}
 
+/// Emit one feature, tagging its primitives with the boundary/point-style variant
+/// it varies under. Replicates the Go portrayer's Passes semantics (§8.6.1/§11.2.2):
+///   - AREA features whose boundary changes under PlainBoundaries get two passes —
+///     the default (symbolized, bnd=1) and the plain stream (bnd=0);
+///   - (non-SOUNDG) POINT features whose symbol changes under SimplifiedSymbols get
+///     two passes — the default (paper, pts=0) and the simplified stream (pts=1);
+///   - everything else (including features whose variant stream is identical) stays
+///     a single common pass (bnd=pts=2, tags omitted).
+/// SOUNDG bypasses this path (emitted as a multipoint earlier), so it never doubles.
+fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+    const base = try s101.parse(a, instr);
+
+    // Point-symbol style (pts): a point feature whose simplified-symbol stream
+    // differs is emitted twice (paper pts=0 + simplified pts=1); else common.
+    if (f.prim == 1) {
+        if (variantDiffers(instr, simplified)) {
+            try emitParsed(a, cell, f, fi, geo, base, 2, 0, z, x, y, tb, box, L);
+            const sp = try s101.parse(a, simplified.?);
+            try emitParsed(a, cell, f, fi, geo, sp, 2, 1, z, x, y, tb, box, L);
+        } else {
+            try emitParsed(a, cell, f, fi, geo, base, 2, 2, z, x, y, tb, box, L);
+        }
+        return;
+    }
+    // Boundary symbolization (bnd): an area feature whose plain-boundary stream
+    // differs is emitted twice (symbolized bnd=1 + plain bnd=0); else common.
+    if (f.prim == 3 and variantDiffers(instr, plain)) {
+        try emitParsed(a, cell, f, fi, geo, base, 1, 2, z, x, y, tb, box, L);
+        const pl = try s101.parse(a, plain.?);
+        try emitParsed(a, cell, f, fi, geo, pl, 0, 2, z, x, y, tb, box, L);
+        return;
+    }
+    // Lines, and any feature whose variant is absent/identical: one common pass.
+    try emitParsed(a, cell, f, fi, geo, base, 2, 2, z, x, y, tb, box, L);
+}
+
+/// Emit one parsed portrayal pass `p`, stamping every primitive with the pass's
+/// boundary (`bnd`) and point-style (`pts`) variant tags.
+fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     // Route each feature into its base layer or the *_scamin bucket depending on
     // whether it carries a SCAMIN (1:N) display limit. Same geometry/properties
     // either way; the bucket lets the style gate the feature below its scale.
@@ -327,6 +386,8 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
         .band = L.band,
         .date_start = p.date_start,
         .date_end = p.date_end,
+        .bnd = bnd,
+        .pts = pts,
     };
     const areas_l = if (scamin != null) L.areas_scamin else L.areas;
     const apat_l = if (scamin != null) L.area_patterns_scamin else L.area_patterns;
@@ -557,10 +618,15 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
     }
 }
 
-/// One cell plus its optional per-feature S-101 instruction streams.
+/// One cell plus its optional per-feature S-101 instruction streams. `portrayal`
+/// is the default pass; `portrayal_plain` / `portrayal_simplified` are the
+/// boundary-style (area) and point-style (point) display variants (null when not
+/// computed) — see portray.CellPortrayal.
 pub const CellRef = struct {
     cell: *s57.Cell,
     portrayal: ?[]const ?[]const u8 = null,
+    portrayal_plain: ?[]const ?[]const u8 = null,
+    portrayal_simplified: ?[]const ?[]const u8 = null,
     geo: ?GeoParts = null,
     band: u8 = 0,
     /// Drop this coarser band cell's AREA fills / patterns where a finer band's
@@ -618,7 +684,7 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
         Lc.band = cr.band; // so this cell's features carry its band for the sort key
         Lc.suppress_fills = cr.suppress_fills; // coarse band over finer M_COVR (whole-tile): drop fill
         Lc.suppress_patterns = cr.suppress_patterns; // coarse band over finer M_COVR (centre): drop pattern
-        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.geo, z, x, y, tb, box);
+        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, z, x, y, tb, box);
     }
 
     var layers = std.ArrayList(mvt.Layer).empty;
@@ -645,6 +711,8 @@ fn appendCellFeatures(
     soundings: *std.ArrayList(mvt.Feature),
     cell: *s57.Cell,
     portrayal: ?[]const ?[]const u8,
+    portrayal_plain: ?[]const ?[]const u8,
+    portrayal_simplified: ?[]const ?[]const u8,
     geo: ?GeoParts,
     z: u8,
     x: u32,
@@ -667,7 +735,12 @@ fn appendCellFeatures(
         const errored = stream != null and std.mem.startsWith(u8, stream.?, "ERROR:");
         if (stream) |s| {
             if (!errored) {
-                try emitFromInstr(a, cell.*, f, fi, geo, s, z, x, y, tb, box, L);
+                // The boundary-style (area) / point-style (point) display variants
+                // for this feature, if portrayed — emitFromInstr splits the feature
+                // into two passes only when the variant actually differs.
+                const plain: ?[]const u8 = if (portrayal_plain) |pp| (if (fi < pp.len) pp[fi] else null) else null;
+                const simplified: ?[]const u8 = if (portrayal_simplified) |pp| (if (fi < pp.len) pp[fi] else null) else null;
+                try emitFromInstr(a, cell.*, f, fi, geo, s, plain, simplified, z, x, y, tb, box, L);
                 continue;
             }
         }
@@ -854,7 +927,7 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
     };
-    try emitFromInstr(a, cell, f_sc, 0, null, "DrawingPriority:7;PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f_sc, 0, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
     try std.testing.expectEqual(@as(usize, 0), points.items.len);
     try std.testing.expectEqual(@as(usize, 1), points_s.items.len);
     try std.testing.expectEqual(@as(i64, 7), findProp(points_s.items[0].properties, "draw_prio").?.int);
@@ -865,10 +938,135 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .rcnm = 0, .rcid = 2, .prim = 1, .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try emitFromInstr(a, cell, f_base, 0, null, "PointInstruction:BOYLAT01", 0, 0, 0, tb, box, L);
+    try emitFromInstr(a, cell, f_base, 0, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
     try std.testing.expectEqual(@as(usize, 1), points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "draw_prio").?.int);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "scamin"));
+    // No point-style variant -> common pass: no `pts` tag (client coalesces to 2).
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "pts"));
+}
+
+test "variantDiffers: absent/errored/identical = common, real change = split" {
+    try std.testing.expect(!variantDiffers("PointInstruction:A", null));
+    try std.testing.expect(!variantDiffers("PointInstruction:A", "ERROR: boom"));
+    try std.testing.expect(!variantDiffers("PointInstruction:A", "PointInstruction:A"));
+    try std.testing.expect(variantDiffers("PointInstruction:BOYLAT01", "PointInstruction:BOYLAT11"));
+}
+
+test "emitFromInstr tags pts 0/1 when a point's simplified symbol differs" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
+        .edges = std.AutoHashMap(u32, usize).init(gpa),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
+        .arena = std.heap.ArenaAllocator.init(gpa),
+    };
+    defer cell.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, .{ .lon = 0, .lat = 0 });
+
+    var areas = std.ArrayList(mvt.Feature).empty;
+    var area_patterns = std.ArrayList(mvt.Feature).empty;
+    var lines = std.ArrayList(mvt.Feature).empty;
+    var points = std.ArrayList(mvt.Feature).empty;
+    var texts = std.ArrayList(mvt.Feature).empty;
+    var areas_s = std.ArrayList(mvt.Feature).empty;
+    var apat_s = std.ArrayList(mvt.Feature).empty;
+    var lines_s = std.ArrayList(mvt.Feature).empty;
+    var points_s = std.ArrayList(mvt.Feature).empty;
+    var texts_s = std.ArrayList(mvt.Feature).empty;
+    const L = Layers{
+        .areas = &areas,            .area_patterns = &area_patterns,    .lines = &lines,
+        .points = &points,          .texts = &texts,
+        .areas_scamin = &areas_s,   .area_patterns_scamin = &apat_s,    .lines_scamin = &lines_s,
+        .points_scamin = &points_s, .texts_scamin = &texts_s,
+    };
+    const tb = [4]f64{ -1, -1, 1, 1 };
+    const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
+
+    const f = s57.Feature{
+        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+    };
+    // Paper -> BOYLAT01; simplified -> BOYLAT11. Two passes: pts=0 then pts=1.
+    try emitFromInstr(a, cell, f, 0, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", 0, 0, 0, tb, box, L);
+    try std.testing.expectEqual(@as(usize, 2), points.items.len);
+    try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "pts").?.int);
+    try std.testing.expectEqualStrings("BOYLAT01", findProp(points.items[0].properties, "symbol_name").?.string);
+    try std.testing.expectEqual(@as(i64, 1), findProp(points.items[1].properties, "pts").?.int);
+    try std.testing.expectEqualStrings("BOYLAT11", findProp(points.items[1].properties, "symbol_name").?.string);
+    // Boundary axis untouched on a point: no `bnd` tag.
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "bnd"));
+}
+
+test "emitFromInstr tags bnd 1/0 when an area's plain boundary differs" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
+        .edges = std.AutoHashMap(u32, usize).init(gpa),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
+        .arena = std.heap.ArenaAllocator.init(gpa),
+    };
+    defer cell.deinit();
+    // A square ring, pre-assembled below so emitFromInstr skips edge resolution.
+    const ring = [_]s57.LonLat{
+        .{ .lon = -0.5, .lat = -0.5 }, .{ .lon = 0.5, .lat = -0.5 },
+        .{ .lon = 0.5, .lat = 0.5 },   .{ .lon = -0.5, .lat = 0.5 },
+        .{ .lon = -0.5, .lat = -0.5 },
+    };
+
+    var areas = std.ArrayList(mvt.Feature).empty;
+    var area_patterns = std.ArrayList(mvt.Feature).empty;
+    var lines = std.ArrayList(mvt.Feature).empty;
+    var points = std.ArrayList(mvt.Feature).empty;
+    var texts = std.ArrayList(mvt.Feature).empty;
+    var areas_s = std.ArrayList(mvt.Feature).empty;
+    var apat_s = std.ArrayList(mvt.Feature).empty;
+    var lines_s = std.ArrayList(mvt.Feature).empty;
+    var points_s = std.ArrayList(mvt.Feature).empty;
+    var texts_s = std.ArrayList(mvt.Feature).empty;
+    const L = Layers{
+        .areas = &areas,            .area_patterns = &area_patterns,    .lines = &lines,
+        .points = &points,          .texts = &texts,
+        .areas_scamin = &areas_s,   .area_patterns_scamin = &apat_s,    .lines_scamin = &lines_s,
+        .points_scamin = &points_s, .texts_scamin = &texts_s,
+    };
+    const tb = [4]f64{ -1, -1, 1, 1 };
+    const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
+
+    // Pre-assembled geometry for one area feature (bypasses edge resolution).
+    const part = try a.dupe(s57.LonLat, &ring);
+    const parts = try a.alloc([]s57.LonLat, 1);
+    parts[0] = part;
+    const geo_one = try a.alloc(?[][]s57.LonLat, 1);
+    geo_one[0] = parts;
+
+    const f = s57.Feature{ .rcnm = 0, .rcid = 1, .prim = 3, .objl = 42 };
+    // Symbolized boundary draws a complex line; plain draws a simple stroke.
+    const symbolized = "ColorFill:DEPMS;LineStyle:CTNARE51,,1,CHMGD;LineInstruction:CTNARE51";
+    const plain = "ColorFill:DEPMS;LineStyle:_simple_,,1,CHMGD;LineInstruction:_simple_";
+    try emitFromInstr(a, cell, f, 0, geo_one, symbolized, plain, null, 0, 0, 0, tb, box, L);
+    // Both passes emit the fill: one tagged bnd=1 (symbolized), one bnd=0 (plain).
+    try std.testing.expectEqual(@as(usize, 2), areas.items.len);
+    try std.testing.expectEqual(@as(i64, 1), findProp(areas.items[0].properties, "bnd").?.int);
+    try std.testing.expectEqual(@as(i64, 0), findProp(areas.items[1].properties, "bnd").?.int);
+    // Symbolized + plain boundary line, each tagged with its pass's bnd.
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expectEqual(@as(i64, 1), findProp(lines.items[0].properties, "bnd").?.int);
+    try std.testing.expectEqual(@as(i64, 0), findProp(lines.items[1].properties, "bnd").?.int);
 }
 
 test "generate a tile from a cell is well-formed MVT" {

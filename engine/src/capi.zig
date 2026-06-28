@@ -32,7 +32,9 @@ const Format = enum(c_int) { auto = 0, pmtiles = 1, s57_cell = 2 };
 
 const CellBackend = struct {
     cell: s57.Cell,
-    portrayal: ?[]?[]const u8 = null, // per-feature S-101 instruction stream
+    portrayal: ?[]const ?[]const u8 = null, // per-feature default S-101 instruction stream
+    portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
+    portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     portray_arena: ?*std.heap.ArenaAllocator = null,
 };
 
@@ -47,6 +49,8 @@ const LazyCell = struct {
     band: bake_enc.Band,
     cell: ?s57.Cell = null,
     portrayal: ?[]const ?[]const u8 = null,
+    portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
+    portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     arena: ?*std.heap.ArenaAllocator = null,
     tick: u64 = 0, // LRU: last tile that used this cell
     // M_COVR(CATCOV=1) data-coverage polygons (each = a list of lon/lat rings),
@@ -124,8 +128,10 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
     var cell = s57.parseCellWithUpdates(gpa, lc.base, lc.updates) catch return;
     if (gpa.create(std.heap.ArenaAllocator)) |p| {
         p.* = std.heap.ArenaAllocator.init(gpa);
-        if (portray.portrayCell(p.allocator(), &cell, ls.rules_dir)) |res| {
-            lc.portrayal = res;
+        if (portray.portrayCellVariants(p.allocator(), &cell, ls.rules_dir)) |cp| {
+            lc.portrayal = cp.base;
+            lc.portrayal_plain = cp.plain;
+            lc.portrayal_simplified = cp.simplified;
             lc.arena = p;
         } else |_| {
             p.deinit();
@@ -141,6 +147,8 @@ fn lazyUnload(lc: *LazyCell) void {
     lc.cell = null;
     lc.portrayal = null;
     lc.coverage = null; // backing memory lived in cell.arena, freed by c.deinit()
+    lc.portrayal_plain = null;
+    lc.portrayal_simplified = null;
     if (lc.arena) |p| {
         p.deinit();
         gpa.destroy(p);
@@ -263,8 +271,10 @@ fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const 
     var cb = CellBackend{ .cell = cell };
     const pa = gpa.create(std.heap.ArenaAllocator) catch return cb;
     pa.* = std.heap.ArenaAllocator.init(gpa);
-    if (portray.portrayCell(pa.allocator(), &cb.cell, dir)) |res| {
-        cb.portrayal = res;
+    if (portray.portrayCellVariants(pa.allocator(), &cb.cell, dir)) |cp| {
+        cb.portrayal = cp.base;
+        cb.portrayal_plain = cp.plain;
+        cb.portrayal_simplified = cp.simplified;
         cb.portray_arena = pa;
     } else |_| {
         pa.deinit();
@@ -396,14 +406,20 @@ const BakeWork = struct {
         // One arena per cell holds both the portrayal streams and the assembled
         // geometry cache, freed together when the band is done.
         var portrayal: ?[]const ?[]const u8 = null;
+        var portrayal_plain: ?[]const ?[]const u8 = null;
+        var portrayal_simplified: ?[]const ?[]const u8 = null;
         var geo: ?s57_mvt.GeoParts = null;
         const pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(gpa);
-            portrayal = portray.portrayCell(p.allocator(), &cell, c.rules_dir) catch null;
+            if (portray.portrayCellVariants(p.allocator(), &cell, c.rules_dir)) |cp| {
+                portrayal = cp.base;
+                portrayal_plain = cp.plain;
+                portrayal_simplified = cp.simplified;
+            } else |_| {}
             if (c.build_geo) geo = s57_mvt.buildGeoCache(p.allocator(), &cell) catch null;
         }
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .geo = geo, .bounds = b };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b };
         c.arenas[i] = pa;
     }
 };
@@ -716,7 +732,15 @@ export fn tile57_tile_get(
     // empty tiles aren't recomputed every frame).
     const bytes: []u8 = switch (s.backend) {
         .reader => |*r| (r.getTile(gpa, z, x, y) catch return -1) orelse (gpa.alloc(u8, 0) catch return -1),
-        .cell => |*cb| s57_mvt.generateTile(gpa, &cb.cell, z, x, y, cb.portrayal) catch return -1,
+        .cell => |*cb| blk_cell: {
+            const one = [_]s57_mvt.CellRef{.{
+                .cell = &cb.cell,
+                .portrayal = cb.portrayal,
+                .portrayal_plain = cb.portrayal_plain,
+                .portrayal_simplified = cb.portrayal_simplified,
+            }};
+            break :blk_cell s57_mvt.generateTileMulti(gpa, &one, z, x, y) catch return -1;
+        },
         .cells => |*ls| blk: {
             const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
             // Collect every overlapping cell whose native band range includes z, so
@@ -782,6 +806,8 @@ export fn tile57_tile_get(
                     refs.append(gpa, .{
                         .cell = c,
                         .portrayal = lc.portrayal,
+                        .portrayal_plain = lc.portrayal_plain,
+                        .portrayal_simplified = lc.portrayal_simplified,
                         .band = @intFromEnum(lc.band),
                         .suppress_fills = bake_enc.coarseAreaSuppressed(nm, z, cov_whole),
                         .suppress_patterns = bake_enc.coarseAreaSuppressed(nm, z, cov_centre),

@@ -42,6 +42,8 @@ private:
     QDoubleSpinBox *safety_ = nullptr;
     QDoubleSpinBox *deep_ = nullptr;
     QDoubleSpinBox *safetyDepth_ = nullptr;
+    QComboBox *boundaryStyle_ = nullptr;
+    QCheckBox *simplifiedPoints_ = nullptr;
     QCheckBox *textNames_ = nullptr;
     QCheckBox *lightDescriptions_ = nullptr;
     QCheckBox *textOther_ = nullptr;

@@ -321,8 +321,10 @@ int tile57_diag_portray_demo(const char *dir) {
     static const char *driver =
         "local cps={Type='array:ContextParameter'}\n"
         "local function cp(n,t,d) table.insert(cps, PortrayalCreateContextParameter(n,t,d)) end\n"
-        "cp('RadarOverlay','boolean','false'); cp('PlainBoundaries','boolean','false')\n"
-        "cp('SimplifiedSymbols','boolean','false'); cp('FourShades','boolean','true')\n"
+        "cp('RadarOverlay','boolean','false')\n"
+        "cp('PlainBoundaries','boolean', PLAIN_BOUNDARIES and 'true' or 'false')\n"
+        "cp('SimplifiedSymbols','boolean', SIMPLIFIED_SYMBOLS and 'true' or 'false')\n"
+        "cp('FourShades','boolean','true')\n"
         "cp('FullLightLines','boolean','false'); cp('IgnoreScaleMinimum','boolean','false')\n"
         "cp('ShallowWaterDangers','boolean','false'); cp('SafetyContour','real','30')\n"
         "cp('SafetyDepth','real','30'); cp('ShallowContour','real','2')\n"
@@ -543,8 +545,12 @@ static int lp_store(lua_State *L) { /* tg_store(index, instr) */
 }
 
 /* Run the S-101 rules over the adapted cell features (tgp_*), storing each
- * feature's instruction stream via tgp_emit. Returns 0 on success. */
-int tg_portray_run(const char *dir, size_t dir_len) {
+ * feature's instruction stream via tgp_emit. `plain_boundaries` /
+ * `simplified_symbols` (0/1) override the S-101 PlainBoundaries /
+ * SimplifiedSymbols context parameters so the caller can portray the
+ * plain-boundary (S-52 §8.6.1) and simplified-point-symbol (§11.2.2) display
+ * variants; both 0 reproduces the default pass unchanged. Returns 0 on success. */
+int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int simplified_symbols) {
     char dbuf[4096];
     if (dir_len >= sizeof dbuf) return -1;
     memcpy(dbuf, dir, dir_len);
@@ -635,8 +641,10 @@ int tg_portray_run(const char *dir, size_t dir_len) {
     static const char *driver =
         "local cps={Type='array:ContextParameter'}\n"
         "local function cp(n,t,d) table.insert(cps, PortrayalCreateContextParameter(n,t,d)) end\n"
-        "cp('RadarOverlay','boolean','false'); cp('PlainBoundaries','boolean','false')\n"
-        "cp('SimplifiedSymbols','boolean','false'); cp('FourShades','boolean','true')\n"
+        "cp('RadarOverlay','boolean','false')\n"
+        "cp('PlainBoundaries','boolean', PLAIN_BOUNDARIES and 'true' or 'false')\n"
+        "cp('SimplifiedSymbols','boolean', SIMPLIFIED_SYMBOLS and 'true' or 'false')\n"
+        "cp('FourShades','boolean','true')\n"
         "cp('FullLightLines','boolean','false'); cp('IgnoreScaleMinimum','boolean','false')\n"
         "cp('ShallowWaterDangers','boolean','false'); cp('SafetyContour','real','30')\n"
         "cp('SafetyDepth','real','30'); cp('ShallowContour','real','2')\n"
@@ -670,6 +678,14 @@ int tg_portray_run(const char *dir, size_t dir_len) {
         "end\n";
     lua_pushboolean(L, g_portray_quiet);
     lua_setglobal(L, "QUIET");
+    // Display-variant context overrides (S-52 §8.6.1 / §11.2.2): the driver's
+    // cp() lines read these globals for the PlainBoundaries / SimplifiedSymbols
+    // context parameters. Both 0 => the default pass (symbolized boundaries +
+    // paper-chart point symbols).
+    lua_pushboolean(L, plain_boundaries);
+    lua_setglobal(L, "PLAIN_BOUNDARIES");
+    lua_pushboolean(L, simplified_symbols);
+    lua_setglobal(L, "SIMPLIFIED_SYMBOLS");
     int rc = 0;
     if (luaL_dostring(L, driver) != LUA_OK) {
         fprintf(stderr, "[s101] dispatch: %s\n", lua_tostring(L, -1));

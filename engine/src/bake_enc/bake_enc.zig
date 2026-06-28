@@ -23,6 +23,8 @@ const tile = @import("tile");
 pub const Backend = struct {
     cell: s57.Cell,
     portrayal: ?[]const ?[]const u8 = null,
+    portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
+    portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     geo: ?s57_mvt.GeoParts = null, // line/area geometry assembled once (buildGeoCache)
     bounds: [4]f64,
 };
@@ -169,7 +171,7 @@ const TileGenCtx = struct {
         const idxs = c.idx_lists[i];
         const refs = c.gpa.alloc(s57_mvt.CellRef, idxs.len) catch return;
         defer c.gpa.free(refs);
-        for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .geo = c.backends[idx].geo };
+        for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo };
         const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y) catch return;
         if (mvt_bytes.len > 0) c.results[i] = mvt_bytes else c.gpa.free(mvt_bytes);
     }
