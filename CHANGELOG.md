@@ -27,19 +27,19 @@ C ABI is not yet frozen.
   — behavior identical; the C ABI (`tile57_*`) is unchanged.
 
 ### Added — offline chart-bundle baker
-- **`chartplotter-bake bundle <cell> -o <dir>`** emits a self-contained,
+- **`tile57 bundle <cell> -o <dir>`** emits a self-contained,
   relocatable **chart bundle**: `tiles/chart.pmtiles` + `assets/colortables.json` +
   `assets/style-{day,dusk,night}.json` + `manifest.json`. The tiles carry S-52 colour
   *tokens* (palette-independent); the assets carry the RGB and the style layers. Both
   halves come from the same S-101 catalogue and are stamped with a `schema_version`
   (`tile57/1`) so a renderer can refuse a mismatched bundle.
 - **New `assets` module** (mirrors the Go oracle's `internal/engine/assets.EmitS101`)
-  and **`chartplotter-bake assets <catalog-dir> -o <dir>`** emit the portrayal
+  and **`tile57 assets <catalog-dir> -o <dir>`** emit the portrayal
   assets independent of a cell. First artifact: `colortables.json` (token → hex per
   day/dusk/night palette, parsed from `ColorProfiles/colorProfile.xml`) — **byte-
   identical to the Go oracle's output**.
 - **MapLibre `style.json` generation** (`assets/style.zig`, a port of
-  ported from the web `s52-style.mjs`/`chart-style.mjs`): `chartplotter-bake style`
+  ported from the web `s52-style.mjs`/`chart-style.mjs`): `tile57 style`
   emits one style per palette, and `bundle` writes the three styles + references them
   in `manifest.portrayal.styles`, so a bundle is **directly renderable**.
 
@@ -48,7 +48,7 @@ C ABI is not yet frozen.
   transitional `scripts/check-style-parity.sh`). `engine/src/assets/style.zig` is
   now the sole style generator — verified full-file identical to `build_style.py`
   (27 layers × 3 palettes) before removal — and `scripts/gen-style.sh` drives
-  `chartplotter-bake style`. Line styles, sprite/pattern atlases (SVG raster), and
+  `tile57 style`. Line styles, sprite/pattern atlases (SVG raster), and
   glyphs (SDF) — to light up the symbol/text layers — are next.
 
 ### Added — on-demand ENC_ROOT + offline baker
@@ -82,7 +82,7 @@ C ABI is not yet frozen.
   matching the Go reference), bakes finest → coarsest with best-band dedup, holding
   one band at a time. Portrayal + per-tile MVT generation run across all cores
   (`parallelFor`; thread-local Lua context, warmed catalogue, quiet flag); per-cell
-  geometry is assembled once (`buildGeoCache`) and reused. CLI `chartplotter-bake
+  geometry is assembled once (`buildGeoCache`) and reused. CLI `tile57
   bake-root <ENC_ROOT> -o out.pmtiles`; C ABI `tile57_bake_cells`. The app can use
   it on open via `CHARTPLOTTER_BAKE=1` (cached under `$XDG_CACHE_HOME/chartplotter`,
   `CHARTPLOTTER_BAKE_MIN/MAXZOOM` to set the range) for smooth-everywhere offline
@@ -100,12 +100,12 @@ C ABI is not yet frozen.
   attrs (ORIENT, VERCCL/VERCLR/VERCOP, HORCLR) so NavigationLine / RecommendedTrack
   / SpanOpening read `feature.<complex>.<value>` instead of crashing on a nil
   complex (Go sync: the `clearances` map + orientation alias).
-- **`chartplotter-bake` CLI** (`engine/tools/bake.zig`): pre-bake a cell to a
-  PMTiles archive — `chartplotter-bake bake <cell.000> -o out.pmtiles
+- **`tile57` CLI** (`engine/tools/bake.zig`): pre-bake a cell to a
+  PMTiles archive — `tile57 bake <cell.000> -o out.pmtiles
   [--rules DIR] [--minzoom N --maxzoom N] [updates…]` — over the cell's bounds,
   plus `inspect`, `cell`, and `version`. The precache path that mirrors
   chartplotter-go's `bake`.
-- **Full S-101 portrayal in the baker.** `chartplotter-bake` now runs the same
+- **Full S-101 portrayal in the baker.** `tile57` now runs the same
   embedded-Lua S-101 rule engine as the live library (not the `classify()`
   fallback), so baked tiles carry the full S-101 layer set
   (areas/area_patterns/lines/point_symbols/soundings/text + `*_scamin` declutter

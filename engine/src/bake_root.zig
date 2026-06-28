@@ -1,4 +1,4 @@
-//! Module root for the chartplotter-bake CLI.
+//! Module root for the tile57 CLI.
 //!
 //! Same surface as root.zig (the pure-Zig engine) PLUS portray.zig — the
 //! embedded-Lua S-101 portrayal — so the baker emits full S-101 styling rather

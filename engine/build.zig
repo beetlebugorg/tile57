@@ -248,7 +248,7 @@ pub fn build(b: *std.Build) void {
     bake_engine.addImport("portray", portray_mod);
 
     const bake = b.addExecutable(.{
-        .name = "chartplotter-bake",
+        .name = "tile57",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/bake.zig"),
             .target = bake_target,

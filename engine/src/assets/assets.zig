@@ -501,7 +501,7 @@ test "linestylesJson: dash pattern + placed symbols, sorted ids, skips no-interv
 
 test "manifestJson: pins schema_version and couples tiles to portrayal" {
     const out = try manifestJson(std.testing.allocator, .{
-        .generator = "chartplotter-bake 0.1.0",
+        .generator = "tile57 0.1.0",
         .created = "2026-06-27T00:00:00Z",
         .catalogue_version = "S-101 PC 1.4.0",
         .tiles_rel = "tiles/chart.pmtiles",

@@ -10,7 +10,7 @@
 # Qt6 (qmake6). Set QT_ROOT_DIR if Qt6 isn't under /usr.
 #
 # Then view a baked chart bundle (needs a display):
-#   chartplotter-bake bundle <cell.000> -o out
+#   tile57 bundle <cell.000> -o out
 #   build/qt/chartplotter-qt out/assets/style-day.json 38.97 -76.49 13
 set -euo pipefail
 

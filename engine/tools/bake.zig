@@ -1,4 +1,4 @@
-//! chartplotter-bake — the offline S-57 -> PMTiles baker / inspector CLI.
+//! tile57 — the offline S-57 -> PMTiles baker / inspector CLI.
 //!
 //! Subcommands:
 //!   bake <cell.000> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N] [update.001 ...]
@@ -20,7 +20,7 @@ const engine = @import("engine");
 const assets = @import("assets");
 const sprite = @import("sprite");
 
-const VERSION = "chartplotter-bake 0.1.0";
+const VERSION = "tile57 0.1.0";
 
 const DEFAULT_MINZOOM: u8 = 8;
 const DEFAULT_MAXZOOM: u8 = 16;
@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "inspect")) {
         if (args.len < 3) {
-            std.debug.print("usage: chartplotter-bake inspect <file.pmtiles> [z x y]\n", .{});
+            std.debug.print("usage: tile57 inspect <file.pmtiles> [z x y]\n", .{});
             return;
         }
         const path = args[2];
@@ -134,7 +134,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "cell")) {
         if (args.len < 3) {
-            std.debug.print("usage: chartplotter-bake cell <file.000>\n", .{});
+            std.debug.print("usage: tile57 cell <file.000>\n", .{});
             return;
         }
         const path = args[2];
@@ -1031,33 +1031,33 @@ fn printUsage() void {
         \\{s} — offline S-57 -> PMTiles baker / inspector
         \\
         \\usage:
-        \\  chartplotter-bake bake <cell.000> -o <out.pmtiles> [options] [update.001 ...]
+        \\  tile57 bake <cell.000> -o <out.pmtiles> [options] [update.001 ...]
         \\      -o, --output PATH   output PMTiles archive (required)
         \\      --rules DIR         S-101 portrayal rules directory (optional)
         \\      --minzoom N         lowest zoom to bake (default {d})
         \\      --maxzoom N         highest zoom to bake (default {d})
-        \\  chartplotter-bake bake-root <ENC_ROOT> -o <out.pmtiles> [options]
+        \\  tile57 bake-root <ENC_ROOT> -o <out.pmtiles> [options]
         \\      Bake a whole ENC_ROOT (every <CELL>.000 + updates) into one
         \\      archive, zoom-banded per cell by compilation scale.
         \\      -o/--output, --rules as above; --minzoom/--maxzoom clamp the bands.
-        \\  chartplotter-bake bundle <cell.000> -o <out-dir> [options] [update.001 ...]
+        \\  tile57 bundle <cell.000> -o <out-dir> [options] [update.001 ...]
         \\      Emit a self-contained chart bundle: tiles/chart.pmtiles +
         \\      assets/colortables.json + manifest.json (pins schema_version,
         \\      couples tiles to portrayal). --rules/--minzoom/--maxzoom as above;
         \\      --catalog DIR PortrayalCatalog (default: parent of --rules);
         \\      --created ISO8601 stamps the manifest (no wall clock in-process).
-        \\  chartplotter-bake assets <portrayal-catalog-dir> -o <out-dir>
+        \\  tile57 assets <portrayal-catalog-dir> -o <out-dir>
         \\      Emit just the portrayal assets (colortables.json today) for a
         \\      catalogue, independent of any cell.
-        \\  chartplotter-bake style <portrayal-catalog-dir> --scheme day -o <out.json>
+        \\  tile57 style <portrayal-catalog-dir> --scheme day -o <out.json>
         \\      Emit one MapLibre style.json (colours from the catalogue, or
         \\      --colortables FILE). --scheme day|dusk|night; --source-tiles/
         \\      --pmtiles-url pick the source; --sprite/--glyphs enable symbol/text
         \\      layers; --minzoom/--maxzoom.
-        \\  chartplotter-bake inspect <file.pmtiles> [z x y]
-        \\  chartplotter-bake cell <file.000>
-        \\  chartplotter-bake version
-        \\  chartplotter-bake help
+        \\  tile57 inspect <file.pmtiles> [z x y]
+        \\  tile57 cell <file.000>
+        \\  tile57 version
+        \\  tile57 help
         \\
     , .{ VERSION, DEFAULT_MINZOOM, DEFAULT_MAXZOOM });
 }

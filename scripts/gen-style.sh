@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate style/chart-{day,dusk,night}.json + chart-zig-day.json from the colour
 # tables via the Zig style generator (engine/src/assets/style.zig, exposed as
-# `chartplotter-bake style`). The styles point at local absolute paths so the host
+# `tile57 style`). The styles point at local absolute paths so the host
 # binary can run from anywhere; they are machine-specific and gitignored.
 set -euo pipefail
 
@@ -14,7 +14,7 @@ GLYPHS="${GLYPHS:-$ROOT/reference/assets/glyphs}"
 SPRITE="${SPRITE:-$ROOT/reference/assets/sprite-mln}"
 
 # Build the baker if it isn't built yet.
-BAKE="$ROOT/engine/zig-out/bin/chartplotter-bake"
+BAKE="$ROOT/engine/zig-out/bin/tile57"
 [[ -x "$BAKE" ]] || ( cd "$ROOT/engine" && zig build )
 
 # Build the MapLibre-format sprite sheet (symbols + area patterns) if missing.

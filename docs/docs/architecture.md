@@ -104,7 +104,7 @@ MapLibre widget (`vendor/maplibre-native-qt`, built by
 mbgl/libtile57 directly. (It replaced an earlier GLFW/macOS-Metal MapLibre Native
 window.)
 
-`chartplotter-bake` (`engine/tools/bake.zig`) is the pure-Zig CLI over the engine
+`tile57` (`engine/tools/bake.zig`) is the pure-Zig CLI over the engine
 for the offline path (tiles, bundles, styles).
 
 ## The offline chart bundle
@@ -127,7 +127,7 @@ manifest stamps both with a `schema_version` (`tile57/1` — the
 [tile-schema](./tile-schema.md) layer/property vocabulary) that a renderer checks
 before loading. `assets/colortables.json` is byte-identical to the Go oracle's.
 
-Baker subcommands (`chartplotter-bake`):
+Baker subcommands (`tile57`):
 
 | Subcommand | What it does |
 |-----------|--------------|

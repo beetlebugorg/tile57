@@ -91,7 +91,7 @@ Full instructions are in the
 | `libtile57.a` | the Zig S-57 **tile generator** + its `tile57_*` C ABI |
 | `chartplotter-render` | headless host: chart → PNG (PMTiles, an S-57 cell, or an ENC_ROOT) |
 | `chartplotter-qt` | interactive **Qt6** chart window (QMapLibre); build via `scripts/build-qmaplibre.sh` |
-| `chartplotter-bake` | offline CLI: bake a cell/ENC_ROOT to PMTiles, or emit a self-contained **chart bundle** (tiles + portrayal assets + manifest) |
+| `tile57` | offline CLI: bake a cell/ENC_ROOT to PMTiles, or emit a self-contained **chart bundle** (tiles + portrayal assets + manifest) |
 
 ## Documentation
 

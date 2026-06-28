@@ -19,7 +19,7 @@ Built only when Zig 0.16 is found:
 | `libtile57.a` | static lib | the Zig S-57 tile generator + its `tile57_*` [C ABI](./c-api.md). |
 | `libchartplotter.a` | static lib | the headless chart **renderer** (chart → PNG) over MapLibre + libtile57; `chartplotter_*` [C API](./c-api.md). |
 | `chartplotter-render` | executable | headless host: renders a chart to a PNG (PMTiles, an S-57 cell, or an ENC_ROOT). |
-| `chartplotter-bake` | executable | offline CLI: bake a cell/ENC_ROOT to PMTiles or a self-contained chart bundle. |
+| `tile57` | executable | offline CLI: bake a cell/ENC_ROOT to PMTiles or a self-contained chart bundle. |
 
 The interactive **Qt6 window** (`chartplotter-qt`, `app/qt`) is built separately
 via `scripts/build-qmaplibre.sh` — it links the [QMapLibre](https://github.com/maplibre/maplibre-native-qt)
@@ -101,7 +101,7 @@ style:
 scripts/build-qmaplibre.sh                 # -> build/qt/chartplotter-qt (needs Qt6)
 
 # bake a bundle, then view it (needs a display):
-engine/zig-out/bin/chartplotter-bake bundle \
+engine/zig-out/bin/tile57 bundle \
   ../chartplotter-go/testdata/US5MD1MC.000 -o out
 build/qt/chartplotter-qt out/assets/style-day.json 38.97 -76.49 13
 ```
@@ -112,19 +112,19 @@ QMapLibre — independent of libtile57/mbgl.
 ## Pre-baking tiles to PMTiles
 
 For the precache path (render fast from a ready archive, or ship a region), the
-`chartplotter-bake` CLI bakes a cell to a PMTiles archive offline — the native
+`tile57` CLI bakes a cell to a PMTiles archive offline — the native
 analogue of chartplotter-go's `bake`:
 
 ```sh
-cd engine && zig build       # builds engine/zig-out/bin/chartplotter-bake (pure Zig)
+cd engine && zig build       # builds engine/zig-out/bin/tile57 (pure Zig)
 
-engine/zig-out/bin/chartplotter-bake bake \
+engine/zig-out/bin/tile57 bake \
   ../chartplotter-go/testdata/US4MD81M.000 \
   -o charts.pmtiles --minzoom 8 --maxzoom 16 \
   [US4MD81M.001 US4MD81M.002 ...]         # optional update files, applied in order
 
-chartplotter-bake inspect charts.pmtiles  # zoom range + tile counts
-chartplotter-bake version
+tile57 inspect charts.pmtiles  # zoom range + tile counts
+tile57 version
 ```
 
 The archive then renders through `chartplotter-render`; a baked **bundle** also

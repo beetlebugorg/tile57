@@ -56,7 +56,7 @@ orientation + clearance complex attributes are synthesized. Remaining gaps:
 A pre-baked PMTiles archive from chartplotter-go does not have these gaps; they are
 specific to live in-process generation / the native baker.
 
-`chartplotter-bake` runs the same full S-101 portrayal as the live library, so its
+`tile57` runs the same full S-101 portrayal as the live library, so its
 output matches live generation (it no longer emits only the `classify()`
 fallback).
 
@@ -89,5 +89,5 @@ LRU). The catalogue opens in seconds; memory stays bounded. Caveats:
   panels) is future work.
 - **The Qt window renders a pre-baked bundle**, not live tiles. `chartplotter-qt`
   loads a chart bundle's PMTiles via QMapLibre; producing the bundle
-  (`chartplotter-bake bundle`) is a separate offline step. Live in-process
+  (`tile57 bundle`) is a separate offline step. Live in-process
   generation (`zigtiles://`) currently only backs the headless PNG renderer.
