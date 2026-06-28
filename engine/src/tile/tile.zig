@@ -35,7 +35,14 @@ pub fn worldToTile(w: [2]f64, z: u8, tx: u32, ty: u32, extent: i32) mvt.Point {
     const ext: f64 = @floatFromInt(extent);
     const px = (w[0] * scale - @as(f64, @floatFromInt(tx))) * ext;
     const py = (w[1] * scale - @as(f64, @floatFromInt(ty))) * ext;
-    return .{ .x = @intFromFloat(@round(px)), .y = @intFromFloat(@round(py)) };
+    return .{ .x = roundI32(px), .y = roundI32(py) };
+}
+
+// Round to nearest (ties away from zero, == @round) via hardware truncation
+// (@intFromFloat is CVTTSD2SI) — the baseline musl target has no ROUNDSD, so
+// @round compiled to a software routine that profiled at ~15% of the bake.
+inline fn roundI32(v: f64) i32 {
+    return @intFromFloat(if (v >= 0) v + 0.5 else v - 0.5);
 }
 
 /// Geographic bounds of tile (z,x,y): [min_lon, min_lat, max_lon, max_lat].
