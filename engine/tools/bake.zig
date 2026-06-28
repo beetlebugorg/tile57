@@ -91,6 +91,10 @@ pub fn main(init: std.process.Init) !void {
         return runSprite(io, arena, args);
     }
 
+    if (std.mem.eql(u8, sub, "pattern")) {
+        return runPattern(io, arena, args);
+    }
+
     if (std.mem.eql(u8, sub, "bundle")) {
         return runBundle(io, arena, args);
     }
@@ -490,6 +494,82 @@ fn emitSprites(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_na
     return atlas;
 }
 
+const AREAFILLS_REL = "AreaFills";
+
+// Read every Symbols/*.svg into a list (shared by the sprite + pattern atlases).
+fn readSymbols(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]sprite.SvgSrc {
+    const sym_dir_path = try std.fs.path.join(a, &.{ catalog_dir, SYMBOLS_REL });
+    var dir = try std.Io.Dir.cwd().openDir(io, sym_dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var srcs = std.ArrayList(sprite.SvgSrc).empty;
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".svg")) continue;
+        const path = try a.dupe(u8, entry.path);
+        const svg = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
+        try srcs.append(a, .{ .id = std.fs.path.stem(std.fs.path.basename(path)), .svg = svg });
+    }
+    return srcs.items;
+}
+
+// Read AreaFills/*.xml + Symbols/*.svg + the palette CSS and build the pattern
+// atlas (patterns.json + patterns.png). Mirrors the Go oracle's PatternAtlasS101FS.
+fn patternAtlasBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8) !sprite.Atlas {
+    const af_dir_path = try std.fs.path.join(a, &.{ catalog_dir, AREAFILLS_REL });
+    var dir = try std.Io.Dir.cwd().openDir(io, af_dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var fills = std.ArrayList(sprite.AreaFillSrc).empty;
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".xml")) continue;
+        const path = try a.dupe(u8, entry.path);
+        const xml = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
+        try fills.append(a, .{ .id = std.fs.path.stem(std.fs.path.basename(path)), .xml = xml });
+    }
+    const symbols = try readSymbols(io, a, catalog_dir);
+    const css_path = try std.fs.path.join(a, &.{ catalog_dir, SYMBOLS_REL, css_name });
+    const css = try std.Io.Dir.cwd().readFileAlloc(io, css_path, a, .unlimited);
+    return sprite.patternAtlas(a, fills.items, symbols, css);
+}
+
+fn emitPatterns(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, json_path: []const u8, png_path: []const u8) !sprite.Atlas {
+    const atlas = try patternAtlasBytes(io, a, catalog_dir, css_name);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = atlas.json });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = png_path, .data = atlas.png });
+    return atlas;
+}
+
+/// `pattern <portrayal-catalog-dir> -o <out-dir> [--css daySvgStyle.css]` — emit
+/// the S-101 area-fill pattern atlas (patterns.json + patterns.png).
+fn runPattern(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var catalog: ?[]const u8 = null;
+    var out: ?[]const u8 = null;
+    var css: []const u8 = DEFAULT_CSS;
+    var f = Flags{ .args = args };
+    while (f.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            out = f.val(arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--css")) {
+            css = f.val(arg) orelse return;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usageErr("unknown flag");
+        } else if (catalog == null) {
+            catalog = arg;
+        }
+    }
+    const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
+    const catalog_dir = resolveCatalogDir(catalog);
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    const json_path = try std.fs.path.join(a, &.{ out_dir, "patterns.json" });
+    const png_path = try std.fs.path.join(a, &.{ out_dir, "patterns.png" });
+    const atlas = try emitPatterns(io, a, catalog_dir, css, json_path, png_path);
+    std.debug.print("emitted pattern atlas from {s} (css {s})\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalog_dir, css, json_path, atlas.json.len, png_path, atlas.png.len });
+}
+
 /// `sprite <portrayal-catalog-dir> -o <out-dir> [--css daySvgStyle.css]` — emit
 /// the S-101 symbol atlas (sprite.json + sprite.png) for a palette.
 fn runSprite(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -543,7 +623,10 @@ fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const sj_path = try std.fs.path.join(a, &.{ out_dir, "sprite.json" });
     const sp_path = try std.fs.path.join(a, &.{ out_dir, "sprite.png" });
     const atlas = try emitSprites(io, a, catalog_dir, DEFAULT_CSS, sj_path, sp_path);
-    std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalog_dir, ct_path, json.len, ls_path, ls.len, sj_path, atlas.json.len, sp_path, atlas.png.len });
+    const pj_path = try std.fs.path.join(a, &.{ out_dir, "patterns.json" });
+    const pp_path = try std.fs.path.join(a, &.{ out_dir, "patterns.png" });
+    const pat = try emitPatterns(io, a, catalog_dir, DEFAULT_CSS, pj_path, pp_path);
+    std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalog_dir, ct_path, json.len, ls_path, ls.len, sj_path, atlas.json.len, sp_path, atlas.png.len, pj_path, pat.json.len, pp_path, pat.png.len });
 }
 
 /// `bundle <cell.000> -o <out-dir> [--rules DIR] [--catalog DIR] [--minzoom N]
@@ -612,6 +695,10 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const sp_path = try std.fs.path.join(a, &.{ assets_dir, "sprite.png" });
     _ = emitSprites(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, sj_path, sp_path) catch |err|
         std.debug.print("warning: sprite atlas emit failed ({s})\n", .{@errorName(err)});
+    const pj_path = try std.fs.path.join(a, &.{ assets_dir, "patterns.json" });
+    const pp_path = try std.fs.path.join(a, &.{ assets_dir, "patterns.png" });
+    _ = emitPatterns(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, pj_path, pp_path) catch |err|
+        std.debug.print("warning: pattern atlas emit failed ({s})\n", .{@errorName(err)});
     var styles: ?assets.Manifest.Styles = null;
     if (emitColorTables(io, a, resolveCatalogDir(catalog), ct_path)) |ct| {
         // One style.json per palette, resolving colour tokens from the colortables.

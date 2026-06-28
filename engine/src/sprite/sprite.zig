@@ -290,37 +290,54 @@ fn skipSubtree(src: []const u8, i: *usize) void {
 
 // ---- raster + atlas ------------------------------------------------------
 
-const Raster = struct {
+// One already-rasterised, atlas-bound cell: its RGBA (Zig/arena-owned, straight
+// alpha) plus the pivot the sprite anchor uses. Patterns carry pivot 0,0.
+const NamedCell = struct {
     name: []const u8,
     w: u32,
     h: u32,
-    pivot_x: f32,
-    pivot_y: f32,
-    rgba: [*]u8, // C-owned (tg_svg_free); freed after blit
+    pivot_x: f32 = 0,
+    pivot_y: f32 = 0,
+    rgba: []const u8,
 };
 
 const Cell = struct { x: u32, y: u32, w: u32, h: u32, pivot_x: f32, pivot_y: f32 };
 
-fn lessByHeightDesc(_: void, a: Raster, b: Raster) bool {
+fn lessByHeightDesc(_: void, a: NamedCell, b: NamedCell) bool {
     return a.h > b.h;
+}
+
+const RenderedSym = struct { w: u32, h: u32, pivot_x: f64, pivot_y: f64, rgba: []u8 };
+
+// Flatten + rasterize one symbol SVG into arena-owned straight-alpha RGBA. null
+// on parse/raster failure or a degenerate (zero-size) result.
+fn renderSym(ar: std.mem.Allocator, svg: []const u8, css: *std.StringHashMap([]const u8)) ?RenderedSym {
+    const flat = flatten(ar, svg, css) catch return null;
+    var w: c_int = 0;
+    var h: c_int = 0;
+    const px = tg_svg_rasterize(flat.svg.ptr, @floatCast(px_per_mm), &w, &h) orelse return null;
+    defer tg_svg_free(px);
+    const uw: u32 = @intCast(@max(w, 0));
+    const uh: u32 = @intCast(@max(h, 0));
+    if (uw == 0 or uh == 0) return null;
+    const n = @as(usize, uw) * uh * 4;
+    const buf = ar.alloc(u8, n) catch return null;
+    @memcpy(buf, px[0..n]);
+    return .{ .w = uw, .h = uh, .pivot_x = -flat.vb[0] * px_per_mm, .pivot_y = -flat.vb[1] * px_per_mm, .rgba = buf };
 }
 
 /// Build a sprite atlas from S-101 symbol SVGs and a palette stylesheet.
 /// Returns sprite.json + atlas PNG bytes (allocator-owned). Mirrors the Go
 /// oracle's SpriteAtlasS101FS + packInto + toJSON.
 pub fn spriteAtlas(a: std.mem.Allocator, srcs: []const SvgSrc, css_data: []const u8) !Atlas {
-    return buildAtlas(a, srcs, css_data, sprite_atlas_width);
-}
-
-fn buildAtlas(a: std.mem.Allocator, srcs: []const SvgSrc, css_data: []const u8, width: u32) !Atlas {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const ar = arena_state.allocator();
 
     var css = try loadCss(ar, css_data);
 
-    // Process in id order so the stable height-sort below breaks ties the same
-    // way the Go oracle does (it iterates the Symbols dir alphabetically).
+    // Process in id order so the stable height-sort breaks ties the same way the
+    // Go oracle does (it iterates the Symbols dir alphabetically).
     const ordered = try ar.dupe(SvgSrc, srcs);
     std.mem.sort(SvgSrc, ordered, {}, struct {
         fn less(_: void, x: SvgSrc, y: SvgSrc) bool {
@@ -328,37 +345,169 @@ fn buildAtlas(a: std.mem.Allocator, srcs: []const SvgSrc, css_data: []const u8, 
         }
     }.less);
 
-    var rasters = std.ArrayList(Raster).empty;
+    var cells = std.ArrayList(NamedCell).empty;
     for (ordered) |s| {
-        const flat = flatten(ar, s.svg, &css) catch continue;
-        var w: c_int = 0;
-        var h: c_int = 0;
-        const px = tg_svg_rasterize(flat.svg.ptr, @floatCast(px_per_mm), &w, &h) orelse continue;
-        const uw: u32 = @intCast(@max(w, 0));
-        const uh: u32 = @intCast(@max(h, 0));
-        if (uw == 0 or uh == 0 or uw > max_cell_side or uh > max_cell_side) {
-            tg_svg_free(px);
-            continue;
-        }
-        try rasters.append(ar, .{
+        const r = renderSym(ar, s.svg, &css) orelse continue;
+        if (r.w > max_cell_side or r.h > max_cell_side) continue;
+        try cells.append(ar, .{
             .name = s.id,
-            .w = uw,
-            .h = uh,
-            .pivot_x = @floatCast(-flat.vb[0] * px_per_mm),
-            .pivot_y = @floatCast(-flat.vb[1] * px_per_mm),
-            .rgba = px,
+            .w = r.w,
+            .h = r.h,
+            .pivot_x = @floatCast(r.pivot_x),
+            .pivot_y = @floatCast(r.pivot_y),
+            .rgba = r.rgba,
         });
     }
-    defer for (rasters.items) |r| tg_svg_free(r.rgba);
+    return packAtlas(a, ar, cells.items, sprite_atlas_width);
+}
 
-    // Shelf-pack tallest-first (stable), matching the Go packInto.
-    std.sort.insertion(Raster, rasters.items, {}, lessByHeightDesc);
+/// One S-101 AreaFills/*.xml input: `id` is the file stem, `xml` the file bytes.
+pub const AreaFillSrc = struct { id: []const u8, xml: []const u8 };
+
+const AreaFill = struct { symbol_ref: []const u8, v1x: f64, v1y: f64, v2x: f64, v2y: f64 };
+
+fn parseAreaFill(xml: []const u8) AreaFill {
+    var af = AreaFill{ .symbol_ref = "", .v1x = 0, .v1y = 0, .v2x = 0, .v2y = 0 };
+    if (attrAfter(xml, "<symbol", "reference")) |ref| af.symbol_ref = ref;
+    if (between(xml, "<v1>", "</v1>")) |b| {
+        af.v1x = tagFloat(b, "x") orelse 0;
+        af.v1y = tagFloat(b, "y") orelse 0;
+    }
+    if (between(xml, "<v2>", "</v2>")) |b| {
+        af.v2x = tagFloat(b, "x") orelse 0;
+        af.v2y = tagFloat(b, "y") orelse 0;
+    }
+    return af;
+}
+
+fn between(s: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
+    const i = std.mem.indexOf(u8, s, open) orelse return null;
+    const rest = s[i + open.len ..];
+    const e = std.mem.indexOf(u8, rest, close) orelse return null;
+    return rest[0..e];
+}
+
+// Value of attribute `attr="..."` that appears after the first occurrence of `tag`.
+fn attrAfter(s: []const u8, tag: []const u8, attr: []const u8) ?[]const u8 {
+    const ti = std.mem.indexOf(u8, s, tag) orelse return null;
+    const needle = std.mem.concat(std.heap.page_allocator, u8, &.{ attr, "=\"" }) catch return null;
+    defer std.heap.page_allocator.free(needle);
+    const rest = s[ti..];
+    const ai = std.mem.indexOf(u8, rest, needle) orelse return null;
+    const after = rest[ai + needle.len ..];
+    const q = std.mem.indexOfScalar(u8, after, '"') orelse return null;
+    return after[0..q];
+}
+
+fn tagFloat(s: []const u8, comptime tag: []const u8) ?f64 {
+    const open = "<" ++ tag ++ ">";
+    const i = std.mem.indexOf(u8, s, open) orelse return null;
+    const rest = s[i + open.len ..];
+    const close = std.mem.indexOfScalar(u8, rest, '<') orelse return null;
+    return std.fmt.parseFloat(f64, std.mem.trim(u8, rest[0..close], " \t\r\n")) catch null;
+}
+
+/// Build the area-fill pattern atlas from S-101 AreaFills + their referenced
+/// Symbols + a palette stylesheet. Each fill tiles its symbol on the v1/v2
+/// lattice into a seamless cell. Mirrors PatternAtlasS101FS + seamlessTile.
+pub fn patternAtlas(a: std.mem.Allocator, fills: []const AreaFillSrc, symbols: []const SvgSrc, css_data: []const u8) !Atlas {
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const ar = arena_state.allocator();
+
+    var css = try loadCss(ar, css_data);
+    var sym_by_id = std.StringHashMap([]const u8).init(ar);
+    for (symbols) |s| try sym_by_id.put(s.id, s.svg);
+
+    const ordered = try ar.dupe(AreaFillSrc, fills);
+    std.mem.sort(AreaFillSrc, ordered, {}, struct {
+        fn less(_: void, x: AreaFillSrc, y: AreaFillSrc) bool {
+            return std.mem.lessThan(u8, x.id, y.id);
+        }
+    }.less);
+
+    var cells = std.ArrayList(NamedCell).empty;
+    for (ordered) |f| {
+        const af = parseAreaFill(f.xml);
+        if (af.symbol_ref.len == 0) continue;
+        const svg = sym_by_id.get(af.symbol_ref) orelse continue;
+        const sym = renderSym(ar, svg, &css) orelse continue;
+        const tile = seamlessTile(ar, sym, af) orelse continue;
+        try cells.append(ar, .{ .name = f.id, .w = tile.w, .h = tile.h, .rgba = tile.rgba });
+    }
+    return packAtlas(a, ar, cells.items, sprite_atlas_width);
+}
+
+const Tile = struct { w: u32, h: u32, rgba: []u8 };
+
+// Stamp the rendered symbol onto the v1/v2 lattice cell (px), wrapping at the
+// edges. A staggered v2 (v2.x != 0) doubles the tile height and half-drops the
+// second row. Mirrors the Go seamlessTile. null for a degenerate/oversized cell.
+fn seamlessTile(ar: std.mem.Allocator, sym: RenderedSym, af: AreaFill) ?Tile {
+    const wf = @round(af.v1x * px_per_mm);
+    const row_hf = @round(af.v2y * px_per_mm);
+    if (wf < 1 or row_hf < 1) return null;
+    const w: u32 = @intFromFloat(wf);
+    const row_h: u32 = @intFromFloat(row_hf);
+    const rows: u32 = if (@abs(af.v2x) > 1e-6) 2 else 1;
+    const h = row_h * rows;
+    if (w > max_cell_side or h > max_cell_side) return null;
+
+    const tile = ar.alloc(u8, @as(usize, w) * h * 4) catch return null;
+    @memset(tile, 0);
+
+    var centres: [2][2]f64 = undefined;
+    var nc: usize = 1;
+    centres[0] = .{ @as(f64, @floatFromInt(w)) / 2.0, @as(f64, @floatFromInt(row_h)) / 2.0 };
+    if (rows == 2) {
+        centres[1] = .{ @as(f64, @floatFromInt(w)), @as(f64, @floatFromInt(row_h)) * 1.5 };
+        nc = 2;
+    }
+    const pw: f64 = @floatFromInt(w);
+    const ph: f64 = @floatFromInt(h);
+    for (centres[0..nc]) |c| {
+        var jy: i32 = -1;
+        while (jy <= 1) : (jy += 1) {
+            var ix: i32 = -1;
+            while (ix <= 1) : (ix += 1) {
+                const dx: i32 = @intFromFloat(@round(c[0] + @as(f64, @floatFromInt(ix)) * pw - sym.pivot_x));
+                const dy: i32 = @intFromFloat(@round(c[1] + @as(f64, @floatFromInt(jy)) * ph - sym.pivot_y));
+                stampOver(tile, w, h, sym, dx, dy);
+            }
+        }
+    }
+    return .{ .w = w, .h = h, .rgba = tile };
+}
+
+// Copy sym's non-transparent pixels into dst at (dx,dy), clipped to dst.
+fn stampOver(dst: []u8, dw: u32, dh: u32, sym: RenderedSym, dx: i32, dy: i32) void {
+    var sy: u32 = 0;
+    while (sy < sym.h) : (sy += 1) {
+        const y = dy + @as(i32, @intCast(sy));
+        if (y < 0 or y >= @as(i32, @intCast(dh))) continue;
+        var sx: u32 = 0;
+        while (sx < sym.w) : (sx += 1) {
+            const x = dx + @as(i32, @intCast(sx));
+            if (x < 0 or x >= @as(i32, @intCast(dw))) continue;
+            const si = (@as(usize, sy) * sym.w + sx) * 4;
+            if (sym.rgba[si + 3] == 0) continue;
+            const di = (@as(usize, @intCast(y)) * dw + @as(usize, @intCast(x))) * 4;
+            @memcpy(dst[di .. di + 4], sym.rgba[si .. si + 4]);
+        }
+    }
+}
+
+// Shelf-pack already-rasterised cells (tallest-first, stable) into one atlas of
+// `width`, blit them, and emit { json, png }. Mirrors the Go packInto + toJSON +
+// encodePNG. `cells_in` must already be in id order (for stable tie-break).
+fn packAtlas(a: std.mem.Allocator, ar: std.mem.Allocator, cells_in: []NamedCell, width: u32) !Atlas {
+    std.sort.insertion(NamedCell, cells_in, {}, lessByHeightDesc);
     var cells = std.StringHashMap(Cell).init(ar);
     var pen_x: u32 = atlas_pad;
     var pen_y: u32 = atlas_pad;
     var shelf_h: u32 = 0;
     var total_h: u32 = atlas_pad;
-    for (rasters.items) |r| {
+    for (cells_in) |r| {
         if (pen_x + r.w + atlas_pad > width) {
             pen_x = atlas_pad;
             pen_y += shelf_h + atlas_pad;
@@ -371,10 +520,9 @@ fn buildAtlas(a: std.mem.Allocator, srcs: []const SvgSrc, css_data: []const u8, 
     }
     const height = @max(total_h, 1);
 
-    // Blit cells into the atlas RGBA.
     const rgba = try ar.alloc(u8, @as(usize, width) * height * 4);
     @memset(rgba, 0);
-    for (rasters.items) |r| {
+    for (cells_in) |r| {
         const c = cells.get(r.name).?;
         var row: u32 = 0;
         while (row < r.h) : (row += 1) {
@@ -384,7 +532,6 @@ fn buildAtlas(a: std.mem.Allocator, srcs: []const SvgSrc, css_data: []const u8, 
         }
     }
 
-    // PNG encode (C/stb).
     var png_len: c_int = 0;
     const png_ptr = tg_png_encode(rgba.ptr, @intCast(width), @intCast(height), &png_len) orelse return error.PngEncode;
     defer tg_svg_free(png_ptr);
