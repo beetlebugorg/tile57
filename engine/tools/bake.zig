@@ -26,6 +26,16 @@ const VERSION = "tile57 0.1.0";
 const DEFAULT_MINZOOM: u8 = 8;
 const DEFAULT_MAXZOOM: u8 = 16;
 
+// Lazy-baker tuning (bake-root): LRU budget = parsed cells kept loaded across
+// super-tiles; super-tile depth = how far below a band's min zoom the spatial
+// batch tile sits. Overridable via --lru / --superdz for tuning.
+const DEFAULT_LRU_BUDGET: usize = 64;
+const DEFAULT_SUPER_DZ: u8 = 3;
+
+// Total parse+portray calls across the bake (atomic; workers run in parallel).
+// Compared against the cell count per band to surface excessive re-parsing.
+var g_parses = std.atomic.Value(usize).init(0);
+
 // Env access lives in the Lua C shim (Zig 0.16 gates env behind std.Io);
 // returns the S-101 rules dir from TILE57_S101_RULES or null. Mirrors capi.zig.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
@@ -174,6 +184,29 @@ pub fn main(init: std.process.Init) !void {
         var cell = try engine.s57.parseCell(arena, data);
         defer cell.deinit();
         std.debug.print("  S-57: comf={d} cscl=1:{d}  vectors={d} features={d}\n", .{ cell.params.comf, cell.params.cscl, cell.vectors.len, cell.features.len });
+        {
+            // Per-cell memory breakdown (counts × struct sizes) to find the bloat.
+            var pts: usize = 0;
+            var snds: usize = 0;
+            for (cell.vectors) |v| {
+                pts += v.points.len;
+                snds += v.soundings.len;
+            }
+            var attrs: usize = 0;
+            var refs: usize = 0;
+            var attrbytes: usize = 0;
+            for (cell.features) |f| {
+                attrs += f.attrs.len;
+                refs += f.refs.len;
+                for (f.attrs) |x| attrbytes += x.value.len;
+            }
+            const LL = @sizeOf(engine.s57.LonLat);
+            const kb = 1024;
+            std.debug.print(
+                "  mem: pts={d}({d}KB @{d}B) snds={d}({d}KB) vecstructs={d}KB | attrs={d}({d}KB val) refs={d} featstructs={d}KB\n",
+                .{ pts, pts * LL / kb, LL, snds, snds * @sizeOf(engine.s57.Sounding) / kb, cell.vectors.len * @sizeOf(engine.s57.VectorRecord) / kb, attrs, attrbytes / kb, refs, cell.features.len * @sizeOf(engine.s57.Feature) / kb },
+            );
+        }
         if (cell.bounds()) |b| {
             std.debug.print("  geometry bounds: lon [{d:.4}, {d:.4}]  lat [{d:.4}, {d:.4}]\n", .{ b[0], b[2], b[1], b[3] });
         }
@@ -204,8 +237,8 @@ pub fn main(init: std.process.Init) !void {
                     line_verts += g.len;
                     if (!sample_ok and gb != null) {
                         const p = g[0];
-                        sample_ok = p.lon >= gb.?[0] - 1e-6 and p.lon <= gb.?[2] + 1e-6 and
-                            p.lat >= gb.?[1] - 1e-6 and p.lat <= gb.?[3] + 1e-6;
+                        sample_ok = p.lon() >= gb.?[0] - 1e-6 and p.lon() <= gb.?[2] + 1e-6 and
+                            p.lat() >= gb.?[1] - 1e-6 and p.lat() <= gb.?[3] + 1e-6;
                     }
                 }
             } else if (f.prim == 1) {
@@ -241,8 +274,8 @@ pub fn main(init: std.process.Init) !void {
                 for (parts) |g| {
                     var i: usize = 1;
                     while (i < g.len) : (i += 1) {
-                        const dx = g[i].lon - g[i - 1].lon;
-                        const dy = g[i].lat - g[i - 1].lat;
+                        const dx = g[i].lon() - g[i - 1].lon();
+                        const dy = g[i].lat() - g[i - 1].lat();
                         const d = @sqrt(dx * dx + dy * dy);
                         if (d > maxseg) maxseg = d;
                     }
@@ -394,7 +427,7 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     // `bake` takes a single cell.000 OR an ENC_ROOT directory — same archive out.
     if (isDir(io, base_path)) {
         const rzoom_max: u8 = if (maxzoom == DEFAULT_MAXZOOM) 18 else maxzoom; // root default 18
-        const rb = bakeRoot(io, a, base_path, out_path, resolveRulesDir(rules), minzoom, rzoom_max) catch |err| {
+        const rb = bakeRoot(io, a, base_path, out_path, resolveRulesDir(rules), minzoom, rzoom_max, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ) catch |err| {
             std.debug.print("error: cannot bake ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
             return;
         };
@@ -839,7 +872,7 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     var snd_stacks: []const []const u8 = &.{}; // sounding glyph stacks for sprite-mln
     if (isDir(io, base_path)) {
         // ENC_ROOT: streamed straight to tiles_path; updates auto-discovered per cell.
-        const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom) catch |err| {
+        const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ) catch |err| {
             std.debug.print("error: cannot bundle ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
             return;
         };
@@ -993,6 +1026,11 @@ fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(
 // handed to a worker to parse + portray in parallel.
 const CellSource = struct { base: []const u8, updates: []const []const u8 };
 
+// One ENC_ROOT base cell: its `.000` path (updates are <stem>.001…, found on load)
+// and the cheap peek bbox [w,s,e,n], used to assign it to spatial super-tiles
+// without a full parse.
+const CellEntry = struct { path: []const u8, bbox: [4]f64 };
+
 // Parallel parse+portray worker context. Each index is independent: a fresh cell
 // + its own portrayal arena + a per-thread Lua state (portray.zig g_ctx is
 // thread-local). Workers use the page allocator (thread-safe); the shared
@@ -1008,6 +1046,7 @@ const PortrayWork = struct {
     fn run(uptr: *anyopaque, i: usize) void {
         const c: *PortrayWork = @ptrCast(@alignCast(uptr));
         const src = c.sources[i];
+        _ = g_parses.fetchAdd(1, .monotonic); // count parse+portray calls (re-parse diagnostics)
         var cell = engine.s57.parseCellWithUpdates(c.gpa, src.base, src.updates) catch return;
         const b = cell.bounds() orelse {
             cell.deinit();
@@ -1081,16 +1120,17 @@ const BakeSink = struct {
 // straight to `out_path` (the data section streams through a StreamWriter — only
 // the compressed data + small directory are held, not the raw tiles). Returns the
 // union bounds + cell stems + sounding stacks. error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8) !RootBake {
     const page = std.heap.page_allocator;
     var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer dir.close(io);
 
-    // Pass 1: walk base cells, group paths by navigational band (cheap peek: bbox +
-    // CSCL, no geometry), and accumulate the union bbox + cell stems.
+    // Pass 1: walk base cells, group by navigational band with a cheap peek (bbox +
+    // CSCL, no geometry/topology), recording each cell's path + bbox so pass 2 can
+    // load only the cells overlapping a given region. Also the union bbox + stems.
     const Bands = engine.bake_enc;
-    var band_paths: [Bands.bands_fine_to_coarse.len]std.ArrayList([]const u8) = undefined;
-    for (&band_paths) |*bp| bp.* = std.ArrayList([]const u8).empty;
+    var band_cells: [Bands.bands_fine_to_coarse.len]std.ArrayList(CellEntry) = undefined;
+    for (&band_cells) |*bc| bc.* = std.ArrayList(CellEntry).empty;
     var cell_names = std.ArrayList([]const u8).empty;
     var ubox: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }; // [w,s,e,n]
     var total_cells: usize = 0;
@@ -1104,16 +1144,18 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             const bytes = dir.readFileAlloc(io, path, page, .unlimited) catch continue;
             const meta = engine.s57.peekMeta(page, bytes);
             page.free(bytes);
-            const cscl = if (meta) |m| m.cscl else 0;
-            try band_paths[@intFromEnum(Bands.bandOf(cscl))].append(a, path);
-            if (meta) |m| if (m.bounds) |bb| {
-                ubox[0] = @min(ubox[0], bb[0]);
-                ubox[1] = @min(ubox[1], bb[1]);
-                ubox[2] = @max(ubox[2], bb[2]);
-                ubox[3] = @max(ubox[3], bb[3]);
-            };
             try cell_names.append(a, try a.dupe(u8, std.fs.path.stem(std.fs.path.basename(path))));
             total_cells += 1;
+            // A cell with no peek-bbox has no geometry to bake — skip it (it would
+            // produce no tiles). The peek bbox is a superset of the parsed bounds,
+            // so a cell is assigned to every super-tile its real geometry touches.
+            const m = meta orelse continue;
+            const bb = m.bounds orelse continue;
+            ubox[0] = @min(ubox[0], bb[0]);
+            ubox[1] = @min(ubox[1], bb[1]);
+            ubox[2] = @max(ubox[2], bb[2]);
+            ubox[3] = @max(ubox[3], bb[3]);
+            try band_cells[@intFromEnum(Bands.bandOf(m.cscl))].append(a, .{ .path = path, .bbox = bb });
         }
     }
     if (total_cells == 0) return error.NoGeometry;
@@ -1138,71 +1180,180 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var baker = Bands.Baker.init(page, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
     defer baker.deinit();
 
-    // Pass 2: bake band-by-band, finest → coarsest (best-band dedup). Read a band's
-    // files (serial IO), parse + portray them in parallel, bake, then free — so
-    // peak memory is one band's cells and the portrayal runs across all cores.
-    var loaded: usize = 0;
+    // Pass 2: bake each band finest → coarsest (best-band dedup via baker.emitted).
+    // Within a band, walk spatial "super-tiles" (one tile at zoom zs = zlo - SUPER_DZ):
+    // load ONLY the cells overlapping each super-tile (parse + portray in parallel),
+    // generate that super-tile's tiles (clipped, parallel), and keep parsed cells in
+    // a small LRU so neighbouring super-tiles reuse them (cells span a few super-tiles
+    // and are parsed once). Peak memory is the busiest super-tile's cells + the LRU
+    // budget — not the whole band. Coarse bands have few (huge) cells and a tiny grid,
+    // so they fall back to loading them together.
+    std.debug.print("  (lazy bake: lru={d} cells, super-dz={d})\n", .{ lru_budget, super_dz });
+    var done_cells: usize = 0;
     for (Bands.bands_fine_to_coarse) |band| {
-        const paths = band_paths[@intFromEnum(band)].items;
-        if (paths.len == 0) continue;
-        std.debug.print("\n  band {s}: {d} cells\n", .{ @tagName(band), paths.len });
+        const entries = band_cells[@intFromEnum(band)].items;
+        if (entries.len == 0) continue;
+        const parses0 = g_parses.load(.monotonic);
 
-        // Read this band's raw bytes on the main thread (IO isn't thread-safe here).
-        var sources = std.ArrayList(CellSource).empty;
-        for (paths) |bpath| {
-            const base_bytes = dir.readFileAlloc(io, bpath, page, .unlimited) catch continue;
-            const stem = bpath[0 .. bpath.len - 4];
-            var ups = std.ArrayList([]const u8).empty;
-            var k: u32 = 1;
-            while (k <= 999) : (k += 1) {
-                const upn = std.fmt.allocPrint(page, "{s}.{d:0>3}", .{ stem, k }) catch break;
-                defer page.free(upn);
-                const ub = dir.readFileAlloc(io, upn, page, .unlimited) catch break;
-                ups.append(page, ub) catch break;
+        const zr = Bands.bandZooms(band);
+        const zlo = @max(minzoom, zr.min);
+        const zhi = @min(maxzoom, zr.max);
+        if (zlo > zhi) {
+            done_cells += entries.len;
+            continue;
+        }
+        const zs: u8 = if (zlo >= super_dz) zlo - super_dz else 0;
+
+        // Inverted index: super-tile (sx,sy at zs) → the cell indices overlapping it.
+        var stmap = std.AutoHashMap(u64, std.ArrayList(u32)).init(page);
+        defer {
+            var vit = stmap.valueIterator();
+            while (vit.next()) |v| v.deinit(page);
+            stmap.deinit();
+        }
+        for (entries, 0..) |e, i| {
+            const nw = lonLatToTile(e.bbox[0], e.bbox[3], zs);
+            const se = lonLatToTile(e.bbox[2], e.bbox[1], zs);
+            var sy = nw[1];
+            while (sy <= se[1]) : (sy += 1) {
+                var sx = nw[0];
+                while (sx <= se[0]) : (sx += 1) {
+                    const k = (@as(u64, sy) << 32) | sx; // row-major (spatial locality)
+                    const gop = try stmap.getOrPut(k);
+                    if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                    try gop.value_ptr.append(page, @intCast(i));
+                }
             }
-            const updates = ups.toOwnedSlice(page) catch &.{};
-            sources.append(page, .{ .base = base_bytes, .updates = updates }) catch {};
+        }
+        const stkeys = try page.alloc(u64, stmap.count());
+        defer page.free(stkeys);
+        {
+            var kit = stmap.keyIterator();
+            var j: usize = 0;
+            while (kit.next()) |kp| : (j += 1) stkeys[j] = kp.*;
+        }
+        std.mem.sort(u64, stkeys, {}, struct {
+            fn lt(_: void, x: u64, y: u64) bool {
+                return x < y;
+            }
+        }.lt);
+
+        // Per-band LRU cache of parsed cells (index-aligned with `entries`).
+        const cache = try page.alloc(?Bands.Backend, entries.len);
+        defer page.free(cache);
+        @memset(cache, null);
+        const cache_ar = try page.alloc(?*std.heap.ArenaAllocator, entries.len);
+        defer page.free(cache_ar);
+        @memset(cache_ar, null);
+        const used = try page.alloc(u64, entries.len); // LRU tick per cell
+        defer page.free(used);
+        @memset(used, 0);
+        const gave_up = try page.alloc(bool, entries.len); // load failed: don't retry
+        defer page.free(gave_up);
+        @memset(gave_up, false);
+        var n_loaded: usize = 0;
+        var tick: u64 = 0;
+        const build_geo = Bands.cacheGeoForBand(band);
+
+        for (stkeys) |stk| {
+            const cells = stmap.get(stk).?.items;
+            const sx: u32 = @intCast(stk & 0xFFFFFFFF);
+            const sy: u32 = @intCast(stk >> 32);
+
+            // Load this super-tile's not-yet-loaded cells (read bytes serially, then
+            // parse + portray in parallel).
+            var miss = std.ArrayList(u32).empty;
+            defer miss.deinit(page);
+            for (cells) |ci| if (cache[ci] == null and !gave_up[ci]) miss.append(page, ci) catch {};
+            if (miss.items.len > 0) {
+                const src = try page.alloc(CellSource, miss.items.len);
+                defer page.free(src);
+                const outs = try page.alloc(?Bands.Backend, miss.items.len);
+                defer page.free(outs);
+                const ars = try page.alloc(?*std.heap.ArenaAllocator, miss.items.len);
+                defer page.free(ars);
+                @memset(outs, null);
+                @memset(ars, null);
+                for (miss.items, 0..) |ci, j| {
+                    const bpath = entries[ci].path;
+                    const base_bytes = dir.readFileAlloc(io, bpath, page, .unlimited) catch {
+                        src[j] = .{ .base = &.{}, .updates = &.{} };
+                        continue;
+                    };
+                    const stem = bpath[0 .. bpath.len - 4];
+                    var ups = std.ArrayList([]const u8).empty;
+                    var u: u32 = 1;
+                    while (u <= 999) : (u += 1) {
+                        const upn = std.fmt.allocPrint(page, "{s}.{d:0>3}", .{ stem, u }) catch break;
+                        defer page.free(upn);
+                        const ub = dir.readFileAlloc(io, upn, page, .unlimited) catch break;
+                        ups.append(page, ub) catch break;
+                    }
+                    src[j] = .{ .base = base_bytes, .updates = ups.toOwnedSlice(page) catch &.{} };
+                }
+                var pw = PortrayWork{ .sources = src, .outs = outs, .arenas = ars, .rules_dir = rules_dir, .gpa = page, .build_geo = build_geo };
+                Bands.parallelFor(miss.items.len, &pw, PortrayWork.run);
+                for (miss.items, 0..) |ci, j| {
+                    if (src[j].base.len > 0) page.free(src[j].base);
+                    for (src[j].updates) |ub| page.free(ub);
+                    if (src[j].updates.len > 0) page.free(src[j].updates);
+                    if (outs[j]) |be| {
+                        cache[ci] = be;
+                        cache_ar[ci] = ars[j];
+                        n_loaded += 1;
+                    } else gave_up[ci] = true;
+                }
+            }
+            tick += 1;
+            for (cells) |ci| used[ci] = tick;
+
+            // Generate this super-tile's tiles from its loaded cells (clipped, parallel).
+            var subset = std.ArrayList(Bands.Backend).empty;
+            defer subset.deinit(page);
+            for (cells) |ci| if (cache[ci]) |be| subset.append(page, be) catch {};
+            baker.bakeBand(band, subset.items, .{ .zs = zs, .sx = sx, .sy = sy }, cliProgress, null) catch {};
+
+            // Evict least-recently-used cells beyond the budget (never this
+            // super-tile's, which carry the current tick).
+            while (n_loaded > lru_budget) {
+                var victim: ?usize = null;
+                var best: u64 = std.math.maxInt(u64);
+                for (cache, 0..) |c, ci| {
+                    if (c != null and used[ci] < best) {
+                        best = used[ci];
+                        victim = ci;
+                    }
+                }
+                const v = victim orelse break;
+                if (used[v] == tick) break; // only the current super-tile's cells remain
+                if (cache[v]) |*be| be.cell.deinit();
+                if (cache_ar[v]) |p| {
+                    p.deinit();
+                    page.destroy(p);
+                    cache_ar[v] = null;
+                }
+                cache[v] = null;
+                n_loaded -= 1;
+            }
         }
 
-        // Parse + portray in parallel.
-        const outs = page.alloc(?Bands.Backend, sources.items.len) catch continue;
-        defer page.free(outs);
-        @memset(outs, null);
-        const pas = page.alloc(?*std.heap.ArenaAllocator, sources.items.len) catch continue;
-        defer page.free(pas);
-        @memset(pas, null);
-        var pw = PortrayWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = rules_dir, .gpa = page, .build_geo = Bands.cacheGeoForBand(band) };
-        Bands.parallelFor(sources.items.len, &pw, PortrayWork.run);
-
-        // The cells copied what they keep — free this band's raw bytes now.
-        for (sources.items) |s| {
-            page.free(s.base);
-            for (s.updates) |u| page.free(u);
-            page.free(s.updates);
+        // Free any cells still loaded at the end of the band.
+        for (cache, 0..) |c, ci| {
+            if (c != null) {
+                if (cache[ci]) |*be| be.cell.deinit();
+                if (cache_ar[ci]) |p| {
+                    p.deinit();
+                    page.destroy(p);
+                }
+            }
         }
-        sources.deinit(page);
-        loaded += paths.len;
-        cliProgress(null, 0, loaded, total_cells);
-
-        // Collect the successful Backends (single owner) aligned with their arenas.
-        var backends = std.ArrayList(Bands.Backend).empty;
-        var band_arenas = std.ArrayList(?*std.heap.ArenaAllocator).empty;
-        backends.ensureTotalCapacity(page, outs.len) catch {};
-        band_arenas.ensureTotalCapacity(page, outs.len) catch {};
-        for (outs, pas) |o, pa| if (o) |be| {
-            backends.appendAssumeCapacity(be);
-            band_arenas.appendAssumeCapacity(pa);
-        };
-
-        baker.bakeBand(band, backends.items, cliProgress, null) catch {};
-
-        for (backends.items) |*be| be.cell.deinit();
-        for (band_arenas.items) |pa| if (pa) |p| {
-            p.deinit();
-            page.destroy(p);
-        };
-        backends.deinit(page);
-        band_arenas.deinit(page);
+        const parses = g_parses.load(.monotonic) - parses0;
+        std.debug.print(
+            "\n  band {s}: {d} cells, {d} super-tiles, {d} parses ({d:.2}x re-parse)\n",
+            .{ @tagName(band), entries.len, stkeys.len, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(entries.len, 1))) },
+        );
+        done_cells += entries.len;
+        cliProgress(null, 0, done_cells, total_cells);
     }
 
     // Assemble out_path = prefix (header + directory + metadata) ++ the data
@@ -1246,6 +1397,8 @@ fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !vo
     var rules: ?[]const u8 = null;
     var minzoom: u8 = 0;
     var maxzoom: u8 = 18;
+    var lru: usize = DEFAULT_LRU_BUDGET;
+    var super_dz: u8 = DEFAULT_SUPER_DZ;
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
@@ -1256,6 +1409,10 @@ fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !vo
             minzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--maxzoom")) {
             maxzoom = f.int(u8, arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--lru")) {
+            lru = f.int(usize, arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--superdz")) {
+            super_dz = f.int(u8, arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (root == null) {
@@ -1266,7 +1423,8 @@ fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !vo
     const out_path = out orelse return usageErr("missing -o/--output <out.pmtiles>");
     if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
     if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
-    const rb = bakeRoot(io, a, root_path, out_path, resolveRulesDir(rules), minzoom, maxzoom) catch |err| {
+    if (lru < 1) return usageErr("--lru must be >= 1");
+    const rb = bakeRoot(io, a, root_path, out_path, resolveRulesDir(rules), minzoom, maxzoom, lru, super_dz) catch |err| {
         std.debug.print("error: {s} ({s})\n", .{ root_path, @errorName(err) });
         return;
     };

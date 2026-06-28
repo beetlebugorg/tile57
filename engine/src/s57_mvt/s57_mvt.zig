@@ -84,11 +84,11 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64) ![]const u8 {
 fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, out: *std.ArrayList(mvt.Feature)) !void {
     const snds = cell.soundingsFor(a, f) catch return;
     for (snds) |s| {
-        if (s.lon < tb[0] or s.lon > tb[2] or s.lat < tb[1] or s.lat > tb[3]) continue;
+        if (s.lon() < tb[0] or s.lon() > tb[2] or s.lat() < tb[1] or s.lat() > tb[3]) continue;
         const sym_s = try sndfrmSyms(a, "SOUNDS", s.depth);
         if (sym_s.len == 0) continue;
         const sym_g = try sndfrmSyms(a, "SOUNDG", s.depth);
-        const pt = tile.project(s.lon, s.lat, z, x, y, tile.EXTENT);
+        const pt = tile.project(s.lon(), s.lat(), z, x, y, tile.EXTENT);
         const parts = try a.alloc([]const mvt.Point, 1);
         const single = try a.alloc(mvt.Point, 1);
         single[0] = pt;
@@ -206,10 +206,10 @@ fn orientAreaRings(a: Allocator, rings: []const []const mvt.Point) ![]const []co
 fn geomBounds(g: []const s57.LonLat) [4]f64 {
     var b = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
     for (g) |p| {
-        b[0] = @min(b[0], p.lon);
-        b[1] = @min(b[1], p.lat);
-        b[2] = @max(b[2], p.lon);
-        b[3] = @max(b[3], p.lat);
+        b[0] = @min(b[0], p.lon());
+        b[1] = @min(b[1], p.lat());
+        b[2] = @max(b[2], p.lon());
+        b[3] = @max(b[3], p.lat());
     }
     return b;
 }
@@ -399,8 +399,8 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // placed at the feature's node.
     if (f.prim == 1) {
         const pg = cell.pointGeometry(f) orelse return;
-        if (pg.lon < tb[0] or pg.lon > tb[2] or pg.lat < tb[1] or pg.lat > tb[3]) return;
-        const pt = tile.project(pg.lon, pg.lat, z, x, y, tile.EXTENT);
+        if (pg.lon() < tb[0] or pg.lon() > tb[2] or pg.lat() < tb[1] or pg.lat() > tb[3]) return;
+        const pt = tile.project(pg.lon(), pg.lat(), z, x, y, tile.EXTENT);
         const parts = try a.alloc([]const mvt.Point, 1);
         const single = try a.alloc(mvt.Point, 1);
         single[0] = pt;
@@ -437,7 +437,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         if (gp.len < 2) continue;
         if (overlaps(geomBounds(gp), tb)) any_overlap = true;
         const proj = try a.alloc(mvt.Point, gp.len);
-        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
         try projected.append(a, proj);
     }
     if (!any_overlap or projected.items.len == 0) return;
@@ -504,8 +504,8 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // point-feature labels show, so area/channel/place names were missing.
     if (p.texts.len > 0) {
         if (s57.areaRepresentativePoint(geo_parts)) |rp| {
-            if (rp.lon >= tb[0] and rp.lon <= tb[2] and rp.lat >= tb[1] and rp.lat <= tb[3]) {
-                const cpt = tile.project(rp.lon, rp.lat, z, x, y, tile.EXTENT);
+            if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
+                const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
                 const single = try a.alloc(mvt.Point, 1);
                 single[0] = cpt;
@@ -544,7 +544,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
-        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
         const sub = try tile.clipLine(a, proj, box);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -559,8 +559,8 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 
     // SWPARE51 bracket + "swept to <DRVAL1>" label at the representative point.
     const rp = s57.areaRepresentativePoint(geo_parts) orelse return;
-    if (rp.lon < tb[0] or rp.lon > tb[2] or rp.lat < tb[1] or rp.lat > tb[3]) return;
-    const cpt = tile.project(rp.lon, rp.lat, z, x, y, tile.EXTENT);
+    if (rp.lon() < tb[0] or rp.lon() > tb[2] or rp.lat() < tb[1] or rp.lat() > tb[3]) return;
+    const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
     const parts = try a.alloc([]const mvt.Point, 1);
     const single = try a.alloc(mvt.Point, 1);
     single[0] = cpt;
@@ -604,7 +604,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
-        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon, pt.lat, z, x, y, tile.EXTENT);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
         const sub = try tile.clipLine(a, proj, box);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -775,7 +775,7 @@ fn appendCellFeatures(
                 if (gp.len < 2) continue;
                 if (!overlaps(geomBounds(gp), tb)) continue;
                 const proj = try a.alloc(mvt.Point, gp.len);
-                for (gp, 0..) |p, i| proj[i] = tile.project(p.lon, p.lat, z, x, y, tile.EXTENT);
+                for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
                 const ring = try tile.clipPolygon(a, proj, box);
                 if (ring.len >= 3) try rings.append(a, ring);
             }
@@ -797,7 +797,7 @@ fn appendCellFeatures(
             if (gp.len < 2) continue;
             if (!overlaps(geomBounds(gp), tb)) continue;
             const proj = try a.alloc(mvt.Point, gp.len);
-            for (gp, 0..) |p, i| proj[i] = tile.project(p.lon, p.lat, z, x, y, tile.EXTENT);
+            for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
             const sub = try tile.clipLine(a, proj, box);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -900,7 +900,7 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .arena = std.heap.ArenaAllocator.init(gpa),
     };
     defer cell.deinit();
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, .{ .lon = 0, .lat = 0 });
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
     var areas = std.ArrayList(mvt.Feature).empty;
     var area_patterns = std.ArrayList(mvt.Feature).empty;
@@ -969,7 +969,7 @@ test "emitFromInstr tags pts 0/1 when a point's simplified symbol differs" {
         .arena = std.heap.ArenaAllocator.init(gpa),
     };
     defer cell.deinit();
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, .{ .lon = 0, .lat = 0 });
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
     var areas = std.ArrayList(mvt.Feature).empty;
     var area_patterns = std.ArrayList(mvt.Feature).empty;
@@ -1023,9 +1023,9 @@ test "emitFromInstr tags bnd 1/0 when an area's plain boundary differs" {
     defer cell.deinit();
     // A square ring, pre-assembled below so emitFromInstr skips edge resolution.
     const ring = [_]s57.LonLat{
-        .{ .lon = -0.5, .lat = -0.5 }, .{ .lon = 0.5, .lat = -0.5 },
-        .{ .lon = 0.5, .lat = 0.5 },   .{ .lon = -0.5, .lat = 0.5 },
-        .{ .lon = -0.5, .lat = -0.5 },
+        s57.LonLat.init(-0.5, -0.5), s57.LonLat.init(0.5, -0.5),
+        s57.LonLat.init(0.5, 0.5),   s57.LonLat.init(-0.5, 0.5),
+        s57.LonLat.init(-0.5, -0.5),
     };
 
     var areas = std.ArrayList(mvt.Feature).empty;

@@ -32,6 +32,12 @@ pub const Backend = struct {
 /// Native [minzoom, maxzoom] Web-Mercator span for a navigational-purpose band.
 pub const ZoomRange = struct { min: u8, max: u8 };
 
+/// Restricts a bakeBand pass to the tiles under one "super-tile" (a tile at the
+/// coarser zoom `zs`): only (z,x,y) with z >= zs whose ancestor at zs is (sx,sy)
+/// are generated. Lets the lazy baker process a band one spatial super-tile at a
+/// time — loading only the cells overlapping it — instead of the whole band.
+pub const TileClip = struct { zs: u8, sx: u32, sy: u32 };
+
 /// Navigational-purpose bands, finest → coarsest (the order bands must be baked in
 /// for best-band dedup). Mirrors chartplotter-go bake.Band.
 pub const Band = enum(u8) { berthing = 0, harbor, approach, coastal, general, overview };
@@ -224,7 +230,7 @@ pub const Baker = struct {
     /// Bake one band's already-parsed+portrayed cells. Tiles a finer band already
     /// emitted are skipped (call bands finest → coarsest). The cells must stay
     /// valid for the duration of this call; the caller may free them afterward.
-    pub fn bakeBand(self: *Baker, band: Band, backends: []Backend, progress: Progress, ctx: ?*anyopaque) !void {
+    pub fn bakeBand(self: *Baker, band: Band, backends: []Backend, clip: ?TileClip, progress: Progress, ctx: ?*anyopaque) !void {
         const zr = bandZooms(band);
         const zlo = @max(self.minzoom, zr.min);
         const zhi = @min(self.maxzoom, zr.max);
@@ -247,10 +253,23 @@ pub const Baker = struct {
             while (z <= zhi) : (z += 1) {
                 const nw = lonLatToTile(b[0], b[3], z);
                 const se = lonLatToTile(b[2], b[1], z);
-                var ty = nw[1];
-                while (ty <= se[1]) : (ty += 1) {
-                    var tx = nw[0];
-                    while (tx <= se[0]) : (tx += 1) {
+                // Clamp the cell's tile span to the super-tile's tile range at z
+                // (clip.zs <= zlo <= z, so the shift is non-negative).
+                var xlo = nw[0];
+                var xhi = se[0];
+                var ylo = nw[1];
+                var yhi = se[1];
+                if (clip) |cl| {
+                    const shift: u5 = @intCast(z - cl.zs);
+                    xlo = @max(xlo, cl.sx << shift);
+                    xhi = @min(xhi, ((cl.sx + 1) << shift) - 1);
+                    ylo = @max(ylo, cl.sy << shift);
+                    yhi = @min(yhi, ((cl.sy + 1) << shift) - 1);
+                }
+                var ty = ylo;
+                while (ty <= yhi) : (ty += 1) {
+                    var tx = xlo;
+                    while (tx <= xhi) : (tx += 1) {
                         const key = tileKey(z, tx, ty);
                         if (self.emitted.contains(key)) continue; // a finer band has it
                         const gop = try tilemap.getOrPut(key);

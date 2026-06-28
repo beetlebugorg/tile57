@@ -100,20 +100,20 @@ fn buildDepthIndex(a: std.mem.Allocator, cell: *const s57.Cell) ![]DepthArea {
             .drval1 = 0,
             .has_drval1 = false,
             .rings = rings,
-            .min_lon = rings[0][0].lon,
-            .min_lat = rings[0][0].lat,
-            .max_lon = rings[0][0].lon,
-            .max_lat = rings[0][0].lat,
+            .min_lon = rings[0][0].lon(),
+            .min_lat = rings[0][0].lat(),
+            .max_lon = rings[0][0].lon(),
+            .max_lat = rings[0][0].lat(),
         };
         if (f.attrFloat(s57.ATTR_DRVAL1)) |d| {
             da.drval1 = d;
             da.has_drval1 = true;
         }
         for (rings) |ring| for (ring) |c| {
-            da.min_lon = @min(da.min_lon, c.lon);
-            da.max_lon = @max(da.max_lon, c.lon);
-            da.min_lat = @min(da.min_lat, c.lat);
-            da.max_lat = @max(da.max_lat, c.lat);
+            da.min_lon = @min(da.min_lon, c.lon());
+            da.max_lon = @max(da.max_lon, c.lon());
+            da.min_lat = @min(da.min_lat, c.lat());
+            da.max_lat = @max(da.max_lat, c.lat());
         };
         try areas.append(a, da);
     }
@@ -142,7 +142,7 @@ const TopmarkData = struct { shape: []const u8, colour: []const u8 };
 // its topmark (which share the vertex) collide. Mirrors the Go pointLocKey
 // (7-decimal fixed format); the exact string only needs to be self-consistent.
 fn pointLocKey(a: std.mem.Allocator, pt: s57.LonLat) ![]const u8 {
-    return std.fmt.allocPrint(a, "{d:.7},{d:.7}", .{ pt.lon, pt.lat });
+    return std.fmt.allocPrint(a, "{d:.7},{d:.7}", .{ pt.lon(), pt.lat() });
 }
 
 fn buildTopmarkIndex(a: std.mem.Allocator, cell: *const s57.Cell) !std.StringHashMap(TopmarkData) {
@@ -305,7 +305,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         if (isDangerCode(code)) {
             var clearance: f64 = 0;
             if (representativePoint(a, cell, f)) |pt| {
-                if (depth_index.shoalestDrval1(pt.lon, pt.lat)) |d| {
+                if (depth_index.shoalestDrval1(pt.lon(), pt.lat())) |d| {
                     clearance = d;
                     try attrs.append(a, .{ .name = "surroundingDepth", .value = try fmtFloat(a, d) });
                 }
@@ -328,7 +328,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (cell.pointGeometry(f)) |pg| {
                 const z = f.attrFloat(s57.ATTR_VALSOU) orelse 0;
                 const arr = try a.alloc([3]f64, 1);
-                arr[0] = .{ pg.lon, pg.lat, z };
+                arr[0] = .{ pg.lon(), pg.lat(), z };
                 points = arr;
             }
         }
@@ -393,7 +393,7 @@ test "TOPMAR folds into co-located buoy as the topmark complex" {
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
     };
     defer cell.arena.deinit();
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, .{ .lon = -76.5, .lat = 39.0 });
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
 
     const adapted = try adaptCell(a, &cell);
     // The standalone TOPMAR is dropped; only the buoy is adapted.
@@ -413,12 +413,12 @@ test "DepthIndex shoalest DRVAL1 lookup" {
     const t = std.testing;
     // Area A is a 10x10 box (DRVAL1 10); area B a 2..8 box inside it (DRVAL1 3).
     var ring_a = [_]s57.LonLat{
-        .{ .lon = 0, .lat = 0 },  .{ .lon = 10, .lat = 0 },
-        .{ .lon = 10, .lat = 10 }, .{ .lon = 0, .lat = 10 },
+        s57.LonLat.init(0, 0),  s57.LonLat.init(10, 0),
+        s57.LonLat.init(10, 10), s57.LonLat.init(0, 10),
     };
     var ring_b = [_]s57.LonLat{
-        .{ .lon = 2, .lat = 2 }, .{ .lon = 8, .lat = 2 },
-        .{ .lon = 8, .lat = 8 }, .{ .lon = 2, .lat = 8 },
+        s57.LonLat.init(2, 2), s57.LonLat.init(8, 2),
+        s57.LonLat.init(8, 8), s57.LonLat.init(2, 8),
     };
     var parts_a = [_][]s57.LonLat{ring_a[0..]};
     var parts_b = [_][]s57.LonLat{ring_b[0..]};

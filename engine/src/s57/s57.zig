@@ -12,8 +12,47 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const iso = @import("iso8211");
 
-pub const LonLat = struct { lon: f64, lat: f64 };
-pub const Sounding = struct { lon: f64, lat: f64, depth: f64 };
+// Geographic coordinate stored in S-57's native integer ×1e7 units (lon ±1.8e9,
+// lat ±9e8 both fit i32) — 8 bytes/point vs 16 for an f64 pair, lossless for the
+// standard comf=1e7. Degrees are derived on access via lon()/lat().
+pub const E7: f64 = 1e7;
+pub const LonLat = struct {
+    lon_e7: i32,
+    lat_e7: i32,
+
+    pub inline fn lon(self: LonLat) f64 {
+        return @as(f64, @floatFromInt(self.lon_e7)) / E7;
+    }
+    pub inline fn lat(self: LonLat) f64 {
+        return @as(f64, @floatFromInt(self.lat_e7)) / E7;
+    }
+    /// From degrees.
+    pub inline fn init(lon_deg: f64, lat_deg: f64) LonLat {
+        return .{ .lon_e7 = degToE7(lon_deg), .lat_e7 = degToE7(lat_deg) };
+    }
+};
+pub const Sounding = struct {
+    lon_e7: i32,
+    lat_e7: i32,
+    depth: f64,
+
+    pub inline fn lon(self: Sounding) f64 {
+        return @as(f64, @floatFromInt(self.lon_e7)) / E7;
+    }
+    pub inline fn lat(self: Sounding) f64 {
+        return @as(f64, @floatFromInt(self.lat_e7)) / E7;
+    }
+    pub inline fn init(lon_deg: f64, lat_deg: f64, depth: f64) Sounding {
+        return .{ .lon_e7 = degToE7(lon_deg), .lat_e7 = degToE7(lat_deg), .depth = depth };
+    }
+};
+/// Degrees → ×1e7 integer, clamped to i32 (defends against corrupt out-of-range coords).
+pub inline fn degToE7(deg: f64) i32 {
+    const v = @round(deg * E7);
+    if (v >= 2147483647.0) return 2147483647;
+    if (v <= -2147483648.0) return -2147483648;
+    return @intFromFloat(v);
+}
 
 /// Even-odd ray-cast: is (lon,lat) inside the polygon defined by `rings` (one
 /// outer ring plus any holes, all in lon/lat)? A point inside a hole counts as
@@ -26,8 +65,8 @@ pub fn pointInRings(rings: []const []const LonLat, lon: f64, lat: f64) bool {
         var j: usize = ring.len - 1;
         for (ring, 0..) |p, i| {
             const q = ring[j];
-            if ((p.lat > lat) != (q.lat > lat) and
-                lon < (q.lon - p.lon) * (lat - p.lat) / (q.lat - p.lat) + p.lon)
+            if ((p.lat() > lat) != (q.lat() > lat) and
+                lon < (q.lon() - p.lon()) * (lat - p.lat()) / (q.lat() - p.lat()) + p.lon())
             {
                 inside = !inside;
             }
@@ -51,14 +90,14 @@ pub fn ringCentroid(ring: []const LonLat) ?LonLat {
     var i: usize = 0;
     while (i < ring.len) : (i += 1) {
         const j = (i + 1) % ring.len;
-        const cross = ring[i].lon * ring[j].lat - ring[j].lon * ring[i].lat;
+        const cross = ring[i].lon() * ring[j].lat() - ring[j].lon() * ring[i].lat();
         area2 += cross;
-        cx += (ring[i].lon + ring[j].lon) * cross;
-        cy += (ring[i].lat + ring[j].lat) * cross;
+        cx += (ring[i].lon() + ring[j].lon()) * cross;
+        cy += (ring[i].lat() + ring[j].lat()) * cross;
     }
     if (@abs(area2) < 1e-12) return null;
     const a6 = 3.0 * area2; // 6 * (signed area = area2 / 2)
-    return .{ .lon = cx / a6, .lat = cy / a6 };
+    return LonLat.init(cx / a6, cy / a6);
 }
 
 /// Even-odd point-in-polygon over the union of rings (exterior boundary + holes):
@@ -72,8 +111,8 @@ pub fn pointInRingsEvenOdd(lon: f64, lat: f64, rings: []const []LonLat) bool {
         while (i < ring.len) : (i += 1) {
             const a = ring[i];
             const b = ring[j];
-            if ((a.lat > lat) != (b.lat > lat) and
-                lon < (b.lon - a.lon) * (lat - a.lat) / (b.lat - a.lat) + a.lon)
+            if ((a.lat() > lat) != (b.lat() > lat) and
+                lon < (b.lon() - a.lon()) * (lat - a.lat()) / (b.lat() - a.lat()) + a.lon())
             {
                 inside = !inside;
             }
@@ -89,44 +128,44 @@ pub fn pointInRingsEvenOdd(lon: f64, lat: f64, rings: []const []LonLat) bool {
 pub fn areaRepresentativePoint(rings: []const []LonLat) ?LonLat {
     if (rings.len == 0) return null;
     if (ringCentroid(rings[0])) |c| {
-        if (pointInRingsEvenOdd(c.lon, c.lat, rings)) return c;
+        if (pointInRingsEvenOdd(c.lon(), c.lat(), rings)) return c;
     }
     var clon: f64 = 0;
     var clat: f64 = 0;
     var n: usize = 0;
     for (rings) |ring| for (ring) |q| {
-        clon += q.lon;
-        clat += q.lat;
+        clon += q.lon();
+        clat += q.lat();
         n += 1;
     };
     if (n == 0) return null;
-    return .{ .lon = clon / @as(f64, @floatFromInt(n)), .lat = clat / @as(f64, @floatFromInt(n)) };
+    return LonLat.init(clon / @as(f64, @floatFromInt(n)), clat / @as(f64, @floatFromInt(n)));
 }
 
 test "area representative point centres on the centroid when inside" {
     const t = std.testing;
     // A wide rectangle (0,0)-(10,2): the centre of gravity is dead-centre.
     var rect = [_]LonLat{
-        .{ .lon = 0, .lat = 0 },  .{ .lon = 10, .lat = 0 },
-        .{ .lon = 10, .lat = 2 }, .{ .lon = 0, .lat = 2 },
+        LonLat.init(0, 0),  LonLat.init(10, 0),
+        LonLat.init(10, 2), LonLat.init(0, 2),
     };
     var parts = [_][]LonLat{rect[0..]};
     const rp = areaRepresentativePoint(parts[0..]).?;
-    try t.expectApproxEqAbs(@as(f64, 5), rp.lon, 1e-9);
-    try t.expectApproxEqAbs(@as(f64, 1), rp.lat, 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 5), rp.lon(), 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 1), rp.lat(), 1e-9);
 
     // Even-odd containment: centre inside, far point outside.
     try t.expect(pointInRingsEvenOdd(5, 1, parts[0..]));
     try t.expect(!pointInRingsEvenOdd(20, 1, parts[0..]));
 
     // A triangle's centroid is the mean of its three vertices.
-    var tri = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 6, .lat = 0 }, .{ .lon = 0, .lat = 6 } };
+    var tri = [_]LonLat{ LonLat.init(0, 0), LonLat.init(6, 0), LonLat.init(0, 6) };
     const c = ringCentroid(tri[0..]).?;
-    try t.expectApproxEqAbs(@as(f64, 2), c.lon, 1e-9);
-    try t.expectApproxEqAbs(@as(f64, 2), c.lat, 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 2), c.lon(), 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 2), c.lat(), 1e-9);
 
     // A degenerate (collinear / 2-point) ring has no centroid.
-    var deg = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 1, .lat = 1 } };
+    var deg = [_]LonLat{ LonLat.init(0, 0), LonLat.init(1, 1) };
     try t.expect(ringCentroid(deg[0..]) == null);
 }
 
@@ -279,9 +318,9 @@ pub const Cell = struct {
             }
             const tail = cur.items[cur.items.len - 1];
             const last = edge[edge.len - 1];
-            if (tail.lon == edge[0].lon and tail.lat == edge[0].lat) {
+            if (tail.lon_e7 == edge[0].lon_e7 and tail.lat_e7 == edge[0].lat_e7) {
                 try cur.appendSlice(a, edge[1..]); // connected forward: drop shared node
-            } else if (tail.lon == last.lon and tail.lat == last.lat) {
+            } else if (tail.lon_e7 == last.lon_e7 and tail.lat_e7 == last.lat_e7) {
                 // Edge connects at its far end: the stored ORNT didn't orient it
                 // for this traversal. Reverse it so the ring stays continuous.
                 std.mem.reverse(LonLat, edge);
@@ -304,7 +343,7 @@ pub const Cell = struct {
             var items = part;
             if (out.items.len > 0 and items.len > 0) {
                 const tail = out.items[out.items.len - 1];
-                if (tail.lon == items[0].lon and tail.lat == items[0].lat) items = items[1..];
+                if (tail.lon_e7 == items[0].lon_e7 and tail.lat_e7 == items[0].lat_e7) items = items[1..];
             }
             try out.appendSlice(a, items);
         }
@@ -355,10 +394,10 @@ pub const Cell = struct {
         var any = false;
         for (self.vectors) |v| for (v.points) |p| {
             any = true;
-            min_lon = @min(min_lon, p.lon);
-            min_lat = @min(min_lat, p.lat);
-            max_lon = @max(max_lon, p.lon);
-            max_lat = @max(max_lat, p.lat);
+            min_lon = @min(min_lon, p.lon());
+            min_lat = @min(min_lat, p.lat());
+            max_lon = @max(max_lon, p.lon());
+            max_lat = @max(max_lat, p.lat());
         };
         return if (any) .{ min_lon, min_lat, max_lon, max_lat } else null;
     }
@@ -393,7 +432,7 @@ fn parseSG2D(a: Allocator, data: []const u8, comf: f64) ![]LonLat {
     while (i < n) : (i += 1) {
         const y = i32le(data, i * 8); // YCOO = latitude
         const x = i32le(data, i * 8 + 4); // XCOO = longitude
-        pts[i] = .{ .lat = @as(f64, @floatFromInt(y)) / comf, .lon = @as(f64, @floatFromInt(x)) / comf };
+        pts[i] = LonLat.init(@as(f64, @floatFromInt(x)) / comf, @as(f64, @floatFromInt(y)) / comf);
     }
     return pts;
 }
@@ -457,11 +496,11 @@ fn parseSG3D(a: Allocator, data: []const u8, comf: f64, somf: f64) ![]Sounding {
         const y = i32le(data, i * 12);
         const x = i32le(data, i * 12 + 4);
         const z = i32le(data, i * 12 + 8);
-        out[i] = .{
-            .lat = @as(f64, @floatFromInt(y)) / comf,
-            .lon = @as(f64, @floatFromInt(x)) / comf,
-            .depth = @as(f64, @floatFromInt(z)) / somf,
-        };
+        out[i] = Sounding.init(
+            @as(f64, @floatFromInt(x)) / comf,
+            @as(f64, @floatFromInt(y)) / comf,
+            @as(f64, @floatFromInt(z)) / somf,
+        );
     }
     return out;
 }
@@ -810,14 +849,14 @@ test "parse SG2D coordinates to lon/lat" {
     std.mem.writeInt(i32, data[12..16], @as(i32, @intFromFloat(-76.5 * 1e7)), .little);
     const pts = try parseSG2D(arena.allocator(), &data, 1e7);
     try std.testing.expectEqual(@as(usize, 2), pts.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 38.9784), pts[0].lat, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f64, -76.4820), pts[0].lon, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 38.9784), pts[0].lat(), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, -76.4820), pts[0].lon(), 1e-6);
 }
 
 test "pointInRings: inside, outside, and inside a hole" {
     // A 0..10 square (outer) with a 4..6 square hole.
-    const outer = [_]LonLat{ .{ .lon = 0, .lat = 0 }, .{ .lon = 10, .lat = 0 }, .{ .lon = 10, .lat = 10 }, .{ .lon = 0, .lat = 10 } };
-    const hole = [_]LonLat{ .{ .lon = 4, .lat = 4 }, .{ .lon = 6, .lat = 4 }, .{ .lon = 6, .lat = 6 }, .{ .lon = 4, .lat = 6 } };
+    const outer = [_]LonLat{ LonLat.init(0, 0), LonLat.init(10, 0), LonLat.init(10, 10), LonLat.init(0, 10) };
+    const hole = [_]LonLat{ LonLat.init(4, 4), LonLat.init(6, 4), LonLat.init(6, 6), LonLat.init(4, 6) };
     const rings = [_][]const LonLat{ outer[0..], hole[0..] };
     try std.testing.expect(pointInRings(&rings, 1, 1)); // inside outer, outside hole
     try std.testing.expect(!pointInRings(&rings, 5, 5)); // inside the hole -> outside

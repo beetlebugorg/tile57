@@ -834,7 +834,7 @@ pub fn bakeArchive(
             backs.appendAssumeCapacity(be);
             band_arenas.appendAssumeCapacity(pa);
         };
-        baker.bakeBand(band, backs.items, progress, user) catch {};
+        baker.bakeBand(band, backs.items, null, progress, user) catch {};
         for (backs.items) |*be| be.cell.deinit();
         for (band_arenas.items) |pa| if (pa) |p| {
             p.deinit();
