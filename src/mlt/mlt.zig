@@ -183,6 +183,8 @@ fn encodeGeometryColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.
     // Classify each feature + gather topology + interleaved vertices.
     var gtypes = try a.alloc(u32, n);
     defer a.free(gtypes);
+    var geom_lengths = Buf.empty; // LENGTH/GEOMETRIES (multi-geometry counts)
+    defer geom_lengths.deinit(a);
     var part_lengths = Buf.empty; // LENGTH/PARTS values (varint), per contributing feature
     defer part_lengths.deinit(a);
     var ring_lengths = Buf.empty; // LENGTH/RINGS values
@@ -190,29 +192,49 @@ fn encodeGeometryColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.
     var verts = std.ArrayList(i32).empty; // interleaved x,y across all features
     defer verts.deinit(a);
 
+    var n_geom_vals: u64 = 0;
     var n_part_vals: u64 = 0;
     var n_ring_vals: u64 = 0;
+    var any_geometries = false;
     var any_parts = false;
     var any_rings = false;
 
     for (features, 0..) |f, i| {
         switch (f.geom_type) {
             .point => {
-                gtypes[i] = G_POINT;
-                // Single point: parts[0][0]. (Multipoint deferred.)
-                const p = f.parts[0][0];
-                try verts.append(a, p.x);
-                try verts.append(a, p.y);
-            },
-            .linestring => {
-                gtypes[i] = G_LINESTRING;
-                any_parts = true;
-                const line = f.parts[0]; // single line (multiline deferred)
-                try putVarint(&part_lengths, a, line.len);
-                n_part_vals += 1;
-                for (line) |p| {
+                // Count all points across parts; >1 -> MultiPoint (tile57 emits
+                // single points today, but this stays correct if that changes).
+                var npts: u64 = 0;
+                for (f.parts) |part| for (part) |p| {
                     try verts.append(a, p.x);
                     try verts.append(a, p.y);
+                    npts += 1;
+                };
+                if (npts == 1) {
+                    gtypes[i] = G_POINT;
+                } else {
+                    gtypes[i] = G_MULTIPOINT;
+                    any_geometries = true;
+                    try putVarint(&geom_lengths, a, npts);
+                    n_geom_vals += 1;
+                }
+            },
+            .linestring => {
+                // All lines -> MultiLineString so clip-split lines (clipLine yields
+                // several sub-lines) keep every segment. GEOMETRIES = line count;
+                // PARTS = vertices per line.
+                gtypes[i] = G_MULTILINESTRING;
+                any_geometries = true;
+                any_parts = true;
+                try putVarint(&geom_lengths, a, f.parts.len);
+                n_geom_vals += 1;
+                for (f.parts) |line| {
+                    try putVarint(&part_lengths, a, line.len);
+                    n_part_vals += 1;
+                    for (line) |p| {
+                        try verts.append(a, p.x);
+                        try verts.append(a, p.y);
+                    }
                 }
             },
             .polygon => {
@@ -239,8 +261,9 @@ fn encodeGeometryColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.
         }
     }
 
-    // numStreams = GeometryType + (PARTS?) + (RINGS?) + VertexBuffer.
+    // numStreams = GeometryType + (GEOMETRIES?) + (PARTS?) + (RINGS?) + VertexBuffer.
     var num_streams: u64 = 2;
+    if (any_geometries) num_streams += 1;
     if (any_parts) num_streams += 1;
     if (any_rings) num_streams += 1;
     try putVarint(body, a, num_streams);
@@ -252,6 +275,12 @@ fn encodeGeometryColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.
         for (gtypes) |g| try putVarint(&data, a, g);
         try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_VARINT, n, data.items.len);
         try body.appendSlice(a, data.items);
+    }
+
+    // ---- GEOMETRIES length stream (sub-geometry count for multi types) -------
+    if (any_geometries) {
+        try writeStreamMeta(body, a, PHYS_LENGTH, LEN_GEOMETRIES, LLT_NONE, LLT_NONE, PLT_VARINT, n_geom_vals, geom_lengths.items.len);
+        try body.appendSlice(a, geom_lengths.items);
     }
 
     // ---- PARTS length stream (vertices-per-line / rings-per-polygon) ---------
@@ -486,6 +515,21 @@ test "partial / boolean / mixed-type property keys are skipped (non-nullable onl
     // only0 present on 1/2 features -> skipped; flag is boolean -> skipped.
     var cb: [MAX_PROP_KEYS]PropCol = undefined;
     try std.testing.expectEqual(@as(usize, 0), collectPropCols(&feats, &cb));
+}
+
+test "clip-split (multi-part) line keeps every segment (verified)" {
+    const a = std.testing.allocator;
+    // A line that split into 2 sub-lines at the tile boundary. Verified via the
+    // reference decoder: 1 MultiLineString feature, vertexBuffer
+    // [0,0,10,0,20,20,30,20,40,25], geometryOffsets {0,2}, partOffsets {0,2,5}.
+    const l0 = [_]mvt.Point{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 0 } };
+    const l1 = [_]mvt.Point{ .{ .x = 20, .y = 20 }, .{ .x = 30, .y = 20 }, .{ .x = 40, .y = 25 } };
+    const parts = [_][]const mvt.Point{ &l0, &l1 };
+    const feats = [_]mvt.Feature{.{ .geom_type = .linestring, .parts = &parts }};
+    const layers = [_]mvt.Layer{.{ .name = "layer1", .extent = 4096, .features = &feats }};
+    const bytes = try encode(a, .{ .layers = &layers });
+    defer a.free(bytes);
+    try std.testing.expect(bytes.len > 12);
 }
 
 test "encode line + polygon round-trips (verified via reference decoder)" {
