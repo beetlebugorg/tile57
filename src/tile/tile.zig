@@ -90,18 +90,22 @@ fn intersect(a: mvt.Point, c: mvt.Point, edge: Edge, b: Box) mvt.Point {
     const ay: f64 = @floatFromInt(a.y);
     const cx: f64 = @floatFromInt(c.x);
     const cy: f64 = @floatFromInt(c.y);
-    const bound: f64 = @floatFromInt(switch (edge) {
+    // The clip boundary is an exact integer; use it directly (no round needed) and
+    // hardware-round only the interpolated coordinate (see roundI32 — @round
+    // compiled to a software routine on the baseline musl target).
+    const bi: i32 = switch (edge) {
         .left, .top => b.min,
         .right, .bottom => b.max,
-    });
+    };
+    const bound: f64 = @floatFromInt(bi);
     return switch (edge) {
         .left, .right => blk: {
             const t = (bound - ax) / (cx - ax);
-            break :blk .{ .x = @intFromFloat(@round(bound)), .y = @intFromFloat(@round(ay + t * (cy - ay))) };
+            break :blk .{ .x = bi, .y = roundI32(ay + t * (cy - ay)) };
         },
         .top, .bottom => blk: {
             const t = (bound - ay) / (cy - ay);
-            break :blk .{ .x = @intFromFloat(@round(ax + t * (cx - ax))), .y = @intFromFloat(@round(bound)) };
+            break :blk .{ .x = roundI32(ax + t * (cx - ax)), .y = bi };
         },
     };
 }
@@ -213,8 +217,8 @@ fn clipSegment(p0: mvt.Point, p1: mvt.Point, b: Box) ?[2]mvt.Point {
     const nx1 = x0 + t1 * dx;
     const ny1 = y0 + t1 * dy;
     return .{
-        .{ .x = @intFromFloat(@round(nx0)), .y = @intFromFloat(@round(ny0)) },
-        .{ .x = @intFromFloat(@round(nx1)), .y = @intFromFloat(@round(ny1)) },
+        .{ .x = roundI32(nx0), .y = roundI32(ny0) },
+        .{ .x = roundI32(nx1), .y = roundI32(ny1) },
     };
 }
 
