@@ -104,4 +104,3 @@ and serves the best-available scale band per tile.
 
 See the [**Architecture**](./architecture.md) page for how the engine fits
 together.
-</content>

@@ -105,4 +105,3 @@ The pure-Zig foundational parsers under `tile57.formats`:
 
 `tile57.version` is the package version string (`"0.1.0"`), matching
 `build.zig.zon` and `tile57_version()`.
-</content>

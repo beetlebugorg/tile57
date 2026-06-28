@@ -55,4 +55,3 @@ API](./zig-api.md).
 
 Next: [**Getting Started**](./getting-started.md) bakes a chart and fetches a
 tile.
-</content>

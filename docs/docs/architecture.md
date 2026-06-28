@@ -128,4 +128,3 @@ manifest stamps both with a `schema_version` (`tile57/1` — the
 [tile-schema](./tile-schema.md) vocabulary) that a renderer checks before loading.
 
 See the [**Tile Schema**](./tile-schema.md) for the vector-tile layer contract.
-</content>

@@ -204,4 +204,3 @@ part of the embedding API.
 ## Versioning
 
 Pre-1.0 (`0.1.0`). No external consumers yet, so the ABI is not frozen.
-</content>

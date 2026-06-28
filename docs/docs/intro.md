@@ -82,5 +82,3 @@ stage.
 - [**Architecture**](./architecture.md) — the pipeline and the Zig packages.
 - [**Tile Schema**](./tile-schema.md) — the vector-tile layer contract.
 - [**Known Limitations**](./limitations.md) — what does not render yet.
-</content>
-</invoke>
