@@ -325,14 +325,19 @@ pub const WriteOptions = struct {
 };
 
 /// Streaming archive writer: feed tiles one at a time (each gzipped + content-
-/// deduped into a growing data buffer; the raw MVT is NOT retained), then emit
-/// the archive. Lets a baker stream tiles instead of holding them all — the
-/// `prefix` (header + directory + metadata) is small, and the data buffer can be
-/// written straight to a file after it, so peak memory is the compressed data
-/// section, not the raw tiles + a whole-archive copy. Pure (no fs).
+/// deduped, the raw MVT is NOT retained), then emit the archive. Lets a baker
+/// stream tiles instead of holding them all. The `prefix` (header + directory +
+/// metadata) is small; the data section is either kept in a growing buffer
+/// (`init`, for callers that want the whole archive as bytes) or streamed
+/// straight to a file (`initFile`) so it never lives on the heap at all — the
+/// latter keeps a full-catalogue bake's peak memory to the directory + dedup
+/// map, not the multi-GB compressed data section. Pure: any file I/O is done via
+/// the caller-supplied `std.Io`.
 pub const StreamWriter = struct {
     gpa: Allocator,
-    data: std.ArrayList(u8) = .empty, // concatenated unique gzipped tiles
+    data: std.ArrayList(u8) = .empty, // in-memory data section (sink == null)
+    sink: ?Sink = null, // else: gzipped tiles streamed straight to this file
+    data_len: u64 = 0, // bytes written to the data section so far (== next offset)
     entries: std.ArrayList(Entry) = .empty, // one per addressed tile (pre-sort)
     hash_to_off: std.AutoHashMap(u64, Off),
     num_addressed: u64 = 0,
@@ -342,9 +347,22 @@ pub const StreamWriter = struct {
 
     const Off = struct { off: u64, len: u32 };
 
+    // A file the data section is appended to. The writer never reads it back; the
+    // caller concatenates `prefix` ++ this file into the final archive and owns
+    // the file's lifetime (close/delete).
+    const Sink = struct { io: std.Io, file: std.Io.File };
+
     pub fn init(gpa: Allocator) StreamWriter {
         return .{ .gpa = gpa, .hash_to_off = std.AutoHashMap(u64, Off).init(gpa) };
     }
+
+    /// Like `init`, but the (gzipped, deduped) data section is appended to `file`
+    /// as tiles arrive rather than buffered in memory. `file` must be empty and
+    /// positioned at 0; the writer appends sequentially via `io`.
+    pub fn initFile(gpa: Allocator, io: std.Io, file: std.Io.File) StreamWriter {
+        return .{ .gpa = gpa, .hash_to_off = std.AutoHashMap(u64, Off).init(gpa), .sink = .{ .io = io, .file = file } };
+    }
+
     pub fn deinit(self: *StreamWriter) void {
         self.data.deinit(self.gpa);
         self.entries.deinit(self.gpa);
@@ -365,9 +383,10 @@ pub const StreamWriter = struct {
             off = slot.value_ptr.off;
             len = slot.value_ptr.len;
         } else {
-            off = self.data.items.len;
+            off = self.data_len;
             len = @intCast(comp.len);
-            try self.data.appendSlice(self.gpa, comp);
+            if (self.sink) |s| try s.file.writeStreamingAll(s.io, comp) else try self.data.appendSlice(self.gpa, comp);
+            self.data_len += len;
             slot.value_ptr.* = .{ .off = off, .len = len };
             self.num_contents += 1;
         }
@@ -409,7 +428,7 @@ pub const StreamWriter = struct {
             .leaf_dir_offset = data_off,
             .leaf_dir_length = 0,
             .tile_data_offset = data_off,
-            .tile_data_length = self.data.items.len,
+            .tile_data_length = self.data_len,
             .num_addressed_tiles = self.num_addressed,
             .num_tile_entries = merged.items.len,
             .num_tile_contents = self.num_contents,
@@ -438,8 +457,10 @@ pub const StreamWriter = struct {
     }
 
     /// The whole archive as one buffer (prefix ++ data). For consumers that need
-    /// bytes (the C ABI); the streaming CLI writes prefix + data to a file instead.
+    /// bytes (the C ABI); requires the in-memory data section (`init`, not
+    /// `initFile`). The streaming CLI concatenates prefix + the data file instead.
     pub fn finishBytes(self: *StreamWriter, opts: WriteOptions) ![]u8 {
+        std.debug.assert(self.sink == null); // a file-backed writer has no in-memory data
         if (self.num_addressed == 0) return self.gpa.alloc(u8, 0);
         const pre = try self.prefix(self.gpa, opts);
         defer self.gpa.free(pre);

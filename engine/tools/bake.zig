@@ -1122,7 +1122,16 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     engine.catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
     engine.portray.setQuiet(true); // many threads -> suppress the per-cell stderr
 
-    var sw = engine.pmtiles.StreamWriter.init(page);
+    // Stream the gzipped tiles straight to a temp data file (concatenated into
+    // out_path at the end) so the whole compressed archive never lives in RAM —
+    // only the directory + dedup map do. Peak memory is then one band's cells.
+    const data_tmp = try std.fmt.allocPrint(a, "{s}.data.tmp", .{out_path});
+    var data_file = try std.Io.Dir.cwd().createFile(io, data_tmp, .{ .read = true });
+    errdefer {
+        data_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
+    }
+    var sw = engine.pmtiles.StreamWriter.initFile(page, io, data_file);
     defer sw.deinit();
     var sounds = std.StringHashMap(void).init(a);
     var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = page };
@@ -1136,6 +1145,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     for (Bands.bands_fine_to_coarse) |band| {
         const paths = band_paths[@intFromEnum(band)].items;
         if (paths.len == 0) continue;
+        std.debug.print("\n  band {s}: {d} cells\n", .{ @tagName(band), paths.len });
 
         // Read this band's raw bytes on the main thread (IO isn't thread-safe here).
         var sources = std.ArrayList(CellSource).empty;
@@ -1195,8 +1205,10 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         band_arenas.deinit(page);
     }
 
-    // Stream the archive to out_path: the small prefix (header + directory +
-    // metadata) then the compressed data section — no whole-archive copy in RAM.
+    // Assemble out_path = prefix (header + directory + metadata) ++ the data
+    // section streamed to data_tmp. The prefix is small; the data is copied in
+    // bounded chunks (positional reads, no whole-archive buffer), then the temp
+    // file is removed.
     const opts = engine.pmtiles.WriteOptions{
         .min_lon_e7 = toE7(ubox[0]),
         .min_lat_e7 = toE7(ubox[1]),
@@ -1205,9 +1217,21 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     };
     const pre = try sw.prefix(a, opts);
     var file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
-    defer file.close(io);
     try file.writeStreamingAll(io, pre);
-    try file.writeStreamingAll(io, sw.data.items);
+    {
+        const chunk = try a.alloc(u8, 1 << 20); // 1 MiB
+        defer a.free(chunk);
+        var pos: u64 = 0;
+        while (pos < sw.data_len) {
+            const want: usize = @intCast(@min(@as(u64, chunk.len), sw.data_len - pos));
+            _ = try data_file.readPositionalAll(io, chunk[0..want], pos);
+            try file.writeStreamingAll(io, chunk[0..want]);
+            pos += want;
+        }
+    }
+    file.close(io);
+    data_file.close(io);
+    std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
 
     var stacks = std.ArrayList([]const u8).empty;
     var it = sounds.keyIterator();
