@@ -26,12 +26,16 @@ const PHYS_OFFSET: u8 = 2;
 const PHYS_LENGTH: u8 = 3;
 // DictionaryType (low nibble when DATA).
 const DICT_NONE: u8 = 0;
+const DICT_SINGLE: u8 = 1;
 const DICT_VERTEX: u8 = 3;
+// OffsetType (low nibble when OFFSET).
+const OFF_STRING: u8 = 2;
 // LengthType (low nibble when LENGTH).
 const LEN_VAR_BINARY: u8 = 0;
 const LEN_GEOMETRIES: u8 = 1;
 const LEN_PARTS: u8 = 2;
 const LEN_RINGS: u8 = 3;
+const LEN_DICTIONARY: u8 = 6;
 // LogicalLevelTechnique ordinals.
 const LLT_NONE: u8 = 0;
 const LLT_DELTA: u8 = 1;
@@ -327,26 +331,75 @@ fn collectPropCols(features: []const mvt.Feature, out: []PropCol) usize {
     return n;
 }
 
+// Encode a string property column. Dictionary-encodes (distinct values + a
+// per-feature index) when values repeat — the big size win for chart attributes
+// like class / color_token / dash — and falls back to plain (length+data) when
+// they don't (all-distinct, e.g. labels) or there are too many distinct values to
+// dedup cheaply. All scratch is arena-backed (freed on the per-layer reset).
+fn encodeStringColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Feature, key: []const u8) !void {
+    const n = features.len;
+    const DICT_CAP = 256; // keep the linear dedup O(features); past this -> plain
+    var dict = std.ArrayList([]const u8).empty;
+    const idxs = try a.alloc(u32, n);
+    var dict_ok = true;
+    for (features, 0..) |f, fi| {
+        const s = featureValue(f, key).?.string;
+        var found: ?u32 = null;
+        for (dict.items, 0..) |d, di| {
+            if (std.mem.eql(u8, d, s)) {
+                found = @intCast(di);
+                break;
+            }
+        }
+        if (found) |ix| {
+            idxs[fi] = ix;
+        } else if (dict.items.len < DICT_CAP) {
+            idxs[fi] = @intCast(dict.items.len);
+            try dict.append(a, s);
+        } else {
+            dict_ok = false;
+            break;
+        }
+    }
+
+    if (dict_ok and dict.items.len < n) {
+        // Dictionary: LENGTH/DICTIONARY + DATA/SINGLE + OFFSET/STRING (3 streams).
+        try putVarint(body, a, 3);
+        var dlen = Buf.empty;
+        var dbytes = Buf.empty;
+        for (dict.items) |d| {
+            try putVarint(&dlen, a, d.len);
+            try dbytes.appendSlice(a, d);
+        }
+        try writeStreamMeta(body, a, PHYS_LENGTH, LEN_DICTIONARY, LLT_NONE, LLT_NONE, PLT_VARINT, dict.items.len, dlen.items.len);
+        try body.appendSlice(a, dlen.items);
+        try writeStreamMeta(body, a, PHYS_DATA, DICT_SINGLE, LLT_NONE, LLT_NONE, PLT_NONE, dbytes.items.len, dbytes.items.len);
+        try body.appendSlice(a, dbytes.items);
+        var off = Buf.empty;
+        for (idxs) |ix| try putVarint(&off, a, ix);
+        try writeStreamMeta(body, a, PHYS_OFFSET, OFF_STRING, LLT_NONE, LLT_NONE, PLT_VARINT, n, off.items.len);
+        try body.appendSlice(a, off.items);
+    } else {
+        // Plain: LENGTH/VAR_BINARY (per-feature lengths) + DATA/NONE (bytes).
+        try putVarint(body, a, 2);
+        var lens = Buf.empty;
+        var data = Buf.empty;
+        for (features) |f| {
+            const s = featureValue(f, key).?.string;
+            try putVarint(&lens, a, s.len);
+            try data.appendSlice(a, s);
+        }
+        try writeStreamMeta(body, a, PHYS_LENGTH, LEN_VAR_BINARY, LLT_NONE, LLT_NONE, PLT_VARINT, n, lens.items.len);
+        try body.appendSlice(a, lens.items);
+        try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_NONE, data.items.len, data.items.len);
+        try body.appendSlice(a, data.items);
+    }
+}
+
 fn encodePropertyColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Feature, col: PropCol) !void {
     const n = features.len;
     switch (col.kind) {
-        .string => {
-            // STRING has a stream count (hasStreamCount): LENGTH + DATA (plain).
-            try putVarint(body, a, 2);
-            var lens = Buf.empty;
-            defer lens.deinit(a);
-            var data = Buf.empty;
-            defer data.deinit(a);
-            for (features) |f| {
-                const s = featureValue(f, col.key).?.string;
-                try putVarint(&lens, a, s.len);
-                try data.appendSlice(a, s);
-            }
-            try writeStreamMeta(body, a, PHYS_LENGTH, LEN_VAR_BINARY, LLT_NONE, LLT_NONE, PLT_VARINT, n, lens.items.len);
-            try body.appendSlice(a, lens.items);
-            try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_NONE, data.items.len, data.items.len);
-            try body.appendSlice(a, data.items);
-        },
+        .string => try encodeStringColumn(body, a, features, col.key),
         .int32 => {
             var data = Buf.empty;
             defer data.deinit(a);
