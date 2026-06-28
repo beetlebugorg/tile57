@@ -10,8 +10,10 @@
 #include <QMouseEvent>
 #include <QPointF>
 #include <QTimer>
+#include <QWheelEvent>
 
 #include <cmath>
+#include <cstdio>
 
 namespace cpn {
 namespace {
@@ -98,6 +100,49 @@ private:
     bool dragging_ = false;
     QPointF lastPos_, vel_;
     quint64 lastT_ = 0;
+};
+
+// Scroll-wheel zoom with an explicit, configurable direction. QMapLibre's built-in
+// handler maps the wheel-delta sign straight to zoom (positive delta = zoom in), so
+// the felt direction follows whatever the OS/mouse scroll convention reports — which
+// can come through inverted across platforms (Wayland high-res wheels, natural
+// scroll, etc.). To make the chart's zoom direction deterministic we own the wheel:
+// filter it before the widget, apply our own zoom, and consume it so it isn't
+// double-handled. CHART_ZOOM_INVERT=1 flips the direction; CHART_ZOOM_DEBUG=1 logs
+// the raw deltas so the right default can be confirmed on a given box.
+class WheelZoom : public QObject {
+public:
+    explicit WheelZoom(QMapLibre::MapWidget *w)
+        : QObject(w), widget_(w),
+          invert_(qEnvironmentVariableIsSet("CHART_ZOOM_INVERT")),
+          debug_(qEnvironmentVariableIsSet("CHART_ZOOM_DEBUG")) {
+        w->installEventFilter(this);
+    }
+
+protected:
+    bool eventFilter(QObject *, QEvent *ev) override {
+        if (ev->type() != QEvent::Wheel) return false;
+        auto *we = static_cast<QWheelEvent *>(ev);
+        int dy = we->angleDelta().y();
+        if (debug_)
+            std::fprintf(stderr, "[wheel] angleDelta.y=%d pixelDelta.y=%d invert=%d\n", dy,
+                         we->pixelDelta().y(), int(invert_));
+        if (dy == 0) return false; // horizontal-only wheel — let the widget have it
+        auto *m = widget_->map();
+        if (!m) return false;
+        if (invert_) dy = -dy;
+        // Same response curve as QMapLibre's handleWheelEvent, on our signed delta.
+        constexpr float kWheel = 1200.0f;
+        float factor = static_cast<float>(dy) / kWheel;
+        if (dy < 0) factor = factor > -1 ? factor : 1 / factor;
+        m->scaleBy(1.0 + factor, we->position());
+        return true; // we applied the zoom; don't let the widget zoom again
+    }
+
+private:
+    QMapLibre::MapWidget *widget_;
+    bool invert_;
+    bool debug_;
 };
 
 // --- Status HUD (band · scale · zoom · position + overscale), ported ~1:1 from the
@@ -189,6 +234,7 @@ QMapLibre::MapWidget *makeMapWidget(const QString &styleUrl, double lat, double 
 
     auto *widget = new QMapLibre::MapWidget(settings);
     new MapFling(widget);     // inertial panning; parented to the widget
+    new WheelZoom(widget);    // deterministic scroll-zoom direction (CHART_ZOOM_INVERT)
     installStatusBox(widget); // band · scale · zoom · position HUD
     return widget;
 }
