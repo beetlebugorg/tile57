@@ -19,11 +19,10 @@ the portrayal assets a renderer needs:
 zig build                          # builds zig-out/bin/tile57
 T=zig-out/bin/tile57
 
-# A self-contained bundle: tiles + style + assets + manifest
-$T bundle CELL.000 -o out/
-
-# A whole ENC_ROOT, band-streamed into one PMTiles archive
-$T bake-root /path/to/ENC_ROOT -o chart.pmtiles
+# One command: a single cell OR a whole ENC_ROOT (band-streamed) ->
+# a self-contained bundle (tiles/chart.pmtiles + style + assets + manifest)
+$T bake CELL.000 -o out/
+$T bake /path/to/ENC_ROOT -o out/
 
 # Just the portrayal assets (from the embedded catalogue — no path needed)
 $T assets     -o assets/   # colortables + linestyles + sprite + patterns
@@ -31,12 +30,12 @@ $T sprite-mln -o assets/   # the MapLibre sprite sheet
 # (pass a /path/to/PortrayalCatalog to use an on-disk catalogue instead)
 
 # Inspect / summarise
-$T inspect chart.pmtiles        # zoom range + tile counts
+$T inspect out/tiles/chart.pmtiles  # zoom range + tile counts
 $T cell    CELL.000             # summarise an S-57 cell
 $T version
 ```
 
-Run `tile57 help` for the full subcommand list (`bake`, `bake-root`, `bundle`,
+Run `tile57 help` for the full subcommand list (`bake`,
 `assets`, `sprite`, `pattern`, `sprite-mln`, `style`, `inspect`, `cell`,
 `version`, `help`).
 
