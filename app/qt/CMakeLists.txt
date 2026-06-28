@@ -14,7 +14,7 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets)
 qt_standard_project_setup()
 find_package(QMapLibre REQUIRED COMPONENTS Widgets)
 
-qt_add_executable(chartplotter-qt main.cpp)
+qt_add_executable(chartplotter-qt main.cpp map_helpers.cpp)
 target_link_libraries(chartplotter-qt PRIVATE QMapLibre::Widgets)
 
 # Live ENC support: when the outer build passes TILE57_LIB (the Zig tile
@@ -23,7 +23,8 @@ target_link_libraries(chartplotter-qt PRIVATE QMapLibre::Widgets)
 # Qt6::Network. Without TILE57_LIB the viewer still builds (style files only).
 if(TILE57_LIB)
   find_package(Qt6 REQUIRED COMPONENTS Network)
-  target_sources(chartplotter-qt PRIVATE tile_server.cpp mariner_panel.cpp)
+  target_sources(chartplotter-qt PRIVATE
+    tile_server.cpp mariner_panel.cpp band_panel.cpp chart_window.cpp)
   target_include_directories(chartplotter-qt PRIVATE
     ${CHARTPLOTTER_INCLUDE_DIR}  # include/  -> tile57.h
     ${CHARTPLOTTER_APP_DIR})     # app/      -> enc_root.hpp

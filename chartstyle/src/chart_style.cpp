@@ -133,6 +133,16 @@ json categoryFilter(const MarinerSettings &m) {
     return json::array({"all", inCat, json::array({"!", isQual})});
 }
 
+// NOAA band visibility (the band-filter column): show a feature only if its baked
+// `band` rank is in the enabled set. A missing band (single cell / pmtiles)
+// coalesces to 0. Band/chart visibility lives outside MarinerSettings (a
+// chart-source concern); the host passes the enabled ranks.
+json bandFilter(const std::vector<int> &enabled) {
+    json en = json::array();
+    for (int r : enabled) en.push_back(r);
+    return json::array({"in", coalesce(get("band"), 0), json::array({"literal", en})});
+}
+
 // Boundary symbolization (S-52 §8.6.1), client-side: each area primitive is baked
 // with a `bnd` tag — 2 = style-independent (always shown), 0 = plain-boundary, 1 =
 // symbolized-boundary. Show common (2) + the active style. A missing `bnd` (non-area
@@ -233,7 +243,7 @@ bool isId(const json &layer, std::initializer_list<const char *> ids) {
 } // namespace
 
 std::string buildStyle(const std::string &templateJson, const MarinerSettings &m,
-                       const std::string &colortablesJson) {
+                       const std::string &colortablesJson, const std::vector<int> *enabledBands) {
     json style, cts;
     try {
         style = json::parse(templateJson);
@@ -280,6 +290,7 @@ std::string buildStyle(const std::string &templateJson, const MarinerSettings &m
         if (L.value("source", std::string()) == "chart") {
             std::vector<json> clauses;
             clauses.push_back(categoryFilter(m));
+            if (enabledBands) clauses.push_back(bandFilter(*enabledBands));
             // Boundary symbolization (areas) + point-symbol style (points): each
             // shows the style-independent (2) primitives plus the active style's.
             clauses.push_back(boundaryFilter(m));

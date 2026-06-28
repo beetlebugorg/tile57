@@ -43,8 +43,10 @@ signals:
     void progress(const QString &stage, quint64 done, quint64 total);
     // The raw (tile-URL-rewritten) style template + S-52 colortables, handed to the
     // UI thread, which owns the MarinerSettings and (re)builds the style live.
+    // presentBands is the bitmask of navigational bands in the source (for the
+    // data-driven band-filter column; 0 = single cell / pmtiles).
     void ready(const QString &templateJson, const QString &colortablesJson, double lat, double lon,
-               double zoom, double minZoomFloor);
+               double zoom, double minZoomFloor, quint32 presentBands);
     void failed(const QString &reason);
     // Live tile activity for a loading indicator (cross-thread, queued).
     void activity(int inflight, quint64 served);

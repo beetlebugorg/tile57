@@ -596,6 +596,22 @@ export fn tile57_source_zoom_range(src: ?*Source, min_z: *u8, max_z: *u8) callco
     }
 }
 
+/// Bitmask of the navigational bands actually present in the source (bit r set =
+/// band rank r has at least one cell; 0=berthing/finest … 5=overview/coarsest).
+/// Lets a host build a data-driven band filter that lists only the loaded bands.
+/// 0 for a single cell / PMTiles archive (no multi-band concept).
+export fn tile57_source_bands(src: ?*Source) callconv(.c) u32 {
+    const s = src orelse return 0;
+    return switch (s.backend) {
+        .cells => |ls| blk: {
+            var mask: u32 = 0;
+            for (ls.cells) |lc| mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(lc.band)));
+            break :blk mask;
+        },
+        else => 0,
+    };
+}
+
 /// Geographic bounds of the source (west,south,east,north degrees); returns true
 /// when known. Lets a host frame the data with its own fit-to-window logic
 /// (MapLibre's cameraForLatLngBounds) rather than a guessed center+zoom.

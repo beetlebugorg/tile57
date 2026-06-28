@@ -13,6 +13,7 @@
 #include "chartstyle/mariner.hpp"
 
 #include <string>
+#include <vector>
 
 namespace chartstyle {
 
@@ -20,9 +21,15 @@ namespace chartstyle {
 // colortablesJson: { "day": {TOKEN: "#rrggbb", ...}, "dusk": {...}, "night": {...} }
 //   (S-52 colour tables). Pass "" or an empty object to keep the template's baked
 //   depth colours (the shading expression is only regenerated when a palette is
-//   available). Returns the patched style JSON; on parse failure returns the
-//   template unchanged.
+//   available).
+// enabledBands: optional band-visibility filter — band/chart visibility is a
+//   chart-source concern, kept OUT of MarinerSettings. nullptr = no band filter
+//   (show all); otherwise show only features whose `band` rank is in the list (an
+//   empty list hides every banded feature). The host fills it from the loaded
+//   source's present bands (tile57_source_bands).
+// Returns the patched style JSON; on parse failure returns the template unchanged.
 std::string buildStyle(const std::string &templateJson, const MarinerSettings &m,
-                       const std::string &colortablesJson);
+                       const std::string &colortablesJson,
+                       const std::vector<int> *enabledBands = nullptr);
 
 } // namespace chartstyle

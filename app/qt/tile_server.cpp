@@ -154,9 +154,11 @@ void TileServer::run() {
     // owns the MarinerSettings and (re)builds the style via chartstyle::buildStyle.
     const std::string cts = readWhole(findRepoFile(exePath_.toStdString(), "reference/assets/colortables.json"));
 
+    const quint32 bands = tile57_source_bands(src_); // present navigational bands
+
     std::fprintf(stderr, "[chart] serving %s on http://127.0.0.1:%u\n",
                  chartPath_.toUtf8().constData(), port);
-    emit ready(QString::fromStdString(json), QString::fromStdString(cts), lat, lon, zoom, minZoomFloor);
+    emit ready(QString::fromStdString(json), QString::fromStdString(cts), lat, lon, zoom, minZoomFloor, bands);
 }
 
 void TileServer::onNewConnection() {

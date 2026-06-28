@@ -109,6 +109,11 @@ void tile57_source_close(tile57_source *src);
 /* Min/max zoom the source serves (PMTiles: archive range; cell: 0..18). */
 void tile57_source_zoom_range(tile57_source *src, uint8_t *min_z, uint8_t *max_z);
 
+/* Bitmask of the navigational bands present in the source (bit r = band rank r has
+ * a cell; 0=berthing/finest .. 5=overview/coarsest). 0 for a single cell / PMTiles.
+ * Lets a host build a data-driven band filter listing only the loaded bands. */
+uint32_t tile57_source_bands(tile57_source *src);
+
 /* Geographic bounds (west, south, east, north degrees); true when known, so a
  * host can frame the data with its own fit-to-window logic. PMTiles -> archive
  * bounds; cell -> data extent. False for degenerate or near-global extents (the
