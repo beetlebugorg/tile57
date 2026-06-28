@@ -1,6 +1,6 @@
-# chartplotter-native documentation
+# tile57 documentation
 
-This is the source for the chartplotter-native documentation site. It is built
+This is the source for the tile57 documentation site. It is built
 with [Docusaurus](https://docusaurus.io/) and shares the look of the
 [chartplotter-go docs](https://beetlebugorg.github.io/chartplotter/).
 

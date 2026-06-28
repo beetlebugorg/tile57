@@ -6,6 +6,7 @@ const sidebars = {
     'intro',
     'installation',
     'getting-started',
+    'zig-api',
     'c-api',
     'architecture',
     'tile-schema',

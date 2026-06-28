@@ -3,14 +3,14 @@ import {themes as prismThemes} from 'prism-react-renderer';
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: 'chartplotter-native',
-  tagline: '⚓ Marine chart tiles, generated natively in Zig.',
+  title: 'tile57',
+  tagline: '⚓ A high-performance, low-memory S-57 → MVT + S-52 style engine.',
 
   url: 'https://beetlebugorg.github.io',
-  baseUrl: '/chartplotter-native/',
+  baseUrl: '/tile57/',
 
   organizationName: 'beetlebugorg',
-  projectName: 'chartplotter-native',
+  projectName: 'tile57',
 
   onBrokenLinks: 'warn',
 
@@ -34,7 +34,7 @@ const config = {
           routeBasePath: '/',
           sidebarPath: './sidebars.js',
           editUrl:
-            'https://github.com/beetlebugorg/chartplotter-native/tree/main/docs/',
+            'https://github.com/beetlebugorg/tile57/tree/main/docs/',
         },
         blog: false,
         theme: {
@@ -48,7 +48,7 @@ const config = {
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
       navbar: {
-        title: 'chartplotter-native',
+        title: 'tile57',
         items: [
           {
             href: 'https://github.com/beetlebugorg/chartplotter',
@@ -56,7 +56,7 @@ const config = {
             position: 'right',
           },
           {
-            href: 'https://github.com/beetlebugorg/chartplotter-native',
+            href: 'https://github.com/beetlebugorg/tile57',
             label: 'GitHub',
             position: 'right',
           },
@@ -78,7 +78,7 @@ const config = {
             items: [
               {
                 label: 'GitHub',
-                href: 'https://github.com/beetlebugorg/chartplotter-native',
+                href: 'https://github.com/beetlebugorg/tile57',
               },
               {
                 label: 'chartplotter-go (reference impl)',
@@ -92,7 +92,7 @@ const config = {
       prism: {
         theme: prismThemes.github,
         darkTheme: prismThemes.dracula,
-        additionalLanguages: ['bash', 'json', 'c', 'cpp', 'zig', 'cmake'],
+        additionalLanguages: ['bash', 'json', 'c', 'zig'],
       },
     }),
 };

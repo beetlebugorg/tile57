@@ -6,78 +6,53 @@ sidebar_position: 2
 
 # Installation
 
-chartplotter-native builds from source. CMake is the top-level integrator: it
-builds the vendored MapLibre Native and drives `zig build` for the tile
-generator. There are no pre-built binaries.
+tile57 builds from source with **Zig 0.16** — no CMake, no system libraries
+beyond Zig itself. There are no pre-built binaries.
 
 ## 1. Clone + fetch the submodules
 
 ```sh
-git clone https://github.com/beetlebugorg/chartplotter-native.git
-cd chartplotter-native
+git clone https://github.com/beetlebugorg/tile57.git
+cd tile57
 git submodule update --init --recursive
 ```
 
-The submodules are large: **MapLibre Native** (~1.6 GB into
-`vendor/maplibre-native/`) and the official **IHO S-101 catalogue** (Portrayal +
-Feature catalogues under `vendor/`; the FC repo is ~350 MB).
+The vendored **IHO S-101 Portrayal Catalogue** comes in as a submodule (under
+`vendor/`); the engine portrays against it at runtime. Lua 5.4 is vendored under
+`engine/vendor/lua` and compiled in, so no system Lua is needed.
 
-## 2. Toolchain
+## 2. Zig 0.16.0 (required)
 
-### macOS (Apple Silicon or Intel)
+The engine, the `tile57` CLI, and the static library all need **Zig 0.16.0**.
+Install it from [ziglang.org/download](https://ziglang.org/download/) (pin
+0.16.0) and put it on your `PATH`.
 
-```sh
-xcode-select --install            # Clang + Metal
-brew install cmake ninja libuv    # libuv backs the darwin run loop
-pip3 install Pillow               # for the sprite builder
-```
-
-Metal works out of the box.
-
-### Linux (Arch shown; adapt for your distro)
+## 3. Build + test
 
 ```sh
-sudo pacman -S --needed cmake ninja clang python-pillow libepoxy
-sudo pacman -S --needed qt6-base       # for the interactive Qt window (chartplotter-qt)
-sudo pacman -S --needed ccache         # optional, for fast rebuilds
+cd engine
+zig build         # builds engine/zig-out/bin/tile57 + libtile57.a
+zig build test    # runs the unit + parity tests
 ```
 
-The Qt window (`chartplotter-qt`) is built separately via
-`scripts/build-qmaplibre.sh`, which builds [QMapLibre](https://github.com/maplibre/maplibre-native-qt)
-from the `vendor/maplibre-native-qt` submodule against your system Qt6.
+`zig build` produces:
 
-### Zig 0.16.0 (required)
+| Target | What it is |
+|--------|-----------|
+| `tile57` (`engine/zig-out/bin/tile57`) | the offline CLI: bake cells/ENC_ROOTs to PMTiles or a chart bundle, and emit portrayal assets. |
+| `libtile57.a` | the static library behind the [C ABI](./c-api.md) (`include/tile57.h`). |
 
-The tile generator and all three of our targets need **Zig 0.16.0**. Install it
-from [ziglang.org/download](https://ziglang.org/download/) (pin 0.16.0) and put
-it on your `PATH`; CMake finds it automatically (it also checks `~/.local/bin`
-and `~/.local/share/zig-0.16.0`).
+The engine is also a real Zig package named `tile57` (v0.1.0); a Zig consumer
+adds it as a dependency and uses `@import("tile57")` — see the [Zig
+API](./zig-api.md).
 
-:::note Lua is vendored
-Lua 5.4 is vendored under `engine/vendor/lua` and compiled into
-`libtile57.a` — no system Lua is needed.
-:::
+## Runtime knob
 
-:::tip First build is slow
-The first `mbgl-core` build is large (~15 min on 8 cores). `ccache` (picked up
-automatically when present) makes subsequent rebuilds fast.
-:::
+- `TILE57_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57 cells.
+  A fallback only: it applies when a caller passes `NULL`/`null` for the
+  `rules_dir` argument. Defaults to the vendored catalogue under
+  `vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.
 
-## 3. Reference data + styles
-
-Our hosts render tiles + assets produced by the Go reference impl, plus generated
-styles. `gen-reference.sh` picks the right prebuilt Go binary for your OS/arch
-(`../chartplotter-go/dist/chartplotter_<os>_<arch>_s101`), emits assets, bakes
-`annapolis.pmtiles`, and generates the full-S-52 styles:
-
-```sh
-scripts/gen-reference.sh    # assets + tiles + styles
-scripts/gen-style.sh        # just the styles, if reference data already exists
-```
-
-Reference data and the generated styles are gitignored (they are machine-specific
-— the styles embed an absolute PMTiles path). Regenerate them after cloning.
-After a `git pull`, `scripts/dev-rebuild.sh` regenerates the styles and rebuilds
-our targets in whichever build dir exists.
-
-Next: [**Getting Started**](./getting-started.md) builds and runs the hosts.
+Next: [**Getting Started**](./getting-started.md) bakes a chart and fetches a
+tile.
+</content>

@@ -1,13 +1,13 @@
 ---
 id: tile-schema
 title: Tile Schema
-sidebar_position: 6
+sidebar_position: 7
 ---
 
 # Tile Schema
 
-The vector tiles use a fixed set of layers and fields. The style depends on this
-schema, so the names are a contract — it matches
+tile57's vector tiles use a fixed set of layers and fields. The generated
+MapLibre style depends on this schema, so the names are a contract — it matches
 [chartplotter-go's schema](https://beetlebugorg.github.io/chartplotter/tile-schema)
 so the same generated S-52 style works against either. Do not rename a layer or a
 field without updating the style generator (`engine/src/assets/style.zig`) to match
@@ -34,7 +34,7 @@ contour value, including the 0 m drying line) for line-centre labels.
 
 Fields like `color_token` and `halo_color_token` hold S-101 color **names**, not
 RGB values. The style resolves them against `colortables.json` to get the right
-Day, Dusk, or Night color — which is how the viewer switches palette without
+Day, Dusk, or Night color — which is how a renderer switches palette without
 regenerating tiles.
 
 ## Zoom levels and navigational bands
@@ -54,7 +54,7 @@ covers the Web-Mercator zoom range that matches its scale:
 | Harbor | 14 – 16 |
 | Berthing | 16 – 18 |
 
-Vector tiles scale crisply, so the viewer **overzooms** the top level rather than
+Vector tiles scale crisply, so a renderer **overzooms** the top level rather than
 baking more. Within a band, each feature carries an S-52 **SCAMIN** (the scale
 below which it should disappear); honoring it per-feature is what the `*_scamin`
 buckets are for, so minor features drop out at their own thresholds and the chart

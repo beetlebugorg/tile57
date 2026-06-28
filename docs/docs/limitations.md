@@ -1,12 +1,12 @@
 ---
 id: limitations
 title: Known Limitations
-sidebar_position: 7
+sidebar_position: 8
 ---
 
 # Known Limitations
 
-chartplotter-native runs the official IHO S-101 Portrayal Catalogue, and on the
+tile57 runs the official IHO S-101 Portrayal Catalogue, and on the
 test cells (`US4MD81M.000`, `US5MD1MC.000` + updates) **every feature now portrays
 with zero rule errors** — depth areas and contours, soundings, coastline and land,
 buoys and beacons, lights, dangers (obstructions / wrecks / rocks), data-quality
@@ -54,40 +54,28 @@ orientation + clearance complex attributes are synthesized. Remaining gaps:
   rule and the feature is suppressed — the Go reference behaves identically.
 
 A pre-baked PMTiles archive from chartplotter-go does not have these gaps; they are
-specific to live in-process generation / the native baker.
-
-`tile57` runs the same full S-101 portrayal as the live library, so its
-output matches live generation (it no longer emits only the `classify()`
-fallback).
+specific to tile57's own portrayal. The `tile57` CLI baker runs the same full
+S-101 portrayal as the live `Source` path, so a baked archive matches live
+generation.
 
 ## ENC_ROOT loading
 
-Pointing a host at an ENC_ROOT directory builds a cheap spatial index (band + bbox
-per cell) and generates tiles **on demand**, parsing + portraying only the cells a
-requested tile needs (best-available scale band per tile, recent cells held in an
-LRU). The catalogue opens in seconds; memory stays bounded. Caveats:
+Opening an ENC_ROOT (`Source.openCells` / `openCellsStreaming`) builds a cheap
+spatial index (band + bbox per cell) and generates tiles **on demand**, parsing +
+portraying only the cells a requested tile needs (best-available scale band per
+tile, recent cells held in an LRU). The catalogue opens in seconds; memory stays
+bounded. Caveats:
 
 - **First-view latency.** The first tile over a fresh area parses + portrays its
   1–4 cells (tens of ms), then they're cached. Opening the whole NOAA catalogue
   also pays a one-time index scan (a few seconds, parsing every cell header).
-- **Offline bake (opt-in).** `CHARTPLOTTER_BAKE=1` instead bakes the ENC_ROOT to a
-  cached PMTiles for smooth panning everywhere (`CHARTPLOTTER_BAKE_MAXZOOM`,
-  default 14; the client overzooms past it). The whole catalogue is a multi-minute
-  one-time bake; a region is far quicker.
-- **Low zoom is style-gated.** The vector source's `minzoom` (9 in the bundled
-  styles) means nothing draws below it regardless of the data.
+- **Offline bake.** For smooth panning everywhere, bake the ENC_ROOT once to a
+  cached PMTiles archive (`tile57 bake-root`, or `bakeArchive` /
+  `tile57_bake_cells`) and open that instead. The whole catalogue is a
+  multi-minute one-time bake; a region is far quicker.
+- **Low zoom is style-gated.** The generated style's vector-source `minzoom`
+  (9 in the bundled styles) means nothing draws below it regardless of the data.
 - **Update merge gaps.** Feature/vector insert/delete/modify and the SGCC/FSPC
   control fields (indexed coordinate / spatial-pointer edits) are applied; VRPC
   (indexed edits to an edge's begin/end node pointers) is not modelled — a VRPT
   update is taken as a full replacement.
-
-## Native / platform
-
-- **No platform chrome yet.** The current hosts are a headless PNG renderer
-  (`chartplotter-render`) and a bare Qt6 map window (`chartplotter-qt`, built on
-  the QMapLibre widget). Real application chrome (menus, chart library, instrument
-  panels) is future work.
-- **The Qt window renders a pre-baked bundle**, not live tiles. `chartplotter-qt`
-  loads a chart bundle's PMTiles via QMapLibre; producing the bundle
-  (`tile57 bundle`) is a separate offline step. Live in-process
-  generation (`tile57://`) currently only backs the headless PNG renderer.
