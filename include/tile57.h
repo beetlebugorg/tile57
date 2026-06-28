@@ -146,6 +146,49 @@ void tile57_tile_free(uint8_t *ptr, size_t len);
  * call any time; subsequent tile57_tile_get calls simply regenerate/decode. */
 void tile57_source_clear_cache(tile57_source *src);
 
+/* ---- chart-style generation ---------------------------------------------
+ *
+ * tile57 ships tile generation AND style generation together: tile57_build_style
+ * turns a MapLibre style template + the mariner's S-52 display options + the S-52
+ * colortables into a concrete style JSON, client-side. It patches the mariner-
+ * driven parts of the template (depth shading, sounding/danger symbol swaps,
+ * contour-label units, the per-scheme recolour) and AND-s the display filters
+ * (category, band, boundary/point style, date validity, text groups, …) onto
+ * every source:"chart" layer. The template + colortables are produced by the
+ * engine's asset generator; the host fills tile57_mariner from its UI. */
+
+typedef enum { TILE57_SCHEME_DAY=0, TILE57_SCHEME_DUSK=1, TILE57_SCHEME_NIGHT=2 } tile57_scheme;
+typedef enum { TILE57_DEPTH_METERS=0, TILE57_DEPTH_FEET=1 } tile57_depth_unit;
+typedef enum { TILE57_BOUNDARY_SYMBOLIZED=0, TILE57_BOUNDARY_PLAIN=1 } tile57_boundary_style;
+
+typedef struct {
+    tile57_scheme scheme;
+    double shallow_contour, safety_contour, deep_contour, safety_depth;
+    bool four_shade_water;
+    tile57_depth_unit depth_unit;
+    bool display_base, display_standard, display_other;
+    bool data_quality, show_inform_callouts, show_meta_bounds, show_isolated_dangers_shallow;
+    tile57_boundary_style boundary_style;
+    bool simplified_points, show_full_sector_lines;
+    bool text_names, show_light_descriptions, text_other;
+    bool date_dependent, highlight_date_dependent;
+    char date_view[9]; /* "YYYYMMDD" or "" (empty -> today) */
+} tile57_mariner;
+
+/* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.
+ * enabled_bands: NULL = no band filter (show all); else only features whose `band`
+ * rank is in the array (count entries) are shown. On success returns 1 with the
+ * style JSON in *out / *out_len (free with tile57_tile_free); 0 on error. */
+int tile57_build_style(const char *template_json, size_t template_len,
+                       const tile57_mariner *m,
+                       const char *colortables_json, size_t colortables_len,
+                       const int32_t *enabled_bands, size_t enabled_band_count,
+                       uint8_t **out, size_t *out_len);
+
+/* Fill *m with the canonical default mariner settings (so a host needn't hardcode
+ * them). date_view is set to "" (today). */
+void tile57_mariner_defaults(tile57_mariner *m);
+
 #ifdef __cplusplus
 }
 #endif

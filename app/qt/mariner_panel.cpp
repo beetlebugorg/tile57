@@ -22,7 +22,7 @@ QDoubleSpinBox *metresBox(double value) {
 }
 } // namespace
 
-MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *parent)
+MarinerPanel::MarinerPanel(const tile57_mariner &initial, QWidget *parent)
     : QWidget(parent), s_(initial) {
     setMinimumWidth(280);
 
@@ -55,15 +55,15 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     catCol->setContentsMargins(12, 10, 12, 12);
     catCol->setSpacing(8);
     displayBase_ = new QCheckBox(QStringLiteral("Base"));
-    displayBase_->setChecked(s_.displayBase);
+    displayBase_->setChecked(s_.display_base);
     displayBase_->setEnabled(false); // base is always shown
     displayBase_->setToolTip(QStringLiteral("Display Base is always shown"));
     catCol->addWidget(displayBase_);
     displayStandard_ = new QCheckBox(QStringLiteral("Standard"));
-    displayStandard_->setChecked(s_.displayStandard);
+    displayStandard_->setChecked(s_.display_standard);
     catCol->addWidget(displayStandard_);
     displayOther_ = new QCheckBox(QStringLiteral("Other"));
-    displayOther_->setChecked(s_.displayOther);
+    displayOther_->setChecked(s_.display_other);
     catCol->addWidget(displayOther_);
     root->addWidget(catBox);
 
@@ -73,18 +73,18 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     tidyForm(depthForm);
     depthUnit_ = new QComboBox;
     depthUnit_->addItems({QStringLiteral("Metres"), QStringLiteral("Feet")});
-    depthUnit_->setCurrentIndex(static_cast<int>(s_.depthUnit));
+    depthUnit_->setCurrentIndex(static_cast<int>(s_.depth_unit));
     depthForm->addRow(QStringLiteral("Units"), depthUnit_);
     fourShades_ = new QCheckBox(QStringLiteral("Four depth shades"));
-    fourShades_->setChecked(s_.fourShadeWater);
+    fourShades_->setChecked(s_.four_shade_water);
     depthForm->addRow(fourShades_);
-    shallow_ = metresBox(s_.shallowContour);
+    shallow_ = metresBox(s_.shallow_contour);
     depthForm->addRow(QStringLiteral("Shallow contour"), shallow_);
-    safety_ = metresBox(s_.safetyContour);
+    safety_ = metresBox(s_.safety_contour);
     depthForm->addRow(QStringLiteral("Safety contour"), safety_);
-    deep_ = metresBox(s_.deepContour);
+    deep_ = metresBox(s_.deep_contour);
     depthForm->addRow(QStringLiteral("Deep contour"), deep_);
-    safetyDepth_ = metresBox(s_.safetyDepth);
+    safetyDepth_ = metresBox(s_.safety_depth);
     depthForm->addRow(QStringLiteral("Safety depth"), safetyDepth_);
     root->addWidget(depthBox);
 
@@ -94,10 +94,10 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     tidyForm(symForm);
     boundaryStyle_ = new QComboBox;
     boundaryStyle_->addItems({QStringLiteral("Symbolized"), QStringLiteral("Plain")});
-    boundaryStyle_->setCurrentIndex(static_cast<int>(s_.boundaryStyle));
+    boundaryStyle_->setCurrentIndex(static_cast<int>(s_.boundary_style));
     symForm->addRow(QStringLiteral("Boundaries"), boundaryStyle_);
     simplifiedPoints_ = new QCheckBox(QStringLiteral("Simplified point symbols"));
-    simplifiedPoints_->setChecked(s_.simplifiedPoints);
+    simplifiedPoints_->setChecked(s_.simplified_points);
     symForm->addRow(simplifiedPoints_);
     root->addWidget(symBox);
 
@@ -107,13 +107,13 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     textCol->setContentsMargins(12, 10, 12, 12);
     textCol->setSpacing(8);
     textNames_ = new QCheckBox(QStringLiteral("Names"));
-    textNames_->setChecked(s_.textNames);
+    textNames_->setChecked(s_.text_names);
     textCol->addWidget(textNames_);
     lightDescriptions_ = new QCheckBox(QStringLiteral("Light descriptions"));
-    lightDescriptions_->setChecked(s_.showLightDescriptions);
+    lightDescriptions_->setChecked(s_.show_light_descriptions);
     textCol->addWidget(lightDescriptions_);
     textOther_ = new QCheckBox(QStringLiteral("Other text"));
-    textOther_->setChecked(s_.textOther);
+    textOther_->setChecked(s_.text_other);
     textCol->addWidget(textOther_);
     root->addWidget(textBox);
 
@@ -123,16 +123,16 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     ovForm->setContentsMargins(12, 10, 12, 12);
     ovForm->setSpacing(8);
     dataQuality_ = new QCheckBox(QStringLiteral("Data quality (CATZOC)"));
-    dataQuality_->setChecked(s_.dataQuality);
+    dataQuality_->setChecked(s_.data_quality);
     ovForm->addWidget(dataQuality_);
     infoCallouts_ = new QCheckBox(QStringLiteral("Information callouts"));
-    infoCallouts_->setChecked(s_.showInformCallouts);
+    infoCallouts_->setChecked(s_.show_inform_callouts);
     ovForm->addWidget(infoCallouts_);
     metaBounds_ = new QCheckBox(QStringLiteral("Cell / coverage boundaries"));
-    metaBounds_->setChecked(s_.showMetaBounds);
+    metaBounds_->setChecked(s_.show_meta_bounds);
     ovForm->addWidget(metaBounds_);
     isoDangersShallow_ = new QCheckBox(QStringLiteral("Isolated dangers in shallow water"));
-    isoDangersShallow_->setChecked(s_.showIsolatedDangersShallow);
+    isoDangersShallow_->setChecked(s_.show_isolated_dangers_shallow);
     ovForm->addWidget(isoDangersShallow_);
     root->addWidget(ovBox);
 
@@ -142,10 +142,10 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
     dateCol->setContentsMargins(12, 10, 12, 12);
     dateCol->setSpacing(8);
     dateDependent_ = new QCheckBox(QStringLiteral("Hide features out of date"));
-    dateDependent_->setChecked(s_.dateDependent);
+    dateDependent_->setChecked(s_.date_dependent);
     dateCol->addWidget(dateDependent_);
     highlightDate_ = new QCheckBox(QStringLiteral("Highlight date-dependent"));
-    highlightDate_->setChecked(s_.highlightDateDependent);
+    highlightDate_->setChecked(s_.highlight_date_dependent);
     dateCol->addWidget(highlightDate_);
     root->addWidget(dateBox);
 
@@ -176,26 +176,26 @@ MarinerPanel::MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *
 }
 
 void MarinerPanel::pull() {
-    s_.scheme = static_cast<chartstyle::Scheme>(scheme_->currentIndex());
-    s_.displayStandard = displayStandard_->isChecked();
-    s_.displayOther = displayOther_->isChecked();
-    s_.depthUnit = static_cast<chartstyle::DepthUnit>(depthUnit_->currentIndex());
-    s_.boundaryStyle = static_cast<chartstyle::BoundaryStyle>(boundaryStyle_->currentIndex());
-    s_.simplifiedPoints = simplifiedPoints_->isChecked();
-    s_.fourShadeWater = fourShades_->isChecked();
-    s_.shallowContour = shallow_->value();
-    s_.safetyContour = safety_->value();
-    s_.deepContour = deep_->value();
-    s_.safetyDepth = safetyDepth_->value();
-    s_.dataQuality = dataQuality_->isChecked();
-    s_.showInformCallouts = infoCallouts_->isChecked();
-    s_.showMetaBounds = metaBounds_->isChecked();
-    s_.showIsolatedDangersShallow = isoDangersShallow_->isChecked();
-    s_.dateDependent = dateDependent_->isChecked();
-    s_.highlightDateDependent = highlightDate_->isChecked();
-    s_.textNames = textNames_->isChecked();
-    s_.showLightDescriptions = lightDescriptions_->isChecked();
-    s_.textOther = textOther_->isChecked();
+    s_.scheme = static_cast<tile57_scheme>(scheme_->currentIndex());
+    s_.display_standard = displayStandard_->isChecked();
+    s_.display_other = displayOther_->isChecked();
+    s_.depth_unit = static_cast<tile57_depth_unit>(depthUnit_->currentIndex());
+    s_.boundary_style = static_cast<tile57_boundary_style>(boundaryStyle_->currentIndex());
+    s_.simplified_points = simplifiedPoints_->isChecked();
+    s_.four_shade_water = fourShades_->isChecked();
+    s_.shallow_contour = shallow_->value();
+    s_.safety_contour = safety_->value();
+    s_.deep_contour = deep_->value();
+    s_.safety_depth = safetyDepth_->value();
+    s_.data_quality = dataQuality_->isChecked();
+    s_.show_inform_callouts = infoCallouts_->isChecked();
+    s_.show_meta_bounds = metaBounds_->isChecked();
+    s_.show_isolated_dangers_shallow = isoDangersShallow_->isChecked();
+    s_.date_dependent = dateDependent_->isChecked();
+    s_.highlight_date_dependent = highlightDate_->isChecked();
+    s_.text_names = textNames_->isChecked();
+    s_.show_light_descriptions = lightDescriptions_->isChecked();
+    s_.text_other = textOther_->isChecked();
     emit changed(s_);
 }
 

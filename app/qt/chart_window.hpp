@@ -4,7 +4,7 @@
 // main() when the tile-server worker signals ready().
 #pragma once
 
-#include "chartstyle/mariner.hpp"
+#include "tile57.h"
 
 #include <QMainWindow>
 #include <QString>
@@ -33,7 +33,7 @@ private:
 
     QString templateJson_;
     QString colortables_;
-    chartstyle::MarinerSettings settings_;
+    tile57_mariner settings_;
     std::vector<int> enabledBands_;
     bool hasBands_ = false;
     QMapLibre::MapWidget *map_ = nullptr;

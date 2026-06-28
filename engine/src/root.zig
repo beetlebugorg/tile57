@@ -22,6 +22,7 @@ pub const s101_adapt = s100.s101_adapt;
 pub const catalogue = s100.catalogue;
 pub const bake_enc = @import("bake_enc"); // banded multi-cell ENC_ROOT -> PMTiles
 pub const assets = @import("assets"); // chart-bundle asset/manifest generation
+pub const chartstyle = @import("chartstyle"); // mariner-driven MapLibre style patching
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {
@@ -37,5 +38,6 @@ test {
     _ = catalogue;
     _ = bake_enc;
     _ = assets;
+    _ = chartstyle;
     _ = @import("mvt_parity_test.zig");
 }

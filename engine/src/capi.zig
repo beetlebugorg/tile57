@@ -17,12 +17,17 @@ const portray = @import("portray");
 const bake_enc = @import("bake_enc");
 const catalogue = @import("s100").catalogue;
 const tile = @import("tile");
+const chartstyle = @import("chartstyle");
 
 const gpa = std.heap.page_allocator;
 
 // Env access lives in C (Zig 0.16 puts env behind Io); returns the S-101 rules
 // dir from TILE57_S101_RULES or null.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
+
+// Wall-clock time for "today" date resolution in tile57_build_style. Zig 0.16
+// keeps the clock behind Io; the lib links libc, so call time(3) directly.
+extern fn time(tloc: ?*c_long) callconv(.c) c_long;
 
 // Keep in sync with the TILE57_VERSION_* macros in tile57.h.
 const version_string = "0.1.0";
@@ -863,4 +868,129 @@ export fn tile57_source_clear_cache(src: ?*Source) callconv(.c) void {
     var it = s.cache.valueIterator();
     while (it.next()) |v| gpa.free(v.*);
     s.cache.clearRetainingCapacity();
+}
+
+// ---- chart-style generation (mirrors tile57_mariner in tile57.h) -----------
+
+// The S-52 mariner display options across the C seam. POD; layout matches the
+// C struct (enums are int-sized, bools 1 byte). Consumed by tile57_build_style.
+const CMariner = extern struct {
+    scheme: c_int,
+    shallow_contour: f64,
+    safety_contour: f64,
+    deep_contour: f64,
+    safety_depth: f64,
+    four_shade_water: bool,
+    depth_unit: c_int,
+    display_base: bool,
+    display_standard: bool,
+    display_other: bool,
+    data_quality: bool,
+    show_inform_callouts: bool,
+    show_meta_bounds: bool,
+    show_isolated_dangers_shallow: bool,
+    boundary_style: c_int,
+    simplified_points: bool,
+    show_full_sector_lines: bool,
+    text_names: bool,
+    show_light_descriptions: bool,
+    text_other: bool,
+    date_dependent: bool,
+    highlight_date_dependent: bool,
+    date_view: [9]u8,
+};
+
+// "YYYYMMDD" or "" from the fixed char[9] field (NUL-terminated or full 8 chars).
+fn dateViewSlice(buf: *const [9]u8) []const u8 {
+    const n = std.mem.indexOfScalar(u8, buf, 0) orelse buf.len;
+    return buf[0..@min(n, 8)];
+}
+
+/// Build a MapLibre style JSON from a template + mariner settings + S-52
+/// colortables. `enabled_bands` NULL = no band filter (show all); else only
+/// features whose `band` rank is in the array are shown. On success returns 1 with
+/// the style JSON in out/out_len (free with tile57_tile_free); 0 on error.
+export fn tile57_build_style(
+    template_json: [*]const u8,
+    template_len: usize,
+    cm: *const CMariner,
+    colortables_json: ?[*]const u8,
+    colortables_len: usize,
+    enabled_bands: ?[*]const i32,
+    enabled_band_count: usize,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const m = chartstyle.MarinerSettings{
+        .scheme = switch (cm.scheme) {
+            1 => .dusk,
+            2 => .night,
+            else => .day,
+        },
+        .shallow_contour = cm.shallow_contour,
+        .safety_contour = cm.safety_contour,
+        .deep_contour = cm.deep_contour,
+        .safety_depth = cm.safety_depth,
+        .four_shade_water = cm.four_shade_water,
+        .depth_unit = if (cm.depth_unit == 1) .feet else .meters,
+        .display_base = cm.display_base,
+        .display_standard = cm.display_standard,
+        .display_other = cm.display_other,
+        .data_quality = cm.data_quality,
+        .show_inform_callouts = cm.show_inform_callouts,
+        .show_meta_bounds = cm.show_meta_bounds,
+        .show_isolated_dangers_shallow = cm.show_isolated_dangers_shallow,
+        .boundary_style = if (cm.boundary_style == 1) .plain else .symbolized,
+        .simplified_points = cm.simplified_points,
+        .show_full_sector_lines = cm.show_full_sector_lines,
+        .text_names = cm.text_names,
+        .show_light_descriptions = cm.show_light_descriptions,
+        .text_other = cm.text_other,
+        .date_dependent = cm.date_dependent,
+        .highlight_date_dependent = cm.highlight_date_dependent,
+        .date_view = dateViewSlice(&cm.date_view),
+    };
+
+    const tmpl = template_json[0..template_len];
+    const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
+    const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
+
+    // Same allocator path as tile57_tile_get's output, so the host frees the
+    // result with tile57_tile_free.
+    const now_unix: i64 = @intCast(time(null));
+    const style = chartstyle.buildStyle(gpa, tmpl, &m, cts, bands, now_unix) catch return 0;
+    out.* = style.ptr;
+    out_len.* = style.len;
+    return 1;
+}
+
+/// Fill `cm` with the canonical default mariner settings (the same field defaults
+/// the Zig MarinerSettings carries), so a host doesn't hardcode them. date_view = "".
+export fn tile57_mariner_defaults(cm: *CMariner) callconv(.c) void {
+    const d = chartstyle.MarinerSettings{};
+    cm.* = .{
+        .scheme = @intCast(@intFromEnum(d.scheme)),
+        .shallow_contour = d.shallow_contour,
+        .safety_contour = d.safety_contour,
+        .deep_contour = d.deep_contour,
+        .safety_depth = d.safety_depth,
+        .four_shade_water = d.four_shade_water,
+        .depth_unit = @intCast(@intFromEnum(d.depth_unit)),
+        .display_base = d.display_base,
+        .display_standard = d.display_standard,
+        .display_other = d.display_other,
+        .data_quality = d.data_quality,
+        .show_inform_callouts = d.show_inform_callouts,
+        .show_meta_bounds = d.show_meta_bounds,
+        .show_isolated_dangers_shallow = d.show_isolated_dangers_shallow,
+        .boundary_style = @intCast(@intFromEnum(d.boundary_style)),
+        .simplified_points = d.simplified_points,
+        .show_full_sector_lines = d.show_full_sector_lines,
+        .text_names = d.text_names,
+        .show_light_descriptions = d.show_light_descriptions,
+        .text_other = d.text_other,
+        .date_dependent = d.date_dependent,
+        .highlight_date_dependent = d.highlight_date_dependent,
+        .date_view = [_]u8{0} ** 9,
+    };
 }

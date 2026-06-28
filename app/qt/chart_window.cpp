@@ -5,7 +5,7 @@
 #include "mariner_panel.hpp"
 #include "tile_server.hpp"
 
-#include "chartstyle/chart_style.hpp"
+#include "tile57.h"
 
 #include <QMapLibre/Map>
 #include <QMapLibreWidgets/MapWidget>
@@ -25,10 +25,28 @@
 namespace cpn {
 namespace {
 
-// Build the concrete style from the template + mariner settings + enabled bands.
-std::string styledJson(const QString &templateJson, const chartstyle::MarinerSettings &s,
+// Build the concrete style from the template + mariner settings + enabled bands,
+// via the tile57 C ABI (style generation now ships inside libtile57).
+std::string styledJson(const QString &templateJson, const tile57_mariner &m,
                        const QString &colortables, const std::vector<int> *enabledBands) {
-    return chartstyle::buildStyle(templateJson.toStdString(), s, colortables.toStdString(), enabledBands);
+    const std::string tmpl = templateJson.toStdString();
+    const std::string cts = colortables.toStdString();
+    std::vector<int32_t> bands;
+    const int32_t *bandsPtr = nullptr;
+    if (enabledBands) {
+        bands.assign(enabledBands->begin(), enabledBands->end());
+        bandsPtr = bands.data();
+    }
+    uint8_t *out = nullptr;
+    size_t len = 0;
+    if (tile57_build_style(tmpl.data(), tmpl.size(), &m, cts.data(), cts.size(), bandsPtr,
+                           bands.size(), &out, &len) == 1 &&
+        out) {
+        std::string s(reinterpret_cast<const char *>(out), len);
+        tile57_tile_free(out, len);
+        return s;
+    }
+    return tmpl; // fallback: the template unchanged
 }
 
 // Stage a style JSON in a temp file and return its file:// URL — the only way to
@@ -96,6 +114,7 @@ ChartWindow::ChartWindow(QString templateJson, QString colortables, quint32 pres
                          QWidget *parent)
     : QMainWindow(parent), templateJson_(std::move(templateJson)), colortables_(std::move(colortables)) {
     setWindowTitle(QStringLiteral("chartplotter-qt"));
+    tile57_mariner_defaults(&settings_); // canonical defaults from tile57
 
     // Initial style: built from the defaults + all bands, staged for the URL load.
     const QString initialUrl =
@@ -143,7 +162,7 @@ ChartWindow::ChartWindow(QString templateJson, QString colortables, quint32 pres
     dialog->hide();
 
     QObject::connect(panel, &cpn::MarinerPanel::changed, this,
-                     [this](const chartstyle::MarinerSettings &s) { settings_ = s; restyle(); });
+                     [this](const tile57_mariner &s) { settings_ = s; restyle(); });
 
     // The corner toggle button. Repositions to the top-right on each map change.
     auto *btn = new QToolButton(map_);

@@ -1,14 +1,10 @@
 // MarinerPanel — the S-52 mariner-settings control panel (Qt-side UI). Holds a
-// chartstyle::MarinerSettings, exposes the achievable axes as controls, and emits
-// changed() whenever the mariner adjusts one so the viewer can restyle live.
-//
-// Only the axes the current S-57 tiles support are shown (depth contours/shades/
-// units, safety depth, data-quality + info-callout toggles, palette). The axes that
-// need extra per-feature tags from the tile engine (display category, boundary/
-// point style, sector legs, text groups, dates) are added once the engine bakes them.
+// tile57_mariner (the canonical settings struct from the tile57 C ABI), exposes the
+// display axes as controls, and emits changed() whenever the mariner adjusts one so
+// the viewer can rebuild the style live (tile57_build_style).
 #pragma once
 
-#include "chartstyle/mariner.hpp"
+#include "tile57.h"
 
 #include <QWidget>
 
@@ -21,16 +17,16 @@ namespace cpn {
 class MarinerPanel : public QWidget {
     Q_OBJECT
 public:
-    explicit MarinerPanel(const chartstyle::MarinerSettings &initial, QWidget *parent = nullptr);
-    [[nodiscard]] const chartstyle::MarinerSettings &settings() const { return s_; }
+    explicit MarinerPanel(const tile57_mariner &initial, QWidget *parent = nullptr);
+    [[nodiscard]] const tile57_mariner &settings() const { return s_; }
 
 signals:
-    void changed(const chartstyle::MarinerSettings &settings);
+    void changed(const tile57_mariner &settings);
 
 private:
     void pull();  // read controls -> s_, then emit changed()
 
-    chartstyle::MarinerSettings s_;
+    tile57_mariner s_;
 
     QComboBox *scheme_ = nullptr;
     QCheckBox *displayBase_ = nullptr;

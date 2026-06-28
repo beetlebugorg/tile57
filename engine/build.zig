@@ -153,6 +153,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/assets/assets.zig"),
     });
 
+    // Chart-style generation: patch a MapLibre style template per the mariner's
+    // S-52 display options (a 1:1 Zig port of the C++ chartstyle/ module). Pure +
+    // target-agnostic; consumed by the C ABI (capi.zig) so tile57 ships tile +
+    // style generation together. See src/chartstyle/.
+    const chartstyle_mod = b.addModule("chartstyle", .{
+        .root_source_file = b.path("src/chartstyle/chartstyle.zig"),
+    });
+
     // All pure packages, imported by name into engine / libtile57.a / the baker.
     // (portray is libc, wired separately into the lib + baker only.)
     const pure_pkgs = [_]std.Build.Module.Import{
@@ -166,6 +174,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57_mvt", .module = s57_mvt_mod },
         .{ .name = "bake_enc", .module = bake_enc_mod },
         .{ .name = "assets", .module = assets_mod },
+        .{ .name = "chartstyle", .module = chartstyle_mod },
     };
 
     // Pure-Zig public module (no libc). Used by the unit tests so that
@@ -277,4 +286,5 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tile", .module = tile_mod },
     });
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
 }

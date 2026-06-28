@@ -30,15 +30,8 @@ if(TILE57_LIB)
     ${CHARTPLOTTER_APP_DIR})     # app/      -> enc_root.hpp
   target_link_libraries(chartplotter-qt PRIVATE ${TILE57_LIB} Qt6::Network)
   target_compile_definitions(chartplotter-qt PRIVATE CHARTPLOTTER_WITH_TILE57)
-
-  # chartstyle: the cross-platform client-side mariner style builder (no Qt/mbgl).
-  # Compiled into the viewer; any future platform app compiles the same sources.
-  if(CHARTSTYLE_DIR)
-    target_sources(chartplotter-qt PRIVATE ${CHARTSTYLE_DIR}/src/chart_style.cpp)
-    target_include_directories(chartplotter-qt PRIVATE
-      ${CHARTSTYLE_DIR}/include ${CHARTSTYLE_DIR}/vendor)
-    target_compile_definitions(chartplotter-qt PRIVATE CHARTPLOTTER_WITH_CHARTSTYLE)
-  endif()
+  # Style generation now ships inside libtile57 (tile57_build_style); the viewer
+  # calls the C ABI — no separate C++ chartstyle module.
 endif()
 
 # QMapLibre links as @rpath/QMapLibre*.framework but carries no absolute path, so
