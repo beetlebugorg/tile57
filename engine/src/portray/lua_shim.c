@@ -117,14 +117,21 @@ static int embedded_lua_searcher(lua_State *L) {
     size_t len = 0;
     const char *src = tg_embedded_lua(name, nlen, &len);
     if (!src) {
+        /* Lua's own formatter (not libc printf) — folded into "module 'x' not found". */
         lua_pushfstring(L, "\n\tno embedded module '%s'", name);
         return 1;
     }
-    /* '@' prefix => Lua treats the chunk name as a file path in tracebacks. */
+    /* Chunk name "@<name>.lua" ('@' => Lua shows it as a file path in tracebacks),
+     * built with bounded memcpy — NOT snprintf: this runs on the baker's worker
+     * threads, and musl's vfprintf is unsafe there (it crashed under parallel load). */
     char chunk[160];
-    snprintf(chunk, sizeof chunk, "@%.140s.lua", name);
+    size_t n = nlen < sizeof(chunk) - 6 ? nlen : sizeof(chunk) - 6;
+    chunk[0] = '@';
+    memcpy(chunk + 1, name, n);
+    memcpy(chunk + 1 + n, ".lua", 4);
+    chunk[1 + n + 4] = '\0';
     if (luaL_loadbuffer(L, src, len, chunk) != LUA_OK)
-        return luaL_error(L, "error loading embedded module '%s':\n\t%s", name, lua_tostring(L, -1));
+        return lua_error(L); /* loader error already on the stack */
     lua_pushstring(L, name); /* passed to the loader as its 2nd arg, like the file searcher */
     return 2;
 }
