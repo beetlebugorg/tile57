@@ -1,6 +1,6 @@
-//! S-101 Feature Catalogue loader. The compact catalogue.json (distilled from
-//! the vendored FeatureCatalogue.xml by scripts/gen-catalogue.py) is embedded
-//! and parsed once; C-ABI accessors (tgc_*) let lua_shim.c build the Lua tables
+//! S-101 Feature Catalogue loader. The compact, committed catalogue.json
+//! (vendor/s101/catalogue.json; distilled from the vendored FeatureCatalogue.xml)
+//! is embedded and parsed once; C-ABI accessors (tgc_*) let lua_shim.c build the Lua tables
 //! the Host*TypeInfo/TypeCodes callbacks return, and resolve S-57 aliases ->
 //! S-101 codes for the adaptation.
 

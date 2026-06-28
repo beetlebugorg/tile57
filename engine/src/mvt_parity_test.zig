@@ -32,7 +32,8 @@ test "decode real Go-baked tile matches the oracle" {
         try std.testing.expectEqual(@as(u32, 4096), L.extent);
         try counts.put(L.name, L.features.len);
     }
-    // Counts from scripts/mvt_inspect.py over the same tile.
+    // Expected per-layer feature counts for the embedded fixture tile (cross-
+    // checked against `tile57 inspect` over the same tile).
     try std.testing.expectEqual(@as(usize, 104), counts.get("areas").?);
     try std.testing.expectEqual(@as(usize, 138), counts.get("areas_scamin").?);
     try std.testing.expectEqual(@as(usize, 146), counts.get("lines").?);
