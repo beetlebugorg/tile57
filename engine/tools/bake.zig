@@ -434,7 +434,7 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     // `bake` takes a single cell.000 OR an ENC_ROOT directory — same archive out.
     if (isDir(io, base_path)) {
         const rzoom_max: u8 = if (maxzoom == DEFAULT_MAXZOOM) 18 else maxzoom; // root default 18
-        const rb = bakeRoot(io, a, base_path, out_path, resolveRulesDir(rules), minzoom, rzoom_max, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ) catch |err| {
+        const rb = bakeRoot(io, a, base_path, out_path, resolveRulesDir(rules), minzoom, rzoom_max, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ, false) catch |err| {
             std.debug.print("error: cannot bake ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
             return;
         };
@@ -879,7 +879,7 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     var snd_stacks: []const []const u8 = &.{}; // sounding glyph stacks for sprite-mln
     if (isDir(io, base_path)) {
         // ENC_ROOT: streamed straight to tiles_path; updates auto-discovered per cell.
-        const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ) catch |err| {
+        const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ, true) catch |err| {
             std.debug.print("error: cannot bundle ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
             return;
         };
@@ -1158,12 +1158,18 @@ const BakeSink = struct {
     sounds: *std.StringHashMap(void),
     a: std.mem.Allocator, // persistent (sound-stack strings; returned to caller)
     gpa: std.mem.Allocator, // scratch backing
+    collect_sounds: bool, // bundle wants sprite-mln sounding composites; plain bake doesn't
 
-    fn run(ctx: ?*anyopaque, z: u8, x: u32, y: u32, mvt: []const u8) anyerror!void {
+    // `comp` is the already-gzipped tile (compressed in the gen worker), so the
+    // serial path here is just dedup + write — fast. Sounding-stack collection (only
+    // for the bundle) gunzips + decodes; plain bake-root skips it entirely.
+    fn run(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
         const self: *BakeSink = @ptrCast(@alignCast(ctx.?));
-        var scratch = std.heap.ArenaAllocator.init(self.gpa);
-        defer scratch.deinit();
-        if (engine.mvt.decode(scratch.allocator(), mvt)) |layers| {
+        if (self.collect_sounds) collect: {
+            var scratch = std.heap.ArenaAllocator.init(self.gpa);
+            defer scratch.deinit();
+            const mvt = engine.gzip.decompress(scratch.allocator(), comp) catch break :collect;
+            const layers = engine.mvt.decode(scratch.allocator(), mvt) catch break :collect;
             for (layers) |L| {
                 if (!std.mem.eql(u8, L.name, "soundings")) continue;
                 for (L.features) |feat| for (feat.properties) |p| {
@@ -1176,8 +1182,8 @@ const BakeSink = struct {
                     }
                 };
             }
-        } else |_| {}
-        try self.sw.add(z, x, y, mvt);
+        }
+        try self.sw.addCompressed(z, x, y, comp);
     }
 };
 
@@ -1201,7 +1207,7 @@ fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
 // straight to `out_path` (the data section streams through a StreamWriter — only
 // the compressed data + small directory are held, not the raw tiles). Returns the
 // union bounds + cell stems + sounding stacks. error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool) !RootBake {
     const page = std.heap.page_allocator;
     var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
     defer dir.close(io);
@@ -1286,7 +1292,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var sw = engine.pmtiles.StreamWriter.initFile(page, io, data_file);
     defer sw.deinit();
     var sounds = std.StringHashMap(void).init(a);
-    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = page };
+    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = page, .collect_sounds = collect_sounds };
     var baker = Bands.Baker.init(page, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
     defer baker.deinit();
 
@@ -1550,7 +1556,7 @@ fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !vo
     if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
     if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
     if (lru < 1) return usageErr("--lru must be >= 1");
-    const rb = bakeRoot(io, a, root_path, out_path, resolveRulesDir(rules), minzoom, maxzoom, lru, super_dz) catch |err| {
+    const rb = bakeRoot(io, a, root_path, out_path, resolveRulesDir(rules), minzoom, maxzoom, lru, super_dz, false) catch |err| {
         std.debug.print("error: {s} ({s})\n", .{ root_path, @errorName(err) });
         return;
     };

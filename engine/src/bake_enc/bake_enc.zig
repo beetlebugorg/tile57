@@ -188,7 +188,10 @@ const TileGenCtx = struct {
         defer c.gpa.free(refs);
         for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo, .geo_world = c.backends[idx].geo_world, .feat_bbox = c.backends[idx].feat_bbox };
         const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y) catch return;
-        if (mvt_bytes.len > 0) c.results[i] = mvt_bytes else c.gpa.free(mvt_bytes);
+        defer c.gpa.free(mvt_bytes);
+        // Gzip here, in the worker — the expensive step done in parallel; the serial
+        // collection then only dedups + writes the already-compressed tile.
+        if (mvt_bytes.len > 0) c.results[i] = pmtiles.StreamWriter.gzipTile(c.gpa, mvt_bytes) catch null;
         if (c.done) |d| {
             const n = d.fetchAdd(1, .monotonic) + 1;
             if (c.progress) |cb| if (n % 1024 == 0) cb(c.pctx, 1, c.base + n, 0);

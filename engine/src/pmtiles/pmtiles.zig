@@ -369,10 +369,23 @@ pub const StreamWriter = struct {
         self.hash_to_off.deinit();
     }
 
+    /// Gzip one tile's MVT for `addCompressed` — lets a caller compress in parallel
+    /// (the expensive step) and keep `addCompressed` (dedup + write) a cheap serial tail.
+    pub fn gzipTile(gpa: Allocator, mvt: []const u8) ![]u8 {
+        return gzip.compress(gpa, mvt);
+    }
+
     /// Add one tile (gzipped + deduped). Tiles may arrive in any order.
     pub fn add(self: *StreamWriter, z: u8, x: u32, y: u32, mvt: []const u8) !void {
         const comp = try gzip.compress(self.gpa, mvt);
         defer self.gpa.free(comp);
+        try self.addCompressed(z, x, y, comp);
+    }
+
+    /// Like `add`, but `comp` is already gzipped (e.g. by gzipTile in a worker).
+    /// Dedups by content + records the directory entry; the only stateful step, so
+    /// this is the serial tail of an otherwise-parallel bake. NOT thread-safe.
+    pub fn addCompressed(self: *StreamWriter, z: u8, x: u32, y: u32, comp: []const u8) !void {
         self.min_z = @min(self.min_z, z);
         self.max_z = @max(self.max_z, z);
         const h = std.hash.Wyhash.hash(0, comp);
