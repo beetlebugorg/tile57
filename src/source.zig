@@ -362,7 +362,8 @@ const OpenWork = struct {
     out: []LazyCell,
     ok: []bool,
 
-    fn run(uptr: *anyopaque, i: usize) void {
+    fn run(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
+        _ = scratch; // persistent outputs go straight to `gpa`
         const c: *OpenWork = @ptrCast(@alignCast(uptr));
         const in = c.inputs[i];
         const meta = s57.peekMeta(gpa, in.base) orelse return;
@@ -426,7 +427,7 @@ pub const Source = struct {
         @memset(ok, false);
 
         var ow = OpenWork{ .inputs = cells_in, .out = tmp, .ok = ok };
-        bake_enc.parallelFor(cells_in.len, &ow, OpenWork.run);
+        bake_enc.parallelFor(gpa, cells_in.len, &ow, OpenWork.run);
 
         var valid: usize = 0;
         for (ok) |k| {
@@ -639,7 +640,9 @@ pub const Source = struct {
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
                 }};
-                break :blk_cell s57_mvt.generateTileMulti(gpa, &one, z, x, y, .mvt) catch return error.TileGen;
+                var ar = std.heap.ArenaAllocator.init(gpa);
+                defer ar.deinit();
+                break :blk_cell s57_mvt.generateTileMulti(ar.allocator(), gpa, &one, z, x, y, .mvt) catch return error.TileGen;
             },
             .cells => |*ls| try tileFromCells(ls, z, x, y),
         };
@@ -721,7 +724,9 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32) ![]u8 {
             }) catch {};
         }
     }
-    const mvt = s57_mvt.generateTileMulti(gpa, refs.items, z, x, y, .mvt) catch return error.TileGen;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const mvt = s57_mvt.generateTileMulti(ar.allocator(), gpa, refs.items, z, x, y, .mvt) catch return error.TileGen;
     lazyEvict(ls, keep_from);
     return mvt;
 }
@@ -737,7 +742,8 @@ const BakeWork = struct {
     rules_dir: []const u8,
     build_geo: bool,
 
-    fn run(uptr: *anyopaque, i: usize) void {
+    fn run(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
+        _ = scratch; // owns persistent backends via its own arenas / `gpa`
         const c: *BakeWork = @ptrCast(@alignCast(uptr));
         const src = c.sources[i];
         var cell = s57.parseCellWithUpdates(gpa, src.base, src.updates) catch return;
@@ -822,7 +828,7 @@ pub fn bakeArchive(
         defer gpa.free(pas);
         @memset(pas, null);
         var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir, .build_geo = bake_enc.cacheGeoForBand(band) };
-        bake_enc.parallelFor(sources.items.len, &bw, BakeWork.run);
+        bake_enc.parallelFor(gpa, sources.items.len, &bw, BakeWork.run);
         loaded += idxs.len;
         if (progress) |cb| cb(user, 0, loaded, cells_in.len);
 

@@ -735,16 +735,21 @@ pub const CellRef = struct {
 /// stream are styled by it, the rest fall back to classify().
 pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, portrayal: ?[]const ?[]const u8) ![]u8 {
     const one = [_]CellRef{.{ .cell = cell, .portrayal = portrayal }};
-    return generateTileMulti(gpa, &one, z, x, y, .mvt);
-}
-
-/// Generate MVT bytes (uncompressed) for tile (z,x,y) overlaying one or more
-/// cells (an ENC_ROOT). Each cell's features are appended into the shared layers,
-/// so a tile spanning several cells carries all of them.
-pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, format: TileFormat) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const a = arena.allocator();
+    return generateTileMulti(arena.allocator(), gpa, &one, z, x, y, .mvt);
+}
+
+/// Generate encoded tile bytes (uncompressed) for tile (z,x,y) overlaying one or
+/// more cells (an ENC_ROOT). Each cell's features are appended into the shared
+/// layers, so a tile spanning several cells carries all of them.
+///
+/// `scratch` holds all transient working memory (geometry assembly, clipped rings,
+/// the per-layer feature lists). A batch baker passes a per-thread arena reset
+/// between tiles; `out` owns only the returned encoded bytes (pass `scratch` too
+/// when the result is consumed before the next reset, e.g. gzipped immediately).
+pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, format: TileFormat) ![]u8 {
+    const a = scratch;
 
     const tb = tile.tileBoundsLonLat(z, x, y);
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
@@ -793,11 +798,11 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
     if (soundings.items.len > 0) try layers.append(a, .{ .name = "soundings", .features = soundings.items });
     if (texts.items.len > 0) try layers.append(a, .{ .name = "text", .features = texts.items });
     if (texts_scamin.items.len > 0) try layers.append(a, .{ .name = "text_scamin", .features = texts_scamin.items });
-    if (layers.items.len == 0) return gpa.alloc(u8, 0); // empty tile
+    if (layers.items.len == 0) return out.alloc(u8, 0); // empty tile
 
     return switch (format) {
-        .mvt => mvt.encode(gpa, .{ .layers = layers.items }),
-        .mlt => mlt.encode(gpa, .{ .layers = layers.items }),
+        .mvt => mvt.encode(out, .{ .layers = layers.items }),
+        .mlt => mlt.encode(out, .{ .layers = layers.items }),
     };
 }
 

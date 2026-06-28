@@ -130,23 +130,35 @@ const ParCtx = struct {
     next: std.atomic.Value(usize),
     n: usize,
     user: *anyopaque,
-    func: *const fn (*anyopaque, usize) void,
+    func: *const fn (*anyopaque, usize, std.mem.Allocator) void,
+    gpa: std.mem.Allocator,
 };
 
+// Each worker owns ONE scratch arena, reset (capacity retained) after every item,
+// so per-item working memory reuses the same pages instead of re-mmaping a fresh
+// arena per call — the bake's per-tile allocations were churning millions of page
+// faults. The callee must not retain anything from `scratch` past its own return.
 fn parWorker(pc: *ParCtx) void {
+    var arena = std.heap.ArenaAllocator.init(pc.gpa);
+    defer arena.deinit();
+    const scratch = arena.allocator();
     while (true) {
         const i = pc.next.fetchAdd(1, .monotonic);
         if (i >= pc.n) return;
-        pc.func(pc.user, i);
+        pc.func(pc.user, i, scratch);
+        _ = arena.reset(.retain_capacity);
     }
 }
 
-/// Run func(user, i) for every i in [0, n) across the CPU threads. func must be
-/// safe to call concurrently for distinct i (no shared mutable state). Falls back
-/// to serial when there's one CPU or one item.
-pub fn parallelFor(n: usize, user: *anyopaque, func: *const fn (*anyopaque, usize) void) void {
+/// Run func(user, i, scratch) for every i in [0, n) across the CPU threads. func
+/// must be safe to call concurrently for distinct i (no shared mutable state).
+/// `scratch` is a per-thread arena reset between items — use it for transient
+/// per-item memory; copy anything that must outlive the call into a real
+/// allocator. `gpa` backs those scratch arenas. Falls back to serial when there's
+/// one CPU or one item.
+pub fn parallelFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *const fn (*anyopaque, usize, std.mem.Allocator) void) void {
     if (n == 0) return;
-    var pc = ParCtx{ .next = std.atomic.Value(usize).init(0), .n = n, .user = user, .func = func };
+    var pc = ParCtx{ .next = std.atomic.Value(usize).init(0), .n = n, .user = user, .func = func, .gpa = gpa };
     const cpus = std.Thread.getCpuCount() catch 1;
     var nthreads = @min(@max(cpus, 1), n);
     if (nthreads > 64) nthreads = 64;
@@ -178,20 +190,21 @@ const TileGenCtx = struct {
     base: usize = 0,
     done: ?*std.atomic.Value(usize) = null,
 
-    fn gen(uptr: *anyopaque, i: usize) void {
+    fn gen(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
         const c: *TileGenCtx = @ptrCast(@alignCast(uptr));
         const key = c.keys[i];
         const z: u8 = @intCast(key >> 48);
         const x: u32 = @intCast((key >> 24) & 0xFFFFFF);
         const y: u32 = @intCast(key & 0xFFFFFF);
         const idxs = c.idx_lists[i];
-        const refs = c.gpa.alloc(s57_mvt.CellRef, idxs.len) catch return;
-        defer c.gpa.free(refs);
+        // refs + the encoded tile are transient (gzipped right below), so they ride
+        // the per-thread scratch arena — reset after this tile, no per-tile mmap.
+        const refs = scratch.alloc(s57_mvt.CellRef, idxs.len) catch return;
         for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo, .geo_world = c.backends[idx].geo_world, .feat_bbox = c.backends[idx].feat_bbox };
-        const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y, c.format) catch return;
-        defer c.gpa.free(mvt_bytes);
+        const mvt_bytes = s57_mvt.generateTileMulti(scratch, scratch, refs, z, x, y, c.format) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
-        // collection then only dedups + writes the already-compressed tile.
+        // collection then only dedups + writes the already-compressed tile. The
+        // gzipped result must outlive the scratch reset, so it comes from `c.gpa`.
         if (mvt_bytes.len > 0) c.results[i] = pmtiles.StreamWriter.gzipTile(c.gpa, mvt_bytes) catch null;
         if (c.done) |d| {
             const n = d.fetchAdd(1, .monotonic) + 1;
@@ -319,7 +332,7 @@ pub const Baker = struct {
 
         var done = std.atomic.Value(usize).init(0);
         var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .progress = progress, .pctx = ctx, .base = self.count, .done = &done };
-        parallelFor(n, &tg, TileGenCtx.gen);
+        parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
             const mvt_bytes = mvt_opt orelse continue;

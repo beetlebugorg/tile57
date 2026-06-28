@@ -911,7 +911,8 @@ const LoadWork = struct {
     rules_dir: []const u8,
     gpa: std.mem.Allocator,
 
-    fn run(uptr: *anyopaque, j: usize) void {
+    fn run(uptr: *anyopaque, j: usize, scratch: std.mem.Allocator) void {
+        _ = scratch; // parsed cell + portrayal are persistent; kept in their own arenas
         const c: *LoadWork = @ptrCast(@alignCast(uptr));
         const ci = c.cells[j];
         const bpath = c.entries[ci].path;
@@ -1256,7 +1257,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(page, ci) catch {};
             if (miss.items.len > 0) {
                 var lw = LoadWork{ .cells = miss.items, .entries = entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = page };
-                Bands.parallelFor(miss.items.len, &lw, LoadWork.run);
+                Bands.parallelFor(page, miss.items.len, &lw, LoadWork.run);
                 for (miss.items) |ci| {
                     if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
                 }
