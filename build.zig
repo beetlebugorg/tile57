@@ -192,6 +192,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/pmtiles/pmtiles.zig"),
         .imports = &.{ .{ .name = "gzip", .module = gzip_mod }, .{ .name = "mvt", .module = mvt_mod } },
     });
+    // MapLibre Tile (MLT) encoder — optional alternative to MVT over the same model.
+    const mlt_mod = b.addModule("mlt", .{
+        .root_source_file = b.path("src/mlt/mlt.zig"),
+        .imports = &.{.{ .name = "mvt", .module = mvt_mod }},
+    });
 
     // S-57 -> MVT tile generation (s57_mvt) + the banded ENC_ROOT baker (bake_enc,
     // mirrors the Go oracle's internal/engine/baker). Pure; s57_mvt <- bake_enc.
@@ -201,6 +206,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s57", .module = s57_mod },
             .{ .name = "s100", .module = s100_mod },
             .{ .name = "mvt", .module = mvt_mod },
+            .{ .name = "mlt", .module = mlt_mod },
             .{ .name = "tile", .module = tile_mod },
         },
     });
@@ -391,6 +397,9 @@ pub fn build(b: *std.Build) void {
     });
     addCatalogueJson(b, s100_test); // catalogue.zig @embedFile's the JSON
     _ = addPkgTest(b, test_step, "src/mvt/mvt.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/mlt/mlt.zig", target, optimize, &.{
+        .{ .name = "mvt", .module = mvt_mod },
+    });
     _ = addPkgTest(b, test_step, "src/gzip/gzip.zig", target, optimize, &.{});
     _ = addPkgTest(b, test_step, "src/tile/tile.zig", target, optimize, &.{
         .{ .name = "mvt", .module = mvt_mod },
