@@ -23,6 +23,25 @@ const std = @import("std");
 /// Library version (matches build.zig.zon and tile57_version()).
 pub const version = "0.1.0";
 
+// ---- high-level engine: open a Source, fetch tiles, bake, build a style ----
+const source = @import("source.zig");
+/// An embeddable chart tile source: `Source.openBytes` / `Source.openCells`,
+/// then `.tile(z,x,y)`. See source.zig.
+pub const Source = source.Source;
+pub const Format = source.Format;
+pub const CellInput = source.CellInput;
+pub const Progress = source.Progress;
+/// Bake an ENC_ROOT into one band-streamed PMTiles archive.
+pub const bakeArchive = source.bakeArchive;
+/// Free bytes returned by `Source.tile` / `bakeArchive`.
+pub const freeBytes = source.freeBytes;
+
+/// MapLibre style generation from a template + mariner S-52 display settings.
+pub const style = struct {
+    pub const build = chartstyle.buildStyle;
+    pub const Mariner = chartstyle.MarinerSettings;
+};
+
 // ---- portrayal asset + style generation ----------------------------------
 pub const assets = @import("assets"); // colortables / linestyles / style / manifest
 pub const chartstyle = @import("chartstyle"); // mariner-driven MapLibre style patching

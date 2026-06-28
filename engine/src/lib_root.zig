@@ -7,11 +7,13 @@
 //! system crt's .sframe relocations).
 
 pub const engine = @import("root.zig");
+pub const api = @import("tile57.zig"); // the public Zig API (Source/bake/style)
 pub const capi = @import("capi.zig");
 pub const portray = @import("portray");
 pub const catalogue = @import("s100").catalogue;
 
 comptime {
+    _ = api; // compile-check the public Zig root in the libc build
     _ = capi; // force the C ABI export fns into the archive
     _ = portray; // force the tgp_* accessors into the archive
     _ = catalogue; // force the tgc_* accessors into the archive
