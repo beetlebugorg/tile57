@@ -63,11 +63,11 @@ const ST_FLOAT: u8 = 7;
 const ST_DOUBLE: u8 = 8;
 const ST_STRING: u8 = 9;
 
-// A property column we can emit non-nullably (key present on every feature with a
-// single, supported, mappable value type). boolean / partial / mixed keys are
-// skipped for now (nullable + boolean-RLE present streams are a later increment).
+// A property column: a key present on >=1 feature with a single supported value
+// type. `nullable` when not every feature has it (a boolean-RLE present stream +
+// null-skipped data are emitted). boolean / mixed-type keys are still skipped.
 const PropKind = enum { string, int32, uint32, double, float };
-const PropCol = struct { key: []const u8, kind: PropKind };
+const PropCol = struct { key: []const u8, kind: PropKind, nullable: bool };
 
 fn scalarOrdinal(kind: PropKind) u8 {
     return switch (kind) {
@@ -156,7 +156,7 @@ pub fn encode(gpa: std.mem.Allocator, tile: mvt.Tile) ![]u8 {
         try putVarint(&body, a, 1 + propcols.len); // columnCount
         try body.append(a, TYPECODE_GEOMETRY);
         for (propcols) |c| {
-            try body.append(a, 10 + scalarOrdinal(c.kind) * 2); // non-nullable scalar typeCode
+            try body.append(a, 10 + scalarOrdinal(c.kind) * 2 + @as(u8, if (c.nullable) 1 else 0));
             try putVarint(&body, a, c.key.len);
             try body.appendSlice(a, c.key);
         }
@@ -321,8 +321,8 @@ const MAX_PROP_KEYS = 64;
 // supported, mappable value type — emittable as non-nullable columns. Fills `out`
 // and returns the count. Heap-free + linear (keys per layer are few): this runs
 // per tile per layer for the whole bake, so a per-tile StringHashMap was a real
-// hot spot. Partial, mixed-type, or boolean keys are skipped (nullable + boolean-
-// RLE come later); keys past MAX_PROP_KEYS are ignored.
+// hot spot. A key on a subset of features is emitted nullable; mixed-type and
+// boolean keys are skipped; keys past MAX_PROP_KEYS are ignored.
 fn collectPropCols(features: []const mvt.Feature, out: []PropCol) usize {
     var keys: [MAX_PROP_KEYS][]const u8 = undefined;
     var kinds: [MAX_PROP_KEYS]PropKind = undefined;
@@ -352,12 +352,33 @@ fn collectPropCols(features: []const mvt.Feature, out: []PropCol) usize {
     }
     var n: usize = 0;
     for (0..nk) |i| {
-        if (oks[i] and counts[i] == features.len and n < out.len) {
-            out[n] = .{ .key = keys[i], .kind = kinds[i] };
+        if (oks[i] and counts[i] > 0 and n < out.len) {
+            out[n] = .{ .key = keys[i], .kind = kinds[i], .nullable = counts[i] < features.len };
             n += 1;
         }
     }
     return n;
+}
+
+// Emit a PRESENT stream: a per-feature presence bit (LSB-first packed) byte-RLE'd
+// (ORC, literal-only runs — gzip compresses the result anyway).
+fn writePresentStream(body: *Buf, a: std.mem.Allocator, present: []const bool) !void {
+    const nbytes = (present.len + 7) / 8;
+    const bits = try a.alloc(u8, nbytes);
+    @memset(bits, 0);
+    for (present, 0..) |p, i| if (p) {
+        bits[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    };
+    var rle = Buf.empty;
+    var off: usize = 0;
+    while (off < nbytes) {
+        const chunk = @min(nbytes - off, 128);
+        try rle.append(a, @intCast(@as(usize, 256) - chunk)); // literal-run header (256-len)
+        try rle.appendSlice(a, bits[off .. off + chunk]);
+        off += chunk;
+    }
+    try writeStreamMeta(body, a, PHYS_PRESENT, 0, LLT_NONE, LLT_NONE, PLT_NONE, present.len, rle.items.len);
+    try body.appendSlice(a, rle.items);
 }
 
 // Encode a string property column. Dictionary-encodes (distinct values + a
@@ -365,14 +386,18 @@ fn collectPropCols(features: []const mvt.Feature, out: []PropCol) usize {
 // like class / color_token / dash — and falls back to plain (length+data) when
 // they don't (all-distinct, e.g. labels) or there are too many distinct values to
 // dedup cheaply. All scratch is arena-backed (freed on the per-layer reset).
-fn encodeStringColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Feature, key: []const u8) !void {
-    const n = features.len;
+fn encodeStringColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Feature, col: PropCol) !void {
     const DICT_CAP = 256; // keep the linear dedup O(features); past this -> plain
+    var npresent: usize = 0;
+    for (features) |f| if (featureValue(f, col.key) != null) {
+        npresent += 1;
+    };
+    // Build dict + per-PRESENT-feature index over the features that have the key.
     var dict = std.ArrayList([]const u8).empty;
-    const idxs = try a.alloc(u32, n);
+    var idxs = std.ArrayList(u32).empty;
     var dict_ok = true;
-    for (features, 0..) |f, fi| {
-        const s = featureValue(f, key).?.string;
+    for (features) |f| {
+        const s = (featureValue(f, col.key) orelse continue).string;
         var found: ?u32 = null;
         for (dict.items, 0..) |d, di| {
             if (std.mem.eql(u8, d, s)) {
@@ -381,19 +406,28 @@ fn encodeStringColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Fe
             }
         }
         if (found) |ix| {
-            idxs[fi] = ix;
+            try idxs.append(a, ix);
         } else if (dict.items.len < DICT_CAP) {
-            idxs[fi] = @intCast(dict.items.len);
+            try idxs.append(a, @intCast(dict.items.len));
             try dict.append(a, s);
         } else {
             dict_ok = false;
             break;
         }
     }
+    const use_dict = dict_ok and dict.items.len < npresent;
 
-    if (dict_ok and dict.items.len < n) {
-        // Dictionary: LENGTH/DICTIONARY + DATA/SINGLE + OFFSET/STRING (3 streams).
-        try putVarint(body, a, 3);
+    // numStreams = (present?) + data streams (dict=3, plain=2). decodeScalarProperty
+    // consumes the present stream first for nullable columns; decodeString reads the
+    // rest. Data streams cover PRESENT features only; the present bitmap maps back.
+    try putVarint(body, a, (if (col.nullable) @as(u64, 1) else 0) + (if (use_dict) @as(u64, 3) else 2));
+    if (col.nullable) {
+        const pr = try a.alloc(bool, features.len);
+        for (features, 0..) |f, i| pr[i] = featureValue(f, col.key) != null;
+        try writePresentStream(body, a, pr);
+    }
+
+    if (use_dict) {
         var dlen = Buf.empty;
         var dbytes = Buf.empty;
         for (dict.items) |d| {
@@ -405,20 +439,18 @@ fn encodeStringColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Fe
         try writeStreamMeta(body, a, PHYS_DATA, DICT_SINGLE, LLT_NONE, LLT_NONE, PLT_NONE, dbytes.items.len, dbytes.items.len);
         try body.appendSlice(a, dbytes.items);
         var off = Buf.empty;
-        for (idxs) |ix| try putVarint(&off, a, ix);
-        try writeStreamMeta(body, a, PHYS_OFFSET, OFF_STRING, LLT_NONE, LLT_NONE, PLT_VARINT, n, off.items.len);
+        for (idxs.items) |ix| try putVarint(&off, a, ix);
+        try writeStreamMeta(body, a, PHYS_OFFSET, OFF_STRING, LLT_NONE, LLT_NONE, PLT_VARINT, npresent, off.items.len);
         try body.appendSlice(a, off.items);
     } else {
-        // Plain: LENGTH/VAR_BINARY (per-feature lengths) + DATA/NONE (bytes).
-        try putVarint(body, a, 2);
         var lens = Buf.empty;
         var data = Buf.empty;
         for (features) |f| {
-            const s = featureValue(f, key).?.string;
+            const s = (featureValue(f, col.key) orelse continue).string;
             try putVarint(&lens, a, s.len);
             try data.appendSlice(a, s);
         }
-        try writeStreamMeta(body, a, PHYS_LENGTH, LEN_VAR_BINARY, LLT_NONE, LLT_NONE, PLT_VARINT, n, lens.items.len);
+        try writeStreamMeta(body, a, PHYS_LENGTH, LEN_VAR_BINARY, LLT_NONE, LLT_NONE, PLT_VARINT, npresent, lens.items.len);
         try body.appendSlice(a, lens.items);
         try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_NONE, data.items.len, data.items.len);
         try body.appendSlice(a, data.items);
@@ -426,46 +458,38 @@ fn encodeStringColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Fe
 }
 
 fn encodePropertyColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Feature, col: PropCol) !void {
-    const n = features.len;
-    switch (col.kind) {
-        .string => try encodeStringColumn(body, a, features, col.key),
-        .int32 => {
-            var data = Buf.empty;
-            defer data.deinit(a);
-            for (features) |f| try putVarint(&data, a, zigzag32(@intCast(featureValue(f, col.key).?.int)));
-            try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_VARINT, n, data.items.len);
-            try body.appendSlice(a, data.items);
-        },
-        .uint32 => {
-            var data = Buf.empty;
-            defer data.deinit(a);
-            for (features) |f| try putVarint(&data, a, featureValue(f, col.key).?.uint);
-            try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_VARINT, n, data.items.len);
-            try body.appendSlice(a, data.items);
-        },
-        .double => {
-            var data = Buf.empty;
-            defer data.deinit(a);
-            for (features) |f| {
-                var le: [8]u8 = undefined;
-                std.mem.writeInt(u64, &le, @bitCast(featureValue(f, col.key).?.double), .little);
-                try data.appendSlice(a, &le);
-            }
-            try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_NONE, n, data.items.len);
-            try body.appendSlice(a, data.items);
-        },
-        .float => {
-            var data = Buf.empty;
-            defer data.deinit(a);
-            for (features) |f| {
-                var le: [4]u8 = undefined;
-                std.mem.writeInt(u32, &le, @bitCast(featureValue(f, col.key).?.float), .little);
-                try data.appendSlice(a, &le);
-            }
-            try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, PLT_NONE, n, data.items.len);
-            try body.appendSlice(a, data.items);
-        },
+    if (col.kind == .string) return encodeStringColumn(body, a, features, col);
+    // Numeric: a nullable column emits a PRESENT stream (no stream-count prefix —
+    // hasStreamCount is false for scalars), then a DATA stream over present features.
+    if (col.nullable) {
+        const pr = try a.alloc(bool, features.len);
+        for (features, 0..) |f, i| pr[i] = featureValue(f, col.key) != null;
+        try writePresentStream(body, a, pr);
     }
+    var data = Buf.empty;
+    var nvals: u64 = 0;
+    for (features) |f| {
+        const v = featureValue(f, col.key) orelse continue;
+        nvals += 1;
+        switch (col.kind) {
+            .int32 => try putVarint(&data, a, zigzag32(@intCast(v.int))),
+            .uint32 => try putVarint(&data, a, v.uint),
+            .double => {
+                var le: [8]u8 = undefined;
+                std.mem.writeInt(u64, &le, @bitCast(v.double), .little);
+                try data.appendSlice(a, &le);
+            },
+            .float => {
+                var le: [4]u8 = undefined;
+                std.mem.writeInt(u32, &le, @bitCast(v.float), .little);
+                try data.appendSlice(a, &le);
+            },
+            .string => unreachable,
+        }
+    }
+    const plt: u8 = if (col.kind == .int32 or col.kind == .uint32) PLT_VARINT else PLT_NONE;
+    try writeStreamMeta(body, a, PHYS_DATA, DICT_NONE, LLT_NONE, LLT_NONE, plt, nvals, data.items.len);
+    try body.appendSlice(a, data.items);
 }
 
 test "encode a single point tile is non-empty + framed" {
@@ -506,15 +530,37 @@ test "encode point features with string/double/int properties (verified)" {
     try std.testing.expectEqual(@as(usize, 3), collectPropCols(&feats, &cb));
 }
 
-test "partial / boolean / mixed-type property keys are skipped (non-nullable only)" {
+test "partial key -> nullable column; boolean/mixed-type keys skipped" {
     const p = [_]mvt.Point{.{ .x = 1, .y = 1 }};
     const pp = [_][]const mvt.Point{&p};
     const props0 = [_]mvt.Prop{ .{ .key = "only0", .value = .{ .string = "x" } }, .{ .key = "flag", .value = .{ .boolean = true } } };
     const props1 = [_]mvt.Prop{.{ .key = "flag", .value = .{ .boolean = false } }};
     const feats = [_]mvt.Feature{ .{ .geom_type = .point, .parts = &pp, .properties = &props0 }, .{ .geom_type = .point, .parts = &pp, .properties = &props1 } };
-    // only0 present on 1/2 features -> skipped; flag is boolean -> skipped.
+    // only0 present on 1/2 features -> emitted as a nullable column; flag is boolean -> skipped.
     var cb: [MAX_PROP_KEYS]PropCol = undefined;
-    try std.testing.expectEqual(@as(usize, 0), collectPropCols(&feats, &cb));
+    const ncols = collectPropCols(&feats, &cb);
+    try std.testing.expectEqual(@as(usize, 1), ncols);
+    try std.testing.expectEqualStrings("only0", cb[0].key);
+    try std.testing.expect(cb[0].nullable);
+}
+
+test "nullable property column (key on a subset of features) — verified" {
+    const a = std.testing.allocator;
+    // class on both features (non-nullable); drval1 only on feature 0. Verified via
+    // the reference decoder: class=["DEPARE","DEPARE"], drval1=[2.5, null].
+    const p0 = [_]mvt.Point{.{ .x = 1, .y = 2 }};
+    const pp0 = [_][]const mvt.Point{&p0};
+    const p1 = [_]mvt.Point{.{ .x = 3, .y = 4 }};
+    const pp1 = [_][]const mvt.Point{&p1};
+    const props0 = [_]mvt.Prop{ .{ .key = "class", .value = .{ .string = "DEPARE" } }, .{ .key = "drval1", .value = .{ .double = 2.5 } } };
+    const props1 = [_]mvt.Prop{.{ .key = "class", .value = .{ .string = "DEPARE" } }};
+    const feats = [_]mvt.Feature{ .{ .geom_type = .point, .parts = &pp0, .properties = &props0 }, .{ .geom_type = .point, .parts = &pp1, .properties = &props1 } };
+    const layers = [_]mvt.Layer{.{ .name = "layer1", .extent = 4096, .features = &feats }};
+    const bytes = try encode(a, .{ .layers = &layers });
+    defer a.free(bytes);
+    var cb: [MAX_PROP_KEYS]PropCol = undefined;
+    const cols = collectPropCols(&feats, &cb);
+    try std.testing.expectEqual(@as(usize, 2), cols); // class (non-null) + drval1 (nullable)
 }
 
 test "clip-split (multi-part) line keeps every segment (verified)" {
