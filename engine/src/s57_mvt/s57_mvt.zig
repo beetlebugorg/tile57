@@ -105,6 +105,103 @@ fn overlaps(b0: [4]f64, b1: [4]f64) bool {
     return b0[0] <= b1[2] and b0[2] >= b1[0] and b0[1] <= b1[3] and b0[3] >= b1[1];
 }
 
+/// Shoelace signed area (x2) of a ring in tile space; only its sign is used.
+/// y is down, so a positive value is a clockwise (exterior) ring per the MVT spec.
+fn ringSignedArea(ring: []const mvt.Point) i64 {
+    if (ring.len < 3) return 0;
+    var area: i64 = 0;
+    var j: usize = ring.len - 1;
+    for (ring, 0..) |p, i| {
+        const q = ring[j];
+        area += @as(i64, q.x) * @as(i64, p.y) - @as(i64, p.x) * @as(i64, q.y);
+        j = i;
+    }
+    return area;
+}
+
+/// Even-odd ray test: is tile-space point `pt` inside `ring`?
+fn ringContains(ring: []const mvt.Point, pt: mvt.Point) bool {
+    if (ring.len < 3) return false;
+    var inside = false;
+    const px: f64 = @floatFromInt(pt.x);
+    const py: f64 = @floatFromInt(pt.y);
+    var j: usize = ring.len - 1;
+    for (ring, 0..) |p, i| {
+        const q = ring[j];
+        const ax: f64 = @floatFromInt(p.x);
+        const ay: f64 = @floatFromInt(p.y);
+        const bx: f64 = @floatFromInt(q.x);
+        const by: f64 = @floatFromInt(q.y);
+        if ((ay > py) != (by > py) and
+            px < (bx - ax) * (py - ay) / (by - ay) + ax)
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    return inside;
+}
+
+/// Orient + order a feature's clipped area rings into MVT multipolygon parts so
+/// holes are SUBTRACTED instead of filled (e.g. an island inside a sea/depth
+/// area). Mirrors the Go reference encodePolygon: classify each ring by geometric
+/// nesting depth (even = exterior, odd = hole), force exteriors to a positive
+/// signed area (clockwise in y-down tile space) and holes to negative, and emit
+/// each exterior immediately followed by the holes it directly contains. This is
+/// independent of the FSPT USAG tags, and keeps disjoint multi-part areas
+/// (multiple exteriors) working as a proper multipolygon. `rings` are the clipped
+/// rings (open, >= 3 pts); returned parts may reverse a ring into a fresh copy.
+fn orientAreaRings(a: Allocator, rings: []const []const mvt.Point) ![]const []const mvt.Point {
+    const n = rings.len;
+    const depth = try a.alloc(usize, n);
+    for (rings, 0..) |ri, i| {
+        var d: usize = 0;
+        for (rings, 0..) |rj, j| {
+            if (i != j and ringContains(rj, ri[0])) d += 1;
+        }
+        depth[i] = d;
+    }
+
+    const done = try a.alloc(bool, n);
+    @memset(done, false);
+    var out = std.ArrayList([]const mvt.Point).empty;
+
+    const emit = struct {
+        fn one(al: Allocator, list: *std.ArrayList([]const mvt.Point), ring: []const mvt.Point, d: usize) !void {
+            const want_pos = (d % 2) == 0; // even depth = exterior (positive), odd = hole
+            if ((ringSignedArea(ring) >= 0) == want_pos) {
+                try list.append(al, ring);
+            } else {
+                const rev = try al.alloc(mvt.Point, ring.len);
+                for (ring, 0..) |p, k| rev[ring.len - 1 - k] = p;
+                try list.append(al, rev);
+            }
+        }
+    }.one;
+
+    // Each exterior (even depth) followed by the holes it directly contains, so a
+    // decoder attaches each hole to the right exterior (depth exactly +1, inside).
+    for (0..n) |i| {
+        if (done[i] or depth[i] % 2 != 0) continue;
+        done[i] = true;
+        try emit(a, &out, rings[i], depth[i]);
+        for (0..n) |k| {
+            if (done[k] or depth[k] != depth[i] + 1) continue;
+            if (ringContains(rings[i], rings[k][0])) {
+                done[k] = true;
+                try emit(a, &out, rings[k], depth[k]);
+            }
+        }
+    }
+    // Safety net: emit anything not placed (malformed nesting) on its own.
+    for (0..n) |i| {
+        if (done[i]) continue;
+        done[i] = true;
+        try emit(a, &out, rings[i], depth[i]);
+    }
+    return out.items;
+}
+
 fn geomBounds(g: []const s57.LonLat) [4]f64 {
     var b = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
     for (g) |p| {
@@ -143,33 +240,11 @@ fn featureScamin(f: s57.Feature) ?i64 {
     return if (n > 0) n else null;
 }
 
-/// Feature-level metadata shared by every primitive a feature emits.
-const Meta = struct {
-    prio: i64,
-    cat: i64,
-    scamin: ?i64,
-    date_start: []const u8 = "",
-    date_end: []const u8 = "",
-};
-
-/// Append the shared metadata tags: S-52 draw priority + display-category rank
-/// (always), the SCAMIN 1:N denominator (when gated), and the date-dependent
-/// validity tags (when dated).
-fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
-    try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
-    try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
-    if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
-    // Date-dependent display (S-52 §10.4.1.1): recurring iff a "--" month-day prefix;
-    // strip it so the client compares MMDD (recurring) / YYYYMMDD (fixed).
-    if (m.date_start.len > 0 or m.date_end.len > 0) {
-        const recurring: i64 = if (std.mem.startsWith(u8, m.date_start, "--") or
-            std.mem.startsWith(u8, m.date_end, "--")) 1 else 0;
-        try props.append(a, .{ .key = "date_recurring", .value = .{ .int = recurring } });
-        const ds = std.mem.trimStart(u8, m.date_start, "-");
-        const de = std.mem.trimStart(u8, m.date_end, "-");
-        if (ds.len > 0) try props.append(a, .{ .key = "date_start", .value = .{ .string = ds } });
-        if (de.len > 0) try props.append(a, .{ .key = "date_end", .value = .{ .string = de } });
-    }
+/// Append the metadata tags shared by every emitFromInstr feature: the S-52
+/// draw priority (always) and, for SCAMIN-gated features, the 1:N denominator.
+fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), draw_prio: i64, scamin: ?i64) !void {
+    try props.append(a, .{ .key = "draw_prio", .value = .{ .int = draw_prio } });
+    if (scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
 }
 
 /// Per-feature cached line/area geometry for a cell (indexed by feature index;
@@ -197,12 +272,12 @@ fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.
 
 fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, instr: []const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     const p = try s101.parse(a, instr);
+    const prio = p.draw_prio;
 
     // Route each feature into its base layer or the *_scamin bucket depending on
     // whether it carries a SCAMIN (1:N) display limit. Same geometry/properties
     // either way; the bucket lets the style gate the feature below its scale.
     const scamin = featureScamin(f);
-    const meta = Meta{ .prio = p.draw_prio, .cat = p.cat, .scamin = scamin, .date_start = p.date_start, .date_end = p.date_end };
     const areas_l = if (scamin != null) L.areas_scamin else L.areas;
     const apat_l = if (scamin != null) L.area_patterns_scamin else L.area_patterns;
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
@@ -224,7 +299,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
             try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
             try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-            try appendMeta(a, &props, meta);
+            try appendMeta(a, &props, prio, scamin);
             try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         }
         for (p.texts) |t| {
@@ -232,8 +307,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
             try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
             try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
-            try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
-            try appendMeta(a, &props, meta);
+            try appendMeta(a, &props, prio, scamin);
             try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         }
         return;
@@ -257,31 +331,29 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
     if (!any_overlap or projected.items.len == 0) return;
 
     if (f.prim == 3) {
-        // Clip each ring once (each as its own polygon: avoids hole/winding
-        // misinterpretation; correct for disjoint area parts).
+        // Clip each ring, then assemble ONE multipolygon per feature with the
+        // rings wound exterior-vs-hole (orientAreaRings) so interior holes (e.g.
+        // an island inside a sea/depth area) are subtracted, not filled — and
+        // disjoint area parts still render. (Was: one polygon per ring, which
+        // filled holes with the area's own colour.)
         var rings = std.ArrayList([]const mvt.Point).empty;
         for (projected.items) |proj| {
             const ring = try tile.clipPolygon(a, proj, box);
             if (ring.len >= 3) try rings.append(a, ring);
         }
-        if (p.fill_token) |token| {
-            for (rings.items) |ring| {
-                const parts = try a.alloc([]const mvt.Point, 1);
-                parts[0] = ring;
+        if (rings.items.len > 0) {
+            const parts = try orientAreaRings(a, rings.items);
+            if (p.fill_token) |token| {
                 var props = std.ArrayList(mvt.Prop).empty;
                 try props.append(a, .{ .key = "color_token", .value = .{ .string = token } });
-                try appendMeta(a, &props, meta);
+                try appendMeta(a, &props, prio, scamin);
                 try areas_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
             }
-        }
-        // AreaFillReference -> a tiled fill pattern (DRGARE/FOUL/quality fills).
-        for (p.patterns) |pat| {
-            for (rings.items) |ring| {
-                const parts = try a.alloc([]const mvt.Point, 1);
-                parts[0] = ring;
+            // AreaFillReference -> a tiled fill pattern (DRGARE/FOUL/quality fills).
+            for (p.patterns) |pat| {
                 var props = std.ArrayList(mvt.Prop).empty;
                 try props.append(a, .{ .key = "pattern_name", .value = .{ .string = pat } });
-                try appendMeta(a, &props, meta);
+                try appendMeta(a, &props, prio, scamin);
                 try apat_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
             }
         }
@@ -307,7 +379,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
             try props.append(a, .{ .key = "width_px", .value = .{ .double = ln.width } });
             try props.append(a, .{ .key = "dash", .value = .{ .string = dash } });
             if (valdco) |v| try props.append(a, .{ .key = "valdco", .value = .{ .double = v } });
-            try appendMeta(a, &props, meta);
+            try appendMeta(a, &props, prio, scamin);
             try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
         }
     }
@@ -328,8 +400,7 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
                     try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
                     try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
                     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
-                    try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
-                    try appendMeta(a, &props, meta);
+                    try appendMeta(a, &props, prio, scamin);
                     try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
                 }
             }
@@ -350,7 +421,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
     const points_l = if (scamin != null) L.points_scamin else L.points;
     const texts_l = if (scamin != null) L.texts_scamin else L.texts;
-    const meta = Meta{ .prio = 6, .cat = 1, .scamin = scamin }; // native fallback (no portrayal)
+    const prio: i64 = 6;
 
     // Dashed CHGRD boundary on each ring (clipped to the tile).
     for (geo_parts) |gp| {
@@ -366,7 +437,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHGRD" } });
         try props.append(a, .{ .key = "width_px", .value = .{ .double = 1 } });
         try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
-        try appendMeta(a, &props, meta);
+        try appendMeta(a, &props, prio, scamin);
         try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 
@@ -383,7 +454,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     try sprops.append(a, .{ .key = "symbol_name", .value = .{ .string = "SWPARE51" } });
     try sprops.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
     try sprops.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-    try appendMeta(a, &sprops, meta);
+    try appendMeta(a, &sprops, prio, scamin);
     try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = sprops.items });
 
     if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| {
@@ -392,7 +463,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         try tprops.append(a, .{ .key = "text", .value = .{ .string = label } });
         try tprops.append(a, .{ .key = "color_token", .value = .{ .string = "CHBLK" } });
         try tprops.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
-        try appendMeta(a, &tprops, meta);
+        try appendMeta(a, &tprops, prio, scamin);
         try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = tprops.items });
     }
 }
@@ -412,7 +483,6 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 
     const scamin = featureScamin(f);
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const meta = Meta{ .prio = 6, .cat = 1, .scamin = scamin }; // native fallback (no portrayal)
     for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
@@ -426,7 +496,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         try props.append(a, .{ .key = "color_token", .value = .{ .string = color } });
         try props.append(a, .{ .key = "width_px", .value = .{ .double = width } });
         try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
-        try appendMeta(a, &props, meta);
+        try appendMeta(a, &props, 6, scamin);
         try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 }
@@ -551,36 +621,46 @@ fn appendCellFeatures(
         const geo_parts = featureParts(a, cell.*, geo, fi, f) catch continue;
         if (geo_parts.len == 0) continue;
 
+        if (cls.kind == .area) {
+            // Collect the feature's clipped rings, then emit ONE multipolygon with
+            // holes subtracted (see orientAreaRings) — same fix as the portrayal
+            // path so a sea/depth hole over an island isn't filled.
+            var rings = std.ArrayList([]const mvt.Point).empty;
+            for (geo_parts) |gp| {
+                if (gp.len < 2) continue;
+                if (!overlaps(geomBounds(gp), tb)) continue;
+                const proj = try a.alloc(mvt.Point, gp.len);
+                for (gp, 0..) |p, i| proj[i] = tile.project(p.lon, p.lat, z, x, y, tile.EXTENT);
+                const ring = try tile.clipPolygon(a, proj, box);
+                if (ring.len >= 3) try rings.append(a, ring);
+            }
+            if (rings.items.len == 0) continue;
+            const parts = try orientAreaRings(a, rings.items);
+            // Depth areas carry DRVAL1/DRVAL2 so the style's SEABED01 shading
+            // applies (areasFillColor keys on `drval1`).
+            var aprops = std.ArrayList(mvt.Prop).empty;
+            try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
+            try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
+            if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
+            if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
+            try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
+            continue;
+        }
+
         for (geo_parts) |gp| {
             if (gp.len < 2) continue;
             if (!overlaps(geomBounds(gp), tb)) continue;
             const proj = try a.alloc(mvt.Point, gp.len);
             for (gp, 0..) |p, i| proj[i] = tile.project(p.lon, p.lat, z, x, y, tile.EXTENT);
-
-            if (cls.kind == .area) {
-                const ring = try tile.clipPolygon(a, proj, box);
-                if (ring.len < 3) continue;
-                const parts = try a.alloc([]const mvt.Point, 1);
-                parts[0] = ring;
-                // Depth areas carry DRVAL1/DRVAL2 so the style's SEABED01 shading
-                // applies (areasFillColor keys on `drval1`).
-                var aprops = std.ArrayList(mvt.Prop).empty;
-                try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
-                try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
-                if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
-                if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
-                try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
-            } else {
-                const sub = try tile.clipLine(a, proj, box);
-                if (sub.len == 0) continue;
-                const parts = try a.alloc([]const mvt.Point, sub.len);
-                for (sub, 0..) |s, i| parts[i] = s;
-                const lprops = try a.alloc(mvt.Prop, 3);
-                lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
-                lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
-                lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
-                try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
-            }
+            const sub = try tile.clipLine(a, proj, box);
+            if (sub.len == 0) continue;
+            const parts = try a.alloc([]const mvt.Point, sub.len);
+            for (sub, 0..) |s, i| parts[i] = s;
+            const lprops = try a.alloc(mvt.Prop, 3);
+            lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
+            lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
+            lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
+            try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
         }
     }
 }
@@ -594,6 +674,54 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0));
     try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6));
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0));
+}
+
+test "orientAreaRings subtracts a hole: exterior CW (+), interior CCW (-)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A sea-area exterior square (CCW as authored) with a smaller island hole
+    // inside it (also CCW as authored). y is down in tile space.
+    const ext = [_]mvt.Point{
+        .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 100 },
+        .{ .x = 100, .y = 100 }, .{ .x = 100, .y = 0 },
+    };
+    const hole = [_]mvt.Point{
+        .{ .x = 40, .y = 40 }, .{ .x = 40, .y = 60 },
+        .{ .x = 60, .y = 60 }, .{ .x = 60, .y = 40 },
+    };
+    // Pass the hole first to prove ordering is by geometry, not input order.
+    const rings = [_][]const mvt.Point{ hole[0..], ext[0..] };
+    const out = try orientAreaRings(a, &rings);
+
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    // First emitted ring is the exterior (positive signed area), then its hole
+    // (negative). This is the winding MapLibre reads to cut the hole out.
+    try std.testing.expect(ringSignedArea(out[0]) > 0);
+    try std.testing.expect(ringSignedArea(out[1]) < 0);
+    // The exterior must be the 100x100 ring, the hole the 20x20 one.
+    try std.testing.expect(@abs(ringSignedArea(out[0])) > @abs(ringSignedArea(out[1])));
+}
+
+test "orientAreaRings keeps disjoint parts as separate exteriors (multipolygon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two disjoint squares (CTNARE-style multi-part area): both are exteriors,
+    // both wound positive, neither becomes a hole of the other.
+    const r0 = [_]mvt.Point{
+        .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 10 }, .{ .x = 10, .y = 10 }, .{ .x = 10, .y = 0 },
+    };
+    const r1 = [_]mvt.Point{
+        .{ .x = 50, .y = 50 }, .{ .x = 50, .y = 60 }, .{ .x = 60, .y = 60 }, .{ .x = 60, .y = 50 },
+    };
+    const rings = [_][]const mvt.Point{ r0[0..], r1[0..] };
+    const out = try orientAreaRings(a, &rings);
+    try std.testing.expectEqual(@as(usize, 2), out.len);
+    try std.testing.expect(ringSignedArea(out[0]) > 0);
+    try std.testing.expect(ringSignedArea(out[1]) > 0);
 }
 
 fn findProp(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
