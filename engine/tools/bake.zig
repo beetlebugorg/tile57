@@ -1036,10 +1036,6 @@ fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(
     }
 }
 
-// One cell's raw bytes (base + sequential updates), read on the main thread and
-// handed to a worker to parse + portray in parallel.
-const CellSource = struct { base: []const u8, updates: []const []const u8 };
-
 // One ENC_ROOT base cell: its `.000` path (updates are <stem>.001…, found on load)
 // and the cheap peek bbox [w,s,e,n], used to assign it to spatial super-tiles
 // without a full parse.
@@ -1075,14 +1071,20 @@ fn copyStreams(a: std.mem.Allocator, src: []const ?[]const u8) ![]const ?[]const
     return out;
 }
 
-// Parallel cell loader. Each index parses one cell (a fresh per-thread Lua state;
-// page allocator is thread-safe), builds its geo cache (evictable), and — only the
-// first time the cell is loaded (portray[ci] == null) — runs the S-101 portrayal
-// and copies the streams into a sticky arena. Re-loads after a geometry eviction
-// re-parse only, reusing the resident portrayal. Distinct ci per j ⇒ race-free.
+// Parallel cell loader. Each index READS its cell's .000 (+ sequential updates)
+// from disk, parses it (a fresh per-thread Lua state; page allocator is
+// thread-safe), builds its geo cache (evictable), and — only the first time the
+// cell is loaded (portray[ci] == null) — runs the S-101 portrayal and copies the
+// streams into a sticky arena. Reading in the worker (std.Io.Dir.readFileAlloc is
+// thread-safe: each call opens its own handle, no shared mutable state) makes a
+// super-tile's cell reads parallel, so a cold first-bake isn't disk-read-serial.
+// Re-loads after a geometry eviction re-parse only, reusing the resident
+// portrayal. Distinct ci per j ⇒ race-free.
 const LoadWork = struct {
-    cells: []const u32, // cell indices, aligned with `sources`
-    sources: []const CellSource,
+    cells: []const u32, // cell indices into `entries`
+    entries: []const CellEntry, // cell file path; bytes read in-worker (parallel I/O)
+    dir: std.Io.Dir,
+    io: std.Io,
     portray: []?CellPortray, // resident; produced only when null
     geom: []?CellGeom, // (re)built every load
     rules_dir: []const u8,
@@ -1091,10 +1093,29 @@ const LoadWork = struct {
     fn run(uptr: *anyopaque, j: usize) void {
         const c: *LoadWork = @ptrCast(@alignCast(uptr));
         const ci = c.cells[j];
-        const src = c.sources[j];
-        if (src.base.len == 0) return;
+        const bpath = c.entries[ci].path;
+        const base = c.dir.readFileAlloc(c.io, bpath, c.gpa, .unlimited) catch return;
+        defer c.gpa.free(base);
+        if (base.len == 0) return;
+        // Read sequential updates (.001…) until the first missing one.
+        var ups = std.ArrayList([]const u8).empty;
+        defer {
+            for (ups.items) |ub| c.gpa.free(ub);
+            ups.deinit(c.gpa);
+        }
+        const stem = bpath[0 .. bpath.len - 4];
+        var u: u32 = 1;
+        while (u <= 999) : (u += 1) {
+            const upn = std.fmt.allocPrint(c.gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
+            defer c.gpa.free(upn);
+            const ub = c.dir.readFileAlloc(c.io, upn, c.gpa, .unlimited) catch break;
+            ups.append(c.gpa, ub) catch {
+                c.gpa.free(ub);
+                break;
+            };
+        }
         _ = g_parses.fetchAdd(1, .monotonic); // count parses (re-parse diagnostics)
-        var cell = engine.s57.parseCellWithUpdates(c.gpa, src.base, src.updates) catch return;
+        var cell = engine.s57.parseCellWithUpdates(c.gpa, base, ups.items) catch return;
         const b = cell.bounds() orelse {
             cell.deinit();
             return;
@@ -1384,36 +1405,17 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             const sx: u32 = @intCast(stk & 0xFFFFFFFF);
             const sy: u32 = @intCast(stk >> 32);
 
-            // (Re)load this super-tile's cells whose geometry isn't resident — read
-            // bytes serially (IO isn't thread-safe), then parse (+ portray once) in
-            // parallel. A cell already portrayed is only re-parsed, never re-portrayed.
+            // (Re)load this super-tile's cells whose geometry isn't resident — each
+            // worker reads its own cell's bytes + parses (+ portrays once) in
+            // parallel, so cold reads aren't serialised. A cell already portrayed is
+            // only re-parsed, never re-portrayed.
             var miss = std.ArrayList(u32).empty;
             defer miss.deinit(page);
             for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(page, ci) catch {};
             if (miss.items.len > 0) {
-                const src = try page.alloc(CellSource, miss.items.len);
-                defer page.free(src);
-                @memset(src, .{ .base = &.{}, .updates = &.{} });
-                for (miss.items, 0..) |ci, j| {
-                    const bpath = entries[ci].path;
-                    const base_bytes = dir.readFileAlloc(io, bpath, page, .unlimited) catch continue;
-                    const stem = bpath[0 .. bpath.len - 4];
-                    var ups = std.ArrayList([]const u8).empty;
-                    var u: u32 = 1;
-                    while (u <= 999) : (u += 1) {
-                        const upn = std.fmt.allocPrint(page, "{s}.{d:0>3}", .{ stem, u }) catch break;
-                        defer page.free(upn);
-                        const ub = dir.readFileAlloc(io, upn, page, .unlimited) catch break;
-                        ups.append(page, ub) catch break;
-                    }
-                    src[j] = .{ .base = base_bytes, .updates = ups.toOwnedSlice(page) catch &.{} };
-                }
-                var lw = LoadWork{ .cells = miss.items, .sources = src, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = page };
+                var lw = LoadWork{ .cells = miss.items, .entries = entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = page };
                 Bands.parallelFor(miss.items.len, &lw, LoadWork.run);
-                for (miss.items, 0..) |ci, j| {
-                    if (src[j].base.len > 0) page.free(src[j].base);
-                    for (src[j].updates) |ub| page.free(ub);
-                    if (src[j].updates.len > 0) page.free(src[j].updates);
+                for (miss.items) |ci| {
                     if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
                 }
             }
