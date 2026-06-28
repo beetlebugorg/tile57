@@ -141,7 +141,15 @@ fn addPkgTest(
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseFast: the tile57 CLI is a compute-heavy baking tool, and a
+    // Debug build bakes ~2.6x slower (no inlining/hoisting/vectorisation). A plain
+    // `zig build` (gen-style.sh, ad-hoc bakes) should produce a fast binary; pass
+    // `-Doptimize=Debug` (or ReleaseSafe) for development. (The C++ host's
+    // libtile57.a already builds ReleaseFast explicitly via CMake / zig-build-lib.sh,
+    // which pass -Doptimize and so still work.) NB: not standardOptimizeOption's
+    // preferred_optimize_mode — that keeps the no-flag default at Debug and drops
+    // the -Doptimize option entirely.
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
 
     // Lua: POSIX feature flags on Unix; Windows lets luaconf.h auto-pick
     // LUA_USE_WINDOWS. The portray module is target-agnostic (it inherits each
