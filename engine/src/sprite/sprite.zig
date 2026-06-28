@@ -454,15 +454,19 @@ const pattern_pixel_ratio: f64 = px_per_unit / (0.01 / 0.35278); // ≈ 2.822
 const MlnCell = struct { name: []const u8, w: u32, h: u32, ratio: f64, rgba: []const u8 };
 
 /// A MapLibre sprite (sprite-mln.json + sprite-mln.png) assembled from the S-101
-/// symbols + area-fill patterns. Returns allocator-owned bytes. Soundings (the
-/// data-dependent comma-joined glyph stacks) are added separately from the tiles.
-pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8) !Atlas {
+/// symbols + area-fill patterns + the soundings' composite glyph stacks. Returns
+/// allocator-owned bytes. `soundings` are the distinct comma-joined glyph lists
+/// the soundings layer references (collected from the baked tiles); pass &.{} to
+/// skip them (e.g. the catalogue-only `sprite-mln` command without tiles).
+pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8, soundings: []const []const u8) !Atlas {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const ar = arena_state.allocator();
     var css = try loadCss(ar, css_data);
 
     var cells = std.ArrayList(MlnCell).empty;
+    // name -> rendered symbol, for compositing sounding glyph stacks.
+    var rendered = std.StringHashMap(RenderedSym).init(ar);
 
     // Symbols, id order (deterministic packing).
     const sym_ordered = try ar.dupe(SvgSrc, symbols);
@@ -473,6 +477,7 @@ pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const A
     }.less);
     for (sym_ordered) |s| {
         const sym = renderSym(ar, s.svg, &css) orelse continue;
+        try rendered.put(s.id, sym); // for sounding composites (any size)
         if (sym.w > max_cell_side or sym.h > max_cell_side) continue;
         const c = centredCanvas(ar, sym) orelse continue;
         try cells.append(ar, .{ .name = s.id, .w = c.w, .h = c.h, .ratio = 1, .rgba = c.rgba });
@@ -500,7 +505,59 @@ pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const A
         try cells.append(ar, .{ .name = name, .w = t.w, .h = t.h, .ratio = pattern_pixel_ratio, .rgba = t.rgba });
     }
 
+    // Sounding glyph stacks: composite each comma-joined list into one pivot-
+    // centred image keyed by the exact string the soundings layer references.
+    // Sorted for deterministic packing.
+    const snd_ordered = try ar.dupe([]const u8, soundings);
+    std.mem.sort([]const u8, snd_ordered, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.less);
+    for (snd_ordered) |stack| {
+        const t = compositeSounding(ar, &rendered, stack) orelse continue;
+        try cells.append(ar, .{ .name = stack, .w = t.w, .h = t.h, .ratio = 1, .rgba = t.rgba });
+    }
+
     return packMln(a, ar, cells.items, sprite_atlas_width);
+}
+
+// Composite a comma-joined glyph list (e.g. "SOUNDSC3,SOUNDS12,SOUNDS54") into
+// one pivot-centred image — each glyph self-positions by its pivot. Port of
+// build_sprite.py compositeSounding. null if no glyph is known.
+fn compositeSounding(ar: std.mem.Allocator, rendered: *std.StringHashMap(RenderedSym), stack: []const u8) ?Tile {
+    const Part = struct { sym: RenderedSym, left: f64, top: f64 };
+    var parts = std.ArrayList(Part).empty;
+    var min_x: f64 = std.math.inf(f64);
+    var min_y: f64 = std.math.inf(f64);
+    var max_x: f64 = -std.math.inf(f64);
+    var max_y: f64 = -std.math.inf(f64);
+    var it = std.mem.tokenizeScalar(u8, stack, ',');
+    while (it.next()) |name| {
+        const sym = rendered.get(name) orelse continue;
+        const left = -sym.pivot_x;
+        const top = -sym.pivot_y;
+        parts.append(ar, .{ .sym = sym, .left = left, .top = top }) catch return null;
+        min_x = @min(min_x, left);
+        min_y = @min(min_y, top);
+        max_x = @max(max_x, left + @as(f64, @floatFromInt(sym.w)));
+        max_y = @max(max_y, top + @as(f64, @floatFromInt(sym.h)));
+    }
+    if (parts.items.len == 0) return null;
+    const half_w = @max(-min_x, max_x);
+    const half_h = @max(-min_y, max_y);
+    const w: u32 = @max(1, @as(u32, @intFromFloat(@ceil(2 * half_w))));
+    const h: u32 = @max(1, @as(u32, @intFromFloat(@ceil(2 * half_h))));
+    const buf = ar.alloc(u8, @as(usize, w) * h * 4) catch return null;
+    @memset(buf, 0);
+    const wf: f64 = @floatFromInt(w);
+    const hf: f64 = @floatFromInt(h);
+    for (parts.items) |p| {
+        const dx: i32 = @intFromFloat(@round(wf / 2 + p.left));
+        const dy: i32 = @intFromFloat(@round(hf / 2 + p.top));
+        blitClipped(buf, w, h, p.sym.rgba, p.sym.w, p.sym.h, dx, dy);
+    }
+    return .{ .w = w, .h = h, .rgba = buf };
 }
 
 // Pivot-centred canvas: move the S-52 pivot to the image centre so MapLibre's

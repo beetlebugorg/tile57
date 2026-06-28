@@ -567,18 +567,57 @@ fn readFills(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]sprit
 
 // Build the MapLibre sprite (sprite-mln) directly from the catalogue's Symbols +
 // AreaFills + palette CSS. Mirrors the old scripts/build_sprite.py, in Zig.
-fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8) !sprite.Atlas {
+fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, soundings: []const []const u8) !sprite.Atlas {
     const symbols = try readSymbols(io, a, catalog_dir);
     const fills = try readFills(io, a, catalog_dir);
     const css_path = try std.fs.path.join(a, &.{ catalog_dir, SYMBOLS_REL, css_name });
     const css = try std.Io.Dir.cwd().readFileAlloc(io, css_path, a, .unlimited);
-    return sprite.spriteMln(a, symbols, fills, css);
+    return sprite.spriteMln(a, symbols, fills, css, soundings);
+}
+
+// Distinct comma-joined sounding glyph stacks (sym_s/sym_g/symbol_names) across a
+// baked archive's `soundings` layer — the strings the style's icon-image produces,
+// so sprite-mln must carry a composite for each. Decodes each tile in bounds.
+fn collectSoundingStacks(io: std.Io, a: std.mem.Allocator, archive: []const u8, minzoom: u8, maxzoom: u8, b: [4]f64) ![]const []const u8 {
+    _ = io;
+    var reader = engine.pmtiles.Reader.init(a, archive) catch return &.{};
+    defer reader.deinit();
+    var set = std.StringHashMap(void).init(a);
+    var z: u8 = minzoom;
+    while (z <= maxzoom) : (z += 1) {
+        const nw = lonLatToTile(b[0], b[3], z);
+        const se = lonLatToTile(b[2], b[1], z);
+        var ty = nw[1];
+        while (ty <= se[1]) : (ty += 1) {
+            var tx = nw[0];
+            while (tx <= se[0]) : (tx += 1) {
+                const tile = (reader.getTile(a, z, tx, ty) catch null) orelse continue;
+                const layers = engine.mvt.decode(a, tile) catch continue;
+                for (layers) |L| {
+                    if (!std.mem.eql(u8, L.name, "soundings")) continue;
+                    for (L.features) |feat| {
+                        for (feat.properties) |p| {
+                            if (!std.mem.eql(u8, p.key, "sym_s") and !std.mem.eql(u8, p.key, "sym_g") and !std.mem.eql(u8, p.key, "symbol_names")) continue;
+                            switch (p.value) {
+                                .string => |sv| if (std.mem.indexOfScalar(u8, sv, ',') != null) set.put(sv, {}) catch {},
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var out = std.ArrayList([]const u8).empty;
+    var it = set.keyIterator();
+    while (it.next()) |k| try out.append(a, k.*);
+    return out.items;
 }
 
 // Emit sprite-mln.{json,png} + identical @2x copies (MapLibre requests @2x on
 // HiDPI; a missing @2x sheet fails the whole sprite load).
-fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, out_dir: []const u8, base: []const u8) !sprite.Atlas {
-    const atlas = try spriteMlnBytes(io, a, catalog_dir, css_name);
+fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, out_dir: []const u8, base: []const u8, soundings: []const []const u8) !sprite.Atlas {
+    const atlas = try spriteMlnBytes(io, a, catalog_dir, css_name, soundings);
     for ([_][]const u8{ "", "@2x" }) |suffix| {
         const jn = try std.fmt.allocPrint(a, "{s}{s}.json", .{ base, suffix });
         const pn = try std.fmt.allocPrint(a, "{s}{s}.png", .{ base, suffix });
@@ -610,7 +649,8 @@ fn runSpriteMln(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
     const catalog_dir = resolveCatalogDir(catalog);
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
-    const atlas = try emitSpriteMln(io, a, catalog_dir, css, out_dir, "sprite-mln");
+    // Catalogue-only: no tiles, so no sounding composites (the bundle adds those).
+    const atlas = try emitSpriteMln(io, a, catalog_dir, css, out_dir, "sprite-mln", &.{});
     std.debug.print("emitted sprite-mln from {s} (css {s})\n  sprite-mln.json ({d} bytes) + .png ({d} bytes) + @2x\n", .{ catalog_dir, css, atlas.json.len, atlas.png.len });
 }
 
@@ -767,7 +807,10 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     // sprite.json/patterns.json (the web/oracle format) would be redundant here —
     // they stay available via the standalone `tile57 sprite`/`pattern` commands.
     // If sprite-mln emits, the styles get a `sprite` URL so symbols + patterns render.
-    const sprite_ok = if (emitSpriteMln(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, assets_dir, "sprite-mln")) |_| true else |err| blk: {
+    // Collect the bundle's sounding glyph stacks so sprite-mln carries a composite
+    // for each (the soundings layer references them by their comma-joined string).
+    const snd_stacks = collectSoundingStacks(io, a, res.archive, minzoom, maxzoom, res.bounds) catch &.{};
+    const sprite_ok = if (emitSpriteMln(io, a, resolveCatalogDir(catalog), DEFAULT_CSS, assets_dir, "sprite-mln", snd_stacks)) |_| true else |err| blk: {
         std.debug.print("warning: sprite-mln emit failed ({s})\n", .{@errorName(err)});
         break :blk false;
     };
