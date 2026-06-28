@@ -18,8 +18,8 @@ git submodule update --init --recursive
 ```
 
 The vendored **IHO S-101 Portrayal Catalogue** comes in as a submodule (under
-`vendor/`); the engine portrays against it at runtime. Lua 5.4 is vendored under
-`engine/vendor/lua` and compiled in, so no system Lua is needed.
+`engine/vendor/`); the engine portrays against it at runtime. Lua 5.4 is vendored
+under `engine/vendor/lua` and compiled in, so no system Lua is needed.
 
 ## 2. Zig 0.16.0 (required)
 
@@ -51,7 +51,7 @@ API](./zig-api.md).
 - `TILE57_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57 cells.
   A fallback only: it applies when a caller passes `NULL`/`null` for the
   `rules_dir` argument. Defaults to the vendored catalogue under
-  `vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.
+  `engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules`.
 
 Next: [**Getting Started**](./getting-started.md) bakes a chart and fetches a
 tile.

@@ -21,7 +21,7 @@ S-57 ENC cell (.000)
    ▼
 S-57 feature + geometry model         engine/src/s57/       (pkg: s57)
    │  apply S-101 portrayal           engine/src/portray/ (pkg) + embedded Lua 5.4
-   ▼                                   (vendor/S-101_Portrayal-Catalogue)
+   ▼                            (engine/vendor/S-101_Portrayal-Catalogue)
 portrayal instruction stream
    │  adapt to drawing primitives     engine/src/s100/      (pkg: s100)
    ▼

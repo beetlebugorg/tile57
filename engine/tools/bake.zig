@@ -35,7 +35,7 @@ extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
 fn resolveRulesDir(explicit: ?[]const u8) []const u8 {
     if (explicit) |d| return d;
     if (tg_env_rules()) |dirz| return std.mem.span(dirz);
-    return "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+    return "engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
 }
 
 // True if `path` is a directory (an ENC_ROOT) rather than a single cell.000 file.

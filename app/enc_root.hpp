@@ -33,7 +33,7 @@ namespace cpn {
 inline std::string resolveRulesDir(const char *argv0) {
     namespace fs = std::filesystem;
     if (const char *env = std::getenv("TILE57_S101_RULES"); env && *env) return env;
-    const fs::path suffix = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+    const fs::path suffix = "engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
     std::error_code ec;
     std::vector<fs::path> starts;
     starts.push_back(fs::current_path(ec));

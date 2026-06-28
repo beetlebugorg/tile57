@@ -297,7 +297,7 @@ fn tileKey(z: u8, x: u32, y: u32) u64 {
 fn resolveRulesDir(rules_dir: ?[]const u8) []const u8 {
     if (rules_dir) |d| return d;
     if (tg_env_rules()) |dirz| return std.mem.span(dirz);
-    return "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
+    return "engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
 }
 
 // Open a PMTiles archive from owned bytes (takes ownership on success, frees on

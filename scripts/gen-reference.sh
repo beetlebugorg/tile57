@@ -57,8 +57,8 @@ find_one() { find "$GO" \( -name .git -o -name worktrees -o -name node_modules \
 # independently). Override with S101_PC / S101_FC.
 PC="${S101_PC:-}"
 FC="${S101_FC:-}"
-VPC="$ROOT/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog"
-VFC="$ROOT/vendor/S-101-Documentation-and-FC/S-101FC/FeatureCatalogue.xml"
+VPC="$ROOT/engine/vendor/S-101_Portrayal-Catalogue/PortrayalCatalog"
+VFC="$ROOT/engine/vendor/S-101-Documentation-and-FC/S-101FC/FeatureCatalogue.xml"
 [[ -z "$PC" && -d "$VPC/LineStyles" ]] && PC="$VPC"
 [[ -z "$FC" && -f "$VFC" ]] && FC="$VFC"
 if [[ -z "$PC" ]]; then
