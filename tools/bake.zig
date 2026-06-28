@@ -106,10 +106,6 @@ pub fn main(init: std.process.Init) !void {
         return runBake(io, arena, args);
     }
 
-    if (std.mem.eql(u8, sub, "bake-root")) {
-        return runBakeRoot(io, arena, args);
-    }
-
     if (std.mem.eql(u8, sub, "assets")) {
         return runAssets(io, arena, args);
     }
@@ -124,10 +120,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "sprite-mln")) {
         return runSpriteMln(io, arena, args);
-    }
-
-    if (std.mem.eql(u8, sub, "bundle")) {
-        return runBundle(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "style")) {
@@ -317,147 +309,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     printUsage();
-}
-
-// ---- bake ---------------------------------------------------------------
-
-const BakeResult = struct { archive: []u8, bounds: [4]f64, tiles: usize };
-
-/// Decode a base cell (+ updates), run S-101 portrayal, and bake every
-/// web-mercator MVT tile covering its bounds across [minzoom,maxzoom] into a
-/// PMTiles archive. Returns the archive plus the cell bounds and tile count.
-/// Shared by `bake` (writes the archive) and `bundle` (wraps it with assets + a
-/// manifest). bounds() -> [west, south, east, north]; error.NoGeometry if the
-/// cell has nothing to bake.
-fn bakeCell(
-    io: std.Io,
-    a: std.mem.Allocator,
-    base_path: []const u8,
-    updates: []const []const u8,
-    rules_dir: []const u8,
-    minzoom: u8,
-    maxzoom: u8,
-) !BakeResult {
-    const base_bytes = try std.Io.Dir.cwd().readFileAlloc(io, base_path, a, .unlimited);
-    const update_bytes = try a.alloc([]const u8, updates.len);
-    for (updates, 0..) |u, ui| {
-        update_bytes[ui] = try std.Io.Dir.cwd().readFileAlloc(io, u, a, .unlimited);
-    }
-
-    var cell = try engine.s57.parseCellWithUpdates(a, base_bytes, update_bytes);
-    defer cell.deinit();
-
-    // S-101 portrayal: run the embedded-Lua rule engine over the cell's adapted
-    // features (same path the live library uses) so baked tiles carry full S-101
-    // styling. The arena `a` outlives tile generation, as portrayCell requires.
-    // Portrayal failure (e.g. rules dir not found) is non-fatal: generateTile
-    // then falls back to the built-in classify() styling.
-    // Three passes (default + plain-boundary + simplified-symbol) so baked tiles
-    // carry the bnd/pts display-variant tags the client toggles live.
-    const cp: engine.portray.CellPortrayal = if (engine.portray.portrayCellVariants(a, &cell, rules_dir)) |res|
-        res
-    else |err| blk: {
-        std.debug.print(
-            "warning: S-101 portrayal failed ({s}) with rules dir '{s}'; baking with classify() fallback\n",
-            .{ @errorName(err), rules_dir },
-        );
-        break :blk .{ .base = &.{} };
-    };
-
-    const b = cell.bounds() orelse return error.NoGeometry;
-
-    var tiles = std.ArrayList(engine.pmtiles.InputTile).empty;
-    var z: u8 = minzoom;
-    while (z <= maxzoom) : (z += 1) {
-        // North-west corner -> (min x, min y); south-east corner -> (max x, max y).
-        const nw = lonLatToTile(b[0], b[3], z);
-        const se = lonLatToTile(b[2], b[1], z);
-        var ty = nw[1];
-        while (ty <= se[1]) : (ty += 1) {
-            var tx = nw[0];
-            while (tx <= se[0]) : (tx += 1) {
-                // Generate with the page allocator, not the arena `a`: generateTile
-                // frees a per-tile child arena each call, which an arena backing
-                // would leak (tens of GB over a high-vertex cell).
-                const one = [_]engine.s57_mvt.CellRef{.{ .cell = &cell, .portrayal = cp.base, .portrayal_plain = cp.plain, .portrayal_simplified = cp.simplified }};
-                const tile_mvt = try engine.s57_mvt.generateTileMulti(std.heap.page_allocator, &one, z, tx, ty);
-                if (tile_mvt.len == 0) continue; // empty tile: nothing covered here
-                try tiles.append(a, .{ .z = z, .x = tx, .y = ty, .mvt = tile_mvt });
-            }
-        }
-    }
-
-    const opts = engine.pmtiles.WriteOptions{
-        .min_lon_e7 = toE7(b[0]),
-        .min_lat_e7 = toE7(b[1]),
-        .max_lon_e7 = toE7(b[2]),
-        .max_lat_e7 = toE7(b[3]),
-    };
-    const archive = try engine.pmtiles.write(a, tiles.items, opts);
-    return .{ .archive = archive, .bounds = b, .tiles = tiles.items.len };
-}
-
-/// `bake <cell.000> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N] [update.001 ...]`
-fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
-    var base: ?[]const u8 = null;
-    var out: ?[]const u8 = null;
-    var rules: ?[]const u8 = null;
-    var minzoom: u8 = DEFAULT_MINZOOM;
-    var maxzoom: u8 = DEFAULT_MAXZOOM;
-    var updates = std.ArrayList([]const u8).empty;
-
-    var f = Flags{ .args = args };
-    while (f.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            out = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--rules")) {
-            rules = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--minzoom")) {
-            minzoom = f.int(u8, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--maxzoom")) {
-            maxzoom = f.int(u8, arg) orelse return;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("error: unknown flag '{s}'\n\n", .{arg});
-            return printUsage();
-        } else if (base == null) {
-            base = arg;
-        } else {
-            try updates.append(a, arg);
-        }
-    }
-
-    const base_path = base orelse return usageErr("missing <cell.000 | ENC_ROOT> input");
-    const out_path = out orelse return usageErr("missing -o/--output <out.pmtiles>");
-    if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
-    if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
-
-    // `bake` takes a single cell.000 OR an ENC_ROOT directory — same archive out.
-    if (isDir(io, base_path)) {
-        const rzoom_max: u8 = if (maxzoom == DEFAULT_MAXZOOM) 18 else maxzoom; // root default 18
-        const rb = bakeRoot(io, a, base_path, out_path, resolveRulesDir(rules), minzoom, rzoom_max, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ, false) catch |err| {
-            std.debug.print("error: cannot bake ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
-            return;
-        };
-        std.debug.print("\nbaked {d} cells -> {s}\n", .{ rb.cells.len, out_path });
-        return;
-    }
-
-    const res = bakeCell(io, a, base_path, updates.items, resolveRulesDir(rules), minzoom, maxzoom) catch |err| switch (err) {
-        error.NoGeometry => {
-            std.debug.print("error: {s} has no geometry to bake\n", .{base_path});
-            return;
-        },
-        else => return err,
-    };
-    if (res.tiles == 0) {
-        std.debug.print("warning: no non-empty tiles produced for zoom {d}..{d}\n", .{ minzoom, maxzoom });
-    }
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = res.archive });
-
-    std.debug.print(
-        "baked 1 cell ({d} update file(s) applied) -> {s}\n  {d} tiles written, zoom {d}..{d}\n  output {d} bytes ({d:.1} MB)\n",
-        .{ updates.items.len, out_path, res.tiles, minzoom, maxzoom, res.archive.len, @as(f64, @floatFromInt(res.archive.len)) / (1024.0 * 1024.0) },
-    );
 }
 
 // ---- assets / bundle ----------------------------------------------------
@@ -662,45 +513,6 @@ fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css
     return sprite.spriteMln(a, symbols, fills, css, soundings);
 }
 
-// Distinct comma-joined sounding glyph stacks (sym_s/sym_g/symbol_names) across a
-// baked archive's `soundings` layer — the strings the style's icon-image produces,
-// so sprite-mln must carry a composite for each. Decodes each tile in bounds.
-fn collectSoundingStacks(io: std.Io, a: std.mem.Allocator, archive: []const u8, minzoom: u8, maxzoom: u8, b: [4]f64) ![]const []const u8 {
-    _ = io;
-    var reader = engine.pmtiles.Reader.init(a, archive) catch return &.{};
-    defer reader.deinit();
-    var set = std.StringHashMap(void).init(a);
-    var z: u8 = minzoom;
-    while (z <= maxzoom) : (z += 1) {
-        const nw = lonLatToTile(b[0], b[3], z);
-        const se = lonLatToTile(b[2], b[1], z);
-        var ty = nw[1];
-        while (ty <= se[1]) : (ty += 1) {
-            var tx = nw[0];
-            while (tx <= se[0]) : (tx += 1) {
-                const tile = (reader.getTile(a, z, tx, ty) catch null) orelse continue;
-                const layers = engine.mvt.decode(a, tile) catch continue;
-                for (layers) |L| {
-                    if (!std.mem.eql(u8, L.name, "soundings")) continue;
-                    for (L.features) |feat| {
-                        for (feat.properties) |p| {
-                            if (!std.mem.eql(u8, p.key, "sym_s") and !std.mem.eql(u8, p.key, "sym_g") and !std.mem.eql(u8, p.key, "symbol_names")) continue;
-                            switch (p.value) {
-                                .string => |sv| if (std.mem.indexOfScalar(u8, sv, ',') != null) set.put(sv, {}) catch {},
-                                else => {},
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    var out = std.ArrayList([]const u8).empty;
-    var it = set.keyIterator();
-    while (it.next()) |k| try out.append(a, k.*);
-    return out.items;
-}
-
 // Emit sprite-mln.{json,png} + identical @2x copies (MapLibre requests @2x on
 // HiDPI; a missing @2x sheet fails the whole sprite load).
 fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, out_dir: []const u8, base: []const u8, soundings: []const []const u8) !sprite.Atlas {
@@ -827,11 +639,13 @@ fn runAssets(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     std.debug.print("emitted assets from {s}\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n  {s} ({d} bytes)\n", .{ catalogLabel(catalog_dir), ct_path, json.len, ls_path, ls.len, sj_path, atlas.json.len, sp_path, atlas.png.len, pj_path, pat.json.len, pp_path, pat.png.len });
 }
 
-/// `bundle <cell.000> -o <out-dir> [--rules DIR] [--catalog DIR] [--minzoom N]
-///  [--maxzoom N] [--created ISO8601] [update.001 …]` — one bake emits a
-/// self-contained chart bundle: tiles/chart.pmtiles + assets/colortables.json +
+/// `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--catalog DIR]
+///  [--minzoom N] [--maxzoom N] [--lru N] [--superdz N] [--created ISO8601]` —
+/// THE bake command. A single cell or a whole ENC_ROOT, streamed through the same
+/// lazy banded bake into a self-contained chart bundle: tiles/chart.pmtiles +
+/// assets/colortables.json + sprite-mln + style-{day,dusk,night}.json +
 /// manifest.json (pins schema_version, couples tiles to portrayal).
-fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var rules: ?[]const u8 = null;
@@ -839,7 +653,8 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     var created: []const u8 = "";
     var minzoom: u8 = DEFAULT_MINZOOM;
     var maxzoom: u8 = DEFAULT_MAXZOOM;
-    var updates = std.ArrayList([]const u8).empty;
+    var lru: usize = DEFAULT_LRU_BUDGET; // lazy-bake tuning: parsed cells held resident
+    var super_dz: u8 = DEFAULT_SUPER_DZ; // lazy-bake tuning: spatial super-tile depth
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -855,12 +670,16 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
             minzoom = f.int(u8, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--maxzoom")) {
             maxzoom = f.int(u8, arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--lru")) {
+            lru = f.int(usize, arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--superdz")) {
+            super_dz = f.int(u8, arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
             base = arg;
         } else {
-            try updates.append(a, arg);
+            return usageErr("unexpected argument (cell updates are auto-discovered next to the .000)");
         }
     }
 
@@ -868,6 +687,7 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
     if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
     if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
+    if (lru < 1) return usageErr("--lru must be >= 1");
 
     // 1. tiles -> <out>/tiles/chart.pmtiles. Input may be a single cell.000 or a
     // whole ENC_ROOT directory (band-streamed multi-cell bake, streamed to disk).
@@ -877,30 +697,15 @@ fn runBundle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void
     var bounds: [4]f64 = undefined;
     var cells: []const []const u8 = undefined;
     var snd_stacks: []const []const u8 = &.{}; // sounding glyph stacks for sprite-mln
-    if (isDir(io, base_path)) {
-        // ENC_ROOT: streamed straight to tiles_path; updates auto-discovered per cell.
-        const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ, true) catch |err| {
-            std.debug.print("error: cannot bundle ENC_ROOT {s} ({s})\n", .{ base_path, @errorName(err) });
-            return;
-        };
-        bounds = rb.bounds;
-        cells = rb.cells;
-        snd_stacks = rb.sounds;
-    } else {
-        const res = bakeCell(io, a, base_path, updates.items, resolveRulesDir(rules), minzoom, maxzoom) catch |err| switch (err) {
-            error.NoGeometry => {
-                std.debug.print("error: {s} has no geometry to bundle\n", .{base_path});
-                return;
-            },
-            else => return err,
-        };
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tiles_path, .data = res.archive });
-        bounds = res.bounds;
-        const one = try a.alloc([]const u8, 1);
-        one[0] = std.fs.path.stem(std.fs.path.basename(base_path));
-        cells = one;
-        snd_stacks = collectSoundingStacks(io, a, res.archive, minzoom, maxzoom, res.bounds) catch &.{};
-    }
+    // Single cell.000 OR a whole ENC_ROOT — both stream to tiles_path through the
+    // SAME lazy banded bake; sounding glyph stacks are collected during the bake.
+    const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom, lru, super_dz, true) catch |err| {
+        std.debug.print("error: cannot bake {s} ({s})\n", .{ base_path, @errorName(err) });
+        return;
+    };
+    bounds = rb.bounds;
+    cells = rb.cells;
+    snd_stacks = rb.sounds;
 
     // 2. assets -> <out>/assets/colortables.json + style-{day,dusk,night}.json
     const assets_dir = try std.fs.path.join(a, &.{ out_dir, "assets" });
@@ -1230,7 +1035,13 @@ fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
 // union bounds + cell stems + sounding stacks. error.NoGeometry if no cell parses.
 fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool) !RootBake {
     const page = std.heap.page_allocator;
-    var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    // Input may be a whole ENC_ROOT directory OR a single cell `.000` file; either
+    // way the lazy super-tile bake below streams to disk through the SAME path. For
+    // a single file the "dir" is its parent (the worker reads the cell + its `.001…`
+    // updates from there) and pass 1 is just that one cell.
+    const single_file = !isDir(io, root_path);
+    const dir_path = if (single_file) (std.fs.path.dirname(root_path) orelse ".") else root_path;
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
 
     // Pass 1: learn each cell's band + bbox. Fast path: an exchange-set catalogue
@@ -1244,7 +1055,19 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var ubox: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }; // [w,s,e,n]
     var total_cells: usize = 0;
 
-    const via_catalog = cat: {
+    const via_catalog = if (single_file) sf: {
+        // Single cell: one entry, band + bbox from a cheap peek (no dir scan).
+        const base = std.fs.path.basename(root_path);
+        const bytes = dir.readFileAlloc(io, base, page, .unlimited) catch return error.NoGeometry;
+        defer page.free(bytes);
+        const m = engine.s57.peekMeta(page, bytes) orelse return error.NoGeometry;
+        const bb = m.bounds orelse return error.NoGeometry;
+        ubox = bb;
+        total_cells = 1;
+        try cell_names.append(a, try a.dupe(u8, std.fs.path.stem(base)));
+        try band_cells[@intFromEnum(Bands.bandOf(m.cscl))].append(a, .{ .path = try a.dupe(u8, base), .bbox = bb });
+        break :sf false;
+    } else cat: {
         const cbytes = dir.readFileAlloc(io, "CATALOG.031", page, .unlimited) catch break :cat false;
         defer page.free(cbytes);
         const entries = engine.s57.parseCatalog(a, cbytes) orelse break :cat false;
@@ -1271,7 +1094,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         break :cat n_cells > 0;
     };
 
-    if (!via_catalog) {
+    if (!single_file and !via_catalog) {
         var walker = try dir.walk(a);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
@@ -1524,47 +1347,6 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     return .{ .bounds = ubox, .cells = cell_names.items, .sounds = stacks.items };
 }
 
-/// `bake-root <ENC_ROOT> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N]`
-fn runBakeRoot(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
-    var root: ?[]const u8 = null;
-    var out: ?[]const u8 = null;
-    var rules: ?[]const u8 = null;
-    var minzoom: u8 = 0;
-    var maxzoom: u8 = 18;
-    var lru: usize = DEFAULT_LRU_BUDGET;
-    var super_dz: u8 = DEFAULT_SUPER_DZ;
-    var f = Flags{ .args = args };
-    while (f.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            out = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--rules")) {
-            rules = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--minzoom")) {
-            minzoom = f.int(u8, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--maxzoom")) {
-            maxzoom = f.int(u8, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--lru")) {
-            lru = f.int(usize, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--superdz")) {
-            super_dz = f.int(u8, arg) orelse return;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return usageErr("unknown flag");
-        } else if (root == null) {
-            root = arg;
-        }
-    }
-    const root_path = root orelse return usageErr("missing <ENC_ROOT> input");
-    const out_path = out orelse return usageErr("missing -o/--output <out.pmtiles>");
-    if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
-    if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
-    if (lru < 1) return usageErr("--lru must be >= 1");
-    const rb = bakeRoot(io, a, root_path, out_path, resolveRulesDir(rules), minzoom, maxzoom, lru, super_dz, false) catch |err| {
-        std.debug.print("error: {s} ({s})\n", .{ root_path, @errorName(err) });
-        return;
-    };
-    std.debug.print("\nbaked {d} cells -> {s}\n", .{ rb.cells.len, out_path });
-}
-
 /// lon/lat (deg) -> web-mercator tile (x, y) at zoom z, clamped to the valid range.
 fn lonLatToTile(lon: f64, lat: f64, z: u8) [2]u32 {
     const w = engine.tile.lonLatToWorld(lon, lat); // normalised [0,1], y down
@@ -1590,21 +1372,23 @@ fn printUsage() void {
         \\{s} — offline S-57 -> PMTiles baker / inspector
         \\
         \\usage:
-        \\  tile57 bake <cell.000> -o <out.pmtiles> [options] [update.001 ...]
-        \\      -o, --output PATH   output PMTiles archive (required)
-        \\      --rules DIR         S-101 portrayal rules directory (optional)
+        \\  tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [options]
+        \\      Bake a single S-57 cell OR a whole ENC_ROOT (every <CELL>.000 +
+        \\      its auto-discovered updates, zoom-banded per cell by compilation
+        \\      scale) into a self-contained chart bundle, streamed to disk:
+        \\      <out>/tiles/chart.pmtiles + assets/colortables.json + sprite-mln +
+        \\      style-{{day,dusk,night}}.json + manifest.json (pins schema_version,
+        \\      couples tiles to portrayal).
+        \\      -o, --output DIR    output bundle directory (required)
+        \\      --rules DIR         S-101 portrayal rules directory (default: embedded)
+        \\      --catalog DIR       PortrayalCatalog (default: parent of --rules)
         \\      --minzoom N         lowest zoom to bake (default {d})
         \\      --maxzoom N         highest zoom to bake (default {d})
-        \\  tile57 bake-root <ENC_ROOT> -o <out.pmtiles> [options]
-        \\      Bake a whole ENC_ROOT (every <CELL>.000 + updates) into one
-        \\      archive, zoom-banded per cell by compilation scale.
-        \\      -o/--output, --rules as above; --minzoom/--maxzoom clamp the bands.
-        \\  tile57 bundle <cell.000> -o <out-dir> [options] [update.001 ...]
-        \\      Emit a self-contained chart bundle: tiles/chart.pmtiles +
-        \\      assets/colortables.json + manifest.json (pins schema_version,
-        \\      couples tiles to portrayal). --rules/--minzoom/--maxzoom as above;
-        \\      --catalog DIR PortrayalCatalog (default: parent of --rules);
-        \\      --created ISO8601 stamps the manifest (no wall clock in-process).
+        \\      --created ISO8601   stamp the manifest (no wall clock in-process)
+        \\      --lru N             parsed cells held resident (lazy-bake tuning; trade
+        \\                          memory for fewer re-parses; default {d})
+        \\      --superdz N         spatial super-tile depth below a band's min zoom
+        \\                          (lazy-bake tuning; default {d})
         \\  tile57 assets <portrayal-catalog-dir> -o <out-dir>
         \\      Emit just the portrayal assets (colortables.json today) for a
         \\      catalogue, independent of any cell.
@@ -1618,5 +1402,5 @@ fn printUsage() void {
         \\  tile57 version
         \\  tile57 help
         \\
-    , .{ VERSION, DEFAULT_MINZOOM, DEFAULT_MAXZOOM });
+    , .{ VERSION, DEFAULT_MINZOOM, DEFAULT_MAXZOOM, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ });
 }
