@@ -34,13 +34,35 @@ if(TILE57_LIB)
   # calls the C ABI — no separate C++ chartstyle module.
 endif()
 
-# QMapLibre links as @rpath/QMapLibre*.framework but carries no absolute path, so
-# the binary needs an rpath to find it at runtime. The frameworks install to
-# <prefix>/lib, and QMapLibre_DIR is <prefix>/lib/cmake/QMapLibre — derive the lib
-# dir from it and bake it into the install rpath (Qt itself resolves via absolute
-# Homebrew paths, so only QMapLibre needs this).
-get_filename_component(QMAPLIBRE_LIBDIR "${QMapLibre_DIR}/../.." ABSOLUTE)
-set_target_properties(chartplotter-qt PROPERTIES
-  INSTALL_RPATH "${QMAPLIBRE_LIBDIR}")
+if(WIN32)
+  # Windows has no rpath: the loader finds DLLs in the exe's own directory or on
+  # PATH. QMapLibre installs its DLLs to <prefix>/bin (QMapLibre_DIR is
+  # <prefix>/lib/cmake/QMapLibre). Copy them next to the binary post-build, and run
+  # windeployqt for the Qt DLLs + the `platforms/` plugin so the app is runnable
+  # standalone. (UNVERIFIED on Windows — adjust paths/flags as needed.)
+  get_filename_component(QMAPLIBRE_BINDIR "${QMapLibre_DIR}/../../bin" ABSOLUTE)
+  add_custom_command(TARGET chartplotter-qt POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${QMAPLIBRE_BINDIR}" "$<TARGET_FILE_DIR:chartplotter-qt>"
+    COMMENT "Copying QMapLibre DLLs next to chartplotter-qt")
+  find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "${Qt6_DIR}/../../../bin")
+  if(WINDEPLOYQT_EXECUTABLE)
+    add_custom_command(TARGET chartplotter-qt POST_BUILD
+      COMMAND "${WINDEPLOYQT_EXECUTABLE}" --no-translations "$<TARGET_FILE:chartplotter-qt>"
+      COMMENT "windeployqt: staging Qt DLLs + platform plugin")
+  else()
+    message(WARNING "windeployqt not found; Qt DLLs won't be staged automatically")
+  endif()
+else()
+  # QMapLibre links as @rpath/QMapLibre*.framework (macOS) / SONAME libQMapLibre*.so
+  # (Linux) but carries no absolute path, so the binary needs an rpath to find it at
+  # runtime. The libs install to <prefix>/lib, and QMapLibre_DIR is
+  # <prefix>/lib/cmake/QMapLibre — derive the lib dir from it and bake it into the
+  # install rpath (Qt itself resolves via absolute Homebrew/system paths, so only
+  # QMapLibre needs this).
+  get_filename_component(QMAPLIBRE_LIBDIR "${QMapLibre_DIR}/../.." ABSOLUTE)
+  set_target_properties(chartplotter-qt PROPERTIES
+    INSTALL_RPATH "${QMAPLIBRE_LIBDIR}")
+endif()
 
 install(TARGETS chartplotter-qt RUNTIME DESTINATION bin)

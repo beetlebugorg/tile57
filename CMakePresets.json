@@ -38,12 +38,24 @@
       "inherits": "macos",
       "binaryDir": "${sourceDir}/build-macos-desktop",
       "cacheVariables": { "CHARTPLOTTER_WITH_QT": "ON" }
+    },
+    {
+      "name": "windows-desktop",
+      "displayName": "Windows + Qt6 viewer (chartplotter-qt)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-windows-desktop",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CHARTPLOTTER_WITH_QT": "ON"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     }
   ],
   "buildPresets": [
     { "name": "headless", "configurePreset": "headless", "targets": ["chartplotter-render"] },
     { "name": "desktop", "configurePreset": "desktop", "targets": ["chartplotter-qt"] },
     { "name": "macos", "configurePreset": "macos", "targets": ["chartplotter-render"] },
-    { "name": "macos-desktop", "configurePreset": "macos-desktop", "targets": ["chartplotter-qt"] }
+    { "name": "macos-desktop", "configurePreset": "macos-desktop", "targets": ["chartplotter-qt"] },
+    { "name": "windows-desktop", "configurePreset": "windows-desktop", "targets": ["chartplotter-qt"] }
   ]
 }

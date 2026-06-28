@@ -30,27 +30,34 @@ endif()
 #
 # Defaults below are plain CACHE entries (no FORCE) so a preset or -D... wins.
 # ---------------------------------------------------------------------------
-# The render backend is platform-fixed (exactly one allowed), so FORCE it — this
-# also clears a stale value if the build dir was configured for another backend.
-if(APPLE)
-  set(MLN_WITH_METAL    ON  CACHE BOOL "" FORCE)  # Metal: the only macOS render backend
-  set(MLN_WITH_OPENGL   OFF CACHE BOOL "" FORCE)
-  set(MLN_WITH_EGL      OFF CACHE BOOL "")
-  set(MLN_DARWIN_USE_LIBUV ON CACHE BOOL "")      # libuv run loop on darwin
-else()
-  set(MLN_WITH_OPENGL   ON  CACHE BOOL "" FORCE)  # OpenGL/EGL: the only Linux render backend
-  set(MLN_WITH_EGL      ON  CACHE BOOL "")         # surfaceless headless backend
-  set(MLN_WITH_METAL    OFF CACHE BOOL "" FORCE)
+# Windows is VIEWER-ONLY: the headless render path below builds our OWN vendored
+# mbgl-core (EGL/OpenGL or Metal), which isn't ported to Windows. The Qt viewer
+# gets its mbgl from QMapLibre's separate ExternalProject, so on Windows we skip
+# the vendored mbgl + chartplotter-render entirely and only build libtile57 + the
+# viewer. (Linux/macOS are unaffected — NOT WIN32 is always true there.)
+if(NOT WIN32)
+  # The render backend is platform-fixed (exactly one allowed), so FORCE it — this
+  # also clears a stale value if the build dir was configured for another backend.
+  if(APPLE)
+    set(MLN_WITH_METAL    ON  CACHE BOOL "" FORCE)  # Metal: the only macOS render backend
+    set(MLN_WITH_OPENGL   OFF CACHE BOOL "" FORCE)
+    set(MLN_WITH_EGL      OFF CACHE BOOL "")
+    set(MLN_DARWIN_USE_LIBUV ON CACHE BOOL "")      # libuv run loop on darwin
+  else()
+    set(MLN_WITH_OPENGL   ON  CACHE BOOL "" FORCE)  # OpenGL/EGL: the only Linux render backend
+    set(MLN_WITH_EGL      ON  CACHE BOOL "")         # surfaceless headless backend
+    set(MLN_WITH_METAL    OFF CACHE BOOL "" FORCE)
+  endif()
+
+  set(MLN_WITH_VULKAN   OFF CACHE BOOL "" FORCE)
+  set(MLN_WITH_WEBGPU   OFF CACHE BOOL "" FORCE)
+  set(MLN_WITH_PMTILES  ON  CACHE BOOL "")   # native pmtiles:// source
+  set(MLN_WITH_WERROR   OFF CACHE BOOL "")   # clang/gcc are bleeding-edge here
+  set(MLN_WITH_NODE     OFF CACHE BOOL "")
+  set(MLN_WITH_QT       OFF CACHE BOOL "")
+
+  add_subdirectory(vendor/maplibre-native)
 endif()
-
-set(MLN_WITH_VULKAN   OFF CACHE BOOL "" FORCE)
-set(MLN_WITH_WEBGPU   OFF CACHE BOOL "" FORCE)
-set(MLN_WITH_PMTILES  ON  CACHE BOOL "")   # native pmtiles:// source
-set(MLN_WITH_WERROR   OFF CACHE BOOL "")   # clang/gcc are bleeding-edge here
-set(MLN_WITH_NODE     OFF CACHE BOOL "")
-set(MLN_WITH_QT       OFF CACHE BOOL "")
-
-add_subdirectory(vendor/maplibre-native)
 
 # ---------------------------------------------------------------------------
 # Zig tile generator (libtile57.a), built by its own `zig build`, linked
@@ -60,18 +67,30 @@ add_subdirectory(vendor/maplibre-native)
 find_program(ZIG_EXECUTABLE zig HINTS "$ENV{HOME}/.local/bin" "$ENV{HOME}/.local/share/zig-0.16.0")
 if(ZIG_EXECUTABLE)
   set(ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/engine)
-  set(TILE57_LIB ${ENGINE_DIR}/zig-out/lib/libtile57.a)
+  # Artifact name + build driver are ABI-specific. POSIX uses zig-build-lib.sh
+  # (it also does a macOS-only `ld -r` archive re-pack). Windows has no POSIX
+  # shell and needs no re-pack, so invoke `zig build` directly there; the
+  # windows-msvc archive is `tile57.lib`, not `libtile57.a`.
+  if(WIN32)
+    set(TILE57_LIB ${ENGINE_DIR}/zig-out/lib/tile57.lib)
+    set(_tile57_build_cmd ${ZIG_EXECUTABLE} build -Doptimize=ReleaseFast)
+    set(_tile57_build_dir ${ENGINE_DIR})
+  else()
+    set(TILE57_LIB ${ENGINE_DIR}/zig-out/lib/libtile57.a)
+    set(_tile57_build_cmd ${CMAKE_COMMAND} -E env "ZIG=${ZIG_EXECUTABLE}"
+        "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/zig-build-lib.sh ReleaseFast)
+    set(_tile57_build_dir ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
   # Always invoke `zig build` (Zig's own cache makes it a no-op when nothing
   # changed). A glob of src/*.zig is evaluated at configure time and misses new
   # files / the C shim / vendored Lua, so relying on it for deps left the lib
   # stale after a pull. Running unconditionally is cheap and always correct.
   add_custom_target(tile57_lib ALL
     BYPRODUCTS ${TILE57_LIB}
-    COMMAND ${CMAKE_COMMAND} -E env "ZIG=${ZIG_EXECUTABLE}"
-            "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
-            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/zig-build-lib.sh ReleaseFast
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "Building libtile57.a (zig build + macOS archive re-pack)"
+    COMMAND ${_tile57_build_cmd}
+    WORKING_DIRECTORY ${_tile57_build_dir}
+    COMMENT "Building libtile57 (zig build)"
     VERBATIM)
 
   # -------------------------------------------------------------------------
@@ -80,26 +99,29 @@ if(ZIG_EXECUTABLE)
   # + libtile57 behind the C API in include/chartplotter.h: render a chart to a
   # PNG offscreen (ChartTileSource serves tiles from libtile57). chartplotter-render
   # is a thin main over it. The interactive window is the Qt6 app in app/qt.
+  # Needs our vendored mbgl-core, which isn't built on Windows (viewer-only).
   # -------------------------------------------------------------------------
-  set(MLN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native)
+  if(NOT WIN32)
+    set(MLN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native)
 
-  add_library(chartplotter_widget STATIC app/chartplotter.cpp app/chart_tile_source.cpp)
-  set_target_properties(chartplotter_widget PROPERTIES OUTPUT_NAME chartplotter)
-  add_dependencies(chartplotter_widget tile57_lib)
-  target_include_directories(chartplotter_widget PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_include_directories(chartplotter_widget PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/app
-    ${MLN_DIR}/platform/default/include)
-  target_link_libraries(chartplotter_widget PUBLIC mbgl-core ${TILE57_LIB})
-  target_link_libraries(chartplotter_widget PRIVATE mbgl-compiler-options)
+    add_library(chartplotter_widget STATIC app/chartplotter.cpp app/chart_tile_source.cpp)
+    set_target_properties(chartplotter_widget PROPERTIES OUTPUT_NAME chartplotter)
+    add_dependencies(chartplotter_widget tile57_lib)
+    target_include_directories(chartplotter_widget PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(chartplotter_widget PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/app
+      ${MLN_DIR}/platform/default/include)
+    target_link_libraries(chartplotter_widget PUBLIC mbgl-core ${TILE57_LIB})
+    target_link_libraries(chartplotter_widget PRIVATE mbgl-compiler-options)
 
-  # Thin exe: chart -> PNG (headless EGL / Metal).
-  add_executable(chartplotter-render app/chartplotter_render_main.cpp)
-  target_include_directories(chartplotter-render PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/app)
-  target_link_libraries(chartplotter-render PRIVATE chartplotter_widget mbgl-compiler-options)
+    # Thin exe: chart -> PNG (headless EGL / Metal).
+    add_executable(chartplotter-render app/chartplotter_render_main.cpp)
+    target_include_directories(chartplotter-render PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/app)
+    target_link_libraries(chartplotter-render PRIVATE chartplotter_widget mbgl-compiler-options)
+  endif()
 else()
-  message(STATUS "zig not found; skipping chartplotter-render (needs libtile57)")
+  message(STATUS "zig not found; skipping libtile57 (live-ENC viewer + chartplotter-render need it)")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -130,8 +152,11 @@ if(CHARTPLOTTER_WITH_QT)
   set(QMLB_SRC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/maplibre-native-qt)
   set(QMLB_PREFIX ${CMAKE_BINARY_DIR}/qmaplibre)
 
-  # Renderer MUST match Qt's RHI backend: Metal on macOS, OpenGL on Linux. (An
-  # OpenGL mbgl crashes against a Metal QRhiCommandBuffer.)
+  # Renderer MUST match Qt's RHI backend: Metal on macOS, OpenGL on Linux AND
+  # Windows. QMapLibre's MapWidget forces the QRhiWidget API to match how mbgl was
+  # built (setApi(OpenGL) under MLN_RENDER_BACKEND_OPENGL), so an OpenGL mbgl makes
+  # Qt use its OpenGL RHI on Windows too — no Direct3D mismatch. (An OpenGL mbgl
+  # crashes against a Metal/D3D QRhiCommandBuffer, hence the match requirement.)
   if(APPLE)
     set(QMLB_RENDERER -DMLN_WITH_METAL=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0)
   else()

@@ -21,13 +21,22 @@ fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
 // Attach the embedded Lua 5.4 interpreter + the portrayal C shim to a module.
 // Attached to the `portray` module — which both libtile57.a and the baker import
 // — so the Lua runtime is defined once and can't drift between them.
-fn addLua(b: *std.Build, mod: *std.Build.Module) void {
+//
+// `posix`: define LUA_USE_POSIX (Unix). On Windows it must stay OFF — forcing it
+// pulls in <unistd.h>/dlopen; without it luaconf.h auto-selects LUA_USE_WINDOWS
+// from _WIN32. lua_shim.c is already portable (only getenv + ANSI stdio).
+fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool) void {
     mod.addIncludePath(b.path("vendor/lua/src"));
-    mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = &.{"-DLUA_USE_POSIX"} });
+    const shim_flags: []const []const u8 = if (posix) &.{"-DLUA_USE_POSIX"} else &.{};
+    mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = shim_flags });
+    const lua_flags: []const []const u8 = if (posix)
+        &.{ "-std=gnu99", "-DLUA_USE_POSIX", "-O2" }
+    else
+        &.{ "-std=gnu99", "-O2" };
     mod.addCSourceFiles(.{
         .root = b.path("vendor/lua/src"),
         .files = &lua_sources,
-        .flags = &.{ "-std=gnu99", "-DLUA_USE_POSIX", "-O2" },
+        .flags = lua_flags,
     });
 }
 
@@ -80,6 +89,12 @@ fn addPkgTest(
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Lua: POSIX feature flags on Unix; Windows lets luaconf.h auto-pick
+    // LUA_USE_WINDOWS. The portray module is target-agnostic (it inherits each
+    // consumer's target), but on a given host the lib + baker share this OS, so
+    // gate the flag on the top-level target.
+    const lua_posix = target.result.os.tag != .windows;
 
     // Foundational packages, mirroring the Go oracle's pkg/iso8211, pkg/s57,
     // pkg/s100. Pure Zig (no libc/Lua) and target-agnostic: they omit target/
@@ -153,7 +168,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s100", .module = s100_mod },
         },
     });
-    addLua(b, portray_mod);
+    addLua(b, portray_mod, lua_posix);
 
     // Asset/style generation for the chart bundle (colortables, manifest, …).
     // Pure + target-agnostic like the foundational packages, so it compiles
