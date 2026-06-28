@@ -1,5 +1,10 @@
 const std = @import("std");
 
+// The vendored S-101 PortrayalCatalog, relative to the engine/ build root. Its
+// Rules (Lua) + Symbols/LineStyles/AreaFills/ColorProfiles (assets) are embedded
+// into the binary so tile57 portrays + styles charts with no on-disk catalogue.
+const PORTRAYAL_CATALOG = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog";
+
 // Lua 5.4 core sources (vendored from lua.org), minus the standalone mains.
 const lua_sources = [_][]const u8{
     "lapi.c",    "lauxlib.c", "lbaselib.c", "lcode.c",   "lcorolib.c", "lctype.c",
@@ -220,7 +225,7 @@ pub fn build(b: *std.Build) void {
     // Embed the S-101 Lua rules (216 framework + feature-class files) so the Lua
     // `require` searcher in lua_shim.c can load them from memory — tile57 portrays
     // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
-    portray_mod.addImport("rules_registry", embedDir(b, "rules_registry", "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules", ".lua"));
+    portray_mod.addImport("rules_registry", embedDir(b, "rules_registry", PORTRAYAL_CATALOG ++ "/Rules", ".lua"));
 
     // Asset/style generation for the chart bundle (colortables, manifest, …).
     // Pure + target-agnostic like the foundational packages, so it compiles
@@ -330,6 +335,17 @@ pub fn build(b: *std.Build) void {
     addPkgs(bake_engine, &pure_pkgs);
     bake_engine.addImport("portray", portray_mod);
 
+    // The S-101 portrayal *assets* embedded into the CLI: symbol SVGs, the palette
+    // CSS, line-style + area-fill XML, and the colour profile. tile57 emits
+    // colortables / sprites / patterns / style.json from these with no on-disk
+    // catalogue; a --catalog / positional dir still overrides (read from disk).
+    const catalog_embed = b.createModule(.{ .root_source_file = b.path("tools/catalog_embed.zig") });
+    catalog_embed.addImport("symbols_registry", embedDir(b, "symbols_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".svg"));
+    catalog_embed.addImport("css_registry", embedDir(b, "css_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".css"));
+    catalog_embed.addImport("linestyles_registry", embedDir(b, "linestyles_registry", PORTRAYAL_CATALOG ++ "/LineStyles", ".xml"));
+    catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
+    catalog_embed.addImport("colorprofile_registry", embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml"));
+
     const bake = b.addExecutable(.{
         .name = "tile57",
         .root_module = b.createModule(.{
@@ -341,6 +357,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "engine", .module = bake_engine },
                 .{ .name = "assets", .module = assets_mod },
                 .{ .name = "sprite", .module = sprite_mod },
+                .{ .name = "catalog", .module = catalog_embed },
             },
         }),
     });
