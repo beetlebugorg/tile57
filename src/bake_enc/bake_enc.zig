@@ -169,6 +169,7 @@ const TileGenCtx = struct {
     results: []?[]u8,
     backends: []Backend,
     gpa: std.mem.Allocator,
+    format: s57_mvt.TileFormat = .mvt,
     // Live progress emitted from inside the parallel batch (so a big super-tile
     // shows tiles flowing rather than appearing hung). `done` counts processed
     // tiles; `base` is the emitted count before this batch.
@@ -187,7 +188,7 @@ const TileGenCtx = struct {
         const refs = c.gpa.alloc(s57_mvt.CellRef, idxs.len) catch return;
         defer c.gpa.free(refs);
         for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo, .geo_world = c.backends[idx].geo_world, .feat_bbox = c.backends[idx].feat_bbox };
-        const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y) catch return;
+        const mvt_bytes = s57_mvt.generateTileMulti(c.gpa, refs, z, x, y, c.format) catch return;
         defer c.gpa.free(mvt_bytes);
         // Gzip here, in the worker — the expensive step done in parallel; the serial
         // collection then only dedups + writes the already-compressed tile.
@@ -223,6 +224,7 @@ pub const Baker = struct {
     sink: TileSink,
     count: usize = 0, // tiles handed to the sink
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
+    format: s57_mvt.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
 
     pub fn init(gpa: std.mem.Allocator, minzoom: u8, maxzoom: u8, sink: TileSink) Baker {
         return .{
@@ -316,7 +318,7 @@ pub const Baker = struct {
         @memset(results, null);
 
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .progress = progress, .pctx = ctx, .base = self.count, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .progress = progress, .pctx = ctx, .base = self.count, .done = &done };
         parallelFor(n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {

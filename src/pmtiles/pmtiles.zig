@@ -16,7 +16,7 @@ pub const HEADER_LEN = 127;
 const MAGIC = "PMTiles";
 
 pub const Compression = enum(u8) { unknown = 0, none = 1, gzip = 2, brotli = 3, zstd = 4 };
-pub const TileType = enum(u8) { unknown = 0, mvt = 1, png = 2, jpeg = 3, webp = 4, avif = 5 };
+pub const TileType = enum(u8) { unknown = 0, mvt = 1, png = 2, jpeg = 3, webp = 4, avif = 5, mlt = 6 };
 
 pub const Header = struct {
     root_dir_offset: u64 = 0,
@@ -322,6 +322,7 @@ pub const WriteOptions = struct {
     min_lat_e7: i32 = -850000000,
     max_lon_e7: i32 = 1800000000,
     max_lat_e7: i32 = 850000000,
+    tile_type: TileType = .mvt, // .mlt for MapLibre Tile output
 };
 
 /// Streaming archive writer: feed tiles one at a time (each gzipped + content-
@@ -448,7 +449,7 @@ pub const StreamWriter = struct {
             .clustered = 0, // data in arrival order, not tile-id order
             .internal_compression = .none,
             .tile_compression = .gzip,
-            .tile_type = .mvt,
+            .tile_type = opts.tile_type,
             .min_zoom = min_z,
             .max_zoom = self.max_z,
             .min_lon_e7 = opts.min_lon_e7,

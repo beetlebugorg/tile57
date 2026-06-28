@@ -129,39 +129,46 @@ pub fn encode(gpa: std.mem.Allocator, tile: mvt.Tile) ![]u8 {
     var out = Buf.empty;
     errdefer out.deinit(gpa);
 
-    for (tile.layers) |layer| {
-        const propcols = try collectPropCols(gpa, layer.features);
-        defer gpa.free(propcols);
+    // All per-layer scratch (body/head + the column streams' temp buffers) goes
+    // through a bump-pointer arena reset per layer, so the encoder doesn't hit the
+    // page allocator thousands of times per tile (a measurable bake hot spot). Only
+    // the returned `out` lives on `gpa`.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-        var body = Buf.empty;
-        defer body.deinit(gpa);
+    var colbuf: [MAX_PROP_KEYS]PropCol = undefined;
+    for (tile.layers) |layer| {
+        const propcols = colbuf[0..collectPropCols(layer.features, &colbuf)];
+
+        var body = Buf.empty; // arena-backed
 
         // ---- embedded metadata: name, extent, columnCount, columns ------------
         // Columns are listed here in the SAME order their streams appear below:
         // geometry first, then one column per emittable property key.
-        try putVarint(&body, gpa, layer.name.len);
-        try body.appendSlice(gpa, layer.name);
-        try putVarint(&body, gpa, layer.extent);
-        try putVarint(&body, gpa, 1 + propcols.len); // columnCount
-        try body.append(gpa, TYPECODE_GEOMETRY);
+        try putVarint(&body, a, layer.name.len);
+        try body.appendSlice(a, layer.name);
+        try putVarint(&body, a, layer.extent);
+        try putVarint(&body, a, 1 + propcols.len); // columnCount
+        try body.append(a, TYPECODE_GEOMETRY);
         for (propcols) |c| {
-            try body.append(gpa, 10 + scalarOrdinal(c.kind) * 2); // non-nullable scalar typeCode
-            try putVarint(&body, gpa, c.key.len);
-            try body.appendSlice(gpa, c.key);
+            try body.append(a, 10 + scalarOrdinal(c.kind) * 2); // non-nullable scalar typeCode
+            try putVarint(&body, a, c.key.len);
+            try body.appendSlice(a, c.key);
         }
 
         // ---- column data (same order as metadata) -----------------------------
-        try encodeGeometryColumn(&body, gpa, layer.features);
-        for (propcols) |c| try encodePropertyColumn(&body, gpa, layer.features, c);
+        try encodeGeometryColumn(&body, a, layer.features);
+        for (propcols) |c| try encodePropertyColumn(&body, a, layer.features, c);
 
         // ---- block framing: varint(blockLength) varint(tag=1) body -----------
-        var head = Buf.empty;
-        defer head.deinit(gpa);
-        try putVarint(&head, gpa, 1); // tag = 1 (embedded metadata)
+        var head = Buf.empty; // arena-backed
+        try putVarint(&head, a, 1); // tag = 1 (embedded metadata)
         const block_len = head.items.len + body.items.len;
         try putVarint(&out, gpa, block_len);
         try out.appendSlice(gpa, head.items);
         try out.appendSlice(gpa, body.items);
+        _ = arena.reset(.retain_capacity); // reuse the scratch across layers
     }
 
     return out.toOwnedSlice(gpa);
@@ -274,34 +281,50 @@ fn encodeGeometryColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.
     }
 }
 
+// Max distinct property keys we emit per layer (chart layers have far fewer).
+const MAX_PROP_KEYS = 64;
+
 // Distinct property keys (first-seen order) present on EVERY feature with a single
-// supported, mappable value type — emittable as non-nullable columns. Partial,
-// mixed-type, or boolean keys are skipped (nullable + boolean-RLE come later).
-fn collectPropCols(a: std.mem.Allocator, features: []const mvt.Feature) ![]PropCol {
-    const Info = struct { kind: PropKind, count: usize, ok: bool };
-    var order = std.ArrayList([]const u8).empty;
-    defer order.deinit(a);
-    var info = std.StringHashMap(Info).init(a);
-    defer info.deinit();
+// supported, mappable value type — emittable as non-nullable columns. Fills `out`
+// and returns the count. Heap-free + linear (keys per layer are few): this runs
+// per tile per layer for the whole bake, so a per-tile StringHashMap was a real
+// hot spot. Partial, mixed-type, or boolean keys are skipped (nullable + boolean-
+// RLE come later); keys past MAX_PROP_KEYS are ignored.
+fn collectPropCols(features: []const mvt.Feature, out: []PropCol) usize {
+    var keys: [MAX_PROP_KEYS][]const u8 = undefined;
+    var kinds: [MAX_PROP_KEYS]PropKind = undefined;
+    var counts: [MAX_PROP_KEYS]usize = undefined;
+    var oks: [MAX_PROP_KEYS]bool = undefined;
+    var nk: usize = 0;
     for (features) |f| {
         for (f.properties) |p| {
             const k = valueKind(p.value);
-            const gop = try info.getOrPut(p.key);
-            if (!gop.found_existing) {
-                try order.append(a, p.key);
-                gop.value_ptr.* = .{ .kind = k orelse .string, .count = 0, .ok = k != null };
+            var found = false;
+            for (keys[0..nk], 0..) |kk, i| {
+                if (std.mem.eql(u8, kk, p.key)) {
+                    counts[i] += 1;
+                    if (k == null or (oks[i] and kinds[i] != k.?)) oks[i] = false;
+                    found = true;
+                    break;
+                }
             }
-            gop.value_ptr.count += 1;
-            if (k == null or (gop.value_ptr.ok and gop.value_ptr.kind != k.?)) gop.value_ptr.ok = false;
+            if (!found and nk < MAX_PROP_KEYS) {
+                keys[nk] = p.key;
+                kinds[nk] = k orelse .string;
+                counts[nk] = 1;
+                oks[nk] = k != null;
+                nk += 1;
+            }
         }
     }
-    var cols = std.ArrayList(PropCol).empty;
-    errdefer cols.deinit(a);
-    for (order.items) |key| {
-        const e = info.get(key).?;
-        if (e.ok and e.count == features.len) try cols.append(a, .{ .key = key, .kind = e.kind });
+    var n: usize = 0;
+    for (0..nk) |i| {
+        if (oks[i] and counts[i] == features.len and n < out.len) {
+            out[n] = .{ .key = keys[i], .kind = kinds[i] };
+            n += 1;
+        }
     }
-    return cols.toOwnedSlice(a);
+    return n;
 }
 
 fn encodePropertyColumn(body: *Buf, a: std.mem.Allocator, features: []const mvt.Feature, col: PropCol) !void {
@@ -397,22 +420,19 @@ test "encode point features with string/double/int properties (verified)" {
     const bytes = try encode(a, .{ .layers = &layers });
     defer a.free(bytes);
     // 3 property columns emitted (class/drval1/band) — all present on both features.
-    const cols = try collectPropCols(a, &feats);
-    defer a.free(cols);
-    try std.testing.expectEqual(@as(usize, 3), cols.len);
+    var cb: [MAX_PROP_KEYS]PropCol = undefined;
+    try std.testing.expectEqual(@as(usize, 3), collectPropCols(&feats, &cb));
 }
 
 test "partial / boolean / mixed-type property keys are skipped (non-nullable only)" {
-    const a = std.testing.allocator;
     const p = [_]mvt.Point{.{ .x = 1, .y = 1 }};
     const pp = [_][]const mvt.Point{&p};
     const props0 = [_]mvt.Prop{ .{ .key = "only0", .value = .{ .string = "x" } }, .{ .key = "flag", .value = .{ .boolean = true } } };
     const props1 = [_]mvt.Prop{.{ .key = "flag", .value = .{ .boolean = false } }};
     const feats = [_]mvt.Feature{ .{ .geom_type = .point, .parts = &pp, .properties = &props0 }, .{ .geom_type = .point, .parts = &pp, .properties = &props1 } };
-    const cols = try collectPropCols(a, &feats);
-    defer a.free(cols);
     // only0 present on 1/2 features -> skipped; flag is boolean -> skipped.
-    try std.testing.expectEqual(@as(usize, 0), cols.len);
+    var cb: [MAX_PROP_KEYS]PropCol = undefined;
+    try std.testing.expectEqual(@as(usize, 0), collectPropCols(&feats, &cb));
 }
 
 test "encode line + polygon round-trips (verified via reference decoder)" {

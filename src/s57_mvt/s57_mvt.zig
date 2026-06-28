@@ -10,6 +10,10 @@ const Allocator = std.mem.Allocator;
 const s57 = @import("s57");
 const tile = @import("tile");
 const mvt = @import("mvt");
+const mlt = @import("mlt");
+
+/// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile (optional).
+pub const TileFormat = enum { mvt, mlt };
 const s101 = @import("s100").s101_instr;
 const catalogue = @import("s100").catalogue;
 
@@ -731,13 +735,13 @@ pub const CellRef = struct {
 /// stream are styled by it, the rest fall back to classify().
 pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, portrayal: ?[]const ?[]const u8) ![]u8 {
     const one = [_]CellRef{.{ .cell = cell, .portrayal = portrayal }};
-    return generateTileMulti(gpa, &one, z, x, y);
+    return generateTileMulti(gpa, &one, z, x, y, .mvt);
 }
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) overlaying one or more
 /// cells (an ENC_ROOT). Each cell's features are appended into the shared layers,
 /// so a tile spanning several cells carries all of them.
-pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32) ![]u8 {
+pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, format: TileFormat) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -791,7 +795,10 @@ pub fn generateTileMulti(gpa: Allocator, cells: []const CellRef, z: u8, x: u32, 
     if (texts_scamin.items.len > 0) try layers.append(a, .{ .name = "text_scamin", .features = texts_scamin.items });
     if (layers.items.len == 0) return gpa.alloc(u8, 0); // empty tile
 
-    return mvt.encode(gpa, .{ .layers = layers.items });
+    return switch (format) {
+        .mvt => mvt.encode(gpa, .{ .layers = layers.items }),
+        .mlt => mlt.encode(gpa, .{ .layers = layers.items }),
+    };
 }
 
 /// Append one cell's features for tile (z,x,y) into the shared layer lists.

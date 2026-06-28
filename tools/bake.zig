@@ -655,6 +655,7 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var maxzoom: u8 = DEFAULT_MAXZOOM;
     var lru: usize = DEFAULT_LRU_BUDGET; // lazy-bake tuning: parsed cells held resident
     var super_dz: u8 = DEFAULT_SUPER_DZ; // lazy-bake tuning: spatial super-tile depth
+    var format: engine.s57_mvt.TileFormat = .mvt; // tile encoding: mvt (default) or mlt
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -674,6 +675,9 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             lru = f.int(usize, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--superdz")) {
             super_dz = f.int(u8, arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            const v = f.val(arg) orelse return;
+            format = if (std.mem.eql(u8, v, "mlt")) .mlt else if (std.mem.eql(u8, v, "mvt")) .mvt else return usageErr("--format must be mvt or mlt");
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -699,7 +703,7 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var snd_stacks: []const []const u8 = &.{}; // sounding glyph stacks for sprite-mln
     // Single cell.000 OR a whole ENC_ROOT — both stream to tiles_path through the
     // SAME lazy banded bake; sounding glyph stacks are collected during the bake.
-    const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom, lru, super_dz, true) catch |err| {
+    const rb = bakeRoot(io, a, base_path, tiles_path, resolveRulesDir(rules), minzoom, maxzoom, lru, super_dz, true, format) catch |err| {
         std.debug.print("error: cannot bake {s} ({s})\n", .{ base_path, @errorName(err) });
         return;
     };
@@ -1033,7 +1037,7 @@ fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
 // straight to `out_path` (the data section streams through a StreamWriter — only
 // the compressed data + small directory are held, not the raw tiles). Returns the
 // union bounds + cell stems + sounding stacks. error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat) !RootBake {
     const page = std.heap.page_allocator;
     // Input may be a whole ENC_ROOT directory OR a single cell `.000` file; either
     // way the lazy super-tile bake below streams to disk through the SAME path. For
@@ -1136,8 +1140,11 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var sw = engine.pmtiles.StreamWriter.initFile(page, io, data_file);
     defer sw.deinit();
     var sounds = std.StringHashMap(void).init(a);
-    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = page, .collect_sounds = collect_sounds };
+    // Sounding-stack collection decodes each tile as MVT, so it only applies to the
+    // MVT output; for MLT the sprite-mln sounding composites are skipped (TODO).
+    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = page, .collect_sounds = collect_sounds and format == .mvt };
     var baker = Bands.Baker.init(page, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
+    baker.format = format;
     defer baker.deinit();
 
     // Pass 2: bake each band finest → coarsest (best-band dedup via baker.emitted).
@@ -1322,6 +1329,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         .min_lat_e7 = toE7(ubox[1]),
         .max_lon_e7 = toE7(ubox[2]),
         .max_lat_e7 = toE7(ubox[3]),
+        .tile_type = if (format == .mlt) .mlt else .mvt,
     };
     const pre = try sw.prefix(a, opts);
     var file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
@@ -1389,6 +1397,7 @@ fn printUsage() void {
         \\                          memory for fewer re-parses; default {d})
         \\      --superdz N         spatial super-tile depth below a band's min zoom
         \\                          (lazy-bake tuning; default {d})
+        \\      --format mvt|mlt    tile encoding (default mvt; mlt = MapLibre Tile)
         \\  tile57 assets <portrayal-catalog-dir> -o <out-dir>
         \\      Emit just the portrayal assets (colortables.json today) for a
         \\      catalogue, independent of any cell.

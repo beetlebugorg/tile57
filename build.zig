@@ -413,6 +413,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
         .{ .name = "s100", .module = s100_mod },
         .{ .name = "mvt", .module = mvt_mod },
+        .{ .name = "mlt", .module = mlt_mod },
         .{ .name = "tile", .module = tile_mod },
     });
     _ = addPkgTest(b, test_step, "src/bake_enc/bake_enc.zig", target, optimize, &.{

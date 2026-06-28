@@ -639,7 +639,7 @@ pub const Source = struct {
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
                 }};
-                break :blk_cell s57_mvt.generateTileMulti(gpa, &one, z, x, y) catch return error.TileGen;
+                break :blk_cell s57_mvt.generateTileMulti(gpa, &one, z, x, y, .mvt) catch return error.TileGen;
             },
             .cells => |*ls| try tileFromCells(ls, z, x, y),
         };
@@ -721,7 +721,7 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32) ![]u8 {
             }) catch {};
         }
     }
-    const mvt = s57_mvt.generateTileMulti(gpa, refs.items, z, x, y) catch return error.TileGen;
+    const mvt = s57_mvt.generateTileMulti(gpa, refs.items, z, x, y, .mvt) catch return error.TileGen;
     lazyEvict(ls, keep_from);
     return mvt;
 }
