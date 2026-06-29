@@ -14,11 +14,12 @@ addEventListener('unhandledrejection', (e) => err('promise rejected: ' + (e.reas
 const protocol = new pmtiles.Protocol();
 maplibregl.addProtocol('pmtiles', protocol.tile);
 
-// Assets served next to this page (see ./bake.sh + ./serve.sh). Defaults to MLT
-// (MapLibre Tile); ?fmt=mvt uses the MVT bake; ?pmtiles=<path> overrides the archive.
+// Assets served next to this page (see ./bake.sh + ./serve.sh). The bundle is MVT,
+// so default to MVT; ?fmt=mlt loads the small MLT sample bake; ?pmtiles=<path>
+// overrides the archive.
 const params = new URLSearchParams(location.search);
-const isMlt = params.get('fmt') !== 'mvt';
-const pmtilesPath = params.get('pmtiles') || (isMlt ? 'bundle/tiles/chart.pmtiles' : 'chart/tiles/chart.pmtiles');
+const isMlt = params.get('fmt') === 'mlt';
+const pmtilesPath = params.get('pmtiles') || (isMlt ? 'chart-mlt/tiles/chart.pmtiles' : 'bundle/tiles/chart.pmtiles');
 const PMTILES = 'pmtiles://' + new URL(pmtilesPath, location.href).href;
 const SPRITE = new URL('bundle/assets/sprite-mln', location.href).href;
 const GLYPHS = 'glyphs/{fontstack}/{range}.pbf'; // vendored Noto Sans Regular (self-contained)
