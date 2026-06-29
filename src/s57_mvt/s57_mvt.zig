@@ -139,7 +139,7 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc
 /// Emit a SOUNDG feature's multipoint soundings into the `soundings` layer, one
 /// point per sounding, with sym_s/sym_g/depth so the style's SNDFRM glyphs and
 /// the mariner safety-depth switch (soundings_image) render the depth digits.
-fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, out: *std.ArrayList(mvt.Feature)) !void {
+fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, meta: Meta, z: u8, x: u32, y: u32, tb: [4]f64, out: *std.ArrayList(mvt.Feature)) !void {
     const snds = cell.soundingsFor(a, f) catch return;
     // Per-feature quality flags (SNDFRM04): swept => B1, low-accuracy => C2/C3 ring.
     // These attributes apply to the whole SOUNDG feature, so derive them once.
@@ -156,12 +156,16 @@ fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y:
         const single = try a.alloc(mvt.Point, 1);
         single[0] = pt;
         parts[0] = single;
-        const props = try a.alloc(mvt.Prop, 4);
-        props[0] = .{ .key = "sym_s", .value = .{ .string = sym_s } };
-        props[1] = .{ .key = "sym_g", .value = .{ .string = sym_g } };
-        props[2] = .{ .key = "depth", .value = .{ .double = s.depth } };
-        props[3] = .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } };
-        try out.append(a, .{ .geom_type = .point, .parts = parts, .properties = props });
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(a, .{ .key = "sym_s", .value = .{ .string = sym_s } });
+        try props.append(a, .{ .key = "sym_g", .value = .{ .string = sym_g } });
+        try props.append(a, .{ .key = "depth", .value = .{ .double = s.depth } });
+        try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+        // Shared S-52 mariner-filter metadata (draw priority / display category /
+        // band / SCAMIN / class) so soundings honour the client's category + SCAMIN
+        // gating like every other feature — oracle routeSoundingGroup (bake.go:894).
+        try appendMeta(a, &props, meta);
+        try out.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 }
 
@@ -1583,7 +1587,19 @@ fn appendCellFeatures(
         // the `soundings` layer (the flat S-101 instruction stream can't carry
         // per-sounding geometry). Bypasses the portrayal/classify dispatch.
         if (f.objl == 129) {
-            try emitSoundings(a, cell.*, f, z, x, y, tb, soundings);
+            // SOUNDG bypasses the portrayal dispatch (multipoint geometry can't ride
+            // the flat instruction stream), so its feature-level Meta is built here.
+            // SNDFRM04 portrayal is deterministic for the class: DrawingPriority 18,
+            // display category Other (cat=2) — verified against the oracle's
+            // routeSoundingGroup (fb.DisplayPriority / catRank(fb.DisplayCategory)).
+            const smeta = Meta{
+                .prio = 18,
+                .cat = 2,
+                .class = "SOUNDG",
+                .scamin = featureScamin(f),
+                .band = L.band,
+            };
+            try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, soundings);
             continue;
         }
         // NEWOBJ with a producer SYMINS attribute: portray the explicit S-52 symbol
