@@ -139,9 +139,13 @@ const linestyle_px_per_mm: f64 = @as(f64, default_px_per_symbol_unit) * 100.0;
 /// One raw LineStyles/*.xml input: `id` is the file stem, `xml` the file bytes.
 pub const LineStyleSrc = struct { id: []const u8, xml: []const u8 };
 
-const Dash = struct { start: f64, length: f64 };
-const PlacedSym = struct { reference: []const u8, position: f64 };
-const ParsedLine = struct {
+// Raw (millimetre) line-style geometry from one LineStyles/*.xml, before any
+// px conversion. Public so the baker can build its along-line tessellation table
+// (emitComplexLine) at the PresLib feature scale, which differs from the symbol
+// scale `analysePattern` applies for the client linestyles.json.
+pub const Dash = struct { start: f64, length: f64 };
+pub const PlacedSym = struct { reference: []const u8, position: f64 };
+pub const ParsedLine = struct {
     interval_length: f64 = 0,
     pen_width: f64 = 0,
     pen_color: []const u8 = "",
@@ -200,7 +204,7 @@ fn lineBody(xml: []const u8) []const u8 {
     return xml;
 }
 
-fn parseLineStyle(a: std.mem.Allocator, xml: []const u8) !ParsedLine {
+pub fn parseLineStyle(a: std.mem.Allocator, xml: []const u8) !ParsedLine {
     const body = lineBody(xml);
     var p = ParsedLine{
         .interval_length = tagFloat(body, "intervalLength") orelse 0,

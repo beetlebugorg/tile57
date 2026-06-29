@@ -366,6 +366,37 @@ fn embeddedLinestyles(a: std.mem.Allocator) ![]assets.LineStyleSrc {
     return out;
 }
 
+// Build the complex-line tessellation table (id -> LsInfo) from `srcs` and register
+// it with s57_mvt before baking, so a named (symbolised) linestyle is drawn as its
+// real dash runs + embedded symbols instead of a generic dashed stroke. Mirrors Go
+// lsInfoFromCatalog; mm geometry is converted at the PresLib feature scale. Best
+// effort — a malformed/short style is simply skipped. `gpa` outlives the bake.
+fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const assets.LineStyleSrc) void {
+    const px = engine.s57_mvt.LINESTYLE_PX_PER_MM;
+    for (srcs) |s| {
+        const parsed = assets.parseLineStyle(gpa, s.xml) catch continue;
+        const period = parsed.interval_length * px;
+        if (period < 0.5) continue; // no interval to tile (pure-symbol style)
+        var runs = std.ArrayList([2]f64).empty;
+        for (parsed.dashes) |d| {
+            const lo = d.start * px;
+            const hi = (d.start + d.length) * px;
+            if (hi - lo > 1e-6) runs.append(gpa, .{ lo, hi }) catch {};
+        }
+        var syms = std.ArrayList(engine.s57_mvt.LsSym).empty;
+        for (parsed.symbols) |sym| syms.append(gpa, .{ .name = sym.reference, .offset_px = sym.position * px }) catch {};
+        var width = parsed.pen_width * px;
+        if (width < 0.6) width = 0.9; // S-52 minimum pen
+        engine.s57_mvt.registerLinestyle(gpa, s.id, .{
+            .period_px = period,
+            .on_runs = runs.items,
+            .symbols = syms.items,
+            .color_token = parsed.pen_color,
+            .width_px = width,
+        });
+    }
+}
+
 // Embedded palette stylesheet bytes by file name (e.g. "daySvgStyle.css"); the
 // lookup is by stem, so callers can pass a bare name. Null if not embedded.
 fn embeddedCss(css_name: []const u8) ?[]const u8 {
@@ -1144,6 +1175,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     std.debug.print("baking {d} cells from {s} ({s}, rules: {s})\n", .{ total_cells, root_path, if (via_catalog) "via CATALOG.031" else "scanned", if (rules_dir.len == 0) "embedded" else rules_dir });
 
     engine.catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
+    registerLinestyles(gpa, embeddedLinestyles(a) catch &.{}); // complex-line tessellation table
     engine.portray.setQuiet(true); // many threads -> suppress the per-cell stderr
 
     // Stream the gzipped tiles straight to a temp data file (concatenated into

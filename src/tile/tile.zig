@@ -239,6 +239,11 @@ fn clipSegment(p0: mvt.Point, p1: mvt.Point, b: Box) ?[2]mvt.Point {
 /// A float tile-space point (unrounded), for the arc-length / phased-clip path.
 pub const FPoint = struct { x: f64, y: f64 };
 
+/// Quantise a float tile point to an integer mvt.Point (same rounding as project).
+pub fn quantizeF(p: FPoint) mvt.Point {
+    return .{ .x = roundI32(p.x), .y = roundI32(p.y) };
+}
+
 /// Project a normalised web-mercator world coord to UNROUNDED tile-local float
 /// coordinates (the float counterpart of worldToTile).
 pub fn worldToTileF(w: [2]f64, z: u8, tx: u32, ty: u32, extent: i32) FPoint {

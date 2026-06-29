@@ -646,9 +646,16 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // Best-band suppression: a finer band covers the tile centre, so drop this coarse
     // cell's line strokes (they'd double-draw beside the finer copy).
     if (!L.suppress_lines) for (p.lines) |ln| {
-        // _simple_ -> solid; any named/complex line style (NAVLNE/RECTRC leading
-        // lines, CTNARE limits, …) is approximated as dashed rather than a bold
-        // solid stroke (full along-line symbology is a later step).
+        // A named (complex) linestyle in the registered table is tessellated along the
+        // geometry (dash runs + embedded symbols on the tangent); see emitComplexLine.
+        if (!std.mem.eql(u8, ln.style, "solid")) {
+            if (g_linestyles.get(ln.style)) |info| {
+                try emitComplexLine(a, geo_parts, info, ln.color, !L.suppress_points, z, x, y, box, meta, lines_l, points_l);
+                continue;
+            }
+        }
+        // _simple_ -> solid; an UNregistered named style (or no table, e.g. the live
+        // host path) is approximated as a dashed stroke rather than a bold solid one.
         const dash: []const u8 = if (std.mem.eql(u8, ln.style, "solid")) "solid" else "dashed";
         for (stroke_proj) |proj| {
             const sub = try clipSimplifyLine(a, proj, box);
@@ -989,6 +996,154 @@ fn buildSyminsPortrayal(a: Allocator, f: s57.Feature) !?s101.Portrayal {
         .points = points.items,
         .texts = texts.items,
     };
+}
+
+// === Complex (symbolised) line tessellation (S-101 LineStyles) =============
+// A named linestyle (LC / a LineInstruction whose style is not "_simple_") is
+// tessellated per zoom: walk the line by arc length and emit, per period, the dash
+// "on" runs as line segments + each embedded symbol as a point rotated to the local
+// tangent. Mirrors Go bake/complexline.go + linestyle_catalog.go. The mm geometry is
+// parsed by assets.parseLineStyle; the baker converts it to LsInfo at the PresLib
+// FEATURE scale (ls_px_per_mm) and registers it before baking.
+
+const ls_feature_scale: f64 = 0.01 / 0.35278; // px per 0.01-mm PresLib unit (= SYMBOL_SCALE)
+const ls_px_per_mm: f64 = 100.0 * ls_feature_scale; // mm -> screen px
+/// The mm->px feature scale the baker must apply when building an LsInfo from the raw
+/// millimetre LineStyles geometry (assets.parseLineStyle), so the tessellator and the
+/// table agree. Differs from the symbol-scale assets.analysePattern uses for the
+/// client linestyles.json.
+pub const LINESTYLE_PX_PER_MM = ls_px_per_mm;
+
+pub const LsSym = struct { name: []const u8, offset_px: f64 };
+pub const LsInfo = struct {
+    period_px: f64,
+    on_runs: []const [2]f64, // [lo,hi] screen px from period start
+    symbols: []const LsSym,
+    color_token: []const u8,
+    width_px: f64,
+};
+
+// Set once by the baker before tile generation; read-only during the parallel bake
+// (generateTileMulti only reads), so it needs no lock. Absent => named lines fall
+// back to the generic dashed stroke (live/host path, no regression).
+var g_linestyles: std.StringHashMapUnmanaged(LsInfo) = .{};
+
+/// Register one analysed complex linestyle (id = LineStyles file stem). `id` and the
+/// LsInfo slices must outlive the bake (embedded XML / the bake's long-lived alloc).
+pub fn registerLinestyle(gpa: Allocator, id: []const u8, info: LsInfo) void {
+    g_linestyles.put(gpa, id, info) catch {};
+}
+
+/// Drop all registered linestyles (host/test reset).
+pub fn clearLinestyles(gpa: Allocator) void {
+    g_linestyles.deinit(gpa);
+    g_linestyles = .{};
+}
+
+const LsTangent = struct { p: tile.FPoint, dx: f64, dy: f64 };
+
+/// Point at local arc `d` along rp plus the (un-normalised) tangent of its segment.
+fn lsPointAndTangent(rp: []const tile.FPoint, rarc: []const f64, d_in: f64) ?LsTangent {
+    const total = rarc[rarc.len - 1];
+    const d = std.math.clamp(d_in, 0, total);
+    var i: usize = 0;
+    while (i + 1 < rp.len) : (i += 1) {
+        if (d <= rarc[i + 1] or i + 2 == rp.len) {
+            const seg = rarc[i + 1] - rarc[i];
+            const t: f64 = if (seg > 1e-12) (d - rarc[i]) / seg else 0;
+            return .{
+                .p = .{ .x = rp[i].x + t * (rp[i + 1].x - rp[i].x), .y = rp[i].y + t * (rp[i + 1].y - rp[i].y) },
+                .dx = rp[i + 1].x - rp[i].x,
+                .dy = rp[i + 1].y - rp[i].y,
+            };
+        }
+    }
+    return null;
+}
+
+fn lsLerpArc(rp: []const tile.FPoint, rarc: []const f64, d: f64) tile.FPoint {
+    return (lsPointAndTangent(rp, rarc, d) orelse LsTangent{ .p = rp[0], .dx = 0, .dy = 0 }).p;
+}
+
+/// Sub-polyline of rp between local arc distances d0..d1 (endpoints interpolated).
+fn lsSubPathByArc(a: Allocator, rp: []const tile.FPoint, rarc: []const f64, d0_in: f64, d1_in: f64) ![]tile.FPoint {
+    const total = rarc[rarc.len - 1];
+    const d0 = std.math.clamp(d0_in, 0, total);
+    const d1 = std.math.clamp(d1_in, 0, total);
+    if (d1 - d0 < 1e-9) return &.{};
+    var out = std.ArrayList(tile.FPoint).empty;
+    try out.append(a, lsLerpArc(rp, rarc, d0));
+    for (rp, 0..) |p, i| {
+        if (rarc[i] > d0 and rarc[i] < d1) try out.append(a, p);
+    }
+    try out.append(a, lsLerpArc(rp, rarc, d1));
+    return out.items;
+}
+
+/// Tessellate a complex linestyle along a feature's geometry parts into this tile.
+/// `emit_symbols` is false when best-band suppression drops the coarse cell's points.
+fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, meta: Meta, lines_l: *std.ArrayList(mvt.Feature), points_l: *std.ArrayList(mvt.Feature)) !void {
+    const ext: f64 = @floatFromInt(tile.EXTENT);
+    const px_scale = ext / 256.0; // figures are laid out in 256-px-per-tile space
+    const period = info.period_px * px_scale;
+    if (period < 1e-6) return;
+    for (parts) |part| {
+        if (part.len < 2) continue;
+        const fpts = try a.alloc(tile.FPoint, part.len);
+        for (part, 0..) |pt, i| fpts[i] = tile.worldToTileF(tile.lonLatToWorld(pt.lon(), pt.lat()), z, x, y, tile.EXTENT);
+        const arc = try a.alloc(f64, part.len);
+        arc[0] = 0;
+        for (1..part.len) |i| arc[i] = arc[i - 1] + std.math.hypot(fpts[i].x - fpts[i - 1].x, fpts[i].y - fpts[i - 1].y);
+        for (try tile.clipLinePhased(a, fpts, arc, box)) |run| {
+            const rp = run.points;
+            if (rp.len < 2) continue;
+            const rarc = try a.alloc(f64, rp.len);
+            rarc[0] = 0;
+            for (1..rp.len) |i| rarc[i] = rarc[i - 1] + std.math.hypot(rp[i].x - rp[i - 1].x, rp[i].y - rp[i - 1].y);
+            const g0 = run.arc0;
+            const run_end = g0 + rarc[rp.len - 1];
+            var k: i64 = @intFromFloat(@floor(g0 / period));
+            while (@as(f64, @floatFromInt(k)) * period < run_end) : (k += 1) {
+                const base = @as(f64, @floatFromInt(k)) * period;
+                for (info.on_runs) |on| { // dash on-runs -> line segments
+                    const lo = @max(base + on[0] * px_scale, g0);
+                    const hi = @min(base + on[1] * px_scale, run_end);
+                    if (hi - lo < 1e-6) continue;
+                    const sub = try lsSubPathByArc(a, rp, rarc, lo - g0, hi - g0);
+                    if (sub.len < 2) continue;
+                    const seg = try a.alloc(mvt.Point, sub.len);
+                    for (sub, 0..) |sp, i| seg[i] = tile.quantizeF(sp);
+                    const segparts = try a.alloc([]const mvt.Point, 1);
+                    segparts[0] = seg;
+                    var props = std.ArrayList(mvt.Prop).empty;
+                    try props.append(a, .{ .key = "color_token", .value = .{ .string = color } });
+                    try props.append(a, .{ .key = "width_px", .value = .{ .double = info.width_px } });
+                    try props.append(a, .{ .key = "dash", .value = .{ .string = "solid" } });
+                    try appendMeta(a, &props, meta);
+                    try lines_l.append(a, .{ .geom_type = .linestring, .parts = segparts, .properties = props.items });
+                }
+                if (!emit_symbols) continue;
+                for (info.symbols) |sym| { // embedded symbols -> tangent-rotated points
+                    if (sym.name.len == 0) continue;
+                    const gp = base + sym.offset_px * px_scale;
+                    if (gp < g0 or gp > run_end) continue;
+                    const tp = lsPointAndTangent(rp, rarc, gp - g0) orelse continue;
+                    const rot = std.math.atan2(tp.dy, tp.dx) * 180.0 / std.math.pi;
+                    const single = try a.alloc(mvt.Point, 1);
+                    single[0] = tile.quantizeF(tp.p);
+                    const sparts = try a.alloc([]const mvt.Point, 1);
+                    sparts[0] = single;
+                    var sprops = std.ArrayList(mvt.Prop).empty;
+                    try sprops.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.name } });
+                    try sprops.append(a, .{ .key = "rotation_deg", .value = .{ .double = rot } });
+                    try sprops.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+                    try sprops.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } }); // turns with the chart
+                    try appendMeta(a, &sprops, meta);
+                    try points_l.append(a, .{ .geom_type = .point, .parts = sparts, .properties = sprops.items });
+                }
+            }
+        }
+    }
 }
 
 /// Native S-52 fallback for SweptArea (SWPARE, objl 134). The S-101 Portrayal
