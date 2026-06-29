@@ -205,6 +205,14 @@ pub fn resolveAttrByCode(attl: u16) ?[]const u8 {
     return resolveAttr(acr);
 }
 
+/// S-57 ATTL (numeric) -> S-57 acronym (e.g. 116 -> "OBJNAM"). Used to resolve a
+/// SYMINS TX/TE attribute reference (given by acronym) back to a feature attr code.
+pub fn attrAcronym(attl: u16) ?[]const u8 {
+    ensureLoaded();
+    const c = &(g_cat orelse return null);
+    return c.attr_acronym.get(attl);
+}
+
 // ---- Zig-side lookups (for s101_adapt) -----------------------------------
 
 pub fn resolveFeature(s57_acronym: []const u8) ?[]const u8 {
