@@ -972,12 +972,25 @@ fn mergeFile(
 
             if (ruin == 3) { // modify in place
                 if (vidx.get(key)) |i| if (vecs.items[i]) |*ex| {
+                    // SGCC (coordinate control) edits whichever coordinate list this
+                    // record carries. The oracle keeps both 2D and 3D in one
+                    // `Coordinates` slice, so SGCC applies to either; here they're split
+                    // into `points` (SG2D edges/nodes) and `soundings` (SG3D sounding
+                    // nodes), so route the control to the SG3D list for a sounding record
+                    // and the SG2D list otherwise (a coordinate DELETE ships SGCC with no
+                    // SG2D/SG3D, so fall back to whichever existing list is populated). A
+                    // bare SG2D/SG3D with no SGCC is a full replacement.
                     if (rec.field("SGCC")) |sgcc| {
-                        ex.points = try applyControl(a, LonLat, ex.points, v.points, sgcc);
+                        if (rec.field("SG3D") != null or (rec.field("SG2D") == null and ex.soundings.len > 0)) {
+                            ex.soundings = try applyControl(a, Sounding, ex.soundings, v.soundings, sgcc);
+                        } else {
+                            ex.points = try applyControl(a, LonLat, ex.points, v.points, sgcc);
+                        }
                     } else if (rec.field("SG2D") != null) {
                         ex.points = v.points;
+                    } else if (rec.field("SG3D") != null) {
+                        ex.soundings = v.soundings;
                     }
-                    if (rec.field("SG3D") != null) ex.soundings = v.soundings;
                     // VRPC = indexed insert/delete/modify of the VRPT list (§8.4.3.2):
                     // a single-endpoint modify ships VRPC{modify,idx,count=1} + ONE
                     // VRPT, so editing the list (not replacing it) preserves the other
@@ -1133,6 +1146,23 @@ test "VRPC partial VRPT modify preserves the unmodified endpoint" {
     deriveEndpoints(&v);
     try std.testing.expectEqual(@as(u32, 100), v.begin_node); // preserved
     try std.testing.expectEqual(@as(u32, 300), v.end_node); // updated
+}
+
+test "SGCC modify of one sounding preserves the rest (SG3D list)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A 3-point sounding node; an SGCC{modify, idx=2 (1-based), count=1} edit ships
+    // ONE replacement sounding. The other two must survive (a wholesale replace would
+    // collapse the node to a single point — the SG2D bug this routing fix mirrors).
+    const base = [_]Sounding{ Sounding.init(0, 0, 1), Sounding.init(1, 1, 2), Sounding.init(2, 2, 3) };
+    const upd = [_]Sounding{Sounding.init(5, 5, 9)};
+    const ctrl = [_]u8{ 3, 2, 0, 1, 0 }; // modify, IX=2 LE, NC=1 LE
+    const out = try applyControl(a, Sounding, &base, &upd, &ctrl);
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqual(@as(f64, 1), out[0].depth); // preserved
+    try std.testing.expectEqual(@as(f64, 9), out[1].depth); // modified
+    try std.testing.expectEqual(@as(f64, 3), out[2].depth); // preserved
 }
 
 test "featureQuapos majority-of-drawn-edges aggregate" {
