@@ -95,7 +95,10 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         if (std.mem.eql(u8, key, "ColorFill")) {
             fill_token = val;
         } else if (std.mem.eql(u8, key, "AreaFillReference")) {
-            try patterns.append(a, val);
+            // DIAMOND1 (SEABED01 shallow-water pattern) is owned by the client's
+            // toggle-aware, live-safety-contour layer; baking it would double the
+            // shading and ignore the toggle (mirrors Go s101build.go:371).
+            if (!std.mem.eql(u8, val, "DIAMOND1")) try patterns.append(a, val);
         } else if (std.mem.eql(u8, key, "LineStyle")) {
             // _simple_,,<width>,<color>
             cur_style = nthCsv(val, 0);
@@ -177,8 +180,8 @@ test "parse the real DEPARE03 instruction stream" {
         "ViewingGroup:90000;DrawingPriority:9;DisplayPlane:UnderRadar;AreaFillReference:DIAMOND1";
     const p = try parse(a, stream);
     try std.testing.expectEqualStrings("DEPMS", p.fill_token.?);
-    try std.testing.expectEqual(@as(usize, 1), p.patterns.len);
-    try std.testing.expectEqualStrings("DIAMOND1", p.patterns[0]);
+    // DIAMOND1 is dropped (client-owned shallow-water pattern), so no patterns remain.
+    try std.testing.expectEqual(@as(usize, 0), p.patterns.len);
     // draw_prio = max(3, 9) over the two viewing-group sections.
     try std.testing.expectEqual(@as(i64, 9), p.draw_prio);
     // Display category = most visible over {13030 -> Base, 90000 -> Other} = Base.
