@@ -1,0 +1,38 @@
+{
+  "name": "@beetlebug/tile57-style-engine",
+  "version": "0.1.0",
+  "description": "Generate a MapLibre style.json from S-52 mariner settings, client-side, via the tile57 chartstyle engine compiled to WebAssembly.",
+  "type": "module",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    },
+    "./style-engine.wasm": "./style-engine.wasm"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "style-engine.wasm",
+    "README.md"
+  ],
+  "scripts": {
+    "example": "node examples/generate.mjs",
+    "test": "node examples/generate.mjs"
+  },
+  "keywords": [
+    "maplibre",
+    "s-52",
+    "s-57",
+    "enc",
+    "nautical-chart",
+    "chartplotter",
+    "wasm",
+    "style"
+  ],
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "sideEffects": false
+}
