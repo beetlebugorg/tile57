@@ -381,6 +381,62 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bake.addArgs(args);
     b.step("run", "Run the bake CLI").dependOn(&run_bake.step);
 
+    // ---- JS/wasm style engine (bindings/) -----------------------------------
+    //
+    // A tiny entry point that compiles `chartstyle.buildStyle` to wasm so a
+    // front-end can turn S-52 mariner settings into a MapLibre style.json fully
+    // client-side. The MapLibre template + S-52 colortables are @embedFile'd (as
+    // anonymous imports, mirroring addCatalogueJson) so the wasm needs no file
+    // inputs. The shared settings parser is reused by the native parity oracle so
+    // the two backends can't drift. All additive — a plain `zig build` / `zig
+    // build test` is unaffected; `zig build wasm` builds the wasm.
+    const style_settings_mod = b.addModule("style_settings", .{
+        .root_source_file = b.path("bindings/shared/settings.zig"),
+        .imports = &.{.{ .name = "chartstyle", .module = chartstyle_mod }},
+    });
+
+    // Attach the embedded template + colortables to a bindings consumer module.
+    const addStyleAssets = struct {
+        fn f(bb: *std.Build, m: *std.Build.Module) void {
+            m.addAnonymousImport("template_json", .{ .root_source_file = bb.path("bindings/wasm/assets/template.json") });
+            m.addAnonymousImport("colortables_json", .{ .root_source_file = bb.path("bindings/wasm/assets/colortables.json") });
+        }
+    }.f;
+
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/wasm/style_wasm.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall, // smallest wasm; this isn't a hot path
+        .imports = &.{
+            .{ .name = "chartstyle", .module = chartstyle_mod },
+            .{ .name = "settings", .module = style_settings_mod },
+        },
+    });
+    addStyleAssets(b, wasm_mod);
+    const wasm = b.addExecutable(.{ .name = "style-engine", .root_module = wasm_mod });
+    wasm.entry = .disabled; // reactor-style: no _start, just the exported fns
+    wasm.rdynamic = true; // export the `export fn`s into the wasm export table
+    const wasm_step = b.step("wasm", "Build the wasm style engine (bindings/)");
+    wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
+
+    // Native parity oracle: same engine + same template/colortables/settings,
+    // native target. `zig build style-parity` builds it; the parity script diffs
+    // its output against the wasm/JS output.
+    const parity_mod = b.createModule(.{
+        .root_source_file = b.path("bindings/parity/parity.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "chartstyle", .module = chartstyle_mod },
+            .{ .name = "settings", .module = style_settings_mod },
+        },
+    });
+    addStyleAssets(b, parity_mod);
+    const parity = b.addExecutable(.{ .name = "style-parity", .root_module = parity_mod });
+    b.step("style-parity", "Build the native style-parity oracle (bindings/)")
+        .dependOn(&b.addInstallArtifact(parity, .{}).step);
+
     // Tests. The engine module (root.zig) covers its own files — the relative-
     // imported gzip/pmtiles/tile/s57_mvt/bake_enc + the MVT parity test. Each
     // standalone package is tested through its own root (addPkgTest), since a
@@ -424,6 +480,10 @@ pub fn build(b: *std.Build) void {
     });
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
+    // bindings/ shared settings parser (used by the wasm engine + parity oracle).
+    _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{
+        .{ .name = "chartstyle", .module = chartstyle_mod },
+    });
     // The public root (src/tile57.zig) is compile-checked via lib_root.zig in the
     // libtile57.a build — it imports source.zig (Lua/libc), so it can't be a pure
     // pkg test here.
