@@ -429,6 +429,29 @@ pub fn buildFeatBBox(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts) ![]?[4
     defer tmp.deinit();
     for (cell.features, 0..) |f, i| {
         out[i] = null;
+        // SOUNDG (129) is a point feature (prim==1) whose single referenced node is a
+        // MULTIPOINT carrying many SG3D soundings spread across the cell. Its cull bbox
+        // must span ALL those soundings — pointGeometry returns just one representative
+        // node, which would shrink the bbox to a single tile and make the per-tile cull
+        // drop the whole feature (and all its soundings) on every other tile.
+        if (f.objl == 129) {
+            const snds = cell.soundingsFor(tmp.allocator(), f) catch &.{};
+            if (snds.len > 0) {
+                var w: f64 = 1e18;
+                var s: f64 = 1e18;
+                var e: f64 = -1e18;
+                var n: f64 = -1e18;
+                for (snds) |sd| {
+                    w = @min(w, sd.lon());
+                    e = @max(e, sd.lon());
+                    s = @min(s, sd.lat());
+                    n = @max(n, sd.lat());
+                }
+                out[i] = .{ w, s, e, n };
+            }
+            _ = tmp.reset(.retain_capacity);
+            continue;
+        }
         if (f.prim == 1) {
             if (cell.pointGeometry(f)) |p| out[i] = .{ p.lon(), p.lat(), p.lon(), p.lat() };
             continue;
