@@ -577,8 +577,36 @@ static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value}
     }
     lua_newtable(L);
     if (v) {
-        lua_pushlstring(L, v, len);
-        lua_rawseti(L, -2, 1);
+        /* enumeration / integer attributes are S-57 comma-separated lists (e.g.
+         * COLOUR "1,3", NATSUR "4,6"); the framework expects ONE array element per
+         * value, so a rule like hasValue(COLOUR, 3) can match. text / real / date
+         * values are single-valued and served verbatim. Mirrors Go splitValue
+         * (s101/complex.go:258). */
+        size_t vtl = 0;
+        const char *vt = tgc_simple_valuetype(code, strlen(code), &vtl);
+        int is_list = vt != NULL &&
+            ((vtl == 11 && memcmp(vt, "enumeration", 11) == 0) ||
+             (vtl == 7 && memcmp(vt, "integer", 7) == 0));
+        if (is_list) {
+            int idx = 1;
+            const char *start = v;
+            const char *vend = v + len;
+            for (const char *p = v; p <= vend; p++) {
+                if (p == vend || *p == ',') {
+                    const char *s = start, *e = p; /* trim surrounding blanks */
+                    while (s < e && (*s == ' ' || *s == '\t')) s++;
+                    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+                    if (e > s) {
+                        lua_pushlstring(L, s, (size_t)(e - s));
+                        lua_rawseti(L, -2, idx++);
+                    }
+                    start = p + 1;
+                }
+            }
+        } else {
+            lua_pushlstring(L, v, len);
+            lua_rawseti(L, -2, 1);
+        }
     }
     return 1;
 }
