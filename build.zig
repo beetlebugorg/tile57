@@ -415,6 +415,7 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = .ReleaseSmall, // smallest wasm; this isn't a hot path
         .imports = &.{
+            .{ .name = "assets", .module = assets_mod },
             .{ .name = "chartstyle", .module = chartstyle_mod },
             .{ .name = "settings", .module = style_settings_mod },
         },
@@ -434,6 +435,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "assets", .module = assets_mod },
             .{ .name = "chartstyle", .module = chartstyle_mod },
             .{ .name = "settings", .module = style_settings_mod },
         },

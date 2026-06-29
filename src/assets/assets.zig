@@ -23,6 +23,7 @@ pub const SCHEMA_VERSION = "tile57/1";
 // MapLibre style.json generation lives in style.zig.
 pub const StyleOpts = @import("style.zig").StyleOpts;
 pub const styleJson = @import("style.zig").styleJson;
+pub const buildFromTemplate = @import("style.zig").buildFromTemplate;
 
 // ---- colortables.json ----------------------------------------------------
 

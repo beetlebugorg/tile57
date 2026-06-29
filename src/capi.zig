@@ -420,7 +420,10 @@ export fn tile57_build_style(
     const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
     const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
     const now_unix: i64 = @intCast(time(null));
-    const style = chartstyle.buildStyle(gpa, tmpl, &m, cts, bands, now_unix) catch return 0;
+    // Single style builder: regenerate the full style with the mariner baked in
+    // (chartstyle.buildStyle's template-patch pass is retired). buildFromTemplate lifts
+    // the source config out of the passed template and drives the one styleJson.
+    const style = assets.buildFromTemplate(gpa, tmpl, &m, cts, bands, now_unix) catch return 0;
     out.* = style.ptr;
     out_len.* = style.len;
     return 1;

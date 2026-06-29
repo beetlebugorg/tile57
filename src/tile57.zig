@@ -42,8 +42,10 @@ pub const bakeArchive = source.bakeArchive;
 pub const freeBytes = source.freeBytes;
 
 /// MapLibre style generation from a template + mariner S-52 display settings.
+/// `build` is the single style builder (regenerates the full style with the mariner
+/// baked in; the old template-patch pass is retired) — see assets.buildFromTemplate.
 pub const style = struct {
-    pub const build = chartstyle.buildStyle;
+    pub const build = assets.buildFromTemplate;
     pub const Mariner = chartstyle.MarinerSettings;
 };
 

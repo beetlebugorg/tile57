@@ -21,6 +21,7 @@
 //! style_free(result_ptr, result_len).
 
 const std = @import("std");
+const assets = @import("assets");
 const chartstyle = @import("chartstyle");
 const settings = @import("settings");
 
@@ -85,7 +86,7 @@ export fn style_build(settings_ptr: usize, settings_len: usize, now_unix: f64) i
     };
     const m = settings.parse(arena.allocator(), settings_bytes);
     const now: i64 = @intFromFloat(now_unix);
-    const out = chartstyle.buildStyle(gpa, template_json, &m, colortables_json, null, now) catch return 0;
+    const out = assets.buildFromTemplate(gpa, template_json, &m, colortables_json, null, now) catch return 0;
     g_result_ptr = @intFromPtr(out.ptr);
     g_result_len = out.len;
     return 1;

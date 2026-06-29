@@ -19,19 +19,9 @@ const FALLBACK = "#ff00ff";
 const FONT = .{"Noto Sans Regular"};
 
 // ---- MapLibre expressions, as comptime tuples ----------------------------
-
-// Depth-area band edges: coalesce(get drvalN, default).
-const D1 = .{ "coalesce", .{ "get", "drval1" }, -1 };
-const D2 = .{ "coalesce", .{ "get", "drval2" }, 0 };
-// SEABED01 depth-band token (deepest first; case: first match wins).
-const SEABED = .{
-    "case",
-    .{ "all", .{ ">=", D1, 30 }, .{ ">", D2, 30 } }, "DEPDW",
-    .{ "all", .{ ">=", D1, 10 }, .{ ">", D2, 10 } }, "DEPMD",
-    .{ "all", .{ ">=", D1, 2 },  .{ ">", D2, 2 } },  "DEPMS",
-    .{ "all", .{ ">=", D1, 0 },  .{ ">", D2, 0 } },  "DEPVS",
-    "DEPIT",
-};
+// SEABED01 depth shading, the danger-symbol swap, and the sounding bold/faint split
+// are mariner-dependent and now resolve through the chartstyle builders (one style
+// builder); only the mariner-INDEPENDENT layout exprs remain comptime tuples here.
 
 // SCAMIN display-scale denominator at z0 (0.28 mm OGC pixel, equator). Used by the
 // zoom-filter FALLBACK gate below — applied only when no SCAMIN manifest is supplied
@@ -79,11 +69,7 @@ const FILT_SOLID = .{ "==", .{ "coalesce", .{ "get", "dash" }, "solid" }, "solid
 const FILT_DASHED = .{ "==", .{ "get", "dash" }, "dashed" };
 const FILT_DOTTED = .{ "==", .{ "get", "dash" }, "dotted" };
 
-// OBSTRN/WRECKS danger swap (sym_deep beyond safety) + pivot_center "ctr:" variant.
-const SYM_NAME = .{ "case", .{ "all", .{ "has", "sym_deep" }, .{ ">", .{ "coalesce", .{ "get", "danger_depth" }, 0 }, 10 } }, .{ "get", "sym_deep" }, .{ "get", "symbol_name" } };
-const PSI = .{ "case", .{ "==", .{ "coalesce", .{ "get", "pivot_center" }, 0 }, 1 }, .{ "concat", "ctr:", SYM_NAME }, SYM_NAME };
 const ICON_SIZE = .{ "/", .{ "coalesce", .{ "get", "scale" }, 0.08 }, 0.08 };
-const SOUNDINGS_IMG = .{ "case", .{ "has", "sym_s" }, .{ "case", .{ "<=", .{ "coalesce", .{ "get", "depth" }, 0 }, 10 }, .{ "get", "sym_s" }, .{ "get", "sym_g" } }, .{ "get", "symbol_names" } };
 
 const VROW = .{ "match", .{ "coalesce", .{ "get", "valign" }, "middle" }, "top", "top", "bottom", "bottom", "center" };
 const TEXT_ANCHOR = .{
@@ -123,43 +109,30 @@ pub const StyleOpts = struct {
     now_unix: i64 = 0, // host wall-clock (epoch s) for the date filter's "today"
 };
 
-// ---- colour resolution (the one runtime-variable expression) -------------
+// Precomputed, mariner-aware style expressions shared by every layer of one
+// styleJson call — the single style builder. Colours / depth shading / icon images
+// resolve ONCE through the chartstyle builders (so chartstyle.buildStyle's patch pass
+// is retired); `common`/`text_group` are the S-52 display filters, empty/null in
+// template mode (opts.mariner == null) so a template renders without baked gating.
+const SCtx = struct {
+    fill_color: std.json.Value, // areas fill (SEABED01 depth shading)
+    line_color: std.json.Value,
+    text_color: std.json.Value,
+    halo: std.json.Value,
+    contour_color: std.json.Value,
+    sound_img: std.json.Value, // soundings icon-image (SNDFRM04 safety split)
+    point_img: std.json.Value, // point icon-image (OBSTRN/WRECKS danger swap + ctr:)
+    contour_field: std.json.Value, // DEPCNT label text-field (SAFCON01 unit)
+    common: []const std.json.Value, // filters AND-ed onto every chart layer ([] = template)
+    text_group: ?std.json.Value, // extra filter for text layers (null = template)
+};
 
-// After the array head + token expr, append TOK,hex pairs + fallback and close.
-fn finishColorMatch(js: *Stringify, palette: std.json.ObjectMap, fallback: []const u8) !void {
-    for (palette.keys()) |k| {
-        try js.write(k);
-        try js.write(palette.get(k).?.string);
-    }
-    try js.write(fallback);
-    try js.endArray();
-}
+// ---- layer building blocks ----------------------------------------------
 
-// ["match",["coalesce",["get",prop],""], TOK,hex, …, fallback]
-fn colorExpr(js: *Stringify, prop: []const u8, palette: std.json.ObjectMap, fallback: []const u8) !void {
-    try js.beginArray();
-    try js.write("match");
-    try js.write(.{ "coalesce", .{ "get", prop }, "" });
-    try finishColorMatch(js, palette, fallback);
-}
-
-// Depth areas (drval1) shade via SEABED01; everything else uses its colour_token.
-fn areasFillColor(js: *Stringify, palette: std.json.ObjectMap) !void {
-    try js.beginArray();
-    try js.write("case");
-    try js.write(.{ "has", "drval1" });
-    try js.beginArray(); // SEABED01 match
-    try js.write("match");
-    try js.write(SEABED);
-    try finishColorMatch(js, palette, FALLBACK);
-    try colorExpr(js, "color_token", palette, FALLBACK); // default arm
-    try js.endArray();
-}
-
-fn linePaint(js: *Stringify, palette: std.json.ObjectMap, dash: ?[2]i64) !void {
+fn linePaint(js: *Stringify, line_color: std.json.Value, dash: ?[2]i64) !void {
     try js.beginObject();
     try js.objectField("line-color");
-    try colorExpr(js, "color_token", palette, FALLBACK);
+    try js.write(line_color);
     try js.objectField("line-width");
     try js.write(.{ "coalesce", .{ "get", "width_px" }, 1 });
     if (dash) |d| {
@@ -168,26 +141,6 @@ fn linePaint(js: *Stringify, palette: std.json.ObjectMap, dash: ?[2]i64) !void {
     }
     try js.endObject();
 }
-
-fn haloColor(scheme: []const u8) []const u8 {
-    return if (std.mem.eql(u8, scheme, "day")) "rgba(255,255,255,0.9)" else "rgba(0,0,0,0.85)";
-}
-
-fn textColor(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap) !void {
-    if (std.mem.eql(u8, scheme, "day")) {
-        try colorExpr(js, "color_token", palette, "#000000");
-    } else {
-        try js.write(if (std.mem.eql(u8, scheme, "night")) "#aab7bf" else "#dde7ec");
-    }
-}
-
-fn contourLabelColor(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap) !void {
-    if (!std.mem.eql(u8, scheme, "day")) return textColor(js, scheme, palette);
-    const c = if (palette.get("CHGRD")) |v| v.string else if (palette.get("CHBLK")) |v| v.string else "#000000";
-    try js.write(c);
-}
-
-// ---- layer building blocks ----------------------------------------------
 
 fn layerHead(js: *Stringify, id: []const u8, kind: []const u8, source_layer: []const u8) !void {
     try js.objectField("id");
@@ -245,24 +198,30 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
     try js.endArray();
 }
 
-// Write a layer's `filter` (the `base` predicate ANDed with the bucket's scamin clause,
-// or either alone) and its native `minzoom`. `has_base=false` for layers with no base
-// predicate (fills/patterns/complex/soundings); a plain bucket then emits neither field.
-fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket) !void {
+// Write a layer's `filter` and native `minzoom`. The filter ANDs together (in order):
+// the `base` predicate (when has_base), the bucket's SCAMIN clause (per-value / #no /
+// zoom-gate), the shared mariner `common` filters, and a layer-specific `extra` (the
+// text-group filter on text layers). All optional; a single part is written bare (no
+// "all" wrapper) so a template layer is byte-identical to the pre-mariner output.
+// `has_base=false` for layers with no base predicate (fills/patterns/complex/soundings).
+fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, common: []const std.json.Value, extra: ?std.json.Value) !void {
     const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate;
-    if (has_base or has_clause) {
+    var n: usize = common.len;
+    if (has_base) n += 1;
+    if (has_clause) n += 1;
+    if (extra != null) n += 1;
+    if (n > 0) {
         try js.objectField("filter");
-        if (has_base and has_clause) {
+        const wrap = n > 1;
+        if (wrap) {
             try js.beginArray();
             try js.write("all");
-            try js.write(base);
-            try writeScaminClause(js, bkt);
-            try js.endArray();
-        } else if (has_clause) {
-            try writeScaminClause(js, bkt);
-        } else {
-            try js.write(base);
         }
+        if (has_base) try js.write(base);
+        if (has_clause) try writeScaminClause(js, bkt);
+        for (common) |c| try js.write(c);
+        if (extra) |e| try js.write(e);
+        if (wrap) try js.endArray();
     }
     if (bkt.minzoom) |mz| {
         try js.objectField("minzoom");
@@ -270,28 +229,28 @@ fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket) !void
     }
 }
 
-fn lineLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, name: []const u8, filt: anytype, dash: ?[2]i64, bkt: Bucket) !void {
+fn lineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, name: []const u8, filt: anytype, dash: ?[2]i64, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     const id = try std.fmt.bufPrint(&buf, "{s}-{s}{s}", .{ sl, name, bkt.suffix });
     try js.beginObject();
     try layerHead(js, id, "line", sl);
-    try applyBucket(js, filt, true, bkt);
+    try applyBucket(js, filt, true, bkt, s.common, null);
     try js.objectField("paint");
-    try linePaint(js, palette, dash);
+    try linePaint(js, s.line_color, dash);
     try js.endObject();
 }
 
 // solid / dashed / dotted line layers for one source-layer (one SCAMIN bucket).
-fn lineLayers(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
-    try lineLayer(js, palette, sl, "solid", FILT_SOLID, null, bkt);
-    try lineLayer(js, palette, sl, "dashed", FILT_DASHED, .{ 4, 3 }, bkt);
-    try lineLayer(js, palette, sl, "dotted", FILT_DOTTED, .{ 1, 2 }, bkt);
+fn lineLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
+    try lineLayer(js, s, sl, "solid", FILT_SOLID, null, bkt);
+    try lineLayer(js, s, sl, "dashed", FILT_DASHED, .{ 4, 3 }, bkt);
+    try lineLayer(js, s, sl, "dotted", FILT_DOTTED, .{ 1, 2 }, bkt);
 }
 
-fn pointLayout(js: *Stringify, alignment: []const u8) !void {
+fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value) !void {
     try js.beginObject();
     try js.objectField("icon-image");
-    try js.write(PSI);
+    try js.write(icon);
     try js.objectField("icon-size");
     try js.write(ICON_SIZE);
     try js.objectField("icon-rotate");
@@ -307,28 +266,28 @@ fn pointLayout(js: *Stringify, alignment: []const u8) !void {
     try js.endObject();
 }
 
-fn pointSymbolLayers(js: *Stringify, sl: []const u8, bkt: Bucket) !void {
+fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     // viewport-aligned (screen-up)
     const vid = try std.fmt.bufPrint(&buf, "{s}{s}", .{ sl, bkt.suffix });
     try js.beginObject();
     try layerHead(js, vid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt);
+    try applyBucket(js, .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt, s.common, null);
     try js.objectField("layout");
-    try pointLayout(js, "viewport");
+    try pointLayout(js, "viewport", s.point_img);
     try js.endObject();
     // map-aligned (true-north)
     var nbuf: [96]u8 = undefined;
     const nid = try std.fmt.bufPrint(&nbuf, "{s}-north{s}", .{ sl, bkt.suffix });
     try js.beginObject();
     try layerHead(js, nid, "symbol", sl);
-    try applyBucket(js, .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt);
+    try applyBucket(js, .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt, s.common, null);
     try js.objectField("layout");
-    try pointLayout(js, "map");
+    try pointLayout(js, "map", s.point_img);
     try js.endObject();
 }
 
-fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     const sfx = if (std.mem.eql(u8, sl, "text")) "" else "-scamin";
 
@@ -336,7 +295,7 @@ fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, s
     const lid = try std.fmt.bufPrint(&buf, "light-text{s}{s}", .{ sfx, bkt.suffix });
     try js.beginObject();
     try layerHead(js, lid, "symbol", sl);
-    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt);
+    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s.common, s.text_group);
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -358,7 +317,7 @@ fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, s
     try js.objectField("text-optional");
     try js.write(true);
     try js.endObject();
-    try textPaint(js, scheme, palette, 1.4);
+    try textPaint(js, s.text_color, s.halo, 1.4);
     try js.endObject();
 
     // text<sfx> — general collidable labels.
@@ -366,7 +325,7 @@ fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, s
     const tid = try std.fmt.bufPrint(&buf2, "text{s}{s}", .{ sfx, bkt.suffix });
     try js.beginObject();
     try layerHead(js, tid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt);
+    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s.common, s.text_group);
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -384,17 +343,17 @@ fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, s
     try js.objectField("text-optional");
     try js.write(true);
     try js.endObject();
-    try textPaint(js, scheme, palette, 1.4);
+    try textPaint(js, s.text_color, s.halo, 1.4);
     try js.endObject();
 }
 
-fn textPaint(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, halo_width: f64) !void {
+fn textPaint(js: *Stringify, text_color: std.json.Value, halo: std.json.Value, halo_width: f64) !void {
     try js.objectField("paint");
     try js.beginObject();
     try js.objectField("text-color");
-    try textColor(js, scheme, palette);
+    try js.write(text_color);
     try js.objectField("text-halo-color");
-    try js.write(haloColor(scheme));
+    try js.write(halo);
     try js.objectField("text-halo-width");
     try js.write(halo_width);
     try js.objectField("text-halo-blur");
@@ -403,7 +362,7 @@ fn textPaint(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, ha
 }
 
 // One area-fill layer for a source-layer + SCAMIN bucket.
-fn fillLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+fn fillLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "fill-{s}{s}", .{ sl, bkt.suffix }), "fill", sl);
@@ -415,16 +374,16 @@ fn fillLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, bkt: B
     try js.objectField("paint");
     try js.beginObject();
     try js.objectField("fill-color");
-    try areasFillColor(js, palette);
+    try js.write(s.fill_color);
     try js.objectField("fill-antialias");
     try js.write(true);
     try js.endObject();
-    try applyBucket(js, .{}, false, bkt);
+    try applyBucket(js, .{}, false, bkt, s.common, null);
     try js.endObject();
 }
 
 // One area fill-pattern layer (sprite required) for a source-layer + SCAMIN bucket.
-fn patternLayer(js: *Stringify, sl: []const u8, bkt: Bucket) !void {
+fn patternLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "fillpat-{s}{s}", .{ sl, bkt.suffix }), "fill", sl);
@@ -433,33 +392,33 @@ fn patternLayer(js: *Stringify, sl: []const u8, bkt: Bucket) !void {
     try js.objectField("fill-pattern");
     try js.write(.{ "concat", "pat:", .{ "coalesce", .{ "get", "pattern_name" }, "" } });
     try js.endObject();
-    try applyBucket(js, .{}, false, bkt);
+    try applyBucket(js, .{}, false, bkt, s.common, null);
     try js.endObject();
 }
 
 // One complex (symbolised) line layer for a source-layer + SCAMIN bucket.
-fn complexLineLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+fn complexLineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}{s}", .{ sl, bkt.suffix }), "line", sl);
     try js.objectField("paint");
-    try linePaint(js, palette, null);
-    try applyBucket(js, .{}, false, bkt);
+    try linePaint(js, s.line_color, null);
+    try applyBucket(js, .{}, false, bkt, s.common, null);
     try js.endObject();
 }
 
 // One DEPCNT contour value-label layer (glyphs required) for a source-layer + bucket.
-fn contourLabelLayer(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+fn contourLabelLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}{s}", .{ sl, bkt.suffix }), "symbol", sl);
-    try applyBucket(js, .{ "has", "valdco" }, true, bkt);
+    try applyBucket(js, .{ "has", "valdco" }, true, bkt, s.common, null);
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("symbol-placement");
     try js.write("line-center");
     try js.objectField("text-field");
-    try js.write(.{ "to-string", .{ "get", "valdco" } });
+    try js.write(s.contour_field);
     try js.objectField("text-font");
     try js.write(FONT);
     try js.objectField("text-size");
@@ -474,9 +433,9 @@ fn contourLabelLayer(js: *Stringify, scheme: []const u8, palette: std.json.Objec
     try js.objectField("paint");
     try js.beginObject();
     try js.objectField("text-color");
-    try contourLabelColor(js, scheme, palette);
+    try js.write(s.contour_color);
     try js.objectField("text-halo-color");
-    try js.write(haloColor(scheme));
+    try js.write(s.halo);
     try js.objectField("text-halo-width");
     try js.write(1.2);
     try js.objectField("text-halo-blur");
@@ -486,15 +445,15 @@ fn contourLabelLayer(js: *Stringify, scheme: []const u8, palette: std.json.Objec
 }
 
 // The soundings symbol layer (sprite required) for a SCAMIN bucket.
-fn soundingsLayer(js: *Stringify, bkt: Bucket) !void {
+fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, .{}, false, bkt);
+    try applyBucket(js, .{}, false, bkt, s.common, null);
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("icon-image");
-    try js.write(SOUNDINGS_IMG);
+    try js.write(s.sound_img);
     try js.objectField("icon-size");
     try js.write(ICON_SIZE);
     try js.objectField("icon-allow-overlap");
@@ -560,6 +519,31 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     const all_buckets: []const Bucket = allb.items;
     const snd_buckets: []const Bucket = sndb.items;
 
+    // The single style builder: resolve every mariner-aware colour / icon / display
+    // filter ONCE through the chartstyle builders (retiring chartstyle.buildStyle's
+    // template-patch pass). scheme always comes from opts.scheme (the bundle emits one
+    // style per scheme); a null opts.mariner is a TEMPLATE — default mariner for the
+    // colour/layout exprs, but NO display filters baked in (the client gates live).
+    const scheme_e: chartstyle.Scheme = if (std.mem.eql(u8, opts.scheme, "night"))
+        .night
+    else if (std.mem.eql(u8, opts.scheme, "dusk")) .dusk else .day;
+    var m: chartstyle.MarinerSettings = opts.mariner orelse .{};
+    m.scheme = scheme_e;
+    const filters_on = opts.mariner != null;
+    const b = chartstyle.B{ .a = ba };
+    const s = SCtx{
+        .fill_color = try chartstyle.areasFillColor(b, &palette, &m),
+        .line_color = try chartstyle.lineColor(b, &palette),
+        .text_color = try chartstyle.textColor(b, m.scheme, &palette),
+        .halo = chartstyle.textHaloColor(b, m.scheme),
+        .contour_color = try chartstyle.contourLabelColor(b, m.scheme, &palette),
+        .sound_img = try chartstyle.soundingsIconImage(b, &m),
+        .point_img = try chartstyle.pointSymbolImage(b, &m),
+        .contour_field = try chartstyle.contourLabelField(b, &m),
+        .common = if (filters_on) try chartstyle.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
+        .text_group = if (filters_on) try chartstyle.textGroupFilter(b, &m) else null,
+    };
+
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     var stringify: Stringify = .{ .writer = &aw.writer };
@@ -611,43 +595,43 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     try js.endObject();
 
     // 2. area fills — base (plain) + one SCAMIN bucket layer per manifest value.
-    try fillLayer(js, palette, "areas", .{});
-    for (all_buckets) |bkt| try fillLayer(js, palette, "areas_scamin", bkt);
+    try fillLayer(js, &s, "areas", .{});
+    for (all_buckets) |bkt| try fillLayer(js, &s, "areas_scamin", bkt);
 
     // 3. area fill patterns (sprite required)
     if (sprite_on) {
-        try patternLayer(js, "area_patterns", .{});
-        for (all_buckets) |bkt| try patternLayer(js, "area_patterns_scamin", bkt);
+        try patternLayer(js, &s, "area_patterns", .{});
+        for (all_buckets) |bkt| try patternLayer(js, &s, "area_patterns_scamin", bkt);
     }
 
     // 4. lines: solid/dashed/dotted over base + _scamin buckets
-    try lineLayers(js, palette, "lines", .{});
-    for (all_buckets) |bkt| try lineLayers(js, palette, "lines_scamin", bkt);
+    try lineLayers(js, &s, "lines", .{});
+    for (all_buckets) |bkt| try lineLayers(js, &s, "lines_scamin", bkt);
 
     // 5. complex (symbolised) lines
-    try complexLineLayer(js, palette, "complex_lines", .{});
-    for (all_buckets) |bkt| try complexLineLayer(js, palette, "complex_lines_scamin", bkt);
+    try complexLineLayer(js, &s, "complex_lines", .{});
+    for (all_buckets) |bkt| try complexLineLayer(js, &s, "complex_lines_scamin", bkt);
 
     // 6. light sector limit lines (no SCAMIN bucketing)
-    try lineLayers(js, palette, "sector_lines", .{});
+    try lineLayers(js, &s, "sector_lines", .{});
 
     // 7. contour value labels (DEPCNT VALDCO) — text, needs glyphs.
     if (glyphs_on) {
-        try contourLabelLayer(js, opts.scheme, palette, "lines", .{});
-        for (all_buckets) |bkt| try contourLabelLayer(js, opts.scheme, palette, "lines_scamin", bkt);
+        try contourLabelLayer(js, &s, "lines", .{});
+        for (all_buckets) |bkt| try contourLabelLayer(js, &s, "lines_scamin", bkt);
     }
 
     // 8. point symbols + soundings (sprite required)
     if (sprite_on) {
-        try pointSymbolLayers(js, "point_symbols", .{});
-        for (all_buckets) |bkt| try pointSymbolLayers(js, "point_symbols_scamin", bkt);
-        for (snd_buckets) |bkt| try soundingsLayer(js, bkt);
+        try pointSymbolLayers(js, &s, "point_symbols", .{});
+        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt);
+        for (snd_buckets) |bkt| try soundingsLayer(js, &s, bkt);
     }
 
     // 9. text labels — need an SDF glyph source.
     if (glyphs_on) {
-        try textLayers(js, opts.scheme, palette, "text", .{});
-        for (all_buckets) |bkt| try textLayers(js, opts.scheme, palette, "text_scamin", bkt);
+        try textLayers(js, &s, "text", .{});
+        for (all_buckets) |bkt| try textLayers(js, &s, "text_scamin", bkt);
     }
 
     try js.endArray(); // layers
@@ -662,6 +646,67 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     }
     try js.endObject();
     return aw.toOwnedSlice();
+}
+
+/// Build a full MapLibre style from a base template + mariner settings — the single
+/// builder behind the C-ABI / WASM / parity callers (replaces chartstyle.buildStyle's
+/// template-patch pass). The passed template carries ONLY the host's source config
+/// (sprite / glyphs / chart tiles+zoom); this lifts that out and regenerates every
+/// layer via styleJson with the mariner baked in. Signature mirrors the retired
+/// buildStyle so callers are a one-line change. A bad template or unusable colortables
+/// returns the template bytes unchanged (alloc-owned dup), as buildStyle did.
+pub fn buildFromTemplate(
+    alloc: std.mem.Allocator,
+    template_json: []const u8,
+    m: *const chartstyle.MarinerSettings,
+    colortables_json: []const u8,
+    enabled_bands: ?[]const i32,
+    now_unix: i64,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, template_json, .{}) catch
+        return alloc.dupe(u8, template_json);
+    defer parsed.deinit();
+    var opts = StyleOpts{
+        .scheme = switch (m.scheme) {
+            .dusk => "dusk",
+            .night => "night",
+            .day => "day",
+        },
+        .colortables_json = colortables_json,
+        .mariner = m.*,
+        .enabled_bands = enabled_bands,
+        .now_unix = now_unix,
+    };
+    if (parsed.value == .object) {
+        const root = parsed.value.object;
+        if (root.get("sprite")) |v| {
+            if (v == .string) opts.sprite = v.string;
+        }
+        if (root.get("glyphs")) |v| {
+            if (v == .string) opts.glyphs = v.string;
+        }
+        if (root.get("sources")) |sv| {
+            if (sv == .object) if (sv.object.get("chart")) |cv| {
+                if (cv == .object) {
+                    const c = cv.object;
+                    if (c.get("url")) |u| {
+                        if (u == .string) opts.pmtiles_url = u.string;
+                    }
+                    if (c.get("tiles")) |t| {
+                        if (t == .array and t.array.items.len > 0 and t.array.items[0] == .string)
+                            opts.source_tiles = t.array.items[0].string;
+                    }
+                    if (c.get("minzoom")) |z| {
+                        if (z == .integer) opts.minzoom = @intCast(z.integer);
+                    }
+                    if (c.get("maxzoom")) |z| {
+                        if (z == .integer) opts.maxzoom = @intCast(z.integer);
+                    }
+                }
+            };
+        }
+    }
+    return styleJson(alloc, opts) catch alloc.dupe(u8, template_json);
 }
 
 test "styleJson: valid JSON, expected layers, palette-resolved colour" {
@@ -686,4 +731,85 @@ test "styleJson: valid JSON, expected layers, palette-resolved colour" {
     try std.testing.expect(parsed.value.object.get("sprite") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"fill-areas\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "#c9edff") != null);
+}
+
+// ---- single-builder (buildFromTemplate) tests — ported from the retired
+//      chartstyle.buildStyle tests, now exercising the one styleJson path. -------
+const cs_template =
+    \\{"version":8,"sources":{"chart":{"type":"vector","url":"pmtiles://x"}},"sprite":"x","glyphs":"x","layers":[]}
+;
+const cs_ct =
+    \\{"day":{"DEPDW":"#c9edff","DEPMD":"#9bc4e0","DEPMS":"#6aa5cf","DEPVS":"#3a86bf","DEPIT":"#bfe6ff","CHGRD":"#5a5a44","CHBLK":"#000000"},"dusk":{"DEPDW":"#0a141e"},"night":{"DEPDW":"#050a0f"}}
+;
+
+test "buildFromTemplate: defaults bake SEABED fill + category/M_QUAL filter (single-pass)" {
+    const a = std.testing.allocator;
+    const m = chartstyle.MarinerSettings{};
+    const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "DEPMD") != null); // SEABED01 band
+    try std.testing.expect(std.mem.indexOf(u8, out, "ISODGR01") != null); // category filter
+    try std.testing.expect(std.mem.indexOf(u8, out, "M_QUAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "10.0") != null); // float depth edges
+    try std.testing.expect(std.mem.indexOf(u8, out, "30.0") != null);
+}
+
+test "buildFromTemplate: night scheme -> neutral ink + dark halo" {
+    const a = std.testing.allocator;
+    const m = chartstyle.MarinerSettings{ .scheme = .night };
+    const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "#aab7bf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "rgba(0,0,0,0.85)") != null);
+}
+
+test "buildFromTemplate: feet depth unit -> contour label uses M_TO_FT" {
+    const a = std.testing.allocator;
+    const m = chartstyle.MarinerSettings{ .depth_unit = .feet };
+    const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "3.280839895") != null);
+}
+
+test "buildFromTemplate: enabled bands add a band filter" {
+    const a = std.testing.allocator;
+    const m = chartstyle.MarinerSettings{};
+    const bands = [_]i32{ 2, 3 };
+    const out = try buildFromTemplate(a, cs_template, &m, cs_ct, &bands, 1700000000);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"band\"") != null);
+}
+
+test "buildFromTemplate: date resolution (pinned + today + off)" {
+    const a = std.testing.allocator;
+    const m1 = chartstyle.MarinerSettings{ .date_view = "20240115" };
+    const o1 = try buildFromTemplate(a, cs_template, &m1, cs_ct, null, 1700000000);
+    defer a.free(o1);
+    try std.testing.expect(std.mem.indexOf(u8, o1, "20240115") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o1, "0115") != null);
+
+    const m2 = chartstyle.MarinerSettings{};
+    const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
+    defer a.free(o2);
+    try std.testing.expect(std.mem.indexOf(u8, o2, "20231114") != null);
+
+    const m3 = chartstyle.MarinerSettings{ .date_dependent = false };
+    const o3 = try buildFromTemplate(a, cs_template, &m3, cs_ct, null, 1700000000);
+    defer a.free(o3);
+    try std.testing.expect(std.mem.indexOf(u8, o3, "date_recurring") == null);
+}
+
+test "buildFromTemplate: viewing-group filter (future-use scaffold) gates by vg" {
+    const a = std.testing.allocator;
+    const vgs = [_]i32{ 26070, 27070 };
+    const m = chartstyle.MarinerSettings{ .viewing_groups = &vgs };
+    const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"vg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "26070") != null);
+    // null viewing_groups -> no vg filter at all.
+    const m2 = chartstyle.MarinerSettings{};
+    const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
+    defer a.free(o2);
+    try std.testing.expect(std.mem.indexOf(u8, o2, "\"vg\"") == null);
 }

@@ -12,6 +12,7 @@
 //!   out.json      : output path for the generated MapLibre style.json
 
 const std = @import("std");
+const assets = @import("assets");
 const chartstyle = @import("chartstyle");
 const settings = @import("settings");
 
@@ -32,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     const out_path = args[3];
 
     const m = settings.parse(a, settings_json);
-    const style = try chartstyle.buildStyle(a, template_json, &m, colortables_json, null, now_unix);
+    const style = try assets.buildFromTemplate(a, template_json, &m, colortables_json, null, now_unix);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = style });
     std.debug.print("style-parity: wrote {s} ({d} bytes)\n", .{ out_path, style.len });
 }
