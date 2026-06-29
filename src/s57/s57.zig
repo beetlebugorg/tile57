@@ -975,7 +975,10 @@ fn mergeFile(
             if (rec.field("ATTV")) |av| v.quapos = quaposFromAttv(a, av);
 
             if (ruin == 3) { // modify in place
-                if (vidx.get(key)) |i| if (vecs.items[i]) |*ex| {
+                // The oracle errors on a MODIFY whose target is absent (updates.go:291),
+                // which drops the whole cell via the baker's parse-error skip. Match it.
+                const i = vidx.get(key) orelse return error.ModifyMissingSpatial;
+                if (vecs.items[i]) |*ex| {
                     // SGCC (coordinate control) edits whichever coordinate list this
                     // record carries. The oracle keeps both 2D and 3D in one
                     // `Coordinates` slice, so SGCC applies to either; here they're split
@@ -1012,7 +1015,7 @@ fn mergeFile(
                     // coordinates and vector pointers — it never re-reads ATTV, so a
                     // modified record keeps its base QUAPOS. Match that for byte-parity
                     // (don't refresh ex.quapos from the update's ATTV here).
-                };
+                } else return error.ModifyMissingSpatial;
                 continue;
             }
             // insert (1) — upsert
@@ -1039,7 +1042,9 @@ fn mergeFile(
             if (rec.field("ATTF")) |at| f.attrs = try parseATTF(a, at);
 
             if (ruin == 3) {
-                if (fidx.get(key)) |i| if (feats.items[i]) |*ex| {
+                // MODIFY of an absent feature errors (updates.go:202) -> cell dropped.
+                const i = fidx.get(key) orelse return error.ModifyMissingFeature;
+                if (feats.items[i]) |*ex| {
                     const fspc = rec.field("FSPC");
                     if (fspc != null and fspc.?.len >= 5) {
                         ex.refs = try applyControl(a, SpatialRef, ex.refs, f.refs, fspc.?);
@@ -1051,7 +1056,7 @@ fn mergeFile(
                     // carries at least one, so a present-but-empty ATTF preserves the
                     // existing set instead of clobbering it.
                     if (f.attrs.len > 0) ex.attrs = f.attrs;
-                };
+                } else return error.ModifyMissingFeature;
                 continue;
             }
             if (fidx.get(key)) |i| {
