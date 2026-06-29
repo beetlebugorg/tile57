@@ -644,8 +644,10 @@ fn parseDSPM(data: []const u8) DatasetParams {
     p.cscl = i32le(data, 8);
     p.comf = i32le(data, 16);
     p.somf = i32le(data, 20);
-    if (p.comf == 0) p.comf = 10_000_000;
-    if (p.somf == 0) p.somf = 10;
+    // §7.3.2.1 requires a positive multiplier; a zero OR NEGATIVE factor falls back
+    // to the standard default (matches the oracle's `<= 0` guard, not just `== 0`).
+    if (p.comf <= 0) p.comf = 10_000_000;
+    if (p.somf <= 0) p.somf = 10;
     return p;
 }
 
@@ -1104,6 +1106,13 @@ test "parse DSPM coordinate factors" {
     try std.testing.expectEqual(@as(i32, 10_000_000), p.comf);
     try std.testing.expectEqual(@as(i32, 10), p.somf);
     try std.testing.expectEqual(@as(i32, 25000), p.cscl);
+
+    // Zero OR negative COMF/SOMF both fall back to the standard defaults (§7.3.2.1).
+    std.mem.writeInt(i32, data[16..20], -5, .little);
+    std.mem.writeInt(i32, data[20..24], 0, .little);
+    const pn = parseDSPM(&data);
+    try std.testing.expectEqual(@as(i32, 10_000_000), pn.comf);
+    try std.testing.expectEqual(@as(i32, 10), pn.somf);
 }
 
 test "VRPC partial VRPT modify preserves the unmodified endpoint" {
