@@ -350,10 +350,50 @@ const Layers = struct {
 };
 
 /// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
-fn featureScamin(f: s57.Feature) ?i64 {
+pub fn featureScamin(f: s57.Feature) ?i64 {
     const v = f.attr(ATTR_SCAMIN) orelse return null;
     const n = std.fmt.parseInt(i64, std.mem.trim(u8, v, " "), 10) catch return null;
     return if (n > 0) n else null;
+}
+
+/// The vector layers this engine emits, in emit order — the source-layer ids the
+/// generated MapLibre style reads. Static: an archive may omit empties, but the
+/// TileJSON advertises the full set (mirrors the Go pmtiles metadataJSON, with this
+/// engine's actual layer split — points/text get _scamin buckets, complex lines fold
+/// into `lines`). Keep in sync with the layer appends in appendCellFeatures' finalize.
+pub const VECTOR_LAYERS = [_][]const u8{
+    "areas",         "areas_scamin",  "area_patterns", "area_patterns_scamin",
+    "lines",         "lines_scamin",  "point_symbols", "point_symbols_scamin",
+    "soundings",     "text",          "text_scamin",
+};
+
+/// PMTiles archive metadata JSON: the static vector_layers list MapLibre reads from
+/// the TileJSON, plus a "scamin" array of the distinct SCAMIN denominators present
+/// (ascending) so the client builds one native-minzoom bucket layer per value at
+/// load (host-canonical-backend.md §2) instead of probing tiles. Mirrors the Go
+/// pmtiles.Builder.metadata (vector_layers + scamin splice). `scamin` empty -> omit
+/// the field. Caller owns the returned bytes (allocated in `a`).
+pub fn metadataJson(a: Allocator, scamin: []const u32) ![]const u8 {
+    var b = std.ArrayList(u8).empty;
+    try b.appendSlice(a, "{\"name\":\"chartplotter\",\"format\":\"pbf\",\"vector_layers\":[");
+    for (VECTOR_LAYERS, 0..) |name, i| {
+        if (i > 0) try b.append(a, ',');
+        try b.appendSlice(a, "{\"id\":\"");
+        try b.appendSlice(a, name);
+        try b.appendSlice(a, "\",\"fields\":{}}");
+    }
+    try b.append(a, ']');
+    if (scamin.len > 0) {
+        try b.appendSlice(a, ",\"scamin\":[");
+        for (scamin, 0..) |v, i| {
+            if (i > 0) try b.append(a, ',');
+            var nbuf: [16]u8 = undefined;
+            try b.appendSlice(a, std.fmt.bufPrint(&nbuf, "{d}", .{v}) catch unreachable);
+        }
+        try b.append(a, ']');
+    }
+    try b.append(a, '}');
+    return b.toOwnedSlice(a);
 }
 
 /// Feature-level metadata shared by every primitive a feature emits, so the

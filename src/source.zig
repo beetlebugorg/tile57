@@ -809,6 +809,13 @@ pub fn bakeArchive(
     var baker = bake_enc.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sw, .func = streamSink });
     defer baker.deinit();
 
+    // Distinct SCAMIN denominators across all cells -> published in the archive
+    // metadata so the client builds one native-minzoom bucket per value at load
+    // (host-canonical-backend.md §2). Collected from the parsed cells (the source
+    // of truth) while they're alive, before each band frees them.
+    var scamin_set = std.AutoHashMap(u32, void).init(gpa);
+    defer scamin_set.deinit();
+
     var loaded: usize = 0;
     for (bake_enc.bands_fine_to_coarse) |band| {
         const idxs = band_idx[@intFromEnum(band)].items;
@@ -845,6 +852,9 @@ pub fn bakeArchive(
             backs.appendAssumeCapacity(be);
             band_arenas.appendAssumeCapacity(pa);
         };
+        for (backs.items) |be| for (be.cell.features) |f| {
+            if (s57_mvt.featureScamin(f)) |sc| scamin_set.put(@intCast(sc), {}) catch {};
+        };
         baker.bakeBand(band, backs.items, null, progress, user) catch {};
         for (backs.items) |*be| be.cell.deinit();
         for (band_arenas.items) |pa| if (pa) |p| {
@@ -857,7 +867,17 @@ pub fn bakeArchive(
 
     if (sw.num_addressed == 0) return null;
     const ub = baker.unionBounds();
+    var scamin_vals = std.ArrayList(u32).empty;
+    defer scamin_vals.deinit(gpa);
+    {
+        var it = scamin_set.keyIterator();
+        while (it.next()) |k| try scamin_vals.append(gpa, k.*);
+        std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
+    }
+    const meta = try s57_mvt.metadataJson(gpa, scamin_vals.items);
+    defer gpa.free(meta);
     return try sw.finishBytes(.{
+        .metadata_json = meta,
         .min_lon_e7 = @intFromFloat(@round(ub[0] * 1e7)),
         .min_lat_e7 = @intFromFloat(@round(ub[1] * 1e7)),
         .max_lon_e7 = @intFromFloat(@round(ub[2] * 1e7)),

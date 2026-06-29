@@ -1057,13 +1057,14 @@ const RootBake = struct { bounds: [4]f64, cells: []const []const u8, sounds: []c
 const BakeSink = struct {
     sw: *engine.pmtiles.StreamWriter,
     sounds: *std.StringHashMap(void),
+    scamin: *std.AutoHashMap(u32, void), // distinct SCAMIN denominators -> archive manifest
     a: std.mem.Allocator, // persistent (sound-stack strings; returned to caller)
     gpa: std.mem.Allocator, // scratch backing
     collect_sounds: bool, // bundle wants sprite-mln sounding composites; plain bake doesn't
 
     // `comp` is the already-gzipped tile (compressed in the gen worker), so the
-    // serial path here is just dedup + write — fast. Sounding-stack collection (only
-    // for the bundle) gunzips + decodes; plain bake-root skips it entirely.
+    // serial path here is just dedup + write — fast. Sounding-stack + SCAMIN-manifest
+    // collection (only for the bundle) gunzips + decodes; plain bake-root skips it.
     fn run(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
         const self: *BakeSink = @ptrCast(@alignCast(ctx.?));
         if (self.collect_sounds) collect: {
@@ -1072,8 +1073,19 @@ const BakeSink = struct {
             const mvt = engine.gzip.decompress(scratch.allocator(), comp) catch break :collect;
             const layers = engine.mvt.decode(scratch.allocator(), mvt) catch break :collect;
             for (layers) |L| {
-                if (!std.mem.eql(u8, L.name, "soundings")) continue;
+                const is_snd = std.mem.eql(u8, L.name, "soundings");
                 for (L.features) |feat| for (feat.properties) |p| {
+                    // Distinct SCAMIN denominators across EVERY layer -> the client's
+                    // per-SCAMIN bucket manifest (host-canonical-backend.md §2).
+                    if (std.mem.eql(u8, p.key, "scamin")) {
+                        switch (p.value) {
+                            .int => |iv| if (iv > 0) self.scamin.put(@intCast(iv), {}) catch {},
+                            else => {},
+                        }
+                        continue;
+                    }
+                    // Soundings glyph stacks for the sprite-mln composite atlas.
+                    if (!is_snd) continue;
                     if (!std.mem.eql(u8, p.key, "sym_s") and !std.mem.eql(u8, p.key, "sym_g") and !std.mem.eql(u8, p.key, "symbol_names")) continue;
                     switch (p.value) {
                         .string => |sv| if (std.mem.indexOfScalar(u8, sv, ',') != null and !self.sounds.contains(sv)) {
@@ -1217,9 +1229,11 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var sw = engine.pmtiles.StreamWriter.initFile(gpa, io, data_file);
     defer sw.deinit();
     var sounds = std.StringHashMap(void).init(a);
-    // Sounding-stack collection decodes each tile as MVT, so it only applies to the
-    // MVT output; for MLT the sprite-mln sounding composites are skipped (TODO).
-    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .a = a, .gpa = gpa, .collect_sounds = collect_sounds and format == .mvt };
+    var scamin = std.AutoHashMap(u32, void).init(gpa);
+    defer scamin.deinit();
+    // Sounding-stack + SCAMIN-manifest collection decodes each tile as MVT, so it only
+    // applies to the MVT output; for MLT the sprite-mln sounding composites are skipped (TODO).
+    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .scamin = &scamin, .a = a, .gpa = gpa, .collect_sounds = collect_sounds and format == .mvt };
     var baker = Bands.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
     baker.format = format;
     defer baker.deinit();
@@ -1401,7 +1415,18 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // section streamed to data_tmp. The prefix is small; the data is copied in
     // bounded chunks (positional reads, no whole-archive buffer), then the temp
     // file is removed.
+    // PMTiles metadata: vector_layers (TileJSON) + the distinct SCAMIN denominators
+    // (when collected) so the client builds its per-SCAMIN bucket layers at load.
+    var scamin_vals = std.ArrayList(u32).empty;
+    defer scamin_vals.deinit(a);
+    {
+        var it = scamin.keyIterator();
+        while (it.next()) |k| try scamin_vals.append(a, k.*);
+        std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
+    }
+    const meta = try engine.s57_mvt.metadataJson(a, scamin_vals.items);
     const opts = engine.pmtiles.WriteOptions{
+        .metadata_json = meta,
         .min_lon_e7 = toE7(ubox[0]),
         .min_lat_e7 = toE7(ubox[1]),
         .max_lon_e7 = toE7(ubox[2]),
