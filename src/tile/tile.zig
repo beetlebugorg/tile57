@@ -113,15 +113,19 @@ fn intersect(a: mvt.Point, c: mvt.Point, edge: Edge, b: Box) mvt.Point {
 fn clipEdge(a: Allocator, ring: []const mvt.Point, edge: Edge, b: Box, out: *std.ArrayList(mvt.Point)) !void {
     out.clearRetainingCapacity();
     if (ring.len == 0) return;
+    // Sutherland-Hodgman emits at most two vertices per input vertex (a crossing
+    // intersection plus the vertex itself), so reserve the worst case once and
+    // append without a per-vertex capacity check — append was ~13% of the bake.
+    try out.ensureTotalCapacity(a, ring.len * 2);
     var prev = ring[ring.len - 1];
     for (ring) |cur| {
         const cur_in = inside(cur, edge, b);
         const prev_in = inside(prev, edge, b);
         if (cur_in) {
-            if (!prev_in) try out.append(a, intersect(prev, cur, edge, b));
-            try out.append(a, cur);
+            if (!prev_in) out.appendAssumeCapacity(intersect(prev, cur, edge, b));
+            out.appendAssumeCapacity(cur);
         } else if (prev_in) {
-            try out.append(a, intersect(prev, cur, edge, b));
+            out.appendAssumeCapacity(intersect(prev, cur, edge, b));
         }
         prev = cur;
     }
