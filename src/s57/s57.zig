@@ -863,6 +863,26 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
     return list.items;
 }
 
+/// Merge NATF (Feature Record National Attribute) into an already-parsed ATTF list.
+/// NATF carries the national-language attributes (NOBJNM=301, NINFOM=300, NTXTDS=304,
+/// …) in the identical repeating ATTL(2)+ATVL+UT layout as ATTF and shares the same
+/// attribute code space (S-57 §7.6.4). ATTF is parsed first and wins on any code
+/// overlap, so only NATF codes not already present are appended — matching the
+/// oracle's map merge (feature.go:125-131). attr() scans in order, so keeping the
+/// ATTF entries ahead of the NATF-only ones preserves that precedence.
+fn mergeNatf(a: Allocator, attf: []const Attr, natf_data: []const u8) ![]Attr {
+    const natf = try parseATTF(a, natf_data);
+    var list = std.ArrayList(Attr).empty;
+    try list.appendSlice(a, attf);
+    outer: for (natf) |n| {
+        for (attf) |x| {
+            if (x.code == n.code) continue :outer;
+        }
+        try list.append(a, n);
+    }
+    return list.items;
+}
+
 /// ATTV (spatial-level attributes) carry QUAPOS — quality of position lives on the
 /// edge/node records, not on the feature. ATTV shares the ATTL(2)+ATVL layout of a
 /// feature's ATTF, so reuse parseATTF and pull out QUAPOS. Returns 0 if absent.
@@ -1209,6 +1229,7 @@ fn mergeFile(
             }
             if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
             if (rec.field("ATTF")) |at| f.attrs = try parseATTF(a, at);
+            if (rec.field("NATF")) |nt| f.attrs = try mergeNatf(a, f.attrs, nt);
 
             if (ruin == 3) {
                 // MODIFY of an absent feature errors (updates.go:202) -> cell dropped.
@@ -1365,6 +1386,23 @@ test "SGCC modify of one sounding preserves the rest (SG3D list)" {
     try std.testing.expectEqual(@as(f64, 1), out[0].depth); // preserved
     try std.testing.expectEqual(@as(f64, 9), out[1].depth); // modified
     try std.testing.expectEqual(@as(f64, 3), out[2].depth); // preserved
+}
+
+test "mergeNatf appends national attrs, ATTF wins on code overlap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // ATTF: OBJNAM(116)="Pier A", DRVAL1(87)="x" — each ATTL(2 LE)+ATVL+UT.
+    const attf_bytes = [_]u8{ 116, 0 } ++ "Pier A".* ++ [_]u8{iso.UT} ++ [_]u8{ 87, 0 } ++ "x".* ++ [_]u8{iso.UT};
+    // NATF: NOBJNM(301=0x012D)="Muelle A", and OBJNAM(116) again to prove ATTF wins.
+    const natf_bytes = [_]u8{ 0x2D, 0x01 } ++ "Muelle A".* ++ [_]u8{iso.UT} ++ [_]u8{ 116, 0 } ++ "LOSE".* ++ [_]u8{iso.UT};
+    const attf = try parseATTF(a, &attf_bytes);
+    const merged = try mergeNatf(a, attf, &natf_bytes);
+    const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 0, .attrs = merged };
+    try std.testing.expectEqual(@as(usize, 3), merged.len); // no duplicate 116
+    try std.testing.expectEqualStrings("Pier A", f.attr(116).?); // ATTF wins
+    try std.testing.expectEqualStrings("x", f.attr(87).?);
+    try std.testing.expectEqualStrings("Muelle A", f.attr(301).?); // NATF national name
 }
 
 test "featureQuapos majority-of-drawn-edges aggregate" {
