@@ -724,6 +724,8 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32) ![]u8 {
                 .band = @intFromEnum(lc.band),
                 .suppress_fills = bake_enc.coarseAreaSuppressed(nm, z, cov_whole),
                 .suppress_patterns = bake_enc.coarseAreaSuppressed(nm, z, cov_centre),
+                .suppress_lines = bake_enc.coarseAreaSuppressed(nm, z, cov_centre),
+                .suppress_points = bake_enc.coarseAreaSuppressed(nm, z, cov_whole),
             }) catch {};
         }
     }

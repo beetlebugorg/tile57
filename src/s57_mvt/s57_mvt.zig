@@ -271,9 +271,19 @@ const Layers = struct {
     // are dropped — the finer cell carries the real data. Fills are suppressed only
     // where a finer band covers the WHOLE tile (no seam gap; the finer fill occludes
     // via the band sort-key); patterns, which draw above all fills, are suppressed by
-    // the tile centre so they can't lap over finer land. Lines/points/text unaffected.
+    // the tile centre so they can't lap over finer land.
     suppress_fills: bool = false,
     suppress_patterns: bool = false,
+    // Best-band suppression for the remaining geometry of an overzoomed coarser cell:
+    //   suppress_lines  — drop boundary/line STROKES where a finer band covers the tile
+    //     centre. Lines double-draw beside the finer copy (no opaque fill hides them),
+    //     so this matches the Go line rule (coverageScaleAt at the tile centre).
+    //   suppress_points — drop point symbols + text where a finer band covers the WHOLE
+    //     tile. Conservative per-tile approximation of Go's per-point position test:
+    //     a partly-covered seam tile keeps the coarse points/labels (the finer cell,
+    //     drawn on top, wins where it has data); no labels lost over a coverage gap.
+    suppress_lines: bool = false,
+    suppress_points: bool = false,
 };
 
 /// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
@@ -515,7 +525,9 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         const single = try a.alloc(mvt.Point, 1);
         single[0] = pt;
         parts[0] = single;
-        for (p.points) |sym| {
+        // Best-band suppression: a finer band covers this whole tile, so drop this
+        // coarse cell's point symbols + text (the finer cell carries them).
+        if (!L.suppress_points) for (p.points) |sym| {
             var props = std.ArrayList(mvt.Prop).empty;
             try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
             try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
@@ -523,8 +535,8 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
             try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
             try appendMeta(a, &props, meta);
             try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-        }
-        for (p.texts) |t| {
+        };
+        if (!L.suppress_points) for (p.texts) |t| {
             var props = std.ArrayList(mvt.Prop).empty;
             try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
             try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
@@ -532,7 +544,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
             try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
             try appendMeta(a, &props, meta);
             try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-        }
+        };
         return;
     }
 
@@ -618,7 +630,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // Fast path: when no edge carries mask/usag info the drawn geometry equals the
     // full geometry, so reuse `projected` (and its precomputed-world-coord cull).
     var stroke_proj: []const []mvt.Point = projected.items;
-    if (p.lines.len > 0 and s57.hasBoundaryMaskInfo(f)) {
+    if (!L.suppress_lines and p.lines.len > 0 and s57.hasBoundaryMaskInfo(f)) {
         var stroke_storage = std.ArrayList([]mvt.Point).empty;
         const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
         for (dparts) |dp| {
@@ -631,7 +643,9 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         stroke_proj = stroke_storage.items;
     }
 
-    for (p.lines) |ln| {
+    // Best-band suppression: a finer band covers the tile centre, so drop this coarse
+    // cell's line strokes (they'd double-draw beside the finer copy).
+    if (!L.suppress_lines) for (p.lines) |ln| {
         // _simple_ -> solid; any named/complex line style (NAVLNE/RECTRC leading
         // lines, CTNARE limits, …) is approximated as dashed rather than a bold
         // solid stroke (full along-line symbology is a later step).
@@ -649,12 +663,13 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
             try appendMeta(a, &props, meta);
             try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
         }
-    }
+    };
 
     // Area / line labels (TextInstruction): placed at the area representative
     // point (centre of gravity; see areaRepresentativePoint). Without this only
     // point-feature labels show, so area/channel/place names were missing.
-    if (p.texts.len > 0) {
+    // (suppress_points: a finer band covers the whole tile — drop coarse labels.)
+    if (!L.suppress_points and p.texts.len > 0) {
         if (s57.areaRepresentativePoint(a, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
@@ -679,7 +694,8 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // area representative point (CentreOnArea) or along a line; place them at the rep
     // point so centred-area marks (anchorage, restricted-area/entry, marine farm, TSS
     // arrows) aren't dropped — previously p.points was only emitted for prim==1.
-    if (p.points.len > 0) {
+    // (suppress_points: a finer band covers the whole tile — drop coarse symbols.)
+    if (!L.suppress_points and p.points.len > 0) {
         if (s57.areaRepresentativePoint(a, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
@@ -990,8 +1006,9 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const texts_l = if (scamin != null) L.texts_scamin else L.texts;
     const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .band = L.band };
 
-    // Dashed CHGRD boundary on each ring (clipped to the tile).
-    for (geo_parts) |gp| {
+    // Dashed CHGRD boundary on each ring (clipped to the tile). Best-band: drop the
+    // stroke where a finer band covers the tile centre (suppress_lines).
+    if (!L.suppress_lines) for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
@@ -1006,9 +1023,11 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
         try appendMeta(a, &props, meta);
         try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
-    }
+    };
 
-    // SWPARE51 bracket + "swept to <DRVAL1>" label at the representative point.
+    // SWPARE51 bracket + "swept to <DRVAL1>" label at the representative point. Drop
+    // both where a finer band covers the whole tile (suppress_points).
+    if (L.suppress_points) return;
     const rp = s57.areaRepresentativePoint(a, geo_parts) orelse return;
     if (rp.lon() < tb[0] or rp.lon() > tb[2] or rp.lat() < tb[1] or rp.lat() > tb[3]) return;
     const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
@@ -1045,6 +1064,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// RecommendedTrack whose Curve-only S-101 rule errors). DrawingPriority 6.
 fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, color: []const u8, width: f64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
     if (f.prim != 2 and f.prim != 3) return;
+    if (L.suppress_lines) return; // coarse band over finer M_COVR (centre): drop the stroke
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
@@ -1087,10 +1107,13 @@ pub const CellRef = struct {
     /// projecting + clipping every feature of every cell (the baker's spatial cull).
     feat_bbox: ?[]const ?[4]f64 = null,
     band: u8 = 0,
-    /// Drop this coarser band cell's AREA fills / patterns where a finer band's
-    /// M_COVR data-coverage is present. See Layers.suppress_fills/suppress_patterns.
+    /// Drop this coarser band cell's AREA fills / patterns / line strokes / point
+    /// symbols+text where a finer band's M_COVR data-coverage is present. See the
+    /// Layers.suppress_* fields for the per-geometry whole-tile vs centre rules.
     suppress_fills: bool = false,
     suppress_patterns: bool = false,
+    suppress_lines: bool = false,
+    suppress_points: bool = false,
 };
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
@@ -1147,6 +1170,8 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
         Lc.band = cr.band; // so this cell's features carry its band for the sort key
         Lc.suppress_fills = cr.suppress_fills; // coarse band over finer M_COVR (whole-tile): drop fill
         Lc.suppress_patterns = cr.suppress_patterns; // coarse band over finer M_COVR (centre): drop pattern
+        Lc.suppress_lines = cr.suppress_lines; // (centre): drop coarse boundary/line strokes
+        Lc.suppress_points = cr.suppress_points; // (whole-tile): drop coarse point symbols + text
         try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 
@@ -1278,6 +1303,8 @@ fn appendCellFeatures(
             continue;
         }
 
+        // Line classes: drop the stroke where a finer band covers the tile centre.
+        if (L.suppress_lines) continue;
         for (geo_parts) |gp| {
             if (gp.len < 2) continue;
             if (!overlaps(geomBounds(gp), tb)) continue;
