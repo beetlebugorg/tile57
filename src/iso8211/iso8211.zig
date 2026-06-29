@@ -137,11 +137,30 @@ fn parseFields(a: Allocator, entries: []DirectoryEntry, field_area: []const u8) 
     return list.items;
 }
 
+// A record whose leader carries length 0 uses the ISO 8211 "length not stored"
+// convention — recover the field-area size as the furthest directory entry's end
+// (Position+Length). Some S-57 producers (e.g. USACE Inland ENCs) encode every
+// data record this way; mirrors Go's fieldAreaSizeFromDirectory.
+fn fieldAreaSizeFromDirectory(entries: []const DirectoryEntry) usize {
+    var max: usize = 0;
+    for (entries) |e| {
+        const end = e.position + e.length;
+        if (end > max) max = end;
+    }
+    return max;
+}
+
 fn parseRecord(a: Allocator, bytes: []const u8, offset: usize) !struct { rec: Record, next: usize } {
-    const leader = try Leader.parse(bytes[offset..]);
-    if (leader.record_length == 0 or offset + leader.record_length > bytes.len) return error.BadRecordLength;
+    var leader = try Leader.parse(bytes[offset..]);
+    // record_length 0 on a non-'D'/'L' leader is trailing padding => end of records.
+    if (leader.record_length == 0 and leader.leader_id != 'D' and leader.leader_id != 'L') return error.EndOfRecords;
+    // The directory occupies [24, field_area_start) regardless of record_length, so
+    // parse it first, then recover a "length not stored" (==0) record's true length.
+    if (leader.field_area_start < 24 or offset + leader.field_area_start > bytes.len) return error.BadRecordLength;
+    const entries = try parseDirectory(a, leader, bytes[offset .. offset + leader.field_area_start]);
+    if (leader.record_length == 0) leader.record_length = leader.field_area_start + fieldAreaSizeFromDirectory(entries);
+    if (leader.record_length < 24 or offset + leader.record_length > bytes.len) return error.BadRecordLength;
     const rec_bytes = bytes[offset .. offset + leader.record_length];
-    const entries = try parseDirectory(a, leader, rec_bytes);
     const field_area = rec_bytes[leader.field_area_start..];
     const fields = try parseFields(a, entries, field_area);
     return .{ .rec = .{ .leader = leader, .entries = entries, .fields = fields }, .next = offset + leader.record_length };
@@ -231,6 +250,27 @@ pub fn parse(gpa: Allocator, bytes: []const u8) !File {
 }
 
 // ---- tests --------------------------------------------------------------
+
+test "record_length==0 (length not stored) recovers size from the directory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 24-byte leader with record length "00000" (not stored), field_area_start 34,
+    // tag/len/pos sizes 4/3/2; one directory entry (tag TEST, len 5, pos 0) + FT;
+    // then the 5-byte field area "DATA"+FT. True length must resolve to 39.
+    const rec = "00000" ++ "3D 1 " ++ "00" ++ "00034" ++ "   " ++ "32 4" ++
+        "TEST00500" ++ "\x1e" ++ "DATA\x1e";
+    try std.testing.expectEqual(@as(usize, 39), rec.len);
+    const r = try parseRecord(a, rec, 0);
+    try std.testing.expectEqual(@as(usize, 39), r.rec.leader.record_length); // recovered, not 0
+    try std.testing.expectEqual(@as(usize, 39), r.next);
+    try std.testing.expectEqualSlices(u8, "DATA", r.rec.field("TEST").?);
+    // A length-0 leader that parses but is NOT a 'D'/'L' record is trailing
+    // padding -> end of records (mirrors Go's buf[6]!='D'&&!='L' io.EOF).
+    const pad = "00000" ++ "     " ++ "00" ++ "00024" ++ "   " ++ "11 1"; // id byte (pos 6) = ' '
+    try std.testing.expectEqual(@as(usize, 24), pad.len);
+    try std.testing.expectError(error.EndOfRecords, parseRecord(a, pad, 0));
+}
 
 test "subfield format control parsing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
