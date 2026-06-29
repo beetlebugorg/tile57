@@ -164,14 +164,82 @@ fn segDist(px: f64, py: f64, ax0: f64, ay0: f64, bx: f64, by: f64) f64 {
 /// Signed distance (positive inside) from scaled point (px,py) to the polygon: the
 /// min distance to any edge of any ring, with the sign from even-odd inclusion.
 /// Longitudes are pre-scaled by kx so distances are in roughly equal ground units.
+///
+/// Hot path of the pole-of-inaccessibility search (~60% of the bake): the same rings
+/// are evaluated at thousands of candidate points, and `segDist`'s `divsd`/`sqrtsd`
+/// dominate. Edges are processed `W` at a time with `@Vector` so those land as packed
+/// `divpd`/`sqrtpd`. Output is bit-for-bit identical to the scalar form:
+///   - `best` is a float-min reduction; `segDist` returns `@sqrt` of a finite
+///     non-negative sum, never NaN, so min is order-independent and exact.
+///   - `inside` is an even-odd parity (XOR) over crossing edges, order-independent.
+///   - each lane reproduces the scalar op sequence exactly. The branchless `segDist`
+///     matches the branched scalar one in every case: when `ex==ey==0` the scalar
+///     skips `t` and clamps to `a`; here `t = 0/0 = NaN`, and `t>0`/`t>1` are both
+///     false (NaN compares false), so the same `a` is selected. Divisions in masked-
+///     off lanes can produce inf/NaN but are discarded (SSE2 masks FP exceptions).
+/// `@Vector` lowers to scalar on targets without SIMD (e.g. WASM), so this is portable.
 fn polySignedDist(rings: []const []LonLat, kx: f64, px: f64, py: f64) f64 {
+    const W = 4;
+    const VF = @Vector(W, f64);
+    const VI = @Vector(W, i32);
     var inside = false;
     var best: f64 = std.math.inf(f64);
+
+    const pxv: VF = @splat(px);
+    const pyv: VF = @splat(py);
+    const kxv: VF = @splat(kx);
+    const e7v: VF = @splat(E7);
+    const zero: VF = @splat(0.0);
+    const one: VF = @splat(1.0);
+    var bestv: VF = @splat(std.math.inf(f64));
+    var parityv: @Vector(W, u1) = @splat(0);
+
     for (rings) |ring| {
         const n = ring.len;
         if (n == 0) continue;
-        var j: usize = n - 1;
         var i: usize = 0;
+        // Vectorised body: process W edges (a=ring[i+k], b=previous vertex) at once.
+        while (i + W <= n) : (i += W) {
+            var alon: [W]i32 = undefined;
+            var alat: [W]i32 = undefined;
+            var blon: [W]i32 = undefined;
+            var blat: [W]i32 = undefined;
+            inline for (0..W) |k| {
+                const ii = i + k;
+                const jj = if (ii == 0) n - 1 else ii - 1;
+                alon[k] = ring[ii].lon_e7;
+                alat[k] = ring[ii].lat_e7;
+                blon[k] = ring[jj].lon_e7;
+                blat[k] = ring[jj].lat_e7;
+            }
+            // Scaled coords: per lane (f64(lon_e7)/E7)*kx and f64(lat_e7)/E7 — the
+            // exact op order of LonLat.lon()/lat() and the *kx pre-scale.
+            const ax = (@as(VF, @floatFromInt(@as(VI, alon))) / e7v) * kxv;
+            const ay = @as(VF, @floatFromInt(@as(VI, alat))) / e7v;
+            const bx = (@as(VF, @floatFromInt(@as(VI, blon))) / e7v) * kxv;
+            const by = @as(VF, @floatFromInt(@as(VI, blat))) / e7v;
+
+            // Even-odd crossing: c1 && c2, accumulated as parity (XOR).
+            const c1 = (ay > pyv) != (by > pyv);
+            const val = (bx - ax) * (pyv - ay) / (by - ay) + ax;
+            const c2 = pxv < val;
+            const crossing = @select(bool, c1, c2, @as(@Vector(W, bool), @splat(false)));
+            parityv ^= @select(u1, crossing, @as(@Vector(W, u1), @splat(1)), @as(@Vector(W, u1), @splat(0)));
+
+            // Branchless segDist (point-to-segment), per-lane identical to scalar.
+            const ex = bx - ax;
+            const ey = by - ay;
+            const t = ((pxv - ax) * ex + (pyv - ay) * ey) / (ex * ex + ey * ey);
+            const projx = ax + ex * t;
+            const projy = ay + ey * t;
+            const cx = @select(f64, t > one, bx, @select(f64, t > zero, projx, ax));
+            const cy = @select(f64, t > one, by, @select(f64, t > zero, projy, ay));
+            const dx = pxv - cx;
+            const dy = pyv - cy;
+            bestv = @min(bestv, @sqrt(dx * dx + dy * dy));
+        }
+        // Scalar remainder (and whole ring when n < W): original code, edge by edge.
+        var j: usize = if (i == 0) n - 1 else i - 1;
         while (i < n) : (i += 1) {
             const ax = ring[i].lon() * kx;
             const ay = ring[i].lat();
@@ -185,6 +253,8 @@ fn polySignedDist(rings: []const []LonLat, kx: f64, px: f64, py: f64) f64 {
             j = i;
         }
     }
+    best = @min(best, @reduce(.Min, bestv));
+    if (@reduce(.Xor, parityv) == 1) inside = !inside;
     return if (inside) best else -best;
 }
 
@@ -261,6 +331,49 @@ pub fn areaRepresentativePoint(a: std.mem.Allocator, rings: []const []LonLat) ?L
         pq.push(a, plMkCell(rings, kx, c.x + hh, c.y + hh, hh)) catch break;
     }
     return LonLat.init(best.x / kx, best.y);
+}
+
+fn polySignedDistRef(rings: []const []LonLat, kx: f64, px: f64, py: f64) f64 {
+    var inside = false;
+    var best: f64 = std.math.inf(f64);
+    for (rings) |ring| {
+        const n = ring.len;
+        if (n == 0) continue;
+        var j: usize = n - 1;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const ax = ring[i].lon() * kx;
+            const ay = ring[i].lat();
+            const bx = ring[j].lon() * kx;
+            const by = ring[j].lat();
+            if ((ay > py) != (by > py) and px < (bx - ax) * (py - ay) / (by - ay) + ax) {
+                inside = !inside;
+            }
+            const d = segDist(px, py, ax, ay, bx, by);
+            if (d < best) best = d;
+            j = i;
+        }
+    }
+    return if (inside) best else -best;
+}
+
+test "vectorised polySignedDist is bit-identical to the scalar reference" {
+    const t = std.testing;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+    var buf: [40]LonLat = undefined;
+    var trial: usize = 0;
+    while (trial < 5000) : (trial += 1) {
+        const n = rnd.intRangeAtMost(usize, 1, buf.len); // exercise all W-remainder splits
+        for (0..n) |k| buf[k] = .{ .lon_e7 = rnd.int(i32), .lat_e7 = rnd.int(i32) };
+        var rings = [_][]LonLat{buf[0..n]};
+        const kx = rnd.float(f64);
+        const px = (rnd.float(f64) - 0.5) * 400.0;
+        const py = (rnd.float(f64) - 0.5) * 200.0;
+        const got = polySignedDist(rings[0..], kx, px, py);
+        const ref = polySignedDistRef(rings[0..], kx, px, py);
+        try t.expectEqual(@as(u64, @bitCast(ref)), @as(u64, @bitCast(got)));
+    }
 }
 
 test "area representative point centres on the centroid when inside" {
