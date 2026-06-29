@@ -1018,7 +1018,9 @@ fn mergeFile(
                 } else return error.ModifyMissingSpatial;
                 continue;
             }
-            // insert (1) — upsert
+            // insert (1) — upsert. RUIN values other than insert/delete/modify are
+            // invalid; the oracle errors (updates.go:351), dropping the cell.
+            if (is_update and ruin != 1) return error.UnknownRUIN;
             if (vidx.get(key)) |i| {
                 vecs.items[i] = v;
             } else {
@@ -1059,6 +1061,8 @@ fn mergeFile(
                 } else return error.ModifyMissingFeature;
                 continue;
             }
+            // insert (1) — upsert. See the spatial branch: unknown RUIN errors.
+            if (is_update and ruin != 1) return error.UnknownRUIN;
             if (fidx.get(key)) |i| {
                 feats.items[i] = f;
             } else {
