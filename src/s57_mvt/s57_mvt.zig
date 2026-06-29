@@ -50,14 +50,27 @@ fn classify(objl: u16) Class {
     };
 }
 
+/// True if the S-57 comma-separated list value `csv` contains any of `targets`.
+/// (Mirrors s101_adapt.hasListVal; S-57 list attributes are comma-joined.)
+fn listHasAny(csv: []const u8, targets: []const i64) bool {
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |p| {
+        const n = std.fmt.parseInt(i64, std.mem.trim(u8, p, " "), 10) catch continue;
+        for (targets) |t| if (n == t) return true;
+    }
+    return false;
+}
+
 /// Port of SNDFRM04's sounding glyph composition: build the comma-joined glyph-name
 /// string for a depth and prefix ("SOUNDS" bold/shallow or "SOUNDG" faint/deep).
-/// Covers the negative-value A-prefix (drying heights) and the full magnitude range
-/// up to 5 digits. STILL omits the swept (B1) and low-accuracy-ring (C2/C3) prefixes
-/// — those need quality attributes (techniqueOf/qualityOfVerticalMeasurement, status,
-/// spatial QUAPOS) we don't read yet — so soundings flagged with those won't match a
-/// sprite composite; the common ones do.
-fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64) ![]const u8 {
+/// Covers the swept (B1) and low-accuracy-ring (C3 shallow / C2 deep) quality
+/// prefixes, the negative-value A-prefix (drying heights), and the full magnitude
+/// range up to 5 digits. Glyph order matches the rule: B1, ring, A-prefix, digits.
+/// `swept`/`low_acc` come from the feature's quality attributes (TECSOU/QUASOU/
+/// STATUS). NOTE: the rule's spatial-QUAPOS fallback for the ring (when the direct
+/// attrs are absent) is not yet wired — soundings whose only low-accuracy signal is
+/// a poor spatial quality-of-position still miss the ring; the direct attrs match.
+fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: bool) ![]const u8 {
     const d = @abs(depth);
     // Round to tenths: depth is an f64 (z/somf), so naive truncation would hit binary
     // FP off-by-one on the tenths digit (12.3 stored as 12.299999…). Rounding d*10
@@ -69,6 +82,15 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64) ![]const u8 {
     var dbuf: [12]u8 = undefined;
     const ds = std.fmt.bufPrint(&dbuf, "{d}", .{idepth}) catch return "";
     var toks = std.ArrayList([]const u8).empty;
+
+    // Quality prefixes lead the composite (SNDFRM04:37-51). Swept soundings get a B1
+    // ring; low-accuracy ones get a ring sized to the variant — C3 on the shallow
+    // SOUNDS glyph, C2 on the deep SOUNDG glyph (the rule's lowAccuracySymbolRing).
+    if (swept) try toks.append(a, try std.fmt.allocPrint(a, "{s}B1", .{prefix}));
+    if (low_acc) {
+        const ring = if (std.mem.eql(u8, prefix, "SOUNDS")) "C3" else "C2";
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, ring }));
+    }
 
     // Negative soundings (drying heights / heights above datum) get an A-prefix ring
     // (SNDFRM04:62-68): A3 if |d|>=10 with a fraction, A2 if |d|>=10 whole, else A1.
@@ -119,11 +141,16 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64) ![]const u8 {
 /// the mariner safety-depth switch (soundings_image) render the depth digits.
 fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, z: u8, x: u32, y: u32, tb: [4]f64, out: *std.ArrayList(mvt.Feature)) !void {
     const snds = cell.soundingsFor(a, f) catch return;
+    // Per-feature quality flags (SNDFRM04): swept => B1, low-accuracy => C2/C3 ring.
+    // These attributes apply to the whole SOUNDG feature, so derive them once.
+    const swept = listHasAny(f.attr(s57.ATTR_TECSOU) orelse "", &.{ 4, 18 });
+    const low_acc = listHasAny(f.attr(s57.ATTR_QUASOU) orelse "", &.{ 3, 4, 5, 8, 9 }) or
+        listHasAny(f.attr(s57.ATTR_STATUS) orelse "", &.{18});
     for (snds) |s| {
         if (s.lon() < tb[0] or s.lon() > tb[2] or s.lat() < tb[1] or s.lat() > tb[3]) continue;
-        const sym_s = try sndfrmSyms(a, "SOUNDS", s.depth);
+        const sym_s = try sndfrmSyms(a, "SOUNDS", s.depth, swept, low_acc);
         if (sym_s.len == 0) continue;
-        const sym_g = try sndfrmSyms(a, "SOUNDG", s.depth);
+        const sym_g = try sndfrmSyms(a, "SOUNDG", s.depth, swept, low_acc);
         const pt = tile.project(s.lon(), s.lat(), z, x, y, tile.EXTENT);
         const parts = try a.alloc([]const mvt.Point, 1);
         const single = try a.alloc(mvt.Point, 1);
@@ -1634,23 +1661,39 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("SOUNDS12,SOUNDS57", try sndfrmSyms(a, "SOUNDS", 2.7));
-    try std.testing.expectEqualStrings("SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", 0.6));
-    try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0));
-    try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6));
-    try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0));
+    try std.testing.expectEqualStrings("SOUNDS12,SOUNDS57", try sndfrmSyms(a, "SOUNDS", 2.7, false, false));
+    try std.testing.expectEqualStrings("SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", 0.6, false, false));
+    try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, false, false));
+    try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6, false, false));
+    try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0, false, false));
 
     // >= 1000 m (4-digit, codes 2,1,0,4) — previously dropped entirely.
-    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG12,SOUNDG03,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 1234.0));
-    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG10,SOUNDG00,SOUNDG40", try sndfrmSyms(a, "SOUNDG", 1000.0));
+    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG12,SOUNDG03,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 1234.0, false, false));
+    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG10,SOUNDG00,SOUNDG40", try sndfrmSyms(a, "SOUNDG", 1000.0, false, false));
     // >= 10000 m (5-digit, codes 3,2,1,0,4) — deepest oceans.
-    try std.testing.expectEqualStrings("SOUNDG31,SOUNDG20,SOUNDG19,SOUNDG09,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 10994.0));
+    try std.testing.expectEqualStrings("SOUNDG31,SOUNDG20,SOUNDG19,SOUNDG09,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 10994.0, false, false));
 
     // Negative soundings (drying heights): A-prefix ring by sign/magnitude.
-    try std.testing.expectEqualStrings("SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3));
-    try std.testing.expectEqualStrings("SOUNDSA2,SOUNDS11,SOUNDS05", try sndfrmSyms(a, "SOUNDS", -15.0));
-    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", -5.0));
-    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", -0.6));
+    try std.testing.expectEqualStrings("SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, false, false));
+    try std.testing.expectEqualStrings("SOUNDSA2,SOUNDS11,SOUNDS05", try sndfrmSyms(a, "SOUNDS", -15.0, false, false));
+    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", -5.0, false, false));
+    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", -0.6, false, false));
+
+    // Quality prefixes (SNDFRM04:37-51): B1 (swept) and the low-accuracy ring lead
+    // the composite, ring sized to the variant (C3 shallow / C2 deep).
+    try std.testing.expectEqualStrings("SOUNDSB1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, true, false));
+    try std.testing.expectEqualStrings("SOUNDSC3,SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, false, true));
+    try std.testing.expectEqualStrings("SOUNDGC2,SOUNDG15", try sndfrmSyms(a, "SOUNDG", 5.0, false, true));
+    // B1 then ring then A-prefix then digits, all together.
+    try std.testing.expectEqualStrings("SOUNDSB1,SOUNDSC3,SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, true, true));
+}
+
+test "listHasAny splits S-57 comma lists and matches any target" {
+    try std.testing.expect(listHasAny("4", &.{ 4, 18 }));
+    try std.testing.expect(listHasAny("6,18", &.{ 4, 18 }));
+    try std.testing.expect(listHasAny(" 3 , 7 ", &.{ 3, 4, 5, 8, 9 }));
+    try std.testing.expect(!listHasAny("1,2,6", &.{ 4, 18 }));
+    try std.testing.expect(!listHasAny("", &.{18}));
 }
 
 test "orientAreaRings subtracts a hole: exterior CW (+), interior CCW (-)" {
