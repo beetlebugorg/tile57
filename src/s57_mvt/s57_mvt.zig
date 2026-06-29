@@ -613,12 +613,30 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // contourValdco fix (no `> 0` drop).
     const valdco: ?f64 = if (f.objl == 43) f.attrFloat(s57.ATTR_VALDCO) else null;
 
+    // S-52 §8.6.2: masked (MASK==1) / data-limit (USAG==3) boundary edges must NOT be
+    // drawn. The FILL above keeps full rings; the STROKE uses the drawable subset.
+    // Fast path: when no edge carries mask/usag info the drawn geometry equals the
+    // full geometry, so reuse `projected` (and its precomputed-world-coord cull).
+    var stroke_proj: []const []mvt.Point = projected.items;
+    if (p.lines.len > 0 and s57.hasBoundaryMaskInfo(f)) {
+        var stroke_storage = std.ArrayList([]mvt.Point).empty;
+        const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
+        for (dparts) |dp| {
+            if (dp.len < 2) continue;
+            if (!overlaps(geomBounds(dp), tb)) continue;
+            const proj = try a.alloc(mvt.Point, dp.len);
+            for (dp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+            try stroke_storage.append(a, proj);
+        }
+        stroke_proj = stroke_storage.items;
+    }
+
     for (p.lines) |ln| {
         // _simple_ -> solid; any named/complex line style (NAVLNE/RECTRC leading
         // lines, CTNARE limits, …) is approximated as dashed rather than a bold
         // solid stroke (full along-line symbology is a later step).
         const dash: []const u8 = if (std.mem.eql(u8, ln.style, "solid")) "solid" else "dashed";
-        for (projected.items) |proj| {
+        for (stroke_proj) |proj| {
             const sub = try clipSimplifyLine(a, proj, box);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);

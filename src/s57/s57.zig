@@ -374,6 +374,17 @@ pub fn isLowAccuracyQuapos(q: i32) bool {
     return q != 0 and q != 1 and q != 10 and q != 11;
 }
 
+/// True when any FSPT edge ref carries MASK/USAG masking info (S-52 §8.6.2). When
+/// false the drawn geometry equals the full geometry, so callers keep the fast path
+/// (the precomputed/full parts) instead of re-assembling a drawable subset.
+pub fn hasBoundaryMaskInfo(f: Feature) bool {
+    for (f.refs) |ref| {
+        if (ref.name.rcnm != RCNM_VE) continue;
+        if (ref.mask != 0 or ref.usag != 0) return true;
+    }
+    return false;
+}
+
 pub const Attr = struct { code: u16, value: []const u8 };
 
 pub const Feature = struct {
@@ -497,6 +508,61 @@ pub const Cell = struct {
             try out.appendSlice(a, items);
         }
         return out.items;
+    }
+
+    /// Like lineGeometryParts but for the DRAWN boundary/line geometry (S-52 §8.6.2):
+    /// edges flagged MASK==1 (masked) or USAG==3 (exterior boundary truncated by the
+    /// data limit) are dropped, so they don't stroke as spurious boundary lines. A
+    /// dropped (or degenerate) edge breaks continuity, so the next drawn edge starts a
+    /// fresh part. The FILL geometry (lineGeometryParts) is deliberately untouched —
+    /// the fill still uses complete rings. Only meaningful when hasBoundaryMaskInfo(f).
+    pub fn drawableLineParts(self: Cell, a: Allocator, f: Feature) ![][]LonLat {
+        var parts = std.ArrayList([]LonLat).empty;
+        var cur = std.ArrayList(LonLat).empty;
+        var broken = false;
+        for (f.refs) |ref| {
+            if (ref.name.rcnm != RCNM_VE) continue;
+            if (ref.mask == 1 or ref.usag == 3) {
+                if (cur.items.len > 0) {
+                    try parts.append(a, cur.items);
+                    cur = std.ArrayList(LonLat).empty;
+                }
+                broken = true; // masked / data-limit edge: not drawn, breaks the chain
+                continue;
+            }
+            const edge = try self.edgeCoordsRaw(a, ref.name.rcid, ref.ornt);
+            if (edge.len == 0) {
+                if (cur.items.len > 0) {
+                    try parts.append(a, cur.items);
+                    cur = std.ArrayList(LonLat).empty;
+                }
+                broken = true; // degenerate edge still interrupts continuity
+                continue;
+            }
+            if (cur.items.len == 0 or broken) {
+                if (cur.items.len > 0) {
+                    try parts.append(a, cur.items);
+                    cur = std.ArrayList(LonLat).empty;
+                }
+                try cur.appendSlice(a, edge);
+                broken = false;
+                continue;
+            }
+            const tail = cur.items[cur.items.len - 1];
+            const last = edge[edge.len - 1];
+            if (tail.lon_e7 == edge[0].lon_e7 and tail.lat_e7 == edge[0].lat_e7) {
+                try cur.appendSlice(a, edge[1..]);
+            } else if (tail.lon_e7 == last.lon_e7 and tail.lat_e7 == last.lat_e7) {
+                std.mem.reverse(LonLat, edge);
+                try cur.appendSlice(a, edge[1..]);
+            } else {
+                try parts.append(a, cur.items);
+                cur = std.ArrayList(LonLat).empty;
+                try cur.appendSlice(a, edge);
+            }
+        }
+        if (cur.items.len > 0) try parts.append(a, cur.items);
+        return parts.items;
     }
 
     /// A point feature's coordinate (its isolated/connected node).
@@ -1096,6 +1162,70 @@ test "featureQuapos majority-of-drawn-edges aggregate" {
     };
     const f2 = Feature{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 30, .refs = &refs2 };
     try std.testing.expectEqual(@as(i32, 0), cell.featureQuapos(f2));
+}
+
+test "drawableLineParts drops MASK/USAG edges and breaks the chain" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Three collinear edges that join tail-to-head into one chain (0,0)->(3,0).
+    const vectors = try aa.alloc(VectorRecord, 3);
+    vectors[0] = .{ .rcnm = RCNM_VE, .rcid = 10, .points = try aa.dupe(LonLat, &.{ LonLat.init(0, 0), LonLat.init(1, 0) }), .soundings = &.{} };
+    vectors[1] = .{ .rcnm = RCNM_VE, .rcid = 11, .points = try aa.dupe(LonLat, &.{ LonLat.init(1, 0), LonLat.init(2, 0) }), .soundings = &.{} };
+    vectors[2] = .{ .rcnm = RCNM_VE, .rcid = 12, .points = try aa.dupe(LonLat, &.{ LonLat.init(2, 0), LonLat.init(3, 0) }), .soundings = &.{} };
+
+    var edges = std.AutoHashMap(u32, usize).init(aa);
+    try edges.put(10, 0);
+    try edges.put(11, 1);
+    try edges.put(12, 2);
+
+    var cell = Cell{
+        .params = .{},
+        .vectors = vectors,
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, LonLat).init(aa),
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(aa),
+        .arena = std.heap.ArenaAllocator.init(a),
+    };
+    defer cell.arena.deinit();
+
+    // No mask info -> full geometry; gate is false, drawable == full (one chain).
+    const refs_full = [_]SpatialRef{
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 10 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 11 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 12 }, .ornt = 1 },
+    };
+    const f_full = Feature{ .rcnm = 100, .rcid = 1, .prim = 2, .objl = 30, .refs = &refs_full };
+    try std.testing.expect(!hasBoundaryMaskInfo(f_full));
+    try std.testing.expectEqual(@as(usize, 1), (try cell.lineGeometryParts(aa, f_full)).len);
+    try std.testing.expectEqual(@as(usize, 1), (try cell.drawableLineParts(aa, f_full)).len);
+
+    // Mask the middle edge: fill still one ring, drawn boundary splits into two parts
+    // with the masked segment removed.
+    const refs_masked = [_]SpatialRef{
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 10 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 11 }, .ornt = 1, .mask = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 12 }, .ornt = 1 },
+    };
+    const f_masked = Feature{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 30, .refs = &refs_masked };
+    try std.testing.expect(hasBoundaryMaskInfo(f_masked));
+    try std.testing.expectEqual(@as(usize, 1), (try cell.lineGeometryParts(aa, f_masked)).len); // fill untouched
+    const drawn = try cell.drawableLineParts(aa, f_masked);
+    try std.testing.expectEqual(@as(usize, 2), drawn.len);
+    try std.testing.expectEqual(@as(usize, 2), drawn[0].len); // (0,0)-(1,0)
+    try std.testing.expectEqual(@as(usize, 2), drawn[1].len); // (2,0)-(3,0)
+
+    // USAG==3 (data-limit) is dropped the same way.
+    const refs_usag = [_]SpatialRef{
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 10 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 11 }, .ornt = 1, .usag = 3 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 12 }, .ornt = 1 },
+    };
+    const f_usag = Feature{ .rcnm = 100, .rcid = 3, .prim = 2, .objl = 30, .refs = &refs_usag };
+    try std.testing.expectEqual(@as(usize, 2), (try cell.drawableLineParts(aa, f_usag)).len);
 }
 
 test "parse SG2D coordinates to lon/lat" {
