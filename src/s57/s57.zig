@@ -961,7 +961,11 @@ fn mergeFile(
             const key = vkey.of(rcnm, rcid);
 
             if (ruin == 2) { // delete
-                if (vidx.get(key)) |i| vecs.items[i] = null;
+                // Drop the index entry too (not just tombstone the slot): the oracle
+                // removes the record from its map, so a later re-INSERT of the same key
+                // appends a fresh record at the end (rather than reviving this slot in
+                // place) and a MODIFY-after-delete finds nothing.
+                if (vidx.fetchRemove(key)) |kv| vecs.items[kv.value] = null;
                 continue;
             }
             var v = VectorRecord{ .rcnm = rcnm, .rcid = rcid, .points = &.{}, .soundings = &.{} };
@@ -1026,7 +1030,9 @@ fn mergeFile(
             const key = if (rec.field("FOID")) |fo| foidKey(fo) else vkey.of(f.rcnm, f.rcid);
 
             if (ruin == 2) {
-                if (fidx.get(key)) |i| feats.items[i] = null;
+                // See the spatial-delete note: drop the index entry so re-INSERT
+                // appends and MODIFY-after-delete is treated as missing.
+                if (fidx.fetchRemove(key)) |kv| feats.items[kv.value] = null;
                 continue;
             }
             if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
