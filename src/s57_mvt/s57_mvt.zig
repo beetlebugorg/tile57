@@ -50,20 +50,40 @@ fn classify(objl: u16) Class {
     };
 }
 
-/// Port of SNDFRM04's core digit composition (the SOUNDG03 path): build the
-/// comma-joined sounding glyph-name string for a depth and prefix ("SOUNDS"
-/// bold/shallow or "SOUNDG" faint/deep). Omits the swept / low-accuracy-ring /
-/// negative-value prefixes (they need quality attributes we don't read yet), so
-/// soundings flagged with those won't match a sprite composite; the common ones
-/// do. Returns "" for depths we don't compose (>= 1000 m).
+/// Port of SNDFRM04's sounding glyph composition: build the comma-joined glyph-name
+/// string for a depth and prefix ("SOUNDS" bold/shallow or "SOUNDG" faint/deep).
+/// Covers the negative-value A-prefix (drying heights) and the full magnitude range
+/// up to 5 digits. STILL omits the swept (B1) and low-accuracy-ring (C2/C3) prefixes
+/// — those need quality attributes (techniqueOf/qualityOfVerticalMeasurement, status,
+/// spatial QUAPOS) we don't read yet — so soundings flagged with those won't match a
+/// sprite composite; the common ones do.
 fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64) ![]const u8 {
     const d = @abs(depth);
+    // Round to tenths: depth is an f64 (z/somf), so naive truncation would hit binary
+    // FP off-by-one on the tenths digit (12.3 stored as 12.299999…). Rounding d*10
+    // recovers the exact tenths for all 0.1 m-precision SOUNDG data (somf=10), which
+    // equals the oracle's decimal-string first-fractional digit (SNDFRM04:53-72).
     const tenths: i64 = @intFromFloat(@round(d * 10.0));
     const idepth: i64 = @divTrunc(tenths, 10);
     const frac: u8 = @intCast(@mod(tenths, 10));
-    var dbuf: [8]u8 = undefined;
+    var dbuf: [12]u8 = undefined;
     const ds = std.fmt.bufPrint(&dbuf, "{d}", .{idepth}) catch return "";
     var toks = std.ArrayList([]const u8).empty;
+
+    // Negative soundings (drying heights / heights above datum) get an A-prefix ring
+    // (SNDFRM04:62-68): A3 if |d|>=10 with a fraction, A2 if |d|>=10 whole, else A1.
+    // (Only SOUNDS* A-glyphs exist — a negative sounding is always <= safety depth so
+    // the style picks the SOUNDS variant; the SOUNDG variant is composed but unused.)
+    if (depth < 0) {
+        if (idepth >= 10 and frac != 0) {
+            try toks.append(a, try std.fmt.allocPrint(a, "{s}A3", .{prefix}));
+        } else if (idepth >= 10) {
+            try toks.append(a, try std.fmt.allocPrint(a, "{s}A2", .{prefix}));
+        } else {
+            try toks.append(a, try std.fmt.allocPrint(a, "{s}A1", .{prefix}));
+        }
+    }
+
     if (idepth < 10) {
         try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[0] }));
         if (frac != 0) try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
@@ -78,7 +98,19 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64) ![]const u8 {
         try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
         try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
         try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[2] }));
-    } else return "";
+    } else if (idepth < 10000) {
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[2] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}4{c}", .{ prefix, ds[3] }));
+    } else {
+        // >= 10000 m (deepest oceans ~11 km): 5 digits at codes 3,2,1,0,4.
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}3{c}", .{ prefix, ds[0] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[1] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[2] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[3] }));
+        try toks.append(a, try std.fmt.allocPrint(a, "{s}4{c}", .{ prefix, ds[4] }));
+    }
     return std.mem.join(a, ",", toks.items);
 }
 
@@ -1487,6 +1519,18 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0));
     try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6));
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0));
+
+    // >= 1000 m (4-digit, codes 2,1,0,4) — previously dropped entirely.
+    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG12,SOUNDG03,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 1234.0));
+    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG10,SOUNDG00,SOUNDG40", try sndfrmSyms(a, "SOUNDG", 1000.0));
+    // >= 10000 m (5-digit, codes 3,2,1,0,4) — deepest oceans.
+    try std.testing.expectEqualStrings("SOUNDG31,SOUNDG20,SOUNDG19,SOUNDG09,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 10994.0));
+
+    // Negative soundings (drying heights): A-prefix ring by sign/magnitude.
+    try std.testing.expectEqualStrings("SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3));
+    try std.testing.expectEqualStrings("SOUNDSA2,SOUNDS11,SOUNDS05", try sndfrmSyms(a, "SOUNDS", -15.0));
+    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", -5.0));
+    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", -0.6));
 }
 
 test "orientAreaRings subtracts a hole: exterior CW (+), interior CCW (-)" {
