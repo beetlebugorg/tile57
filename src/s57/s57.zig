@@ -1030,6 +1030,13 @@ fn mergeFile(
         } else if (rec.field("FRID")) |frid| {
             if (frid.len < 12) continue;
             // RCNM(1) RCID(4) PRIM(1)@5 GRUP(1)@6 OBJL(2)@7 RVER(2)@9 RUIN(1)@11
+            // FRID byte[0] (RCNM) must be 100 for a feature record (§7.6.1). The oracle
+            // skips a non-100 record in the base (parseFeatureRecord -> nil) and errors
+            // on one in an update (applyFeatureUpdate -> "failed to parse feature record").
+            if (frid[0] != 100) {
+                if (is_update) return error.BadFeatureRecord;
+                continue;
+            }
             const ruin: u8 = if (is_update) frid[11] else 1;
             var f = Feature{ .rcnm = frid[0], .rcid = u32le(frid, 1), .prim = frid[5], .objl = u16le(frid, 7) };
             const key = if (rec.field("FOID")) |fo| foidKey(fo) else vkey.of(f.rcnm, f.rcid);
