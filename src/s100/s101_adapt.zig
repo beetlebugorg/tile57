@@ -246,10 +246,14 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
                 try attrs.append(a, .{ .name = aname, .value = v });
         }
 
-        // featureName[1].name from OBJNAM (text labels).
+        // featureName[1] from OBJNAM. language + nameUsage are mandatory: the
+        // framework's GetFeatureName requires nameUsage (and prefers language=='eng');
+        // without them PortrayFeatureName emits no text (mirrors Go complex.go:90-92).
         if (name.len > 0) {
-            const subs = try a.alloc(NameVal, 1);
+            const subs = try a.alloc(NameVal, 3);
             subs[0] = .{ .name = "name", .value = name };
+            subs[1] = .{ .name = "language", .value = "eng" };
+            subs[2] = .{ .name = "nameUsage", .value = "1" }; // selected even if language differs
             try complex.append(a, .{ .name = "featureName", .subs = subs });
         }
         // zoneOfConfidence[1].categoryOfZoneOfConfidenceInData from M_QUAL CATZOC,

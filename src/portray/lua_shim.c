@@ -715,7 +715,15 @@ int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int si
         "for _,item in ipairs(portrayalContext.FeaturePortrayalItems) do\n"
         "  local feature=item.Feature\n"
         "  local fp=item:NewFeaturePortrayal()\n"
-        "  local ok,err=pcall(function() require(feature.Code); _G[feature.Code](feature,fp,ctx) end)\n"
+        // After the class rule runs, fall back to PortrayFeatureName when the rule
+        // didn't self-label (fp.GetFeatureNameCalled) — this is how place/area/region
+        // names etc. get their centred black label (mirrors Go engine.go:374-376 /
+        // main.lua). vg is the rule's returned viewing group.
+        "  local ok,err=pcall(function()\n"
+        "    require(feature.Code)\n"
+        "    local vg=_G[feature.Code](feature,fp,ctx)\n"
+        "    if not fp.GetFeatureNameCalled then PortrayFeatureName(feature,fp,ctx,32,24,vg,nil,'TextAlignHorizontal:Center;TextAlignVertical:Top;LocalOffset:0,-3.51;FontColor:CHBLK') end\n"
+        "  end)\n"
         "  local instr\n"
         "  if ok then nok=nok+1; instr=table.concat(fp.DrawingInstructions, ';')\n"
         // A feature whose own class has no rule file is NOT an error: the catalogue
