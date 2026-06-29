@@ -18,6 +18,7 @@ class RangeHandler(http.server.SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")  # allow cross-origin fetch
+        self.send_header("Cache-Control", "no-store")  # always serve fresh (no stale app.js)
         super().end_headers()
 
     def do_GET(self):

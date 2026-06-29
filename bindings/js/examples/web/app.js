@@ -18,10 +18,10 @@ maplibregl.addProtocol('pmtiles', protocol.tile);
 // (MapLibre Tile); ?fmt=mvt uses the MVT bake; ?pmtiles=<path> overrides the archive.
 const params = new URLSearchParams(location.search);
 const isMlt = params.get('fmt') !== 'mvt';
-const pmtilesPath = params.get('pmtiles') || (isMlt ? 'chart-mlt/tiles/chart.pmtiles' : 'chart/tiles/chart.pmtiles');
+const pmtilesPath = params.get('pmtiles') || (isMlt ? 'bundle/tiles/chart.pmtiles' : 'chart/tiles/chart.pmtiles');
 const PMTILES = 'pmtiles://' + new URL(pmtilesPath, location.href).href;
-const SPRITE = new URL('chart/assets/sprite-mln', location.href).href;
-const GLYPHS = 'https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf'; // public "Noto Sans Regular"
+const SPRITE = new URL('bundle/assets/sprite-mln', location.href).href;
+const GLYPHS = 'glyphs/{fontstack}/{range}.pbf'; // vendored Noto Sans Regular (self-contained)
 
 // Read the mariner settings off the control panel (omitted fields fall back to the
 // engine's canonical defaults).
@@ -54,15 +54,22 @@ async function main() {
     return style;
   };
 
-  // Camera from the baked bundle's manifest (anchor = [lon, lat]); sane fallback.
-  let center = [-76.31, 38.70];
+  // Camera: a data-rich default (a globe-spanning catalogue's manifest anchor is
+  // its bbox centre — meaningless, e.g. lon 0). minZoom comes from the manifest so
+  // you can't zoom out past the data's lowest level into a blank map.
+  let center = [-76.49, 38.97]; // Annapolis — present in the NOAA catalogue
   let zoom = 12;
+  let minZoom = 8;
   try {
-    const mf = await (await fetch('chart/manifest.json')).json();
-    if (Array.isArray(mf?.data?.anchor)) center = mf.data.anchor;
-  } catch { /* keep fallback */ }
+    const mf = await (await fetch('bundle/manifest.json')).json();
+    if (Number.isFinite(mf?.data?.minzoom)) minZoom = mf.data.minzoom;
+    const bb = mf?.data?.bbox;
+    const a = mf?.data?.anchor;
+    // Use the manifest anchor only for a regional bake (non-global coverage).
+    if (Array.isArray(a) && Array.isArray(bb) && bb[2] - bb[0] < 180) center = a;
+  } catch { /* keep defaults */ }
 
-  const map = new maplibregl.Map({ container: 'map', style: buildStyle(), center, zoom, hash: true });
+  const map = new maplibregl.Map({ container: 'map', style: buildStyle(), center, zoom, minZoom, hash: true });
   map.addControl(new maplibregl.NavigationControl());
   map.on('error', (e) => err(e.error?.message || e.error || 'map error'));
 
