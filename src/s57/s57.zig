@@ -553,6 +553,13 @@ pub const Cell = struct {
     /// S-57 App. B.1 Annex A §17 scn 2. Arena-backed (freed with the cell); empty for
     /// cells with no coast.
     coast_edges: std.AutoHashMapUnmanaged(u32, void) = .{},
+    /// Per-feature area representative (label) point, indexed by feature index; built
+    /// once per cell by the baker (s57_mvt.buildLabelCache) so the per-tile emit reuses
+    /// it instead of re-running the pole-of-inaccessibility (polylabel) search for every
+    /// tile a feature touches — the dominant bake cost. null = not built (the live
+    /// single-tile path falls back to an on-demand search). Allocated in the baker's
+    /// geometry arena, not the cell arena.
+    label_cache: ?[]const ?LonLat = null,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Cell) void {

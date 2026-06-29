@@ -990,7 +990,16 @@ const LoadWork = struct {
         } else |_| {}
         c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_world = geo_world, .geo_arena = geo_arena, .feat_bbox = feat_bbox };
 
-        if (c.portray[ci] != null) return; // already portrayed — reuse it (the speed win)
+        // Label-point cache: built from the (reused or fresh) portrayal — only features
+        // whose base stream draws a Text/centred-symbol consult labelPoint, so cache just
+        // those (see s57_mvt.buildLabelCache). Set on the STORED cell so the per-tile emit
+        // reuses it instead of re-running the dominant polylabel search every tile.
+        if (c.portray[ci]) |pc| { // already portrayed — reuse it (the speed win)
+            if (c.geom[ci]) |*g| if (g.geo_arena) |ga| {
+                g.cell.label_cache = engine.s57_mvt.buildLabelCache(ga.allocator(), &g.cell, g.geo, pc.base) catch null;
+            };
+            return;
+        }
         const sticky = c.gpa.create(std.heap.ArenaAllocator) catch return;
         sticky.* = std.heap.ArenaAllocator.init(c.gpa);
         const sa = sticky.allocator();
@@ -1009,6 +1018,9 @@ const LoadWork = struct {
             // marks the cell portrayed so it isn't retried.
             c.portray[ci] = .{ .arena = sticky, .base = null, .plain = null, .simplified = null, .bounds = b };
         }
+        if (c.geom[ci]) |*g| if (g.geo_arena) |ga| {
+            g.cell.label_cache = engine.s57_mvt.buildLabelCache(ga.allocator(), &g.cell, g.geo, c.portray[ci].?.base) catch null;
+        };
     }
 };
 

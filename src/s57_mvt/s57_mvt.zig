@@ -426,6 +426,34 @@ pub fn buildFeatBBox(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts) ![]?[4
     return out;
 }
 
+/// Per-feature area representative (label) point cache, indexed by feature index —
+/// stored on the cell (cell.label_cache) and reused by the per-tile emit. The pole-
+/// of-inaccessibility (polylabel) search depends only on the feature's full geometry
+/// (tile-invariant), so computing it ONCE per cell removes the per-tile recompute that
+/// dominates the bake. ONLY area/line features whose portrayal draws a label or centred
+/// symbol (Text/PointInstruction) ever consult labelPoint, so cache only those — running
+/// the search for every other area would cost more than the per-tile recompute it saves.
+/// A null slot (unlabelled, or `streams==null`) makes labelPoint fall back to a live
+/// search, so the cached point is byte-identical either way. `streams` is the per-feature
+/// base instruction stream (parallel to cell.features); null = cache nothing.
+pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, streams: ?[]const ?[]const u8) ![]?s57.LonLat {
+    const out = try a.alloc(?s57.LonLat, cell.features.len);
+    @memset(out, null);
+    const ss = streams orelse return out;
+    var tmp = std.heap.ArenaAllocator.init(a);
+    defer tmp.deinit();
+    for (cell.features, 0..) |f, i| {
+        if (f.prim != 2 and f.prim != 3) continue;
+        if (i >= ss.len) break;
+        const s = ss[i] orelse continue;
+        if (std.mem.indexOf(u8, s, "TextInstruction") == null and std.mem.indexOf(u8, s, "PointInstruction") == null) continue;
+        const parts = featureParts(tmp.allocator(), cell.*, geo, i, f) catch continue;
+        out[i] = s57.areaRepresentativePoint(tmp.allocator(), parts);
+        _ = tmp.reset(.retain_capacity);
+    }
+    return out;
+}
+
 /// One assembled line/area part: its tile-independent web-mercator coords plus its
 /// static lon/lat bbox [w,s,e,n] and the matching normalised world bbox
 /// [min_wx,min_wy,max_wx,max_wy]. Both are computed ONCE here so the baker's
@@ -478,6 +506,17 @@ pub fn buildGeoWorld(a: Allocator, geo: GeoParts) !GeoWorld {
 fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.Feature) ![][]s57.LonLat {
     if (geo) |g| if (fi < g.len) if (g[fi]) |p| return p;
     return cell.lineGeometryParts(a, f);
+}
+
+/// The feature's area representative (label) point: the per-cell cached value (baker
+/// path) if present, else an on-demand polylabel search (live single-tile path).
+/// Byte-identical either way — the cache is the same search precomputed once.
+fn labelPoint(a: Allocator, cell: s57.Cell, fi: usize, geo_parts: [][]s57.LonLat) ?s57.LonLat {
+    // Use the cache only when it holds a point for this feature; a null slot means
+    // "not cached" (an unlabelled feature, or one the cache skipped) and falls back to
+    // a live search — so the cached path is always byte-identical to the live one.
+    if (cell.label_cache) |lc| if (fi < lc.len) if (lc[fi]) |p| return p;
+    return s57.areaRepresentativePoint(a, geo_parts);
 }
 
 /// True when `variant` is a usable display-variant stream that genuinely differs
@@ -790,7 +829,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // point-feature labels show, so area/channel/place names were missing.
     // (suppress_points: a finer band covers the whole tile — drop coarse labels.)
     if (!L.suppress_points and p.texts.len > 0) {
-        if (s57.areaRepresentativePoint(a, geo_parts)) |rp| {
+        if (labelPoint(a, cell, fi, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
@@ -816,7 +855,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // arrows) aren't dropped — previously p.points was only emitted for prim==1.
     // (suppress_points: a finer band covers the whole tile — drop coarse symbols.)
     if (!L.suppress_points and p.points.len > 0) {
-        if (s57.areaRepresentativePoint(a, geo_parts)) |rp| {
+        if (labelPoint(a, cell, fi, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
@@ -1296,7 +1335,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     // SWPARE51 bracket + "swept to <DRVAL1>" label at the representative point. Drop
     // both where a finer band covers the whole tile (suppress_points).
     if (L.suppress_points) return;
-    const rp = s57.areaRepresentativePoint(a, geo_parts) orelse return;
+    const rp = labelPoint(a, cell, fi, geo_parts) orelse return;
     if (rp.lon() < tb[0] or rp.lon() > tb[2] or rp.lat() < tb[1] or rp.lat() > tb[3]) return;
     const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
     const parts = try a.alloc([]const mvt.Point, 1);
