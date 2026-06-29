@@ -791,8 +791,17 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         // One style.json per palette, resolving colour tokens from the colortables.
         // sprite enables the symbol/pattern layers; glyphs (text) await SDF glyphs.
         var ok = true;
+        // SCAMIN bucket minzooms are latitude-dependent; fix them at the archive center.
+        const scamin_lat = (bounds[1] + bounds[3]) / 2.0;
         for ([_][]const u8{ "day", "dusk", "night" }) |sc| {
-            const sj = assets.styleJson(a, .{ .scheme = sc, .colortables_json = ct, .sprite = if (sprite_ok) "sprite-mln" else null }) catch {
+            const sj = assets.styleJson(a, .{
+                .scheme = sc,
+                .colortables_json = ct,
+                .sprite = if (sprite_ok) "sprite-mln" else null,
+                .minzoom = minzoom,
+                .scamin = rb.scamin,
+                .scamin_lat = scamin_lat,
+            }) catch {
                 ok = false;
                 break;
             };
@@ -1048,7 +1057,7 @@ const LoadWork = struct {
 // bundle manifest), and the distinct sounding glyph stacks collected while baking
 // (for sprite-mln). The archive itself is streamed straight to `out_path`. Shared
 // by `bake`/`bake-root`/`bundle`.
-const RootBake = struct { bounds: [4]f64, cells: []const []const u8, sounds: []const []const u8 };
+const RootBake = struct { bounds: [4]f64, cells: []const []const u8, sounds: []const []const u8, scamin: []const u32 = &.{} };
 
 // Per-tile sink for the streaming bake: feed each tile into the PMTiles
 // StreamWriter (gzip+dedup, no raw-tile retention) and, in the same pass, collect
@@ -1417,8 +1426,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // file is removed.
     // PMTiles metadata: vector_layers (TileJSON) + the distinct SCAMIN denominators
     // (when collected) so the client builds its per-SCAMIN bucket layers at load.
-    var scamin_vals = std.ArrayList(u32).empty;
-    defer scamin_vals.deinit(a);
+    var scamin_vals = std.ArrayList(u32).empty; // returned in RootBake (lives in `a`)
     {
         var it = scamin.keyIterator();
         while (it.next()) |k| try scamin_vals.append(a, k.*);
@@ -1454,7 +1462,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var stacks = std.ArrayList([]const u8).empty;
     var it = sounds.keyIterator();
     while (it.next()) |k| try stacks.append(a, k.*);
-    return .{ .bounds = ubox, .cells = cell_names.items, .sounds = stacks.items };
+    return .{ .bounds = ubox, .cells = cell_names.items, .sounds = stacks.items, .scamin = scamin_vals.items };
 }
 
 /// lon/lat (deg) -> web-mercator tile (x, y) at zoom z, clamped to the valid range.

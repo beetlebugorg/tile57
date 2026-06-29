@@ -15,8 +15,6 @@ const std = @import("std");
 const Stringify = std.json.Stringify;
 
 const FALLBACK = "#ff00ff";
-// SCAMIN display-scale denominator at z0 (physical 512-tile scale).
-const DENOM_Z0 = 279541132.0;
 const FONT = .{"Noto Sans Regular"};
 
 // ---- MapLibre expressions, as comptime tuples ----------------------------
@@ -34,14 +32,20 @@ const SEABED = .{
     "DEPIT",
 };
 
-// Show a SCAMIN feature only at/above its 1:N display zoom.
+// SCAMIN display-scale denominator at z0 (0.28 mm OGC pixel, equator). Used by the
+// zoom-filter FALLBACK gate below — applied only when no SCAMIN manifest is supplied
+// (so a source without the manifest still gates by value, just at integer-zoom snap
+// + the OGC scale rather than the precise per-value native buckets).
+const DENOM_Z0 = 279541132.0;
+
+// Fallback per-feature gate: show a SCAMIN feature only at/above its 1:N display zoom.
+// Superseded by the native per-value minzoom buckets when the manifest is present.
 const SCAMIN_GATE = .{ ">=", .{"zoom"}, .{ "log2", .{ "/", DENOM_Z0, .{ "coalesce", .{ "get", "scamin" }, DENOM_Z0 } } } };
 
 // Physical-scale constants from the web client (web/src/lib/util.mjs), so an engine
 // SCAMIN bucket's native minzoom MATCHES the JS client's scaminDisplayZoom (the §7
-// render-parity gate). NOTE these intentionally differ from DENOM_Z0 above: the bake
-// floor / legacy filter use the 0.28 mm OGC pixel (DENOM_Z0 = M_PER_PX_Z0/0.00028 ≈
-// 279.5M), while the client DISPLAY cutoff uses the calibrated 0.2645 mm CSS pixel.
+// render-parity gate). The client DISPLAY cutoff uses the calibrated 0.2645 mm CSS
+// pixel (NOT the 0.28 mm OGC pixel the bake floor / Go scaminZoom use, ≈279.5M).
 const M_PER_PX_Z0 = 78271.516964020485; // metres / CSS-px at z0, equator (512-tile)
 const DEFAULT_PX_PITCH_MM = 0.2645; // calibrated CSS-pixel pitch (NOT the OGC 0.28 mm)
 
@@ -99,11 +103,15 @@ pub const StyleOpts = struct {
     glyphs: ?[]const u8 = null, // glyphs template; enables text/labels
     minzoom: u32 = 9,
     maxzoom: u32 = 16,
+    // SCAMIN manifest: the distinct SCAMIN denominators present (the PMTiles metadata
+    // "scamin" array). Each becomes a per-value bucket layer with a native minzoom of
+    // scaminDisplayZoom(value, scamin_lat). Empty -> the *_scamin layers fall back to a
+    // single ungated layer (features still render; no scale gating without the manifest).
+    scamin: []const u32 = &.{},
+    // Representative latitude for the bucket minzooms (the archive's center). SCAMIN
+    // cutoffs are latitude-dependent (cos lat); a baked style fixes them at one lat.
+    scamin_lat: f64 = 0,
 };
-
-fn isScamin(sl: []const u8) bool {
-    return std.mem.endsWith(u8, sl, "_scamin");
-}
 
 // ---- colour resolution (the one runtime-variable expression) -------------
 
@@ -182,36 +190,92 @@ fn layerHead(js: *Stringify, id: []const u8, kind: []const u8, source_layer: []c
     try js.write(source_layer);
 }
 
-// `,"filter": base` — or `["all", base, SCAMIN_GATE]` when gated. (all_of)
-fn gatedFilter(js: *Stringify, base: anytype, gated: bool) !void {
-    try js.objectField("filter");
-    if (gated) {
-        try js.beginArray();
-        try js.write("all");
-        try js.write(base);
+// One SCAMIN bucket layer's gating: a per-value layer (`sm`) gets a native fractional
+// `minzoom` (scaminDisplayZoom) + a `["==",scamin,v]` filter; the catch-all `#no` layer
+// (`no_lows` set) takes features WITHOUT scamin plus the folded below-floor values. The
+// default (`.{}`) is the unbucketed layer — no clause, no minzoom, no suffix — so a
+// non-SCAMIN layer renders byte-identically to before. Replaces the old per-feature
+// `zoom`-filter (SCAMIN_GATE) with host-canonical native minzoom buckets (§2).
+const Bucket = struct {
+    sm: ?u32 = null, // per-value bucket: filter scamin == sm
+    no_lows: ?[]const u32 = null, // #no bucket: !has(scamin) OR scamin in these folded low values
+    zoom_gate: bool = false, // no-manifest fallback: AND the per-feature SCAMIN_GATE zoom filter
+    minzoom: ?f64 = null,
+    suffix: []const u8 = "", // id suffix: "#sm<v>" / "#no" / "" (plain)
+};
+
+// The scamin filter clause for a bucket: `["==",["get","scamin"],v]` (per-value) or
+// `["any", ["!",["has","scamin"]], ["in",["get","scamin"],["literal",[lows…]]]]` (#no).
+fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
+    if (bkt.zoom_gate) {
         try js.write(SCAMIN_GATE);
+        return;
+    }
+    if (bkt.sm) |v| {
+        try js.beginArray();
+        try js.write("==");
+        try js.write(.{ "get", "scamin" });
+        try js.write(v);
         try js.endArray();
-    } else {
-        try js.write(base);
+        return;
+    }
+    try js.beginArray();
+    try js.write("any");
+    try js.write(.{ "!", .{ "has", "scamin" } });
+    try js.beginArray();
+    try js.write("in");
+    try js.write(.{ "get", "scamin" });
+    try js.beginArray();
+    try js.write("literal");
+    try js.beginArray();
+    if (bkt.no_lows) |lows| for (lows) |v| try js.write(v);
+    try js.endArray();
+    try js.endArray();
+    try js.endArray();
+    try js.endArray();
+}
+
+// Write a layer's `filter` (the `base` predicate ANDed with the bucket's scamin clause,
+// or either alone) and its native `minzoom`. `has_base=false` for layers with no base
+// predicate (fills/patterns/complex/soundings); a plain bucket then emits neither field.
+fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket) !void {
+    const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate;
+    if (has_base or has_clause) {
+        try js.objectField("filter");
+        if (has_base and has_clause) {
+            try js.beginArray();
+            try js.write("all");
+            try js.write(base);
+            try writeScaminClause(js, bkt);
+            try js.endArray();
+        } else if (has_clause) {
+            try writeScaminClause(js, bkt);
+        } else {
+            try js.write(base);
+        }
+    }
+    if (bkt.minzoom) |mz| {
+        try js.objectField("minzoom");
+        try js.write(mz);
     }
 }
 
-fn lineLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, name: []const u8, filt: anytype, dash: ?[2]i64, gated: bool) !void {
-    var buf: [64]u8 = undefined;
-    const id = try std.fmt.bufPrint(&buf, "{s}-{s}", .{ sl, name });
+fn lineLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, name: []const u8, filt: anytype, dash: ?[2]i64, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    const id = try std.fmt.bufPrint(&buf, "{s}-{s}{s}", .{ sl, name, bkt.suffix });
     try js.beginObject();
     try layerHead(js, id, "line", sl);
-    try gatedFilter(js, filt, gated);
+    try applyBucket(js, filt, true, bkt);
     try js.objectField("paint");
     try linePaint(js, palette, dash);
     try js.endObject();
 }
 
-// solid / dashed / dotted line layers for one source-layer.
-fn lineLayers(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, gated: bool) !void {
-    try lineLayer(js, palette, sl, "solid", FILT_SOLID, null, gated);
-    try lineLayer(js, palette, sl, "dashed", FILT_DASHED, .{ 4, 3 }, gated);
-    try lineLayer(js, palette, sl, "dotted", FILT_DOTTED, .{ 1, 2 }, gated);
+// solid / dashed / dotted line layers for one source-layer (one SCAMIN bucket).
+fn lineLayers(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+    try lineLayer(js, palette, sl, "solid", FILT_SOLID, null, bkt);
+    try lineLayer(js, palette, sl, "dashed", FILT_DASHED, .{ 4, 3 }, bkt);
+    try lineLayer(js, palette, sl, "dotted", FILT_DOTTED, .{ 1, 2 }, bkt);
 }
 
 fn pointLayout(js: *Stringify, alignment: []const u8) !void {
@@ -233,34 +297,36 @@ fn pointLayout(js: *Stringify, alignment: []const u8) !void {
     try js.endObject();
 }
 
-fn pointSymbolLayers(js: *Stringify, sl: []const u8, gated: bool) !void {
-    var buf: [64]u8 = undefined;
+fn pointSymbolLayers(js: *Stringify, sl: []const u8, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
     // viewport-aligned (screen-up)
+    const vid = try std.fmt.bufPrint(&buf, "{s}{s}", .{ sl, bkt.suffix });
     try js.beginObject();
-    try layerHead(js, sl, "symbol", sl);
-    try gatedFilter(js, .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, gated);
+    try layerHead(js, vid, "symbol", sl);
+    try applyBucket(js, .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt);
     try js.objectField("layout");
     try pointLayout(js, "viewport");
     try js.endObject();
     // map-aligned (true-north)
-    const nid = try std.fmt.bufPrint(&buf, "{s}-north", .{sl});
+    var nbuf: [96]u8 = undefined;
+    const nid = try std.fmt.bufPrint(&nbuf, "{s}-north{s}", .{ sl, bkt.suffix });
     try js.beginObject();
     try layerHead(js, nid, "symbol", sl);
-    try gatedFilter(js, .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, gated);
+    try applyBucket(js, .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt);
     try js.objectField("layout");
     try pointLayout(js, "map");
     try js.endObject();
 }
 
-fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, sl: []const u8, gated: bool) !void {
-    var buf: [64]u8 = undefined;
-    const suffix = if (std.mem.eql(u8, sl, "text")) "" else "-scamin";
+fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    const sfx = if (std.mem.eql(u8, sl, "text")) "" else "-scamin";
 
-    // light-text<suffix> — always-on LIGHTS characteristics, top-anchored.
-    const lid = try std.fmt.bufPrint(&buf, "light-text{s}", .{suffix});
+    // light-text<sfx> — always-on LIGHTS characteristics, top-anchored.
+    const lid = try std.fmt.bufPrint(&buf, "light-text{s}{s}", .{ sfx, bkt.suffix });
     try js.beginObject();
     try layerHead(js, lid, "symbol", sl);
-    try gatedFilter(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, gated);
+    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt);
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -285,12 +351,12 @@ fn textLayers(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, s
     try textPaint(js, scheme, palette, 1.4);
     try js.endObject();
 
-    // text<suffix> — general collidable labels.
-    var buf2: [64]u8 = undefined;
-    const tid = try std.fmt.bufPrint(&buf2, "text{s}", .{suffix});
+    // text<sfx> — general collidable labels.
+    var buf2: [96]u8 = undefined;
+    const tid = try std.fmt.bufPrint(&buf2, "text{s}{s}", .{ sfx, bkt.suffix });
     try js.beginObject();
     try layerHead(js, tid, "symbol", sl);
-    try gatedFilter(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, gated);
+    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt);
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -326,6 +392,107 @@ fn textPaint(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, ha
     try js.endObject();
 }
 
+// One area-fill layer for a source-layer + SCAMIN bucket.
+fn fillLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    try js.beginObject();
+    try layerHead(js, try std.fmt.bufPrint(&buf, "fill-{s}{s}", .{ sl, bkt.suffix }), "fill", sl);
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("fill-sort-key");
+    try js.write(FILL_SORT);
+    try js.endObject();
+    try js.objectField("paint");
+    try js.beginObject();
+    try js.objectField("fill-color");
+    try areasFillColor(js, palette);
+    try js.objectField("fill-antialias");
+    try js.write(true);
+    try js.endObject();
+    try applyBucket(js, .{}, false, bkt);
+    try js.endObject();
+}
+
+// One area fill-pattern layer (sprite required) for a source-layer + SCAMIN bucket.
+fn patternLayer(js: *Stringify, sl: []const u8, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    try js.beginObject();
+    try layerHead(js, try std.fmt.bufPrint(&buf, "fillpat-{s}{s}", .{ sl, bkt.suffix }), "fill", sl);
+    try js.objectField("paint");
+    try js.beginObject();
+    try js.objectField("fill-pattern");
+    try js.write(.{ "concat", "pat:", .{ "coalesce", .{ "get", "pattern_name" }, "" } });
+    try js.endObject();
+    try applyBucket(js, .{}, false, bkt);
+    try js.endObject();
+}
+
+// One complex (symbolised) line layer for a source-layer + SCAMIN bucket.
+fn complexLineLayer(js: *Stringify, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    try js.beginObject();
+    try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}{s}", .{ sl, bkt.suffix }), "line", sl);
+    try js.objectField("paint");
+    try linePaint(js, palette, null);
+    try applyBucket(js, .{}, false, bkt);
+    try js.endObject();
+}
+
+// One DEPCNT contour value-label layer (glyphs required) for a source-layer + bucket.
+fn contourLabelLayer(js: *Stringify, scheme: []const u8, palette: std.json.ObjectMap, sl: []const u8, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    try js.beginObject();
+    try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}{s}", .{ sl, bkt.suffix }), "symbol", sl);
+    try applyBucket(js, .{ "has", "valdco" }, true, bkt);
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("symbol-placement");
+    try js.write("line-center");
+    try js.objectField("text-field");
+    try js.write(.{ "to-string", .{ "get", "valdco" } });
+    try js.objectField("text-font");
+    try js.write(FONT);
+    try js.objectField("text-size");
+    try js.write(10);
+    try js.objectField("text-max-angle");
+    try js.write(30);
+    try js.objectField("text-allow-overlap");
+    try js.write(false);
+    try js.objectField("text-optional");
+    try js.write(true);
+    try js.endObject();
+    try js.objectField("paint");
+    try js.beginObject();
+    try js.objectField("text-color");
+    try contourLabelColor(js, scheme, palette);
+    try js.objectField("text-halo-color");
+    try js.write(haloColor(scheme));
+    try js.objectField("text-halo-width");
+    try js.write(1.2);
+    try js.objectField("text-halo-blur");
+    try js.write(0.5);
+    try js.endObject();
+    try js.endObject();
+}
+
+// The soundings symbol layer (sprite required) for a SCAMIN bucket.
+fn soundingsLayer(js: *Stringify, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    try js.beginObject();
+    try layerHead(js, try std.fmt.bufPrint(&buf, "soundings{s}", .{bkt.suffix}), "symbol", "soundings");
+    try applyBucket(js, .{}, false, bkt);
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("icon-image");
+    try js.write(SOUNDINGS_IMG);
+    try js.objectField("icon-size");
+    try js.write(ICON_SIZE);
+    try js.objectField("icon-allow-overlap");
+    try js.write(false);
+    try js.endObject();
+    try js.endObject();
+}
+
 /// Emit a MapLibre style.json for `opts.scheme`. Returns allocator-owned bytes.
 pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, opts.colortables_json, .{}) catch
@@ -345,6 +512,43 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     // glyph source otherwise aborts the whole style load in MapLibre).
     const glyphs_on = opts.glyphs != null;
     const sea = if (palette.get("DEPDW")) |v| v.string else "#93aebb";
+
+    // SCAMIN buckets (host §2): split the manifest into below-source-floor values
+    // (folded into the catch-all #no bucket — they show from the floor anyway) and
+    // above-floor values (one #sm<v> bucket each, native minzoom = scaminDisplayZoom
+    // at the representative lat). `all_buckets` drives the all-SCAMIN *_scamin layers;
+    // `snd_buckets` drives the mixed `soundings` layer (always a #no for its bare
+    // non-SCAMIN soundings). An empty manifest -> a single plain (ungated) layer.
+    var barena = std.heap.ArenaAllocator.init(alloc);
+    defer barena.deinit();
+    const ba = barena.allocator();
+    const floor: f64 = @floatFromInt(opts.minzoom);
+    var lows = std.ArrayList(u32).empty;
+    var his = std.ArrayList(Bucket).empty;
+    for (opts.scamin) |v| {
+        const mz = scaminDisplayZoom(@floatFromInt(v), opts.scamin_lat);
+        if (mz <= floor + 1e-6) {
+            try lows.append(ba, v);
+        } else {
+            try his.append(ba, .{ .sm = v, .minzoom = mz, .suffix = try std.fmt.allocPrint(ba, "#sm{d}", .{v}) });
+        }
+    }
+    const low_slice: []const u32 = lows.items;
+    var allb = std.ArrayList(Bucket).empty;
+    var sndb = std.ArrayList(Bucket).empty;
+    if (opts.scamin.len == 0) {
+        // No manifest -> the per-feature zoom-filter fallback (still gates by value,
+        // integer-zoom snap) on every SCAMIN-bearing layer, incl. soundings.
+        try allb.append(ba, .{ .zoom_gate = true });
+        try sndb.append(ba, .{ .zoom_gate = true });
+    } else {
+        if (low_slice.len > 0) try allb.append(ba, .{ .no_lows = low_slice, .suffix = "#no" });
+        try allb.appendSlice(ba, his.items);
+        try sndb.append(ba, .{ .no_lows = low_slice, .suffix = "#no" });
+        try sndb.appendSlice(ba, his.items);
+    }
+    const all_buckets: []const Bucket = allb.items;
+    const snd_buckets: []const Bucket = sndb.items;
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
@@ -396,130 +600,44 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     try js.endObject();
     try js.endObject();
 
-    // 2. area fills + SCAMIN clone
-    for ([_][]const u8{ "areas", "areas_scamin" }) |sl| {
-        var buf: [64]u8 = undefined;
-        try js.beginObject();
-        try layerHead(js, try std.fmt.bufPrint(&buf, "fill-{s}", .{sl}), "fill", sl);
-        try js.objectField("layout");
-        try js.beginObject();
-        try js.objectField("fill-sort-key");
-        try js.write(FILL_SORT);
-        try js.endObject();
-        try js.objectField("paint");
-        try js.beginObject();
-        try js.objectField("fill-color");
-        try areasFillColor(js, palette);
-        try js.objectField("fill-antialias");
-        try js.write(true);
-        try js.endObject();
-        if (isScamin(sl)) {
-            try js.objectField("filter");
-            try js.write(SCAMIN_GATE);
-        }
-        try js.endObject();
-    }
+    // 2. area fills — base (plain) + one SCAMIN bucket layer per manifest value.
+    try fillLayer(js, palette, "areas", .{});
+    for (all_buckets) |bkt| try fillLayer(js, palette, "areas_scamin", bkt);
 
     // 3. area fill patterns (sprite required)
     if (sprite_on) {
-        for ([_][]const u8{ "area_patterns", "area_patterns_scamin" }) |sl| {
-            var buf: [64]u8 = undefined;
-            try js.beginObject();
-            try layerHead(js, try std.fmt.bufPrint(&buf, "fillpat-{s}", .{sl}), "fill", sl);
-            try js.objectField("paint");
-            try js.beginObject();
-            try js.objectField("fill-pattern");
-            try js.write(.{ "concat", "pat:", .{ "coalesce", .{ "get", "pattern_name" }, "" } });
-            try js.endObject();
-            if (isScamin(sl)) {
-                try js.objectField("filter");
-                try js.write(SCAMIN_GATE);
-            }
-            try js.endObject();
-        }
+        try patternLayer(js, "area_patterns", .{});
+        for (all_buckets) |bkt| try patternLayer(js, "area_patterns_scamin", bkt);
     }
 
-    // 4. lines: solid/dashed/dotted over base + _scamin
-    for ([_][]const u8{ "lines", "lines_scamin" }) |sl| {
-        try lineLayers(js, palette, sl, isScamin(sl));
-    }
+    // 4. lines: solid/dashed/dotted over base + _scamin buckets
+    try lineLayers(js, palette, "lines", .{});
+    for (all_buckets) |bkt| try lineLayers(js, palette, "lines_scamin", bkt);
 
     // 5. complex (symbolised) lines
-    for ([_][]const u8{ "complex_lines", "complex_lines_scamin" }) |sl| {
-        var buf: [64]u8 = undefined;
-        try js.beginObject();
-        try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}", .{sl}), "line", sl);
-        try js.objectField("paint");
-        try linePaint(js, palette, null);
-        if (isScamin(sl)) {
-            try js.objectField("filter");
-            try js.write(SCAMIN_GATE);
-        }
-        try js.endObject();
-    }
+    try complexLineLayer(js, palette, "complex_lines", .{});
+    for (all_buckets) |bkt| try complexLineLayer(js, palette, "complex_lines_scamin", bkt);
 
-    // 6. light sector limit lines
-    try lineLayers(js, palette, "sector_lines", false);
+    // 6. light sector limit lines (no SCAMIN bucketing)
+    try lineLayers(js, palette, "sector_lines", .{});
 
     // 7. contour value labels (DEPCNT VALDCO) — text, needs glyphs.
-    if (glyphs_on) for ([_][]const u8{ "lines", "lines_scamin" }) |sl| {
-        var buf: [64]u8 = undefined;
-        try js.beginObject();
-        try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}", .{sl}), "symbol", sl);
-        try gatedFilter(js, .{ "has", "valdco" }, isScamin(sl));
-        try js.objectField("layout");
-        try js.beginObject();
-        try js.objectField("symbol-placement");
-        try js.write("line-center");
-        try js.objectField("text-field");
-        try js.write(.{ "to-string", .{ "get", "valdco" } });
-        try js.objectField("text-font");
-        try js.write(FONT);
-        try js.objectField("text-size");
-        try js.write(10);
-        try js.objectField("text-max-angle");
-        try js.write(30);
-        try js.objectField("text-allow-overlap");
-        try js.write(false);
-        try js.objectField("text-optional");
-        try js.write(true);
-        try js.endObject();
-        try js.objectField("paint");
-        try js.beginObject();
-        try js.objectField("text-color");
-        try contourLabelColor(js, opts.scheme, palette);
-        try js.objectField("text-halo-color");
-        try js.write(haloColor(opts.scheme));
-        try js.objectField("text-halo-width");
-        try js.write(1.2);
-        try js.objectField("text-halo-blur");
-        try js.write(0.5);
-        try js.endObject();
-        try js.endObject();
-    };
+    if (glyphs_on) {
+        try contourLabelLayer(js, opts.scheme, palette, "lines", .{});
+        for (all_buckets) |bkt| try contourLabelLayer(js, opts.scheme, palette, "lines_scamin", bkt);
+    }
 
     // 8. point symbols + soundings (sprite required)
     if (sprite_on) {
-        try pointSymbolLayers(js, "point_symbols", false);
-        try pointSymbolLayers(js, "point_symbols_scamin", true);
-        try js.beginObject();
-        try layerHead(js, "soundings", "symbol", "soundings");
-        try js.objectField("layout");
-        try js.beginObject();
-        try js.objectField("icon-image");
-        try js.write(SOUNDINGS_IMG);
-        try js.objectField("icon-size");
-        try js.write(ICON_SIZE);
-        try js.objectField("icon-allow-overlap");
-        try js.write(false);
-        try js.endObject();
-        try js.endObject();
+        try pointSymbolLayers(js, "point_symbols", .{});
+        for (all_buckets) |bkt| try pointSymbolLayers(js, "point_symbols_scamin", bkt);
+        for (snd_buckets) |bkt| try soundingsLayer(js, bkt);
     }
 
     // 9. text labels — need an SDF glyph source.
     if (glyphs_on) {
-        try textLayers(js, opts.scheme, palette, "text", false);
-        try textLayers(js, opts.scheme, palette, "text_scamin", true);
+        try textLayers(js, opts.scheme, palette, "text", .{});
+        for (all_buckets) |bkt| try textLayers(js, opts.scheme, palette, "text_scamin", bkt);
     }
 
     try js.endArray(); // layers
