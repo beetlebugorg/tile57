@@ -14,6 +14,33 @@ pub const Line = struct { style: []const u8, width: f64, color: []const u8 };
 pub const Point = struct { symbol: []const u8, rotation: f64, offset_x: f64, offset_y: f64, rot_north: bool = false };
 pub const Text = struct { text: []const u8, color: []const u8, group: i64 = 0 };
 
+/// One stroked element of a screen-space figure a rule CONSTRUCTED via
+/// AugmentedRay / ArcByRadius — a light-sector leg (ray) or sector arc/ring. Sizes
+/// stay in their source units (display mm, or a ground-distance leg in metres); the
+/// baker tessellates them around the feature anchor per zoom (mm are fixed display
+/// millimetres, hence per-zoom). Mirrors Go's portrayal.AugmentedFigure.
+pub const AugFigure = struct {
+    is_ray: bool, // true: a straight leg (bearing/length); false: an arc/ring
+    // Ray params: true-north bearing (already from-seaward reversed by the rule) and
+    // its length as display mm, OR as a ground distance (metres) when length_ground_m>0.
+    bearing_deg: f64 = 0,
+    length_mm: f64 = 0,
+    length_ground_m: f64 = 0,
+    // Arc params, centred on the anchor; a 0 sweep is a full all-round ring.
+    radius_mm: f64 = 0,
+    start_deg: f64 = 0,
+    sweep_deg: f64 = 0,
+    // Stroke from the rule's LineStyle (width in mm; dashed from its dash length).
+    color: []const u8 = "CHBLK",
+    width_mm: f64 = 0,
+    dashed: bool = false,
+    // Explicit anchor from an AugmentedPoint instruction (else the feature geometry).
+    anchor_lon: f64 = 0,
+    anchor_lat: f64 = 0,
+    has_anchor: bool = false,
+    vg: i64 = 0, // the figure's draw viewing group, so sector arcs filter independently
+};
+
 pub const Portrayal = struct {
     fill_token: ?[]const u8 = null, // ColorFill (last wins)
     patterns: []const []const u8 = &.{}, // AreaFillReference
@@ -30,12 +57,23 @@ pub const Portrayal = struct {
     // standard (1) when none carries a category band. Surfaced as the MVT `cat`
     // property so the mariner's Base/Standard/Other selection filters client-side.
     cat: i64 = 1,
+    // Raw S-101 viewing-group number of the feature's PRIMARY draw (the first
+    // instruction whose draw viewing group is a real 1xxxx/2xxxx/3xxxx/9xxxx display
+    // group). For a non-text section the modifier is `ViewingGroup:<drawVG>` (arg0);
+    // for a text section it is `ViewingGroup:<textGroup>,<drawVG>` (arg1 is the draw
+    // group). Surfaced as the MVT `vg` property so the client can filter on the exact
+    // viewing group (§14.5), not just the coarse Base/Standard/Other category band. 0
+    // when the feature carries no banded viewing group.
+    vg: i64 = 0,
     // Date-dependent validity (S-52 §10.4.1.1), from the feature-level `Date:start,
     // end` instruction. S-100 truncated dates: a "--" prefix marks a recurring
     // month-day bound. Empty when the feature is undated. Surfaced as the MVT
     // date_start/date_end/date_recurring properties.
     date_start: []const u8 = "",
     date_end: []const u8 = "",
+    // Constructed screen-space sector figures (LightSectored legs/arcs), tessellated
+    // around the feature anchor by the baker. Empty for non-sectored features.
+    aug_figures: []const AugFigure = &.{},
 };
 
 /// Display-category rank for a viewing group, from its leading digit (S-52 §10.3.4):
@@ -66,7 +104,7 @@ fn toFloat(s: []const u8) f64 {
 // Go's pxPerMM = float64(DefaultPxPerSymbolUnit)*100, DefaultPxPerSymbolUnit being
 // float32(0.01/0.26458) (~3.7796 px/mm). Kept in the float32->float64 form so the
 // scaled width matches the oracle.
-const PX_PER_MM: f64 = @as(f64, @as(f32, 0.01 / 0.26458)) * 100.0;
+pub const PX_PER_MM: f64 = @as(f64, @as(f32, 0.01 / 0.26458)) * 100.0;
 
 /// Parse one feature's instruction stream. Allocates into `a` (use an arena).
 pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
@@ -74,10 +112,12 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var lines = std.ArrayList(Line).empty;
     var points = std.ArrayList(Point).empty;
     var texts = std.ArrayList(Text).empty;
+    var aug_figures = std.ArrayList(AugFigure).empty;
 
     var fill_token: ?[]const u8 = null;
     var draw_prio: i64 = 0; // feature DrawingPriority = max seen in the stream
     var cat: i64 = -1; // most-visible display-category rank; -1 until a banded VG is seen
+    var vg: i64 = 0; // raw viewing group of the feature's first banded draw (first-wins)
     var date_start: []const u8 = "";
     var date_end: []const u8 = "";
     // running state set by modifier instructions, applied at the next verb
@@ -90,10 +130,35 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var cur_oy: f64 = 0;
     var cur_font: []const u8 = "CHBLK";
     var cur_tgrp: i64 = 0; // text group (S-52 §14.5) of the most recent ViewingGroup
+    var cur_dash_len: f64 = 0; // dash length (LineStyle arg1) of the current _simple_ stroke
+    var cur_draw_vg: i64 = 0; // draw viewing group of the most recent ViewingGroup section
+    // The screen-space figure currently under construction (AugmentedRay/ArcByRadius);
+    // a LineInstruction strokes it (rather than the feature geometry) until ClearGeometry.
+    const AugKind = enum { ray, arc };
+    var cur_aug: ?AugKind = null;
+    var aug_bearing: f64 = 0;
+    var aug_len_mm: f64 = 0;
+    var aug_len_ground: f64 = 0;
+    var aug_radius_mm: f64 = 0;
+    var aug_start: f64 = 0;
+    var aug_sweep: f64 = 0;
+    var cur_anchor_lon: f64 = 0;
+    var cur_anchor_lat: f64 = 0;
+    var cur_has_anchor: bool = false;
 
     var it = std.mem.splitScalar(u8, stream, ';');
     while (it.next()) |item| {
         if (item.len == 0) continue;
+        // ClearGeometry / other colon-less verbs: end of an augmented-geometry run —
+        // drop the explicit anchor and constructed figure so later draws re-attach to
+        // the feature geometry (mirrors Go's ClearGeometry).
+        if (std.mem.eql(u8, item, "ClearGeometry")) {
+            cur_aug = null;
+            cur_has_anchor = false;
+            cur_anchor_lon = 0;
+            cur_anchor_lat = 0;
+            continue;
+        }
         const colon = std.mem.indexOfScalar(u8, item, ':') orelse continue;
         const key = item[0..colon];
         const val = item[colon + 1 ..];
@@ -106,18 +171,63 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // shading and ignore the toggle (mirrors Go s101build.go:371).
             if (!std.mem.eql(u8, val, "DIAMOND1")) try patterns.append(a, val);
         } else if (std.mem.eql(u8, key, "LineStyle")) {
-            // _simple_,,<width>,<color>
+            // _simple_,<dashLength>,<width>,<color>
             cur_style = nthCsv(val, 0);
+            cur_dash_len = toFloat(nthCsv(val, 1));
             cur_width = toFloat(nthCsv(val, 2));
             cur_color = nthCsv(val, 3);
         } else if (std.mem.eql(u8, key, "LineInstruction")) {
-            if (std.mem.eql(u8, val, "_simple_")) {
+            if (cur_aug) |kind| {
+                // A figure (sector leg/arc) is current: this strokes THAT screen-space
+                // geometry with the current LineStyle, not the feature's own geometry.
+                try aug_figures.append(a, .{
+                    .is_ray = kind == .ray,
+                    .bearing_deg = aug_bearing,
+                    .length_mm = aug_len_mm,
+                    .length_ground_m = aug_len_ground,
+                    .radius_mm = aug_radius_mm,
+                    .start_deg = aug_start,
+                    .sweep_deg = aug_sweep,
+                    .color = cur_color,
+                    .width_mm = cur_width,
+                    .dashed = cur_dash_len > 0,
+                    .anchor_lon = cur_anchor_lon,
+                    .anchor_lat = cur_anchor_lat,
+                    .has_anchor = cur_has_anchor,
+                    .vg = cur_draw_vg,
+                });
+            } else if (std.mem.eql(u8, val, "_simple_")) {
                 // mm -> px (Go SimpleLine.Width * pxPerMM); raw mm rendered ~3.78x too thin.
                 try lines.append(a, .{ .style = "solid", .width = cur_width * PX_PER_MM, .color = cur_color });
             } else {
                 // named complex line pattern
                 try lines.append(a, .{ .style = val, .width = cur_width, .color = cur_color });
             }
+        } else if (std.mem.eql(u8, key, "AugmentedRay")) {
+            // "AugmentedRay:<bearingCRS>,<bearing>,<lenCRS>,<len>" — a leg from the
+            // anchor. The bearing (arg1) is already from-seaward reversed. The LENGTH's
+            // CRS (arg2) sets its unit: GeographicCRS => ground metres (a fixed ground
+            // distance), else display mm (the short sector leg).
+            aug_bearing = toFloat(nthCsv(val, 1));
+            const len_crs = std.mem.trim(u8, nthCsv(val, 2), " ");
+            const len_val = toFloat(nthCsv(val, 3));
+            aug_len_mm = 0;
+            aug_len_ground = 0;
+            if (std.mem.eql(u8, len_crs, "GeographicCRS")) aug_len_ground = len_val else aug_len_mm = len_val;
+            cur_aug = .ray;
+        } else if (std.mem.eql(u8, key, "ArcByRadius")) {
+            // "ArcByRadius:<cx>,<cy>,<radiusMM>,<startDeg>,<sweepDeg>" — an arc/ring
+            // centred on the anchor (cx,cy is 0 for sector figures).
+            aug_radius_mm = toFloat(nthCsv(val, 2));
+            aug_start = toFloat(nthCsv(val, 3));
+            aug_sweep = toFloat(nthCsv(val, 4));
+            cur_aug = .arc;
+        } else if (std.mem.eql(u8, key, "AugmentedPoint")) {
+            // "AugmentedPoint:<CRS>,<x>,<y>" places subsequent figures at the geographic
+            // point (x=lon, y=lat) rather than the feature geometry.
+            cur_anchor_lon = toFloat(nthCsv(val, 1));
+            cur_anchor_lat = toFloat(nthCsv(val, 2));
+            cur_has_anchor = true;
         } else if (std.mem.eql(u8, key, "Rotation")) {
             // S-101 form "Rotation:<CRS>,<angle>" (GeographicCRS=true-north, else
             // screen); a bare "Rotation:<angle>" with no CRS is screen-referenced.
@@ -150,10 +260,18 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // over its instructions. Text instructions carry ViewingGroup:<textGroup>,
             // <drawVG>; arg 0 there is the small text-group number, which categoryRank
             // maps to -1 (no band), so it correctly never lowers the category.
-            const vg = std.fmt.parseInt(i64, std.mem.trim(u8, nthCsv(val, 0), " "), 10) catch continue;
-            cur_tgrp = vg; // for a text instruction, arg 0 is its S-52 text group
-            const rank = categoryRank(vg);
+            const arg0 = std.mem.trim(u8, nthCsv(val, 0), " ");
+            const arg1 = std.mem.trim(u8, nthCsv(val, 1), " ");
+            const vg0 = std.fmt.parseInt(i64, arg0, 10) catch continue;
+            cur_tgrp = vg0; // for a text instruction, arg 0 is its S-52 text group
+            const rank = categoryRank(vg0);
             if (rank >= 0 and (cat < 0 or rank < cat)) cat = rank;
+            // Primary draw viewing group: arg1 for a text section (arg0 is the text
+            // group there), else arg0. Record the FIRST one that is a real display
+            // group (a banded 1xxxx/2xxxx/3xxxx/9xxxx VG); first-wins.
+            const draw_vg = if (arg1.len > 0) (std.fmt.parseInt(i64, arg1, 10) catch vg0) else vg0;
+            cur_draw_vg = draw_vg; // current section's draw VG (carried by aug figures)
+            if (vg == 0 and categoryRank(draw_vg) >= 0) vg = draw_vg;
         } else if (std.mem.eql(u8, key, "Date")) {
             // Feature-level validity period "start,end" (either bound may be empty).
             date_start = std.mem.trim(u8, nthCsv(val, 0), " ");
@@ -170,8 +288,10 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         .texts = texts.items,
         .draw_prio = draw_prio,
         .cat = if (cat < 0) 1 else cat, // no banded VG -> Standard
+        .vg = vg,
         .date_start = date_start,
         .date_end = date_end,
+        .aug_figures = aug_figures.items,
     };
 }
 
@@ -203,6 +323,85 @@ test "display category defaults to Standard when no banded viewing group" {
     const p = try parse(a, "ViewingGroup:21,26070;DrawingPriority:24;FontColor:CHBLK;TextInstruction:Foo");
     try std.testing.expectEqual(@as(i64, 1), p.cat); // Standard
     try std.testing.expectEqual(@as(usize, 1), p.texts.len);
+}
+
+test "raw viewing group: first banded draw VG wins (arg0 non-text, arg1 text)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Non-text section: ViewingGroup:<drawVG> — arg0 is the draw group (32050).
+    const ln = try parse(a, "ViewingGroup:32050;DrawingPriority:9;LineStyle:_simple_,,0.96,CHGRD;LineInstruction:_simple_");
+    try std.testing.expectEqual(@as(i64, 32050), ln.vg);
+
+    // Text section: ViewingGroup:<textGroup>,<drawVG> — the draw group is arg1 (26070);
+    // arg0 (21) is the text group and carries no display band, so it must not win.
+    const tx = try parse(a, "ViewingGroup:21,26070;DrawingPriority:24;FontColor:CHBLK;TextInstruction:Foo");
+    try std.testing.expectEqual(@as(i64, 26070), tx.vg);
+
+    // First-wins across sections: an unbanded text group (21) precedes a banded draw
+    // (13030); vg takes the first banded draw VG, here 13030 (and 13030, not 90000).
+    const both = try parse(a,
+        "ViewingGroup:21,29070;FontColor:CHBLK;TextInstruction:Bar;" ++
+        "ViewingGroup:13030;ColorFill:DEPMS;ViewingGroup:90000;AreaFillReference:FOO");
+    try std.testing.expectEqual(@as(i64, 29070), both.vg); // the text draw VG (29070) is banded and comes first
+
+    // No banded VG at all -> vg stays 0.
+    const none = try parse(a, "FontColor:CHBLK;TextInstruction:foo");
+    try std.testing.expectEqual(@as(i64, 0), none.vg);
+}
+
+test "parse LightSectored augmented legs + arcs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A real LightSectored stream (US4MD82M): two dashed sector-limit legs (display mm)
+    // and one arc stroked twice (black backing + yellow), then ClearGeometry + text.
+    const stream =
+        "ViewingGroup:27070;DrawingPriority:24;DisplayPlane:UnderRadar;Hover:true;" ++
+        "AugmentedRay:GeographicCRS,221.0,LocalCRS,25.0;Dash:0,3.6;LineStyle:_simple_,5.4,0.32,CHBLK;LineInstruction:_simple_;" ++
+        "AugmentedRay:GeographicCRS,224.0,LocalCRS,25.0;LineInstruction:_simple_;" ++
+        "ArcByRadius:0,0,20,221.0,3.0;AugmentedPath:LocalCRS,GeographicCRS,LocalCRS;" ++
+        "LineStyle:_simple_,,1.28,CHBLK;LineInstruction:_simple_;" ++
+        "LineStyle:_simple_,,0.64,LITYW;LineInstruction:_simple_;ClearGeometry;ClearGeometry;" ++
+        "FontColor:CHBLK;ViewingGroup:23,27070;TextInstruction:Fl W 2.5s11.6m";
+    const p = try parse(a, stream);
+
+    // 2 dashed legs + 2 arc strokes (black + yellow), and NO feature-geometry lines.
+    try std.testing.expectEqual(@as(usize, 0), p.lines.len);
+    try std.testing.expectEqual(@as(usize, 4), p.aug_figures.len);
+
+    const leg0 = p.aug_figures[0];
+    try std.testing.expect(leg0.is_ray);
+    try std.testing.expectApproxEqAbs(@as(f64, 221.0), leg0.bearing_deg, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 25.0), leg0.length_mm, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.32), leg0.width_mm, 1e-9);
+    try std.testing.expect(leg0.dashed); // dash length 5.4 > 0
+    try std.testing.expectEqualStrings("CHBLK", leg0.color);
+    try std.testing.expectEqual(@as(i64, 27070), leg0.vg);
+
+    const leg1 = p.aug_figures[1];
+    try std.testing.expect(leg1.is_ray and leg1.dashed); // reuses the prior dashed LineStyle
+    try std.testing.expectApproxEqAbs(@as(f64, 224.0), leg1.bearing_deg, 1e-9);
+
+    const arc_back = p.aug_figures[2];
+    try std.testing.expect(!arc_back.is_ray);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), arc_back.radius_mm, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 221.0), arc_back.start_deg, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), arc_back.sweep_deg, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.28), arc_back.width_mm, 1e-9);
+    try std.testing.expect(!arc_back.dashed);
+    try std.testing.expectEqualStrings("CHBLK", arc_back.color);
+
+    const arc_col = p.aug_figures[3];
+    try std.testing.expect(!arc_col.is_ray);
+    try std.testing.expectEqualStrings("LITYW", arc_col.color);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.64), arc_col.width_mm, 1e-9);
+
+    // The characteristic text still parses (rhythmOfLight path).
+    try std.testing.expectEqual(@as(usize, 1), p.texts.len);
+    try std.testing.expectEqualStrings("Fl W 2.5s11.6m", p.texts[0].text);
 }
 
 test "parse line + point + text instructions" {

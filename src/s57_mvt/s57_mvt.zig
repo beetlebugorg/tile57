@@ -330,6 +330,7 @@ fn featureScamin(f: s57.Feature) ?i64 {
 const Meta = struct {
     prio: i64,
     cat: i64 = 1, // display-category rank (0 base, 1 standard, 2 other)
+    vg: i64 = 0, // raw S-101 viewing-group number of the feature's primary draw (0 = none)
     scamin: ?i64 = null,
     class: []const u8 = "", // S-57 object-class acronym (M_QUAL, LIGHTS, …)
     band: u8 = 0, // NOAA band rank (0 finest … 5 coarsest)
@@ -350,6 +351,9 @@ const Meta = struct {
 fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
     try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
+    // Raw viewing group (§14.5): emitted only when the feature has a banded draw VG,
+    // so undated/unbanded features keep their tile footprint unchanged.
+    if (m.vg != 0) try props.append(a, .{ .key = "vg", .value = .{ .int = m.vg } });
     try props.append(a, .{ .key = "band", .value = .{ .int = m.band } });
     if (m.class.len > 0) try props.append(a, .{ .key = "class", .value = .{ .string = m.class } });
     if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
@@ -523,6 +527,78 @@ fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?
     try emitParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, L);
 }
 
+// Web-mercator equatorial circumference (m): converts a ground-distance sector leg
+// (GeographicCRS length) to a normalised-world offset. Mirrors Go bake.earthCircumM.
+const EARTH_CIRCUM_M: f64 = 40075016.686;
+
+/// Screen-space unit vector for a true-north bearing, with y growing southward
+/// (north=(0,-1), east=(1,0)). Mirrors Go bake.bearingToScreen.
+fn bearingToScreen(deg: f64) [2]f64 {
+    const r = deg * std.math.pi / 180.0;
+    return .{ @sin(r), -@cos(r) };
+}
+
+/// Tessellate the parsed sector figures (LightSectored legs/arcs) around `anchor`
+/// into `lines_l` for tile (z,x,y). Port of internal/engine/bake.tessellateFigure:
+/// figures are fixed display-mm sized, so their geographic extent is per-zoom. A ray
+/// is the anchor -> a point at its bearing/length; an arc is N points along its
+/// radius over the sweep (a 0 sweep = a full ring). Built in normalised-world coords
+/// (anchor + screen-offset/worldPx) and projected with worldToTile — identical to
+/// Go's per-zoom sunproject + reproject. Each figure carries its own stroke + vg.
+fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat, meta: Meta, z: u8, x: u32, y: u32, box: tile.Box, lines_l: *std.ArrayList(mvt.Feature)) !void {
+    if (figs.len == 0) return;
+    const world_px = 256.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+    const pxmm = s101.PX_PER_MM;
+    for (figs) |fig| {
+        const alon = if (fig.has_anchor) fig.anchor_lon else anchor.lon();
+        const alat = if (fig.has_anchor) fig.anchor_lat else anchor.lat();
+        const aw = tile.lonLatToWorld(alon, alat);
+
+        var wpts = std.ArrayList([2]f64).empty;
+        if (fig.is_ray) {
+            var len_px = fig.length_mm * pxmm;
+            if (fig.length_ground_m > 0) {
+                const cos_lat = @cos(alat * std.math.pi / 180.0);
+                if (cos_lat > 1e-6) len_px = fig.length_ground_m / (cos_lat * EARTH_CIRCUM_M) * world_px;
+            }
+            if (len_px <= 0) continue;
+            const d = bearingToScreen(fig.bearing_deg);
+            try wpts.append(a, aw);
+            try wpts.append(a, .{ aw[0] + d[0] * len_px / world_px, aw[1] + d[1] * len_px / world_px });
+        } else {
+            const radius_px = fig.radius_mm * pxmm;
+            if (radius_px <= 0) continue;
+            var sweep = fig.sweep_deg;
+            if (sweep == 0) sweep = 360; // a zero sweep is a full all-round ring
+            const n: usize = @max(@as(usize, @intFromFloat(@ceil(@abs(sweep) / 3.0))), 8);
+            var i: usize = 0;
+            while (i <= n) : (i += 1) {
+                const brg = fig.start_deg + sweep * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n));
+                const d = bearingToScreen(brg);
+                try wpts.append(a, .{ aw[0] + d[0] * radius_px / world_px, aw[1] + d[1] * radius_px / world_px });
+            }
+        }
+        if (wpts.items.len < 2) continue;
+
+        const proj = try a.alloc(mvt.Point, wpts.items.len);
+        for (wpts.items, 0..) |w, j| proj[j] = tile.worldToTile(w, z, x, y, tile.EXTENT);
+        // Clip to the tile box (incl. buffer); keep the arc shape (no DP simplify).
+        const sub = try tile.clipLine(a, proj, box);
+        var kept = std.ArrayList([]const mvt.Point).empty;
+        for (sub) |run| if (run.len >= 2) try kept.append(a, run);
+        if (kept.items.len == 0) continue;
+
+        var fmeta = meta;
+        fmeta.vg = if (fig.vg != 0) fig.vg else meta.vg; // sector arcs filter on their own VG
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(a, .{ .key = "color_token", .value = .{ .string = fig.color } });
+        try props.append(a, .{ .key = "width_px", .value = .{ .double = fig.width_mm * pxmm } });
+        try props.append(a, .{ .key = "dash", .value = .{ .string = if (fig.dashed) "dashed" else "solid" } });
+        try appendMeta(a, &props, fmeta);
+        try lines_l.append(a, .{ .geom_type = .linestring, .parts = kept.items, .properties = props.items });
+    }
+}
+
 /// Emit one parsed portrayal pass `p`, stamping every primitive with the pass's
 /// boundary (`bnd`) and point-style (`pts`) variant tags.
 fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
@@ -533,6 +609,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     const meta = Meta{
         .prio = p.draw_prio,
         .cat = p.cat,
+        .vg = p.vg,
         .scamin = scamin,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .band = L.band,
@@ -551,6 +628,10 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // placed at the feature's node.
     if (f.prim == 1) {
         const pg = cell.pointGeometry(f) orelse return;
+        // Sector legs/arcs (LightSectored) are stroked around the light's node and
+        // clipped to the tile box, so they render even when the node sits in the
+        // buffer zone just off-tile. Emitted before the point's in-bounds gate below.
+        try emitAugFigures(a, p.aug_figures, pg, meta, z, x, y, box, lines_l);
         if (pg.lon() < tb[0] or pg.lon() > tb[2] or pg.lat() < tb[1] or pg.lat() > tb[3]) return;
         const pt = tile.project(pg.lon(), pg.lat(), z, x, y, tile.EXTENT);
         const parts = try a.alloc([]const mvt.Point, 1);

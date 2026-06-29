@@ -64,50 +64,31 @@ export fn tgp_primitive(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
     return s.ptr;
 }
 
-/// Attribute value for adapted feature i and S-101 attribute name; null if absent.
-export fn tgp_attr(i: usize, name_ptr: [*]const u8, name_len: usize, out_len: *usize) callconv(.c) ?[*]const u8 {
-    const name = name_ptr[0..name_len];
-    for (g_ctx.?.adapted[i].attrs) |a| {
-        if (std.mem.eql(u8, a.name, name)) {
-            out_len.* = a.value.len;
-            return a.value.ptr;
-        }
-    }
-    return null;
+/// Raw value of simple sub-attribute `code` at the synthesized-tree node addressed
+/// by the framework attributePath `path` (the root when empty), on feature i. Null
+/// when the node or the sub-attribute is absent. The caller (lua_shim) splits S-57
+/// list values by the catalogue value type. Backs HostFeatureGetSimpleAttribute;
+/// resolves the FULL path through the tree (replaces the old single-level
+/// tgp_attr / tgp_complex_attr keyed only by the leading complex name).
+export fn tgp_simple(i: usize, path_ptr: [*]const u8, path_len: usize, code_ptr: [*]const u8, code_len: usize, out_len: *usize) callconv(.c) ?[*]const u8 {
+    const c = g_ctx orelse return null;
+    if (i >= c.adapted.len) return null;
+    const node = c.adapted[i].root.resolve(path_ptr[0..path_len]) orelse return null;
+    const v = node.simpleValue(code_ptr[0..code_len]) orelse return null;
+    out_len.* = v.len;
+    return v.ptr;
 }
 
-/// Number of instances of complex attribute `name` synthesized on feature i
-/// (e.g. featureName from OBJNAM, zoneOfConfidence from M_QUAL CATZOC). Each
-/// synthesized complex attribute is a single instance.
-export fn tgp_complex_count(i: usize, name_ptr: [*]const u8, name_len: usize) callconv(.c) usize {
-    const name = name_ptr[0..name_len];
-    var n: usize = 0;
-    for (g_ctx.?.adapted[i].complex) |c| {
-        if (std.mem.eql(u8, c.name, name)) n += 1;
-    }
-    return n;
-}
-
-/// Value of simple sub-attribute `code` inside a synthesized complex instance on
-/// feature i. `path` is the framework's attributePath; its leading segment names
-/// the complex instance (e.g. "featureName:1", "zoneOfConfidence:1"). Null if the
-/// complex/sub-attribute is absent (the caller then falls back to the flat attrs).
-export fn tgp_complex_attr(i: usize, path_ptr: [*]const u8, path_len: usize, code_ptr: [*]const u8, code_len: usize, out_len: *usize) callconv(.c) ?[*]const u8 {
-    const path = path_ptr[0..path_len];
-    const code = code_ptr[0..code_len];
-    var end: usize = 0;
-    while (end < path.len and path[end] != ':' and path[end] != '/') : (end += 1) {}
-    const cname = path[0..end];
-    for (g_ctx.?.adapted[i].complex) |c| {
-        if (!std.mem.eql(u8, c.name, cname)) continue;
-        for (c.subs) |s| {
-            if (std.mem.eql(u8, s.name, code)) {
-                out_len.* = s.value.len;
-                return s.value.ptr;
-            }
-        }
-    }
-    return null;
+/// Number of instances of complex child `code` at the synthesized-tree node
+/// addressed by the framework attributePath `path` (the root when empty), on
+/// feature i. Backs HostFeatureGetComplexAttributeCount; resolves the full path
+/// through the tree (the old impl ignored the path and counted only root-level
+/// complexes by name).
+export fn tgp_complex_count(i: usize, path_ptr: [*]const u8, path_len: usize, code_ptr: [*]const u8, code_len: usize) callconv(.c) usize {
+    const c = g_ctx orelse return 0;
+    if (i >= c.adapted.len) return 0;
+    const node = c.adapted[i].root.resolve(path_ptr[0..path_len]) orelse return 0;
+    return node.childCount(code_ptr[0..code_len]);
 }
 
 /// Number of point-geometry vertices for feature i (1 for a point feature, 0

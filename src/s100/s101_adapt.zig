@@ -12,16 +12,106 @@ const catalogue = @import("catalogue.zig");
 
 pub const NameVal = struct { name: []const u8, value: []const u8 };
 
-/// A synthesized S-101 complex attribute instance: a named group of simple
-/// sub-attributes (NameVal). S-57 stores many of these flat (one simple per
-/// feature) while the rules read them as complex; we wrap the flat value(s) back
-/// into one instance. Carries featureName (from OBJNAM) and zoneOfConfidence
-/// (from M_QUAL CATZOC). The Host* path serves them via tgp_complex_count /
-/// tgp_complex_attr keyed by the attributePath's leading complex name.
-pub const ComplexAttr = struct {
-    name: []const u8, // S-101 complex attribute name, e.g. "featureName"
-    subs: []NameVal, // simple sub-attribute name -> value (one instance)
+/// One node of the synthesized attribute tree (port of internal/engine/s101/
+/// complex.go's `cnode`): leaf simple values keyed by S-101 sub-attribute name,
+/// plus nested complex children keyed by name (each name -> its ordered instances).
+/// The feature root reuses this shape: `simple` holds the feature's own simple
+/// attributes (translated to S-101 names, one raw value each — the host splits S-57
+/// list values by the catalogue value type), and `children` hold the synthesized
+/// top-level complex attributes, each possibly nesting further (light sectors). The
+/// Host* path serves the tree via tgp_simple / tgp_complex_count, resolving the
+/// framework attributePath through it. Built in adaptCell's arena; instances are
+/// tiny, so key/value slices are used rather than maps.
+pub const CNode = struct {
+    simple: []const NameVal = &.{},
+    children: []const ChildEntry = &.{},
+
+    /// Walk the framework attributePath ("code:idx;code:idx;…") from this node to the
+    /// container being queried. An empty path is the node itself; idx is 1-based.
+    /// Returns null if any segment is missing — the framework then reads count 0 / no
+    /// value, i.e. "attribute absent". Port of complex.go cnode.resolve.
+    pub fn resolve(self: *const CNode, path: []const u8) ?*const CNode {
+        if (path.len == 0) return self;
+        var cur: *const CNode = self;
+        var it = std.mem.splitScalar(u8, path, ';');
+        while (it.next()) |seg| {
+            const colon = std.mem.indexOfScalar(u8, seg, ':') orelse return null;
+            const idx = std.fmt.parseInt(usize, std.mem.trim(u8, seg[colon + 1 ..], " "), 10) catch return null;
+            if (idx < 1) return null;
+            const list = cur.childList(seg[0..colon]) orelse return null;
+            if (idx > list.len) return null;
+            cur = &list[idx - 1];
+        }
+        return cur;
+    }
+
+    fn childList(self: *const CNode, code: []const u8) ?[]const CNode {
+        for (self.children) |c| if (std.mem.eql(u8, c.code, code)) return c.nodes;
+        return null;
+    }
+
+    /// First raw value of simple sub-attribute `code` at this node, or null.
+    pub fn simpleValue(self: *const CNode, code: []const u8) ?[]const u8 {
+        for (self.simple) |s| if (std.mem.eql(u8, s.name, code)) return s.value;
+        return null;
+    }
+
+    /// Number of instances of complex child `code` at this node.
+    pub fn childCount(self: *const CNode, code: []const u8) usize {
+        return if (self.childList(code)) |l| l.len else 0;
+    }
 };
+
+/// A named complex-attribute child of a CNode: `code` -> its ordered instances.
+pub const ChildEntry = struct { code: []const u8, nodes: []const CNode };
+
+/// Incrementally builds a CNode in `a` (an arena): accumulate simple values and
+/// complex children, then `.build()`. addSimple drops empty values (mirrors Go
+/// cnode.addSimple) so the framework reads "absent" rather than an empty string;
+/// addChild appends instances under a code (a repeated code accumulates).
+const NodeBuilder = struct {
+    a: std.mem.Allocator,
+    simple: std.ArrayList(NameVal) = .empty,
+    children: std.ArrayList(ChildEntry) = .empty,
+
+    fn addSimple(self: *NodeBuilder, code: []const u8, value: []const u8) !void {
+        const v = std.mem.trim(u8, value, " ");
+        if (v.len == 0) return;
+        try self.simple.append(self.a, .{ .name = code, .value = v });
+    }
+
+    /// Append a sub-attribute keeping the value VERBATIM (even when empty), for the
+    /// rare case the framework must read a present-but-empty value rather than absent.
+    fn addSimpleRaw(self: *NodeBuilder, code: []const u8, value: []const u8) !void {
+        try self.simple.append(self.a, .{ .name = code, .value = value });
+    }
+
+    fn addChild(self: *NodeBuilder, code: []const u8, node: CNode) !void {
+        try appendChild(self.a, &self.children, code, node);
+    }
+
+    fn build(self: NodeBuilder) CNode {
+        return .{ .simple = self.simple.items, .children = self.children.items };
+    }
+};
+
+/// Append one complex-attribute instance under `code` in `list`, accumulating a
+/// repeated code into its ordered instance slice (port of cnode.addChild). Allocates
+/// the (re)grown node slice in `a`.
+fn appendChild(a: std.mem.Allocator, list: *std.ArrayList(ChildEntry), code: []const u8, node: CNode) !void {
+    for (list.items) |*ce| {
+        if (std.mem.eql(u8, ce.code, code)) {
+            const grown = try a.alloc(CNode, ce.nodes.len + 1);
+            @memcpy(grown[0..ce.nodes.len], ce.nodes);
+            grown[ce.nodes.len] = node;
+            ce.nodes = grown;
+            return;
+        }
+    }
+    const one = try a.alloc(CNode, 1);
+    one[0] = node;
+    try list.append(a, .{ .code = code, .nodes = one });
+}
 
 // S-57 simple attributes the S-101 catalogue models as a single-instance complex
 // attribute wrapping one *Value sub-attribute. The DRAFT rules index these
@@ -41,8 +131,10 @@ pub const Adapted = struct {
     feature_index: usize, // index into cell.features (for geometry)
     code: []const u8, // S-101 feature class name (== rule file name)
     primitive: []const u8, // "Point" | "Curve" | "Surface"
-    attrs: []NameVal, // S-101 attribute name -> value
-    complex: []ComplexAttr = &.{}, // synthesized complex attributes
+    // The synthesized attribute tree: root.simple = the feature's own simple attrs
+    // (S-101 name -> value), root.children = the top-level complex attributes (each
+    // possibly nested). The Host* path resolves the framework attributePath through it.
+    root: CNode = .{},
     // Point geometry (lon, lat, z) served to the rules via _HostFeaturePoints, so
     // HostGetSpatial can return a real Point for `#P` features — the S-101
     // framework's GetSpatial re-enters forever on a nil Point (the OBSTRN/WRECKS
@@ -179,114 +271,10 @@ fn fmtFloat(a: std.mem.Allocator, v: f64) ![]const u8 {
 
 /// S-57 object class (OBJL) -> S-101 feature class code, via the Feature
 /// Catalogue (OBJL -> acronym -> code). Covers all ~150 classes. (Attribute-
-/// dependent aliasing — LIGHTS, MORFAC, ADMARE — is handled by resolveClass; this
-/// returns the catalogue's primary alias target.)
+/// dependent aliasing — LIGHTS, MORFAC, ADMARE — is handled later; this returns
+/// the catalogue's primary alias target.)
 pub fn resolveCode(objl: u16) ?[]const u8 {
     return catalogue.resolveFeatureByObjl(objl);
-}
-
-// --- S-57 list-value helpers (port of complex.go firstListVal/hasListVal) ----
-// S-57 enumeration attributes are comma-separated integer lists (e.g. CATLIT
-// "1,6"); these read the head / membership the way the Go routing does.
-
-/// First integer of an S-57 comma-separated list value, or 0 if absent/unparseable.
-fn firstListVal(csv: ?[]const u8) i64 {
-    const s = csv orelse return 0;
-    const head = std.mem.trim(u8, std.mem.sliceTo(s, ','), " ");
-    return std.fmt.parseInt(i64, head, 10) catch 0;
-}
-
-/// Whether the S-57 comma-separated list value contains `want`.
-fn hasListVal(csv: ?[]const u8, want: i64) bool {
-    const s = csv orelse return false;
-    var it = std.mem.splitScalar(u8, s, ',');
-    while (it.next()) |part| {
-        const n = std.fmt.parseInt(i64, std.mem.trim(u8, part, " "), 10) catch continue;
-        if (n == want) return true;
-    }
-    return false;
-}
-
-/// Whether feature `f` carries a present, non-blank value for attribute `code`
-/// (an all-spaces value reads as absent, mirroring Go's `attrs[x] != ""`).
-fn attrNonEmpty(f: s57.Feature, code: u16) bool {
-    const v = f.attr(code) orelse return false;
-    return std.mem.trim(u8, v, " ").len > 0;
-}
-
-/// S-57 MORFAC -> S-101 feature class by CATMOR (category of mooring/warping
-/// facility). Port of complex.go resolveMooringClass: dolphin->Dolphin,
-/// bollard->Bollard, chain/wire/cable->MooringTrot, mooring buoy->MooringBuoy;
-/// post/pile/tie-up-wall/unknown fall back to Pile. Returns null if the resolved
-/// class isn't in the catalogue (caller then falls back to the alias lookup).
-fn resolveMooringClass(f: s57.Feature) ?[]const u8 {
-    const code: []const u8 = switch (firstListVal(f.attr(s57.ATTR_CATMOR))) {
-        1, 2 => "Dolphin", // dolphin, deviation dolphin
-        3 => "Bollard",
-        6 => "MooringTrot", // chain / wire / cable
-        7 => "MooringBuoy",
-        else => "Pile", // post or pile (5), tie-up wall (4), unknown
-    };
-    return if (catalogue.hasFeature(code)) code else null;
-}
-
-/// S-57 LIGHTS -> S-101 light class by attributes (port of complex.go
-/// resolveLightClass). Air-obstruction (CATLIT 6) and fog-detector (CATLIT 7)
-/// lights have dedicated rules that just add the standard flare + description, so
-/// route those faithfully. Sectored (SECTR1+SECTR2) and directional (CATLIT 1)
-/// lights resolve to LightSectored in the oracle, but that rule iterates the
-/// nested sectorCharacteristics complex the single-level complex plumbing here
-/// can't synthesize yet (buildLightSectors); routing them there would emit nothing
-/// (the flare would vanish), so keep them on LightAllAround — the flare +
-/// characteristic still render, strictly closer to the oracle than an empty draw.
-fn resolveLightClass(f: s57.Feature) []const u8 {
-    // Preserve the oracle's precedence: sectored/directional outrank the
-    // air-obstruction/fog-detector categories (a light that is both stays the
-    // sectored class), so test them first even though both map to LightAllAround
-    // here pending buildLightSectors.
-    if (attrNonEmpty(f, s57.ATTR_SECTR1) and attrNonEmpty(f, s57.ATTR_SECTR2)) return "LightAllAround";
-    const catlit = f.attr(s57.ATTR_CATLIT);
-    if (hasListVal(catlit, 1)) return "LightAllAround"; // directional -> LightSectored (deferred)
-    if (hasListVal(catlit, 6)) return "LightAirObstruction"; // air obstruction
-    if (hasListVal(catlit, 7)) return "LightFogDetector"; // fog detector
-    return "LightAllAround";
-}
-
-/// S-57 object class -> S-101 feature class, resolving the attribute-dependent
-/// one-to-many mappings the catalogue alias can't express. Port of complex.go
-/// resolveCode (the switch + the default catalogue-alias fallback). Returns null
-/// for an unmapped class (the caller then skips the feature).
-fn resolveClass(f: s57.Feature) ?[]const u8 {
-    switch (f.objl) {
-        // LIGHTS aliases to LightAllAround/LightSectored/LightAirObstruction/
-        // LightFogDetector depending on attributes (resolveLightClass).
-        s57.OBJL_LIGHTS => return resolveLightClass(f),
-        // ADMARE aliases to AdministrationArea and VesselTrafficServiceArea; the
-        // plain administration area is the correct default (VTS is a distinct class).
-        s57.OBJL_ADMARE => if (catalogue.hasFeature("AdministrationArea")) return "AdministrationArea",
-        // MORFAC decomposes by CATMOR into distinct point classes (no single alias).
-        s57.OBJL_MORFAC => if (resolveMooringClass(f)) |code| return code,
-        // S-101 merged the separation line (TSELNE, curve) and zone (TSEZNE, surface)
-        // into one geometry-distinguished class with no alias.
-        s57.OBJL_TSELNE, s57.OBJL_TSEZNE => if (catalogue.hasFeature("SeparationZoneOrLine")) return "SeparationZoneOrLine",
-        else => {},
-    }
-    // Default: catalogue alias by acronym. resolveFeatureByObjl covers the numeric
-    // S-57 classes; meta classes (M_*, OBJL >= 300) are absent from the numeric
-    // table, so reach their acronym via the acronymByObjl fallback and alias that
-    // (e.g. M_ACCY -> QualityOfNonBathymetricData, M_QUAL -> QualityOfBathymetricData).
-    if (resolveCode(f.objl)) |code| return code;
-    if (catalogue.acronymByObjl(f.objl)) |acr| {
-        // M_NSYS's oracle output is the dedicated navSystemBuild S-52 boundary
-        // (MARSYS51/NAVARE51 + direction-of-buoyage arrow; Go s101build.go:307),
-        // which supersedes its LocalDirectionOfBuoyage alias. Until that override
-        // is ported, skip M_NSYS rather than draw the wrong (S-101 DIRBOY) arrow
-        // its alias would emit — a missing boundary is closer to the oracle than a
-        // different symbol. (Tracked: portrayal-fallbacks navSystemBuild.)
-        if (std.mem.eql(u8, acr, "M_NSYS")) return null;
-        return catalogue.resolveFeature(acr);
-    }
-    return null;
 }
 
 fn primitiveName(prim: u8) []const u8 {
@@ -296,6 +284,148 @@ fn primitiveName(prim: u8) []const u8 {
         3 => "Surface",
         else => "",
     };
+}
+
+// --- LIGHTS (S-52 sectored/all-around lights) ------------------------------
+// Port of internal/engine/s101/complex.go's resolveLightClass + buildLightSectors +
+// buildRhythmOfLight: S-57 stores a light's characteristic/sector data flat; the
+// LightSectored rule reads a nested sectorCharacteristics -> lightSector ->
+// sectorLimit/directionalCharacter tree, and every light reads rhythmOfLight for its
+// characteristic text. We synthesize both from the S-57 LIGHTS simple attributes.
+
+/// Trimmed value of S-57 attribute `code` on `f`, or "" if absent.
+fn attrTrim(f: s57.Feature, code: u16) []const u8 {
+    return std.mem.trim(u8, f.attr(code) orelse "", " ");
+}
+
+/// Whether the S-57 comma-separated list value `csv` contains the integer `want`.
+/// Port of complex.go hasListVal.
+fn hasListVal(csv: []const u8, want: i64) bool {
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |p| {
+        const n = std.fmt.parseInt(i64, std.mem.trim(u8, p, " "), 10) catch continue;
+        if (n == want) return true;
+    }
+    return false;
+}
+
+/// S-101 light class for an S-57 LIGHTS feature (port of complex.go resolveLightClass):
+/// two sector limits OR a directional light -> LightSectored (sector legs/arcs +
+/// directional characters); air obstruction / fog detector -> their dedicated rules;
+/// everything else an all-around light.
+fn resolveLightClass(f: s57.Feature) []const u8 {
+    if (attrTrim(f, s57.ATTR_SECTR1).len > 0 and attrTrim(f, s57.ATTR_SECTR2).len > 0)
+        return "LightSectored";
+    const catlit = attrTrim(f, s57.ATTR_CATLIT);
+    if (hasListVal(catlit, 1)) return "LightSectored"; // directional function
+    if (hasListVal(catlit, 6)) return "LightAirObstruction";
+    if (hasListVal(catlit, 7)) return "LightFogDetector";
+    return "LightAllAround";
+}
+
+/// First integer in the S-57 comma-separated list `csv`, or 0 if none.
+/// Port of complex.go firstListVal.
+fn firstListVal(csv: []const u8) i64 {
+    var it = std.mem.splitScalar(u8, csv, ',');
+    const first = it.next() orelse return 0;
+    return std.fmt.parseInt(i64, std.mem.trim(u8, first, " "), 10) catch 0;
+}
+
+/// MORFAC (mooring/warping facility) decomposes by CATMOR into distinct point
+/// classes (no single alias). Port of complex.go resolveMooringClass.
+fn resolveMooringClass(f: s57.Feature) ?[]const u8 {
+    const code: []const u8 = switch (firstListVal(attrTrim(f, s57.ATTR_CATMOR))) {
+        1, 2 => "Dolphin", // dolphin, deviation dolphin
+        3 => "Bollard",
+        6 => "MooringTrot", // chain / wire / cable
+        7 => "MooringBuoy",
+        else => "Pile", // post or pile (5), tie-up wall (4), unknown
+    };
+    return if (catalogue.hasFeature(code)) code else null;
+}
+
+/// S-57 object class -> S-101 feature class, including the attribute-dependent
+/// aliases (LIGHTS, MORFAC, ADMARE, TSELNE/TSEZNE) and the meta classes (M_*);
+/// an unmapped class returns null. Port of complex.go resolveCode + resolveClass.
+fn resolveClass(f: s57.Feature) ?[]const u8 {
+    switch (f.objl) {
+        s57.OBJL_LIGHTS => return resolveLightClass(f),
+        s57.OBJL_ADMARE => if (catalogue.hasFeature("AdministrationArea")) return "AdministrationArea",
+        s57.OBJL_MORFAC => if (resolveMooringClass(f)) |code| return code,
+        s57.OBJL_TSELNE, s57.OBJL_TSEZNE => if (catalogue.hasFeature("SeparationZoneOrLine")) return "SeparationZoneOrLine",
+        else => {},
+    }
+    // Default: catalogue alias by numeric class, then by acronym for meta (M_*)
+    // classes absent from the numeric table (M_QUAL -> QualityOfBathymetricData, …).
+    if (resolveCode(f.objl)) |code| return code;
+    if (catalogue.acronymByObjl(f.objl)) |acr| {
+        // M_NSYS's oracle output is the navSystemBuild S-52 boundary, not its
+        // LocalDirectionOfBuoyage alias; skip until that override is ported.
+        if (std.mem.eql(u8, acr, "M_NSYS")) return null;
+        return catalogue.resolveFeature(acr);
+    }
+    return null;
+}
+
+/// Synthesize the nested sectorCharacteristics -> lightSector -> sectorLimit /
+/// directionalCharacter tree LightSectored reads, from the S-57 LIGHTS attributes.
+/// One S-57 LIGHTS feature carries exactly one sector; multiple sectors at a position
+/// are separate co-located features. Port of complex.go buildLightSectors.
+fn buildLightSectors(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry), f: s57.Feature) !void {
+    const sectr1 = attrTrim(f, s57.ATTR_SECTR1);
+    const sectr2 = attrTrim(f, s57.ATTR_SECTR2);
+    const orient = attrTrim(f, s57.ATTR_ORIENT);
+    const sectored = sectr1.len > 0 and sectr2.len > 0;
+    const directional = hasListVal(attrTrim(f, s57.ATTR_CATLIT), 1) and orient.len > 0;
+    if (!sectored and !directional) return;
+
+    var sc = NodeBuilder{ .a = a };
+    try sc.addSimple("lightCharacteristic", attrTrim(f, s57.ATTR_LITCHR));
+    try sc.addSimple("signalGroup", attrTrim(f, s57.ATTR_SIGGRP));
+    try sc.addSimple("signalPeriod", attrTrim(f, s57.ATTR_SIGPER));
+
+    var ls = NodeBuilder{ .a = a };
+    // colour / lightVisibility are S-57 list values; addSimple stores the raw value and
+    // the host splits it by the catalogue value type (== Go splitValue).
+    try ls.addSimple("colour", attrTrim(f, s57.ATTR_COLOUR));
+    try ls.addSimple("valueOfNominalRange", attrTrim(f, s57.ATTR_VALNMR));
+    try ls.addSimple("lightVisibility", attrTrim(f, s57.ATTR_LITVIS));
+
+    if (sectored) {
+        var sl = NodeBuilder{ .a = a };
+        var one = NodeBuilder{ .a = a };
+        try one.addSimple("sectorBearing", sectr1);
+        var two = NodeBuilder{ .a = a };
+        try two.addSimple("sectorBearing", sectr2);
+        try sl.addChild("sectorLimitOne", one.build());
+        try sl.addChild("sectorLimitTwo", two.build());
+        try ls.addChild("sectorLimit", sl.build());
+    } else { // directional
+        var dc = NodeBuilder{ .a = a };
+        var o = NodeBuilder{ .a = a };
+        try o.addSimple("orientationValue", orient);
+        try dc.addChild("orientation", o.build());
+        try ls.addChild("directionalCharacter", dc.build());
+    }
+
+    try sc.addChild("lightSector", ls.build());
+    try appendChild(a, children, "sectorCharacteristics", sc.build());
+}
+
+/// Synthesize the rhythmOfLight complex (lightCharacteristic / signalGroup /
+/// signalPeriod) LITDSN02 reads to build a light's characteristic text, from the S-57
+/// LITCHR / SIGGRP / SIGPER. Built whenever any of the three is present. Port of
+/// complex.go buildRhythmOfLight.
+fn buildRhythmOfLight(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry), f: s57.Feature) !void {
+    const litchr = attrTrim(f, s57.ATTR_LITCHR);
+    const siggrp = attrTrim(f, s57.ATTR_SIGGRP);
+    const sigper = attrTrim(f, s57.ATTR_SIGPER);
+    if (litchr.len == 0 and siggrp.len == 0 and sigper.len == 0) return;
+    var rol = NodeBuilder{ .a = a };
+    try rol.addSimple("lightCharacteristic", litchr);
+    try rol.addSimple("signalGroup", siggrp);
+    try rol.addSimple("signalPeriod", sigper);
+    try appendChild(a, children, "rhythmOfLight", rol.build());
 }
 
 /// Adapt all mappable features of a cell. Allocates into `a` (use an arena).
@@ -313,14 +443,14 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // TOPMAR is folded into its co-located buoy/beacon as the topmark complex
         // (below); the standalone feature has no S-101 class, so don't portray it.
         if (f.objl == s57.OBJL_TOPMAR) continue;
-        // S-57 object class -> S-101 feature class, including the attribute-
-        // dependent aliases (LIGHTS, MORFAC, ADMARE, TSELNE/TSEZNE) and the meta
-        // classes (M_*); an unmapped class is skipped.
+        // S-57 object class -> S-101 feature class, including the attribute-dependent
+        // aliases (LIGHTS, MORFAC, ADMARE, TSELNE/TSEZNE) and the meta classes (M_*);
+        // an unmapped class is skipped.
         const code = resolveClass(f) orelse continue;
         const prim = primitiveName(f.prim);
         if (prim.len == 0) continue;
         var attrs = std.ArrayList(NameVal).empty;
-        var complex = std.ArrayList(ComplexAttr).empty;
+        var children = std.ArrayList(ChildEntry).empty;
         var name: []const u8 = "";
         var catzoc: []const u8 = "";
         for (f.attrs) |at| {
@@ -345,17 +475,16 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             subs[0] = .{ .name = "name", .value = name };
             subs[1] = .{ .name = "language", .value = "eng" };
             subs[2] = .{ .name = "nameUsage", .value = "1" }; // selected even if language differs
-            try complex.append(a, .{ .name = "featureName", .subs = subs });
+            try appendChild(a, &children, "featureName", .{ .simple = subs });
         }
         // zoneOfConfidence[1].categoryOfZoneOfConfidenceInData from M_QUAL CATZOC,
         // so QualityOfBathymetricData reads the data-quality zone (S-57 stores it
         // flat). The optional nested fixedDateRange (DATSTA/DATEND) is not
-        // synthesized — the single-level complex plumbing can't carry a nested
-        // complex, and it's not needed to pick the DQUAL fill pattern.
+        // synthesized — it's not needed to pick the DQUAL fill pattern.
         if (catzoc.len > 0) {
             const subs = try a.alloc(NameVal, 1);
             subs[0] = .{ .name = "categoryOfZoneOfConfidenceInData", .value = catzoc };
-            try complex.append(a, .{ .name = "zoneOfConfidence", .subs = subs });
+            try appendChild(a, &children, "zoneOfConfidence", .{ .simple = subs });
         }
         // orientation / clearance complexes from their S-57 simple attrs, so the
         // route + bridge rules (NavigationLine, RecommendedTrack, SpanOpening) can
@@ -366,7 +495,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (v.len == 0) continue;
             const subs = try a.alloc(NameVal, 1);
             subs[0] = .{ .name = m.sub, .value = v };
-            try complex.append(a, .{ .name = m.complex, .subs = subs });
+            try appendChild(a, &children, m.complex, .{ .simple = subs });
         }
         // SpanOpening (opening bridges) indexes feature.verticalClearanceClosed
         // unconditionally (a draft-rule bug), so guarantee the complex exists —
@@ -375,7 +504,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         if (std.mem.eql(u8, code, "SpanOpening")) {
             const vc = f.attr(s57.ATTR_VERCCL);
             const present = vc != null and std.mem.trim(u8, vc.?, " ").len > 0;
-            if (!present) try complex.append(a, .{ .name = "verticalClearanceClosed", .subs = &.{} });
+            if (!present) try appendChild(a, &children, "verticalClearanceClosed", .{});
         }
 
         // TOPMAR folding: a co-located TOPMAR's shape/colour -> the parent's
@@ -388,9 +517,19 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
                     var subs = std.ArrayList(NameVal).empty;
                     try subs.append(a, .{ .name = "topmarkDaymarkShape", .value = tm.shape });
                     if (tm.colour.len > 0) try subs.append(a, .{ .name = "colour", .value = tm.colour });
-                    try complex.append(a, .{ .name = "topmark", .subs = subs.items });
+                    try appendChild(a, &children, "topmark", .{ .simple = subs.items });
                 }
             }
+        }
+
+        // LIGHTS sector tree + rhythm of light: the LightSectored rule reads the
+        // nested sectorCharacteristics (sectored/directional lights); LITDSN02 reads
+        // rhythmOfLight for every light's characteristic text. Synthesized from the
+        // S-57 LIGHTS simple attributes (port of complex.go buildLightSectors /
+        // buildRhythmOfLight). Gated on the S-57 LIGHTS object class (OBJL 75).
+        if (f.objl == 75) {
+            try buildLightSectors(a, &children, f);
+            try buildRhythmOfLight(a, &children, f);
         }
 
         // Derived depth attributes for under/awash dangers (S-52 DEPVAL): supply
@@ -428,7 +567,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             }
         }
 
-        try out.append(a, .{ .feature_index = i, .code = code, .primitive = prim, .attrs = attrs.items, .complex = complex.items, .points = points });
+        try out.append(a, .{ .feature_index = i, .code = code, .primitive = prim, .root = .{ .simple = attrs.items, .children = children.items }, .points = points });
     }
     return out.items;
 }
@@ -462,58 +601,11 @@ test "adapt a depth area" {
     try std.testing.expectEqual(@as(usize, 1), adapted.len);
     try std.testing.expectEqualStrings("DepthArea", adapted[0].code);
     try std.testing.expectEqualStrings("Surface", adapted[0].primitive);
-    try std.testing.expectEqual(@as(usize, 2), adapted[0].attrs.len);
-    try std.testing.expectEqualStrings("depthRangeMinimumValue", adapted[0].attrs[0].name);
-    try std.testing.expectEqualStrings("5", adapted[0].attrs[0].value);
-}
-
-test "resolveClass routes the attribute-dependent S-57 classes" {
-    const t = std.testing;
-    // ADMARE -> AdministrationArea (NOT the catalogue's VesselTrafficServiceArea alias).
-    try t.expectEqualStrings("AdministrationArea", resolveClass(.{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = s57.OBJL_ADMARE }).?);
-    // TSELNE (curve) and TSEZNE (surface) both -> SeparationZoneOrLine (merged, no alias).
-    try t.expectEqualStrings("SeparationZoneOrLine", resolveClass(.{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = s57.OBJL_TSELNE }).?);
-    try t.expectEqualStrings("SeparationZoneOrLine", resolveClass(.{ .rcnm = 100, .rcid = 3, .prim = 3, .objl = s57.OBJL_TSEZNE }).?);
-    // MORFAC decomposes by CATMOR; absent/unknown -> Pile.
-    const dolphin = [_]s57.Attr{.{ .code = s57.ATTR_CATMOR, .value = "1" }};
-    try t.expectEqualStrings("Dolphin", resolveClass(.{ .rcnm = 100, .rcid = 4, .prim = 1, .objl = s57.OBJL_MORFAC, .attrs = &dolphin }).?);
-    const buoy = [_]s57.Attr{.{ .code = s57.ATTR_CATMOR, .value = "7" }};
-    try t.expectEqualStrings("MooringBuoy", resolveClass(.{ .rcnm = 100, .rcid = 5, .prim = 1, .objl = s57.OBJL_MORFAC, .attrs = &buoy }).?);
-    try t.expectEqualStrings("Pile", resolveClass(.{ .rcnm = 100, .rcid = 6, .prim = 1, .objl = s57.OBJL_MORFAC }).?);
-    // Meta classes resolve via their acronym alias: M_ACCY (300) and M_QUAL (308).
-    try t.expectEqualStrings("QualityOfNonBathymetricData", resolveClass(.{ .rcnm = 100, .rcid = 7, .prim = 3, .objl = 300 }).?);
-    try t.expectEqualStrings("QualityOfBathymetricData", resolveClass(.{ .rcnm = 100, .rcid = 8, .prim = 3, .objl = 308 }).?);
-    // A plain LIGHTS (no category) -> LightAllAround.
-    try t.expectEqualStrings("LightAllAround", resolveClass(.{ .rcnm = 100, .rcid = 9, .prim = 1, .objl = s57.OBJL_LIGHTS }).?);
-    // An unmapped object class resolves to null (caller skips it).
-    try t.expect(resolveClass(.{ .rcnm = 100, .rcid = 10, .prim = 1, .objl = 9999 }) == null);
-}
-
-test "resolveLightClass routes LIGHTS by category" {
-    const t = std.testing;
-    const lights = struct {
-        fn f(rcid: u32, attrs: []const s57.Attr) s57.Feature {
-            return .{ .rcnm = 100, .rcid = rcid, .prim = 1, .objl = s57.OBJL_LIGHTS, .attrs = attrs };
-        }
-    }.f;
-    // Air-obstruction (CATLIT 6) and fog-detector (CATLIT 7) route faithfully.
-    const air = [_]s57.Attr{.{ .code = s57.ATTR_CATLIT, .value = "6" }};
-    try t.expectEqualStrings("LightAirObstruction", resolveLightClass(lights(1, &air)));
-    const fog = [_]s57.Attr{.{ .code = s57.ATTR_CATLIT, .value = "7" }};
-    try t.expectEqualStrings("LightFogDetector", resolveLightClass(lights(2, &fog)));
-    // CATLIT as a list still matches membership.
-    const air_list = [_]s57.Attr{.{ .code = s57.ATTR_CATLIT, .value = "1,6" }};
-    // ...but a directional (CATLIT 1) light outranks air-obstruction and (pending
-    // buildLightSectors) stays LightAllAround rather than its LightSectored class.
-    try t.expectEqualStrings("LightAllAround", resolveLightClass(lights(3, &air_list)));
-    // Sectored light (SECTR1+SECTR2) -> LightAllAround for now (would be LightSectored).
-    const sect = [_]s57.Attr{
-        .{ .code = s57.ATTR_SECTR1, .value = "045" },
-        .{ .code = s57.ATTR_SECTR2, .value = "090" },
-    };
-    try t.expectEqualStrings("LightAllAround", resolveLightClass(lights(4, &sect)));
-    // A plain light -> LightAllAround.
-    try t.expectEqualStrings("LightAllAround", resolveLightClass(lights(5, &.{})));
+    try std.testing.expectEqual(@as(usize, 2), adapted[0].root.simple.len);
+    try std.testing.expectEqualStrings("depthRangeMinimumValue", adapted[0].root.simple[0].name);
+    try std.testing.expectEqualStrings("5", adapted[0].root.simple[0].value);
+    // resolve("") returns the root itself; depthRangeMinimumValue reads back.
+    try std.testing.expectEqualStrings("5", adapted[0].root.resolve("").?.simpleValue("depthRangeMinimumValue").?);
 }
 
 test "TOPMAR folds into co-located buoy as the topmark complex" {
@@ -542,15 +634,78 @@ test "TOPMAR folds into co-located buoy as the topmark complex" {
     const adapted = try adaptCell(a, &cell);
     // The standalone TOPMAR is dropped; only the buoy is adapted.
     try std.testing.expectEqual(@as(usize, 1), adapted.len);
-    var found = false;
-    for (adapted[0].complex) |c| {
-        if (std.mem.eql(u8, c.name, "topmark")) {
-            found = true;
-            try std.testing.expectEqualStrings("topmarkDaymarkShape", c.subs[0].name);
-            try std.testing.expectEqualStrings("2", c.subs[0].value);
+    // The topmark complex resolves through the tree: feature.topmark[1].topmarkDaymarkShape.
+    const root = &adapted[0].root;
+    try std.testing.expectEqual(@as(usize, 1), root.childCount("topmark"));
+    const tm = root.resolve("topmark:1").?;
+    try std.testing.expectEqualStrings("2", tm.simpleValue("topmarkDaymarkShape").?);
+}
+
+test "resolveLightClass routes by sector limits / CATLIT" {
+    const mk = struct {
+        fn f(attrs: []const s57.Attr) s57.Feature {
+            return .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 75, .attrs = attrs };
         }
-    }
-    try std.testing.expect(found);
+    }.f;
+    try std.testing.expectEqualStrings("LightSectored", resolveLightClass(mk(&.{
+        .{ .code = s57.ATTR_SECTR1, .value = "045" }, .{ .code = s57.ATTR_SECTR2, .value = "090" },
+    })));
+    try std.testing.expectEqualStrings("LightSectored", resolveLightClass(mk(&.{.{ .code = s57.ATTR_CATLIT, .value = "1" }})));
+    try std.testing.expectEqualStrings("LightAirObstruction", resolveLightClass(mk(&.{.{ .code = s57.ATTR_CATLIT, .value = "6" }})));
+    try std.testing.expectEqualStrings("LightFogDetector", resolveLightClass(mk(&.{.{ .code = s57.ATTR_CATLIT, .value = "7" }})));
+    try std.testing.expectEqualStrings("LightAllAround", resolveLightClass(mk(&.{})));
+}
+
+test "sectored LIGHTS adapts to LightSectored + nested sectorCharacteristics tree" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const light_attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_SECTR1, .value = "045" },
+        .{ .code = s57.ATTR_SECTR2, .value = "090" },
+        .{ .code = s57.ATTR_COLOUR, .value = "1,3" },
+        .{ .code = s57.ATTR_LITCHR, .value = "2" },
+        .{ .code = s57.ATTR_SIGGRP, .value = "(2)" },
+        .{ .code = s57.ATTR_SIGPER, .value = "6" },
+        .{ .code = s57.ATTR_VALNMR, .value = "10" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 10, .prim = 1, .objl = 75, .refs = &node_ref, .attrs = &light_attrs },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("LightSectored", adapted[0].code);
+    const root = &adapted[0].root;
+
+    // sectorCharacteristics[1].lightSector[1] carries the colour (raw; the host splits
+    // the S-57 list value) + nominal range; its sectorLimit holds the two bearings.
+    try std.testing.expectEqual(@as(usize, 1), root.childCount("sectorCharacteristics"));
+    const ls = root.resolve("sectorCharacteristics:1;lightSector:1").?;
+    try std.testing.expectEqualStrings("1,3", ls.simpleValue("colour").?);
+    try std.testing.expectEqualStrings("10", ls.simpleValue("valueOfNominalRange").?);
+    const one = root.resolve("sectorCharacteristics:1;lightSector:1;sectorLimit:1;sectorLimitOne:1").?;
+    try std.testing.expectEqualStrings("045", one.simpleValue("sectorBearing").?);
+    const two = root.resolve("sectorCharacteristics:1;lightSector:1;sectorLimit:1;sectorLimitTwo:1").?;
+    try std.testing.expectEqualStrings("090", two.simpleValue("sectorBearing").?);
+
+    // rhythmOfLight backs the characteristic text (lightCharacteristic + signalPeriod).
+    const rol = root.resolve("rhythmOfLight:1").?;
+    try std.testing.expectEqualStrings("2", rol.simpleValue("lightCharacteristic").?);
+    try std.testing.expectEqualStrings("6", rol.simpleValue("signalPeriod").?);
 }
 
 test "DepthIndex shoalest DRVAL1 lookup" {

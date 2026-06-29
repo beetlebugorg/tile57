@@ -17,10 +17,10 @@
 extern size_t tgp_count(void);
 extern const char *tgp_code(size_t i, size_t *len);
 extern const char *tgp_primitive(size_t i, size_t *len);
-extern const char *tgp_attr(size_t i, const char *name, size_t nlen, size_t *len);
-extern size_t tgp_complex_count(size_t i, const char *name, size_t nlen);
-extern const char *tgp_complex_attr(size_t i, const char *path, size_t plen,
-                                    const char *code, size_t clen, size_t *len);
+extern const char *tgp_simple(size_t i, const char *path, size_t plen,
+                              const char *code, size_t clen, size_t *len);
+extern size_t tgp_complex_count(size_t i, const char *path, size_t plen,
+                                const char *code, size_t clen);
 extern void tgp_emit(size_t i, const char *instr, size_t len);
 extern size_t tgp_points_count(size_t i);
 extern void tgp_point(size_t i, size_t j, double *x, double *y, double *z);
@@ -559,22 +559,18 @@ static int lp_feature_points(lua_State *L) {
     }
     return 1;
 }
-static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value} */
+static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value(s)} */
     size_t i = (size_t)atol(luaL_checkstring(L, 1));
-    const char *path = lua_tostring(L, 2);
+    const char *path = lua_tostring(L, 2); /* the framework attributePath; "" = the feature root */
     const char *code = luaL_checkstring(L, 3);
     size_t len = 0;
-    const char *v = NULL;
-    /* A simple attribute inside a complex instance carries a non-empty
-     * attributePath whose leading segment names the complex (e.g. "featureName:1",
-     * "zoneOfConfidence:1"); serve it from the synthesized complex-attribute store.
-     * Falls back to the flat attr list when there is no such complex sub-attr. */
-    if (path && *path) {
-        v = tgp_complex_attr(i, path, strlen(path), code, strlen(code), &len);
-    }
-    if (!v) {
-        v = tgp_attr(i, code, strlen(code), &len);
-    }
+    /* Resolve the FULL attributePath through the synthesized tree: an empty path is
+     * the feature root (its own simple attributes), a non-empty path
+     * ("featureName:1", "sectorCharacteristics:1;lightSector:1", …) the addressed
+     * nested node. tgp_simple returns the raw value; the split below turns an S-57
+     * list value into the array the framework expects. */
+    const char *v = tgp_simple(i, path ? path : "", path ? strlen(path) : 0,
+                               code, strlen(code), &len);
     lua_newtable(L);
     if (v) {
         /* enumeration / integer attributes are S-57 comma-separated lists (e.g.
@@ -612,8 +608,10 @@ static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value}
 }
 static int lp_feature_complex_count(lua_State *L) { /* (id, path, code) -> count */
     size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    const char *path = lua_tostring(L, 2); /* "" = the feature root */
     const char *code = luaL_checkstring(L, 3);
-    size_t c = tgp_complex_count(i, code, strlen(code));
+    size_t c = tgp_complex_count(i, path ? path : "", path ? strlen(path) : 0,
+                                 code, strlen(code));
     lua_pushinteger(L, (lua_Integer)c);
     return 1;
 }
