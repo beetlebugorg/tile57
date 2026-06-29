@@ -190,13 +190,18 @@ pub const SpatialRef = struct {
     mask: u8 = 0, // MASK: 1=mask (edge not drawn), 2=show, 255=null
 };
 
+/// One VRPT pointer. The full list is retained so a VRPC-controlled partial modify
+/// (.001+ update) is an indexed insert/delete/modify, not a wholesale replace.
+pub const VPtr = struct { rcid: u32, topi: u8 }; // TOPI 1=begin, 2=end, 3=left, 4=right
+
 pub const VectorRecord = struct {
     rcnm: u8,
     rcid: u32,
     points: []LonLat, // SG2D coordinates (node = 1 point; edge = interior chain)
     soundings: []Sounding, // SG3D (sounding nodes)
-    begin_node: u32 = 0, // VRPT TOPI=1 (edges) — connected-node RCID
+    begin_node: u32 = 0, // VRPT TOPI=1 (edges) — connected-node RCID (derived from vptrs)
     end_node: u32 = 0, // VRPT TOPI=2 (edges)
+    vptrs: []const VPtr = &.{}, // full VRPT pointer list (for VRPC indexed edits)
     quapos: i32 = 0, // QUAPOS quality of position (S-57 spatial-level ATTV); 0 if absent
 };
 
@@ -437,15 +442,28 @@ fn parseSG2D(a: Allocator, data: []const u8, comf: f64) ![]LonLat {
     return pts;
 }
 
-/// VRPT: repeated 9-byte entries NAME(5)+ORNT(1)+USAG(1)+TOPI(1)+MASK(1).
-/// Sets begin/end connected-node RCIDs on the edge (TOPI 1=begin, 2=end).
-fn parseVRPT(v: *VectorRecord, data: []const u8) void {
+/// Set begin/end connected-node RCIDs from the VRPT pointer list (TOPI 1=begin,
+/// 2=end). Re-run after any VRPC edit so the edge's endpoints track the list.
+fn deriveEndpoints(v: *VectorRecord) void {
+    v.begin_node = 0;
+    v.end_node = 0;
+    for (v.vptrs) |p| {
+        if (p.topi == 1) v.begin_node = p.rcid else if (p.topi == 2) v.end_node = p.rcid;
+    }
+}
+
+/// VRPT: repeated 9-byte entries NAME(5)+ORNT(1)+USAG(1)+TOPI(1)+MASK(1). Retains
+/// the full pointer list (for VRPC indexed modifies) and derives begin/end nodes.
+fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) void {
+    const list = a.alloc(VPtr, data.len / 9) catch return;
+    var cnt: usize = 0;
     var off: usize = 0;
     while (off + 9 <= data.len) : (off += 9) {
-        const rcid = u32le(data, off + 1);
-        const topi = data[off + 7];
-        if (topi == 1) v.begin_node = rcid else if (topi == 2) v.end_node = rcid;
+        list[cnt] = .{ .rcid = u32le(data, off + 1), .topi = data[off + 7] };
+        cnt += 1;
     }
+    v.vptrs = list[0..cnt];
+    deriveEndpoints(v);
 }
 
 /// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are
@@ -728,7 +746,7 @@ fn mergeFile(
             var v = VectorRecord{ .rcnm = rcnm, .rcid = rcid, .points = &.{}, .soundings = &.{} };
             if (rec.field("SG2D")) |sg| v.points = try parseSG2D(a, sg, comf);
             if (rec.field("SG3D")) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
-            if (rec.field("VRPT")) |vp| parseVRPT(&v, vp);
+            if (rec.field("VRPT")) |vp| parseVRPT(a, &v, vp);
             if (rec.field("ATTV")) |av| v.quapos = quaposFromAttv(a, av);
 
             if (ruin == 3) { // modify in place
@@ -739,9 +757,16 @@ fn mergeFile(
                         ex.points = v.points;
                     }
                     if (rec.field("SG3D") != null) ex.soundings = v.soundings;
-                    if (rec.field("VRPT") != null) { // begin/end full-replace (VRPC indexing not modelled)
-                        ex.begin_node = v.begin_node;
-                        ex.end_node = v.end_node;
+                    // VRPC = indexed insert/delete/modify of the VRPT list (§8.4.3.2):
+                    // a single-endpoint modify ships VRPC{modify,idx,count=1} + ONE
+                    // VRPT, so editing the list (not replacing it) preserves the other
+                    // endpoint. A bare VRPT with no VRPC is a full replace.
+                    if (rec.field("VRPC")) |vrpc| {
+                        ex.vptrs = try applyControl(a, VPtr, ex.vptrs, v.vptrs, vrpc);
+                        deriveEndpoints(ex);
+                    } else if (rec.field("VRPT") != null) {
+                        ex.vptrs = v.vptrs;
+                        deriveEndpoints(ex);
                     }
                     if (rec.field("ATTV") != null) ex.quapos = v.quapos;
                 };
@@ -860,6 +885,26 @@ test "parse DSPM coordinate factors" {
     try std.testing.expectEqual(@as(i32, 10_000_000), p.comf);
     try std.testing.expectEqual(@as(i32, 10), p.somf);
     try std.testing.expectEqual(@as(i32, 25000), p.cscl);
+}
+
+test "VRPC partial VRPT modify preserves the unmodified endpoint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // edge with begin=100 (TOPI 1), end=200 (TOPI 2)
+    var v = VectorRecord{ .rcnm = RCNM_VE, .rcid = 1, .points = &.{}, .soundings = &.{} };
+    v.vptrs = &.{ .{ .rcid = 100, .topi = 1 }, .{ .rcid = 200, .topi = 2 } };
+    deriveEndpoints(&v);
+    try std.testing.expectEqual(@as(u32, 100), v.begin_node);
+    try std.testing.expectEqual(@as(u32, 200), v.end_node);
+    // an update that modifies ONLY the end pointer: VRPC{modify, idx=2 (1-based), count=1}
+    // + one new VRPT (TOPI 2). The begin pointer must survive (was clobbered to 0 before).
+    const upd = [_]VPtr{.{ .rcid = 300, .topi = 2 }};
+    const ctrl = [_]u8{ 3, 2, 0, 1, 0 }; // instr=modify, IX=2 LE, NC=1 LE
+    v.vptrs = try applyControl(a, VPtr, v.vptrs, &upd, &ctrl);
+    deriveEndpoints(&v);
+    try std.testing.expectEqual(@as(u32, 100), v.begin_node); // preserved
+    try std.testing.expectEqual(@as(u32, 300), v.end_node); // updated
 }
 
 test "featureQuapos majority-of-drawn-edges aggregate" {
