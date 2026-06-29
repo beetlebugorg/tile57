@@ -637,7 +637,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // point (centre of gravity; see areaRepresentativePoint). Without this only
     // point-feature labels show, so area/channel/place names were missing.
     if (p.texts.len > 0) {
-        if (s57.areaRepresentativePoint(geo_parts)) |rp| {
+        if (s57.areaRepresentativePoint(a, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
@@ -662,7 +662,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // point so centred-area marks (anchorage, restricted-area/entry, marine farm, TSS
     // arrows) aren't dropped — previously p.points was only emitted for prim==1.
     if (p.points.len > 0) {
-        if (s57.areaRepresentativePoint(geo_parts)) |rp| {
+        if (s57.areaRepresentativePoint(a, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
@@ -717,7 +717,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     }
 
     // SWPARE51 bracket + "swept to <DRVAL1>" label at the representative point.
-    const rp = s57.areaRepresentativePoint(geo_parts) orelse return;
+    const rp = s57.areaRepresentativePoint(a, geo_parts) orelse return;
     if (rp.lon() < tb[0] or rp.lon() > tb[2] or rp.lat() < tb[1] or rp.lat() > tb[3]) return;
     const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
     const parts = try a.alloc([]const mvt.Point, 1);

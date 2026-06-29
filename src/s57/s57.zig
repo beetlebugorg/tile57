@@ -122,24 +122,145 @@ pub fn pointInRingsEvenOdd(lon: f64, lat: f64, rings: []const []LonLat) bool {
     return inside;
 }
 
-/// The representative point for an area's parts — its centre of gravity when that
-/// lies inside (S-52 PresLib §8.5.3), else the vertex average. The first part is
-/// treated as the exterior ring (like the Go baker). Null with no usable vertices.
-pub fn areaRepresentativePoint(rings: []const []LonLat) ?LonLat {
-    if (rings.len == 0) return null;
-    if (ringCentroid(rings[0])) |c| {
+// The pole-of-inaccessibility search below (areaRepresentativePoint and its PlCell
+// quad-tree refinement) is a port of the Mapbox "polylabel" algorithm
+// (https://github.com/mapbox/polylabel), ISC-licensed — see THIRD_PARTY_LICENSES.md.
+
+/// One square candidate region in the polylabel search (longitude pre-scaled by kx).
+const PlCell = struct {
+    x: f64,
+    y: f64,
+    half: f64,
+    d: f64, // signed distance from centre to the polygon (+ inside)
+    max: f64, // upper bound on d anywhere in the cell (d + half*√2)
+};
+
+/// Max-heap order on PlCell.max — the most-promising cell pops first.
+fn plCellOrder(_: void, a: PlCell, b: PlCell) std.math.Order {
+    return std.math.order(b.max, a.max);
+}
+
+/// Euclidean distance from point (px,py) to segment a–b.
+fn segDist(px: f64, py: f64, ax0: f64, ay0: f64, bx: f64, by: f64) f64 {
+    var ax = ax0;
+    var ay = ay0;
+    const ex = bx - ax;
+    const ey = by - ay;
+    if (ex != 0 or ey != 0) {
+        const t = ((px - ax) * ex + (py - ay) * ey) / (ex * ex + ey * ey);
+        if (t > 1) {
+            ax = bx;
+            ay = by;
+        } else if (t > 0) {
+            ax += ex * t;
+            ay += ey * t;
+        }
+    }
+    const dx = px - ax;
+    const dy = py - ay;
+    return @sqrt(dx * dx + dy * dy);
+}
+
+/// Signed distance (positive inside) from scaled point (px,py) to the polygon: the
+/// min distance to any edge of any ring, with the sign from even-odd inclusion.
+/// Longitudes are pre-scaled by kx so distances are in roughly equal ground units.
+fn polySignedDist(rings: []const []LonLat, kx: f64, px: f64, py: f64) f64 {
+    var inside = false;
+    var best: f64 = std.math.inf(f64);
+    for (rings) |ring| {
+        const n = ring.len;
+        if (n == 0) continue;
+        var j: usize = n - 1;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const ax = ring[i].lon() * kx;
+            const ay = ring[i].lat();
+            const bx = ring[j].lon() * kx;
+            const by = ring[j].lat();
+            if ((ay > py) != (by > py) and px < (bx - ax) * (py - ay) / (by - ay) + ax) {
+                inside = !inside;
+            }
+            const d = segDist(px, py, ax, ay, bx, by);
+            if (d < best) best = d;
+            j = i;
+        }
+    }
+    return if (inside) best else -best;
+}
+
+fn plMkCell(rings: []const []LonLat, kx: f64, x: f64, y: f64, half: f64) PlCell {
+    const SQRT2: f64 = 1.4142135623730951;
+    const d = polySignedDist(rings, kx, x, y);
+    return .{ .x = x, .y = y, .half = half, .d = d, .max = d + half * SQRT2 };
+}
+
+/// The representative point for an area's parts. S-52 PresLib §8.5.3: the centre of
+/// gravity when it lies inside the area; otherwise (concave / holed shapes) the
+/// "pole of inaccessibility" — the interior point farthest from any edge (the Mapbox
+/// polylabel algorithm), so a centred symbol/label never lands outside the area or on
+/// a hole. rings[0] is the exterior; rings[1:] are holes (even-odd containment over
+/// all). Falls back to the vertex average for a degenerate ring or on OOM. Null with
+/// no usable vertices.
+pub fn areaRepresentativePoint(a: std.mem.Allocator, rings: []const []LonLat) ?LonLat {
+    if (rings.len == 0 or rings[0].len == 0) return null;
+    const ext = rings[0];
+    if (ringCentroid(ext)) |c| {
         if (pointInRingsEvenOdd(c.lon(), c.lat(), rings)) return c;
     }
-    var clon: f64 = 0;
-    var clat: f64 = 0;
-    var n: usize = 0;
-    for (rings) |ring| for (ring) |q| {
-        clon += q.lon();
-        clat += q.lat();
-        n += 1;
-    };
-    if (n == 0) return null;
-    return LonLat.init(clon / @as(f64, @floatFromInt(n)), clat / @as(f64, @floatFromInt(n)));
+
+    var min_lat: f64 = std.math.inf(f64);
+    var min_lon: f64 = std.math.inf(f64);
+    var max_lat: f64 = -std.math.inf(f64);
+    var max_lon: f64 = -std.math.inf(f64);
+    var sum_lat: f64 = 0;
+    var sum_lon: f64 = 0;
+    for (ext) |p| {
+        min_lat = @min(min_lat, p.lat());
+        max_lat = @max(max_lat, p.lat());
+        min_lon = @min(min_lon, p.lon());
+        max_lon = @max(max_lon, p.lon());
+        sum_lat += p.lat();
+        sum_lon += p.lon();
+    }
+    const nf: f64 = @floatFromInt(ext.len);
+    const mean = LonLat.init(sum_lon / nf, sum_lat / nf);
+
+    var kx = @cos((min_lat + max_lat) / 2 * std.math.pi / 180.0);
+    if (kx < 1e-9) kx = 1; // near-polar guard; charts don't reach here
+    const x_min = min_lon * kx;
+    const x_max = max_lon * kx;
+    const w = x_max - x_min;
+    const h = max_lat - min_lat;
+    const cell_size = @min(w, h);
+    if (cell_size <= 0) return mean; // zero-area / degenerate ring
+
+    const precision = @max(w, h) / 200.0; // ~0.5% of the span
+    const half = cell_size / 2.0;
+
+    var best = plMkCell(rings, kx, (x_min + x_max) / 2, (min_lat + max_lat) / 2, 0);
+    var pq = std.PriorityQueue(PlCell, void, plCellOrder).initContext({});
+    defer pq.deinit(a);
+    {
+        var x = x_min;
+        while (x < x_max) : (x += cell_size) {
+            var y = min_lat;
+            while (y < max_lat) : (y += cell_size) {
+                pq.push(a, plMkCell(rings, kx, x + half, y + half, half)) catch return mean;
+            }
+        }
+    }
+    const max_cells = 20000; // safety cap for very large / high-vertex rings
+    var processed: usize = 0;
+    while (pq.pop()) |c| : (processed += 1) {
+        if (c.d > best.d) best = c;
+        if (c.max - best.d <= precision or processed >= max_cells) continue;
+        const hh = c.half / 2;
+        pq.push(a, plMkCell(rings, kx, c.x - hh, c.y - hh, hh)) catch break;
+        pq.push(a, plMkCell(rings, kx, c.x + hh, c.y - hh, hh)) catch break;
+        pq.push(a, plMkCell(rings, kx, c.x - hh, c.y + hh, hh)) catch break;
+        pq.push(a, plMkCell(rings, kx, c.x + hh, c.y + hh, hh)) catch break;
+    }
+    return LonLat.init(best.x / kx, best.y);
 }
 
 test "area representative point centres on the centroid when inside" {
@@ -150,7 +271,7 @@ test "area representative point centres on the centroid when inside" {
         LonLat.init(10, 2), LonLat.init(0, 2),
     };
     var parts = [_][]LonLat{rect[0..]};
-    const rp = areaRepresentativePoint(parts[0..]).?;
+    const rp = areaRepresentativePoint(t.allocator, parts[0..]).?;
     try t.expectApproxEqAbs(@as(f64, 5), rp.lon(), 1e-9);
     try t.expectApproxEqAbs(@as(f64, 1), rp.lat(), 1e-9);
 
@@ -167,6 +288,29 @@ test "area representative point centres on the centroid when inside" {
     // A degenerate (collinear / 2-point) ring has no centroid.
     var deg = [_]LonLat{ LonLat.init(0, 0), LonLat.init(1, 1) };
     try t.expect(ringCentroid(deg[0..]) == null);
+}
+
+test "area representative point uses polylabel when the centroid falls outside" {
+    const t = std.testing;
+    // A "U" / C-shaped ring: the centre of gravity sits in the notch, OUTSIDE the
+    // area, so the naive centroid (and a vertex average) would place a symbol off the
+    // polygon. The polylabel pole of inaccessibility must land strictly inside.
+    var u = [_]LonLat{
+        LonLat.init(0, 0),  LonLat.init(10, 0), LonLat.init(10, 3), LonLat.init(3, 3),
+        LonLat.init(3, 7),  LonLat.init(10, 7), LonLat.init(10, 10), LonLat.init(0, 10),
+    };
+    var parts = [_][]LonLat{u[0..]};
+    const cen = ringCentroid(u[0..]).?;
+    try t.expect(!pointInRingsEvenOdd(cen.lon(), cen.lat(), parts[0..])); // centroid is outside
+    const rp = areaRepresentativePoint(t.allocator, parts[0..]).?;
+    try t.expect(pointInRingsEvenOdd(rp.lon(), rp.lat(), parts[0..])); // chosen point is inside
+
+    // A square with a central hole: the point must avoid the hole.
+    var outer = [_]LonLat{ LonLat.init(0, 0), LonLat.init(20, 0), LonLat.init(20, 20), LonLat.init(0, 20) };
+    var hole = [_]LonLat{ LonLat.init(7, 7), LonLat.init(13, 7), LonLat.init(13, 13), LonLat.init(7, 13) };
+    var holed = [_][]LonLat{ outer[0..], hole[0..] };
+    const hp = areaRepresentativePoint(t.allocator, holed[0..]).?;
+    try t.expect(pointInRingsEvenOdd(hp.lon(), hp.lat(), holed[0..])); // inside outer, outside hole
 }
 
 // S-57 vector record names (RCNM).

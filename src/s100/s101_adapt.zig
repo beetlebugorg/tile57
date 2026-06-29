@@ -125,7 +125,7 @@ fn buildDepthIndex(a: std.mem.Allocator, cell: *const s57.Cell) ![]DepthArea {
 fn representativePoint(a: std.mem.Allocator, cell: *const s57.Cell, f: s57.Feature) ?s57.LonLat {
     if (f.prim == 1) return cell.pointGeometry(f);
     const parts = cell.lineGeometryParts(a, f) catch return null;
-    return s57.areaRepresentativePoint(parts);
+    return s57.areaRepresentativePoint(a, parts);
 }
 
 // --- TOPMAR folding (S-52 TOPMAR02) ----------------------------------------
