@@ -228,6 +228,142 @@ fn clipSegment(p0: mvt.Point, p1: mvt.Point, b: Box) ?[2]mvt.Point {
     };
 }
 
+// ---- phase-stable line clip (float; for along-line symbology) -------------
+//
+// Complex (symbolised) linestyles are tessellated per zoom by walking the line
+// by arc length. To keep a dash/symbol pattern continuous across a tile boundary
+// the clip must report, per in-box run, the cumulative arc length at the run's
+// first vertex (arc0). This is the float counterpart of clipLine; emitComplexLine
+// quantises the float results to mvt.Point at emit. Mirrors Go tile.ClipLinePhased.
+
+/// A float tile-space point (unrounded), for the arc-length / phased-clip path.
+pub const FPoint = struct { x: f64, y: f64 };
+
+/// Project a normalised web-mercator world coord to UNROUNDED tile-local float
+/// coordinates (the float counterpart of worldToTile).
+pub fn worldToTileF(w: [2]f64, z: u8, tx: u32, ty: u32, extent: i32) FPoint {
+    const scale = @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+    const ext: f64 = @floatFromInt(extent);
+    return .{
+        .x = (w[0] * scale - @as(f64, @floatFromInt(tx))) * ext,
+        .y = (w[1] * scale - @as(f64, @floatFromInt(ty))) * ext,
+    };
+}
+
+const ClippedSegF = struct { a: FPoint, b: FPoint, t0: f64, exited: bool };
+
+fn clipSegmentF(a: FPoint, c: FPoint, b: Box) ?ClippedSegF {
+    const dx = c.x - a.x;
+    const dy = c.y - a.y;
+    var t0: f64 = 0;
+    var t1: f64 = 1;
+    const lo: f64 = @floatFromInt(b.min);
+    const hi: f64 = @floatFromInt(b.max);
+    const p = [4]f64{ -dx, dx, -dy, dy };
+    const q = [4]f64{ a.x - lo, hi - a.x, a.y - lo, hi - a.y };
+    for (p, q) |pi, qi| {
+        if (pi == 0) {
+            if (qi < 0) return null; // parallel & outside
+            continue;
+        }
+        const t = qi / pi;
+        if (pi < 0) {
+            if (t > t1) return null;
+            if (t > t0) t0 = t;
+        } else {
+            if (t < t0) return null;
+            if (t < t1) t1 = t;
+        }
+    }
+    return .{
+        .a = .{ .x = a.x + t0 * dx, .y = a.y + t0 * dy },
+        .b = .{ .x = a.x + t1 * dx, .y = a.y + t1 * dy },
+        .t0 = t0,
+        .exited = t1 < 1.0,
+    };
+}
+
+fn approxEqF(a: FPoint, b: FPoint) bool {
+    return @abs(a.x - b.x) < 1e-6 and @abs(a.y - b.y) < 1e-6;
+}
+
+/// One clipped polyline run plus the cumulative arc length at its first vertex.
+pub const PhasedRun = struct { points: []FPoint, arc0: f64 };
+
+/// Clip a polyline to the tile box, returning the in-box runs; each run carries
+/// arc0 = the arc length from the polyline's first vertex to the run's first vertex
+/// (so a dash/symbol period lines up across tile boundaries). `arc[i]` is the
+/// cumulative arc length at `pts[i]` and must be the same length as `pts`.
+pub fn clipLinePhased(alloc: Allocator, pts: []const FPoint, arc: []const f64, b: Box) ![]PhasedRun {
+    var runs = std.ArrayList(PhasedRun).empty;
+    if (pts.len < 2) return runs.items;
+    var cur = std.ArrayList(FPoint).empty;
+    var cur_arc0: f64 = 0;
+    var i: usize = 0;
+    while (i + 1 < pts.len) : (i += 1) {
+        const da = arc[i + 1] - arc[i];
+        const seg = clipSegmentF(pts[i], pts[i + 1], b) orelse {
+            if (cur.items.len > 0) {
+                try runs.append(alloc, .{ .points = cur.items, .arc0 = cur_arc0 });
+                cur = std.ArrayList(FPoint).empty;
+            }
+            continue;
+        };
+        const arc_a = arc[i] + seg.t0 * da;
+        if (cur.items.len == 0) {
+            cur_arc0 = arc_a;
+            try cur.append(alloc, seg.a);
+            try cur.append(alloc, seg.b);
+        } else if (approxEqF(cur.items[cur.items.len - 1], seg.a)) {
+            try cur.append(alloc, seg.b);
+        } else {
+            try runs.append(alloc, .{ .points = cur.items, .arc0 = cur_arc0 });
+            cur = std.ArrayList(FPoint).empty;
+            cur_arc0 = arc_a;
+            try cur.append(alloc, seg.a);
+            try cur.append(alloc, seg.b);
+        }
+        if (seg.exited) {
+            try runs.append(alloc, .{ .points = cur.items, .arc0 = cur_arc0 });
+            cur = std.ArrayList(FPoint).empty;
+        }
+    }
+    if (cur.items.len > 0) try runs.append(alloc, .{ .points = cur.items, .arc0 = cur_arc0 });
+    return runs.items;
+}
+
+test "clipLinePhased keeps arc phase across the box boundary" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const box = Box{ .min = 0, .max = 100 };
+
+    // A horizontal line from x=-50 to x=250 at y=50: enters the box at x=0 (arc 50
+    // from the start) and exits at x=100. One run, arc0 = 50.
+    const pts = [_]FPoint{ .{ .x = -50, .y = 50 }, .{ .x = 250, .y = 50 } };
+    const arc = [_]f64{ 0, 300 };
+    const runs = try clipLinePhased(a, &pts, &arc, box);
+    try t.expectEqual(@as(usize, 1), runs.len);
+    try t.expectApproxEqAbs(@as(f64, 50), runs[0].arc0, 1e-9);
+    try t.expectEqual(@as(usize, 2), runs[0].points.len);
+    try t.expectApproxEqAbs(@as(f64, 0), runs[0].points[0].x, 1e-9);
+    try t.expectApproxEqAbs(@as(f64, 100), runs[0].points[1].x, 1e-9);
+
+    // A line that exits the box and re-enters yields two runs, each with its own
+    // arc0: across the top (y=-50, fully outside) then back in.
+    const pts2 = [_]FPoint{
+        .{ .x = 10, .y = 50 }, .{ .x = 10, .y = -50 }, // up and out
+        .{ .x = 90, .y = -50 }, .{ .x = 90, .y = 50 }, // across (out) and back in
+    };
+    // arc: 0,100,180,280
+    const arc2 = [_]f64{ 0, 100, 180, 280 };
+    const runs2 = try clipLinePhased(a, &pts2, &arc2, box);
+    try t.expectEqual(@as(usize, 2), runs2.len);
+    try t.expectApproxEqAbs(@as(f64, 0), runs2[0].arc0, 1e-9); // first run starts at the line's start
+    try t.expect(runs2[1].arc0 > 180); // second run re-enters partway along the last segment
+}
+
 // ---- per-tile simplification (Go bake.go quantizeRing/douglasPeucker) ----
 //
 // A dense S-57 coastline can carry 100k+ vertices into one tile and blow MapLibre's
