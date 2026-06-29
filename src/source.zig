@@ -7,9 +7,9 @@
 //! bakes an ENC_ROOT into one band-streamed PMTiles archive.
 //!
 //! This is the single source of truth; the C ABI (capi.zig / include/tile57.h)
-//! is a thin shim over these types. The engine uses the (thread-safe) page
-//! allocator internally — `tile`/`bakeArchive` return page-allocator-owned bytes;
-//! free them with `freeBytes`.
+//! is a thin shim over these types. The engine uses a single thread-safe
+//! general-purpose allocator internally — `tile`/`bakeArchive` return bytes owned
+//! by it; free them with `freeBytes`.
 //!
 //! Threading: a Source is NOT internally synchronized — don't call `tile` on the
 //! same Source from multiple threads concurrently (the tile cache + LRU mutate
@@ -25,7 +25,10 @@ const bake_enc = @import("bake_enc");
 const catalogue = @import("s100").catalogue;
 const tile = @import("tile");
 
-const gpa = std.heap.page_allocator;
+// smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
+// makes many small, short-lived allocations (tile cache, cell dupes, index
+// lists); page_allocator would mmap each one. Matches the bake CLI + C ABI.
+const gpa = std.heap.smp_allocator;
 
 // Env access lives in C (Zig 0.16 puts env behind Io); returns the S-101 rules
 // dir from TILE57_S101_RULES or null. Provided by the portrayal C shim.

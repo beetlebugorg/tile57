@@ -390,8 +390,10 @@ fn between(s: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
 // Value of attribute `attr="..."` that appears after the first occurrence of `tag`.
 fn attrAfter(s: []const u8, tag: []const u8, attr: []const u8) ?[]const u8 {
     const ti = std.mem.indexOf(u8, s, tag) orelse return null;
-    const needle = std.mem.concat(std.heap.page_allocator, u8, &.{ attr, "=\"" }) catch return null;
-    defer std.heap.page_allocator.free(needle);
+    // Build the `attr="` needle on the stack — attribute names are short, and this
+    // avoids a heap alloc/free per call (was page_allocator, i.e. an mmap each time).
+    var nbuf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&nbuf, "{s}=\"", .{attr}) catch return null;
     const rest = s[ti..];
     const ai = std.mem.indexOf(u8, rest, needle) orelse return null;
     const after = rest[ai + needle.len ..];

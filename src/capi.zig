@@ -10,7 +10,10 @@ const chartstyle = @import("chartstyle");
 const assets = @import("assets");
 const sprite = @import("sprite");
 
-const gpa = std.heap.page_allocator;
+// smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the live
+// tile/source path makes many small, short-lived allocations; page_allocator
+// would mmap each one. Matches the bake CLI's allocator choice.
+const gpa = std.heap.smp_allocator;
 const Source = source.Source;
 
 // Wall-clock time for "today" date resolution in tile57_build_style. Zig 0.16
