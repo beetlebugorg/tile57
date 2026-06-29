@@ -158,8 +158,23 @@ pub fn main(init: std.process.Init) !void {
                 } else {
                     const layers = try engine.mvt.decode(arena, tile);
                     std.debug.print("  tile {d}/{d}/{d}: {d} bytes, {d} layers:\n", .{ z, x, y, tile.len, layers.len });
+                    // Optional 7th arg names a layer whose features' properties are
+                    // dumped (verification aid; does not touch bake output).
+                    const want: ?[]const u8 = if (args.len >= 7) args[6] else null;
                     for (layers) |L| {
                         std.debug.print("    {s}: {d} features (extent {d})\n", .{ L.name, L.features.len, L.extent });
+                        if (want) |w| if (std.mem.eql(u8, w, L.name)) for (L.features, 0..) |feat, fi| {
+                            std.debug.print("      [{d}] {s}:", .{ fi, @tagName(feat.geom_type) });
+                            for (feat.properties) |p| switch (p.value) {
+                                .string => |sv| std.debug.print(" {s}=\"{s}\"", .{ p.key, sv }),
+                                .int => |iv| std.debug.print(" {s}={d}", .{ p.key, iv }),
+                                .double => |dv| std.debug.print(" {s}={d}", .{ p.key, dv }),
+                                .float => |fv| std.debug.print(" {s}={d}", .{ p.key, fv }),
+                                .uint => |uv| std.debug.print(" {s}={d}", .{ p.key, uv }),
+                                .boolean => |bv| std.debug.print(" {s}={}", .{ p.key, bv }),
+                            };
+                            std.debug.print("\n", .{});
+                        };
                     }
                 }
             } else std.debug.print("  tile {d}/{d}/{d}: not found\n", .{ z, x, y });
