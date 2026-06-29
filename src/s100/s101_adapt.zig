@@ -179,10 +179,93 @@ fn fmtFloat(a: std.mem.Allocator, v: f64) ![]const u8 {
 
 /// S-57 object class (OBJL) -> S-101 feature class code, via the Feature
 /// Catalogue (OBJL -> acronym -> code). Covers all ~150 classes. (Attribute-
-/// dependent aliasing — LIGHTS, MORFAC, ADMARE — is handled later; this returns
-/// the catalogue's primary alias target.)
+/// dependent aliasing — LIGHTS, MORFAC, ADMARE — is handled by resolveClass; this
+/// returns the catalogue's primary alias target.)
 pub fn resolveCode(objl: u16) ?[]const u8 {
     return catalogue.resolveFeatureByObjl(objl);
+}
+
+// --- S-57 list-value helpers (port of complex.go firstListVal/hasListVal) ----
+// S-57 enumeration attributes are comma-separated integer lists (e.g. CATLIT
+// "1,6"); these read the head / membership the way the Go routing does.
+
+/// First integer of an S-57 comma-separated list value, or 0 if absent/unparseable.
+fn firstListVal(csv: ?[]const u8) i64 {
+    const s = csv orelse return 0;
+    const head = std.mem.trim(u8, std.mem.sliceTo(s, ','), " ");
+    return std.fmt.parseInt(i64, head, 10) catch 0;
+}
+
+/// Whether the S-57 comma-separated list value contains `want`.
+fn hasListVal(csv: ?[]const u8, want: i64) bool {
+    const s = csv orelse return false;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |part| {
+        const n = std.fmt.parseInt(i64, std.mem.trim(u8, part, " "), 10) catch continue;
+        if (n == want) return true;
+    }
+    return false;
+}
+
+/// Whether feature `f` carries a present, non-blank value for attribute `code`
+/// (an all-spaces value reads as absent, mirroring Go's `attrs[x] != ""`).
+fn attrNonEmpty(f: s57.Feature, code: u16) bool {
+    const v = f.attr(code) orelse return false;
+    return std.mem.trim(u8, v, " ").len > 0;
+}
+
+/// S-57 MORFAC -> S-101 feature class by CATMOR (category of mooring/warping
+/// facility). Port of complex.go resolveMooringClass: dolphin->Dolphin,
+/// bollard->Bollard, chain/wire/cable->MooringTrot, mooring buoy->MooringBuoy;
+/// post/pile/tie-up-wall/unknown fall back to Pile. Returns null if the resolved
+/// class isn't in the catalogue (caller then falls back to the alias lookup).
+fn resolveMooringClass(f: s57.Feature) ?[]const u8 {
+    const code: []const u8 = switch (firstListVal(f.attr(s57.ATTR_CATMOR))) {
+        1, 2 => "Dolphin", // dolphin, deviation dolphin
+        3 => "Bollard",
+        6 => "MooringTrot", // chain / wire / cable
+        7 => "MooringBuoy",
+        else => "Pile", // post or pile (5), tie-up wall (4), unknown
+    };
+    return if (catalogue.hasFeature(code)) code else null;
+}
+
+/// S-57 object class -> S-101 feature class, resolving the attribute-dependent
+/// one-to-many mappings the catalogue alias can't express. Port of complex.go
+/// resolveCode (the switch + the default catalogue-alias fallback). Returns null
+/// for an unmapped class (the caller then skips the feature).
+fn resolveClass(f: s57.Feature) ?[]const u8 {
+    switch (f.objl) {
+        // LIGHTS aliases to LightAllAround/LightSectored/LightAirObstruction/
+        // LightFogDetector depending on attributes. (Attribute routing added next;
+        // for now every light is the all-around flare.)
+        s57.OBJL_LIGHTS => return "LightAllAround",
+        // ADMARE aliases to AdministrationArea and VesselTrafficServiceArea; the
+        // plain administration area is the correct default (VTS is a distinct class).
+        s57.OBJL_ADMARE => if (catalogue.hasFeature("AdministrationArea")) return "AdministrationArea",
+        // MORFAC decomposes by CATMOR into distinct point classes (no single alias).
+        s57.OBJL_MORFAC => if (resolveMooringClass(f)) |code| return code,
+        // S-101 merged the separation line (TSELNE, curve) and zone (TSEZNE, surface)
+        // into one geometry-distinguished class with no alias.
+        s57.OBJL_TSELNE, s57.OBJL_TSEZNE => if (catalogue.hasFeature("SeparationZoneOrLine")) return "SeparationZoneOrLine",
+        else => {},
+    }
+    // Default: catalogue alias by acronym. resolveFeatureByObjl covers the numeric
+    // S-57 classes; meta classes (M_*, OBJL >= 300) are absent from the numeric
+    // table, so reach their acronym via the acronymByObjl fallback and alias that
+    // (e.g. M_ACCY -> QualityOfNonBathymetricData, M_QUAL -> QualityOfBathymetricData).
+    if (resolveCode(f.objl)) |code| return code;
+    if (catalogue.acronymByObjl(f.objl)) |acr| {
+        // M_NSYS's oracle output is the dedicated navSystemBuild S-52 boundary
+        // (MARSYS51/NAVARE51 + direction-of-buoyage arrow; Go s101build.go:307),
+        // which supersedes its LocalDirectionOfBuoyage alias. Until that override
+        // is ported, skip M_NSYS rather than draw the wrong (S-101 DIRBOY) arrow
+        // its alias would emit — a missing boundary is closer to the oracle than a
+        // different symbol. (Tracked: portrayal-fallbacks navSystemBuild.)
+        if (std.mem.eql(u8, acr, "M_NSYS")) return null;
+        return catalogue.resolveFeature(acr);
+    }
+    return null;
 }
 
 fn primitiveName(prim: u8) []const u8 {
@@ -209,23 +292,10 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // TOPMAR is folded into its co-located buoy/beacon as the topmark complex
         // (below); the standalone feature has no S-101 class, so don't portray it.
         if (f.objl == s57.OBJL_TOPMAR) continue;
-        var code = resolveCode(f.objl) orelse meta: {
-            // Meta object classes (M_*) are absent from the numeric S-57 code
-            // table, so resolveCode can't reach their catalogue alias. Map the one
-            // whose portrayal inputs we synthesize: M_QUAL (308) ->
-            // QualityOfBathymetricData, so its CATZOC zone-of-confidence draws.
-            if (f.objl == 308) break :meta "QualityOfBathymetricData";
-            continue;
-        };
-        // LIGHTS (objl 75) needs attribute-dependent aliasing: the catalogue's
-        // primary alias for the "LIGHTS" acronym is one variant (here
-        // LightAirObstruction), but real navigational lights are LightAllAround
-        // (or LightSectored when they carry sector limits). Route them so the
-        // light flare + characteristic text (LightAllAround) actually renders.
-        // (Sectored lights carry SECTR1/SECTR2 (codes 136/137); their sector
-        // arcs aren't rendered from the stream yet, so all lights use
-        // LightAllAround for now — the flare + characteristic still render.)
-        if (f.objl == 75) code = "LightAllAround";
+        // S-57 object class -> S-101 feature class, including the attribute-
+        // dependent aliases (LIGHTS, MORFAC, ADMARE, TSELNE/TSEZNE) and the meta
+        // classes (M_*); an unmapped class is skipped.
+        const code = resolveClass(f) orelse continue;
         const prim = primitiveName(f.prim);
         if (prim.len == 0) continue;
         var attrs = std.ArrayList(NameVal).empty;
@@ -374,6 +444,28 @@ test "adapt a depth area" {
     try std.testing.expectEqual(@as(usize, 2), adapted[0].attrs.len);
     try std.testing.expectEqualStrings("depthRangeMinimumValue", adapted[0].attrs[0].name);
     try std.testing.expectEqualStrings("5", adapted[0].attrs[0].value);
+}
+
+test "resolveClass routes the attribute-dependent S-57 classes" {
+    const t = std.testing;
+    // ADMARE -> AdministrationArea (NOT the catalogue's VesselTrafficServiceArea alias).
+    try t.expectEqualStrings("AdministrationArea", resolveClass(.{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = s57.OBJL_ADMARE }).?);
+    // TSELNE (curve) and TSEZNE (surface) both -> SeparationZoneOrLine (merged, no alias).
+    try t.expectEqualStrings("SeparationZoneOrLine", resolveClass(.{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = s57.OBJL_TSELNE }).?);
+    try t.expectEqualStrings("SeparationZoneOrLine", resolveClass(.{ .rcnm = 100, .rcid = 3, .prim = 3, .objl = s57.OBJL_TSEZNE }).?);
+    // MORFAC decomposes by CATMOR; absent/unknown -> Pile.
+    const dolphin = [_]s57.Attr{.{ .code = s57.ATTR_CATMOR, .value = "1" }};
+    try t.expectEqualStrings("Dolphin", resolveClass(.{ .rcnm = 100, .rcid = 4, .prim = 1, .objl = s57.OBJL_MORFAC, .attrs = &dolphin }).?);
+    const buoy = [_]s57.Attr{.{ .code = s57.ATTR_CATMOR, .value = "7" }};
+    try t.expectEqualStrings("MooringBuoy", resolveClass(.{ .rcnm = 100, .rcid = 5, .prim = 1, .objl = s57.OBJL_MORFAC, .attrs = &buoy }).?);
+    try t.expectEqualStrings("Pile", resolveClass(.{ .rcnm = 100, .rcid = 6, .prim = 1, .objl = s57.OBJL_MORFAC }).?);
+    // Meta classes resolve via their acronym alias: M_ACCY (300) and M_QUAL (308).
+    try t.expectEqualStrings("QualityOfNonBathymetricData", resolveClass(.{ .rcnm = 100, .rcid = 7, .prim = 3, .objl = 300 }).?);
+    try t.expectEqualStrings("QualityOfBathymetricData", resolveClass(.{ .rcnm = 100, .rcid = 8, .prim = 3, .objl = 308 }).?);
+    // LIGHTS -> LightAllAround (attribute routing added in resolveLightClass).
+    try t.expectEqualStrings("LightAllAround", resolveClass(.{ .rcnm = 100, .rcid = 9, .prim = 1, .objl = s57.OBJL_LIGHTS }).?);
+    // An unmapped object class resolves to null (caller skips it).
+    try t.expect(resolveClass(.{ .rcnm = 100, .rcid = 10, .prim = 1, .objl = 9999 }) == null);
 }
 
 test "TOPMAR folds into co-located buoy as the topmark complex" {

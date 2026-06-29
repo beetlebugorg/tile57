@@ -364,8 +364,17 @@ pub const ATTR_VERCCL: u16 = 182; // vertical clearance closed -> verticalCleara
 pub const ATTR_VERCOP: u16 = 183; // vertical clearance open -> verticalClearanceOpen
 pub const ATTR_TOPSHP: u16 = 171; // topmark/daymark shape -> topmark.topmarkDaymarkShape
 pub const ATTR_COLOUR: u16 = 75; // colour -> topmark.colour (and the simple `colour`)
+pub const ATTR_CATLIT: u16 = 37; // category of light -> LIGHTS class routing
+pub const ATTR_CATMOR: u16 = 40; // category of mooring/warping facility -> MORFAC class routing
+pub const ATTR_SECTR1: u16 = 136; // sector limit one (sectored light)
+pub const ATTR_SECTR2: u16 = 137; // sector limit two (sectored light)
 
+pub const OBJL_ADMARE: u16 = 1; // ADMARE: administration area
+pub const OBJL_LIGHTS: u16 = 75; // LIGHTS: attribute-dependent class routing
+pub const OBJL_MORFAC: u16 = 84; // MORFAC: mooring/warping facility (CATMOR-routed)
 pub const OBJL_TOPMAR: u16 = 144; // TOPMAR: folded into its co-located buoy/beacon
+pub const OBJL_TSELNE: u16 = 145; // TSELNE: traffic separation line -> SeparationZoneOrLine
+pub const OBJL_TSEZNE: u16 = 150; // TSEZNE: traffic separation zone -> SeparationZoneOrLine
 
 /// True for a QUAPOS that means "low accuracy" — S-52 draws such geometry DASHED
 /// (approximate-position line style). I.e. present and not surveyed (1), precisely

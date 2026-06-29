@@ -239,6 +239,15 @@ pub fn isComplex(code: []const u8) bool {
     return c.complex_bindings.contains(code);
 }
 
+/// True when `code` is a feature class in the catalogue (mirrors Go's
+/// `e.cat.FeatureTypes[code]` existence check). Every featureType is registered
+/// in feature_bindings during load, so membership there is the class set.
+pub fn hasFeature(code: []const u8) bool {
+    ensureLoaded();
+    const c = &(g_cat orelse return false);
+    return c.feature_bindings.contains(code);
+}
+
 // ---- C-ABI accessors (for lua_shim.c) ------------------------------------
 
 export fn tgc_loaded() callconv(.c) bool {
