@@ -357,10 +357,14 @@ pub fn buildFeatBBox(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts) ![]?[4
 }
 
 /// One assembled line/area part: its tile-independent web-mercator coords plus its
-/// static lon/lat bbox [w,s,e,n]. The bbox is computed ONCE here so the baker's
-/// per-tile overlap cull reuses it instead of recomputing geomBounds for every tile
-/// a feature spans (that recompute was ~10% of the bake).
-pub const WPart = struct { pts: [][2]f64, bbox: [4]f64 };
+/// static lon/lat bbox [w,s,e,n] and the matching normalised world bbox
+/// [min_wx,min_wy,max_wx,max_wy]. Both are computed ONCE here so the baker's
+/// per-tile cull reuses them instead of recomputing geomBounds for every tile a
+/// feature spans (that recompute was ~10% of the bake). worldToTile is linear and
+/// monotonic, so projecting the world bbox corners yields the part's exact
+/// tile-coord bbox — letting emitParsed skip a part that misses the clip box
+/// without projecting its points (byte-identical to clipping it to empty).
+pub const WPart = struct { pts: [][2]f64, bbox: [4]f64, wbbox: [4]f64 };
 
 /// World coords (web-mercator [0,1]) parallel to a geo cache: each line/area
 /// point's tile-independent projection, computed ONCE per cell so the baker
@@ -378,6 +382,7 @@ pub fn buildGeoWorld(a: Allocator, geo: GeoParts) !GeoWorld {
         for (parts, 0..) |part, pi| {
             const wp = try a.alloc([2]f64, part.len);
             var bb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+            var wbb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
             for (part, 0..) |pt, j| {
                 const lo = pt.lon();
                 const la = pt.lat();
@@ -386,8 +391,12 @@ pub fn buildGeoWorld(a: Allocator, geo: GeoParts) !GeoWorld {
                 bb[1] = @min(bb[1], la);
                 bb[2] = @max(bb[2], lo);
                 bb[3] = @max(bb[3], la);
+                wbb[0] = @min(wbb[0], wp[j][0]);
+                wbb[1] = @min(wbb[1], wp[j][1]);
+                wbb[2] = @max(wbb[2], wp[j][0]);
+                wbb[3] = @max(wbb[3], wp[j][1]);
             }
-            wparts[pi] = .{ .pts = wp, .bbox = bb };
+            wparts[pi] = .{ .pts = wp, .bbox = bb, .wbbox = wbb };
         }
         out[i] = wparts;
     }
@@ -516,16 +525,29 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     for (geo_parts, 0..) |gp, pi| {
         if (gp.len < 2) continue;
         const wp: ?WPart = if (wparts) |wps| (if (pi < wps.len and wps[pi].pts.len == gp.len) wps[pi] else null) else null;
-        // Overlap cull: reuse the part's precomputed lon/lat bbox when the world
-        // cache is present (no per-tile geomBounds recompute), else compute it live.
-        if (overlaps(if (wp) |w| w.bbox else geomBounds(gp), tb)) any_overlap = true;
-        const proj = try a.alloc(mvt.Point, gp.len);
         if (wp) |w| {
+            // any_overlap keys on the RAW tile bbox (no buffer), exactly as before —
+            // a feature touching only the buffer zone is still dropped.
+            if (overlaps(w.bbox, tb)) any_overlap = true;
+            // Exact tile-coord cull: worldToTile is linear+monotonic, so projecting
+            // the part's world bbox corners gives its exact projected bbox. If that
+            // misses the clip box the part clips to nothing — skip projecting its
+            // points (byte-identical, just no wasted work). Big win on multi-part
+            // features (coastlines, land/depth areas) that span a super-tile but
+            // touch each leaf tile with only a few of their parts.
+            const lo = tile.worldToTile(.{ w.wbbox[0], w.wbbox[1] }, z, x, y, tile.EXTENT);
+            const hi = tile.worldToTile(.{ w.wbbox[2], w.wbbox[3] }, z, x, y, tile.EXTENT);
+            if (hi.x < box.min or lo.x > box.max or hi.y < box.min or lo.y > box.max) continue;
+            const proj = try a.alloc(mvt.Point, gp.len);
             for (w.pts, 0..) |ww, i| proj[i] = tile.worldToTile(ww, z, x, y, tile.EXTENT);
+            try projected.append(a, proj);
         } else {
+            // Live path (single-tile): bbox-cull in lon/lat, project every part.
+            if (overlaps(geomBounds(gp), tb)) any_overlap = true;
+            const proj = try a.alloc(mvt.Point, gp.len);
             for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+            try projected.append(a, proj);
         }
-        try projected.append(a, proj);
     }
     if (!any_overlap or projected.items.len == 0) return;
 
