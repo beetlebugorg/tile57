@@ -1,0 +1,72 @@
+// tile57 web demo: MapLibre GL JS over PMTiles baked by `tile57 bake`, styled by
+// the @beetlebug/tile57-style-engine npm module (the tile57 chartstyle engine
+// compiled to WebAssembly). The module turns S-52 "mariner settings" into a
+// MapLibre style entirely in the browser; this app just wires the style's source /
+// sprite / glyphs to the assets served alongside.
+import { loadStyleEngine } from './engine/index.js';
+
+const err = (msg) => { document.getElementById('err').textContent = String(msg); console.error(msg); };
+// Surface any uncaught error/rejection on-page (and in the console) for debugging.
+addEventListener('error', (e) => err('JS error: ' + (e.message || e.error)));
+addEventListener('unhandledrejection', (e) => err('promise rejected: ' + (e.reason?.message || e.reason)));
+
+// pmtiles:// protocol so a MapLibre vector source can read a .pmtiles archive.
+const protocol = new pmtiles.Protocol();
+maplibregl.addProtocol('pmtiles', protocol.tile);
+
+// Assets served next to this page (see ./bake.sh + ./serve.sh). The PMTiles path
+// can be overridden with ?pmtiles=<path> (e.g. ?pmtiles=big/chart.pmtiles).
+const params = new URLSearchParams(location.search);
+const pmtilesPath = params.get('pmtiles') || 'chart/tiles/chart.pmtiles';
+const PMTILES = 'pmtiles://' + new URL(pmtilesPath, location.href).href;
+const SPRITE = new URL('chart/assets/sprite-mln', location.href).href;
+const GLYPHS = 'https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf'; // public "Noto Sans Regular"
+
+// Read the mariner settings off the control panel (omitted fields fall back to the
+// engine's canonical defaults).
+function readSettings() {
+  const el = (id) => document.getElementById(id);
+  return {
+    scheme: el('scheme').value,
+    depth_unit: el('depth_unit').value,
+    boundary_style: el('boundary_style').value,
+    four_shade_water: el('four_shade_water').checked,
+    safety_contour: Number(el('safety_contour').value),
+    shallow_contour: Number(el('shallow_contour').value),
+    deep_contour: Number(el('deep_contour').value),
+    text_names: el('text_names').checked,
+  };
+}
+
+async function main() {
+  const engine = await loadStyleEngine();
+
+  // The style engine only substitutes the mariner-driven bits; the source lives in
+  // the template, so we repoint it (and sprite/glyphs) at what we serve.
+  const buildStyle = () => {
+    const style = engine.generateStyle(readSettings());
+    style.sources.chart = { type: 'vector', url: PMTILES };
+    style.sprite = SPRITE;
+    style.glyphs = GLYPHS;
+    return style;
+  };
+
+  // Camera from the baked bundle's manifest (anchor = [lon, lat]); sane fallback.
+  let center = [-76.31, 38.70];
+  let zoom = 12;
+  try {
+    const mf = await (await fetch('chart/manifest.json')).json();
+    if (Array.isArray(mf?.data?.anchor)) center = mf.data.anchor;
+  } catch { /* keep fallback */ }
+
+  const map = new maplibregl.Map({ container: 'map', style: buildStyle(), center, zoom, hash: true });
+  map.addControl(new maplibregl.NavigationControl());
+  map.on('error', (e) => err(e.error?.message || e.error || 'map error'));
+
+  // Regenerate + apply the style whenever a control changes — the whole point of
+  // the demo: live, client-side restyle with no round-trip.
+  for (const c of document.querySelectorAll('#panel select, #panel input'))
+    c.addEventListener('change', () => map.setStyle(buildStyle()));
+}
+
+main().catch(err);

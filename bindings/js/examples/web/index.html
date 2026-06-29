@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>tile57 — MapLibre GL JS + S-52 style engine</title>
+  <link href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, sans-serif; }
+    #map { position: absolute; inset: 0; }
+    #panel {
+      position: absolute; top: 12px; left: 12px; z-index: 1; width: 244px;
+      background: rgba(18, 26, 34, 0.92); color: #e8eef4; padding: 12px 14px;
+      border-radius: 10px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+    }
+    #panel h1 { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
+    #panel label { display: flex; justify-content: space-between; align-items: center; margin: 7px 0; gap: 10px; }
+    #panel select, #panel input[type=number] { width: 100px; }
+    #panel .hint { opacity: 0.62; font-size: 11px; margin-top: 10px; }
+    #panel code { background: rgba(255,255,255,.08); padding: 0 3px; border-radius: 3px; }
+    #err { color: #ff9a9a; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <h1>⚓ S-52 mariner settings</h1>
+    <label>Scheme
+      <select id="scheme"><option>day</option><option>dusk</option><option>night</option></select></label>
+    <label>Depth unit
+      <select id="depth_unit"><option value="meters">metres</option><option value="feet">feet</option></select></label>
+    <label>Boundaries
+      <select id="boundary_style"><option value="symbolized">symbolized</option><option value="plain">plain</option></select></label>
+    <label>4-shade water <input type="checkbox" id="four_shade_water" checked /></label>
+    <label>Safety contour (m) <input type="number" id="safety_contour" value="10" step="1" min="0" /></label>
+    <label>Shallow contour (m) <input type="number" id="shallow_contour" value="2" step="1" min="0" /></label>
+    <label>Deep contour (m) <input type="number" id="deep_contour" value="30" step="1" min="0" /></label>
+    <label>Text labels <input type="checkbox" id="text_names" checked /></label>
+    <div class="hint">
+      Tiles baked by <code>tile57 bake</code>; the style is generated <b>in your browser</b>
+      by <code>@beetlebug/tile57-style-engine</code> (the tile57 chartstyle engine as WASM).
+      Change a setting → the style regenerates client-side.
+    </div>
+    <div id="err"></div>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/pmtiles@4.4.1/dist/pmtiles.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
