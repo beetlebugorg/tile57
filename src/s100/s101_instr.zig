@@ -62,6 +62,12 @@ fn toFloat(s: []const u8) f64 {
     return std.fmt.parseFloat(f64, std.mem.trim(u8, s, " ")) catch 0;
 }
 
+// S-101 simple-line widths are millimetres; the engine renders in pixels. Mirrors
+// Go's pxPerMM = float64(DefaultPxPerSymbolUnit)*100, DefaultPxPerSymbolUnit being
+// float32(0.01/0.26458) (~3.7796 px/mm). Kept in the float32->float64 form so the
+// scaled width matches the oracle.
+const PX_PER_MM: f64 = @as(f64, @as(f32, 0.01 / 0.26458)) * 100.0;
+
 /// Parse one feature's instruction stream. Allocates into `a` (use an arena).
 pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var patterns = std.ArrayList([]const u8).empty;
@@ -106,7 +112,8 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             cur_color = nthCsv(val, 3);
         } else if (std.mem.eql(u8, key, "LineInstruction")) {
             if (std.mem.eql(u8, val, "_simple_")) {
-                try lines.append(a, .{ .style = "solid", .width = cur_width, .color = cur_color });
+                // mm -> px (Go SimpleLine.Width * pxPerMM); raw mm rendered ~3.78x too thin.
+                try lines.append(a, .{ .style = "solid", .width = cur_width * PX_PER_MM, .color = cur_color });
             } else {
                 // named complex line pattern
                 try lines.append(a, .{ .style = val, .width = cur_width, .color = cur_color });
@@ -205,7 +212,7 @@ test "parse line + point + text instructions" {
 
     const line = try parse(a, "ViewingGroup:32050;DrawingPriority:9;LineStyle:_simple_,,0.96,CHGRD;LineInstruction:_simple_");
     try std.testing.expectEqual(@as(usize, 1), line.lines.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.96), line.lines[0].width, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.96) * PX_PER_MM, line.lines[0].width, 1e-6); // mm -> px (~3.63)
     try std.testing.expectEqualStrings("CHGRD", line.lines[0].color);
     try std.testing.expectEqual(@as(i64, 9), line.draw_prio);
 
