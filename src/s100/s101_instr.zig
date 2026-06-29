@@ -11,7 +11,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const Line = struct { style: []const u8, width: f64, color: []const u8 };
-pub const Point = struct { symbol: []const u8, rotation: f64, offset_x: f64, offset_y: f64 };
+pub const Point = struct { symbol: []const u8, rotation: f64, offset_x: f64, offset_y: f64, rot_north: bool = false };
 pub const Text = struct { text: []const u8, color: []const u8, group: i64 = 0 };
 
 pub const Portrayal = struct {
@@ -79,6 +79,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var cur_color: []const u8 = "CHBLK";
     var cur_style: []const u8 = "_simple_";
     var cur_rot: f64 = 0;
+    var cur_rot_north: bool = false; // Rotation CRS == GeographicCRS (rotates with true north)
     var cur_ox: f64 = 0;
     var cur_oy: f64 = 0;
     var cur_font: []const u8 = "CHBLK";
@@ -108,12 +109,22 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
                 try lines.append(a, .{ .style = val, .width = cur_width, .color = cur_color });
             }
         } else if (std.mem.eql(u8, key, "Rotation")) {
-            cur_rot = toFloat(val);
+            // S-101 form "Rotation:<CRS>,<angle>" (GeographicCRS=true-north, else
+            // screen); a bare "Rotation:<angle>" with no CRS is screen-referenced.
+            const crs = nthCsv(val, 0);
+            const ang = nthCsv(val, 1);
+            if (ang.len == 0) {
+                cur_rot = toFloat(crs); // bare angle
+                cur_rot_north = false;
+            } else {
+                cur_rot = toFloat(ang);
+                cur_rot_north = std.mem.eql(u8, std.mem.trim(u8, crs, " "), "GeographicCRS");
+            }
         } else if (std.mem.eql(u8, key, "LocalOffset")) {
             cur_ox = toFloat(nthCsv(val, 0));
             cur_oy = toFloat(nthCsv(val, 1));
         } else if (std.mem.eql(u8, key, "PointInstruction")) {
-            try points.append(a, .{ .symbol = val, .rotation = cur_rot, .offset_x = cur_ox, .offset_y = cur_oy });
+            try points.append(a, .{ .symbol = val, .rotation = cur_rot, .offset_x = cur_ox, .offset_y = cur_oy, .rot_north = cur_rot_north });
         } else if (std.mem.eql(u8, key, "FontColor")) {
             cur_font = val;
         } else if (std.mem.eql(u8, key, "TextInstruction")) {
@@ -203,6 +214,15 @@ test "parse line + point + text instructions" {
     try std.testing.expectEqual(@as(usize, 1), pt.points.len);
     try std.testing.expectEqualStrings("BCNCAR01", pt.points[0].symbol);
     try std.testing.expectApproxEqAbs(@as(f64, 45), pt.points[0].rotation, 1e-9);
+    try std.testing.expect(!pt.points[0].rot_north); // bare form is screen-referenced
+
+    // CRS-qualified rotation (the production form): angle is arg 1, GeographicCRS=true-north.
+    const rg = try parse(a, "Rotation:GeographicCRS,135;PointInstruction:LIGHTS11");
+    try std.testing.expectApproxEqAbs(@as(f64, 135), rg.points[0].rotation, 1e-9);
+    try std.testing.expect(rg.points[0].rot_north);
+    const rp = try parse(a, "Rotation:PortrayalCRS,200;PointInstruction:LIGHTS11");
+    try std.testing.expectApproxEqAbs(@as(f64, 200), rp.points[0].rotation, 1e-9);
+    try std.testing.expect(!rp.points[0].rot_north);
 
     const tx = try parse(a, "FontColor:CHBLK;TextInstruction:Fl.R.4s");
     try std.testing.expectEqual(@as(usize, 1), tx.texts.len);

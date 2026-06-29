@@ -519,6 +519,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
             var props = std.ArrayList(mvt.Prop).empty;
             try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
             try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
+            if (sym.rot_north) try props.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } });
             try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
             try appendMeta(a, &props, meta);
             try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
