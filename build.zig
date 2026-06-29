@@ -319,6 +319,11 @@ pub fn build(b: *std.Build) void {
     addPkgs(lib_mod, &pure_pkgs);
     lib_mod.addImport("portray", portray_mod);
     lib_mod.addImport("sprite", sprite_mod); // C ABI: sprite/pattern atlas generation
+    // Bake the S-52 colour profile into the library so the C ABI can generate the
+    // colortables + base style template with no on-disk catalogue
+    // (tile57_colortables_default / tile57_style_template). Only the ColorProfiles
+    // XML is needed for style JSON — symbols/linestyles ride the bake exe, not the lib.
+    lib_mod.addImport("colorprofile_registry", embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml"));
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
 

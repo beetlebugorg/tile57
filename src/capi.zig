@@ -9,6 +9,10 @@ const source = @import("source.zig");
 const chartstyle = @import("chartstyle");
 const assets = @import("assets");
 const sprite = @import("sprite");
+// The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
+// the style C ABI generates colortables + a base style template with no on-disk
+// catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
+const colorprofile_registry = @import("colorprofile_registry");
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the live
 // tile/source path makes many small, short-lived allocations; page_allocator
@@ -259,6 +263,23 @@ export fn tile57_colortables(xml: [*]const u8, xml_len: usize, out: *[*]u8, out_
     return 1;
 }
 
+// The S-52 colour profile baked into the library, or null if (somehow) absent.
+fn embeddedColorProfileXml() ?[]const u8 {
+    for (colorprofile_registry.entries) |e| return e.bytes;
+    return null;
+}
+
+/// S-52 colortables.json from the colour profile baked into the library — no
+/// on-disk catalogue needed. Pair with tile57_style_template / tile57_build_style.
+/// 1=ok + out/out_len (free with tile57_tile_free), 0=error.
+export fn tile57_colortables_default(out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+    const xml = embeddedColorProfileXml() orelse return 0;
+    const json = assets.colorTablesJson(gpa, xml) catch return 0;
+    out.* = json.ptr;
+    out_len.* = json.len;
+    return 1;
+}
+
 /// linestyles.json from the S-101 LineStyles/*.xml (id = file stem). 1=ok, 0=error.
 export fn tile57_linestyles(srcs: [*]const NamedBytes, count: usize, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -400,6 +421,47 @@ export fn tile57_build_style(
     const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
     const now_unix: i64 = @intCast(time(null));
     const style = chartstyle.buildStyle(gpa, tmpl, &m, cts, bands, now_unix) catch return 0;
+    out.* = style.ptr;
+    out_len.* = style.len;
+    return 1;
+}
+
+/// Generate the base MapLibre style template from the catalogue baked into the
+/// library — no on-disk catalogue or template file needed. This carries the chart
+/// `sources` block, sprite/glyph URLs and the layer set; mariner settings are then
+/// applied on top with tile57_build_style (which substitutes only paint/filter
+/// props and takes no source). `scheme` is a tile57_scheme. `source_tiles` is the
+/// {z}/{x}/{y} chart tiles URL (NULL -> a default pmtiles:// source). `sprite` /
+/// `glyphs` are base URLs that enable the symbol / text layers (NULL omits them).
+/// `minzoom` / `maxzoom` of 0 -> engine defaults. 1=ok + out/out_len (free with
+/// tile57_tile_free), 0=error.
+export fn tile57_style_template(
+    scheme: c_int,
+    source_tiles: ?[*:0]const u8,
+    sprite_url: ?[*:0]const u8,
+    glyphs_url: ?[*:0]const u8,
+    minzoom: u32,
+    maxzoom: u32,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const xml = embeddedColorProfileXml() orelse return 0;
+    const cts = assets.colorTablesJson(gpa, xml) catch return 0;
+    defer gpa.free(cts);
+    var opts = assets.StyleOpts{
+        .scheme = switch (scheme) {
+            1 => "dusk",
+            2 => "night",
+            else => "day",
+        },
+        .colortables_json = cts,
+    };
+    if (source_tiles) |s| opts.source_tiles = std.mem.span(s);
+    if (sprite_url) |s| opts.sprite = std.mem.span(s);
+    if (glyphs_url) |g| opts.glyphs = std.mem.span(g);
+    if (minzoom != 0) opts.minzoom = minzoom;
+    if (maxzoom != 0) opts.maxzoom = maxzoom;
+    const style = assets.styleJson(gpa, opts) catch return 0;
     out.* = style.ptr;
     out_len.* = style.len;
     return 1;

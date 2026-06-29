@@ -223,6 +223,30 @@ int tile57_build_style(const char *template_json, size_t template_len,
                        const int32_t *enabled_bands, size_t enabled_band_count,
                        uint8_t **out, size_t *out_len);
 
+/* The S-52 colortables and base style template are baked into the library, so a
+ * host can generate a complete style with no on-disk catalogue or template file:
+ *   tile57_colortables_default(&ct,&ctn);
+ *   tile57_style_template(scheme, "http://host/{z}/{x}/{y}", NULL,NULL,0,0, &t,&tn);
+ *   tile57_build_style(t,tn, &m, ct,ctn, bands,nb, &style,&sn);   // mariner patch
+ * Free each buffer with tile57_tile_free. */
+
+/* S-52 colortables.json (token -> hex per day/dusk/night) from the colour profile
+ * baked into the library. Returns 1 with out/out_len set, 0 on error. */
+int tile57_colortables_default(uint8_t **out, size_t *out_len);
+
+/* Base MapLibre style template (layers + chart `sources` + sprite/glyph URLs) from
+ * the catalogue baked into the library — no template file needed. The source lives
+ * in the template; the per-change mariner patch (tile57_build_style) takes none.
+ *   scheme:       a tile57_scheme (selects the per-scheme palette).
+ *   source_tiles: the chart {z}/{x}/{y} tiles URL (NULL -> a default pmtiles:// source).
+ *   sprite,glyphs:base URLs that enable the symbol / text layers (NULL omits them).
+ *   minzoom,maxzoom: 0 -> engine defaults.
+ * Returns 1 with out/out_len set (free with tile57_tile_free), 0 on error. */
+int tile57_style_template(tile57_scheme scheme, const char *source_tiles,
+                          const char *sprite, const char *glyphs,
+                          uint32_t minzoom, uint32_t maxzoom,
+                          uint8_t **out, size_t *out_len);
+
 /* Fill *m with the canonical default mariner settings (so a host needn't hardcode
  * them). date_view is set to "" (today). */
 void tile57_mariner_defaults(tile57_mariner *m);
