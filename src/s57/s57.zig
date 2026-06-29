@@ -1037,7 +1037,11 @@ fn mergeFile(
                     } else if (rec.field("FSPT") != null) {
                         ex.refs = f.refs;
                     }
-                    if (rec.field("ATTF") != null) ex.attrs = f.attrs;
+                    // Gate on the PARSED attribute count, not ATTF field presence: the
+                    // oracle (updates.go:228) replaces attributes only when the update
+                    // carries at least one, so a present-but-empty ATTF preserves the
+                    // existing set instead of clobbering it.
+                    if (f.attrs.len > 0) ex.attrs = f.attrs;
                 };
                 continue;
             }
