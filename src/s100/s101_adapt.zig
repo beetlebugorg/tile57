@@ -230,6 +230,28 @@ fn resolveMooringClass(f: s57.Feature) ?[]const u8 {
     return if (catalogue.hasFeature(code)) code else null;
 }
 
+/// S-57 LIGHTS -> S-101 light class by attributes (port of complex.go
+/// resolveLightClass). Air-obstruction (CATLIT 6) and fog-detector (CATLIT 7)
+/// lights have dedicated rules that just add the standard flare + description, so
+/// route those faithfully. Sectored (SECTR1+SECTR2) and directional (CATLIT 1)
+/// lights resolve to LightSectored in the oracle, but that rule iterates the
+/// nested sectorCharacteristics complex the single-level complex plumbing here
+/// can't synthesize yet (buildLightSectors); routing them there would emit nothing
+/// (the flare would vanish), so keep them on LightAllAround — the flare +
+/// characteristic still render, strictly closer to the oracle than an empty draw.
+fn resolveLightClass(f: s57.Feature) []const u8 {
+    // Preserve the oracle's precedence: sectored/directional outrank the
+    // air-obstruction/fog-detector categories (a light that is both stays the
+    // sectored class), so test them first even though both map to LightAllAround
+    // here pending buildLightSectors.
+    if (attrNonEmpty(f, s57.ATTR_SECTR1) and attrNonEmpty(f, s57.ATTR_SECTR2)) return "LightAllAround";
+    const catlit = f.attr(s57.ATTR_CATLIT);
+    if (hasListVal(catlit, 1)) return "LightAllAround"; // directional -> LightSectored (deferred)
+    if (hasListVal(catlit, 6)) return "LightAirObstruction"; // air obstruction
+    if (hasListVal(catlit, 7)) return "LightFogDetector"; // fog detector
+    return "LightAllAround";
+}
+
 /// S-57 object class -> S-101 feature class, resolving the attribute-dependent
 /// one-to-many mappings the catalogue alias can't express. Port of complex.go
 /// resolveCode (the switch + the default catalogue-alias fallback). Returns null
@@ -237,9 +259,8 @@ fn resolveMooringClass(f: s57.Feature) ?[]const u8 {
 fn resolveClass(f: s57.Feature) ?[]const u8 {
     switch (f.objl) {
         // LIGHTS aliases to LightAllAround/LightSectored/LightAirObstruction/
-        // LightFogDetector depending on attributes. (Attribute routing added next;
-        // for now every light is the all-around flare.)
-        s57.OBJL_LIGHTS => return "LightAllAround",
+        // LightFogDetector depending on attributes (resolveLightClass).
+        s57.OBJL_LIGHTS => return resolveLightClass(f),
         // ADMARE aliases to AdministrationArea and VesselTrafficServiceArea; the
         // plain administration area is the correct default (VTS is a distinct class).
         s57.OBJL_ADMARE => if (catalogue.hasFeature("AdministrationArea")) return "AdministrationArea",
@@ -462,10 +483,37 @@ test "resolveClass routes the attribute-dependent S-57 classes" {
     // Meta classes resolve via their acronym alias: M_ACCY (300) and M_QUAL (308).
     try t.expectEqualStrings("QualityOfNonBathymetricData", resolveClass(.{ .rcnm = 100, .rcid = 7, .prim = 3, .objl = 300 }).?);
     try t.expectEqualStrings("QualityOfBathymetricData", resolveClass(.{ .rcnm = 100, .rcid = 8, .prim = 3, .objl = 308 }).?);
-    // LIGHTS -> LightAllAround (attribute routing added in resolveLightClass).
+    // A plain LIGHTS (no category) -> LightAllAround.
     try t.expectEqualStrings("LightAllAround", resolveClass(.{ .rcnm = 100, .rcid = 9, .prim = 1, .objl = s57.OBJL_LIGHTS }).?);
     // An unmapped object class resolves to null (caller skips it).
     try t.expect(resolveClass(.{ .rcnm = 100, .rcid = 10, .prim = 1, .objl = 9999 }) == null);
+}
+
+test "resolveLightClass routes LIGHTS by category" {
+    const t = std.testing;
+    const lights = struct {
+        fn f(rcid: u32, attrs: []const s57.Attr) s57.Feature {
+            return .{ .rcnm = 100, .rcid = rcid, .prim = 1, .objl = s57.OBJL_LIGHTS, .attrs = attrs };
+        }
+    }.f;
+    // Air-obstruction (CATLIT 6) and fog-detector (CATLIT 7) route faithfully.
+    const air = [_]s57.Attr{.{ .code = s57.ATTR_CATLIT, .value = "6" }};
+    try t.expectEqualStrings("LightAirObstruction", resolveLightClass(lights(1, &air)));
+    const fog = [_]s57.Attr{.{ .code = s57.ATTR_CATLIT, .value = "7" }};
+    try t.expectEqualStrings("LightFogDetector", resolveLightClass(lights(2, &fog)));
+    // CATLIT as a list still matches membership.
+    const air_list = [_]s57.Attr{.{ .code = s57.ATTR_CATLIT, .value = "1,6" }};
+    // ...but a directional (CATLIT 1) light outranks air-obstruction and (pending
+    // buildLightSectors) stays LightAllAround rather than its LightSectored class.
+    try t.expectEqualStrings("LightAllAround", resolveLightClass(lights(3, &air_list)));
+    // Sectored light (SECTR1+SECTR2) -> LightAllAround for now (would be LightSectored).
+    const sect = [_]s57.Attr{
+        .{ .code = s57.ATTR_SECTR1, .value = "045" },
+        .{ .code = s57.ATTR_SECTR2, .value = "090" },
+    };
+    try t.expectEqualStrings("LightAllAround", resolveLightClass(lights(4, &sect)));
+    // A plain light -> LightAllAround.
+    try t.expectEqualStrings("LightAllAround", resolveLightClass(lights(5, &.{})));
 }
 
 test "TOPMAR folds into co-located buoy as the topmark complex" {
