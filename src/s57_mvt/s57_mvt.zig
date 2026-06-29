@@ -110,6 +110,30 @@ fn overlaps(b0: [4]f64, b1: [4]f64) bool {
     return b0[0] <= b1[2] and b0[2] >= b1[0] and b0[1] <= b1[3] and b0[3] >= b1[1];
 }
 
+// Clip + per-tile simplify (Go baker quantizeRing): Douglas-Peucker then drop
+// collinear/duplicate vertices so dense coastlines don't blow MapLibre's
+// 65535-vertex-per-fill-segment cap. quantizeRingExact (no DP) is the fallback for
+// a ring DP would collapse below 3 points, so simplification never deletes a whole
+// still-renderable polygon. Returns the simplified ring, or empty if <3 vertices.
+fn clipSimplifyPoly(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]const mvt.Point {
+    const clipped = try tile.clipPolygon(a, proj, box);
+    if (clipped.len < 3) return clipped[0..0];
+    var ring = try tile.simplifyRing(a, clipped);
+    if (ring.len < 3) ring = try tile.dedupCollinear(a, clipped); // DP over-collapsed
+    return if (ring.len >= 3) ring else clipped[0..0];
+}
+
+// Clip a line + simplify each kept run (drop runs that collapse below 2 vertices).
+fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]const []const mvt.Point {
+    const sub = try tile.clipLine(a, proj, box);
+    var out = std.ArrayList([]const mvt.Point).empty;
+    for (sub) |run| {
+        const s = try tile.simplifyRing(a, run);
+        if (s.len >= 2) try out.append(a, s);
+    }
+    return out.items;
+}
+
 /// Shoelace signed area (x2) of a ring in tile space; only its sign is used.
 /// y is down, so a positive value is a clockwise (exterior) ring per the MVT spec.
 fn ringSignedArea(ring: []const mvt.Point) i64 {
@@ -559,7 +583,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         // filled holes with the area's own colour.)
         var rings = std.ArrayList([]const mvt.Point).empty;
         for (projected.items) |proj| {
-            const ring = try tile.clipPolygon(a, proj, box);
+            const ring = try clipSimplifyPoly(a, proj, box);
             if (ring.len >= 3) try rings.append(a, ring);
         }
         // Best-band suppression: drop a coarser band's fill (where a finer band
@@ -594,7 +618,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         // solid stroke (full along-line symbology is a later step).
         const dash: []const u8 = if (std.mem.eql(u8, ln.style, "solid")) "solid" else "dashed";
         for (projected.items) |proj| {
-            const sub = try tile.clipLine(a, proj, box);
+            const sub = try clipSimplifyLine(a, proj, box);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
             for (sub, 0..) |s, i| parts[i] = s;
@@ -654,7 +678,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try tile.clipLine(a, proj, box);
+        const sub = try clipSimplifyLine(a, proj, box);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -714,7 +738,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try tile.clipLine(a, proj, box);
+        const sub = try clipSimplifyLine(a, proj, box);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -910,7 +934,7 @@ fn appendCellFeatures(
                 if (!overlaps(geomBounds(gp), tb)) continue;
                 const proj = try a.alloc(mvt.Point, gp.len);
                 for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-                const ring = try tile.clipPolygon(a, proj, box);
+                const ring = try clipSimplifyPoly(a, proj, box);
                 if (ring.len >= 3) try rings.append(a, ring);
             }
             if (rings.items.len == 0) continue;
@@ -932,7 +956,7 @@ fn appendCellFeatures(
             if (!overlaps(geomBounds(gp), tb)) continue;
             const proj = try a.alloc(mvt.Point, gp.len);
             for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-            const sub = try tile.clipLine(a, proj, box);
+            const sub = try clipSimplifyLine(a, proj, box);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
             for (sub, 0..) |s, i| parts[i] = s;

@@ -228,6 +228,97 @@ fn clipSegment(p0: mvt.Point, p1: mvt.Point, b: Box) ?[2]mvt.Point {
     };
 }
 
+// ---- per-tile simplification (Go bake.go quantizeRing/douglasPeucker) ----
+//
+// A dense S-57 coastline can carry 100k+ vertices into one tile and blow MapLibre's
+// 65535-vertex-per-fill-segment cap, so the whole polygon silently fails to render.
+// Mirror the Go baker: Douglas-Peucker (½-px tolerance) then drop exact consecutive
+// duplicates + collinear midpoints. Points are already on the integer MVT grid here
+// (worldToTile rounds), so the math is exact integer (no separate quantize step).
+
+// (4.0)^2 in MVT extent units — Go's simplifyTolerance=4.0 (~½ px at extent 4096).
+const SIMPLIFY_EPS2: i128 = 16;
+
+/// Drop exact consecutive duplicates and collinear midpoints (lossless at integer
+/// resolution) — Go's quantizePts. Use directly as the no-DP fallback (quantizeRingExact).
+pub fn dedupCollinear(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
+    var out = std.ArrayList(mvt.Point).empty;
+    for (pts) |q| {
+        const n = out.items.len;
+        if (n > 0 and out.items[n - 1].x == q.x and out.items[n - 1].y == q.y) continue;
+        if (n >= 2) {
+            const aa = out.items[n - 2];
+            const bb = out.items[n - 1];
+            const cross = @as(i64, bb.x - aa.x) * @as(i64, q.y - aa.y) - @as(i64, bb.y - aa.y) * @as(i64, q.x - aa.x);
+            if (cross == 0) { // b is collinear with a->q: replace the midpoint
+                out.items[n - 1] = q;
+                continue;
+            }
+        }
+        try out.append(a, q);
+    }
+    return out.items;
+}
+
+/// Douglas-Peucker on integer tile coords (perp dist^2 vs SIMPLIFY_EPS2), keeping
+/// the first/last vertex. Iterative (explicit stack). Returns kept points.
+fn douglasPeucker(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
+    const n = pts.len;
+    if (n < 3) return a.dupe(mvt.Point, pts);
+    const keep = try a.alloc(bool, n);
+    @memset(keep, false);
+    keep[0] = true;
+    keep[n - 1] = true;
+    var stack = std.ArrayList([2]usize).empty;
+    defer stack.deinit(a);
+    try stack.append(a, .{ 0, n - 1 });
+    while (stack.pop()) |seg| {
+        const s = seg[0];
+        const e = seg[1];
+        if (e <= s + 1) continue;
+        const ax: i64 = pts[s].x;
+        const ay: i64 = pts[s].y;
+        const dx: i64 = @as(i64, pts[e].x) - ax;
+        const dy: i64 = @as(i64, pts[e].y) - ay;
+        const den: i128 = @as(i128, dx) * dx + @as(i128, dy) * dy; // segment length^2
+        var best: i128 = -1;
+        var besti: usize = s;
+        var i = s + 1;
+        while (i < e) : (i += 1) {
+            const ex: i64 = @as(i64, pts[i].x) - ax;
+            const ey: i64 = @as(i64, pts[i].y) - ay;
+            // den constant within this segment, so argmax(perp dist) = argmax(num^2)
+            // for den>0, or argmax(ex^2+ey^2) for a degenerate segment.
+            const metric: i128 = if (den == 0)
+                @as(i128, ex) * ex + @as(i128, ey) * ey
+            else blk: {
+                const num: i128 = @as(i128, ex) * dy - @as(i128, ey) * dx;
+                break :blk num * num;
+            };
+            if (metric > best) {
+                best = metric;
+                besti = i;
+            }
+        }
+        const exceeds = if (den == 0) best > SIMPLIFY_EPS2 else best > SIMPLIFY_EPS2 * den;
+        if (exceeds) {
+            keep[besti] = true;
+            try stack.append(a, .{ s, besti });
+            try stack.append(a, .{ besti, e });
+        }
+    }
+    var out = std.ArrayList(mvt.Point).empty;
+    for (pts, 0..) |p, k| if (keep[k]) try out.append(a, p);
+    return out.items;
+}
+
+/// Simplify a clipped ring/line (Go quantizeRing): Douglas-Peucker then collinear/
+/// duplicate removal. Caller falls back to dedupCollinear (quantizeRingExact) when
+/// this collapses a ring below its minimum vertex count.
+pub fn simplifyRing(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
+    return dedupCollinear(a, try douglasPeucker(a, pts));
+}
+
 // ---- tests --------------------------------------------------------------
 
 test "project Annapolis lands in the expected z14 tile" {
