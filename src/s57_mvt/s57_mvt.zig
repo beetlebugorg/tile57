@@ -656,6 +656,31 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
             }
         }
     }
+
+    // Point symbols on a LINE/AREA feature (PointInstruction). Go emits these at the
+    // area representative point (CentreOnArea) or along a line; place them at the rep
+    // point so centred-area marks (anchorage, restricted-area/entry, marine farm, TSS
+    // arrows) aren't dropped — previously p.points was only emitted for prim==1.
+    if (p.points.len > 0) {
+        if (s57.areaRepresentativePoint(geo_parts)) |rp| {
+            if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
+                const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
+                const parts = try a.alloc([]const mvt.Point, 1);
+                const single = try a.alloc(mvt.Point, 1);
+                single[0] = cpt;
+                parts[0] = single;
+                for (p.points) |sym| {
+                    var props = std.ArrayList(mvt.Prop).empty;
+                    try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
+                    try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
+                    if (sym.rot_north) try props.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } });
+                    try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+                    try appendMeta(a, &props, meta);
+                    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+                }
+            }
+        }
+    }
 }
 
 /// Native S-52 fallback for SweptArea (SWPARE, objl 134). The S-101 Portrayal
