@@ -12,8 +12,11 @@
       position: absolute; top: 12px; left: 12px; z-index: 1; width: 244px;
       background: rgba(18, 26, 34, 0.92); color: #e8eef4; padding: 12px 14px;
       border-radius: 10px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+      max-height: calc(100vh - 24px); overflow-y: auto;
     }
     #panel h1 { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
+    #panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+      opacity: .55; margin: 14px 0 2px; font-weight: 600; }
     #panel label { display: flex; justify-content: space-between; align-items: center; margin: 7px 0; gap: 10px; }
     #panel select, #panel input[type=number] { width: 100px; }
     #panel .hint { opacity: 0.62; font-size: 11px; margin-top: 10px; }
@@ -32,10 +35,35 @@
     <label>Boundaries
       <select id="boundary_style"><option value="symbolized">symbolized</option><option value="plain">plain</option></select></label>
     <label>4-shade water <input type="checkbox" id="four_shade_water" checked /></label>
+
+    <h2>Depths</h2>
     <label>Safety contour (m) <input type="number" id="safety_contour" value="10" step="1" min="0" /></label>
     <label>Shallow contour (m) <input type="number" id="shallow_contour" value="2" step="1" min="0" /></label>
     <label>Deep contour (m) <input type="number" id="deep_contour" value="30" step="1" min="0" /></label>
-    <label>Text labels <input type="checkbox" id="text_names" checked /></label>
+    <label>Safety depth (m) <input type="number" id="safety_depth" value="10" step="1" min="0" /></label>
+
+    <h2>Display categories</h2>
+    <label>Display base <input type="checkbox" id="display_base" checked /></label>
+    <label>Standard <input type="checkbox" id="display_standard" checked /></label>
+    <label>Other <input type="checkbox" id="display_other" /></label>
+    <label>Data quality (M_QUAL) <input type="checkbox" id="data_quality" /></label>
+    <label>Meta coverage bounds <input type="checkbox" id="show_meta_bounds" /></label>
+
+    <h2>Symbols</h2>
+    <label>Simplified points <input type="checkbox" id="simplified_points" /></label>
+    <label>Isolated dangers (shallow) <input type="checkbox" id="show_isolated_dangers_shallow" /></label>
+    <label>Full sector lines <input type="checkbox" id="show_full_sector_lines" /></label>
+    <label>INFORM callouts <input type="checkbox" id="show_inform_callouts" /></label>
+
+    <h2>Text</h2>
+    <label>Name labels <input type="checkbox" id="text_names" checked /></label>
+    <label>Light descriptions <input type="checkbox" id="show_light_descriptions" checked /></label>
+    <label>Other text <input type="checkbox" id="text_other" checked /></label>
+
+    <h2>Date display</h2>
+    <label>Date-dependent <input type="checkbox" id="date_dependent" checked /></label>
+    <label>Highlight date features <input type="checkbox" id="highlight_date_dependent" /></label>
+
     <div class="hint">
       Tiles baked by <code>tile57 bake</code>; the style is generated <b>in your browser</b>
       by <code>@beetlebug/tile57-style-engine</code> (the tile57 chartstyle engine as WASM).

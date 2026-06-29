@@ -39,15 +39,36 @@ async function detectEncoding() {
 // engine's canonical defaults).
 function readSettings() {
   const el = (id) => document.getElementById(id);
+  const num = (id) => Number(el(id).value);
+  const chk = (id) => el(id).checked;
   return {
     scheme: el('scheme').value,
     depth_unit: el('depth_unit').value,
     boundary_style: el('boundary_style').value,
-    four_shade_water: el('four_shade_water').checked,
-    safety_contour: Number(el('safety_contour').value),
-    shallow_contour: Number(el('shallow_contour').value),
-    deep_contour: Number(el('deep_contour').value),
-    text_names: el('text_names').checked,
+    four_shade_water: chk('four_shade_water'),
+    // depths
+    safety_contour: num('safety_contour'),
+    shallow_contour: num('shallow_contour'),
+    deep_contour: num('deep_contour'),
+    safety_depth: num('safety_depth'),
+    // display categories
+    display_base: chk('display_base'),
+    display_standard: chk('display_standard'),
+    display_other: chk('display_other'),
+    data_quality: chk('data_quality'),
+    show_meta_bounds: chk('show_meta_bounds'),
+    // symbols
+    simplified_points: chk('simplified_points'),
+    show_isolated_dangers_shallow: chk('show_isolated_dangers_shallow'),
+    show_full_sector_lines: chk('show_full_sector_lines'),
+    show_inform_callouts: chk('show_inform_callouts'),
+    // text
+    text_names: chk('text_names'),
+    show_light_descriptions: chk('show_light_descriptions'),
+    text_other: chk('text_other'),
+    // date display
+    date_dependent: chk('date_dependent'),
+    highlight_date_dependent: chk('highlight_date_dependent'),
   };
 }
 
