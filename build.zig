@@ -244,16 +244,17 @@ pub fn build(b: *std.Build) void {
     // Asset/style generation for the chart bundle (colortables, manifest, …).
     // Pure + target-agnostic like the foundational packages, so it compiles
     // under both the glibc tests and the static-musl baker. See src/assets/.
-    const assets_mod = b.addModule("assets", .{
-        .root_source_file = b.path("src/assets/assets.zig"),
-    });
-
-    // Chart-style generation: patch a MapLibre style template per the mariner's
-    // S-52 display options (a 1:1 Zig port of the C++ chartstyle/ module). Pure +
-    // target-agnostic; consumed by the C ABI (capi.zig) so tile57 ships tile +
-    // style generation together. See src/chartstyle/.
+    // Chart-style generation: the S-52 mariner expression builders (a Zig port of
+    // the web client's s52-style.mjs builders). Pure + target-agnostic. Consumed by
+    // the single style builder (assets/style.zig) and the C ABI (capi.zig). See
+    // src/chartstyle/.
     const chartstyle_mod = b.addModule("chartstyle", .{
         .root_source_file = b.path("src/chartstyle/chartstyle.zig"),
+    });
+
+    const assets_mod = b.addModule("assets", .{
+        .root_source_file = b.path("src/assets/assets.zig"),
+        .imports = &.{.{ .name = "chartstyle", .module = chartstyle_mod }},
     });
 
     // S-101 sprite/pattern atlas builder (nanosvg + stb PNG). libc (the C libs),
@@ -483,7 +484,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "pmtiles", .module = pmtiles_mod },
         .{ .name = "tile", .module = tile_mod },
     });
-    _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{
+        .{ .name = "chartstyle", .module = chartstyle_mod },
+    });
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
     // bindings/ shared settings parser (used by the wasm engine + parity oracle).
     _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{

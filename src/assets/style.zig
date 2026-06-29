@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const Stringify = std.json.Stringify;
+const chartstyle = @import("chartstyle");
 
 const FALLBACK = "#ff00ff";
 const FONT = .{"Noto Sans Regular"};
@@ -111,6 +112,15 @@ pub const StyleOpts = struct {
     // Representative latitude for the bucket minzooms (the archive's center). SCAMIN
     // cutoffs are latitude-dependent (cos lat); a baked style fixes them at one lat.
     scamin_lat: f64 = 0,
+    // S-52 mariner display options. null = a TEMPLATE (no client display filters
+    // baked in — the bundle + tile57_style_template path; the client gates live).
+    // Non-null = the full style with the mariner's display filters + depth shading /
+    // sounding-split / danger-swap baked in (the C-ABI tile57_build_style path).
+    // Colour + layout always resolve through the chartstyle builders (default mariner
+    // when null), so there is ONE style builder — chartstyle.buildStyle is retired.
+    mariner: ?chartstyle.MarinerSettings = null,
+    enabled_bands: ?[]const i32 = null, // mariner NOAA-band filter (null = all bands)
+    now_unix: i64 = 0, // host wall-clock (epoch s) for the date filter's "today"
 };
 
 // ---- colour resolution (the one runtime-variable expression) -------------

@@ -68,6 +68,13 @@ pub const MarinerSettings = struct {
     show_light_descriptions: bool = true,
     text_other: bool = true,
 
+    // -- viewing groups (S-52 §14.5, fine-grained per-VG control) — FUTURE USE.
+    // null = every viewing group shown (current behaviour); a non-null list = show
+    // only features whose raw `vg` (the tile property, already baked) is selected.
+    // Features without a `vg` always show. No client UI wired yet — the style hook
+    // exists so per-viewing-group filtering can be turned on without an engine change.
+    viewing_groups: ?[]const i32 = null,
+
     // -- date-dependent display (S-52 §10.4.1.1) --
     date_dependent: bool = true,
     highlight_date_dependent: bool = false,
@@ -90,7 +97,7 @@ fn fmtFloat(a: std.mem.Allocator, x: f64) ![]const u8 {
 }
 
 // Small builder over an arena: every helper allocates its Value nodes here.
-const B = struct {
+pub const B = struct {
     a: std.mem.Allocator,
 
     fn s(_: B, str: []const u8) Value {
@@ -127,7 +134,7 @@ fn lessStr(_: void, l: []const u8, r: []const u8) bool {
 // Resolve a colour-token-valued expression to an RGB for the active scheme:
 // ["match", tokenExpr, TOK,hex, …(sorted), fallback]. Palette keys are emitted in
 // sorted order to mirror nlohmann's std::map iteration (byte-equal arms).
-fn colorMatch(b: B, tokenExpr: Value, palette: *const ObjectMap, fallback: []const u8) !Value {
+pub fn colorMatch(b: B, tokenExpr: Value, palette: *const ObjectMap, fallback: []const u8) !Value {
     var list = Array.init(b.a);
     try list.append(b.s("match"));
     try list.append(tokenExpr);
@@ -142,28 +149,28 @@ fn colorMatch(b: B, tokenExpr: Value, palette: *const ObjectMap, fallback: []con
 }
 
 // A single resolved colour token for the scheme (concrete value).
-fn token(palette: *const ObjectMap, name: []const u8, fallback: []const u8) []const u8 {
+pub fn token(palette: *const ObjectMap, name: []const u8, fallback: []const u8) []const u8 {
     if (palette.get(name)) |v| if (v == .string) return v.string;
     return fallback;
 }
 
-fn lineColor(b: B, palette: *const ObjectMap) !Value {
+pub fn lineColor(b: B, palette: *const ObjectMap) !Value {
     return colorMatch(b, try b.coalesce(try b.get("color_token"), b.s("")), palette, FALLBACK);
 }
 
 // Text ink. Day uses the per-feature S-52 ink; dusk/night use a bright neutral.
-fn textColor(b: B, scheme: Scheme, palette: *const ObjectMap) !Value {
+pub fn textColor(b: B, scheme: Scheme, palette: *const ObjectMap) !Value {
     if (scheme == .day)
         return colorMatch(b, try b.coalesce(try b.get("color_token"), b.s("")), palette, "#000000");
     return b.s(if (scheme == .night) "#aab7bf" else "#dde7ec");
 }
 
-fn textHaloColor(b: B, scheme: Scheme) Value {
+pub fn textHaloColor(b: B, scheme: Scheme) Value {
     return b.s(if (scheme == .day) "rgba(255,255,255,0.9)" else "rgba(0,0,0,0.85)");
 }
 
 // Contour (depth) labels: CHGRD by day, bright neutral at dusk/night.
-fn contourLabelColor(b: B, scheme: Scheme, palette: *const ObjectMap) !Value {
+pub fn contourLabelColor(b: B, scheme: Scheme, palette: *const ObjectMap) !Value {
     if (scheme == .day) return b.s(token(palette, "CHGRD", "#5a5a44"));
     return b.s(if (scheme == .night) "#aab7bf" else "#dde7ec");
 }
@@ -172,7 +179,7 @@ fn contourLabelColor(b: B, scheme: Scheme, palette: *const ObjectMap) !Value {
 
 // DRVAL1/DRVAL2 vs the mariner's contours -> a depth colour token. Deepest band
 // first (first match in a `case` wins). `>= X && > X` on both bounds per spec.
-fn seabedTokenExpr(b: B, m: *const MarinerSettings) !Value {
+pub fn seabedTokenExpr(b: B, m: *const MarinerSettings) !Value {
     const d1 = try b.coalesce(try b.get("drval1"), b.int(-1));
     const d2 = try b.coalesce(try b.get("drval2"), b.int(0));
     const band = struct {
@@ -202,7 +209,7 @@ fn seabedTokenExpr(b: B, m: *const MarinerSettings) !Value {
 
 // Fill colour for the `areas` layer: depth areas (carry drval1) shade live via
 // SEABED01; everything else uses its baked colour token.
-fn areasFillColor(b: B, palette: *const ObjectMap, m: *const MarinerSettings) !Value {
+pub fn areasFillColor(b: B, palette: *const ObjectMap, m: *const MarinerSettings) !Value {
     return b.arr(&.{
         b.s("case"),
         try b.arr(&.{ b.s("has"), b.s("drval1") }),
@@ -215,7 +222,7 @@ fn areasFillColor(b: B, palette: *const ObjectMap, m: *const MarinerSettings) !V
 
 // SNDFRM04: a sounding <= the live safety depth uses the bold SOUNDS glyphs, else
 // the faint SOUNDG glyphs.
-fn soundingsIconImage(b: B, m: *const MarinerSettings) !Value {
+pub fn soundingsIconImage(b: B, m: *const MarinerSettings) !Value {
     const depthLE = try b.arr(&.{ b.s("<="), try b.coalesce(try b.get("depth"), b.int(0)), try b.flt(m.safety_depth) });
     return b.arr(&.{
         b.s("case"),
@@ -227,7 +234,7 @@ fn soundingsIconImage(b: B, m: *const MarinerSettings) !Value {
 
 // OBSTRN06/WRECKS05: a danger symbol deeper than the live safety contour swaps to
 // the less-prominent DANGER02 (sym_deep). pivot_center draws the "ctr:" variant.
-fn pointSymbolImage(b: B, m: *const MarinerSettings) !Value {
+pub fn pointSymbolImage(b: B, m: *const MarinerSettings) !Value {
     const name = try b.arr(&.{
         b.s("case"),
         try b.arr(&.{
@@ -247,7 +254,7 @@ fn pointSymbolImage(b: B, m: *const MarinerSettings) !Value {
 }
 
 // SAFCON01: the depth-contour value label, in whole metres or whole feet.
-fn contourLabelField(b: B, m: *const MarinerSettings) !Value {
+pub fn contourLabelField(b: B, m: *const MarinerSettings) !Value {
     const v = if (m.depth_unit == .feet)
         try b.arr(&.{ b.s("round"), try b.arr(&.{ b.s("*"), try b.get("valdco"), try b.flt(M_TO_FT) }) })
     else
@@ -263,7 +270,7 @@ fn contourLabelField(b: B, m: *const MarinerSettings) !Value {
 // ---- client-side display filters -------------------------------------------
 
 // Display category (S-52 §10.3.4) + M_QUAL data-quality overlay.
-fn categoryFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn categoryFilter(b: B, m: *const MarinerSettings) !Value {
     var en = Array.init(b.a);
     if (m.display_base) try en.append(b.int(0));
     if (m.display_standard) try en.append(b.int(1));
@@ -283,14 +290,14 @@ fn categoryFilter(b: B, m: *const MarinerSettings) !Value {
 }
 
 // NOAA band visibility: show a feature only if its baked `band` rank is enabled.
-fn bandFilter(b: B, enabled: []const i32) !Value {
+pub fn bandFilter(b: B, enabled: []const i32) !Value {
     var en = Array.init(b.a);
     for (enabled) |r| try en.append(b.int(r));
     return b.arr(&.{ b.s("in"), try b.coalesce(try b.get("band"), b.int(0)), try b.arr(&.{ b.s("literal"), .{ .array = en } }) });
 }
 
 // Boundary symbolization (S-52 §8.6.1): show common (2) + the active style.
-fn boundaryFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn boundaryFilter(b: B, m: *const MarinerSettings) !Value {
     const rank: i64 = if (m.boundary_style == .plain) 0 else 1;
     return b.arr(&.{
         b.s("in"),
@@ -300,7 +307,7 @@ fn boundaryFilter(b: B, m: *const MarinerSettings) !Value {
 }
 
 // Point-symbol style (S-52 §11.2.2): show common (2) + the active style.
-fn pointStyleFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn pointStyleFilter(b: B, m: *const MarinerSettings) !Value {
     const rank: i64 = if (m.simplified_points) 1 else 0;
     return b.arr(&.{
         b.s("in"),
@@ -310,7 +317,7 @@ fn pointStyleFilter(b: B, m: *const MarinerSettings) !Value {
 }
 
 // S-52 §14.5 text-group selection. Important text (11) is always on.
-fn textGroupFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn textGroupFilter(b: B, m: *const MarinerSettings) !Value {
     const g = try b.coalesce(try b.get("tgrp"), b.int(-1));
     const namedSet = struct {
         fn make(bb: B) !Value {
@@ -334,8 +341,22 @@ fn textGroupFilter(b: B, m: *const MarinerSettings) !Value {
     return .{ .array = any };
 }
 
+// S-52 §14.5 fine-grained viewing-group selection (FUTURE USE). null when the
+// mariner selects all viewing groups (no filter). When a set is given, a feature
+// shows iff it has no `vg` (unbanded — always shown) or its `vg` is in the set.
+pub fn viewingGroupFilter(b: B, m: *const MarinerSettings) !?Value {
+    const sel = m.viewing_groups orelse return null;
+    var en = Array.init(b.a);
+    for (sel) |v| try en.append(b.int(v));
+    return try b.arr(&.{
+        b.s("any"),
+        try b.arr(&.{ b.s("!"), try b.arr(&.{ b.s("has"), b.s("vg") }) }),
+        try b.arr(&.{ b.s("in"), try b.get("vg"), try b.arr(&.{ b.s("literal"), .{ .array = en } }) }),
+    });
+}
+
 // Date-dependent display (S-52 §10.4.1.1). `today` is "YYYYMMDD".
-fn dateFilter(b: B, today_str: []const u8) !Value {
+pub fn dateFilter(b: B, today_str: []const u8) !Value {
     const mmdd = if (today_str.len >= 8) today_str[4..] else today_str;
     const T = try b.arr(&.{
         b.s("case"),
@@ -379,7 +400,7 @@ fn dateFilter(b: B, today_str: []const u8) !Value {
 
 // The viewing date "YYYYMMDD": the mariner's pinned date if set, else `now_unix`
 // (Unix epoch seconds, supplied by the host) rendered as a UTC calendar date.
-fn viewingDate(b: B, m: *const MarinerSettings, now_unix: i64) ![]const u8 {
+pub fn viewingDate(b: B, m: *const MarinerSettings, now_unix: i64) ![]const u8 {
     if (m.date_view.len == 8) {
         var digits = true;
         for (m.date_view) |c| digits = digits and (c >= '0' and c <= '9');
@@ -393,6 +414,38 @@ fn viewingDate(b: B, m: *const MarinerSettings, now_unix: i64) ![]const u8 {
     const yd = eday.calculateYearDay();
     const md = yd.calculateMonthDay();
     return std.fmt.allocPrint(b.a, "{d:0>4}{d:0>2}{d:0>2}", .{ yd.year, md.month.numeric(), @as(u32, md.day_index) + 1 });
+}
+
+// The S-52 display filters AND-ed onto EVERY source:"chart" layer (category +
+// M_QUAL, band, boundary/point style, INFORM01/CHDATD01 callout toggles, date
+// validity, meta-bounds). Text-group selection is per-text-layer (textGroupFilter),
+// so it is NOT included here. Used by the single-pass style builder (style.zig) to
+// compose each layer's filter inline — the consolidation that retired buildStyle's
+// template-patch pass. Allocated in `a` (caller's arena).
+pub fn commonChartFilters(a: std.mem.Allocator, m: *const MarinerSettings, enabled_bands: ?[]const i32, now_unix: i64) ![]Value {
+    const b = B{ .a = a };
+    var clauses = Array.init(a);
+    try clauses.append(try categoryFilter(b, m));
+    if (enabled_bands) |eb| try clauses.append(try bandFilter(b, eb));
+    try clauses.append(try boundaryFilter(b, m));
+    try clauses.append(try pointStyleFilter(b, m));
+    if (try viewingGroupFilter(b, m)) |vgf| try clauses.append(vgf); // §14.5 (future use; no-op when null)
+    if (!m.show_inform_callouts)
+        try clauses.append(try b.arr(&.{ b.s("!="), try b.coalesce(try b.get("symbol_name"), b.s("")), b.s("INFORM01") }));
+    if (!m.highlight_date_dependent)
+        try clauses.append(try b.arr(&.{ b.s("!="), try b.coalesce(try b.get("symbol_name"), b.s("")), b.s("CHDATD01") }));
+    if (m.date_dependent)
+        try clauses.append(try dateFilter(b, try viewingDate(b, m, now_unix)));
+    if (!m.show_meta_bounds)
+        try clauses.append(try b.arr(&.{
+            b.s("!"),
+            try b.arr(&.{
+                b.s("in"),
+                try b.coalesce(try b.get("class"), b.s("")),
+                try b.arr(&.{ b.s("literal"), try b.arr(&.{ b.s("M_NPUB"), b.s("M_NSYS"), b.s("M_COVR"), b.s("M_CSCL") }) }),
+            }),
+        }));
+    return clauses.items;
 }
 
 // ---- layer patching ---------------------------------------------------------
