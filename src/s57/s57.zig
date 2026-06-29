@@ -1004,7 +1004,10 @@ fn mergeFile(
                         ex.vptrs = v.vptrs;
                         deriveEndpoints(ex);
                     }
-                    if (rec.field("ATTV") != null) ex.quapos = v.quapos;
+                    // The oracle's spatial MODIFY (updates.go:288-348) updates only
+                    // coordinates and vector pointers — it never re-reads ATTV, so a
+                    // modified record keeps its base QUAPOS. Match that for byte-parity
+                    // (don't refresh ex.quapos from the update's ATTV here).
                 };
                 continue;
             }
