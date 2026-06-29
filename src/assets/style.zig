@@ -37,6 +37,36 @@ const SEABED = .{
 // Show a SCAMIN feature only at/above its 1:N display zoom.
 const SCAMIN_GATE = .{ ">=", .{"zoom"}, .{ "log2", .{ "/", DENOM_Z0, .{ "coalesce", .{ "get", "scamin" }, DENOM_Z0 } } } };
 
+// Physical-scale constants from the web client (web/src/lib/util.mjs), so an engine
+// SCAMIN bucket's native minzoom MATCHES the JS client's scaminDisplayZoom (the §7
+// render-parity gate). NOTE these intentionally differ from DENOM_Z0 above: the bake
+// floor / legacy filter use the 0.28 mm OGC pixel (DENOM_Z0 = M_PER_PX_Z0/0.00028 ≈
+// 279.5M), while the client DISPLAY cutoff uses the calibrated 0.2645 mm CSS pixel.
+const M_PER_PX_Z0 = 78271.516964020485; // metres / CSS-px at z0, equator (512-tile)
+const DEFAULT_PX_PITCH_MM = 0.2645; // calibrated CSS-pixel pitch (NOT the OGC 0.28 mm)
+
+/// Fractional Web-Mercator display zoom at which SCAMIN 1:`scamin` reaches its 1:N
+/// min display scale at `lat` — i.e. the native minzoom of that value's bucket layer.
+/// Mirrors the client zoomForScalePhysical(scamin, lat, DEFAULT_PX_PITCH_MM): the
+/// screen reads 1:scamin when zoom == log2(M_PER_PX_Z0·cos lat / ((pitch/1000)·scamin)).
+pub fn scaminDisplayZoom(scamin: f64, lat: f64) f64 {
+    if (!(scamin > 0)) return 0;
+    const z = std.math.log2(M_PER_PX_Z0 * @cos(lat * std.math.pi / 180.0) /
+        ((DEFAULT_PX_PITCH_MM / 1000.0) * scamin));
+    return std.math.clamp(z, 0, 24);
+}
+
+test "scaminDisplayZoom matches the JS zoomForScalePhysical formula" {
+    // log2(78271.516964 / (0.0002645 · 30000)) = log2(9863.83…) = 13.2685…
+    try std.testing.expectApproxEqAbs(@as(f64, 13.2685), scaminDisplayZoom(30000, 0), 1e-3);
+    // Latitude pulls the cutoff EARLIER (cos lat < 1): higher lat → lower zoom.
+    try std.testing.expect(scaminDisplayZoom(30000, 60) < scaminDisplayZoom(30000, 10));
+    // Coarser SCAMIN (bigger denominator) shows from a lower zoom.
+    try std.testing.expect(scaminDisplayZoom(180000, 0) < scaminDisplayZoom(30000, 0));
+    // Clamped to [0,24].
+    try std.testing.expectEqual(@as(f64, 0), scaminDisplayZoom(0, 0));
+}
+
 // S-52 DrawingPriority fill order: draw_prio*1000 - drval1.
 const FILL_SORT = .{ "-", .{ "*", .{ "coalesce", .{ "get", "draw_prio" }, 0 }, 1000 }, .{ "coalesce", .{ "get", "drval1" }, 0 } };
 
