@@ -662,7 +662,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     // Fast path: when no edge carries mask/usag info the drawn geometry equals the
     // full geometry, so reuse `projected` (and its precomputed-world-coord cull).
     var stroke_proj: []const []mvt.Point = projected.items;
-    if (!L.suppress_lines and p.lines.len > 0 and s57.hasBoundaryMaskInfo(f)) {
+    if (!L.suppress_lines and p.lines.len > 0 and cell.needsDrawableBoundary(f)) {
         var stroke_storage = std.ArrayList([]mvt.Point).empty;
         const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
         for (dparts) |dp| {

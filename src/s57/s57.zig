@@ -394,6 +394,13 @@ pub fn hasBoundaryMaskInfo(f: Feature) bool {
     return false;
 }
 
+/// COALNE (30) / LNDARE (71) / SLCONS (122): the classes whose edges define the
+/// coastline. Their own boundaries are drawn; OTHER area features that share one of
+/// their edges suppress that edge (derived coast-coincident masking, see Cell.coast_edges).
+pub fn isCoastDefiner(objl: u16) bool {
+    return objl == 30 or objl == 71 or objl == 122;
+}
+
 pub const Attr = struct { code: u16, value: []const u8 };
 
 pub const Feature = struct {
@@ -422,6 +429,12 @@ pub const Cell = struct {
     nodes: std.AutoHashMap(u64, LonLat), // (rcnm<<32|rcid) -> point (VI/VC)
     edges: std.AutoHashMap(u32, usize), // edge rcid -> index into vectors
     sounding_vecs: std.AutoHashMap(u64, usize), // (rcnm<<32|rcid) -> vector idx (SG3D nodes)
+    /// Edge RCIDs referenced by any coast-definer (COALNE/LNDARE/SLCONS). A non-coast-
+    /// definer area's boundary edge that's in here IS the coastline, so it's dropped
+    /// from that area's DRAWN boundary (the COALNE/SLCONS line already strokes it) —
+    /// S-57 App. B.1 Annex A §17 scn 2. Arena-backed (freed with the cell); empty for
+    /// cells with no coast.
+    coast_edges: std.AutoHashMapUnmanaged(u32, void) = .{},
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Cell) void {
@@ -526,17 +539,21 @@ pub const Cell = struct {
     /// fresh part. The FILL geometry (lineGeometryParts) is deliberately untouched —
     /// the fill still uses complete rings. Only meaningful when hasBoundaryMaskInfo(f).
     pub fn drawableLineParts(self: Cell, a: Allocator, f: Feature) ![][]LonLat {
+        // Derived coast masking applies only to non-coast-definer AREA boundaries: an
+        // edge shared with a COALNE/LNDARE/SLCONS feature is the coastline itself and
+        // isn't re-stroked here (S-57 App. B.1 Annex A §17 scn 2).
+        const mask_coast = f.prim == 3 and !isCoastDefiner(f.objl);
         var parts = std.ArrayList([]LonLat).empty;
         var cur = std.ArrayList(LonLat).empty;
         var broken = false;
         for (f.refs) |ref| {
             if (ref.name.rcnm != RCNM_VE) continue;
-            if (ref.mask == 1 or ref.usag == 3) {
+            if (ref.mask == 1 or ref.usag == 3 or (mask_coast and self.coast_edges.contains(ref.name.rcid))) {
                 if (cur.items.len > 0) {
                     try parts.append(a, cur.items);
                     cur = std.ArrayList(LonLat).empty;
                 }
-                broken = true; // masked / data-limit edge: not drawn, breaks the chain
+                broken = true; // masked / data-limit / coast-coincident edge: not drawn, breaks the chain
                 continue;
             }
             const edge = try self.edgeCoordsRaw(a, ref.name.rcid, ref.ornt);
@@ -574,6 +591,19 @@ pub const Cell = struct {
         return parts.items;
     }
 
+    /// True when a feature's DRAWN boundary differs from its full geometry — so the
+    /// caller must take the drawableLineParts subset instead of stroking the full
+    /// ring. Either it carries explicit MASK/USAG edge flags, OR derived coast masking
+    /// will drop a coast-coincident edge from a non-coast-definer area's boundary.
+    pub fn needsDrawableBoundary(self: Cell, f: Feature) bool {
+        if (hasBoundaryMaskInfo(f)) return true;
+        if (f.prim != 3 or isCoastDefiner(f.objl)) return false;
+        for (f.refs) |ref| {
+            if (ref.name.rcnm == RCNM_VE and self.coast_edges.contains(ref.name.rcid)) return true;
+        }
+        return false;
+    }
+
     /// A point feature's coordinate (its isolated/connected node).
     pub fn pointGeometry(self: Cell, f: Feature) ?LonLat {
         for (f.refs) |ref| {
@@ -591,12 +621,14 @@ pub const Cell = struct {
     /// constructLineStringGeometry / boundaryQuapos aggregate: masked (MASK==1) and
     /// truncated (USAG==3) edges are not drawn and don't count.
     pub fn featureQuapos(self: Cell, f: Feature) i32 {
+        const mask_coast = f.prim == 3 and !isCoastDefiner(f.objl);
         var total: usize = 0;
         var low: usize = 0;
         var low_val: i32 = 0;
         for (f.refs) |ref| {
             if (ref.name.rcnm != RCNM_VE) continue;
             if (ref.mask == 1 or ref.usag == 3) continue; // not drawn
+            if (mask_coast and self.coast_edges.contains(ref.name.rcid)) continue; // coast-coincident: not drawn
             const idx = self.edges.get(ref.name.rcid) orelse continue;
             total += 1;
             const q = self.vectors[idx].quapos;
@@ -1135,7 +1167,17 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
         }
     }
 
-    return .{ .params = params, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .arena = arena };
+    // Coast-coincident boundary masking set (S-57 App. B.1 Annex A §17 scn 2): the
+    // edge RCIDs used by any COALNE/LNDARE/SLCONS feature. A non-coast-definer area's
+    // boundary edge in this set is the coastline itself and is dropped from its DRAWN
+    // boundary (drawableLineParts / featureQuapos). Arena-backed; freed with the cell.
+    var coast_edges: std.AutoHashMapUnmanaged(u32, void) = .{};
+    for (features.items) |f| {
+        if (!isCoastDefiner(f.objl)) continue;
+        for (f.refs) |ref| if (ref.name.rcnm == RCNM_VE) try coast_edges.put(a, ref.name.rcid, {});
+    }
+
+    return .{ .params = params, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .arena = arena };
 }
 
 // ---- tests --------------------------------------------------------------
@@ -1306,6 +1348,61 @@ test "drawableLineParts drops MASK/USAG edges and breaks the chain" {
     };
     const f_usag = Feature{ .rcnm = 100, .rcid = 3, .prim = 2, .objl = 30, .refs = &refs_usag };
     try std.testing.expectEqual(@as(usize, 2), (try cell.drawableLineParts(aa, f_usag)).len);
+}
+
+test "drawableLineParts: derived coast masking drops coast-coincident area edges" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Three collinear edges joining (0,0)->(3,0); edge 11 is the coast edge.
+    const vectors = try aa.alloc(VectorRecord, 3);
+    vectors[0] = .{ .rcnm = RCNM_VE, .rcid = 10, .points = try aa.dupe(LonLat, &.{ LonLat.init(0, 0), LonLat.init(1, 0) }), .soundings = &.{} };
+    vectors[1] = .{ .rcnm = RCNM_VE, .rcid = 11, .points = try aa.dupe(LonLat, &.{ LonLat.init(1, 0), LonLat.init(2, 0) }), .soundings = &.{} };
+    vectors[2] = .{ .rcnm = RCNM_VE, .rcid = 12, .points = try aa.dupe(LonLat, &.{ LonLat.init(2, 0), LonLat.init(3, 0) }), .soundings = &.{} };
+    var edges = std.AutoHashMap(u32, usize).init(aa);
+    try edges.put(10, 0);
+    try edges.put(11, 1);
+    try edges.put(12, 2);
+
+    var coast: std.AutoHashMapUnmanaged(u32, void) = .{};
+    try coast.put(aa, 11, {}); // edge 11 belongs to a COALNE/LNDARE/SLCONS feature
+
+    var cell = Cell{
+        .params = .{},
+        .vectors = vectors,
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, LonLat).init(aa),
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(aa),
+        .coast_edges = coast,
+        .arena = std.heap.ArenaAllocator.init(a),
+    };
+    defer cell.arena.deinit();
+
+    const refs = [_]SpatialRef{
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 10 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 11 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 12 }, .ornt = 1 },
+    };
+
+    // Non-coast-definer AREA (DEPARE, objl 42, prim 3): the shared coast edge 11 is
+    // dropped from the DRAWN boundary -> two parts; fill ring stays whole.
+    const f_area = Feature{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 42, .refs = &refs };
+    try std.testing.expect(cell.needsDrawableBoundary(f_area)); // no MASK flags, but coast-coincident
+    try std.testing.expectEqual(@as(usize, 1), (try cell.lineGeometryParts(aa, f_area)).len); // fill untouched
+    try std.testing.expectEqual(@as(usize, 2), (try cell.drawableLineParts(aa, f_area)).len);
+
+    // A coast-definer AREA (LNDARE, objl 71) is exempt: it draws its own coast -> one chain.
+    const f_lndare = Feature{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 71, .refs = &refs };
+    try std.testing.expect(!cell.needsDrawableBoundary(f_lndare));
+    try std.testing.expectEqual(@as(usize, 1), (try cell.drawableLineParts(aa, f_lndare)).len);
+
+    // A LINE feature (prim 2) is never coast-masked -> one chain.
+    const f_line = Feature{ .rcnm = 100, .rcid = 3, .prim = 2, .objl = 42, .refs = &refs };
+    try std.testing.expect(!cell.needsDrawableBoundary(f_line));
+    try std.testing.expectEqual(@as(usize, 1), (try cell.drawableLineParts(aa, f_line)).len);
 }
 
 test "parse SG2D coordinates to lon/lat" {
