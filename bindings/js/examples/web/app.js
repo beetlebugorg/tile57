@@ -14,10 +14,11 @@ addEventListener('unhandledrejection', (e) => err('promise rejected: ' + (e.reas
 const protocol = new pmtiles.Protocol();
 maplibregl.addProtocol('pmtiles', protocol.tile);
 
-// Assets served next to this page (see ./bake.sh + ./serve.sh). The PMTiles path
-// can be overridden with ?pmtiles=<path> (e.g. ?pmtiles=big/chart.pmtiles).
+// Assets served next to this page (see ./bake.sh + ./serve.sh). Defaults to MLT
+// (MapLibre Tile); ?fmt=mvt uses the MVT bake; ?pmtiles=<path> overrides the archive.
 const params = new URLSearchParams(location.search);
-const pmtilesPath = params.get('pmtiles') || 'chart/tiles/chart.pmtiles';
+const isMlt = params.get('fmt') !== 'mvt';
+const pmtilesPath = params.get('pmtiles') || (isMlt ? 'chart-mlt/tiles/chart.pmtiles' : 'chart/tiles/chart.pmtiles');
 const PMTILES = 'pmtiles://' + new URL(pmtilesPath, location.href).href;
 const SPRITE = new URL('chart/assets/sprite-mln', location.href).href;
 const GLYPHS = 'https://protomaps.github.io/basemaps-assets/fonts/{fontstack}/{range}.pbf'; // public "Noto Sans Regular"
@@ -45,7 +46,9 @@ async function main() {
   // the template, so we repoint it (and sprite/glyphs) at what we serve.
   const buildStyle = () => {
     const style = engine.generateStyle(readSettings());
-    style.sources.chart = { type: 'vector', url: PMTILES };
+    // The source lives in the template; repoint it at our PMTiles. encoding:"mlt"
+    // tells MapLibre (>=5.12) to decode MapLibre Tile vector data instead of MVT.
+    style.sources.chart = { type: 'vector', url: PMTILES, ...(isMlt ? { encoding: 'mlt' } : {}) };
     style.sprite = SPRITE;
     style.glyphs = GLYPHS;
     return style;

@@ -10,7 +10,7 @@ PORT="${PORT:-3000}"
 mkdir -p engine
 cp -f ../../index.js ../../index.d.ts ../../style-engine.wasm engine/
 
-if [ ! -f chart/tiles/chart.pmtiles ]; then
+if [ ! -f chart-mlt/tiles/chart.pmtiles ] && [ ! -f chart/tiles/chart.pmtiles ]; then
   echo "no baked tiles yet — run e.g.:" >&2
   echo "  ./bake.sh /path/to/US4MD81M.000" >&2
   exit 1
