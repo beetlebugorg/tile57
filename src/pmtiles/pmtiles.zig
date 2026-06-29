@@ -211,6 +211,49 @@ pub fn serializeDir(a: Allocator, entries: []const Entry) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
+// A reader fetches the root directory from the archive's first ~16 KiB (pmtiles.js
+// reads bytes [0, 16384) up front), so the serialized root must share that window
+// with the 127-byte header. Larger archives push the bulk of entries into leaf
+// directories and keep only one pointer per leaf in the root.
+pub const MAX_ROOT_BYTES: usize = 16384 - HEADER_LEN;
+
+pub const Directories = struct { root: []u8, leaves: []u8 };
+
+/// Serialize `entries` (sorted, run-merged) into a root directory + leaf directories,
+/// keeping the root within MAX_ROOT_BYTES. When everything fits, `leaves` is empty
+/// and the root holds every entry; otherwise the entries are split into fixed-size
+/// leaves and the root holds one leaf pointer each (run_length=0, offset relative to
+/// the leaf section). Grows the leaf size until the root fits. Caller owns both slices.
+pub fn buildDirectories(a: Allocator, entries: []const Entry) !Directories {
+    const flat = try serializeDir(a, entries);
+    if (entries.len == 0 or flat.len <= MAX_ROOT_BYTES) return .{ .root = flat, .leaves = &.{} };
+    a.free(flat);
+
+    var leaf_size: usize = 4096;
+    while (true) : (leaf_size *= 2) {
+        var leaves = std.ArrayList(u8).empty;
+        var roots = std.ArrayList(Entry).empty;
+        defer roots.deinit(a);
+        var i: usize = 0;
+        while (i < entries.len) : (i += leaf_size) {
+            const end = @min(i + leaf_size, entries.len);
+            const leaf = try serializeDir(a, entries[i..end]);
+            defer a.free(leaf);
+            try roots.append(a, .{
+                .tile_id = entries[i].tile_id,
+                .offset = leaves.items.len, // relative to the leaf-directory section
+                .length = @intCast(leaf.len),
+                .run_length = 0, // 0 => this root entry points at a leaf directory
+            });
+            try leaves.appendSlice(a, leaf);
+        }
+        const root = try serializeDir(a, roots.items);
+        if (root.len <= MAX_ROOT_BYTES) return .{ .root = root, .leaves = try leaves.toOwnedSlice(a) };
+        a.free(root);
+        leaves.deinit(a);
+    }
+}
+
 fn deserializeDir(a: Allocator, buf: []const u8) ![]Entry {
     var r = VarReader{ .buf = buf };
     const n: usize = @intCast(r.read());
@@ -428,19 +471,20 @@ pub const StreamWriter = struct {
             }
             try merged.append(a, e);
         }
-        const root_dir = try serializeDir(a, merged.items);
+        const dirs = try buildDirectories(a, merged.items);
         const metadata = opts.metadata_json;
         const root_off: u64 = HEADER_LEN;
-        const meta_off: u64 = root_off + root_dir.len;
-        const data_off: u64 = meta_off + metadata.len; // no leaf dirs
+        const meta_off: u64 = root_off + dirs.root.len;
+        const leaf_off: u64 = meta_off + metadata.len;
+        const data_off: u64 = leaf_off + dirs.leaves.len;
         const min_z: u8 = if (self.num_addressed == 0) 0 else self.min_z;
         const header = Header{
             .root_dir_offset = root_off,
-            .root_dir_length = root_dir.len,
+            .root_dir_length = dirs.root.len,
             .metadata_offset = meta_off,
             .metadata_length = metadata.len,
-            .leaf_dir_offset = data_off,
-            .leaf_dir_length = 0,
+            .leaf_dir_offset = leaf_off,
+            .leaf_dir_length = dirs.leaves.len,
             .tile_data_offset = data_off,
             .tile_data_length = self.data_len,
             .num_addressed_tiles = self.num_addressed,
@@ -465,8 +509,9 @@ pub const StreamWriter = struct {
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(a);
         try out.appendSlice(a, &hbuf);
-        try out.appendSlice(a, root_dir);
+        try out.appendSlice(a, dirs.root);
         try out.appendSlice(a, metadata);
+        try out.appendSlice(a, dirs.leaves);
         return out.toOwnedSlice(a);
     }
 
@@ -545,26 +590,26 @@ pub fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8
     }
     if (tiles.len == 0) min_z = 0;
 
-    const root_dir = try serializeDir(a, entries.items);
+    const dirs = try buildDirectories(a, entries.items);
     const metadata = opts.metadata_json;
 
-    // Assemble: header | root | metadata | (no leaf) | data.
+    // Assemble: header | root | metadata | leaf dirs | data.
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
     var hbuf: [HEADER_LEN]u8 = undefined;
 
     const root_off: u64 = HEADER_LEN;
-    const meta_off: u64 = root_off + root_dir.len;
+    const meta_off: u64 = root_off + dirs.root.len;
     const leaf_off: u64 = meta_off + metadata.len;
-    const data_off: u64 = leaf_off; // no leaf dirs
+    const data_off: u64 = leaf_off + dirs.leaves.len;
 
     const header = Header{
         .root_dir_offset = root_off,
-        .root_dir_length = root_dir.len,
+        .root_dir_length = dirs.root.len,
         .metadata_offset = meta_off,
         .metadata_length = metadata.len,
         .leaf_dir_offset = leaf_off,
-        .leaf_dir_length = 0,
+        .leaf_dir_length = dirs.leaves.len,
         .tile_data_offset = data_off,
         .tile_data_length = data.items.len,
         .num_addressed_tiles = tiles.len,
@@ -587,8 +632,9 @@ pub fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8
     header.serialize(&hbuf);
 
     try out.appendSlice(gpa, &hbuf);
-    try out.appendSlice(gpa, root_dir);
+    try out.appendSlice(gpa, dirs.root);
     try out.appendSlice(gpa, metadata);
+    try out.appendSlice(gpa, dirs.leaves);
     try out.appendSlice(gpa, data.items);
     return out.toOwnedSlice(gpa);
 }
@@ -646,6 +692,40 @@ test "write then read round-trips a real tile (writer+reader+gzip+mvt)" {
 
     // Absent tile -> null.
     try std.testing.expect((try r.getTile(gpa, 14, 0, 0)) == null);
+}
+
+test "large archive shards the root into leaf directories and still round-trips" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Enough distinct tiles (unique content -> no dedup/run-merge) that the flat
+    // directory would blow past MAX_ROOT_BYTES, forcing leaf directories.
+    const N: u32 = 20000;
+    const tiles = try a.alloc(InputTile, N);
+    for (0..N) |i| {
+        const payload = try std.fmt.allocPrint(a, "tile-{d}-payload", .{i});
+        tiles[i] = .{ .z = 15, .x = @intCast(i), .y = 0, .mvt = payload };
+    }
+    const archive = try write(gpa, tiles, .{});
+    defer gpa.free(archive);
+
+    var r = try Reader.init(gpa, archive);
+    defer r.deinit();
+    // Root stays within a reader's initial window; the bulk lives in leaf dirs.
+    try std.testing.expect(r.header.root_dir_length <= MAX_ROOT_BYTES);
+    try std.testing.expect(r.header.leaf_dir_length > 0);
+
+    // Every tile is reachable through the root -> leaf lookup, content intact.
+    for ([_]u32{ 0, 1, 4095, 4096, 12345, N / 2, N - 1 }) |i| {
+        const got = (try r.getTile(gpa, 15, i, 0)) orelse return error.MissingTile;
+        defer gpa.free(got);
+        const want = try std.fmt.allocPrint(a, "tile-{d}-payload", .{i});
+        try std.testing.expectEqualSlices(u8, want, got);
+    }
+    // An absent tile in the sharded archive still resolves to null.
+    try std.testing.expect((try r.getTile(gpa, 15, 1, 1)) == null);
 }
 
 test "header serialize/parse round-trip" {
