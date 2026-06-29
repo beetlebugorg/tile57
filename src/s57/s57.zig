@@ -980,11 +980,12 @@ fn mergeFile(
                     // and the SG2D list otherwise (a coordinate DELETE ships SGCC with no
                     // SG2D/SG3D, so fall back to whichever existing list is populated). A
                     // bare SG2D/SG3D with no SGCC is a full replacement.
-                    if (rec.field("SGCC")) |sgcc| {
+                    const sgcc = rec.field("SGCC");
+                    if (sgcc != null and sgcc.?.len >= 5) {
                         if (rec.field("SG3D") != null or (rec.field("SG2D") == null and ex.soundings.len > 0)) {
-                            ex.soundings = try applyControl(a, Sounding, ex.soundings, v.soundings, sgcc);
+                            ex.soundings = try applyControl(a, Sounding, ex.soundings, v.soundings, sgcc.?);
                         } else {
-                            ex.points = try applyControl(a, LonLat, ex.points, v.points, sgcc);
+                            ex.points = try applyControl(a, LonLat, ex.points, v.points, sgcc.?);
                         }
                     } else if (rec.field("SG2D") != null) {
                         ex.points = v.points;
@@ -995,8 +996,9 @@ fn mergeFile(
                     // a single-endpoint modify ships VRPC{modify,idx,count=1} + ONE
                     // VRPT, so editing the list (not replacing it) preserves the other
                     // endpoint. A bare VRPT with no VRPC is a full replace.
-                    if (rec.field("VRPC")) |vrpc| {
-                        ex.vptrs = try applyControl(a, VPtr, ex.vptrs, v.vptrs, vrpc);
+                    const vrpc = rec.field("VRPC");
+                    if (vrpc != null and vrpc.?.len >= 5) {
+                        ex.vptrs = try applyControl(a, VPtr, ex.vptrs, v.vptrs, vrpc.?);
                         deriveEndpoints(ex);
                     } else if (rec.field("VRPT") != null) {
                         ex.vptrs = v.vptrs;
@@ -1029,8 +1031,9 @@ fn mergeFile(
 
             if (ruin == 3) {
                 if (fidx.get(key)) |i| if (feats.items[i]) |*ex| {
-                    if (rec.field("FSPC")) |fspc| {
-                        ex.refs = try applyControl(a, SpatialRef, ex.refs, f.refs, fspc);
+                    const fspc = rec.field("FSPC");
+                    if (fspc != null and fspc.?.len >= 5) {
+                        ex.refs = try applyControl(a, SpatialRef, ex.refs, f.refs, fspc.?);
                     } else if (rec.field("FSPT") != null) {
                         ex.refs = f.refs;
                     }
