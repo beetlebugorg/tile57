@@ -269,7 +269,16 @@ pub fn parse(gpa: Allocator, bytes: []const u8) !File {
     var records = std.ArrayList(Record).empty;
     var off = first.next;
     while (off + 24 <= bytes.len) {
-        const r = parseRecord(a, bytes, off) catch break;
+        // Oracle Parse loop (parser.go:88-97): a data-record parse error fails the WHOLE
+        // file (`return nil, err`); only a clean end-of-records breaks. `catch break`
+        // swallowed every error and kept the partial result — a malformed record left a
+        // truncated-but-accepted cell instead of being dropped. Match: break on the
+        // EndOfRecords padding sentinel (== Go io.EOF), propagate any genuine error so the
+        // source.zig catch-return drops the whole cell, like the oracle's per-cell skip.
+        const r = parseRecord(a, bytes, off) catch |e| {
+            if (e == error.EndOfRecords) break;
+            return e;
+        };
         try records.append(a, r.rec);
         off = r.next;
     }
