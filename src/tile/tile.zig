@@ -163,15 +163,22 @@ pub fn clipLine(a: Allocator, line: []const mvt.Point, b: Box) ![][]mvt.Point {
         const seg = clipSegment(line[i], line[i + 1], b);
         if (seg) |s| {
             if (cur.items.len == 0) {
-                try cur.append(a, s[0]);
-                try cur.append(a, s[1]);
-            } else if (eqPt(cur.items[cur.items.len - 1], s[0])) {
-                try cur.append(a, s[1]);
+                try cur.append(a, s.a);
+                try cur.append(a, s.b);
+            } else if (eqPt(cur.items[cur.items.len - 1], s.a)) {
+                try cur.append(a, s.b);
             } else {
                 try parts.append(a, cur.items);
                 cur = std.ArrayList(mvt.Point).empty;
-                try cur.append(a, s[0]);
-                try cur.append(a, s[1]);
+                try cur.append(a, s.a);
+                try cur.append(a, s.b);
+            }
+            // A segment clipped at its far end leaves the box here; close the run so a
+            // poke-out/re-entry near the same boundary point isn't bridged into one run
+            // (matches Go tile.ClipLine seg.exited and our own clipLinePhased).
+            if (s.exited) {
+                try parts.append(a, cur.items);
+                cur = std.ArrayList(mvt.Point).empty;
             }
         } else if (cur.items.len > 0) {
             try parts.append(a, cur.items);
@@ -186,7 +193,9 @@ fn eqPt(a: mvt.Point, b: mvt.Point) bool {
     return a.x == b.x and a.y == b.y;
 }
 
-fn clipSegment(p0: mvt.Point, p1: mvt.Point, b: Box) ?[2]mvt.Point {
+const ClippedSeg = struct { a: mvt.Point, b: mvt.Point, exited: bool };
+
+fn clipSegment(p0: mvt.Point, p1: mvt.Point, b: Box) ?ClippedSeg {
     var t0: f64 = 0;
     var t1: f64 = 1;
     const dx: f64 = @floatFromInt(p1.x - p0.x);
@@ -223,8 +232,9 @@ fn clipSegment(p0: mvt.Point, p1: mvt.Point, b: Box) ?[2]mvt.Point {
     const nx1 = x0 + t1 * dx;
     const ny1 = y0 + t1 * dy;
     return .{
-        .{ .x = roundI32(nx0), .y = roundI32(ny0) },
-        .{ .x = roundI32(nx1), .y = roundI32(ny1) },
+        .a = .{ .x = roundI32(nx0), .y = roundI32(ny0) },
+        .b = .{ .x = roundI32(nx1), .y = roundI32(ny1) },
+        .exited = t1 < 1.0, // far end was clipped -> the polyline leaves the box here
     };
 }
 
@@ -516,6 +526,30 @@ test "line clip splits a line that exits and re-enters" {
     };
     const parts = try clipLine(a, &line, b);
     try std.testing.expectEqual(@as(usize, 2), parts.len);
+    for (parts) |part| for (part) |p| {
+        try std.testing.expect(p.x >= b.min and p.x <= b.max);
+    };
+}
+
+test "line clip exit-split: retrace out and back yields two runs (Go ClipLine parity)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = Box.default(EXTENT, BUFFER);
+
+    // In -> out -> back in along the SAME line: the exit and re-entry hit the box at
+    // the identical boundary point, so without the exit-split the run would merge into
+    // one [in, boundary, in] polyline. Go tile.ClipLine (and our clipLinePhased)
+    // finalize the run on exit -> two runs. The clipped span is [in, boundary] both ways.
+    const line = [_]mvt.Point{
+        .{ .x = 100, .y = 2048 },
+        .{ .x = 9000, .y = 2048 }, // out the right edge
+        .{ .x = 100, .y = 2048 }, // retrace back in along the same line
+    };
+    const parts = try clipLine(a, &line, b);
+    try std.testing.expectEqual(@as(usize, 2), parts.len);
+    try std.testing.expectEqual(@as(usize, 2), parts[0].len);
+    try std.testing.expectEqual(@as(usize, 2), parts[1].len);
     for (parts) |part| for (part) |p| {
         try std.testing.expect(p.x >= b.min and p.x <= b.max);
     };
