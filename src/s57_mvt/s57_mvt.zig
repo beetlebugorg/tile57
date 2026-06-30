@@ -1515,9 +1515,18 @@ fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, colo
                     const gp = base + sym.offset_px * px_scale;
                     if (gp < g0 or gp > run_end) continue;
                     const tp = lsPointAndTangent(rp, rarc, gp - g0) orelse continue;
+                    const qp = tile.quantizeF(tp.p);
+                    // Own each embedded symbol by exactly ONE tile: emit it only when its
+                    // position lands inside the RAW tile [0,EXTENT). The dash-run lines
+                    // keep the buffered clip (seamless strokes across the seam), but a
+                    // symbol in the buffer zone would otherwise be tessellated by BOTH
+                    // this tile and its neighbour -> the same symbol drawn twice at every
+                    // tile seam (user-reported "double symbols"). Half-open so a symbol on
+                    // the seam belongs to exactly one side (no gap, no double).
+                    if (qp.x < 0 or qp.x >= tile.EXTENT or qp.y < 0 or qp.y >= tile.EXTENT) continue;
                     const rot = std.math.atan2(tp.dy, tp.dx) * 180.0 / std.math.pi;
                     const single = try a.alloc(mvt.Point, 1);
-                    single[0] = tile.quantizeF(tp.p);
+                    single[0] = qp;
                     const sparts = try a.alloc([]const mvt.Point, 1);
                     sparts[0] = single;
                     var sprops = std.ArrayList(mvt.Prop).empty;
