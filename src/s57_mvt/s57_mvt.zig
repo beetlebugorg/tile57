@@ -1605,6 +1605,53 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     }
 }
 
+/// Native S-52 fallback for M_NSYS (objl 306) — the Go reference's navSystemBuild.
+/// A marine navigation-system meta-area whose boundary is the IALA-A / IALA-B system
+/// limit: stroke each ring with the MARSYS51 complex linestyle — the dashed "—A——B—"
+/// pattern carrying the EMMARS01 (IALA-A) and EMMARS02 (IALA-B) letter symbols — or
+/// NAVARE51 when ORIENT marks a direction of buoyage. The S-101 catalogue routes
+/// M_NSYS to nothing (s101_adapt excludes it so this rule owns it), so without this
+/// the boundary draws nothing. DrawingPriority 12. NOTE: the ORIENT-only DIRBOY
+/// direction-of-buoyage arrow (DIRBOY01/A1/B1, CentreOnArea) is not yet ported —
+/// absent on the reference data; the A/B boundary line is the visible feature.
+fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+    if (L.suppress_lines) return;
+    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
+    if (geo_parts.len == 0) return;
+
+    const scamin = featureScamin(f);
+    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
+    const points_l = if (scamin != null) L.points_scamin else L.points;
+    const meta = Meta{ .prio = 12, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .cell = pickCell(L, cell.name), .band = L.band };
+
+    // ORIENT present -> direction-of-buoyage boundary (NAVARE51); else the plain
+    // IALA A/B system boundary (MARSYS51). Both stroke in CHGRD.
+    const boundary: []const u8 = if (f.attr(s57.ATTR_ORIENT) != null) "NAVARE51" else "MARSYS51";
+
+    // Tessellate the registered complex linestyle (dashes + the A/B letter symbols).
+    if (g_linestyles.get(boundary)) |info| {
+        try emitComplexLine(a, geo_parts, info, "CHGRD", !L.suppress_points, z, x, y, box, meta, lines_l, points_l);
+        return;
+    }
+    // No registered linestyle (live/host path, no table): a plain dashed CHGRD ring.
+    for (geo_parts) |gp| {
+        if (gp.len < 2) continue;
+        if (!overlaps(geomBounds(gp), tb)) continue;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+        const sub = try clipSimplifyLine(a, proj, box);
+        if (sub.len == 0) continue;
+        const parts = try a.alloc([]const mvt.Point, sub.len);
+        for (sub, 0..) |s, i| parts[i] = s;
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHGRD" } });
+        try props.append(a, .{ .key = "width_px", .value = .{ .double = 1 } });
+        try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
+        try appendMeta(a, &props, meta);
+        try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
+    }
+}
+
 /// Native S-52 fallback for NEWOBJ (objl 163). NEWOBJ features map to S-101 classes
 /// (e.g. VirtualAISAidToNavigation) whose rule may not portray the encoded geometry
 /// (wrong primitive, unofficial stub, …); when portrayal yields nothing or errors,
@@ -1833,6 +1880,10 @@ fn appendCellFeatures(
         }
         if (f.objl == 109 and f.prim == 3) { // RECTRC area: Curve-only rule errors; draw the track limit
             try emitDashedBoundary(a, cell.*, f, fi, geo, "CHBLK", 1.0, z, x, y, tb, box, L);
+            continue;
+        }
+        if (f.objl == 306 and f.prim == 3) { // M_NSYS — navSystemBuild (IALA A/B boundary linestyle)
+            try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
             continue;
         }
         if (errored) continue; // genuine rule error on a normal class → suppress
