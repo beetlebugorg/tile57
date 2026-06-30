@@ -1365,9 +1365,17 @@ fn mergeFile(
                 } else return error.ModifyMissingFeature;
                 continue;
             }
-            // insert (1) — upsert. See the spatial branch: unknown RUIN errors.
+            // insert (1). See the spatial branch: unknown RUIN errors.
             if (is_update and ruin != 1) return error.UnknownRUIN;
-            if (fidx.get(key)) |i| {
+            // BASE pass appends EVERY parseable feature (no FOID dedup) with a
+            // last-wins index, matching the oracle parseBaseFile: its `features`
+            // slice keeps duplicate-FOID base records (both rendered) while
+            // `featuresByID` indexes the last for updates. UPDATE INSERT upserts
+            // (replace the indexed record in place, else append — updates.go:170).
+            if (!is_update) {
+                try feats.append(a, f);
+                try fidx.put(key, feats.items.len - 1);
+            } else if (fidx.get(key)) |i| {
                 feats.items[i] = f;
             } else {
                 try feats.append(a, f);
