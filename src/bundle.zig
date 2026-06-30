@@ -240,3 +240,718 @@ pub fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, 
     }
     return atlas;
 }
+
+// ========================================================================
+// bakeBundle — the full chart-bundle orchestration (tiles + assets + manifest).
+// Moved out of the `tile57 bake` CLI so any consumer (the C ABI, a Go/JS binding)
+// produces the SAME self-contained bundle the CLI emits. The CLI's `runBake` is now
+// a thin wrapper: parse args -> bundle.bakeBundle(opts) -> print summary.
+// ========================================================================
+
+// Wall-clock seconds (libc time(); std.time is behind std.Io in 0.16). For bake
+// progress timing only — coarse is fine.
+extern fn time(t: ?*c_long) callconv(.c) c_long;
+fn nowSec() i64 {
+    return @intCast(time(null));
+}
+
+// Total parse+portray calls across the bake (atomic; workers run in parallel).
+// Compared against the cell count per band to surface excessive re-parsing.
+var g_parses = std.atomic.Value(usize).init(0);
+
+/// Inputs for `bakeBundle`. Paths are resolved by the caller: an empty `rules_dir`
+/// / `catalog_dir` selects the catalogue embedded in the binary (no on-disk copy).
+pub const BakeOpts = struct {
+    input: []const u8, // a single cell.000 OR a whole ENC_ROOT directory
+    out_dir: []const u8, // bundle output directory (created if absent)
+    rules_dir: []const u8 = "", // "" = embedded S-101 portrayal rules
+    catalog_dir: []const u8 = "", // "" = embedded PortrayalCatalog assets
+    generator: []const u8 = "", // manifest generator string (e.g. "tile57 0.1.0")
+    created: []const u8 = "", // manifest created stamp (ISO8601; "" = unset)
+    minzoom: u8 = 8,
+    maxzoom: u8 = 16,
+    lru: usize = 64, // lazy-bake tuning: parsed cells held resident
+    super_dz: u8 = 3, // lazy-bake tuning: spatial super-tile depth
+    format: engine.s57_mvt.TileFormat = .mvt,
+};
+
+/// What `bakeBundle` produced: the baked cell count + the union bbox [w,s,e,n].
+pub const BakeResult = struct { cell_count: usize, bounds: [4]f64 };
+
+/// Bake a single cell or a whole ENC_ROOT into a self-contained chart bundle under
+/// `opts.out_dir`: tiles/chart.pmtiles + assets/{colortables,linestyles}.json +
+/// sprite-mln + style-{day,dusk,night}.json + manifest.json (pins schema_version,
+/// couples tiles to portrayal). Asset-emit failures degrade gracefully (a warning +
+/// a thinner bundle); a structural failure (no geometry, write error) is returned.
+pub fn bakeBundle(io: std.Io, a: std.mem.Allocator, opts: BakeOpts) !BakeResult {
+    // 1. tiles -> <out>/tiles/chart.pmtiles. Input may be a single cell.000 or a
+    // whole ENC_ROOT directory (band-streamed multi-cell bake, streamed to disk).
+    const tiles_dir = try std.fs.path.join(a, &.{ opts.out_dir, "tiles" });
+    try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
+    const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
+    const rb = try bakeRoot(io, a, opts.input, tiles_path, opts.rules_dir, opts.minzoom, opts.maxzoom, opts.lru, opts.super_dz, true, opts.format);
+    const bounds = rb.bounds;
+    const cells = rb.cells;
+    const snd_stacks = rb.sounds; // sounding glyph stacks for sprite-mln
+
+    // 2. assets -> <out>/assets/colortables.json + style-{day,dusk,night}.json
+    const assets_dir = try std.fs.path.join(a, &.{ opts.out_dir, "assets" });
+    try std.Io.Dir.cwd().createDirPath(io, assets_dir);
+    const ct_path = try std.fs.path.join(a, &.{ assets_dir, "colortables.json" });
+    const ls_path = try std.fs.path.join(a, &.{ assets_dir, "linestyles.json" });
+    _ = emitLinestyles(io, a, opts.catalog_dir, ls_path) catch |err|
+        std.debug.print("warning: linestyles emit failed ({s})\n", .{@errorName(err)});
+    // The bundle ships ONLY the MapLibre-ready sprite (sprite-mln): it already
+    // contains the pivot-centred symbols + ctr:/pat: variants, so the raw
+    // sprite.json/patterns.json (the web/oracle format) would be redundant here —
+    // they stay available via the standalone `tile57 sprite`/`pattern` commands.
+    // If sprite-mln emits, the styles get a `sprite` URL so symbols + patterns
+    // render; snd_stacks (collected during the bake) gives it the sounding composites.
+    const sprite_ok = if (emitSpriteMln(io, a, opts.catalog_dir, DEFAULT_CSS, assets_dir, "sprite-mln", snd_stacks)) |_| true else |err| blk: {
+        std.debug.print("warning: sprite-mln emit failed ({s})\n", .{@errorName(err)});
+        break :blk false;
+    };
+    var styles: ?assets.Manifest.Styles = null;
+    if (emitColorTables(io, a, opts.catalog_dir, ct_path)) |ct| {
+        // One style.json per palette, resolving colour tokens from the colortables.
+        // sprite enables the symbol/pattern layers; glyphs (text) await SDF glyphs.
+        var ok = true;
+        // SCAMIN bucket minzooms are latitude-dependent; fix them at the archive center.
+        const scamin_lat = (bounds[1] + bounds[3]) / 2.0;
+        for ([_][]const u8{ "day", "dusk", "night" }) |sc| {
+            const sj = assets.styleJson(a, .{
+                .scheme = sc,
+                .colortables_json = ct,
+                .sprite = if (sprite_ok) "sprite-mln" else null,
+                .minzoom = opts.minzoom,
+                .scamin = rb.scamin,
+                .scamin_lat = scamin_lat,
+            }) catch {
+                ok = false;
+                break;
+            };
+            const name = try std.fmt.allocPrint(a, "style-{s}.json", .{sc});
+            const sp = try std.fs.path.join(a, &.{ assets_dir, name });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = sj });
+        }
+        if (ok) styles = .{
+            .day = "assets/style-day.json",
+            .dusk = "assets/style-dusk.json",
+            .night = "assets/style-night.json",
+        };
+    } else |err| {
+        std.debug.print("warning: assets emit failed ({s}); bundle has tiles + manifest only\n", .{@errorName(err)});
+    }
+
+    // 3. manifest.json — pins schema_version, couples tiles <-> portrayal.
+    const b = bounds;
+    const manifest = try assets.manifestJson(a, .{
+        .generator = opts.generator,
+        .created = opts.created,
+        .tiles_rel = "tiles/chart.pmtiles",
+        .colortables_rel = "assets/colortables.json",
+        .minzoom = opts.minzoom,
+        .maxzoom = opts.maxzoom,
+        .bbox = b,
+        .anchor = .{ (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0 },
+        .cells = cells,
+        .styles = styles,
+    });
+    const manifest_path = try std.fs.path.join(a, &.{ opts.out_dir, "manifest.json" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest });
+
+    return .{ .cell_count = cells.len, .bounds = bounds };
+}
+
+// ---- bake-root (whole ENC_ROOT / single cell -> one banded PMTiles) -----
+
+// True if `path` is a directory (an ENC_ROOT) rather than a single cell.000 file.
+fn isDir(io: std.Io, path: []const u8) bool {
+    var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    d.close(io);
+    return true;
+}
+
+// Live bake-root progress context (file-level so the C-ABI Progress callback can
+// read the current band + super-tile position alongside the running tile count).
+const ProgressCtx = struct { band: []const u8 = "?", st: usize = 0, st_total: usize = 0 };
+var g_prog: ProgressCtx = .{};
+var g_bake_start: i64 = 0;
+
+/// Console progress for bake-root: stage 0 = loading cells, 1 = baking tiles.
+/// Shows band, super-tile position, running tile count, throughput and elapsed.
+fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void {
+    _ = ctx;
+    _ = total;
+    const secs = @as(f64, @floatFromInt(@max(nowSec() - g_bake_start, 1)));
+    const rate = @as(f64, @floatFromInt(done)) / secs;
+    if (stage == 0) {
+        std.debug.print("\r  {s}: loading {d} cells    ", .{ g_prog.band, done });
+    } else {
+        std.debug.print("\r  {s}: super-tile {d}/{d}  {d} tiles  ({d:.0}/s, {d:.0}s)    ", .{ g_prog.band, g_prog.st, g_prog.st_total, done, rate, secs });
+    }
+}
+
+// One ENC_ROOT base cell: its `.000` path (updates are <stem>.001…, found on load)
+// and the cheap peek bbox [w,s,e,n], used to assign it to spatial super-tiles
+// without a full parse.
+const CellEntry = struct { path: []const u8, bbox: [4]f64 };
+
+// A cell's portrayal: the per-feature S-101 instruction streams (+ display
+// variants), computed ONCE by the Lua engine and kept resident for the whole band
+// in `arena`. Compact relative to geometry, and the expensive thing to produce —
+// so it's never recomputed, even when the cell's geometry is evicted + re-parsed.
+const CellPortray = struct {
+    arena: *std.heap.ArenaAllocator, // sticky: owns the streams below
+    base: ?[]const ?[]const u8,
+    plain: ?[]const ?[]const u8,
+    simplified: ?[]const ?[]const u8,
+    bounds: [4]f64,
+};
+
+// A cell's parsed geometry (the heavy part): the S-57 model + assembled geo cache.
+// EVICTABLE under LRU pressure and re-parsed on demand (cheap — no re-portrayal).
+const CellGeom = struct {
+    cell: engine.s57.Cell, // cell.arena owns the geometry
+    geo: ?engine.s57_mvt.GeoParts,
+    geo_world: ?engine.s57_mvt.GeoWorld = null, // precomputed world coords (in geo_arena)
+    geo_arena: ?*std.heap.ArenaAllocator,
+    feat_bbox: []const ?[4]f64 = &.{}, // per-feature bbox for the per-tile cull (in geo_arena)
+};
+
+// Copy per-feature instruction streams into `a` (the sticky portrayal arena) so
+// they outlive the transient portrayal arena. nulls (features with no stream) stay.
+fn copyStreams(a: std.mem.Allocator, src: []const ?[]const u8) ![]const ?[]const u8 {
+    const out = try a.alloc(?[]const u8, src.len);
+    for (src, 0..) |s, i| out[i] = if (s) |bytes| try a.dupe(u8, bytes) else null;
+    return out;
+}
+
+// Parallel cell loader. Each index READS its cell's .000 (+ sequential updates)
+// from disk, parses it (a fresh per-thread Lua state; page allocator is
+// thread-safe), builds its geo cache (evictable), and — only the first time the
+// cell is loaded (portray[ci] == null) — runs the S-101 portrayal and copies the
+// streams into a sticky arena. Reading in the worker (std.Io.Dir.readFileAlloc is
+// thread-safe: each call opens its own handle, no shared mutable state) makes a
+// super-tile's cell reads parallel, so a cold first-bake isn't disk-read-serial.
+// Re-loads after a geometry eviction re-parse only, reusing the resident
+// portrayal. Distinct ci per j ⇒ race-free.
+const LoadWork = struct {
+    cells: []const u32, // cell indices into `entries`
+    entries: []const CellEntry, // cell file path; bytes read in-worker (parallel I/O)
+    dir: std.Io.Dir,
+    io: std.Io,
+    portray: []?CellPortray, // resident; produced only when null
+    geom: []?CellGeom, // (re)built every load
+    rules_dir: []const u8,
+    gpa: std.mem.Allocator,
+
+    fn run(uptr: *anyopaque, j: usize, scratch: std.mem.Allocator) void {
+        _ = scratch; // parsed cell + portrayal are persistent; kept in their own arenas
+        const c: *LoadWork = @ptrCast(@alignCast(uptr));
+        const ci = c.cells[j];
+        const bpath = c.entries[ci].path;
+        const base = c.dir.readFileAlloc(c.io, bpath, c.gpa, .unlimited) catch return;
+        defer c.gpa.free(base);
+        if (base.len == 0) return;
+        // Read sequential updates (.001…) until the first missing one.
+        var ups = std.ArrayList([]const u8).empty;
+        defer {
+            for (ups.items) |ub| c.gpa.free(ub);
+            ups.deinit(c.gpa);
+        }
+        const stem = bpath[0 .. bpath.len - 4];
+        var u: u32 = 1;
+        while (u <= 999) : (u += 1) {
+            const upn = std.fmt.allocPrint(c.gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
+            defer c.gpa.free(upn);
+            const ub = c.dir.readFileAlloc(c.io, upn, c.gpa, .unlimited) catch break;
+            ups.append(c.gpa, ub) catch {
+                c.gpa.free(ub);
+                break;
+            };
+        }
+        _ = g_parses.fetchAdd(1, .monotonic); // count parses (re-parse diagnostics)
+        var cell = engine.s57.parseCellWithUpdates(c.gpa, base, ups.items) catch return;
+        const b = cell.bounds() orelse {
+            cell.deinit();
+            return;
+        };
+        var geo: ?engine.s57_mvt.GeoParts = null;
+        var geo_world: ?engine.s57_mvt.GeoWorld = null;
+        var geo_arena: ?*std.heap.ArenaAllocator = null;
+        var feat_bbox: []const ?[4]f64 = &.{};
+        if (c.gpa.create(std.heap.ArenaAllocator)) |ga| {
+            ga.* = std.heap.ArenaAllocator.init(c.gpa);
+            // Assemble line/area geometry once + its world coords, so every tile
+            // reprojects cheaply (no per-point tan/log) — the bake's biggest cost.
+            if (engine.s57_mvt.buildGeoCache(ga.allocator(), &cell)) |g| {
+                geo = g;
+                geo_world = engine.s57_mvt.buildGeoWorld(ga.allocator(), g) catch null;
+            } else |_| {}
+            feat_bbox = engine.s57_mvt.buildFeatBBox(ga.allocator(), &cell, geo) catch &.{};
+            geo_arena = ga;
+        } else |_| {}
+        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_world = geo_world, .geo_arena = geo_arena, .feat_bbox = feat_bbox };
+
+        // Label-point cache: built from the (reused or fresh) portrayal — only features
+        // whose base stream draws a Text/centred-symbol consult labelPoint, so cache just
+        // those (see s57_mvt.buildLabelCache). Set on the STORED cell so the per-tile emit
+        // reuses it instead of re-running the dominant polylabel search every tile.
+        if (c.portray[ci]) |pc| { // already portrayed — reuse it (the speed win)
+            if (c.geom[ci]) |*g| if (g.geo_arena) |ga| {
+                g.cell.label_cache = engine.s57_mvt.buildLabelCache(ga.allocator(), &g.cell, g.geo, pc.base) catch null;
+            };
+            return;
+        }
+        const sticky = c.gpa.create(std.heap.ArenaAllocator) catch return;
+        sticky.* = std.heap.ArenaAllocator.init(c.gpa);
+        const sa = sticky.allocator();
+        var tmp = std.heap.ArenaAllocator.init(c.gpa);
+        defer tmp.deinit();
+        if (engine.portray.portrayCellVariants(tmp.allocator(), &cell, c.rules_dir)) |cp| {
+            c.portray[ci] = .{
+                .arena = sticky,
+                .base = copyStreams(sa, cp.base) catch null,
+                .plain = if (cp.plain) |p| (copyStreams(sa, p) catch null) else null,
+                .simplified = if (cp.simplified) |p| (copyStreams(sa, p) catch null) else null,
+                .bounds = b,
+            };
+        } else |_| {
+            // Portrayal failed: a resident entry with no streams (classify() fallback);
+            // marks the cell portrayed so it isn't retried.
+            c.portray[ci] = .{ .arena = sticky, .base = null, .plain = null, .simplified = null, .bounds = b };
+        }
+        if (c.geom[ci]) |*g| if (g.geo_arena) |ga| {
+            g.cell.label_cache = engine.s57_mvt.buildLabelCache(ga.allocator(), &g.cell, g.geo, c.portray[ci].?.base) catch null;
+        };
+    }
+};
+
+// A whole-ENC_ROOT bake result: the union bbox of the cells, their stems (for the
+// bundle manifest), the distinct sounding glyph stacks collected while baking (for
+// sprite-mln), and the distinct SCAMIN denominators (for the client bucket manifest).
+// The archive itself is streamed straight to `out_path`.
+const RootBake = struct { bounds: [4]f64, cells: []const []const u8, sounds: []const []const u8, scamin: []const u32 = &.{} };
+
+// Per-tile sink for the streaming bake: feed each tile into the PMTiles
+// StreamWriter (gzip+dedup, no raw-tile retention) and, in the same pass, collect
+// its soundings-layer glyph stacks (so sprite-mln gets composites without a
+// re-read). A per-tile scratch arena keeps the MVT decode from accumulating.
+const BakeSink = struct {
+    sw: *engine.pmtiles.StreamWriter,
+    sounds: *std.StringHashMap(void),
+    scamin: *std.AutoHashMap(u32, void), // distinct SCAMIN denominators -> archive manifest
+    a: std.mem.Allocator, // persistent (sound-stack strings; returned to caller)
+    gpa: std.mem.Allocator, // scratch backing
+    collect_sounds: bool, // bundle wants sprite-mln sounding composites; plain bake doesn't
+
+    // `comp` is the already-gzipped tile (compressed in the gen worker), so the
+    // serial path here is just dedup + write — fast. Sounding-stack + SCAMIN-manifest
+    // collection (only for the bundle) gunzips + decodes; plain bake-root skips it.
+    fn run(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
+        const self: *BakeSink = @ptrCast(@alignCast(ctx.?));
+        if (self.collect_sounds) collect: {
+            var scratch = std.heap.ArenaAllocator.init(self.gpa);
+            defer scratch.deinit();
+            const mvt = engine.gzip.decompress(scratch.allocator(), comp) catch break :collect;
+            const layers = engine.mvt.decode(scratch.allocator(), mvt) catch break :collect;
+            for (layers) |L| {
+                const is_snd = std.mem.eql(u8, L.name, "soundings");
+                for (L.features) |feat| for (feat.properties) |p| {
+                    // Distinct SCAMIN denominators across EVERY layer -> the client's
+                    // per-SCAMIN bucket manifest (host-canonical-backend.md §2).
+                    if (std.mem.eql(u8, p.key, "scamin")) {
+                        switch (p.value) {
+                            .int => |iv| if (iv > 0) self.scamin.put(@intCast(iv), {}) catch {},
+                            else => {},
+                        }
+                        continue;
+                    }
+                    // Soundings glyph stacks for the sprite-mln composite atlas.
+                    if (!is_snd) continue;
+                    if (!std.mem.eql(u8, p.key, "sym_s") and !std.mem.eql(u8, p.key, "sym_g") and !std.mem.eql(u8, p.key, "symbol_names")) continue;
+                    switch (p.value) {
+                        .string => |sv| if (std.mem.indexOfScalar(u8, sv, ',') != null and !self.sounds.contains(sv)) {
+                            self.sounds.put(self.a.dupe(u8, sv) catch return, {}) catch {};
+                        },
+                        else => {},
+                    }
+                };
+            }
+        }
+        try self.sw.addCompressed(z, x, y, comp);
+    }
+};
+
+// NOAA cell naming: a US ENC's 3rd char is its navigational-purpose digit
+// (1=overview … 6=berthing), so the catalogue fast-path can band a cell from its
+// name without parsing its CSCL header. Null for non-conforming names.
+fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
+    if (stem.len < 3 or (stem[0] != 'U' and stem[0] != 'u')) return null;
+    return switch (stem[2]) {
+        '6' => .berthing,
+        '5' => .harbor,
+        '4' => .approach,
+        '3' => .coastal,
+        '2' => .general,
+        '1' => .overview,
+        else => null,
+    };
+}
+
+// Bake an ENC_ROOT directory (or a single cell.000) into one band-streamed PMTiles
+// archive written straight to `out_path` (the data section streams through a
+// StreamWriter — only the compressed data + small directory are held, not the raw
+// tiles). Returns the union bounds + cell stems + sounding stacks + SCAMIN denoms.
+// error.NoGeometry if no cell parses.
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat) !RootBake {
+    // smp_allocator (Zig's fast thread-safe general-purpose allocator), not
+    // page_allocator: the bake makes many small, short-lived allocations across
+    // worker threads (per-tile gzip results, cell reads, index lists). page_allocator
+    // rounds every allocation up to a page and mmaps it, churning page faults;
+    // smp_allocator pools and reuses freed blocks.
+    const gpa = std.heap.smp_allocator;
+    // Input may be a whole ENC_ROOT directory OR a single cell `.000` file; either
+    // way the lazy super-tile bake below streams to disk through the SAME path. For
+    // a single file the "dir" is its parent (the worker reads the cell + its `.001…`
+    // updates from there) and pass 1 is just that one cell.
+    const single_file = !isDir(io, root_path);
+    const dir_path = if (single_file) (std.fs.path.dirname(root_path) orelse ".") else root_path;
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    // Pass 1: learn each cell's band + bbox. Fast path: an exchange-set catalogue
+    // (CATALOG.031) gives every cell's coverage bbox in ONE file — band each from
+    // its NOAA name digit, no per-cell parse (matches the Go reference). Fallback
+    // (no catalogue): walk the dir and cheaply peek each cell (bbox + CSCL).
+    const Bands = engine.bake_enc;
+    var band_cells: [Bands.bands_fine_to_coarse.len]std.ArrayList(CellEntry) = undefined;
+    for (&band_cells) |*bc| bc.* = std.ArrayList(CellEntry).empty;
+    var cell_names = std.ArrayList([]const u8).empty;
+    var ubox: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }; // [w,s,e,n]
+    var total_cells: usize = 0;
+
+    const via_catalog = if (single_file) sf: {
+        // Single cell: one entry, band + bbox from a cheap peek (no dir scan).
+        const base = std.fs.path.basename(root_path);
+        const bytes = dir.readFileAlloc(io, base, gpa, .unlimited) catch return error.NoGeometry;
+        defer gpa.free(bytes);
+        const m = engine.s57.peekMeta(gpa, bytes) orelse return error.NoGeometry;
+        const bb = m.bounds orelse return error.NoGeometry;
+        ubox = bb;
+        total_cells = 1;
+        try cell_names.append(a, try a.dupe(u8, std.fs.path.stem(base)));
+        try band_cells[@intFromEnum(Bands.bandOf(m.cscl))].append(a, .{ .path = try a.dupe(u8, base), .bbox = bb });
+        break :sf false;
+    } else cat: {
+        const cbytes = dir.readFileAlloc(io, "CATALOG.031", gpa, .unlimited) catch break :cat false;
+        defer gpa.free(cbytes);
+        const entries = engine.s57.parseCatalog(a, cbytes) orelse break :cat false;
+        var n_cells: usize = 0;
+        for (entries) |e| {
+            if (!e.is_cell) continue;
+            n_cells += 1;
+            try cell_names.append(a, e.stem);
+            total_cells += 1;
+            const bb = e.bbox orelse continue;
+            ubox[0] = @min(ubox[0], bb[0]);
+            ubox[1] = @min(ubox[1], bb[1]);
+            ubox[2] = @max(ubox[2], bb[2]);
+            ubox[3] = @max(ubox[3], bb[3]);
+            // Band from the name; for the rare non-NOAA name, peek that one cell.
+            const band = bandFromStem(e.stem) orelse fb: {
+                const cb = dir.readFileAlloc(io, e.path, gpa, .unlimited) catch break :fb Bands.bandOf(0);
+                defer gpa.free(cb);
+                const m = engine.s57.peekMeta(gpa, cb);
+                break :fb Bands.bandOf(if (m) |mm| mm.cscl else 0);
+            };
+            try band_cells[@intFromEnum(band)].append(a, .{ .path = e.path, .bbox = bb });
+        }
+        break :cat n_cells > 0;
+    };
+
+    if (!single_file and !via_catalog) {
+        var walker = try dir.walk(a);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
+            const path = try a.dupe(u8, entry.path);
+            const bytes = dir.readFileAlloc(io, path, gpa, .unlimited) catch continue;
+            const meta = engine.s57.peekMeta(gpa, bytes);
+            gpa.free(bytes);
+            try cell_names.append(a, try a.dupe(u8, std.fs.path.stem(std.fs.path.basename(path))));
+            total_cells += 1;
+            // A cell with no peek-bbox has no geometry to bake — skip it (it would
+            // produce no tiles). The peek bbox is a superset of the parsed bounds,
+            // so a cell is assigned to every super-tile its real geometry touches.
+            const m = meta orelse continue;
+            const bb = m.bounds orelse continue;
+            ubox[0] = @min(ubox[0], bb[0]);
+            ubox[1] = @min(ubox[1], bb[1]);
+            ubox[2] = @max(ubox[2], bb[2]);
+            ubox[3] = @max(ubox[3], bb[3]);
+            try band_cells[@intFromEnum(Bands.bandOf(m.cscl))].append(a, .{ .path = path, .bbox = bb });
+        }
+    }
+    if (total_cells == 0) return error.NoGeometry;
+    std.debug.print("baking {d} cells from {s} ({s}, rules: {s})\n", .{ total_cells, root_path, if (via_catalog) "via CATALOG.031" else "scanned", if (rules_dir.len == 0) "embedded" else rules_dir });
+
+    engine.catalogue.warmUp(); // warm the shared catalogue before parallel portrayal
+    registerLinestyles(gpa, embeddedLinestyles(a) catch &.{}); // complex-line tessellation table
+    engine.portray.setQuiet(true); // many threads -> suppress the per-cell stderr
+
+    // Stream the gzipped tiles straight to a temp data file (concatenated into
+    // out_path at the end) so the whole compressed archive never lives in RAM —
+    // only the directory + dedup map do. Peak memory is then one band's cells.
+    const data_tmp = try std.fmt.allocPrint(a, "{s}.data.tmp", .{out_path});
+    var data_file = try std.Io.Dir.cwd().createFile(io, data_tmp, .{ .read = true });
+    errdefer {
+        data_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
+    }
+    var sw = engine.pmtiles.StreamWriter.initFile(gpa, io, data_file);
+    defer sw.deinit();
+    var sounds = std.StringHashMap(void).init(a);
+    var scamin = std.AutoHashMap(u32, void).init(gpa);
+    defer scamin.deinit();
+    // Sounding-stack + SCAMIN-manifest collection decodes each tile as MVT, so it only
+    // applies to the MVT output; for MLT the sprite-mln sounding composites are skipped (TODO).
+    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .scamin = &scamin, .a = a, .gpa = gpa, .collect_sounds = collect_sounds and format == .mvt };
+    var baker = Bands.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
+    baker.format = format;
+    defer baker.deinit();
+
+    // Pass 2: bake each band finest → coarsest (best-band dedup via baker.emitted).
+    // Within a band, walk spatial "super-tiles" (one tile at zoom zs = zlo - SUPER_DZ):
+    // load ONLY the cells overlapping each super-tile (parse + portray in parallel),
+    // generate that super-tile's tiles (clipped, parallel), and keep parsed cells in
+    // a small LRU so neighbouring super-tiles reuse them (cells span a few super-tiles
+    // and are parsed once). Peak memory is the busiest super-tile's cells + the LRU
+    // budget — not the whole band. Coarse bands have few (huge) cells and a tiny grid,
+    // so they fall back to loading them together.
+    std.debug.print("  (lazy bake: lru={d} cells, super-dz={d})\n", .{ lru_budget, super_dz });
+    g_bake_start = nowSec();
+    var done_cells: usize = 0;
+    for (Bands.bands_fine_to_coarse) |band| {
+        const entries = band_cells[@intFromEnum(band)].items;
+        if (entries.len == 0) continue;
+        const parses0 = g_parses.load(.monotonic);
+        const band_start = nowSec();
+
+        const zr = Bands.bandZooms(band);
+        const zlo = @max(minzoom, zr.min);
+        const zhi = @min(maxzoom, zr.max);
+        if (zlo > zhi) {
+            done_cells += entries.len;
+            continue;
+        }
+        const zs: u8 = if (zlo >= super_dz) zlo - super_dz else 0;
+
+        // Inverted index: super-tile (sx,sy at zs) → the cell indices overlapping it.
+        var stmap = std.AutoHashMap(u64, std.ArrayList(u32)).init(gpa);
+        defer {
+            var vit = stmap.valueIterator();
+            while (vit.next()) |v| v.deinit(gpa);
+            stmap.deinit();
+        }
+        for (entries, 0..) |e, i| {
+            const nw = lonLatToTile(e.bbox[0], e.bbox[3], zs);
+            const se = lonLatToTile(e.bbox[2], e.bbox[1], zs);
+            var sy = nw[1];
+            while (sy <= se[1]) : (sy += 1) {
+                var sx = nw[0];
+                while (sx <= se[0]) : (sx += 1) {
+                    const k = (@as(u64, sy) << 32) | sx; // row-major (spatial locality)
+                    const gop = try stmap.getOrPut(k);
+                    if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                    try gop.value_ptr.append(gpa, @intCast(i));
+                }
+            }
+        }
+        const stkeys = try gpa.alloc(u64, stmap.count());
+        defer gpa.free(stkeys);
+        {
+            var kit = stmap.keyIterator();
+            var j: usize = 0;
+            while (kit.next()) |kp| : (j += 1) stkeys[j] = kp.*;
+        }
+        std.mem.sort(u64, stkeys, {}, struct {
+            fn lt(_: void, x: u64, y: u64) bool {
+                return x < y;
+            }
+        }.lt);
+        g_prog.band = @tagName(band);
+        g_prog.st = 0;
+        g_prog.st_total = stkeys.len;
+        std.debug.print("\n  band {s}: {d} cells, {d} super-tiles (z{d}-{d}) — baking…\n", .{ @tagName(band), entries.len, stkeys.len, zlo, zhi });
+
+        // Per-band caches (index-aligned with `entries`): portrayal is RESIDENT
+        // (computed once — the expensive Lua step — and cheap to keep); geometry is
+        // the heavy part, held in an LRU and re-parsed (NOT re-portrayed) on demand.
+        const portray = try gpa.alloc(?CellPortray, entries.len);
+        defer gpa.free(portray);
+        @memset(portray, null);
+        const geom = try gpa.alloc(?CellGeom, entries.len);
+        defer gpa.free(geom);
+        @memset(geom, null);
+        const used = try gpa.alloc(u64, entries.len); // LRU tick per cell (geometry)
+        defer gpa.free(used);
+        @memset(used, 0);
+        const gave_up = try gpa.alloc(bool, entries.len); // parse failed: don't retry
+        defer gpa.free(gave_up);
+        @memset(gave_up, false);
+        var n_geom: usize = 0; // loaded-geometry count (the LRU target)
+        var tick: u64 = 0;
+
+        for (stkeys, 0..) |stk, st_i| {
+            g_prog.st = st_i + 1;
+            const cells = stmap.get(stk).?.items;
+            const sx: u32 = @intCast(stk & 0xFFFFFFFF);
+            const sy: u32 = @intCast(stk >> 32);
+
+            // (Re)load this super-tile's cells whose geometry isn't resident — each
+            // worker reads its own cell's bytes + parses (+ portrays once) in
+            // parallel, so cold reads aren't serialised. A cell already portrayed is
+            // only re-parsed, never re-portrayed.
+            var miss = std.ArrayList(u32).empty;
+            defer miss.deinit(gpa);
+            for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(gpa, ci) catch {};
+            if (miss.items.len > 0) {
+                var lw = LoadWork{ .cells = miss.items, .entries = entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = gpa };
+                Bands.parallelFor(gpa, miss.items.len, &lw, LoadWork.run);
+                for (miss.items) |ci| {
+                    if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
+                }
+            }
+            tick += 1;
+            for (cells) |ci| used[ci] = tick;
+
+            // Generate this super-tile's tiles from its loaded cells (clipped, parallel):
+            // pair each cell's geometry with its resident portrayal.
+            var subset = std.ArrayList(Bands.Backend).empty;
+            defer subset.deinit(gpa);
+            for (cells) |ci| if (geom[ci]) |g| {
+                const p = portray[ci];
+                subset.append(gpa, .{
+                    .cell = g.cell,
+                    .portrayal = if (p) |pp| pp.base else null,
+                    .portrayal_plain = if (p) |pp| pp.plain else null,
+                    .portrayal_simplified = if (p) |pp| pp.simplified else null,
+                    .geo = g.geo,
+                    .geo_world = g.geo_world,
+                    .feat_bbox = g.feat_bbox,
+                    .bounds = if (p) |pp| pp.bounds else entries[ci].bbox,
+                }) catch {};
+            };
+            baker.bakeBand(band, subset.items, .{ .zs = zs, .sx = sx, .sy = sy }, cliProgress, null) catch {};
+
+            // Evict least-recently-used GEOMETRY beyond the budget (never this
+            // super-tile's, which carry the current tick). Portrayal stays resident.
+            while (n_geom > lru_budget) {
+                var victim: ?usize = null;
+                var best: u64 = std.math.maxInt(u64);
+                for (geom, 0..) |g, ci| {
+                    if (g != null and used[ci] < best) {
+                        best = used[ci];
+                        victim = ci;
+                    }
+                }
+                const v = victim orelse break;
+                if (used[v] == tick) break; // only the current super-tile's cells remain
+                if (geom[v]) |*g| {
+                    g.cell.deinit();
+                    if (g.geo_arena) |p| {
+                        p.deinit();
+                        gpa.destroy(p);
+                    }
+                }
+                geom[v] = null;
+                n_geom -= 1;
+            }
+        }
+
+        // Free remaining geometry + all resident portrayal at the end of the band.
+        for (geom, 0..) |g, ci| if (g != null) {
+            if (geom[ci]) |*gg| {
+                gg.cell.deinit();
+                if (gg.geo_arena) |p| {
+                    p.deinit();
+                    gpa.destroy(p);
+                }
+            }
+        };
+        for (portray, 0..) |p, ci| if (p != null) {
+            portray[ci].?.arena.deinit();
+            gpa.destroy(portray[ci].?.arena);
+        };
+        const parses = g_parses.load(.monotonic) - parses0;
+        const band_secs = nowSec() - band_start;
+        std.debug.print(
+            "\r  band {s} done: {d} cells, {d} super-tiles, {d} tiles total, {d} parses ({d:.2}x), {d}s\n",
+            .{ @tagName(band), entries.len, stkeys.len, baker.count, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(entries.len, 1))), band_secs },
+        );
+        done_cells += entries.len;
+        cliProgress(null, 0, done_cells, total_cells);
+    }
+
+    // Assemble out_path = prefix (header + directory + metadata) ++ the data
+    // section streamed to data_tmp. The prefix is small; the data is copied in
+    // bounded chunks (positional reads, no whole-archive buffer), then the temp
+    // file is removed.
+    // PMTiles metadata: vector_layers (TileJSON) + the distinct SCAMIN denominators
+    // (when collected) so the client builds its per-SCAMIN bucket layers at load.
+    var scamin_vals = std.ArrayList(u32).empty; // returned in RootBake (lives in `a`)
+    {
+        var it = scamin.keyIterator();
+        while (it.next()) |k| try scamin_vals.append(a, k.*);
+        std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
+    }
+    const meta = try engine.s57_mvt.metadataJson(a, scamin_vals.items);
+    const opts = engine.pmtiles.WriteOptions{
+        .metadata_json = meta,
+        .min_lon_e7 = toE7(ubox[0]),
+        .min_lat_e7 = toE7(ubox[1]),
+        .max_lon_e7 = toE7(ubox[2]),
+        .max_lat_e7 = toE7(ubox[3]),
+        .tile_type = if (format == .mlt) .mlt else .mvt,
+    };
+    const pre = try sw.prefix(a, opts);
+    var file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    try file.writeStreamingAll(io, pre);
+    {
+        const chunk = try a.alloc(u8, 1 << 20); // 1 MiB
+        defer a.free(chunk);
+        var pos: u64 = 0;
+        while (pos < sw.data_len) {
+            const want: usize = @intCast(@min(@as(u64, chunk.len), sw.data_len - pos));
+            _ = try data_file.readPositionalAll(io, chunk[0..want], pos);
+            try file.writeStreamingAll(io, chunk[0..want]);
+            pos += want;
+        }
+    }
+    file.close(io);
+    data_file.close(io);
+    std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
+
+    var stacks = std.ArrayList([]const u8).empty;
+    var it = sounds.keyIterator();
+    while (it.next()) |k| try stacks.append(a, k.*);
+    return .{ .bounds = ubox, .cells = cell_names.items, .sounds = stacks.items, .scamin = scamin_vals.items };
+}
+
+/// lon/lat (deg) -> web-mercator tile (x, y) at zoom z, clamped to the valid range.
+fn lonLatToTile(lon: f64, lat: f64, z: u8) [2]u32 {
+    const w = engine.tile.lonLatToWorld(lon, lat); // normalised [0,1], y down
+    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+    const max_idx: f64 = scale - 1.0;
+    const fx = std.math.clamp(@floor(w[0] * scale), 0.0, max_idx);
+    const fy = std.math.clamp(@floor(w[1] * scale), 0.0, max_idx);
+    return .{ @intFromFloat(fx), @intFromFloat(fy) };
+}
+
+/// Degrees -> PMTiles E7 fixed-point.
+fn toE7(v: f64) i32 {
+    return @intFromFloat(@round(v * 1e7));
+}
