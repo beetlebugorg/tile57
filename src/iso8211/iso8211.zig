@@ -82,8 +82,15 @@ pub const Record = struct {
     fields: []Field,
 
     pub fn field(self: Record, tag: []const u8) ?[]const u8 {
-        for (self.fields) |f| if (std.mem.eql(u8, f.tag, tag)) return f.data;
-        return null;
+        // Last match wins, matching the oracle's extractFields map (directory.go:101,
+        // `fields[entry.Tag] = …` — a later directory entry with the same tag overwrites
+        // the earlier one). Was first-wins; identical on valid S-57 (one field per tag
+        // per record), so this only differs on a record with a duplicate tag.
+        var result: ?[]const u8 = null;
+        for (self.fields) |f| if (std.mem.eql(u8, f.tag, tag)) {
+            result = f.data;
+        };
+        return result;
     }
 };
 
