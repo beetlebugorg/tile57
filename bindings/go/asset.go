@@ -35,7 +35,7 @@ func ColortablesDefault() ([]byte, error) {
 // Colortables renders colortables.json from a ColorProfiles colorProfile.xml.
 func Colortables(xml []byte) ([]byte, error) {
 	if len(xml) == 0 {
-		return nil, fmt.Errorf("tile57: empty colorProfile xml")
+		return nil, fmt.Errorf("tile57: empty colorProfile xml: %w", ErrEmptyInput)
 	}
 	var out *C.uint8_t
 	var n C.size_t
@@ -49,7 +49,7 @@ func Colortables(xml []byte) ([]byte, error) {
 // S-101 LineStyles (each NamedBytes.ID is the XML file stem).
 func Linestyles(lineStyles []NamedBytes) ([]byte, error) {
 	if len(lineStyles) == 0 {
-		return nil, fmt.Errorf("tile57: no line styles")
+		return nil, fmt.Errorf("tile57: no line styles: %w", ErrEmptyInput)
 	}
 	arena := &cArena{}
 	defer arena.free()
@@ -67,7 +67,7 @@ func Linestyles(lineStyles []NamedBytes) ([]byte, error) {
 // the atlas PNG.
 func SpriteAtlas(svgs []NamedBytes, css []byte) (spriteJSON, spritePNG []byte, err error) {
 	if len(svgs) == 0 {
-		return nil, nil, fmt.Errorf("tile57: no symbols")
+		return nil, nil, fmt.Errorf("tile57: no symbols: %w", ErrEmptyInput)
 	}
 	arena := &cArena{}
 	defer arena.free()
@@ -85,7 +85,7 @@ func SpriteAtlas(svgs []NamedBytes, css []byte) (spriteJSON, spritePNG []byte, e
 // symbols are the Symbols (SVG) the fills reference. Returns patterns.json + PNG.
 func PatternAtlas(fills, symbols []NamedBytes, css []byte) (patternsJSON, patternsPNG []byte, err error) {
 	if len(fills) == 0 {
-		return nil, nil, fmt.Errorf("tile57: no area fills")
+		return nil, nil, fmt.Errorf("tile57: no area fills: %w", ErrEmptyInput)
 	}
 	arena := &cArena{}
 	defer arena.free()

@@ -46,9 +46,9 @@ import (
 // clamp — the ABI treats 0/24 as unclamped, and 0 max means "no cap"). progress,
 // if non-nil, is called with a [BakeProgress] per update: stage 0 = loading/
 // portraying cells, stage 1 = baking tiles (per-band done/total + band label).
-func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, omitPickAttrs bool, progress func(BakeProgress)) ([]byte, error) {
+func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, pick PickAttrs, progress func(BakeProgress)) ([]byte, error) {
 	if len(cells) == 0 {
-		return nil, fmt.Errorf("tile57: no cells to bake")
+		return nil, fmt.Errorf("tile57: no cells to bake: %w", ErrEmptyInput)
 	}
 	cRules, freeRules := cStringOrNil(rulesDir)
 	defer freeRules()
@@ -67,12 +67,12 @@ func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, omitP
 	var out *C.uint8_t
 	var outLen C.size_t
 	rc := C.tile57_bake_cells_cb(base, C.size_t(len(cells)), cRules,
-		C.uint8_t(minZoom), C.uint8_t(maxZoom), cOmit(omitPickAttrs), user, &out, &outLen)
+		C.uint8_t(minZoom), C.uint8_t(maxZoom), cPick(pick), user, &out, &outLen)
 	switch rc {
 	case 1:
 		return tileBytes(out, outLen), nil
 	case 0:
-		return nil, fmt.Errorf("tile57: bake produced no tiles (nothing covered)")
+		return nil, fmt.Errorf("tile57: bake produced no tiles: %w", ErrNoCoverage)
 	default:
 		return nil, fmt.Errorf("tile57: bake failed")
 	}
@@ -97,9 +97,9 @@ func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, omitP
 // a per-band percentage. BandIndex/BandCount/BandName give the band label
 // ("approach", band 3/6). The planned total slightly over-counts the emitted tiles
 // (empty tiles are skipped), matching the Go baker's planned bar.
-func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, maxZoom uint8, omitPickAttrs bool, progress func(BakeProgress)) (cellCount int, bbox [4]float64, err error) {
+func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, maxZoom uint8, pick PickAttrs, progress func(BakeProgress)) (cellCount int, bbox [4]float64, err error) {
 	if input == "" || outDir == "" {
-		return 0, bbox, fmt.Errorf("tile57: BakeBundle needs input and out dir")
+		return 0, bbox, fmt.Errorf("tile57: BakeBundle needs input and out dir: %w", ErrEmptyInput)
 	}
 	cIn := C.CString(input)
 	defer C.free(unsafe.Pointer(cIn))
@@ -122,12 +122,12 @@ func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, ma
 	var cells C.uint32_t
 	var bb [4]C.double
 	rc := C.tile57_bake_bundle_cb(cIn, cOut, cRules, cCat, cCreated,
-		C.uint8_t(minZoom), C.uint8_t(maxZoom), cOmit(omitPickAttrs), user, &cells, &bb[0])
+		C.uint8_t(minZoom), C.uint8_t(maxZoom), cPick(pick), user, &cells, &bb[0])
 	switch rc {
 	case 1:
 		return int(cells), [4]float64{float64(bb[0]), float64(bb[1]), float64(bb[2]), float64(bb[3])}, nil
 	case 0:
-		return 0, bbox, fmt.Errorf("tile57: bundle bake covered nothing")
+		return 0, bbox, fmt.Errorf("tile57: bundle bake covered nothing: %w", ErrNoCoverage)
 	default:
 		return 0, bbox, fmt.Errorf("tile57: bundle bake failed")
 	}

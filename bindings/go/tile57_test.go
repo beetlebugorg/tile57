@@ -39,10 +39,10 @@ func TestCellInputName(t *testing.T) {
 
 	// badgePresent opens the cell (optionally omitting pick attrs) and reports
 	// whether the cell badge appears in any tile across the cell's zoom range.
-	badgePresent := func(omit bool) bool {
-		src, err := OpenCells([]CellInput{{Base: data, Name: badge}}, "", omit)
+	badgePresent := func(pick PickAttrs) bool {
+		src, err := OpenCells([]CellInput{{Base: data, Name: badge}}, "", pick)
 		if err != nil {
-			t.Fatalf("OpenCells(omit=%v): %v", omit, err)
+			t.Fatalf("OpenCells(pick=%v): %v", pick, err)
 		}
 		defer src.Close()
 		w, s, e, n, _ := src.Bounds()
@@ -60,11 +60,11 @@ func TestCellInputName(t *testing.T) {
 		return false
 	}
 
-	if !badgePresent(false) {
-		t.Fatal("cell badge absent with pick attrs ON — CellInput.Name not emitted as the `cell` prop")
+	if !badgePresent(PickInclude) {
+		t.Fatal("cell badge absent with PickInclude — CellInput.Name not emitted as the `cell` prop")
 	}
-	if badgePresent(true) {
-		t.Fatal("cell badge present with omitPickAttrs=true — the opt-out flag did not drop pick attrs")
+	if badgePresent(PickOmit) {
+		t.Fatal("cell badge present with PickOmit — the opt-out did not drop pick attrs")
 	}
 }
 
@@ -73,7 +73,7 @@ func TestOpenCellAndTile(t *testing.T) {
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	src, err := OpenCells([]CellInput{{Base: data}}, "", false)
+	src, err := OpenCells([]CellInput{{Base: data}}, "", PickInclude)
 	if err != nil {
 		t.Fatalf("OpenCells: %v", err)
 	}

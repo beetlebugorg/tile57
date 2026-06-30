@@ -106,7 +106,7 @@ func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, m
 // emits; nil/empty leaves them ungated. scaminLat is the source's center latitude.
 func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
 	if len(template) == 0 {
-		return nil, fmt.Errorf("tile57: empty style template")
+		return nil, fmt.Errorf("tile57: empty style template: %w", ErrEmptyInput)
 	}
 	cm := m.toC()
 	tmplPtr, tmplLen := charPtr(template)

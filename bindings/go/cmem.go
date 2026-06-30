@@ -46,10 +46,10 @@ func (a *cArena) str(s string) *C.char {
 	return (*C.char)(a.track(unsafe.Pointer(C.CString(s))))
 }
 
-// cOmit maps the Go "omit pick attributes" bool to the C omit_pick_attrs int:
-// 0 = include the per-feature pick attrs (default), non-zero = omit them.
-func cOmit(omit bool) C.int {
-	if omit {
+// cPick maps the Go PickAttrs enum to the C omit_pick_attrs int: 0 = include the
+// per-feature pick attrs (PickInclude, the default), 1 = omit them (PickOmit).
+func cPick(p PickAttrs) C.int {
+	if p == PickOmit {
 		return 1
 	}
 	return 0

@@ -39,6 +39,19 @@ const (
 	FormatS57Cell Format = C.TILE57_FORMAT_S57_CELL // a raw S-57 ENC cell
 )
 
+// PickAttrs selects whether baked/opened tiles carry the per-feature pick-report
+// properties (class / cell / s57) used for a cursor-pick report. The zero value
+// includes them — the common path — so PickInclude can be left unspoken.
+type PickAttrs int
+
+const (
+	// PickInclude (zero value) keeps the per-feature pick-report attrs — what a host
+	// serving a live, clickable chart wants.
+	PickInclude PickAttrs = iota
+	// PickOmit drops them for a leaner bake (smaller tiles, no cursor-pick report).
+	PickOmit
+)
+
 // Version returns the libtile57 version string (e.g. "0.1.0").
 func Version() string { return C.GoString(C.tile57_version()) }
 
@@ -81,7 +94,7 @@ type CellInput struct {
 // for S-57 cells); "" selects the built-in default. The bytes are copied.
 func OpenBytes(data []byte, format Format, rulesDir string) (*Source, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("tile57: empty source bytes")
+		return nil, fmt.Errorf("tile57: empty source bytes: %w", ErrEmptyInput)
 	}
 	cRules, freeRules := cStringOrNil(rulesDir)
 	defer freeRules()
@@ -96,12 +109,12 @@ func OpenBytes(data []byte, format Format, rulesDir string) (*Source, error) {
 
 // OpenCells opens an ENC_ROOT as a multi-cell source: every cell is overlaid when
 // a tile is generated, so a region spanning several cells renders them all. All
-// bytes are copied. rulesDir is as in [OpenBytes]. omitPickAttrs drops the
-// per-feature pick-report properties (class/cell/s57) when true; pass false to keep
-// them (the default — a working cursor-pick report).
-func OpenCells(cells []CellInput, rulesDir string, omitPickAttrs bool) (*Source, error) {
+// bytes are copied. rulesDir is as in [OpenBytes]. pick selects the per-feature
+// pick-report properties (class/cell/s57): [PickInclude] (the zero value) keeps them
+// for a cursor-pick report, [PickOmit] drops them for a leaner source.
+func OpenCells(cells []CellInput, rulesDir string, pick PickAttrs) (*Source, error) {
 	if len(cells) == 0 {
-		return nil, fmt.Errorf("tile57: no cells")
+		return nil, fmt.Errorf("tile57: no cells: %w", ErrEmptyInput)
 	}
 	cRules, freeRules := cStringOrNil(rulesDir)
 	defer freeRules()
@@ -112,7 +125,7 @@ func OpenCells(cells []CellInput, rulesDir string, omitPickAttrs bool) (*Source,
 	arena := &cArena{}
 	defer arena.free()
 	inputs, base := arena.cellInputs(cells)
-	ptr := C.tile57_source_open_cells(base, C.size_t(len(inputs)), cRules, cOmit(omitPickAttrs))
+	ptr := C.tile57_source_open_cells(base, C.size_t(len(inputs)), cRules, cPick(pick))
 	if ptr == nil {
 		return nil, fmt.Errorf("tile57: failed to open %d cell(s)", len(cells))
 	}
@@ -125,7 +138,7 @@ func (s *Source) Tile(z uint8, x, y uint32) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ptr == nil {
-		return nil, fmt.Errorf("tile57: source closed")
+		return nil, ErrSourceClosed
 	}
 	var out *C.uint8_t
 	var outLen C.size_t
@@ -136,7 +149,7 @@ func (s *Source) Tile(z uint8, x, y uint32) ([]byte, error) {
 	case C.TILE57_TILE_EMPTY:
 		return nil, nil
 	default:
-		return nil, fmt.Errorf("tile57: tile %d/%d/%d generation error", z, x, y)
+		return nil, fmt.Errorf("tile57: tile %d/%d/%d generation error (status %d)", z, x, y, int(st))
 	}
 }
 
