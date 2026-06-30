@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const pmtiles = @import("pmtiles");
+const gzip = @import("gzip");
 const s57 = @import("s57");
 const s57_mvt = @import("s57_mvt");
 const portray = @import("portray");
@@ -665,7 +666,110 @@ pub const Source = struct {
         while (it.next()) |v| gpa.free(v.*);
         self.cache.clearRetainingCapacity();
     }
+
+    /// The distinct SCAMIN denominators present in the source, ascending. The host
+    /// publishes these as the live SCAMIN manifest so its style builds one native
+    /// per-value bucket layer per denominator (host-canonical-backend.md §2). A baked
+    /// (PMTiles) source reads them from the archive metadata; a cell / ENC_ROOT source
+    /// scans every cell's features (parsed without portrayal — SCAMIN is a plain S-57
+    /// attribute), reading streamed cells transiently. Returns a gpa-owned slice; free
+    /// the bytes with `freeBytes` (cast: `@ptrCast(vals.ptr)[0 .. vals.len * 4]`).
+    pub fn scamin(self: *Source) ![]u32 {
+        var set = std.AutoHashMap(u32, void).init(gpa);
+        defer set.deinit();
+        switch (self.backend) {
+            .reader => |*r| scaminFromMetadata(r, &set),
+            .cell => |*cb| collectScaminCell(&cb.cell, &set),
+            .cells => |*ls| collectScaminCells(ls, &set),
+        }
+        const vals = try gpa.alloc(u32, set.count());
+        var i: usize = 0;
+        var it = set.keyIterator();
+        while (it.next()) |k| : (i += 1) vals[i] = k.*;
+        std.mem.sort(u32, vals, {}, std.sort.asc(u32));
+        return vals;
+    }
 };
+
+// Collect a parsed cell's distinct SCAMIN denominators into `set`.
+fn collectScaminCell(cell: *const s57.Cell, set: *std.AutoHashMap(u32, void)) void {
+    for (cell.features) |f| if (s57_mvt.featureScamin(f)) |sc| if (sc > 0) set.put(@intCast(sc), {}) catch {};
+}
+
+// Scan every cell of a lazy/streaming source for SCAMIN. Loaded cells are read
+// directly; unloaded cells are parsed throwaway (NO portrayal) — resident bytes in
+// place, streamed cells read transiently via the host reader and freed — so the LRU
+// and the loaded-cell set are left untouched.
+fn collectScaminCells(ls: *LazySource, set: *std.AutoHashMap(u32, void)) void {
+    for (ls.cells) |*lc| {
+        if (lc.cell) |*c| {
+            collectScaminCell(c, set);
+            continue;
+        }
+        if (lc.base.len > 0) {
+            var cell = s57.parseCellWithUpdates(gpa, lc.base, lc.updates) catch continue;
+            defer cell.deinit();
+            collectScaminCell(&cell, set);
+            continue;
+        }
+        // Streaming cell with no resident bytes: read them via the host reader for
+        // this scan only, then free (the normal tile path reads them again on demand).
+        const rd = ls.reader orelse continue;
+        var cb: CellBytes = .{};
+        if (!rd(ls.reader_user, lc.index, &cb)) continue;
+        defer freeCellBytes(&cb);
+        var ups: []const []const u8 = &.{};
+        var ups_arr: ?[][]const u8 = null;
+        if (cb.update_count > 0 and cb.updates != null and cb.update_lens != null) {
+            if (gpa.alloc([]const u8, cb.update_count)) |arr| {
+                for (arr, 0..) |*u, k| u.* = cb.updates.?[k][0..cb.update_lens.?[k]];
+                ups = arr;
+                ups_arr = arr;
+            } else |_| {}
+        }
+        defer if (ups_arr) |arr| gpa.free(arr);
+        var cell = s57.parseCellWithUpdates(gpa, cb.base[0..cb.base_len], ups) catch continue;
+        defer cell.deinit();
+        collectScaminCell(&cell, set);
+    }
+}
+
+// Pull the distinct SCAMIN denominators from a baked archive's metadata JSON (the
+// "scamin":[…] array that bakeArchive / the bundle bake splice in). The metadata is
+// uncompressed in this engine's archives; gunzip it if some other writer compressed it.
+fn scaminFromMetadata(r: *pmtiles.Reader, set: *std.AutoHashMap(u32, void)) void {
+    const h = r.header;
+    if (h.metadata_length == 0) return;
+    const raw = r.bytes[@intCast(h.metadata_offset)..][0..@intCast(h.metadata_length)];
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| gpa.free(o);
+    const json: []const u8 = switch (h.internal_compression) {
+        .none => raw,
+        .gzip => blk: {
+            owned = gzip.decompress(gpa, raw) catch return;
+            break :blk owned.?;
+        },
+        else => return,
+    };
+    scanScaminArray(json, set);
+}
+
+// Minimal extractor for `"scamin":[<uint>,<uint>,…]` from a metadata JSON object;
+// tolerant of whitespace. Ignores everything else (no full JSON parse needed).
+fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
+    const ki = std.mem.indexOf(u8, json, "\"scamin\"") orelse return;
+    var i = ki + "\"scamin\"".len;
+    while (i < json.len and json[i] != '[' and json[i] != '}') i += 1; // skip ` : `
+    if (i >= json.len or json[i] != '[') return;
+    i += 1;
+    while (i < json.len and json[i] != ']') {
+        while (i < json.len and (json[i] < '0' or json[i] > '9') and json[i] != ']') i += 1;
+        if (i >= json.len or json[i] == ']') break;
+        var v: u32 = 0;
+        while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) v = v *% 10 +% (json[i] - '0');
+        if (v > 0) set.put(v, {}) catch {};
+    }
+}
 
 // Multi-cell tile generation: collect overlapping cells, lazily load them, apply
 // best-band M_COVR suppression, and overlay coarse→fine.

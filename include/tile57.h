@@ -174,6 +174,16 @@ void tile57_source_zoom_range(tile57_source *src, uint8_t *min_z, uint8_t *max_z
  * Lets a host build a data-driven band filter listing only the loaded bands. */
 uint32_t tile57_source_bands(tile57_source *src);
 
+/* The distinct SCAMIN denominators present in the source (the live SCAMIN manifest),
+ * ascending — the host publishes these so its style builds one native fractional-
+ * minzoom bucket layer per value (so features honour their 1:N min-display-scale at
+ * zero per-zoom cost). A PMTiles source reads them from the archive metadata; a cell
+ * / ENC_ROOT source scans every cell's features (parsed without portrayal; streamed
+ * cells are read transiently). On success returns 1 with *out pointing at *out_len
+ * int32 values; 0 if there are none; -1 on error. Free *out with
+ * tile57_tile_free((uint8_t*)*out, *out_len * sizeof(int32_t)). */
+int tile57_source_scamin(tile57_source *src, int32_t **out, size_t *out_len);
+
 /* Geographic bounds (west, south, east, north degrees); true when known, so a
  * host can frame the data with its own fit-to-window logic. PMTiles -> archive
  * bounds; cell -> data extent. False for degenerate or near-global extents (the

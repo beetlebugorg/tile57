@@ -226,6 +226,23 @@ export fn tile57_source_bands(src: ?*Source) callconv(.c) u32 {
     return s.bands();
 }
 
+/// The distinct SCAMIN denominators present in the source (the live SCAMIN manifest;
+/// see tile57.h). On success returns 1 with *out pointing at *out_len int32 values
+/// (ascending), 0 if there are none; -1 on error. Free *out with tile57_tile_free
+/// ((uint8_t*)*out, *out_len * sizeof(int32_t)).
+export fn tile57_source_scamin(src: ?*Source, out: *[*]i32, out_len: *usize) callconv(.c) c_int {
+    const s = src orelse return -1;
+    const vals = s.scamin() catch return -1;
+    if (vals.len == 0) {
+        source.freeBytes(@as([*]u8, @ptrCast(vals.ptr))[0 .. vals.len * @sizeOf(u32)]);
+        out_len.* = 0;
+        return 0;
+    }
+    out.* = @ptrCast(vals.ptr); // SCAMIN denominators fit in int32 (max ~2^31)
+    out_len.* = vals.len;
+    return 1;
+}
+
 /// Geographic bounds (west,south,east,north degrees); true when known.
 export fn tile57_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(.c) bool {
     const so = src orelse return false;
