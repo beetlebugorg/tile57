@@ -746,6 +746,26 @@ fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat
     }
 }
 
+/// DEPARE (42) / DRGARE (46) depth-area DRVAL1/DRVAL2 (metres), as f32 to match the
+/// Go baker's `depthVals` + `mvt.FloatVal`. DRVAL2 falls back to DRVAL1 when absent;
+/// a non-depth area or a missing DRVAL1 -> null (the props are omitted). The style's
+/// `areasFillColor` keys on `drval1` to run SEABED01 shading (incl. the DEPDW/white
+/// deep-water shade) + the safety-contour line + shallow pattern LIVE against the
+/// mariner's contours, so depth areas must carry their range.
+fn depthVals(f: s57.Feature) ?[2]f32 {
+    if (f.objl != 42 and f.objl != 46) return null;
+    const d1 = f.attrFloat(s57.ATTR_DRVAL1) orelse return null;
+    const d2 = f.attrFloat(s57.ATTR_DRVAL2) orelse d1;
+    return .{ @floatCast(d1), @floatCast(d2) };
+}
+
+fn appendDepthVals(a: Allocator, props: *std.ArrayList(mvt.Prop), f: s57.Feature) !void {
+    if (depthVals(f)) |dv| {
+        try props.append(a, .{ .key = "drval1", .value = .{ .float = dv[0] } });
+        try props.append(a, .{ .key = "drval2", .value = .{ .float = dv[1] } });
+    }
+}
+
 /// Emit one parsed portrayal pass `p`, stamping every primitive with the pass's
 /// boundary (`bnd`) and point-style (`pts`) variant tags.
 fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
@@ -864,6 +884,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
             if (!L.suppress_fills) if (p.fill_token) |token| {
                 var props = std.ArrayList(mvt.Prop).empty;
                 try props.append(a, .{ .key = "color_token", .value = .{ .string = token } });
+                try appendDepthVals(a, &props, f); // DEPARE/DRGARE -> drval1/drval2 (SEABED01)
                 try appendMeta(a, &props, meta);
                 try areas_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
             };
@@ -1730,8 +1751,7 @@ fn appendCellFeatures(
             try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
             try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
             try aprops.append(a, .{ .key = "band", .value = .{ .int = L.band } });
-            if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| try aprops.append(a, .{ .key = "drval1", .value = .{ .double = d1 } });
-            if (f.attrFloat(s57.ATTR_DRVAL2)) |d2| try aprops.append(a, .{ .key = "drval2", .value = .{ .double = d2 } });
+            try appendDepthVals(a, &aprops, f); // f32 + DRVAL2->DRVAL1 fallback (== oracle depthVals)
             try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
             continue;
         }
