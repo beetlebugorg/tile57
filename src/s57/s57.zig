@@ -857,7 +857,12 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
         off += 2;
         var end = off;
         while (end < data.len and data[end] != iso.UT) end += 1;
-        try list.append(a, .{ .code = code, .value = try a.dupe(u8, data[off..end]) });
+        // Skip an empty ATVL (UT immediately after the 2-byte code): the oracle's
+        // `if valueEnd > offset` (feature.go parseAttributes) drops it rather than
+        // storing a present-but-empty attribute, so a feature with an empty value
+        // has NO such attribute — attr()/attrFloat() then see it as absent.
+        if (end > off)
+            try list.append(a, .{ .code = code, .value = try a.dupe(u8, data[off..end]) });
         off = end + 1; // skip UT
     }
     return list.items;
@@ -1403,6 +1408,20 @@ test "mergeNatf appends national attrs, ATTF wins on code overlap" {
     try std.testing.expectEqualStrings("Pier A", f.attr(116).?); // ATTF wins
     try std.testing.expectEqualStrings("x", f.attr(87).?);
     try std.testing.expectEqualStrings("Muelle A", f.attr(301).?); // NATF national name
+}
+
+test "parseATTF drops an empty ATVL (matches oracle valueEnd > offset)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // OBJNAM(116)="" (UT right after the code), DRVAL1(87)="5" — the empty value is
+    // dropped, so only DRVAL1 survives and attr(116) is absent (not present-but-empty).
+    const bytes = [_]u8{ 116, 0, iso.UT } ++ [_]u8{ 87, 0 } ++ "5".* ++ [_]u8{iso.UT};
+    const attrs = try parseATTF(a, &bytes);
+    try std.testing.expectEqual(@as(usize, 1), attrs.len);
+    const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 0, .attrs = attrs };
+    try std.testing.expectEqual(@as(?[]const u8, null), f.attr(116));
+    try std.testing.expectEqualStrings("5", f.attr(87).?);
 }
 
 test "featureQuapos majority-of-drawn-edges aggregate" {
