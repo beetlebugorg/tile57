@@ -539,7 +539,7 @@ pub const Feature = struct {
 
     pub fn attrFloat(self: Feature, code: u16) ?f64 {
         const v = self.attr(code) orelse return null;
-        return std.fmt.parseFloat(f64, std.mem.trim(u8, v, " ")) catch null;
+        return std.fmt.parseFloat(f64, std.mem.trim(u8, v, FLOAT_WS)) catch null;
     }
 };
 
@@ -1002,8 +1002,15 @@ pub const CatalogEntry = struct {
     is_cell: bool, // BIN .000 base cell
 };
 
+/// ASCII whitespace set matching Go's strings.TrimSpace over byte data: space,
+/// tab, LF, VT, FF, CR. The oracle TrimSpace-es every attribute value before
+/// strconv.ParseFloat (pkg/s57 parseFloat + the portrayal/bake float parses), so
+/// the engine trims the same set wherever it parses a float from an S-57 string —
+/// previously it stripped only ' ', leaving tab/newline-padded numerics unparsed.
+const FLOAT_WS = " \t\n\x0b\x0c\r";
+
 fn parseFloatOpt(s_in: []const u8) ?f64 {
-    const s = std.mem.trim(u8, s_in, " ");
+    const s = std.mem.trim(u8, s_in, FLOAT_WS);
     if (s.len == 0) return null;
     return std.fmt.parseFloat(f64, s) catch null;
 }
@@ -1422,6 +1429,16 @@ test "parseATTF drops an empty ATVL (matches oracle valueEnd > offset)" {
     const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 0, .attrs = attrs };
     try std.testing.expectEqual(@as(?[]const u8, null), f.attr(116));
     try std.testing.expectEqualStrings("5", f.attr(87).?);
+}
+
+test "attrFloat / parseFloatOpt trim full ASCII whitespace (oracle TrimSpace)" {
+    // Tab/newline-padded numerics now parse (the oracle TrimSpace-es before ParseFloat);
+    // previously only ' ' was stripped, so "\t12.5\n" failed to parse.
+    const attrs = [_]Attr{.{ .code = 87, .value = "\t 12.5 \n" }};
+    const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 0, .attrs = &attrs };
+    try std.testing.expectEqual(@as(?f64, 12.5), f.attrFloat(87));
+    try std.testing.expectEqual(@as(?f64, 3.0), parseFloatOpt("\t3\r"));
+    try std.testing.expectEqual(@as(?f64, null), parseFloatOpt(" \t\n")); // all-whitespace -> null
 }
 
 test "featureQuapos majority-of-drawn-edges aggregate" {
