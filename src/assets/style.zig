@@ -287,6 +287,8 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
     // draws over an obstruction (12). symbol-sort-key sorts ascending (lower drawn first
     // = underneath), so the key IS draw_prio. z-order "auto" makes the sort-key take
     // effect (was "source", which ignored it). Mirrors fill-sort-key on the fill layers.
+    // NOTE: this orders WITHIN one layer only; LIGHTS get their own top layer set (see
+    // styleJson) so they beat same-priority bridges that sit in a different scamin bucket.
     try js.objectField("symbol-sort-key");
     try js.write(.{ "coalesce", .{ "get", "draw_prio" }, 0 });
     try js.objectField("symbol-z-order");
@@ -296,22 +298,48 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
     try js.endObject();
 }
 
-fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
+// Which classes a point-symbol layer carries. LIGHTS are split into their own pass so
+// the style can emit them LAST (on top): a light and a bridge are both DrawingPriority
+// 24, but they usually sit in different SCAMIN buckets (separate MapLibre layers, painted
+// in emit order), so an in-layer sort-key can't keep the light on top. A dedicated lights
+// pass emitted after every other point layer makes the paramount navaid always win.
+const PointMode = enum { non_lights, lights_only };
+
+// AND the per-alignment rot_north test with the mode's class clause, then emit the
+// bucket filter. rot_north_eq / mode are comptime so each switch arm passes a concrete
+// tuple type to the generic applyBucket.
+fn applyPointBucket(js: *Stringify, s: *const SCtx, bkt: Bucket, comptime rot_north_eq: bool, comptime mode: PointMode) !void {
+    const rot = if (rot_north_eq)
+        .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }
+    else
+        .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 };
+    switch (mode) {
+        .non_lights => try applyBucket(js, .{ "all", rot, .{ "!=", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s.common, null),
+        .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s.common, null),
+    }
+}
+
+fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket, comptime mode: PointMode) !void {
+    // `-lt` infixes the lights-only layer ids so they stay distinct from the non-light set.
+    const tag = switch (mode) {
+        .non_lights => "",
+        .lights_only => "-lt",
+    };
     var buf: [96]u8 = undefined;
     // viewport-aligned (screen-up)
-    const vid = try std.fmt.bufPrint(&buf, "{s}{s}", .{ sl, bkt.suffix });
+    const vid = try std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ sl, tag, bkt.suffix });
     try js.beginObject();
     try layerHead(js, vid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt, s.common, null);
+    try applyPointBucket(js, s, bkt, false, mode);
     try js.objectField("layout");
     try pointLayout(js, "viewport", s.point_img, s.size_scale);
     try js.endObject();
     // map-aligned (true-north)
     var nbuf: [96]u8 = undefined;
-    const nid = try std.fmt.bufPrint(&nbuf, "{s}-north{s}", .{ sl, bkt.suffix });
+    const nid = try std.fmt.bufPrint(&nbuf, "{s}{s}-north{s}", .{ sl, tag, bkt.suffix });
     try js.beginObject();
     try layerHead(js, nid, "symbol", sl);
-    try applyBucket(js, .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt, s.common, null);
+    try applyPointBucket(js, s, bkt, true, mode);
     try js.objectField("layout");
     try pointLayout(js, "map", s.point_img, s.size_scale);
     try js.endObject();
@@ -658,11 +686,15 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         for (all_buckets) |bkt| try contourLabelLayer(js, &s, "lines_scamin", bkt);
     }
 
-    // 8. point symbols + soundings (sprite required)
+    // 8. point symbols (non-light) + soundings (sprite required)
     if (sprite_on) {
-        try pointSymbolLayers(js, &s, "point_symbols", .{});
-        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt);
+        try pointSymbolLayers(js, &s, "point_symbols", .{}, .non_lights);
+        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .non_lights);
         for (snd_buckets) |bkt| try soundingsLayer(js, &s, bkt);
+        // LIGHTS on top: emitted after every other point symbol so a light always draws
+        // over a same-priority bridge that lives in a different scamin bucket layer.
+        try pointSymbolLayers(js, &s, "point_symbols", .{}, .lights_only);
+        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .lights_only);
     }
 
     // 9. text labels — need an SDF glyph source.
