@@ -736,8 +736,16 @@ pub const Cell = struct {
     pub fn pointGeometry(self: Cell, f: Feature) ?LonLat {
         for (f.refs) |ref| {
             const key = (@as(u64, ref.name.rcnm) << 32) | ref.name.rcid;
-            if (self.nodes.get(key)) |p| return p;
-            if (self.nodeCoord(ref.name.rcid)) |p| return p;
+            if (self.nodes.get(key)) |p| return p; // exact (RCNM,RCID) match
+            // RCID fallback (pointer RCNM absent/unknown): isolated node (VI) FIRST,
+            // then connected (VC) — matching the oracle's getNode order, since an
+            // isolated node holds the SG3D for a multipoint SOUNDG. nodeCoord() is
+            // VC-first (edge endpoints are connected nodes), so the point path can't
+            // reuse it without inverting the priority.
+            const key_vi = (@as(u64, RCNM_VI) << 32) | ref.name.rcid;
+            if (self.nodes.get(key_vi)) |p| return p;
+            const key_vc = (@as(u64, RCNM_VC) << 32) | ref.name.rcid;
+            if (self.nodes.get(key_vc)) |p| return p;
         }
         return null;
     }
@@ -1486,6 +1494,36 @@ test "featureQuapos majority-of-drawn-edges aggregate" {
     };
     const f2 = Feature{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 30, .refs = &refs2 };
     try std.testing.expectEqual(@as(i32, 0), cell.featureQuapos(f2));
+}
+
+test "pointGeometry RCID fallback prefers the isolated node (oracle getNode order)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // RCID 7 exists as BOTH a connected (VC) and an isolated (VI) node, at different
+    // coordinates — so the fallback's node-type priority is observable.
+    var nodes = std.AutoHashMap(u64, LonLat).init(a);
+    try nodes.put((@as(u64, RCNM_VC) << 32) | 7, LonLat.init(1, 10)); // connected
+    try nodes.put((@as(u64, RCNM_VI) << 32) | 7, LonLat.init(2, 20)); // isolated
+    var cell = Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &.{},
+        .nodes = nodes,
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    // Pointer RCNM is unknown (0) -> the exact (RCNM,RCID) match misses and the
+    // fallback runs; it must pick the ISOLATED node (2,20), matching the oracle.
+    const refs = [_]SpatialRef{.{ .name = .{ .rcnm = 0, .rcid = 7 }, .ornt = 1 }};
+    const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 0, .refs = &refs };
+    const p = cell.pointGeometry(f).?;
+    try std.testing.expectEqual(@as(f64, 2), p.lon());
+    try std.testing.expectEqual(@as(f64, 20), p.lat());
 }
 
 test "drawableLineParts drops MASK/USAG edges and breaks the chain" {
