@@ -287,6 +287,11 @@ typedef struct {
     double size_scale;  /* physical-scale multiplier (host _featureSizeScale) applied to
                          * icon-size / line-width / text-size. NOT an S-52 setting.
                          * 1.0 = catalogue sizes verbatim. tile57_mariner_defaults sets 1.0. */
+    const int32_t *viewing_groups_off; /* S-52 §14.5 fine-grained viewing-group control:
+                         * a DENY-LIST of the raw `vg` ids the mariner turned OFF. The
+                         * pointee must outlive the tile57_build_style call. NULL/len 0 ->
+                         * every viewing group shown. tile57_mariner_defaults sets NULL/0. */
+    uint32_t viewing_groups_off_len;
 } tile57_mariner;
 
 /* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.

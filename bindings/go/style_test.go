@@ -60,6 +60,34 @@ func TestIgnoreScamin(t *testing.T) {
 	}
 }
 
+// TestViewingGroupsOff verifies the S-52 §14.5 fine-grained viewing-group deny-list
+// reaches the style through the full C ABI: a non-empty off-set adds a vg deny-list
+// filter referencing the off ids; nil/empty -> no vg filter at all.
+func TestViewingGroupsOff(t *testing.T) {
+	build := func(off []int32) string {
+		m := MarinerDefaults()
+		m.ViewingGroupsOff = off
+		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
+			"glyphs/{fontstack}/{range}.pbf", m, nil, nil, 0)
+		if err != nil {
+			t.Fatalf("Style(off=%v): %v", off, err)
+		}
+		return string(style)
+	}
+	// nil off-set -> no vg filter.
+	if g := build(nil); strings.Contains(g, `"vg"`) {
+		t.Fatalf("nil off-set should produce no vg filter; found \"vg\"")
+	}
+	// empty off-set -> also no vg filter (show all).
+	if g := build([]int32{}); strings.Contains(g, `"vg"`) {
+		t.Fatalf("empty off-set should produce no vg filter; found \"vg\"")
+	}
+	// A non-empty off-set -> a vg deny-list filter referencing the off id.
+	if on := build([]int32{27070}); !strings.Contains(on, `"vg"`) || !strings.Contains(on, "27070") {
+		t.Fatalf("off-set {27070} should add a vg deny-list filter referencing 27070; got none")
+	}
+}
+
 // TestScaminBuckets verifies the runtime build_style emits native per-value SCAMIN
 // bucket layers when given a manifest (host host-canonical-backend.md §"Still needed"
 // #1) — the same gating the offline bundle does. Without a manifest the _scamin

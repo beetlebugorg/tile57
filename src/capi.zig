@@ -447,6 +447,11 @@ const CMariner = extern struct {
     date_view: [9]u8,
     ignore_scamin: bool,
     size_scale: f64,
+    // S-52 §14.5 fine-grained viewing-group control: a DENY-LIST of the raw `vg`
+    // ids the mariner turned OFF (NULL/len 0 -> every group shown). Appended at the
+    // end for ABI-append-safety. The pointee must outlive the tile57_build_style call.
+    viewing_groups_off: [*c]const i32,
+    viewing_groups_off_len: u32,
 };
 
 // "YYYYMMDD" or "" from the fixed char[9] field.
@@ -501,6 +506,10 @@ export fn tile57_build_style(
         .date_view = dateViewSlice(&cm.date_view),
         .ignore_scamin = cm.ignore_scamin,
         .size_scale = cm.size_scale,
+        .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
+            cm.viewing_groups_off[0..cm.viewing_groups_off_len]
+        else
+            null,
     };
     const tmpl = template_json[0..template_len];
     const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
@@ -596,5 +605,7 @@ export fn tile57_mariner_defaults(cm: *CMariner) callconv(.c) void {
         .date_view = [_]u8{0} ** 9,
         .ignore_scamin = d.ignore_scamin,
         .size_scale = d.size_scale,
+        .viewing_groups_off = null, // every viewing group shown
+        .viewing_groups_off_len = 0,
     };
 }

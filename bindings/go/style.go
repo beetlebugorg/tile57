@@ -67,6 +67,7 @@ type Mariner struct {
 	DateView                                                string // "YYYYMMDD" or "" (today)
 	IgnoreScamin                                            bool   // ?ignoreScamin: drop SCAMIN gating, show all in-band
 	SizeScale                                               float64 // physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
+	ViewingGroupsOff                                        []int32 // S-52 §14.5 DENY-LIST: vg ids turned OFF (nil/empty = show all)
 }
 
 // MarinerDefaults returns the canonical default mariner settings from libtile57.
@@ -115,6 +116,11 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 	defer arena.free()
 	bandsPtr, bandsN := arena.int32Array(enabledBands)
 	scaminPtr, scaminN := arena.int32Array(scamin)
+	// Viewing-group deny-list: copy into the arena (C-owned) so the engine never
+	// holds a Go pointer, and point the struct field at it for the duration of the call.
+	vgOffPtr, vgOffN := arena.int32Array(m.ViewingGroupsOff)
+	cm.viewing_groups_off = vgOffPtr
+	cm.viewing_groups_off_len = C.uint32_t(vgOffN)
 
 	var out *C.uint8_t
 	var outLen C.size_t
