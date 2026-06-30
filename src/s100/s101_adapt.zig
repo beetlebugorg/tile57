@@ -347,7 +347,9 @@ fn resolveMooringClass(f: s57.Feature) ?[]const u8 {
 /// S-57 object class -> S-101 feature class, including the attribute-dependent
 /// aliases (LIGHTS, MORFAC, ADMARE, TSELNE/TSEZNE) and the meta classes (M_*);
 /// an unmapped class returns null. Port of complex.go resolveCode + resolveClass.
-fn resolveClass(f: s57.Feature) ?[]const u8 {
+/// Public so the tile emitter can tell a genuinely-unknown class (null → the
+/// §10.1.1 QUESMRK1 mark) from a mapped class the rule simply didn't draw.
+pub fn resolveClass(f: s57.Feature) ?[]const u8 {
     switch (f.objl) {
         s57.OBJL_LIGHTS => return resolveLightClass(f),
         s57.OBJL_ADMARE => if (catalogue.hasFeature("AdministrationArea")) return "AdministrationArea",

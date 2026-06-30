@@ -16,6 +16,7 @@ const mlt = @import("mlt");
 pub const TileFormat = enum { mvt, mlt };
 const s101 = @import("s100").s101_instr;
 const catalogue = @import("s100").catalogue;
+const s101_adapt = @import("s100").s101_adapt;
 
 // S-52 symbol scale the Go baker emits for every point symbol / sounding. The
 // style's icon-size = scale / ATLAS_PPU (0.08), so this renders symbols at
@@ -1912,6 +1913,44 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
     };
 }
 
+/// Emit one centred point symbol at the feature's anchor — its node (point), line
+/// middle vertex, or area representative point (see featureAnchor) — routed to the
+/// scamin bucket and carrying the feature's pick meta (class/cell/s57/scamin/band).
+/// Shared by the §10.6.1.1 INFORM01 "info available" marker and the §10.1.1
+/// QUESMRK1 unknown-object mark, which differ only in symbol/priority/category.
+/// No-op when the anchor doesn't resolve or falls outside the raw tile bounds.
+fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, symbol: []const u8, prio: i64, cat: i64, z: u8, x: u32, y: u32, tb: [4]f64, L: Layers) !void {
+    const rp: ?s57.LonLat = if (f.prim == 1)
+        cell.pointGeometry(f)
+    else rpblk: {
+        const gp = featureParts(a, cell, geo, fi, f) catch break :rpblk null;
+        break :rpblk featureAnchor(a, cell, f, fi, gp);
+    };
+    const p = rp orelse return;
+    if (p.lon() < tb[0] or p.lon() > tb[2] or p.lat() < tb[1] or p.lat() > tb[3]) return;
+    const scamin = featureScamin(f);
+    const points_l = if (scamin != null) L.points_scamin else L.points;
+    const pt = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
+    const parts = try a.alloc([]const mvt.Point, 1);
+    const single = try a.alloc(mvt.Point, 1);
+    single[0] = pt;
+    parts[0] = single;
+    var props = std.ArrayList(mvt.Prop).empty;
+    try props.append(a, .{ .key = "symbol_name", .value = .{ .string = symbol } });
+    try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
+    try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+    try appendMeta(a, &props, .{
+        .prio = prio,
+        .cat = cat,
+        .scamin = scamin,
+        .class = catalogue.acronymByObjl(f.objl) orelse "",
+        .s57 = try pickS57(a, L, f),
+        .cell = pickCell(L, cell.name),
+        .band = L.band,
+    });
+    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+}
+
 /// Append one cell's features for tile (z,x,y) into the shared layer lists.
 fn appendCellFeatures(
     a: Allocator,
@@ -1961,37 +2000,7 @@ fn appendCellFeatures(
         // feature — even an unportrayed/suppressed one. (suppress_points: a finer band
         // covers the whole tile → drop this coarse cell's marker, like its symbols.)
         if (!L.suppress_points and hasAdditionalInfo(f)) {
-            const rp: ?s57.LonLat = if (f.prim == 1)
-                cell.pointGeometry(f)
-            else rpblk: {
-                const gp = featureParts(a, cell.*, geo, fi, f) catch break :rpblk null;
-                break :rpblk featureAnchor(a, cell.*, f, fi, gp);
-            };
-            if (rp) |p| {
-                if (p.lon() >= tb[0] and p.lon() <= tb[2] and p.lat() >= tb[1] and p.lat() <= tb[3]) {
-                    const scamin = featureScamin(f);
-                    const points_l = if (scamin != null) L.points_scamin else L.points;
-                    const pt = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-                    const parts = try a.alloc([]const mvt.Point, 1);
-                    const single = try a.alloc(mvt.Point, 1);
-                    single[0] = pt;
-                    parts[0] = single;
-                    var props = std.ArrayList(mvt.Prop).empty;
-                    try props.append(a, .{ .key = "symbol_name", .value = .{ .string = "INFORM01" } });
-                    try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
-                    try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-                    try appendMeta(a, &props, .{
-                        .prio = 8,
-                        .cat = 2, // Other (overrides the feature's category)
-                        .scamin = scamin,
-                        .class = catalogue.acronymByObjl(f.objl) orelse "",
-                        .s57 = try pickS57(a, L, f),
-                        .cell = pickCell(L, cell.name),
-                        .band = L.band,
-                    });
-                    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-                }
-            }
+            try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, L);
         }
         // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
         // the `soundings` layer (the flat S-101 instruction stream can't carry
@@ -2056,6 +2065,20 @@ fn appendCellFeatures(
         }
         if (f.objl == 306 and f.prim == 3) { // M_NSYS — navSystemBuild (IALA A/B boundary linestyle)
             try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
+            continue;
+        }
+        // Genuinely-unknown object class (no S-101 alias) → the S-52 §10.1.1 QUESMRK1
+        // "unknown object" mark at the feature's representative point (== Go
+        // unknownObjectBuild, dispatched on the engine's "UNMAPPED:" marker). Checked
+        // AFTER the class-specific fallbacks above (NEWOBJ/RECTRC/M_NSYS resolve to null
+        // or error but have their own symbology). A MAPPED class that merely errored or
+        // emitted nothing is NOT marked — it falls through to classify()/suppress below,
+        // matching the oracle (which marks only resolveCode failures, not rule errors).
+        // TOPMAR (folded into its parent buoy/beacon) and SOUNDG (handled above) are
+        // pre-filtered out of the engine batch like the oracle, so they get an empty
+        // stream → suppressed, NOT the unknown mark.
+        if (f.objl != s57.OBJL_TOPMAR and s101_adapt.resolveClass(f) == null) {
+            if (!L.suppress_points) try emitCentredSymbol(a, cell.*, f, fi, geo, "QUESMRK1", 6, 1, z, x, y, tb, L);
             continue;
         }
         if (errored) continue; // genuine rule error on a normal class → suppress
