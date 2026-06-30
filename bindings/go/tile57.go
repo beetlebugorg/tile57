@@ -71,6 +71,9 @@ type Source struct {
 type CellInput struct {
 	Base    []byte
 	Updates [][]byte
+	// Name is the source cell name (e.g. "US4MD81M"), emitted as the `cell`
+	// pick-report property on every feature from this cell. "" = omit it.
+	Name string
 }
 
 // OpenBytes opens a tile source from in-memory bytes (a PMTiles archive or a raw

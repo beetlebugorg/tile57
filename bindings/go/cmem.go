@@ -75,6 +75,10 @@ func (a *cArena) cellInputs(cells []CellInput) ([]C.tile57_cell_input, *C.tile57
 		in.updates = nil
 		in.update_lens = nil
 		in.update_count = 0
+		in.name = nil
+		if c.Name != "" {
+			in.name = a.str(c.Name)
+		}
 		if m := len(c.Updates); m > 0 {
 			updPtrs := (**C.uint8_t)(a.track(C.malloc(C.size_t(m) * C.size_t(unsafe.Sizeof((*C.uint8_t)(nil))))))
 			updLens := (*C.size_t)(a.track(C.malloc(C.size_t(m) * C.size_t(unsafe.Sizeof(C.size_t(0))))))

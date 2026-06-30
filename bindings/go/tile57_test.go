@@ -3,6 +3,7 @@
 package tile57
 
 import (
+	"bytes"
 	"math"
 	"os"
 	"testing"
@@ -24,6 +25,37 @@ func TestColortablesDefault(t *testing.T) {
 	}
 	if len(b) == 0 || b[0] != '{' {
 		t.Fatalf("colortables not JSON object: %d bytes", len(b))
+	}
+}
+
+// CellInput.Name rides through to the `cell` pick-report property on every feature.
+func TestCellInputName(t *testing.T) {
+	data, err := os.ReadFile(testCell)
+	if err != nil {
+		t.Skipf("no test cell: %v", err)
+	}
+	const badge = "PICKCELLZZ" // distinctive token that can only come from the cell prop
+	src, err := OpenCells([]CellInput{{Base: data, Name: badge}}, "")
+	if err != nil {
+		t.Fatalf("OpenCells: %v", err)
+	}
+	defer src.Close()
+
+	w, s, e, n, _ := src.Bounds()
+	mn, mx := src.ZoomRange()
+	found := false
+	for z := mn; z <= mx && z <= 14 && !found; z++ {
+		tx, ty := lonLatToTile((w+e)/2, (s+n)/2, z)
+		body, err := src.Tile(z, tx, ty)
+		if err != nil {
+			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
+		}
+		if bytes.Contains(body, []byte(badge)) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("cell badge not found in any tile — CellInput.Name not emitted as the `cell` prop")
 	}
 }
 

@@ -43,6 +43,10 @@ pub const Format = enum { auto, pmtiles, s57_cell };
 pub const CellInput = struct {
     base: []const u8,
     updates: []const []const u8 = &.{},
+    /// Source ENC cell name (dataset stem, e.g. "US4MD81M") for the pick report's
+    /// "source cell" badge. "" = unknown (the `cell` prop is omitted). The eager
+    /// (openCells) path copies it; the bake path borrows it for the call.
+    name: []const u8 = "",
 };
 
 /// Progress callback for `bakeArchive`: stage 0 = loading/portraying cells,
@@ -102,6 +106,9 @@ const CellBackend = struct {
 const LazyCell = struct {
     base: []u8,
     updates: [][]u8,
+    /// Source cell name for the pick report (gpa-owned copy; the host's input bytes
+    /// are borrowed only for the open call). "" = unknown. Freed in lazyFreeCell.
+    name: []const u8 = "",
     bbox: [4]f64, // [west, south, east, north]
     band: bake_enc.Band,
     cell: ?s57.Cell = null,
@@ -233,6 +240,7 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
         if (!streamRead(ls, lc)) return;
     }
     var cell = s57.parseCellWithUpdates(gpa, lc.base, lc.updates) catch return;
+    cell.name = lc.name; // pick-report source-cell badge (gpa-owned, lives with the source)
     if (gpa.create(std.heap.ArenaAllocator)) |p| {
         p.* = std.heap.ArenaAllocator.init(gpa);
         if (portray.portrayCellVariants(p.allocator(), &cell, ls.rules_dir)) |cp| {
@@ -293,6 +301,7 @@ fn lazyFreeCell(lc: *LazyCell) void {
     if (lc.base.len > 0) gpa.free(lc.base);
     for (lc.updates) |u| gpa.free(u);
     if (lc.updates.len > 0) gpa.free(lc.updates);
+    if (lc.name.len > 0) gpa.free(@constCast(lc.name));
 }
 
 fn tileKey(z: u8, x: u32, y: u32) u64 {
@@ -393,7 +402,8 @@ const OpenWork = struct {
             }
             ups = arr;
         }
-        c.out[i] = .{ .base = base, .updates = ups, .bbox = bbox, .band = bake_enc.bandOf(meta.cscl) };
+        const name = if (in.name.len > 0) (gpa.dupe(u8, in.name) catch "") else "";
+        c.out[i] = .{ .base = base, .updates = ups, .name = name, .bbox = bbox, .band = bake_enc.bandOf(meta.cscl) };
         c.ok[i] = true;
     }
 };
@@ -845,7 +855,7 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32) ![]u8 {
 
 // ---- ENC_ROOT bake -------------------------------------------------------
 
-const BakeSource = struct { base: []const u8, updates: []const []const u8 };
+const BakeSource = struct { base: []const u8, updates: []const []const u8, name: []const u8 = "" };
 
 const BakeWork = struct {
     sources: []const BakeSource,
@@ -859,6 +869,7 @@ const BakeWork = struct {
         const c: *BakeWork = @ptrCast(@alignCast(uptr));
         const src = c.sources[i];
         var cell = s57.parseCellWithUpdates(gpa, src.base, src.updates) catch return;
+        cell.name = src.name; // pick-report badge (borrowed for the bake call)
         const b = cell.bounds() orelse {
             cell.deinit();
             return;
@@ -948,7 +959,7 @@ pub fn bakeArchive(
         for (idxs) |i| {
             const in = cells_in[i];
             const ups = gpa.dupe([]const u8, in.updates) catch &.{};
-            sources.appendAssumeCapacity(.{ .base = in.base, .updates = ups });
+            sources.appendAssumeCapacity(.{ .base = in.base, .updates = ups, .name = in.name });
         }
 
         const outs = gpa.alloc(?bake_enc.Backend, sources.items.len) catch continue;

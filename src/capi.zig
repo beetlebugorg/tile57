@@ -73,6 +73,10 @@ const CellInput = extern struct {
     updates: ?[*]const [*]const u8,
     update_lens: ?[*]const usize,
     update_count: usize,
+    // Source cell name (NUL-terminated, e.g. "US4MD81M") for the pick report's
+    // "source cell" badge. NULL/"" = omitted. Appended after the original fields so
+    // a host that zero-inits the struct gets the no-name (NULL) behaviour.
+    name: ?[*:0]const u8 = null,
 };
 
 // Convert the C CellInput[] into a Zig source.CellInput[] (slices into the host's
@@ -88,7 +92,7 @@ fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]source.Cell
             while (k < cc.update_count) : (k += 1) arr[k] = cc.updates.?[k][0..cc.update_lens.?[k]];
             ups = arr;
         }
-        out[i] = .{ .base = cc.base[0..cc.base_len], .updates = ups };
+        out[i] = .{ .base = cc.base[0..cc.base_len], .updates = ups, .name = spanOpt(cc.name) orelse "" };
     }
     return out;
 }
