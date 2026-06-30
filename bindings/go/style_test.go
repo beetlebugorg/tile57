@@ -18,7 +18,7 @@ func TestStyle(t *testing.T) {
 		"http://localhost:8080/tiles/tile57/{z}/{x}/{y}.mvt",
 		"http://localhost:8080/sprite",
 		"http://localhost:8080/glyphs/{fontstack}/{range}.pbf",
-		m, nil, nil, 0)
+		0, 0, m, nil, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestIgnoreScamin(t *testing.T) {
 	build := func(ignore bool) string {
 		m := MarinerDefaults()
 		m.IgnoreScamin = ignore
-		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "", "", m, nil, nil, 0)
+		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "", "", 0, 0, m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(ignore=%v): %v", ignore, err)
 		}
@@ -68,7 +68,7 @@ func TestViewingGroupsOff(t *testing.T) {
 		m := MarinerDefaults()
 		m.ViewingGroupsOff = off
 		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-			"glyphs/{fontstack}/{range}.pbf", m, nil, nil, 0)
+			"glyphs/{fontstack}/{range}.pbf", 0, 0, m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(off=%v): %v", off, err)
 		}
@@ -97,7 +97,7 @@ func TestScaminBuckets(t *testing.T) {
 	m := MarinerDefaults()
 	scamin := []int32{89999, 119999, 259999}
 	withManifest, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-		"glyphs/{fontstack}/{range}.pbf", m, nil, scamin, 38.0)
+		"glyphs/{fontstack}/{range}.pbf", 0, 0, m, nil, scamin, 38.0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestSizeScale(t *testing.T) {
 		m := MarinerDefaults()
 		m.SizeScale = scale
 		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-			"glyphs/{fontstack}/{range}.pbf", m, nil, nil, 0)
+			"glyphs/{fontstack}/{range}.pbf", 0, 0, m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(scale=%v): %v", scale, err)
 		}

@@ -127,14 +127,16 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 // Style is a convenience that runs the whole pipeline — default colortables +
 // template (scheme, tiles/sprite/glyph URLs) patched by mariner + band filter — to
 // produce a complete MapLibre style JSON from libtile57's baked-in catalogue.
-// scamin/scaminLat (typically Source.Scamin() + the source center latitude) gate the
-// `_scamin` layers by value; pass nil/0 to leave them ungated.
-func Style(scheme Scheme, sourceTiles, sprite, glyphs string, m Mariner, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
+// minZoom/maxZoom set the template's zoom span (0 = the engine default, i.e. z16 max);
+// a host that overzooms past z16 must pass its own maxZoom here. scamin/scaminLat
+// (typically Source.Scamin() + the source center latitude) gate the `_scamin` layers
+// by value; pass nil/0 to leave them ungated.
+func Style(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32, m Mariner, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
 	ct, err := ColortablesDefault()
 	if err != nil {
 		return nil, err
 	}
-	tmpl, err := StyleTemplate(scheme, sourceTiles, sprite, glyphs, 0, 0)
+	tmpl, err := StyleTemplate(scheme, sourceTiles, sprite, glyphs, minZoom, maxZoom)
 	if err != nil {
 		return nil, err
 	}
