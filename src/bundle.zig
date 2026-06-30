@@ -587,9 +587,19 @@ const BakeSink = struct {
                         }
                         continue;
                     }
-                    // Soundings glyph stacks for the sprite-mln composite atlas.
+                    // Soundings glyph stacks for the sprite-mln composite atlas. Both
+                    // unit variants must be collected: the SAME atlas serves the metres
+                    // (sym_s/sym_g) and the feet (sym_s_ft/sym_g_ft) styles — the client
+                    // swaps the icon-image field at runtime, so a feet composite the
+                    // metres pass never referenced (e.g. a deep wreck/obstruction whose
+                    // feet digits compose differently) would otherwise be missing and the
+                    // sounding render blank in feet mode.
                     if (!is_snd) continue;
-                    if (!std.mem.eql(u8, p.key, "sym_s") and !std.mem.eql(u8, p.key, "sym_g") and !std.mem.eql(u8, p.key, "symbol_names")) continue;
+                    const k = p.key;
+                    const is_sound_glyph = std.mem.eql(u8, k, "sym_s") or std.mem.eql(u8, k, "sym_g") or
+                        std.mem.eql(u8, k, "sym_s_ft") or std.mem.eql(u8, k, "sym_g_ft") or
+                        std.mem.eql(u8, k, "symbol_names");
+                    if (!is_sound_glyph) continue;
                     switch (p.value) {
                         .string => |sv| if (std.mem.indexOfScalar(u8, sv, ',') != null and !self.sounds.contains(sv)) {
                             self.sounds.put(self.a.dupe(u8, sv) catch return, {}) catch {};
