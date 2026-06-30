@@ -25,7 +25,7 @@ pub const Leader = struct {
 
     fn parse(buf: []const u8) !Leader {
         if (buf.len < 24) return error.ShortLeader;
-        return .{
+        const l: Leader = .{
             .record_length = try asciiInt(buf[0..5]),
             .interchange_level = buf[5],
             .leader_id = buf[6],
@@ -36,6 +36,18 @@ pub const Leader = struct {
             .size_of_field_position = try asciiDigit(buf[21]),
             .size_of_field_tag = try asciiDigit(buf[23]),
         };
+        // validateLeader (oracle leader.go:163): reject a malformed leader rather than
+        // parse garbage downstream. record_length 0 = the legal "compute from directory"
+        // convention (resolved in parseRecord). The entry-map size fields must be 1..9 —
+        // asciiDigit already bounds them to 0..9, so the real new constraint is non-zero
+        // (a 0 would mis-size every directory entry). The leader-id check is NOT here: a
+        // non-'D'/'L' id is the end-of-records padding sentinel parseRecord handles, so
+        // it validates the id there (after that sentinel), not on every leader parse.
+        if (l.record_length != 0 and l.record_length < 24) return error.BadLeader;
+        if (l.size_of_field_length < 1 or l.size_of_field_length > 9) return error.BadLeader;
+        if (l.size_of_field_position < 1 or l.size_of_field_position > 9) return error.BadLeader;
+        if (l.size_of_field_tag < 1 or l.size_of_field_tag > 9) return error.BadLeader;
+        return l;
     }
 };
 
@@ -165,6 +177,10 @@ fn parseRecord(a: Allocator, bytes: []const u8, offset: usize) !struct { rec: Re
     var leader = try Leader.parse(bytes[offset..]);
     // record_length 0 on a non-'D'/'L' leader is trailing padding => end of records.
     if (leader.record_length == 0 and leader.leader_id != 'D' and leader.leader_id != 'L') return error.EndOfRecords;
+    // A non-'D'/'L' id WITH a stored length is a malformed record, not padding — the
+    // oracle's parseDataRecord errors on id != 'D' (parser.go:162); reject it (DDR 'L' /
+    // DR 'D' both pass). Placed after the padding sentinel so zero-fill still ends cleanly.
+    if (leader.leader_id != 'D' and leader.leader_id != 'L') return error.BadLeader;
     // The directory occupies [24, field_area_start) regardless of record_length, so
     // parse it first, then recover a "length not stored" (==0) record's true length.
     if (leader.field_area_start < 24 or offset + leader.field_area_start > bytes.len) return error.BadRecordLength;
