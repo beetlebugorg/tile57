@@ -87,7 +87,7 @@ fn listHasAny(csv: []const u8, targets: []const i64) bool {
 /// STATUS). NOTE: the rule's spatial-QUAPOS fallback for the ring (when the direct
 /// attrs are absent) is not yet wired — soundings whose only low-accuracy signal is
 /// a poor spatial quality-of-position still miss the ring; the direct attrs match.
-fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: bool) ![]const u8 {
+fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: bool, always_tenths: bool) ![]const u8 {
     const d = @abs(depth);
     // Round to tenths: depth is an f64 (z/somf), so naive truncation would hit binary
     // FP off-by-one on the tenths digit (12.3 stored as 12.299999…). Rounding d*10
@@ -126,7 +126,12 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc
     if (idepth < 10) {
         try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[0] }));
         if (frac != 0) try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
-    } else if (idepth < 31 and frac != 0) {
+    } else if (idepth < 100 and frac != 0 and (idepth < 31 or always_tenths)) {
+        // Two integer digits + a subscript tenth. SNDFRM04 only does this below 31
+        // (native metres rule); `always_tenths` extends it to 99 for a CONVERTED value
+        // (feet) so a converted sounding never collapses to a whole number — we don't
+        // round conversions. (>= 100 displayed units still drop the tenth: the 3-digit
+        // glyph arrangement has no subscript slot.)
         try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
         try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
         try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
@@ -168,17 +173,17 @@ fn soundingQualityFlags(f: s57.Feature) struct { swept: bool, low_acc: bool } {
 /// style swaps in when the mariner selects feet, and the raw metres `depth` the
 /// style's safety-depth split compares against. Returns false (nothing appended) when
 /// the depth composes to no glyphs. The safety split stays in metres (`depth`); only
-/// the displayed digits convert. The feet value flows through the same SNDFRM04
-/// composition as metres, so it carries one decimal place (a subscript tenth) for the
-/// shallow soundings the rule shows tenths for — not pre-rounded to whole feet — so a
-/// 4.5 m obstruction reads "14.8" (ft) rather than "15", matching the metres original.
+/// the displayed digits convert. The metres value follows SNDFRM04 (whole >= 31 m); the
+/// feet value is a CONVERSION, so it keeps its tenth at every magnitude (`always_tenths`)
+/// — we never round a conversion to a whole number. A 4.5 m obstruction reads "14.8"
+/// (ft); a 10 m one reads "32.8" (ft), not "32".
 fn appendSoundingProps(a: Allocator, props: *std.ArrayList(mvt.Prop), depth_m: f64, swept: bool, low_acc: bool) !bool {
-    const sym_s = try sndfrmSyms(a, "SOUNDS", depth_m, swept, low_acc);
+    const sym_s = try sndfrmSyms(a, "SOUNDS", depth_m, swept, low_acc, false);
     if (sym_s.len == 0) return false;
-    const sym_g = try sndfrmSyms(a, "SOUNDG", depth_m, swept, low_acc);
+    const sym_g = try sndfrmSyms(a, "SOUNDG", depth_m, swept, low_acc, false);
     const ft = depth_m * M_TO_FT;
-    const sym_s_ft = try sndfrmSyms(a, "SOUNDS", ft, swept, low_acc);
-    const sym_g_ft = try sndfrmSyms(a, "SOUNDG", ft, swept, low_acc);
+    const sym_s_ft = try sndfrmSyms(a, "SOUNDS", ft, swept, low_acc, true);
+    const sym_g_ft = try sndfrmSyms(a, "SOUNDG", ft, swept, low_acc, true);
     try props.append(a, .{ .key = "sym_s", .value = .{ .string = sym_s } });
     try props.append(a, .{ .key = "sym_g", .value = .{ .string = sym_g } });
     try props.append(a, .{ .key = "sym_s_ft", .value = .{ .string = sym_s_ft } });
@@ -2215,31 +2220,37 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("SOUNDS12,SOUNDS57", try sndfrmSyms(a, "SOUNDS", 2.7, false, false));
-    try std.testing.expectEqualStrings("SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", 0.6, false, false));
-    try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, false, false));
-    try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6, false, false));
-    try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0, false, false));
+    try std.testing.expectEqualStrings("SOUNDS12,SOUNDS57", try sndfrmSyms(a, "SOUNDS", 2.7, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", 0.6, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0, false, false, false));
+
+    // always_tenths (a CONVERTED value, e.g. feet): 32.8 keeps its tenth at every
+    // magnitude — never collapse a conversion to a whole number. Native (metres) drops
+    // the tenth >= 31 per SNDFRM04 (32.8 m -> "32").
+    try std.testing.expectEqualStrings("SOUNDS23,SOUNDS12,SOUNDS58", try sndfrmSyms(a, "SOUNDS", 32.8, false, false, true));
+    try std.testing.expectEqualStrings("SOUNDS13,SOUNDS02", try sndfrmSyms(a, "SOUNDS", 32.8, false, false, false));
 
     // >= 1000 m (4-digit, codes 2,1,0,4) — previously dropped entirely.
-    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG12,SOUNDG03,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 1234.0, false, false));
-    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG10,SOUNDG00,SOUNDG40", try sndfrmSyms(a, "SOUNDG", 1000.0, false, false));
+    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG12,SOUNDG03,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 1234.0, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDG21,SOUNDG10,SOUNDG00,SOUNDG40", try sndfrmSyms(a, "SOUNDG", 1000.0, false, false, false));
     // >= 10000 m (5-digit, codes 3,2,1,0,4) — deepest oceans.
-    try std.testing.expectEqualStrings("SOUNDG31,SOUNDG20,SOUNDG19,SOUNDG09,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 10994.0, false, false));
+    try std.testing.expectEqualStrings("SOUNDG31,SOUNDG20,SOUNDG19,SOUNDG09,SOUNDG44", try sndfrmSyms(a, "SOUNDG", 10994.0, false, false, false));
 
     // Negative soundings (drying heights): A-prefix ring by sign/magnitude.
-    try std.testing.expectEqualStrings("SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, false, false));
-    try std.testing.expectEqualStrings("SOUNDSA2,SOUNDS11,SOUNDS05", try sndfrmSyms(a, "SOUNDS", -15.0, false, false));
-    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", -5.0, false, false));
-    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", -0.6, false, false));
+    try std.testing.expectEqualStrings("SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDSA2,SOUNDS11,SOUNDS05", try sndfrmSyms(a, "SOUNDS", -15.0, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", -5.0, false, false, false));
+    try std.testing.expectEqualStrings("SOUNDSA1,SOUNDS10,SOUNDS56", try sndfrmSyms(a, "SOUNDS", -0.6, false, false, false));
 
     // Quality prefixes (SNDFRM04:37-51): B1 (swept) and the low-accuracy ring lead
     // the composite, ring sized to the variant (C3 shallow / C2 deep).
-    try std.testing.expectEqualStrings("SOUNDSB1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, true, false));
-    try std.testing.expectEqualStrings("SOUNDSC3,SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, false, true));
-    try std.testing.expectEqualStrings("SOUNDGC2,SOUNDG15", try sndfrmSyms(a, "SOUNDG", 5.0, false, true));
+    try std.testing.expectEqualStrings("SOUNDSB1,SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, true, false, false));
+    try std.testing.expectEqualStrings("SOUNDSC3,SOUNDS15", try sndfrmSyms(a, "SOUNDS", 5.0, false, true, false));
+    try std.testing.expectEqualStrings("SOUNDGC2,SOUNDG15", try sndfrmSyms(a, "SOUNDG", 5.0, false, true, false));
     // B1 then ring then A-prefix then digits, all together.
-    try std.testing.expectEqualStrings("SOUNDSB1,SOUNDSC3,SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, true, true));
+    try std.testing.expectEqualStrings("SOUNDSB1,SOUNDSC3,SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, true, true, false));
 }
 
 test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)" {

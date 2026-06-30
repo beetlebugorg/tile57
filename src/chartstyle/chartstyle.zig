@@ -271,10 +271,12 @@ pub fn pointSymbolImage(b: B, m: *const MarinerSettings) !Value {
     });
 }
 
-// SAFCON01: the depth-contour value label, in whole metres or whole feet.
+// SAFCON01: the depth-contour value label. Metres are whole (valdco is whole metres);
+// feet is a CONVERSION, so it keeps one decimal place (round(x*10)/10) — we never round
+// a conversion to a whole number. A 2 m contour reads "6.6" ft, not "7".
 pub fn contourLabelField(b: B, m: *const MarinerSettings) !Value {
     const v = if (m.depth_unit == .feet)
-        try b.arr(&.{ b.s("round"), try b.arr(&.{ b.s("*"), try b.get("valdco"), try b.flt(M_TO_FT) }) })
+        try b.arr(&.{ b.s("/"), try b.arr(&.{ b.s("round"), try b.arr(&.{ b.s("*"), try b.arr(&.{ b.s("*"), try b.get("valdco"), try b.flt(M_TO_FT) }), b.int(10) }) }), b.int(10) })
     else
         try b.arr(&.{ b.s("round"), try b.get("valdco") });
     return b.arr(&.{
