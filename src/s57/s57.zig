@@ -1392,9 +1392,12 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     {
         var bf = try iso.parse(gpa, base_bytes);
         defer bf.deinit();
-        for (bf.records) |rec| if (rec.field("DSPM")) |d| {
-            params = parseDSPM(d);
-        };
+        for (bf.records) |rec| {
+            if (rec.field("DSPM")) |d| {
+                params = parseDSPM(d);
+                break; // use the FIRST DSPM found (oracle extractDatasetParams)
+            }
+        }
     }
     const comf: f64 = @floatFromInt(params.comf);
     const somf: f64 = @floatFromInt(params.somf);
