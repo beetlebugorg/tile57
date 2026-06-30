@@ -636,11 +636,23 @@ fn shortenName(text: []const u8) []const u8 {
 }
 
 fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) !void {
+    // Resolved body size: the FontSize modifier px, or 12 (oracle default). Drives
+    // both the emitted font_size_px and the halo gate below.
+    const font_px: f64 = if (t.font_size > 0) t.font_size else 12;
     try props.append(a, .{ .key = "text", .value = .{ .string = shortenName(t.text) } });
     try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
-    try props.append(a, .{ .key = "font_size_px", .value = .{ .double = if (t.font_size > 0) t.font_size else 12 } });
+    try props.append(a, .{ .key = "font_size_px", .value = .{ .double = font_px } });
     try props.append(a, .{ .key = "halign", .value = .{ .string = t.halign } });
     try props.append(a, .{ .key = "valign", .value = .{ .string = t.valign } });
+    // §10 text halo: the oracle attaches a CHWHT, 1px halo to text >= 10 px
+    // (s101emit.go:130-133) and emits it as halo_color_token / halo_width tile
+    // properties (bake.go:1147-1148); smaller text gets no halo ("" / 0). Our served
+    // style still renders text solid (no halo) by deliberate S-52 choice (style.zig
+    // textPaint passes halo_width 0) — these are tile-parity properties for a client
+    // that wants the legibility halo.
+    const haloed = font_px >= 10;
+    try props.append(a, .{ .key = "halo_color_token", .value = .{ .string = if (haloed) "CHWHT" else "" } });
+    try props.append(a, .{ .key = "halo_width", .value = .{ .double = if (haloed) 1 else 0 } });
     try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
 }
 
@@ -2340,6 +2352,37 @@ test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)
     }
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS55", sym_s); // 4.5 m
     try std.testing.expectEqualStrings("SOUNDS21,SOUNDS14,SOUNDS57", sym_s_ft); // 14.7 ft (truncated)
+}
+
+test "appendTextProps: halo (CHWHT/1) gated on font_size >= 10, matching the oracle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_]struct { fs: f64, halo: bool }{
+        .{ .fs = 0, .halo = true }, // 0 -> emit default 12 -> haloed
+        .{ .fs = 12, .halo = true },
+        .{ .fs = 10, .halo = true }, // boundary: >= 10
+        .{ .fs = 9.9, .halo = false },
+        .{ .fs = 8, .halo = false },
+    };
+    for (cases) |c| {
+        var props = std.ArrayList(mvt.Prop).empty;
+        try appendTextProps(a, &props, .{ .text = "x", .color = "CHBLK", .font_size = c.fs });
+        var color: []const u8 = "<none>";
+        var width: f64 = -1;
+        for (props.items) |p| {
+            if (std.mem.eql(u8, p.key, "halo_color_token")) color = p.value.string;
+            if (std.mem.eql(u8, p.key, "halo_width")) width = p.value.double;
+        }
+        if (c.halo) {
+            try std.testing.expectEqualStrings("CHWHT", color);
+            try std.testing.expectEqual(@as(f64, 1), width);
+        } else {
+            try std.testing.expectEqualStrings("", color);
+            try std.testing.expectEqual(@as(f64, 0), width);
+        }
+    }
 }
 
 test "shortenName: buoy/light names reduce to the chart designation" {
