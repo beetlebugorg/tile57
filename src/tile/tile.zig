@@ -38,11 +38,19 @@ pub fn worldToTile(w: [2]f64, z: u8, tx: u32, ty: u32, extent: i32) mvt.Point {
     return .{ .x = roundI32(px), .y = roundI32(py) };
 }
 
-// Round to nearest (ties away from zero, == @round) via hardware truncation
-// (@intFromFloat is CVTTSD2SI) — the baseline musl target has no ROUNDSD, so
-// @round compiled to a software routine that profiled at ~15% of the bake.
+// Round to nearest, ties away from zero == Go math.Round (Quantize, tile.go:116).
+// Truncate toward zero with the always-available CVTTSD2SI (@intFromFloat — the
+// baseline musl target has no ROUNDSD, so @round/@trunc compile to a slow libm call
+// that profiled at ~15% of the bake), then bump by the fractional part. This avoids
+// the `v ± 0.5` edge where adding 0.5 to a value just below x.5 rounds UP to x+1 in
+// double precision (half-even on the ADD), diverging from math.Round for that
+// measure-zero case — all ALU ops, no software round.
 inline fn roundI32(v: f64) i32 {
-    return @intFromFloat(if (v >= 0) v + 0.5 else v - 0.5);
+    const ti: i64 = @intFromFloat(v);
+    const frac = v - @as(f64, @floatFromInt(ti));
+    if (frac >= 0.5) return @intCast(ti + 1);
+    if (frac <= -0.5) return @intCast(ti - 1);
+    return @intCast(ti);
 }
 
 /// Geographic bounds of tile (z,x,y): [min_lon, min_lat, max_lon, max_lat].
@@ -345,6 +353,25 @@ pub fn clipLinePhased(alloc: Allocator, pts: []const FPoint, arc: []const f64, b
     }
     if (cur.items.len > 0) try runs.append(alloc, .{ .points = cur.items, .arc0 = cur_arc0 });
     return runs.items;
+}
+
+test "roundI32 matches Go math.Round (ties away from zero, no v+0.5 FP edge)" {
+    const t = std.testing;
+    // Standard ties away from zero.
+    try t.expectEqual(@as(i32, 1), roundI32(0.5));
+    try t.expectEqual(@as(i32, -1), roundI32(-0.5));
+    try t.expectEqual(@as(i32, 3), roundI32(2.5));
+    try t.expectEqual(@as(i32, -3), roundI32(-2.5));
+    try t.expectEqual(@as(i32, 2), roundI32(2.4));
+    try t.expectEqual(@as(i32, 0), roundI32(0.0));
+    try t.expectEqual(@as(i32, 7), roundI32(6.6));
+    // The FP edge: the largest double below 0.5 must round to 0 (math.Round does), NOT
+    // to 1 as the old `v + 0.5` trick would (0.499…94 + 0.5 ties to 1.0 in double).
+    const just_below_half = std.math.nextAfter(f64, 0.5, 0.0);
+    try t.expectEqual(@as(i32, 0), roundI32(just_below_half));
+    try t.expectEqual(@as(i32, 0), roundI32(-just_below_half));
+    // The largest double below 2.5 rounds to 2 (nearest), not 3.
+    try t.expectEqual(@as(i32, 2), roundI32(std.math.nextAfter(f64, 2.5, 2.0)));
 }
 
 test "clipLinePhased keeps arc phase across the box boundary" {
