@@ -147,6 +147,12 @@ pub fn main(init: std.process.Init) !void {
                         std.debug.print("    {s}: {d} features (extent {d})\n", .{ L.name, L.features.len, L.extent });
                         if (want) |w| if (std.mem.eql(u8, w, L.name)) for (L.features, 0..) |feat, fi| {
                             std.debug.print("      [{d}] {s}:", .{ fi, @tagName(feat.geom_type) });
+                            // First geometry coord (verification aid: spot duplicate
+                            // point symbols at the same tile-space position).
+                            if (feat.parts.len > 0 and feat.parts[0].len > 0) {
+                                const p0 = feat.parts[0][0];
+                                std.debug.print(" @({d},{d})", .{ p0.x, p0.y });
+                            }
                             for (feat.properties) |p| switch (p.value) {
                                 .string => |sv| std.debug.print(" {s}=\"{s}\"", .{ p.key, sv }),
                                 .int => |iv| std.debug.print(" {s}={d}", .{ p.key, iv }),
