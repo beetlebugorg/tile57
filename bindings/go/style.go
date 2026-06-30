@@ -64,8 +64,8 @@ type Mariner struct {
 	SimplifiedPoints, ShowFullSectorLines                   bool
 	TextNames, ShowLightDescriptions, TextOther             bool
 	DateDependent, HighlightDateDependent                   bool
-	DateView                                                string // "YYYYMMDD" or "" (today)
-	IgnoreScamin                                            bool   // ?ignoreScamin: drop SCAMIN gating, show all in-band
+	DateView                                                string  // "YYYYMMDD" or "" (today)
+	IgnoreScamin                                            bool    // ?ignoreScamin: drop SCAMIN gating, show all in-band
 	SizeScale                                               float64 // physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
 	ViewingGroupsOff                                        []int32 // S-52 §14.5 DENY-LIST: vg ids turned OFF (nil/empty = show all)
 }
@@ -108,19 +108,13 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 	if len(template) == 0 {
 		return nil, fmt.Errorf("tile57: empty style template: %w", ErrEmptyInput)
 	}
-	cm := m.toC()
-	tmplPtr, tmplLen := charPtr(template)
-	ctPtr, ctLen := charPtr(colortables)
-
 	arena := &cArena{}
 	defer arena.free()
+	cm := m.toC(arena) // owns the full conversion incl. the ViewingGroupsOff deny-list
+	tmplPtr, tmplLen := charPtr(template)
+	ctPtr, ctLen := charPtr(colortables)
 	bandsPtr, bandsN := arena.int32Array(enabledBands)
 	scaminPtr, scaminN := arena.int32Array(scamin)
-	// Viewing-group deny-list: copy into the arena (C-owned) so the engine never
-	// holds a Go pointer, and point the struct field at it for the duration of the call.
-	vgOffPtr, vgOffN := arena.int32Array(m.ViewingGroupsOff)
-	cm.viewing_groups_off = vgOffPtr
-	cm.viewing_groups_off_len = C.uint32_t(vgOffN)
 
 	var out *C.uint8_t
 	var outLen C.size_t
@@ -147,9 +141,12 @@ func Style(scheme Scheme, sourceTiles, sprite, glyphs string, m Mariner, enabled
 	return BuildStyle(tmpl, m, ct, enabledBands, scamin, scaminLat)
 }
 
-// toC converts a Mariner to its C struct. cgo maps C _Bool to Go bool, so the
-// flag fields assign directly.
-func (m Mariner) toC() C.tile57_mariner {
+// toC converts a Mariner to its C struct — the COMPLETE conversion, including the
+// ViewingGroupsOff deny-list, which must live in C memory: it is copied into `arena`
+// (freed by the caller after the ABI call) so the engine never holds a Go pointer.
+// Pass the same cArena used for the call's other C arrays. cgo maps C _Bool to Go
+// bool, so the flag fields assign directly.
+func (m Mariner) toC(arena *cArena) C.tile57_mariner {
 	var c C.tile57_mariner
 	c.scheme = C.tile57_scheme(m.Scheme)
 	c.shallow_contour = C.double(m.ShallowContour)
@@ -178,6 +175,10 @@ func (m Mariner) toC() C.tile57_mariner {
 	}
 	c.ignore_scamin = C.bool(m.IgnoreScamin)
 	c.size_scale = C.double(m.SizeScale)
+	// Viewing-group deny-list: arena-owned C array so no Go pointer crosses into C.
+	vgOffPtr, vgOffN := arena.int32Array(m.ViewingGroupsOff)
+	c.viewing_groups_off = vgOffPtr
+	c.viewing_groups_off_len = C.uint32_t(vgOffN)
 	return c
 }
 
