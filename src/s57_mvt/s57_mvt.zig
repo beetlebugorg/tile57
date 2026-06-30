@@ -25,10 +25,12 @@ const s101_adapt = @import("s100").s101_adapt;
 const SYMBOL_SCALE: f64 = 0.02834627777338028;
 
 // Metres → feet. Soundings are stored + portrayed in metres (S-52/S-101 SNDFRM04 is
-// metres-only); this app additionally bakes a whole-feet glyph variant (sym_s_ft/
-// sym_g_ft) so the generated style can show soundings in feet when the mariner picks
-// that unit — a recreational-chartplotter convenience, not ECDIS behaviour, matching
-// the existing depth-contour feet conversion (chartstyle.contourLabelField).
+// metres-only); this app additionally bakes a feet glyph variant (sym_s_ft/sym_g_ft)
+// so the generated style can show soundings in feet when the mariner picks that unit —
+// a recreational-chartplotter convenience, not ECDIS behaviour. The feet value runs
+// through the same SNDFRM04 glyph composition as metres, so it keeps one decimal place
+// for shallow soundings (the depth-contour feet label, chartstyle.contourLabelField,
+// rounds to whole feet — contour valdco values are whole metres).
 const M_TO_FT: f64 = 3.280839895;
 
 // Worst-case reach of a light's sector legs/arcs (emitAugFigures) as a fraction of a
@@ -162,16 +164,19 @@ fn soundingQualityFlags(f: s57.Feature) struct { swept: bool, low_acc: bool } {
 }
 
 /// Append the SNDFRM04 sounding-glyph properties for one depth (metres): the metres
-/// safe/general glyph lists (sym_s/sym_g), a WHOLE-FEET variant (sym_s_ft/sym_g_ft)
-/// the style swaps in when the mariner selects feet, and the raw metres `depth` the
+/// safe/general glyph lists (sym_s/sym_g), a FEET variant (sym_s_ft/sym_g_ft) the
+/// style swaps in when the mariner selects feet, and the raw metres `depth` the
 /// style's safety-depth split compares against. Returns false (nothing appended) when
 /// the depth composes to no glyphs. The safety split stays in metres (`depth`); only
-/// the displayed digits convert, rounded to whole feet like the contour feet label.
+/// the displayed digits convert. The feet value flows through the same SNDFRM04
+/// composition as metres, so it carries one decimal place (a subscript tenth) for the
+/// shallow soundings the rule shows tenths for — not pre-rounded to whole feet — so a
+/// 4.5 m obstruction reads "14.8" (ft) rather than "15", matching the metres original.
 fn appendSoundingProps(a: Allocator, props: *std.ArrayList(mvt.Prop), depth_m: f64, swept: bool, low_acc: bool) !bool {
     const sym_s = try sndfrmSyms(a, "SOUNDS", depth_m, swept, low_acc);
     if (sym_s.len == 0) return false;
     const sym_g = try sndfrmSyms(a, "SOUNDG", depth_m, swept, low_acc);
-    const ft = @round(depth_m * M_TO_FT);
+    const ft = depth_m * M_TO_FT;
     const sym_s_ft = try sndfrmSyms(a, "SOUNDS", ft, swept, low_acc);
     const sym_g_ft = try sndfrmSyms(a, "SOUNDG", ft, swept, low_acc);
     try props.append(a, .{ .key = "sym_s", .value = .{ .string = sym_s } });
@@ -2235,6 +2240,25 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     try std.testing.expectEqualStrings("SOUNDGC2,SOUNDG15", try sndfrmSyms(a, "SOUNDG", 5.0, false, true));
     // B1 then ring then A-prefix then digits, all together.
     try std.testing.expectEqualStrings("SOUNDSB1,SOUNDSC3,SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, true, true));
+}
+
+test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A 4.5 m obstruction: metres reads "4.5" (SOUNDS14,SOUNDS55); feet must read
+    // "14.8" (4.5*3.280839895 = 14.76 → SNDFRM04 tenths), NOT "15" pre-rounded whole.
+    var props = std.ArrayList(mvt.Prop).empty;
+    try std.testing.expect(try appendSoundingProps(a, &props, 4.5, false, false));
+    var sym_s: []const u8 = "";
+    var sym_s_ft: []const u8 = "";
+    for (props.items) |p| {
+        if (std.mem.eql(u8, p.key, "sym_s")) sym_s = p.value.string;
+        if (std.mem.eql(u8, p.key, "sym_s_ft")) sym_s_ft = p.value.string;
+    }
+    try std.testing.expectEqualStrings("SOUNDS14,SOUNDS55", sym_s); // 4.5 m
+    try std.testing.expectEqualStrings("SOUNDS21,SOUNDS14,SOUNDS58", sym_s_ft); // 14.8 ft
 }
 
 test "listHasAny splits S-57 comma lists and matches any target" {
