@@ -872,13 +872,20 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     const valdco: ?f64 = if (f.objl == 43) f.attrFloat(s57.ATTR_VALDCO) else null;
 
     // S-52 §8.6.2: masked (MASK==1) / data-limit (USAG==3) boundary edges must NOT be
-    // drawn. The FILL above keeps full rings; the STROKE uses the drawable subset.
-    // Fast path: when no edge carries mask/usag info the drawn geometry equals the
-    // full geometry, so reuse `projected` (and its precomputed-world-coord cull).
+    // drawn. The FILL above keeps full rings and labels use the full geometry, but the
+    // STROKE uses the drawable subset — for BOTH simple solid strokes AND complex
+    // (symbolized) linestyles, since the oracle masks the line geometry before
+    // portrayal so a symbolized boundary skips masked/coast-coincident edges too.
+    // `stroke_geo` is the lon/lat geometry the strokes draw along (the drawable subset
+    // when masking applies, else the full geometry); `stroke_proj` is its projection
+    // for the simple path. Fast path: with no mask/usag info the drawn geometry equals
+    // the full geometry, so reuse `geo_parts`/`projected` (and its precomputed cull).
+    var stroke_geo: []const []s57.LonLat = geo_parts;
     var stroke_proj: []const []mvt.Point = projected.items;
     if (!L.suppress_lines and p.lines.len > 0 and cell.needsDrawableBoundary(f)) {
         var stroke_storage = std.ArrayList([]mvt.Point).empty;
         const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
+        stroke_geo = dparts;
         for (dparts) |dp| {
             if (dp.len < 2) continue;
             if (!overlaps(geomBounds(dp), tb)) continue;
