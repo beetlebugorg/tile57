@@ -225,7 +225,11 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             cur_dash_len = toFloat(nthCsv(val, 1));
             cur_width = toFloat(nthCsv(val, 2));
             cur_color = nthCsv(val, 3);
-        } else if (std.mem.eql(u8, key, "LineInstruction")) {
+        } else if (std.mem.eql(u8, key, "LineInstruction") or std.mem.eql(u8, key, "LineInstructionUnsuppressed")) {
+            // LineInstructionUnsuppressed (UpdateInformation chart-revision overlay,
+            // CHRVID02/CHRVDEL2) emits the same stroke as LineInstruction — the
+            // "Unsuppressed" suffix is a PresLib suppression flag, not a different draw.
+            // Go Reduce folds both into one case (instructions.go:301); was dropped here.
             if (cur_aug) |kind| {
                 // A figure (sector leg/arc) is current: this strokes THAT screen-space
                 // geometry with the current LineStyle, not the feature's own geometry.
@@ -518,6 +522,11 @@ test "parse line + point + text instructions" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.96) * PX_PER_MM, line.lines[0].width, 1e-6); // mm -> px (~3.63)
     try std.testing.expectEqualStrings("CHGRD", line.lines[0].color);
     try std.testing.expectEqual(@as(i64, 9), line.draw_prio);
+
+    // LineInstructionUnsuppressed (UpdateInformation overlay) strokes like LineInstruction.
+    const uns = try parse(a, "LineStyle:_simple_,,0.64,CHRVID02;LineInstructionUnsuppressed:_simple_");
+    try std.testing.expectEqual(@as(usize, 1), uns.lines.len);
+    try std.testing.expectEqualStrings("CHRVID02", uns.lines[0].color);
 
     // No DrawingPriority in the stream -> default 0.
     const nopri = try parse(a, "FontColor:CHBLK;TextInstruction:foo");
