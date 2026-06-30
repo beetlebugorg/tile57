@@ -375,7 +375,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try js.objectField("text-optional");
     try js.write(true);
     try js.endObject();
-    try textPaint(js, s.text_color, s.halo, 1.4);
+    try textPaint(js, s.text_color, s.halo, 0); // S-52: solid black, no halo
     try js.endObject();
 
     // text<sfx> — general collidable labels.
@@ -401,7 +401,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try js.objectField("text-optional");
     try js.write(true);
     try js.endObject();
-    try textPaint(js, s.text_color, s.halo, 1.4);
+    try textPaint(js, s.text_color, s.halo, 0); // S-52: solid black, no halo
     try js.endObject();
 }
 
@@ -410,12 +410,17 @@ fn textPaint(js: *Stringify, text_color: std.json.Value, halo: std.json.Value, h
     try js.beginObject();
     try js.objectField("text-color");
     try js.write(text_color);
-    try js.objectField("text-halo-color");
-    try js.write(halo);
-    try js.objectField("text-halo-width");
-    try js.write(halo_width);
-    try js.objectField("text-halo-blur");
-    try js.write(0.5);
+    // S-52/S-101 text is solid colour with FontBackgroundColor transparent (no halo) —
+    // PortrayalModel.lua:363-365. A halo is a non-spec legibility addition; omit it when
+    // width <= 0 so navaid/label text matches the official chart's solid look.
+    if (halo_width > 0) {
+        try js.objectField("text-halo-color");
+        try js.write(halo);
+        try js.objectField("text-halo-width");
+        try js.write(halo_width);
+        try js.objectField("text-halo-blur");
+        try js.write(0.5);
+    }
     try js.endObject();
 }
 
