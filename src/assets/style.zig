@@ -112,6 +112,11 @@ pub const StyleOpts = struct {
     // so all features show in-band regardless of their SCAMIN denominator (and
     // regardless of whether a manifest is present). Default off = normal gating.
     ignore_scamin: bool = false,
+    // §4 physical-scale multiplier applied to icon-size / line-width / text-size
+    // (the host's _featureSizeScale from its calibrated CSS-pixel pitch). 1.0 = the
+    // catalogue sizes verbatim (byte-identical output); other values wrap each size
+    // expression in ["*", size_scale, expr].
+    size_scale: f64 = 1.0,
 };
 
 // Precomputed, mariner-aware style expressions shared by every layer of one
@@ -130,16 +135,29 @@ const SCtx = struct {
     contour_field: std.json.Value, // DEPCNT label text-field (SAFCON01 unit)
     common: []const std.json.Value, // filters AND-ed onto every chart layer ([] = template)
     text_group: ?std.json.Value, // extra filter for text layers (null = template)
+    size_scale: f64, // §4 physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
 };
 
 // ---- layer building blocks ----------------------------------------------
 
-fn linePaint(js: *Stringify, line_color: std.json.Value, dash: ?[2]i64) !void {
+// Write a size expression scaled by the physical-scale multiplier (host §4). At the
+// default scale (1.0) the expression is written verbatim — byte-identical to the
+// pre-size_scale output (so the bundle's served style.json never drifts); otherwise
+// it is wrapped in `["*", scale, expr]`. Applies to icon-size / line-width / text-size.
+fn writeScaled(js: *Stringify, expr: anytype, scale: f64) !void {
+    if (scale == 1.0) {
+        try js.write(expr);
+    } else {
+        try js.write(.{ "*", scale, expr });
+    }
+}
+
+fn linePaint(js: *Stringify, line_color: std.json.Value, dash: ?[2]i64, scale: f64) !void {
     try js.beginObject();
     try js.objectField("line-color");
     try js.write(line_color);
     try js.objectField("line-width");
-    try js.write(.{ "coalesce", .{ "get", "width_px" }, 1 });
+    try writeScaled(js, .{ "coalesce", .{ "get", "width_px" }, 1 }, scale);
     if (dash) |d| {
         try js.objectField("line-dasharray");
         try js.write(d);
@@ -241,7 +259,7 @@ fn lineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, name: []const u8, f
     try layerHead(js, id, "line", sl);
     try applyBucket(js, filt, true, bkt, s.common, null);
     try js.objectField("paint");
-    try linePaint(js, s.line_color, dash);
+    try linePaint(js, s.line_color, dash, s.size_scale);
     try js.endObject();
 }
 
@@ -252,12 +270,12 @@ fn lineLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try lineLayer(js, s, sl, "dotted", FILT_DOTTED, .{ 1, 2 }, bkt);
 }
 
-fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value) !void {
+fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scale: f64) !void {
     try js.beginObject();
     try js.objectField("icon-image");
     try js.write(icon);
     try js.objectField("icon-size");
-    try js.write(ICON_SIZE);
+    try writeScaled(js, ICON_SIZE, scale);
     try js.objectField("icon-rotate");
     try js.write(.{ "coalesce", .{ "get", "rotation_deg" }, 0 });
     try js.objectField("icon-allow-overlap");
@@ -279,7 +297,7 @@ fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     try layerHead(js, vid, "symbol", sl);
     try applyBucket(js, .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt, s.common, null);
     try js.objectField("layout");
-    try pointLayout(js, "viewport", s.point_img);
+    try pointLayout(js, "viewport", s.point_img, s.size_scale);
     try js.endObject();
     // map-aligned (true-north)
     var nbuf: [96]u8 = undefined;
@@ -288,7 +306,7 @@ fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     try layerHead(js, nid, "symbol", sl);
     try applyBucket(js, .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }, true, bkt, s.common, null);
     try js.objectField("layout");
-    try pointLayout(js, "map", s.point_img);
+    try pointLayout(js, "map", s.point_img, s.size_scale);
     try js.endObject();
 }
 
@@ -308,7 +326,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try js.objectField("text-font");
     try js.write(FONT);
     try js.objectField("text-size");
-    try js.write(.{ "coalesce", .{ "get", "font_size_px" }, 10 });
+    try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 10 }, s.size_scale);
     try js.objectField("text-anchor");
     try js.write("top");
     try js.objectField("text-offset");
@@ -338,7 +356,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try js.objectField("text-font");
     try js.write(FONT);
     try js.objectField("text-size");
-    try js.write(.{ "coalesce", .{ "get", "font_size_px" }, 11 });
+    try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 11 }, s.size_scale);
     try js.objectField("text-anchor");
     try js.write(TEXT_ANCHOR);
     try js.objectField("symbol-sort-key");
@@ -407,7 +425,7 @@ fn complexLineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket)
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}{s}", .{ sl, bkt.suffix }), "line", sl);
     try js.objectField("paint");
-    try linePaint(js, s.line_color, null);
+    try linePaint(js, s.line_color, null, s.size_scale);
     try applyBucket(js, .{}, false, bkt, s.common, null);
     try js.endObject();
 }
@@ -427,7 +445,7 @@ fn contourLabelLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     try js.objectField("text-font");
     try js.write(FONT);
     try js.objectField("text-size");
-    try js.write(10);
+    try writeScaled(js, 10, s.size_scale);
     try js.objectField("text-max-angle");
     try js.write(30);
     try js.objectField("text-allow-overlap");
@@ -460,7 +478,7 @@ fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     try js.objectField("icon-image");
     try js.write(s.sound_img);
     try js.objectField("icon-size");
-    try js.write(ICON_SIZE);
+    try writeScaled(js, ICON_SIZE, s.size_scale);
     try js.objectField("icon-allow-overlap");
     try js.write(false);
     try js.endObject();
@@ -553,6 +571,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         .contour_field = try chartstyle.contourLabelField(b, &m),
         .common = if (filters_on) try chartstyle.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
         .text_group = if (filters_on) try chartstyle.textGroupFilter(b, &m) else null,
+        .size_scale = opts.size_scale,
     };
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -688,6 +707,7 @@ pub fn buildFromTemplate(
         .enabled_bands = enabled_bands,
         .now_unix = now_unix,
         .ignore_scamin = m.ignore_scamin,
+        .size_scale = m.size_scale,
     };
     if (parsed.value == .object) {
         const root = parsed.value.object;
@@ -785,6 +805,36 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     defer a.free(out_nm_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "log2") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "#sm") == null);
+}
+
+test "styleJson: size_scale wraps icon/line/text sizes in a multiplier" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const base = StyleOpts{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+    };
+
+    // Default scale 1.0: sizes written verbatim, no multiplier wrapper.
+    const def = try styleJson(a, base);
+    defer a.free(def);
+    try std.testing.expect(std.mem.indexOf(u8, def, "\"line-width\":[\"coalesce\",[\"get\",\"width_px\"],1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def, "\"line-width\":[\"*\"") == null);
+
+    // Scaled: icon-size / line-width / text-size each wrap in ["*", scale, expr].
+    var scaled = base;
+    scaled.size_scale = 2.0;
+    const sc = try styleJson(a, scaled);
+    defer a.free(sc);
+    try std.testing.expect(std.mem.indexOf(u8, sc, "\"line-width\":[\"*\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, "\"icon-size\":[\"*\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sc, "\"text-size\":[\"*\"") != null);
+    // The unscaled line-width form is gone.
+    try std.testing.expect(std.mem.indexOf(u8, sc, "\"line-width\":[\"coalesce\"") == null);
 }
 
 // ---- single-builder (buildFromTemplate) tests — ported from the retired

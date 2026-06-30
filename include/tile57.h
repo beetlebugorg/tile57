@@ -246,6 +246,9 @@ typedef struct {
     bool ignore_scamin; /* host ?ignoreScamin debug toggle: drop SCAMIN scale-gating
                          * so every feature shows in-band (the *_scamin layers become
                          * a single ungated layer). NOT an S-52 setting. Default false. */
+    double size_scale;  /* physical-scale multiplier (host _featureSizeScale) applied to
+                         * icon-size / line-width / text-size. NOT an S-52 setting.
+                         * 1.0 = catalogue sizes verbatim. tile57_mariner_defaults sets 1.0. */
 } tile57_mariner;
 
 /* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.

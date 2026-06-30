@@ -58,3 +58,28 @@ func TestIgnoreScamin(t *testing.T) {
 		t.Fatalf("ignore_scamin style should drop the SCAMIN zoom-gate (log2); still present")
 	}
 }
+
+// TestSizeScale verifies the physical-scale multiplier wraps the size expressions
+// through the full C ABI: at the default 1.0 line-width is the verbatim coalesce
+// expression; a non-1.0 scale wraps it (and icon/text sizes) in ["*", scale, expr].
+func TestSizeScale(t *testing.T) {
+	build := func(scale float64) string {
+		m := MarinerDefaults()
+		m.SizeScale = scale
+		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
+			"glyphs/{fontstack}/{range}.pbf", m, nil)
+		if err != nil {
+			t.Fatalf("Style(scale=%v): %v", scale, err)
+		}
+		return string(style)
+	}
+	if d := build(1.0); !strings.Contains(d, `"line-width":["coalesce",["get","width_px"],1]`) {
+		t.Fatalf("default scale should emit the verbatim line-width expression")
+	}
+	s := build(2.0)
+	for _, want := range []string{`"line-width":["*"`, `"icon-size":["*"`, `"text-size":["*"`} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("scaled style missing wrapped size expression %q", want)
+		}
+	}
+}

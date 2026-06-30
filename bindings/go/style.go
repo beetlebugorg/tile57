@@ -66,6 +66,7 @@ type Mariner struct {
 	DateDependent, HighlightDateDependent                   bool
 	DateView                                                string // "YYYYMMDD" or "" (today)
 	IgnoreScamin                                            bool   // ?ignoreScamin: drop SCAMIN gating, show all in-band
+	SizeScale                                               float64 // physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
 }
 
 // MarinerDefaults returns the canonical default mariner settings from libtile57.
@@ -172,6 +173,7 @@ func (m Mariner) toC() C.tile57_mariner {
 		c.date_view[i] = C.char(m.DateView[i])
 	}
 	c.ignore_scamin = C.bool(m.IgnoreScamin)
+	c.size_scale = C.double(m.SizeScale)
 	return c
 }
 
@@ -201,6 +203,7 @@ func marinerFromC(c *C.tile57_mariner) Mariner {
 		DateDependent:              bool(c.date_dependent),
 		HighlightDateDependent:     bool(c.highlight_date_dependent),
 		IgnoreScamin:               bool(c.ignore_scamin),
+		SizeScale:                  float64(c.size_scale),
 	}
 	var dv []byte
 	for i := 0; i < len(c.date_view); i++ {

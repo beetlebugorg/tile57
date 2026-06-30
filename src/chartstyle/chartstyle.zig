@@ -85,6 +85,12 @@ pub const MarinerSettings = struct {
     // the style builder. When true, styleJson drops SCAMIN scale-gating so every
     // feature shows in-band regardless of its 1:N min-display-scale. Default off.
     ignore_scamin: bool = false,
+
+    // -- physical-scale multiplier (host §4 _featureSizeScale) — NOT an S-52 setting;
+    // a render-time transport flag applied to icon-size / line-width / text-size so
+    // the host can match TRUE physical size from its calibrated CSS-pixel pitch.
+    // 1.0 = catalogue sizes verbatim (byte-identical output).
+    size_scale: f64 = 1.0,
 };
 
 // ---- expression DSL ---------------------------------------------------------
