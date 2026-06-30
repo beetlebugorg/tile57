@@ -366,6 +366,22 @@ pub fn build(b: *std.Build) void {
     catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
     catalog_embed.addImport("colorprofile_registry", embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml"));
 
+    // The chart-bundle pipeline as a library module (asset emitters now; bakeRoot +
+    // bakeBundle next), so the CLI is a thin wrapper and the C ABI can build the same
+    // bundle. libc (the sprite atlas builder). See src/bundle.zig.
+    const bundle_mod = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .target = bake_target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = bake_engine },
+            .{ .name = "assets", .module = assets_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+        },
+    });
+
     const bake = b.addExecutable(.{
         .name = "tile57",
         .root_module = b.createModule(.{
@@ -378,6 +394,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "assets", .module = assets_mod },
                 .{ .name = "sprite", .module = sprite_mod },
                 .{ .name = "catalog", .module = catalog_embed },
+                .{ .name = "bundle", .module = bundle_mod },
             },
         }),
     });

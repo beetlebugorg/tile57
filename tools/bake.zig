@@ -19,7 +19,7 @@ const std = @import("std");
 const engine = @import("engine");
 const assets = @import("assets");
 const sprite = @import("sprite");
-const embedded_assets = @import("catalog"); // S-101 portrayal assets embedded into the binary
+const bundle = @import("bundle"); // chart-bundle pipeline (asset emitters etc.) — the lib owns it
 
 const VERSION = "tile57 0.1.0";
 
@@ -340,10 +340,6 @@ pub fn main(init: std.process.Init) !void {
 
 // ---- assets / bundle ----------------------------------------------------
 
-// colorProfile.xml relative to a PortrayalCatalog directory. The baker's default
-// rules dir is <catalog>/Rules; ColorProfiles is its sibling.
-const COLOR_PROFILE_REL = "ColorProfiles/colorProfile.xml";
-
 // Resolve the PortrayalCatalog directory: explicit arg, else "" — which tells the
 // asset emitters below to use the catalogue embedded in the binary (catalog_embed
 // / catalog), so the CLI needs no on-disk catalogue. A non-empty path reads the
@@ -358,231 +354,21 @@ fn catalogLabel(dir: []const u8) []const u8 {
     return if (dir.len == 0) "embedded" else dir;
 }
 
-// ---- embedded catalogue assets (the `dir == ""` path of the readers) ---------
-
-// Embedded Symbols/*.svg as sprite sources (id = file stem). Sorted at build time.
-fn embeddedSymbols(a: std.mem.Allocator) ![]sprite.SvgSrc {
-    const out = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
-    for (embedded_assets.symbols, 0..) |e, i| out[i] = .{ .id = e.name, .svg = e.bytes };
-    return out;
-}
-
-// Embedded AreaFills/*.xml as area-fill sources (id = file stem).
-fn embeddedFills(a: std.mem.Allocator) ![]sprite.AreaFillSrc {
-    const out = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
-    for (embedded_assets.areafills, 0..) |e, i| out[i] = .{ .id = e.name, .xml = e.bytes };
-    return out;
-}
-
-// Embedded LineStyles/*.xml as line-style sources (id = file stem).
-fn embeddedLinestyles(a: std.mem.Allocator) ![]assets.LineStyleSrc {
-    const out = try a.alloc(assets.LineStyleSrc, embedded_assets.linestyles.len);
-    for (embedded_assets.linestyles, 0..) |e, i| out[i] = .{ .id = e.name, .xml = e.bytes };
-    return out;
-}
-
-// Build the complex-line tessellation table (id -> LsInfo) from `srcs` and register
-// it with s57_mvt before baking, so a named (symbolised) linestyle is drawn as its
-// real dash runs + embedded symbols instead of a generic dashed stroke. Mirrors Go
-// lsInfoFromCatalog; mm geometry is converted at the PresLib feature scale. Best
-// effort — a malformed/short style is simply skipped. `gpa` outlives the bake.
-fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const assets.LineStyleSrc) void {
-    const px = engine.s57_mvt.LINESTYLE_PX_PER_MM;
-    for (srcs) |s| {
-        const parsed = assets.parseLineStyle(gpa, s.xml) catch continue;
-        const period = parsed.interval_length * px;
-        if (period < 0.5) continue; // no interval to tile (pure-symbol style)
-        var runs = std.ArrayList([2]f64).empty;
-        for (parsed.dashes) |d| {
-            const lo = d.start * px;
-            const hi = (d.start + d.length) * px;
-            if (hi - lo > 1e-6) runs.append(gpa, .{ lo, hi }) catch {};
-        }
-        var syms = std.ArrayList(engine.s57_mvt.LsSym).empty;
-        for (parsed.symbols) |sym| syms.append(gpa, .{ .name = sym.reference, .offset_px = sym.position * px }) catch {};
-        var width = parsed.pen_width * px;
-        if (width < 0.6) width = 0.9; // S-52 minimum pen
-        engine.s57_mvt.registerLinestyle(gpa, s.id, .{
-            .period_px = period,
-            .on_runs = runs.items,
-            .symbols = syms.items,
-            .color_token = parsed.pen_color,
-            .width_px = width,
-        });
-    }
-}
-
-// Embedded palette stylesheet bytes by file name (e.g. "daySvgStyle.css"); the
-// lookup is by stem, so callers can pass a bare name. Null if not embedded.
-fn embeddedCss(css_name: []const u8) ?[]const u8 {
-    const stem = std.fs.path.stem(std.fs.path.basename(css_name));
-    for (embedded_assets.css) |e| {
-        if (std.mem.eql(u8, e.name, stem)) return e.bytes;
-    }
-    return null;
-}
-
-// The single embedded ColorProfiles/colorProfile.xml, or null if absent.
-fn embeddedColorProfile() ?[]const u8 {
-    for (embedded_assets.colorprofile) |e| return e.bytes;
-    return null;
-}
-
-// Read the palette CSS: from the embedded catalogue (catalog_dir == "") or from
-// <catalog_dir>/Symbols/<css_name> on disk.
-fn readCss(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8) ![]const u8 {
-    if (catalog_dir.len == 0) return embeddedCss(css_name) orelse error.MissingCss;
-    const css_path = try std.fs.path.join(a, &.{ catalog_dir, SYMBOLS_REL, css_name });
-    return std.Io.Dir.cwd().readFileAlloc(io, css_path, a, .unlimited);
-}
-
-// Emit colortables.json from a catalog dir into out_dir. Returns the bytes (arena
-// owned) so `bundle` can reuse them without re-reading. Shared by assets/bundle.
-fn colorTablesBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]u8 {
-    const xml = if (catalog_dir.len == 0)
-        (embeddedColorProfile() orelse return error.MissingColorProfile)
-    else blk: {
-        const xml_path = try std.fs.path.join(a, &.{ catalog_dir, COLOR_PROFILE_REL });
-        break :blk try std.Io.Dir.cwd().readFileAlloc(io, xml_path, a, .unlimited);
-    };
-    return assets.colorTablesJson(a, xml);
-}
-
-fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
-    const json = try colorTablesBytes(io, a, catalog_dir);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json });
-    return json;
-}
-
-// LineStyles/*.xml live under a PortrayalCatalog dir, alongside ColorProfiles.
-const LINESTYLES_REL = "LineStyles";
-
-// Read every LineStyles/*.xml under catalog_dir and emit linestyles.json (dash
-// patterns + placed symbols). Returns the bytes (arena owned). Shared by
-// assets/bundle. Mirrors the Go oracle's EmitS101 linestyles step.
-fn linestylesBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]u8 {
-    if (catalog_dir.len == 0) return assets.linestylesJson(a, try embeddedLinestyles(a));
-    const ls_dir_path = try std.fs.path.join(a, &.{ catalog_dir, LINESTYLES_REL });
-    var dir = try std.Io.Dir.cwd().openDir(io, ls_dir_path, .{ .iterate = true });
-    defer dir.close(io);
-
-    var srcs = std.ArrayList(assets.LineStyleSrc).empty;
-    var walker = try dir.walk(a);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, ".xml")) continue;
-        const path = try a.dupe(u8, entry.path);
-        const xml = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
-        const id = std.fs.path.stem(std.fs.path.basename(path));
-        try srcs.append(a, .{ .id = id, .xml = xml });
-    }
-    return assets.linestylesJson(a, srcs.items);
-}
-
-fn emitLinestyles(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
-    const json = try linestylesBytes(io, a, catalog_dir);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = json });
-    return json;
-}
-
-// Symbols/*.svg live under a PortrayalCatalog dir; the palette stylesheet
-// (daySvgStyle.css etc.) lives alongside them.
-const SYMBOLS_REL = "Symbols";
-const DEFAULT_CSS = "daySvgStyle.css";
-
-// Read every Symbols/*.svg + the palette CSS and build the sprite atlas
-// (sprite.json + sprite.png). Mirrors the Go oracle's SpriteAtlasS101FS.
-fn spriteAtlasBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8) !sprite.Atlas {
-    const srcs = try readSymbols(io, a, catalog_dir);
-    const css = try readCss(io, a, catalog_dir, css_name);
-    return sprite.spriteAtlas(a, srcs, css);
-}
-
-fn emitSprites(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, json_path: []const u8, png_path: []const u8) !sprite.Atlas {
-    const atlas = try spriteAtlasBytes(io, a, catalog_dir, css_name);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = atlas.json });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = png_path, .data = atlas.png });
-    return atlas;
-}
-
-const AREAFILLS_REL = "AreaFills";
-
-// Read every Symbols/*.svg into a list (shared by the sprite + pattern atlases).
-fn readSymbols(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]sprite.SvgSrc {
-    if (catalog_dir.len == 0) return embeddedSymbols(a);
-    const sym_dir_path = try std.fs.path.join(a, &.{ catalog_dir, SYMBOLS_REL });
-    var dir = try std.Io.Dir.cwd().openDir(io, sym_dir_path, .{ .iterate = true });
-    defer dir.close(io);
-    var srcs = std.ArrayList(sprite.SvgSrc).empty;
-    var walker = try dir.walk(a);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, ".svg")) continue;
-        const path = try a.dupe(u8, entry.path);
-        const svg = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
-        try srcs.append(a, .{ .id = std.fs.path.stem(std.fs.path.basename(path)), .svg = svg });
-    }
-    return srcs.items;
-}
-
-// Read AreaFills/*.xml + Symbols/*.svg + the palette CSS and build the pattern
-// atlas (patterns.json + patterns.png). Mirrors the Go oracle's PatternAtlasS101FS.
-fn patternAtlasBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8) !sprite.Atlas {
-    const fills = try readFills(io, a, catalog_dir);
-    const symbols = try readSymbols(io, a, catalog_dir);
-    const css = try readCss(io, a, catalog_dir, css_name);
-    return sprite.patternAtlas(a, fills, symbols, css);
-}
-
-fn emitPatterns(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, json_path: []const u8, png_path: []const u8) !sprite.Atlas {
-    const atlas = try patternAtlasBytes(io, a, catalog_dir, css_name);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = atlas.json });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = png_path, .data = atlas.png });
-    return atlas;
-}
-
-// Read every AreaFills/*.xml under catalog_dir (shared by pattern + sprite-mln).
-fn readFills(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]sprite.AreaFillSrc {
-    if (catalog_dir.len == 0) return embeddedFills(a);
-    const af_dir_path = try std.fs.path.join(a, &.{ catalog_dir, AREAFILLS_REL });
-    var dir = try std.Io.Dir.cwd().openDir(io, af_dir_path, .{ .iterate = true });
-    defer dir.close(io);
-    var fills = std.ArrayList(sprite.AreaFillSrc).empty;
-    var walker = try dir.walk(a);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, ".xml")) continue;
-        const path = try a.dupe(u8, entry.path);
-        const xml = dir.readFileAlloc(io, path, a, .unlimited) catch continue;
-        try fills.append(a, .{ .id = std.fs.path.stem(std.fs.path.basename(path)), .xml = xml });
-    }
-    return fills.items;
-}
-
-// Build the MapLibre sprite (sprite-mln) directly from the catalogue's Symbols +
-// AreaFills + palette CSS. Mirrors the old scripts/build_sprite.py, in Zig.
-fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, soundings: []const []const u8) !sprite.Atlas {
-    const symbols = try readSymbols(io, a, catalog_dir);
-    const fills = try readFills(io, a, catalog_dir);
-    const css = try readCss(io, a, catalog_dir, css_name);
-    return sprite.spriteMln(a, symbols, fills, css, soundings);
-}
-
-// Emit sprite-mln.{json,png} + identical @2x copies (MapLibre requests @2x on
-// HiDPI; a missing @2x sheet fails the whole sprite load).
-fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, out_dir: []const u8, base: []const u8, soundings: []const []const u8) !sprite.Atlas {
-    const atlas = try spriteMlnBytes(io, a, catalog_dir, css_name, soundings);
-    for ([_][]const u8{ "", "@2x" }) |suffix| {
-        const jn = try std.fmt.allocPrint(a, "{s}{s}.json", .{ base, suffix });
-        const pn = try std.fmt.allocPrint(a, "{s}{s}.png", .{ base, suffix });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, jn }), .data = atlas.json });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, pn }), .data = atlas.png });
-    }
-    return atlas;
-}
+// ---- assets / bundle emitters: moved to src/bundle.zig (the lib owns the pipeline;
+// the CLI is a thin wrapper). Aliased so the command handlers below are unchanged. --
+const emitColorTables = bundle.emitColorTables;
+const emitLinestyles = bundle.emitLinestyles;
+const emitSprites = bundle.emitSprites;
+const emitPatterns = bundle.emitPatterns;
+const emitSpriteMln = bundle.emitSpriteMln;
+const colorTablesBytes = bundle.colorTablesBytes;
+const linestylesBytes = bundle.linestylesBytes;
+const spriteAtlasBytes = bundle.spriteAtlasBytes;
+const patternAtlasBytes = bundle.patternAtlasBytes;
+const spriteMlnBytes = bundle.spriteMlnBytes;
+const registerLinestyles = bundle.registerLinestyles;
+const embeddedLinestyles = bundle.embeddedLinestyles;
+const DEFAULT_CSS = bundle.DEFAULT_CSS;
 
 /// `sprite-mln <portrayal-catalog-dir> -o <out-dir> [--css daySvgStyle.css]` —
 /// emit the MapLibre-ready sprite (sprite-mln.{json,png} + @2x): pivot-centred
