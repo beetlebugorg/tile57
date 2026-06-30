@@ -14,12 +14,11 @@ pub const api = @import("tile57.zig"); // the public Zig API (Source/bake/style)
 pub const capi = @import("capi.zig");
 pub const portray = @import("portray");
 pub const catalogue = @import("s100").catalogue;
-pub const bundle = @import("bundle"); // the chart-bundle pipeline (bake_bundle), for the C ABI
+pub const bundle = @import("bundle"); // the chart-bundle pipeline (tile57_bake_bundle rides on capi)
 
 comptime {
     _ = api; // compile-check the public Zig root in the libc build
-    _ = capi; // force the C ABI export fns into the archive
+    _ = capi; // force the C ABI export fns into the archive (incl. tile57_bake_bundle -> bundle)
     _ = portray; // force the tgp_* accessors into the archive
     _ = catalogue; // force the tgc_* accessors into the archive
-    _ = bundle; // compile-check the bundle pipeline in the host/libc build (C ABI next)
 }

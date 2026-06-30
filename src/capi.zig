@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const source = @import("source.zig");
+const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
 const chartstyle = @import("chartstyle");
 const assets = @import("assets");
 const sprite = @import("sprite");
@@ -144,6 +145,57 @@ export fn tile57_bake_cells(
         return 1;
     }
     return 0;
+}
+
+// Manifest generator string for bake_bundle (matches the CLI's "tile57 0.1.0").
+const generator = "tile57 " ++ version_string;
+
+/// Bake a single cell.000 OR a whole ENC_ROOT directory (on-disk paths) into a
+/// self-contained chart bundle written under out_dir — the SAME package the
+/// `tile57 bake … -o out/` CLI emits (tiles/chart.pmtiles with scamin+vector_layers
+/// metadata + assets/{colortables,linestyles}.json + sprite-mln + per-scheme
+/// style-{day,dusk,night}.json + manifest.json). rules_dir/catalog_dir NULL or ""
+/// use the catalogue embedded in the library. created NULL/"" leaves the manifest
+/// "created" unset (else an ISO8601 stamp). progress may be NULL (the built-in
+/// console progress is used). out_cell_count / out_bbox (w,s,e,n) are optional.
+/// 1=ok, 0=nothing covered (no geometry), -1=error. See tile57.h.
+export fn tile57_bake_bundle(
+    input: [*:0]const u8,
+    out_dir: [*:0]const u8,
+    rules_dir: ?[*:0]const u8,
+    catalog_dir: ?[*:0]const u8,
+    created: ?[*:0]const u8,
+    minzoom: u8,
+    maxzoom: u8,
+    progress: BakeProgress,
+    user: ?*anyopaque,
+    out_cell_count: ?*u32,
+    out_bbox: ?*[4]f64,
+) callconv(.c) c_int {
+    // The bundle pipeline does filesystem I/O (read ENC, write the bundle dir); the
+    // lib has no std.process.Init, so stand up a threaded std.Io for the call.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Scratch arena: bakeBundle's allocations (paths, manifest, styles, cell names)
+    // are all consumed by the on-disk writes, so they're freed when this returns.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const res = bundle.bakeBundle(io, arena.allocator(), .{
+        .input = std.mem.span(input),
+        .out_dir = std.mem.span(out_dir),
+        .rules_dir = spanOpt(rules_dir) orelse "",
+        .catalog_dir = spanOpt(catalog_dir) orelse "",
+        .generator = generator,
+        .created = spanOpt(created) orelse "",
+        .minzoom = minzoom,
+        .maxzoom = maxzoom,
+        .progress = progress,
+        .progress_user = user,
+    }) catch |err| return if (err == error.NoGeometry) 0 else -1;
+    if (out_cell_count) |p| p.* = @intCast(res.cell_count);
+    if (out_bbox) |p| p.* = res.bounds;
+    return 1;
 }
 
 /// The resolved backend format (after a TILE57_FORMAT_AUTO sniff).

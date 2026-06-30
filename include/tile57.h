@@ -137,6 +137,28 @@ int tile57_bake_cells(
     tile57_bake_progress progress, void *user,
     uint8_t **out, size_t *out_len);
 
+/* Bake a single cell.000 OR a whole ENC_ROOT directory (`input`, an on-disk path)
+ * into a self-contained chart bundle written under `out_dir` — the SAME package the
+ * `tile57 bake … -o out_dir/` CLI emits:
+ *   out_dir/tiles/chart.pmtiles   (PMTiles with scamin + vector_layers metadata)
+ *   out_dir/assets/colortables.json, linestyles.json, sprite-mln{,@2x}.{json,png}
+ *   out_dir/assets/style-{day,dusk,night}.json   (per-scheme, SCAMIN-bucketed)
+ *   out_dir/manifest.json         (schema_version, bbox, cells, styles)
+ * The host registers chart.pmtiles and serves style-*.json verbatim. `rules_dir`
+ * and `catalog_dir` NULL or "" use the catalogue embedded in the library (no
+ * on-disk catalogue needed); a non-empty path overrides from disk. `created` NULL or
+ * "" leaves the manifest "created" unset, else stamps it (e.g. an ISO8601 string).
+ * minzoom/maxzoom clamp the per-cell bands (pass 0/24 for no clamp). `progress` may
+ * be NULL (a built-in console progress is used). `out_cell_count` and `out_bbox`
+ * (filled west,south,east,north) are optional — pass NULL to skip. Returns 1 on
+ * success, 0 if nothing was covered (no geometry), -1 on error. */
+int tile57_bake_bundle(
+    const char *input, const char *out_dir,
+    const char *rules_dir, const char *catalog_dir, const char *created,
+    uint8_t minzoom, uint8_t maxzoom,
+    tile57_bake_progress progress, void *user,
+    uint32_t *out_cell_count, double *out_bbox);
+
 /* The resolved backend format (meaningful after a TILE57_FORMAT_AUTO open). */
 tile57_format tile57_source_format(tile57_source *src);
 

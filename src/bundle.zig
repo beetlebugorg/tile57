@@ -273,6 +273,10 @@ pub const BakeOpts = struct {
     lru: usize = 64, // lazy-bake tuning: parsed cells held resident
     super_dz: u8 = 3, // lazy-bake tuning: spatial super-tile depth
     format: engine.s57_mvt.TileFormat = .mvt,
+    // Progress callback (stage 0 = loading cells, 1 = baking tiles). null = the
+    // built-in console progress (stderr), matching the CLI; a host passes its own.
+    progress: engine.bake_enc.Progress = null,
+    progress_user: ?*anyopaque = null,
 };
 
 /// What `bakeBundle` produced: the baked cell count + the union bbox [w,s,e,n].
@@ -289,7 +293,7 @@ pub fn bakeBundle(io: std.Io, a: std.mem.Allocator, opts: BakeOpts) !BakeResult 
     const tiles_dir = try std.fs.path.join(a, &.{ opts.out_dir, "tiles" });
     try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
     const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
-    const rb = try bakeRoot(io, a, opts.input, tiles_path, opts.rules_dir, opts.minzoom, opts.maxzoom, opts.lru, opts.super_dz, true, opts.format);
+    const rb = try bakeRoot(io, a, opts.input, tiles_path, opts.rules_dir, opts.minzoom, opts.maxzoom, opts.lru, opts.super_dz, true, opts.format, opts.progress, opts.progress_user);
     const bounds = rb.bounds;
     const cells = rb.cells;
     const snd_stacks = rb.sounds; // sounding glyph stacks for sprite-mln
@@ -605,7 +609,10 @@ fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
 // StreamWriter — only the compressed data + small directory are held, not the raw
 // tiles). Returns the union bounds + cell stems + sounding stacks + SCAMIN denoms.
 // error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
+    // Progress sink: the caller's callback, else the built-in console writer (the CLI
+    // path, byte-identical to before). Both only touch stderr — never the tile bytes.
+    const prog: engine.bake_enc.Progress = progress orelse cliProgress;
     // smp_allocator (Zig's fast thread-safe general-purpose allocator), not
     // page_allocator: the bake makes many small, short-lived allocations across
     // worker threads (per-tile gzip results, cell reads, index lists). page_allocator
@@ -845,7 +852,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     .bounds = if (p) |pp| pp.bounds else entries[ci].bbox,
                 }) catch {};
             };
-            baker.bakeBand(band, subset.items, .{ .zs = zs, .sx = sx, .sy = sy }, cliProgress, null) catch {};
+            baker.bakeBand(band, subset.items, .{ .zs = zs, .sx = sx, .sy = sy }, prog, progress_user) catch {};
 
             // Evict least-recently-used GEOMETRY beyond the budget (never this
             // super-tile's, which carry the current tick). Portrayal stays resident.
@@ -893,7 +900,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             .{ @tagName(band), entries.len, stkeys.len, baker.count, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(entries.len, 1))), band_secs },
         );
         done_cells += entries.len;
-        cliProgress(null, 0, done_cells, total_cells);
+        if (prog) |cb| cb(progress_user, 0, done_cells, total_cells);
     }
 
     // Assemble out_path = prefix (header + directory + metadata) ++ the data
