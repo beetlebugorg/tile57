@@ -775,6 +775,73 @@ fn labelPoint(a: Allocator, cell: s57.Cell, fi: usize, geo_parts: [][]s57.LonLat
     return s57.areaRepresentativePoint(a, geo_parts);
 }
 
+/// Anchor for a centred label / point symbol / info marker on a line or area
+/// feature, mirroring the oracle's textAnchor (build.go:145-162): a LINE anchors
+/// at the MIDDLE VERTEX of its flat FSPT-order coordinate chain (g.line[len/2]);
+/// an AREA at its representative pole-of-inaccessibility point (labelPoint). A
+/// point feature anchors at its node and never reaches here. `geo_parts` is the
+/// assembled line/area geometry. The line case indexes the concatenation of the
+/// parts: lineGeometryParts splits only at genuine discontinuities (where no node
+/// is shared), so the total vertex count and ordering match the oracle's single
+/// constructLineStringGeometry sequence — previously a line was polylabelled like
+/// an area, drifting its label/symbol off the line.
+fn featureAnchor(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo_parts: [][]s57.LonLat) ?s57.LonLat {
+    if (f.prim == 2) return lineMidVertex(geo_parts);
+    return labelPoint(a, cell, fi, geo_parts);
+}
+
+/// The middle vertex of a line's flat FSPT-order coordinate chain — the oracle's
+/// textAnchor line case, g.line[len/2]. `geo_parts` is that chain split only at
+/// genuine discontinuities (no node is shared across a split), so the concatenated
+/// vertex count + ordering match the oracle's single constructLineStringGeometry
+/// sequence; walk the parts to the global middle index.
+fn lineMidVertex(geo_parts: [][]s57.LonLat) ?s57.LonLat {
+    var total: usize = 0;
+    for (geo_parts) |p| total += p.len;
+    if (total == 0) return null;
+    var mid = total / 2;
+    for (geo_parts) |p| {
+        if (mid < p.len) return p[mid];
+        mid -= p.len;
+    }
+    return null; // unreachable: mid < total
+}
+
+test "lineMidVertex: middle vertex of the concatenated FSPT chain" {
+    const v = struct {
+        fn f(i: i32) s57.LonLat {
+            return .{ .lon_e7 = i, .lat_e7 = i };
+        }
+    }.f;
+    {
+        var empty: [0][]s57.LonLat = .{};
+        try std.testing.expect(lineMidVertex(&empty) == null);
+        var ep: [0]s57.LonLat = .{};
+        var one_empty = [_][]s57.LonLat{&ep};
+        try std.testing.expect(lineMidVertex(&one_empty) == null);
+    }
+    // Single part, 5 vertices -> index 2.
+    {
+        var p0 = [_]s57.LonLat{ v(0), v(1), v(2), v(3), v(4) };
+        var parts = [_][]s57.LonLat{&p0};
+        try std.testing.expectEqual(@as(i32, 2), lineMidVertex(&parts).?.lon_e7);
+    }
+    // Two parts (3 + 2 = 5) -> global index 2 is the last vertex of part 0.
+    {
+        var p0 = [_]s57.LonLat{ v(0), v(1), v(2) };
+        var p1 = [_]s57.LonLat{ v(3), v(4) };
+        var parts = [_][]s57.LonLat{ &p0, &p1 };
+        try std.testing.expectEqual(@as(i32, 2), lineMidVertex(&parts).?.lon_e7);
+    }
+    // Two parts (2 + 3 = 5) -> global index 2 is the first vertex of part 1.
+    {
+        var p0 = [_]s57.LonLat{ v(0), v(1) };
+        var p1 = [_]s57.LonLat{ v(2), v(3), v(4) };
+        var parts = [_][]s57.LonLat{ &p0, &p1 };
+        try std.testing.expectEqual(@as(i32, 2), lineMidVertex(&parts).?.lon_e7);
+    }
+}
+
 /// True when `variant` is a usable display-variant stream that genuinely differs
 /// from the default `base` stream — i.e. this feature's portrayal actually changes
 /// under the override, so it needs a two-pass (rank 0/1) split. An absent, errored,
@@ -1112,12 +1179,13 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         }
     };
 
-    // Area / line labels (TextInstruction): placed at the area representative
-    // point (centre of gravity; see areaRepresentativePoint). Without this only
-    // point-feature labels show, so area/channel/place names were missing.
+    // Area / line labels (TextInstruction): placed at the feature's text anchor —
+    // an area's representative point (centre of gravity; see areaRepresentativePoint),
+    // a line's middle vertex (see featureAnchor). Without this only point-feature
+    // labels show, so area/channel/place names were missing.
     // (suppress_points: a finer band covers the whole tile — drop coarse labels.)
     if (!L.suppress_points and p.texts.len > 0) {
-        if (labelPoint(a, cell, fi, geo_parts)) |rp| {
+        if (featureAnchor(a, cell, f, fi, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
@@ -1135,12 +1203,12 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
     }
 
     // Point symbols on a LINE/AREA feature (PointInstruction). Go emits these at the
-    // area representative point (CentreOnArea) or along a line; place them at the rep
-    // point so centred-area marks (anchorage, restricted-area/entry, marine farm, TSS
-    // arrows) aren't dropped — previously p.points was only emitted for prim==1.
-    // (suppress_points: a finer band covers the whole tile — drop coarse symbols.)
+    // feature's anchor (CentreOnArea → area rep point; a line → its middle vertex);
+    // place them there so centred-area marks (anchorage, restricted-area/entry, marine
+    // farm, TSS arrows) aren't dropped — previously p.points was only emitted for
+    // prim==1. (suppress_points: a finer band covers the whole tile — drop coarse symbols.)
     if (!L.suppress_points and p.points.len > 0) {
-        if (labelPoint(a, cell, fi, geo_parts)) |rp| {
+        if (featureAnchor(a, cell, f, fi, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 const parts = try a.alloc([]const mvt.Point, 1);
@@ -1897,7 +1965,7 @@ fn appendCellFeatures(
                 cell.pointGeometry(f)
             else rpblk: {
                 const gp = featureParts(a, cell.*, geo, fi, f) catch break :rpblk null;
-                break :rpblk labelPoint(a, cell.*, fi, gp);
+                break :rpblk featureAnchor(a, cell.*, f, fi, gp);
             };
             if (rp) |p| {
                 if (p.lon() >= tb[0] and p.lon() <= tb[2] and p.lat() >= tb[1] and p.lat() <= tb[3]) {
