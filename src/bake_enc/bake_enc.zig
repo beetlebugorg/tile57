@@ -110,8 +110,15 @@ pub fn cacheGeoForBand(band: Band) bool {
 /// (reset each band): done = tiles baked in the current band, total = the band's
 /// planned tile count when the caller set Baker.band_total (else 0 = "unknown", the
 /// pre-host-§3 behaviour). The caller (bundle bake-root) sets band_base/band_total
-/// per band so a host import UI can show a per-band percentage. C ABI safe.
-pub const Progress = ?*const fn (ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void;
+/// per band so a host import UI can show a per-band percentage.
+///
+/// `band_index`/`band_count` (host §3 band label) locate the current band among the
+/// bands actually being baked (0-based index, count = how many bands have cells), so
+/// the host can show "band 3/6"; `band_name` is its navigational-purpose name
+/// ("berthing"…"overview", a static NUL-terminated string), or null for stage 0
+/// (loading spans all bands). The caller sets Baker.band_index/band_count per band.
+/// C ABI safe.
+pub const Progress = ?*const fn (ctx: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
 
 fn lonLatToTile(lon: f64, lat: f64, z: u8) [2]u32 {
     const w = tile.lonLatToWorld(lon, lat); // normalised [0,1], y down
@@ -194,6 +201,9 @@ const TileGenCtx = struct {
     base: usize = 0, // self.count at this super-tile's start (cumulative)
     band_base: usize = 0, // self.count at the band's start (for the per-band done)
     band_total: usize = 0, // the band's planned tile total (0 = unknown)
+    band_index: u8 = 0, // 0-based ordinal of the current band among baking bands
+    band_count: u8 = 0, // number of bands being baked (for "band i/n")
+    band_name: ?[*:0]const u8 = null, // the band's navigational-purpose name
     done: ?*std.atomic.Value(usize) = null,
 
     fn gen(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
@@ -217,7 +227,7 @@ const TileGenCtx = struct {
             // Per-band tile bar: done = tiles done in this band so far, total = the
             // band's planned tile count (host §3). Live updates from inside the
             // parallel batch so a big super-tile shows movement.
-            if (c.progress) |cb| if (n % 1024 == 0) cb(c.pctx, 1, (c.base - c.band_base) + n, c.band_total);
+            if (c.progress) |cb| if (n % 1024 == 0) cb(c.pctx, 1, (c.base - c.band_base) + n, c.band_total, c.band_index, c.band_count, c.band_name);
         }
     }
 };
@@ -253,6 +263,11 @@ pub const Baker = struct {
     // plannedTiles). band_total 0 => "unknown" (callback reports total 0, as before).
     band_base: usize = 0,
     band_total: usize = 0,
+    // Band label (host §3): the caller sets these per band so the progress callback
+    // can report "band <index+1>/<count> <name>". band_name comes from @tagName(band)
+    // inside bakeBand; index/count are the ordinal among bands that actually bake.
+    band_index: u8 = 0,
+    band_count: u8 = 0,
 
     pub fn init(gpa: std.mem.Allocator, minzoom: u8, maxzoom: u8, sink: TileSink) Baker {
         return .{
@@ -384,8 +399,11 @@ pub const Baker = struct {
         defer self.gpa.free(results);
         @memset(results, null);
 
+        // The band's navigational-purpose name for the progress label (static,
+        // NUL-terminated — @tagName is a comptime string literal, safe across the ABI).
+        const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
@@ -396,9 +414,9 @@ pub const Baker = struct {
             self.count += 1;
             // Per-band tile bar (host §3): done = tiles done in this band, total = the
             // band's planned count the caller set (0 = unknown -> total 0, as before).
-            if (progress) |cb| if (self.count % 256 == 0) cb(ctx, 1, self.count - self.band_base, self.band_total);
+            if (progress) |cb| if (self.count % 256 == 0) cb(ctx, 1, self.count - self.band_base, self.band_total, self.band_index, self.band_count, bname);
         }
-        if (progress) |cb| cb(ctx, 1, self.count - self.band_base, self.band_total);
+        if (progress) |cb| cb(ctx, 1, self.count - self.band_base, self.band_total, self.band_index, self.band_count, bname);
     }
 };
 

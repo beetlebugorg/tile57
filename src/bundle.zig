@@ -383,21 +383,24 @@ var g_prog: ProgressCtx = .{};
 var g_bake_start: i64 = 0;
 
 /// Console progress for bake-root: stage 0 = loading cells, 1 = baking tiles.
-/// Shows band, super-tile position, the per-band tile bar (done/total %, host §3)
-/// and throughput. `done`/`total` for stage 1 are per-band (total 0 = unknown).
-fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void {
+/// Shows the band label (name + i/n), super-tile position, the per-band tile bar
+/// (done/total %, host §3) and throughput. `done`/`total` for stage 1 are per-band
+/// (total 0 = unknown). `band_index`/`band_count`/`band_name` are the host §3 band
+/// label; band_name (when given) overrides g_prog.band so it's always consistent.
+fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void {
     _ = ctx;
+    const name: []const u8 = if (band_name) |p| std.mem.span(p) else g_prog.band;
     const elapsed = @as(f64, @floatFromInt(@max(nowSec() - g_bake_start, 1)));
     if (stage == 0) {
-        std.debug.print("\r  {s}: loading {d} cells    ", .{ g_prog.band, done });
+        std.debug.print("\r  {s}: loading {d} cells    ", .{ name, done });
     } else {
         const band_secs = @as(f64, @floatFromInt(@max(nowSec() - g_prog.band_start, 1)));
         const rate = @as(f64, @floatFromInt(done)) / band_secs;
         if (total > 0) {
             const pct = @as(f64, @floatFromInt(done)) * 100.0 / @as(f64, @floatFromInt(total));
-            std.debug.print("\r  {s}: super-tile {d}/{d}  {d}/{d} tiles ({d:.0}%)  ({d:.0}/s, {d:.0}s)    ", .{ g_prog.band, g_prog.st, g_prog.st_total, done, total, pct, rate, elapsed });
+            std.debug.print("\r  {s} (band {d}/{d}): super-tile {d}/{d}  {d}/{d} tiles ({d:.0}%)  ({d:.0}/s, {d:.0}s)    ", .{ name, band_index + 1, band_count, g_prog.st, g_prog.st_total, done, total, pct, rate, elapsed });
         } else {
-            std.debug.print("\r  {s}: super-tile {d}/{d}  {d} tiles  ({d:.0}/s, {d:.0}s)    ", .{ g_prog.band, g_prog.st, g_prog.st_total, done, rate, elapsed });
+            std.debug.print("\r  {s} (band {d}/{d}): super-tile {d}/{d}  {d} tiles  ({d:.0}/s, {d:.0}s)    ", .{ name, band_index + 1, band_count, g_prog.st, g_prog.st_total, done, rate, elapsed });
         }
     }
 }
@@ -746,6 +749,19 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // so they fall back to loading them together.
     std.debug.print("  (lazy bake: lru={d} cells, super-dz={d})\n", .{ lru_budget, super_dz });
     g_bake_start = nowSec();
+    // Band label (host §3): count the bands that will actually bake (non-empty AND
+    // their zoom range survives the minzoom/maxzoom clamp), so the progress callback
+    // reports "band <i>/<band_count>"; band_ord is the ordinal of the current one.
+    var band_count: u8 = 0;
+    for (Bands.bands_fine_to_coarse) |band| {
+        const entries = band_cells[@intFromEnum(band)].items;
+        if (entries.len == 0) continue;
+        const zr = Bands.bandZooms(band);
+        if (@max(minzoom, zr.min) > @min(maxzoom, zr.max)) continue;
+        band_count += 1;
+    }
+    baker.band_count = band_count;
+    var band_ord: u8 = 0;
     var done_cells: usize = 0;
     for (Bands.bands_fine_to_coarse) |band| {
         const entries = band_cells[@intFromEnum(band)].items;
@@ -760,6 +776,8 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             done_cells += entries.len;
             continue;
         }
+        baker.band_index = band_ord;
+        band_ord += 1;
         const zs: u8 = if (zlo >= super_dz) zlo - super_dz else 0;
 
         // Inverted index: super-tile (sx,sy at zs) → the cell indices overlapping it.
@@ -923,7 +941,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             .{ @tagName(band), entries.len, stkeys.len, baker.count, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(entries.len, 1))), band_secs },
         );
         done_cells += entries.len;
-        if (prog) |cb| cb(progress_user, 0, done_cells, total_cells);
+        if (prog) |cb| cb(progress_user, 0, done_cells, total_cells, band_ord - 1, band_count, @tagName(band).ptr);
     }
 
     // Assemble out_path = prefix (header + directory + metadata) ++ the data

@@ -120,8 +120,9 @@ export fn tile57_source_open_cells_streaming(
     return Source.openCellsStreaming(metas[0..count], read, user, spanOpt(rules_dir)) catch null;
 }
 
-// Progress callback for tile57_bake_cells (matches the header typedef + source.Progress).
-const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void;
+// Progress callback for tile57_bake_cells / tile57_bake_bundle (matches the header
+// typedef + source.Progress + bake_enc.Progress).
+const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
 
 /// Bake an ENC_ROOT into ONE PMTiles archive. See tile57.h. 1=ok, 0=empty, -1=error.
 export fn tile57_bake_cells(

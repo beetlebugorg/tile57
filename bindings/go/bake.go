@@ -9,7 +9,8 @@ package tile57
 // Forward declaration of the //export'd Go progress callback (defined in
 // progress.go). The trampoline lets us hand libtile57 a real C function pointer
 // that re-enters Go, without taking the address of a Go func in Go code.
-void tile57GoBakeProgress(void *user, uint8_t stage, size_t done, size_t total);
+void tile57GoBakeProgress(void *user, uint8_t stage, size_t done, size_t total,
+                          uint8_t band_index, uint8_t band_count, const char *band_name);
 
 static int tile57_bake_cells_cb(const tile57_cell_input *cells, size_t count,
                                 const char *rules_dir, uint8_t minz, uint8_t maxz,
@@ -41,9 +42,9 @@ import (
 // zoom-banded PMTiles archive, so the result opens cheaply via [OpenBytes] with
 // [FormatPMTiles]. minZoom/maxZoom clamp the per-cell bands (pass 0/0 for no
 // clamp — the ABI treats 0/24 as unclamped, and 0 max means "no cap"). progress,
-// if non-nil, is called with (stage, done, total): stage 0 = loading/portraying
-// cells, stage 1 = baking tiles.
-func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, progress func(stage uint8, done, total int)) ([]byte, error) {
+// if non-nil, is called with a [BakeProgress] per update: stage 0 = loading/
+// portraying cells, stage 1 = baking tiles (per-band done/total + band label).
+func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, progress func(BakeProgress)) ([]byte, error) {
 	if len(cells) == 0 {
 		return nil, fmt.Errorf("tile57: no cells to bake")
 	}
@@ -88,12 +89,13 @@ func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, progr
 // clamp). progress nil uses the lib's built-in console progress. Returns the cell
 // count and bbox (west,south,east,north).
 //
-// progress reports (stage, done, total): stage 0 = loading cells (done/total =
-// cells); stage 1 = baking tiles, where done/total are PER BAND (reset each band)
-// and total is that band's planned tile count — so a UI can show a per-band
-// percentage. The planned total slightly over-counts the emitted tiles (empty
-// tiles are skipped), matching the Go baker's planned bar.
-func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, maxZoom uint8, progress func(stage uint8, done, total int)) (cellCount int, bbox [4]float64, err error) {
+// progress reports a [BakeProgress] per update: stage 0 = loading cells
+// (Done/Total = cells); stage 1 = baking tiles, where Done/Total are PER BAND
+// (reset each band) and Total is that band's planned tile count — so a UI can show
+// a per-band percentage. BandIndex/BandCount/BandName give the band label
+// ("approach", band 3/6). The planned total slightly over-counts the emitted tiles
+// (empty tiles are skipped), matching the Go baker's planned bar.
+func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, maxZoom uint8, progress func(BakeProgress)) (cellCount int, bbox [4]float64, err error) {
 	if input == "" || outDir == "" {
 		return 0, bbox, fmt.Errorf("tile57: BakeBundle needs input and out dir")
 	}

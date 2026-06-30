@@ -125,8 +125,19 @@ tile57_source *tile57_source_open_cells_streaming(
  * each band) with total = that band's planned tile count, so a host can draw a
  * per-band percentage (the count is a planned estimate from cell bboxes — the actual
  * emitted total is a little lower as empty tiles are skipped, like the Go baker's
- * planned bar). total 0 means "unknown" (the tile57_bake_cells path). */
-typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, size_t total);
+ * planned bar). total 0 means "unknown" (the tile57_bake_cells path with no planned
+ * count).
+ *
+ * band_index / band_count locate the current band among the bands that actually
+ * bake (0-based index; band_count = how many bands have cells), so the host can
+ * label "band <band_index+1>/<band_count>". band_name is the band's
+ * navigational-purpose name ("berthing","harbor","approach","coastal","general",
+ * "overview") as a static NUL-terminated string owned by the library (valid for the
+ * call; copy if retained), or NULL during a non-band-specific report. Together they
+ * let the host show e.g. "Generating approach tiles (band 3/6): 84/427 (20%)". */
+typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, size_t total,
+                                     uint8_t band_index, uint8_t band_count,
+                                     const char *band_name);
 
 /* Bake a whole ENC_ROOT (the same cells as tile57_source_open_cells) into ONE
  * PMTiles archive, zoom-banded per cell by compilation scale, so the result opens

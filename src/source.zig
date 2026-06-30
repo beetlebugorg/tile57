@@ -46,8 +46,11 @@ pub const CellInput = struct {
 };
 
 /// Progress callback for `bakeArchive`: stage 0 = loading/portraying cells,
-/// stage 1 = baking tiles. C-callconv so a C host can pass one directly.
-pub const Progress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void;
+/// stage 1 = baking tiles. `band_index`/`band_count` locate the current band among
+/// the bands that actually bake; `band_name` is its navigational-purpose name (a
+/// static NUL-terminated string), null for stage 0. C-callconv so a C host can pass
+/// one directly. See bake_enc.Progress (structurally identical).
+pub const Progress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
 
 /// Pre-peeked metadata for one cell in a streaming open: its geographic extent
 /// and compilation scale (1:cscl). The host supplies these (cheap to compute, or
@@ -920,10 +923,21 @@ pub fn bakeArchive(
     var scamin_set = std.AutoHashMap(u32, void).init(gpa);
     defer scamin_set.deinit();
 
+    // Band label (host §3): how many bands actually have cells, so the callback can
+    // report "band <i>/<band_count> <name>" (skip-empty bands aren't counted).
+    var band_count: u8 = 0;
+    for (bake_enc.bands_fine_to_coarse) |band| {
+        if (band_idx[@intFromEnum(band)].items.len > 0) band_count += 1;
+    }
+    baker.band_count = band_count;
+
     var loaded: usize = 0;
+    var band_ord: u8 = 0;
     for (bake_enc.bands_fine_to_coarse) |band| {
         const idxs = band_idx[@intFromEnum(band)].items;
         if (idxs.len == 0) continue;
+        baker.band_index = band_ord;
+        band_ord += 1;
 
         var sources = std.ArrayList(BakeSource).empty;
         defer {
@@ -946,7 +960,7 @@ pub fn bakeArchive(
         var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir, .build_geo = bake_enc.cacheGeoForBand(band) };
         bake_enc.parallelFor(gpa, sources.items.len, &bw, BakeWork.run);
         loaded += idxs.len;
-        if (progress) |cb| cb(user, 0, loaded, cells_in.len);
+        if (progress) |cb| cb(user, 0, loaded, cells_in.len, band_ord - 1, band_count, @tagName(band).ptr);
 
         var backs = std.ArrayList(bake_enc.Backend).empty;
         var band_arenas = std.ArrayList(?*std.heap.ArenaAllocator).empty;
