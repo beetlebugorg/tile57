@@ -113,6 +113,11 @@ fn parseDirectory(a: Allocator, leader: Leader, rec: []const u8) ![]DirectoryEnt
     var list = std.ArrayList(DirectoryEntry).empty;
     var pos: usize = 24;
     const dir_end = leader.field_area_start; // directory ends where field area begins
+    // S-57 Part 3 A.2.3: the directory ends with a field terminator immediately before
+    // the field area. Verify it (oracle directory.go:40 — reject a malformed directory
+    // rather than parse garbage). The caller passes rec.len == field_area_start and
+    // guards field_area_start >= 24, so dir_end>24 means rec[dir_end-1] is in bounds.
+    if (dir_end <= 24 or rec[dir_end - 1] != FT) return error.MissingFieldTerminator;
     while (pos + entry_len <= dir_end) {
         if (rec[pos] == FT) break; // directory terminator
         const tag = rec[pos .. pos + leader.size_of_field_tag];
