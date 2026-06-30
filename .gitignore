@@ -34,3 +34,8 @@ __pycache__/
 
 # Claude Code agent worktrees / session data
 .claude/
+
+# Large untracked local data — never commit (regenerate locally; vendor/ are submodules)
+/charts/
+/test/
+/05CGD_ENCs.zip
