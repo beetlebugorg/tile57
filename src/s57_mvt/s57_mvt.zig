@@ -2129,10 +2129,12 @@ fn appendCellFeatures(
             try emitDashedBoundary(a, cell.*, f, fi, geo, "CHMGF", 1.5, z, x, y, tb, box, L);
             continue;
         }
-        if (f.objl == 109 and f.prim == 3) { // RECTRC area: Curve-only rule errors; draw the track limit
-            try emitDashedBoundary(a, cell.*, f, fi, geo, "CHBLK", 1.0, z, x, y, tb, box, L);
-            continue;
-        }
+        // RECTRC area: the RecommendedTrack rule is Curve-only, so a surface
+        // (prim 3) RECTRC errors. The oracle's error branch (s101build.go:341-355)
+        // handles ONLY NEWOBJ and SWPARE — every other errored class, RECTRC
+        // included, returns a suppressed empty build. So draw nothing: an errored
+        // RECTRC falls through to `if (errored) continue` below (it's a mapped
+        // class → resolveClass != null → no QUESMRK1), matching the oracle.
         if (f.objl == 306 and f.prim == 3) { // M_NSYS — navSystemBuild (IALA A/B boundary linestyle)
             try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
             continue;
@@ -2140,7 +2142,7 @@ fn appendCellFeatures(
         // Genuinely-unknown object class (no S-101 alias) → the S-52 §10.1.1 QUESMRK1
         // "unknown object" mark at the feature's representative point (== Go
         // unknownObjectBuild, dispatched on the engine's "UNMAPPED:" marker). Checked
-        // AFTER the class-specific fallbacks above (NEWOBJ/RECTRC/M_NSYS resolve to null
+        // AFTER the class-specific fallbacks above (NEWOBJ/M_NSYS resolve to null
         // or error but have their own symbology). A MAPPED class that merely errored or
         // emitted nothing is NOT marked — it falls through to classify()/suppress below,
         // matching the oracle (which marks only resolveCode failures, not rule errors).
