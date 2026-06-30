@@ -4,6 +4,7 @@ package tile57
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -17,7 +18,7 @@ func TestStyle(t *testing.T) {
 		"http://localhost:8080/tiles/tile57/{z}/{x}/{y}.mvt",
 		"http://localhost:8080/sprite",
 		"http://localhost:8080/glyphs/{fontstack}/{range}.pbf",
-		m, nil)
+		m, nil, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +46,7 @@ func TestIgnoreScamin(t *testing.T) {
 	build := func(ignore bool) string {
 		m := MarinerDefaults()
 		m.IgnoreScamin = ignore
-		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "", "", m, nil)
+		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "", "", m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(ignore=%v): %v", ignore, err)
 		}
@@ -59,6 +60,52 @@ func TestIgnoreScamin(t *testing.T) {
 	}
 }
 
+// TestScaminBuckets verifies the runtime build_style emits native per-value SCAMIN
+// bucket layers when given a manifest (host host-canonical-backend.md §"Still needed"
+// #1) — the same gating the offline bundle does. Without a manifest the _scamin
+// layers fall back to the per-feature zoom-gate (log2); with one they become
+// fractional-minzoom bucket layers (one per denominator, no log2 fallback).
+func TestScaminBuckets(t *testing.T) {
+	m := MarinerDefaults()
+	scamin := []int32{89999, 119999, 259999}
+	withManifest, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
+		"glyphs/{fontstack}/{range}.pbf", m, nil, scamin, 38.0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Layers []map[string]any `json:"layers"`
+	}
+	if err := json.Unmarshal(withManifest, &doc); err != nil {
+		t.Fatalf("style not valid JSON: %v", err)
+	}
+	// Each manifest value should produce a bucket layer with a numeric minzoom.
+	for _, v := range scamin {
+		tag := "#sm" + itoa(v)
+		found := false
+		for _, L := range doc.Layers {
+			id, _ := L["id"].(string)
+			if strings.Contains(id, tag) {
+				found = true
+				if _, ok := L["minzoom"].(float64); !ok {
+					t.Fatalf("bucket layer %s has no numeric minzoom: %v", id, L["minzoom"])
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("no per-value bucket layer for SCAMIN %d (expected id containing %q)", v, tag)
+		}
+	}
+	// With native buckets the per-feature zoom-gate fallback must be gone.
+	if strings.Contains(string(withManifest), "log2") {
+		t.Fatalf("manifest style should use native minzoom buckets, not the log2 zoom-gate")
+	}
+}
+
+func itoa(v int32) string {
+	return strconv.Itoa(int(v))
+}
+
 // TestSizeScale verifies the physical-scale multiplier wraps the size expressions
 // through the full C ABI: at the default 1.0 line-width is the verbatim coalesce
 // expression; a non-1.0 scale wraps it (and icon/text sizes) in ["*", scale, expr].
@@ -67,7 +114,7 @@ func TestSizeScale(t *testing.T) {
 		m := MarinerDefaults()
 		m.SizeScale = scale
 		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-			"glyphs/{fontstack}/{range}.pbf", m, nil)
+			"glyphs/{fontstack}/{range}.pbf", m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(scale=%v): %v", scale, err)
 		}

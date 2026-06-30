@@ -693,6 +693,27 @@ pub fn buildFromTemplate(
     enabled_bands: ?[]const i32,
     now_unix: i64,
 ) ![]u8 {
+    // No SCAMIN manifest -> the *_scamin layers fall back to a single ungated layer
+    // (the template / wasm / parity callers don't carry a manifest).
+    return buildFromTemplateScamin(alloc, template_json, m, colortables_json, enabled_bands, now_unix, &.{}, 0);
+}
+
+/// Same as buildFromTemplate but threading a SCAMIN manifest (the distinct
+/// denominators present + a representative latitude), so the RUNTIME style gets the
+/// SAME per-value native-minzoom bucket layers the offline bundle does (host
+/// host-canonical-backend.md §"Still needed" #1 — the `tile57_build_style` runtime
+/// path otherwise leaves every `_scamin` layer ungated). Empty `scamin` == the
+/// plain buildFromTemplate behaviour.
+pub fn buildFromTemplateScamin(
+    alloc: std.mem.Allocator,
+    template_json: []const u8,
+    m: *const chartstyle.MarinerSettings,
+    colortables_json: []const u8,
+    enabled_bands: ?[]const i32,
+    now_unix: i64,
+    scamin: []const u32,
+    scamin_lat: f64,
+) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, template_json, .{}) catch
         return alloc.dupe(u8, template_json);
     defer parsed.deinit();
@@ -708,6 +729,8 @@ pub fn buildFromTemplate(
         .now_unix = now_unix,
         .ignore_scamin = m.ignore_scamin,
         .size_scale = m.size_scale,
+        .scamin = scamin,
+        .scamin_lat = scamin_lat,
     };
     if (parsed.value == .object) {
         const root = parsed.value.object;
@@ -916,4 +939,21 @@ test "buildFromTemplate: viewing-group filter (future-use scaffold) gates by vg"
     const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
     defer a.free(o2);
     try std.testing.expect(std.mem.indexOf(u8, o2, "\"vg\"") == null);
+}
+
+test "buildFromTemplateScamin: a manifest emits per-value buckets, no zoom-gate" {
+    const a = std.testing.allocator;
+    const m = chartstyle.MarinerSettings{};
+    // No manifest -> the per-feature zoom-gate fallback (log2), no #sm buckets.
+    const plain = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
+    defer a.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "log2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "#sm") == null);
+    // With a manifest -> native fractional-minzoom bucket layers, no zoom-gate.
+    const scamin = [_]u32{ 89999, 259999 };
+    const bucketed = try buildFromTemplateScamin(a, cs_template, &m, cs_ct, null, 1700000000, &scamin, 38.0);
+    defer a.free(bucketed);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm89999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm259999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "log2") == null);
 }

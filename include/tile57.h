@@ -258,19 +258,29 @@ typedef struct {
 
 /* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.
  * enabled_bands: NULL = no band filter (show all); else only features whose `band`
- * rank is in the array (count entries) are shown. On success returns 1 with the
- * style JSON in *out / *out_len (free with tile57_tile_free); 0 on error. */
+ * rank is in the array (count entries) are shown.
+ * scamin: the distinct SCAMIN denominators present in the source (e.g. from
+ *   tile57_source_scamin / the TileJSON). When non-NULL with scamin_count>0 the
+ *   `_scamin` source-layers are split into one per-value bucket layer with a native
+ *   fractional minzoom = scaminDisplayZoom(value, scamin_lat) — the SAME gating the
+ *   offline bundle style emits. NULL / count 0 -> the `_scamin` layers stay a single
+ *   ungated layer (features render, but SCAMIN does not gate by value).
+ * scamin_lat: representative latitude (degrees) for the bucket minzooms (the SCAMIN
+ *   display cutoff is latitude-dependent); use the source's center latitude.
+ * On success returns 1 with the style JSON in *out / *out_len (free with
+ * tile57_tile_free); 0 on error. */
 int tile57_build_style(const char *template_json, size_t template_len,
                        const tile57_mariner *m,
                        const char *colortables_json, size_t colortables_len,
                        const int32_t *enabled_bands, size_t enabled_band_count,
+                       const int32_t *scamin, size_t scamin_count, double scamin_lat,
                        uint8_t **out, size_t *out_len);
 
 /* The S-52 colortables and base style template are baked into the library, so a
  * host can generate a complete style with no on-disk catalogue or template file:
  *   tile57_colortables_default(&ct,&ctn);
  *   tile57_style_template(scheme, "http://host/{z}/{x}/{y}", NULL,NULL,0,0, &t,&tn);
- *   tile57_build_style(t,tn, &m, ct,ctn, bands,nb, &style,&sn);   // mariner patch
+ *   tile57_build_style(t,tn, &m, ct,ctn, bands,nb, scamin,nsm,lat, &style,&sn);
  * Free each buffer with tile57_tile_free. */
 
 /* S-52 colortables.json (token -> hex per day/dusk/night) from the colour profile

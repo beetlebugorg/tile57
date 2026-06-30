@@ -98,8 +98,12 @@ func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, m
 
 // BuildStyle patches a style template with the mariner settings + S-52 colortables
 // into a concrete MapLibre style JSON. enabledBands (nil = show all) restricts the
-// output to features whose band rank is listed.
-func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []int32) ([]byte, error) {
+// output to features whose band rank is listed. scamin is the SCAMIN manifest (the
+// distinct denominators present, e.g. from Source.Scamin / the TileJSON): when
+// non-empty the `_scamin` layers are split into per-value bucket layers with native
+// minzoom = scaminDisplayZoom(value, scaminLat) — the same gating the offline bundle
+// emits; nil/empty leaves them ungated. scaminLat is the source's center latitude.
+func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
 	if len(template) == 0 {
 		return nil, fmt.Errorf("tile57: empty style template")
 	}
@@ -109,20 +113,12 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 
 	arena := &cArena{}
 	defer arena.free()
-	var bandsPtr *C.int32_t
-	var bandsN C.size_t
-	if n := len(enabledBands); n > 0 {
-		bp := (*C.int32_t)(arena.track(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.int32_t(0))))))
-		bs := unsafe.Slice(bp, n)
-		for i, b := range enabledBands {
-			bs[i] = C.int32_t(b)
-		}
-		bandsPtr, bandsN = bp, C.size_t(n)
-	}
+	bandsPtr, bandsN := arena.int32Array(enabledBands)
+	scaminPtr, scaminN := arena.int32Array(scamin)
 
 	var out *C.uint8_t
 	var outLen C.size_t
-	if C.tile57_build_style(tmplPtr, tmplLen, &cm, ctPtr, ctLen, bandsPtr, bandsN, &out, &outLen) != 1 {
+	if C.tile57_build_style(tmplPtr, tmplLen, &cm, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen) != 1 {
 		return nil, fmt.Errorf("tile57: build_style failed")
 	}
 	return tileBytes(out, outLen), nil
@@ -131,7 +127,9 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 // Style is a convenience that runs the whole pipeline — default colortables +
 // template (scheme, tiles/sprite/glyph URLs) patched by mariner + band filter — to
 // produce a complete MapLibre style JSON from libtile57's baked-in catalogue.
-func Style(scheme Scheme, sourceTiles, sprite, glyphs string, m Mariner, enabledBands []int32) ([]byte, error) {
+// scamin/scaminLat (typically Source.Scamin() + the source center latitude) gate the
+// `_scamin` layers by value; pass nil/0 to leave them ungated.
+func Style(scheme Scheme, sourceTiles, sprite, glyphs string, m Mariner, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
 	ct, err := ColortablesDefault()
 	if err != nil {
 		return nil, err
@@ -140,7 +138,7 @@ func Style(scheme Scheme, sourceTiles, sprite, glyphs string, m Mariner, enabled
 	if err != nil {
 		return nil, err
 	}
-	return BuildStyle(tmpl, m, ct, enabledBands)
+	return BuildStyle(tmpl, m, ct, enabledBands, scamin, scaminLat)
 }
 
 // toC converts a Mariner to its C struct. cgo maps C _Bool to Go bool, so the

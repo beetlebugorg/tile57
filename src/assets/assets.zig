@@ -24,6 +24,7 @@ pub const SCHEMA_VERSION = "tile57/1";
 pub const StyleOpts = @import("style.zig").StyleOpts;
 pub const styleJson = @import("style.zig").styleJson;
 pub const buildFromTemplate = @import("style.zig").buildFromTemplate;
+pub const buildFromTemplateScamin = @import("style.zig").buildFromTemplateScamin;
 
 // ---- colortables.json ----------------------------------------------------
 

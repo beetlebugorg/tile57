@@ -46,6 +46,22 @@ func (a *cArena) str(s string) *C.char {
 	return (*C.char)(a.track(unsafe.Pointer(C.CString(s))))
 }
 
+// int32Array copies a Go []int32 into a malloc'd C int32_t array, returning the
+// base pointer + count (NULL/0 for an empty slice). Used for the enabled-bands and
+// SCAMIN-manifest inputs to tile57_build_style.
+func (a *cArena) int32Array(v []int32) (*C.int32_t, C.size_t) {
+	n := len(v)
+	if n == 0 {
+		return nil, 0
+	}
+	p := (*C.int32_t)(a.track(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.int32_t(0))))))
+	s := unsafe.Slice(p, n)
+	for i, x := range v {
+		s[i] = C.int32_t(x)
+	}
+	return p, C.size_t(n)
+}
+
 // cellInputs builds a C tile57_cell_input array from cells. Returns the typed Go
 // view (for length bookkeeping) and the base pointer to hand to C.
 func (a *cArena) cellInputs(cells []CellInput) ([]C.tile57_cell_input, *C.tile57_cell_input) {

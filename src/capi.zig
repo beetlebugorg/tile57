@@ -455,6 +455,9 @@ export fn tile57_build_style(
     colortables_len: usize,
     enabled_bands: ?[*]const i32,
     enabled_band_count: usize,
+    scamin: ?[*]const i32,
+    scamin_count: usize,
+    scamin_lat: f64,
     out: *[*]u8,
     out_len: *usize,
 ) callconv(.c) c_int {
@@ -492,11 +495,22 @@ export fn tile57_build_style(
     const tmpl = template_json[0..template_len];
     const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
     const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
+    // SCAMIN manifest (the distinct denominators the host read from the source /
+    // TileJSON): converted from the host's i32 to the u32 denominators styleJson
+    // buckets on. Empty/NULL -> the *_scamin layers stay ungated (host §"Still
+    // needed" #1: the runtime build_style now emits the SAME per-value native-minzoom
+    // buckets the offline bundle does when given the manifest).
+    var scamin_buf: []u32 = &.{};
+    defer if (scamin_buf.len > 0) gpa.free(scamin_buf);
+    if (scamin) |p| if (scamin_count > 0) {
+        scamin_buf = gpa.alloc(u32, scamin_count) catch return 0;
+        for (p[0..scamin_count], 0..) |v, i| scamin_buf[i] = @intCast(v);
+    };
     const now_unix: i64 = @intCast(time(null));
     // Single style builder: regenerate the full style with the mariner baked in
     // (chartstyle.buildStyle's template-patch pass is retired). buildFromTemplate lifts
     // the source config out of the passed template and drives the one styleJson.
-    const style = assets.buildFromTemplate(gpa, tmpl, &m, cts, bands, now_unix) catch return 0;
+    const style = assets.buildFromTemplateScamin(gpa, tmpl, &m, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
     out.* = style.ptr;
     out_len.* = style.len;
     return 1;
