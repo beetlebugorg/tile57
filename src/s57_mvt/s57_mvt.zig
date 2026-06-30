@@ -419,6 +419,20 @@ const Meta = struct {
 /// (always), the object-class acronym (data-quality/meta/light filters), the SCAMIN
 /// 1:N denominator (when gated), the boundary/point-style variant tags (only when
 /// style-dependent), and the date-dependent validity tags (when dated).
+// Append the OpText tile properties for one text label, matching the oracle's
+// DrawText property set (bake.go): text, color_token, font_size_px (the FontSize
+// modifier, or 12 by default), halign/valign (the resolved TextAlign values the
+// style's TEXT_ANCHOR keys on), and the §14.5 text group. Halo + offset are
+// separate findings (still on the OpText halo / LocalOffset rows).
+fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) !void {
+    try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
+    try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
+    try props.append(a, .{ .key = "font_size_px", .value = .{ .double = if (t.font_size > 0) t.font_size else 12 } });
+    try props.append(a, .{ .key = "halign", .value = .{ .string = t.halign } });
+    try props.append(a, .{ .key = "valign", .value = .{ .string = t.valign } });
+    try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
+}
+
 fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
     try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
@@ -784,10 +798,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         };
         if (!L.suppress_points) for (p.texts) |t| {
             var props = std.ArrayList(mvt.Prop).empty;
-            try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
-            try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
-            try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
-            try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
+            try appendTextProps(a, &props, t);
             try appendMeta(a, &props, meta);
             try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
         };
@@ -939,10 +950,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
                 parts[0] = single;
                 for (p.texts) |t| {
                     var props = std.ArrayList(mvt.Prop).empty;
-                    try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
-                    try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
-                    try props.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
-                    try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
+                    try appendTextProps(a, &props, t);
                     try appendMeta(a, &props, meta);
                     try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
                 }

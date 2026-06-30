@@ -12,7 +12,39 @@ const Allocator = std.mem.Allocator;
 
 pub const Line = struct { style: []const u8, width: f64, color: []const u8 };
 pub const Point = struct { symbol: []const u8, rotation: f64, offset_x: f64, offset_y: f64, rot_north: bool = false };
-pub const Text = struct { text: []const u8, color: []const u8, group: i64 = 0 };
+pub const Text = struct {
+    text: []const u8,
+    color: []const u8,
+    group: i64 = 0,
+    // S-52 text-style modifiers (OpText), applied at the TextInstruction. font_size
+    // is the FontSize px (0 => the emit default, 12, matching the oracle). halign /
+    // valign are the resolved lowercase tile values the style's TEXT_ANCHOR keys on:
+    // halign "left"|"center"|"right" (default "left"), valign "top"|"middle"|"bottom"
+    // (default "bottom") — matching the oracle's hAlign/vAlign + halignName/valignName.
+    font_size: f64 = 0,
+    halign: []const u8 = "left",
+    valign: []const u8 = "bottom",
+};
+
+/// Map an S-101 TextAlignHorizontal to the tile `halign` value (oracle hAlign +
+/// halignName): "Center"->"center", "Right"->"right", anything else (incl. unset)
+/// ->"left".
+fn mapHAlign(s: []const u8) []const u8 {
+    const t = std.mem.trim(u8, s, " ");
+    if (std.mem.eql(u8, t, "Center")) return "center";
+    if (std.mem.eql(u8, t, "Right")) return "right";
+    return "left";
+}
+
+/// Map an S-101 TextAlignVertical to the tile `valign` value (oracle vAlign +
+/// valignName): "Top"->"top", "Center"->"middle", anything else (incl. unset)
+/// ->"bottom".
+fn mapVAlign(s: []const u8) []const u8 {
+    const t = std.mem.trim(u8, s, " ");
+    if (std.mem.eql(u8, t, "Top")) return "top";
+    if (std.mem.eql(u8, t, "Center")) return "middle";
+    return "bottom";
+}
 
 /// One stroked element of a screen-space figure a rule CONSTRUCTED via
 /// AugmentedRay / ArcByRadius — a light-sector leg (ray) or sector arc/ring. Sizes
@@ -129,6 +161,9 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var cur_ox: f64 = 0;
     var cur_oy: f64 = 0;
     var cur_font: []const u8 = "CHBLK";
+    var cur_font_size: f64 = 0; // FontSize px (0 => emit default 12)
+    var cur_align_h: []const u8 = ""; // TextAlignHorizontal (raw; mapped at TextInstruction)
+    var cur_align_v: []const u8 = ""; // TextAlignVertical (raw; mapped at TextInstruction)
     var cur_tgrp: i64 = 0; // text group (S-52 §14.5) of the most recent ViewingGroup
     var cur_dash_len: f64 = 0; // dash length (LineStyle arg1) of the current _simple_ stroke
     var cur_draw_vg: i64 = 0; // draw viewing group of the most recent ViewingGroup section
@@ -247,8 +282,14 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             try points.append(a, .{ .symbol = val, .rotation = cur_rot, .offset_x = cur_ox, .offset_y = cur_oy, .rot_north = cur_rot_north });
         } else if (std.mem.eql(u8, key, "FontColor")) {
             cur_font = val;
+        } else if (std.mem.eql(u8, key, "FontSize")) {
+            cur_font_size = toFloat(val);
+        } else if (std.mem.eql(u8, key, "TextAlignHorizontal")) {
+            cur_align_h = val;
+        } else if (std.mem.eql(u8, key, "TextAlignVertical")) {
+            cur_align_v = val;
         } else if (std.mem.eql(u8, key, "TextInstruction")) {
-            try texts.append(a, .{ .text = val, .color = cur_font, .group = cur_tgrp });
+            try texts.append(a, .{ .text = val, .color = cur_font, .group = cur_tgrp, .font_size = cur_font_size, .halign = mapHAlign(cur_align_h), .valign = mapVAlign(cur_align_v) });
         } else if (std.mem.eql(u8, key, "DrawingPriority")) {
             // S-52 display priority. A feature draws across several viewing groups,
             // each with its own DrawingPriority; the feature's priority is the MAX
@@ -436,4 +477,28 @@ test "parse line + point + text instructions" {
     const tx = try parse(a, "FontColor:CHBLK;TextInstruction:Fl.R.4s");
     try std.testing.expectEqual(@as(usize, 1), tx.texts.len);
     try std.testing.expectEqualStrings("Fl.R.4s", tx.texts[0].text);
+}
+
+test "parse OpText FontSize / TextAlign modifiers (and oracle left/bottom defaults)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Explicit modifiers snapshot onto the TextInstruction (resolved to tile values).
+    const p = try parse(a, "FontColor:CHBLK;FontSize:8;TextAlignHorizontal:Center;TextAlignVertical:Top;TextInstruction:Foo");
+    try std.testing.expectEqual(@as(usize, 1), p.texts.len);
+    try std.testing.expectEqual(@as(f64, 8), p.texts[0].font_size);
+    try std.testing.expectEqualStrings("center", p.texts[0].halign);
+    try std.testing.expectEqualStrings("top", p.texts[0].valign);
+
+    // No align modifiers -> the oracle defaults (halign "left", valign "bottom") and
+    // font_size 0 (the emit substitutes the default 12).
+    const d = try parse(a, "FontColor:CHBLK;TextInstruction:Bar");
+    try std.testing.expectEqual(@as(f64, 0), d.texts[0].font_size);
+    try std.testing.expectEqualStrings("left", d.texts[0].halign);
+    try std.testing.expectEqualStrings("bottom", d.texts[0].valign);
+
+    // TextAlignVertical:Center maps to "middle" (not "center"), per valignName.
+    const m = try parse(a, "TextAlignVertical:Center;TextInstruction:Baz");
+    try std.testing.expectEqualStrings("middle", m.texts[0].valign);
 }
