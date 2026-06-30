@@ -660,6 +660,102 @@ pub const Cell = struct {
         return out.items;
     }
 
+    fn coordKey(p: LonLat) u64 {
+        return (@as(u64, @as(u32, @bitCast(p.lon_e7))) << 32) | @as(u64, @as(u32, @bitCast(p.lat_e7)));
+    }
+
+    /// Assemble an AREA feature's boundary edges into closed rings by TOPOLOGY —
+    /// following shared endpoints through a global index — NOT raw FSPT order.
+    /// Mirrors the oracle's buildRingsWithUsage (topology.go): an FSPT edge list
+    /// given out of connected order still reassembles into closed rings, where
+    /// lineGeometryParts (which only checks the current tail against the NEXT FSPT
+    /// edge) fragments it into spurious parts. Byte-identical to lineGeometryParts
+    /// when the FSPT list is already connected (the index's first-unused-touching
+    /// pick is then the next edge). The result feeds orientAreaRings, which derives
+    /// exterior-vs-hole by geometric nesting, so ring USAG/order is not needed here.
+    /// Lines keep the FSPT-order assembly (the oracle's constructLineStringGeometry
+    /// is FSPT-order too).
+    pub fn areaGeometryParts(self: Cell, a: Allocator, f: Feature) ![][]LonLat {
+        // Resolve each FSPT edge to its full coordinate polyline (begin node + SG2D
+        // + end node, in FSPT orientation); a sub-2-point edge can't connect (the
+        // oracle's `len(coords) < 2` skip).
+        var segs = std.ArrayList([]LonLat).empty;
+        for (f.refs) |ref| {
+            if (ref.name.rcnm != RCNM_VE) continue;
+            const edge = try self.edgeCoordsRaw(a, ref.name.rcid, ref.ornt);
+            if (edge.len >= 2) try segs.append(a, edge);
+        }
+        if (segs.items.len == 0) return &.{};
+
+        // Index both endpoints of every segment for O(1) continuation lookup. Lists
+        // stay in FSPT (insertion) order so the first-unused-touching pick is
+        // deterministic and equals the next FSPT edge when the list is connected.
+        var endpoints = std.AutoHashMap(u64, std.ArrayList(usize)).init(a);
+        for (segs.items, 0..) |s, i| {
+            const ka = coordKey(s[0]);
+            const kb = coordKey(s[s.len - 1]);
+            const ga = try endpoints.getOrPut(ka);
+            if (!ga.found_existing) ga.value_ptr.* = std.ArrayList(usize).empty;
+            try ga.value_ptr.append(a, i);
+            if (kb != ka) {
+                const gb = try endpoints.getOrPut(kb);
+                if (!gb.found_existing) gb.value_ptr.* = std.ArrayList(usize).empty;
+                try gb.value_ptr.append(a, i);
+            }
+        }
+
+        const used = try a.alloc(bool, segs.items.len);
+        @memset(used, false);
+        var parts = std.ArrayList([]LonLat).empty;
+        for (0..segs.items.len) |i| {
+            if (used[i]) continue;
+            used[i] = true;
+            var ring = std.ArrayList(LonLat).empty;
+            try ring.appendSlice(a, segs.items[i]);
+            const start = ring.items[0];
+            while (true) {
+                const tail = ring.items[ring.items.len - 1];
+                if (tail.lon_e7 == start.lon_e7 and tail.lat_e7 == start.lat_e7) break; // ring closed
+                // First unused segment touching the tail (FSPT order), else dead end.
+                var jn: ?usize = null;
+                if (endpoints.get(coordKey(tail))) |lst| {
+                    for (lst.items) |cand| {
+                        if (!used[cand]) {
+                            jn = cand;
+                            break;
+                        }
+                    }
+                }
+                const j = jn orelse break;
+                used[j] = true;
+                var nxt = segs.items[j];
+                if (!(nxt[0].lon_e7 == tail.lon_e7 and nxt[0].lat_e7 == tail.lat_e7)) {
+                    // connects at its far end -> traverse reversed (fresh copy)
+                    const rev = try a.alloc(LonLat, nxt.len);
+                    for (nxt, 0..) |p, k| rev[nxt.len - 1 - k] = p;
+                    nxt = rev;
+                }
+                // Drop the shared connecting node (nxt[0] == tail).
+                try ring.appendSlice(a, nxt[1..]);
+            }
+            // Close geometrically if the ring dead-ended (matches the oracle); a
+            // naturally-closed ring already has tail == start, so this is a no-op.
+            if (ring.items.len >= 2) {
+                const last = ring.items[ring.items.len - 1];
+                if (last.lon_e7 != start.lon_e7 or last.lat_e7 != start.lat_e7) try ring.append(a, start);
+                if (ring.items.len >= 3) try parts.append(a, ring.items);
+            }
+        }
+        return parts.items;
+    }
+
+    /// Geometry assembly dispatched by primitive: areas (prim 3) reassemble rings by
+    /// topology (areaGeometryParts), lines (prim 2) chain in FSPT order
+    /// (lineGeometryParts) — mirroring the oracle's polygon vs line-string builders.
+    pub fn geometryParts(self: Cell, a: Allocator, f: Feature) ![][]LonLat {
+        return if (f.prim == 3) self.areaGeometryParts(a, f) else self.lineGeometryParts(a, f);
+    }
+
     /// Like lineGeometryParts but for the DRAWN boundary/line geometry (S-52 §8.6.2):
     /// edges flagged MASK==1 (masked) or USAG==3 (exterior boundary truncated by the
     /// data limit) are dropped, so they don't stroke as spurious boundary lines. A
@@ -1524,6 +1620,55 @@ test "pointGeometry RCID fallback prefers the isolated node (oracle getNode orde
     const p = cell.pointGeometry(f).?;
     try std.testing.expectEqual(@as(f64, 2), p.lon());
     try std.testing.expectEqual(@as(f64, 20), p.lat());
+}
+
+test "areaGeometryParts reassembles an out-of-order FSPT ring (endpoint index)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Triangle A(0,0) B(10,0) C(5,10) as connected nodes; three boundary edges
+    // A->B (10), B->C (11), C->A (12).
+    var nodes = std.AutoHashMap(u64, LonLat).init(a);
+    try nodes.put((@as(u64, RCNM_VC) << 32) | 1, LonLat.init(0, 0));
+    try nodes.put((@as(u64, RCNM_VC) << 32) | 2, LonLat.init(10, 0));
+    try nodes.put((@as(u64, RCNM_VC) << 32) | 3, LonLat.init(5, 10));
+    const vecs = try a.alloc(VectorRecord, 3);
+    vecs[0] = .{ .rcnm = RCNM_VE, .rcid = 10, .points = &.{}, .soundings = &.{}, .begin_node = 1, .end_node = 2 };
+    vecs[1] = .{ .rcnm = RCNM_VE, .rcid = 11, .points = &.{}, .soundings = &.{}, .begin_node = 2, .end_node = 3 };
+    vecs[2] = .{ .rcnm = RCNM_VE, .rcid = 12, .points = &.{}, .soundings = &.{}, .begin_node = 3, .end_node = 1 };
+    var edges = std.AutoHashMap(u32, usize).init(a);
+    try edges.put(10, 0);
+    try edges.put(11, 1);
+    try edges.put(12, 2);
+    var cell = Cell{
+        .params = .{},
+        .vectors = vecs,
+        .features = &.{},
+        .nodes = nodes,
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    // FSPT refs in a SCRAMBLED (non-connected) order: 10, 12, 11.
+    const refs = [_]SpatialRef{
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 10 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 12 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = RCNM_VE, .rcid = 11 }, .ornt = 1 },
+    };
+    const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 42, .refs = &refs };
+
+    // Endpoint-index assembly stitches it back into ONE closed ring (A,B,C,A).
+    const ap = try cell.areaGeometryParts(a, f);
+    try std.testing.expectEqual(@as(usize, 1), ap.len);
+    try std.testing.expectEqual(@as(usize, 4), ap[0].len);
+    try std.testing.expect(ap[0][0].lon_e7 == ap[0][3].lon_e7 and ap[0][0].lat_e7 == ap[0][3].lat_e7);
+
+    // The FSPT-order walk fragments the same input into multiple parts.
+    const lp = try cell.lineGeometryParts(a, f);
+    try std.testing.expect(lp.len > 1);
 }
 
 test "drawableLineParts drops MASK/USAG edges and breaks the chain" {

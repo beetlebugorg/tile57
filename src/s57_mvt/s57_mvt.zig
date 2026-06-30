@@ -471,7 +471,7 @@ pub const GeoParts = []const ?[][]s57.LonLat;
 pub fn buildGeoCache(a: Allocator, cell: *const s57.Cell) !GeoParts {
     const parts = try a.alloc(?[][]s57.LonLat, cell.features.len);
     for (cell.features, 0..) |f, i| {
-        parts[i] = if (f.prim == 2 or f.prim == 3) (cell.lineGeometryParts(a, f) catch null) else null;
+        parts[i] = if (f.prim == 2 or f.prim == 3) (cell.geometryParts(a, f) catch null) else null;
     }
     return parts;
 }
@@ -613,7 +613,7 @@ pub fn buildGeoWorld(a: Allocator, geo: GeoParts) !GeoWorld {
 /// else assembled now (the live path).
 fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.Feature) ![][]s57.LonLat {
     if (geo) |g| if (fi < g.len) if (g[fi]) |p| return p;
-    return cell.lineGeometryParts(a, f);
+    return cell.geometryParts(a, f);
 }
 
 /// The feature's area representative (label) point: the per-cell cached value (baker
