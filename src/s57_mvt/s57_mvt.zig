@@ -579,8 +579,46 @@ const Meta = struct {
 // modifier, or 12 by default), halign/valign (the resolved TextAlign values the
 // style's TEXT_ANCHOR keys on), and the §14.5 text group. Halo + offset are
 // separate findings (still on the OpText halo / LocalOffset rows).
+/// Case-insensitive last occurrence of `needle` in `haystack`.
+fn lastIndexOfCI(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var i: usize = haystack.len - needle.len + 1;
+    while (i > 0) {
+        i -= 1;
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+/// Reduce a buoy/lighted-buoy name label to its chart designation. The S-101 buoy
+/// rules tag the feature "by <OBJNAM>" (EncodeString 'by %s'); NOAA OBJNAM is the full
+/// descriptive name ("Chesapeake Channel Lighted Buoy 78A") but a chart shows only the
+/// trailing designation ("78A"), which also de-clutters a channel of buoys whose long
+/// prefix repeats. The "by " prefix marks these name labels; all other text (depth
+/// labels, light elevations, …) has no such prefix and passes through unchanged. The
+/// designation is whatever follows the LAST buoy/beacon type-word; "Light"/"Lt" are
+/// deliberately excluded so a named light keeps its name, and a name with no type-word
+/// keeps its stripped form (e.g. a bare "22").
+fn shortenName(text: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, text, "by ")) return text;
+    const name = std.mem.trim(u8, text[3..], " ");
+    const keywords = [_][]const u8{ "Daybeacon", "Daymark", "Buoy", "Beacon" };
+    var best_end: ?usize = null;
+    for (keywords) |kw| {
+        if (lastIndexOfCI(name, kw)) |idx| {
+            const end = idx + kw.len;
+            if (best_end == null or end > best_end.?) best_end = end;
+        }
+    }
+    if (best_end) |end| {
+        const rest = std.mem.trim(u8, name[end..], " ");
+        if (rest.len > 0) return rest;
+    }
+    return name;
+}
+
 fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) !void {
-    try props.append(a, .{ .key = "text", .value = .{ .string = t.text } });
+    try props.append(a, .{ .key = "text", .value = .{ .string = shortenName(t.text) } });
     try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = if (t.font_size > 0) t.font_size else 12 } });
     try props.append(a, .{ .key = "halign", .value = .{ .string = t.halign } });
@@ -2270,6 +2308,22 @@ test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)
     }
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS55", sym_s); // 4.5 m
     try std.testing.expectEqualStrings("SOUNDS21,SOUNDS14,SOUNDS58", sym_s_ft); // 14.8 ft
+}
+
+test "shortenName: buoy/light names reduce to the chart designation" {
+    // Verbose NOAA OBJNAM tagged "by <name>" by the S-101 buoy rules -> just the id.
+    try std.testing.expectEqualStrings("78A", shortenName("by Chesapeake Channel Lighted Buoy 78A"));
+    try std.testing.expectEqualStrings("CR", shortenName("by Chesapeake Channel Lighted Buoy CR"));
+    try std.testing.expectEqualStrings("3", shortenName("by Tangier Sound Daybeacon 3"));
+    try std.testing.expectEqualStrings("2CR", shortenName("by Lighted Whistle Buoy 2CR"));
+    // No type-word -> the stripped name (already short).
+    try std.testing.expectEqualStrings("22", shortenName("by 22"));
+    // No "by " prefix -> passthrough (depth label, light elevation, place name).
+    try std.testing.expectEqualStrings(" 4.6m", shortenName(" 4.6m"));
+    try std.testing.expectEqualStrings("Herring Bay", shortenName("Herring Bay"));
+    // "Light"/"Lt" are NOT split words -> a named light keeps its name (defensive; such
+    // labels don't carry the "by " buoy prefix anyway).
+    try std.testing.expectEqualStrings("Thomas Point Light", shortenName("by Thomas Point Light"));
 }
 
 test "listHasAny splits S-57 comma lists and matches any target" {
