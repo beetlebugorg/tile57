@@ -282,8 +282,15 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
     try js.write(true);
     try js.objectField("icon-ignore-placement");
     try js.write(true);
+    // Draw point symbols in S-101 DrawingPriority order (the `draw_prio` tile property,
+    // higher = on top), not raw tile/source order — so e.g. a light (DrawingPriority 24)
+    // draws over an obstruction (12). symbol-sort-key sorts ascending (lower drawn first
+    // = underneath), so the key IS draw_prio. z-order "auto" makes the sort-key take
+    // effect (was "source", which ignored it). Mirrors fill-sort-key on the fill layers.
+    try js.objectField("symbol-sort-key");
+    try js.write(.{ "coalesce", .{ "get", "draw_prio" }, 0 });
     try js.objectField("symbol-z-order");
-    try js.write("source");
+    try js.write("auto");
     try js.objectField("icon-rotation-alignment");
     try js.write(alignment);
     try js.endObject();
