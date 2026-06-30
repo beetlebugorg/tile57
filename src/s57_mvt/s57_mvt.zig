@@ -67,6 +67,19 @@ fn classify(objl: u16) Class {
     };
 }
 
+/// S-52 quaposSolidClass (s101build.go:299): man-made structures drawn with a definite
+/// (solid) line regardless of QUAPOS. The approximate-position dashing is for natural
+/// features whose charted position is uncertain (depth contours, coastline, rivers) —
+/// not engineered structures whose edges often inherit a shared coastline's low-accuracy
+/// QUAPOS. Keyed by acronym, like the oracle's map.
+fn quaposSolidClass(objl: u16) bool {
+    const acr = catalogue.acronymByObjl(objl) orelse return false;
+    for ([_][]const u8{ "BRIDGE", "ROADWY", "RAILWY", "CAUSWY", "DAMCON", "GATCON" }) |name| {
+        if (std.mem.eql(u8, acr, name)) return true;
+    }
+    return false;
+}
+
 /// True if the S-57 comma-separated list value `csv` contains any of `targets`.
 /// (Mirrors s101_adapt.hasListVal; S-57 list attributes are comma-joined.)
 fn listHasAny(csv: []const u8, targets: []const i64) bool {
@@ -1270,6 +1283,15 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         stroke_proj = stroke_storage.items;
     }
 
+    // Low-accuracy geometry (QUAPOS not surveyed / precise / calculated) draws DASHED —
+    // the S-52 approximate-position line style (s101build.go:435: DEPCNT03 dashes a
+    // low-accuracy depth contour; the same for coastline, rivers, tracks…). The S-101
+    // rules read this from a per-edge spatial-quality association we don't model, so
+    // apply it from the parsed per-feature QUAPOS aggregate (cell.featureQuapos): switch
+    // SOLID simple strokes to dashed. Man-made structures (quaposSolidClass) and complex
+    // linestyles keep their look. Computed once per feature, outside the stroke loop.
+    const force_dash = !quaposSolidClass(f.objl) and s57.isLowAccuracyQuapos(cell.featureQuapos(f));
+
     // Best-band suppression: a finer band covers the tile centre, so drop this coarse
     // cell's line strokes (they'd double-draw beside the finer copy).
     if (!L.suppress_lines) for (p.lines) |ln| {
@@ -1286,9 +1308,13 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
                 continue;
             }
         }
-        // _simple_ -> solid; an UNregistered named style (or no table, e.g. the live
-        // host path) is approximated as a dashed stroke rather than a bold solid one.
-        const dash: []const u8 = if (std.mem.eql(u8, ln.style, "solid")) "solid" else "dashed";
+        // _simple_ -> solid (dashed when the feature's QUAPOS is low-accuracy, above);
+        // an UNregistered named style (or no table, e.g. the live host path) is
+        // approximated as a dashed stroke rather than a bold solid one.
+        const dash: []const u8 = if (std.mem.eql(u8, ln.style, "solid"))
+            (if (force_dash) "dashed" else "solid")
+        else
+            "dashed";
         for (stroke_proj) |proj| {
             const sub = try clipSimplifyLine(a, proj, box);
             if (sub.len == 0) continue;
