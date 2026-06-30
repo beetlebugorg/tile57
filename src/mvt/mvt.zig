@@ -107,15 +107,25 @@ fn encodeGeometry(b: *Buf, a: Allocator, gt: GeomType, parts: []const []const Po
                 }
             },
             .linestring, .polygon => {
+                // For polygons the MVT ring is implicitly closed by ClosePath, so a
+                // closing-duplicate vertex (last == first, as S-57 area ring assembly
+                // produces) must be dropped or it encodes a redundant LineTo back to
+                // the start. Mirrors the Go encoder's dropClosingDuplicate; linestrings
+                // keep every vertex (encodeLines never drops it).
+                var ring = part;
+                if (gt == .polygon and ring.len >= 2 and
+                    ring[ring.len - 1].x == ring[0].x and ring[ring.len - 1].y == ring[0].y)
+                {
+                    ring = ring[0 .. ring.len - 1];
+                }
                 // MoveTo first vertex.
                 try putVarint(b, a, cmd(1, 1));
-                try putVarint(b, a, zigzag(part[0].x - cx));
-                try putVarint(b, a, zigzag(part[0].y - cy));
-                cx = part[0].x;
-                cy = part[0].y;
-                // For polygons the ring is implicitly closed, so we don't repeat
-                // the first point as the last; LineTo the remaining vertices.
-                const rest = part[1..];
+                try putVarint(b, a, zigzag(ring[0].x - cx));
+                try putVarint(b, a, zigzag(ring[0].y - cy));
+                cx = ring[0].x;
+                cy = ring[0].y;
+                // LineTo the remaining vertices.
+                const rest = ring[1..];
                 if (rest.len > 0) {
                     try putVarint(b, a, cmd(2, @intCast(rest.len)));
                     for (rest) |p| {
@@ -515,6 +525,44 @@ test "round-trip point + polygon with properties" {
     try std.testing.expectEqualStrings("class", poly.properties[0].key);
     try std.testing.expectEqualStrings("DEPARE", poly.properties[0].value.string);
     try std.testing.expectEqual(@as(i64, 5), poly.properties[1].value.int);
+}
+
+test "polygon closing-duplicate vertex is dropped (dropClosingDuplicate)" {
+    const a = std.testing.allocator;
+
+    const open_ring = [_]Point{
+        .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 0 }, .{ .x = 10, .y = 10 }, .{ .x = 0, .y = 10 },
+    };
+    // Same ring but explicitly closed (last == first), as area assembly produces.
+    const closed_ring = [_]Point{
+        .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 0 }, .{ .x = 10, .y = 10 }, .{ .x = 0, .y = 10 }, .{ .x = 0, .y = 0 },
+    };
+
+    const open_parts = [_][]const Point{&open_ring};
+    const closed_parts = [_][]const Point{&closed_ring};
+    const open_feats = [_]Feature{.{ .geom_type = .polygon, .parts = &open_parts }};
+    const closed_feats = [_]Feature{.{ .geom_type = .polygon, .parts = &closed_parts }};
+    const open_layers = [_]Layer{.{ .name = "t", .features = &open_feats }};
+    const closed_layers = [_]Layer{.{ .name = "t", .features = &closed_feats }};
+
+    const open_bytes = try encode(a, Tile{ .layers = &open_layers });
+    defer a.free(open_bytes);
+    const closed_bytes = try encode(a, Tile{ .layers = &closed_layers });
+    defer a.free(closed_bytes);
+
+    // The closing duplicate is dropped, so both encode to byte-identical tiles.
+    try std.testing.expectEqualSlices(u8, open_bytes, closed_bytes);
+
+    // And a linestring with a repeated final vertex KEEPS it (no drop).
+    const line_parts = [_][]const Point{&closed_ring};
+    const line_feats = [_]Feature{.{ .geom_type = .linestring, .parts = &line_parts }};
+    const line_layers = [_]Layer{.{ .name = "t", .features = &line_feats }};
+    const line_bytes = try encode(a, Tile{ .layers = &line_layers });
+    defer a.free(line_bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const dec = try decode(arena.allocator(), line_bytes);
+    try std.testing.expectEqual(@as(usize, 5), dec[0].features[0].parts[0].len);
 }
 
 test "zigzag" {
