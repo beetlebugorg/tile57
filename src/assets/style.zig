@@ -298,12 +298,20 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
     try js.endObject();
 }
 
-// Which classes a point-symbol layer carries. LIGHTS are split into their own pass so
-// the style can emit them LAST (on top): a light and a bridge are both DrawingPriority
-// 24, but they usually sit in different SCAMIN buckets (separate MapLibre layers, painted
-// in emit order), so an in-layer sort-key can't keep the light on top. A dedicated lights
-// pass emitted after every other point layer makes the paramount navaid always win.
-const PointMode = enum { non_lights, lights_only };
+// The S-57 danger point classes whose symbol must stay visible OVER its own depth
+// sounding: an obstruction / wreck / rock marker is the hazard, and a recreational
+// chartplotter keeps it on top of the depth number (a deliberate deviation from the
+// strict S-52 DrawingPriority, which is 12 for these vs 18 for soundings — so by the
+// book the sounding would cover them).
+const DANGER_CLASSES = .{ "OBSTRN", "WRECKS", "UWTROC" };
+
+// Which classes a point-symbol layer carries, so the style can stack three passes in
+// the right z-order: `base` (everything else) UNDER soundings; `dangers_only` (the
+// hazard markers) OVER soundings; `lights_only` (the paramount navaid) over all. LIGHTS
+// and dangers need their own passes because a light/danger and a same-or-higher-priority
+// neighbour usually sit in different SCAMIN buckets (separate MapLibre layers painted in
+// emit order), so an in-layer sort-key can't reorder across them.
+const PointMode = enum { base, dangers_only, lights_only };
 
 // AND the per-alignment rot_north test with the mode's class clause, then emit the
 // bucket filter. rot_north_eq / mode are comptime so each switch arm passes a concrete
@@ -313,16 +321,20 @@ fn applyPointBucket(js: *Stringify, s: *const SCtx, bkt: Bucket, comptime rot_no
         .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }
     else
         .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 };
+    const in_danger = .{ "in", .{ "get", "class" }, .{ "literal", DANGER_CLASSES } };
     switch (mode) {
-        .non_lights => try applyBucket(js, .{ "all", rot, .{ "!=", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s.common, null),
+        // base = not a light AND not a danger (those ride their own over-soundings passes).
+        .base => try applyBucket(js, .{ "all", rot, .{ "!=", .{ "get", "class" }, "LIGHTS" }, .{ "!", in_danger } }, true, bkt, s.common, null),
+        .dangers_only => try applyBucket(js, .{ "all", rot, in_danger }, true, bkt, s.common, null),
         .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s.common, null),
     }
 }
 
 fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket, comptime mode: PointMode) !void {
-    // `-lt` infixes the lights-only layer ids so they stay distinct from the non-light set.
+    // Infix the over-soundings passes' layer ids so they stay distinct from the base set.
     const tag = switch (mode) {
-        .non_lights => "",
+        .base => "",
+        .dangers_only => "-dgr",
         .lights_only => "-lt",
     };
     var buf: [96]u8 = undefined;
@@ -685,11 +697,17 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     // 6. light sector limit lines (no SCAMIN bucketing)
     try lineLayers(js, &s, "sector_lines", .{});
 
-    // 7. point symbols (non-light) + soundings (sprite required)
+    // 7. point symbols + soundings (sprite required), stacked by z-order:
+    //   base symbols (buoys/beacons/landmarks…) UNDER soundings (S-52 priority),
+    //   then soundings, then the DANGER markers (obstruction/wreck/rock) OVER soundings
+    //   so the hazard stays visible on top of its own depth number, then LIGHTS on top.
     if (sprite_on) {
-        try pointSymbolLayers(js, &s, "point_symbols", .{}, .non_lights);
-        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .non_lights);
+        try pointSymbolLayers(js, &s, "point_symbols", .{}, .base);
+        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .base);
         for (snd_buckets) |bkt| try soundingsLayer(js, &s, bkt);
+        // Danger markers over soundings (hazard visibility — see DANGER_CLASSES).
+        try pointSymbolLayers(js, &s, "point_symbols", .{}, .dangers_only);
+        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .dangers_only);
         // LIGHTS on top: emitted after every other point symbol so a light always draws
         // over a same-priority bridge that lives in a different scamin bucket layer.
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .lights_only);
