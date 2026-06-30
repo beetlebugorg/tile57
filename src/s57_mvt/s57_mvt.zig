@@ -914,7 +914,12 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         // geometry (dash runs + embedded symbols on the tangent); see emitComplexLine.
         if (!std.mem.eql(u8, ln.style, "solid")) {
             if (g_linestyles.get(ln.style)) |info| {
-                try emitComplexLine(a, geo_parts, info, ln.color, !L.suppress_points, z, x, y, box, meta, lines_l, points_l);
+                // Draw the symbolized linestyle along the DRAWABLE subset (stroke_geo),
+                // not the full ring — so a complex boundary skips masked / data-limit /
+                // coast-coincident edges like the simple stroke does (S-52 §8.6.2).
+                // e187d80 hoisted stroke_geo but left this call on geo_parts, so complex
+                // linestyles still drew along the entire coastline; feed it stroke_geo.
+                try emitComplexLine(a, stroke_geo, info, ln.color, !L.suppress_points, z, x, y, box, meta, lines_l, points_l);
                 continue;
             }
         }
