@@ -486,6 +486,7 @@ const LoadWork = struct {
         }
         _ = g_parses.fetchAdd(1, .monotonic); // count parses (re-parse diagnostics)
         var cell = engine.s57.parseCellWithUpdates(c.gpa, base, ups.items) catch return;
+        cell.name = std.fs.path.stem(std.fs.path.basename(bpath)); // pick-report source-cell badge (slice into the bake-lived entry path)
         const b = cell.bounds() orelse {
             cell.deinit();
             return;

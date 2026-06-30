@@ -545,6 +545,10 @@ pub const Feature = struct {
 
 pub const Cell = struct {
     params: DatasetParams,
+    /// Source ENC cell name (dataset name, e.g. "US4MD81M") for the cursor-pick
+    /// report's "source cell" badge. Set by the loader from the filename stem after
+    /// parse (the parser sees only bytes); "" when unknown (the `cell` prop is omitted).
+    name: []const u8 = "",
     vectors: []VectorRecord,
     features: []const Feature,
     nodes: std.AutoHashMap(u64, LonLat), // (rcnm<<32|rcid) -> point (VI/VC)

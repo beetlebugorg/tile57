@@ -413,6 +413,9 @@ const Meta = struct {
     // S-57 attribute set as compact acronym->value JSON. "" = omitted (no reportable
     // attribute, or pick attributes disabled). See encodeS57Attrs / pickS57.
     s57: []const u8 = "",
+    // Source ENC cell name (the pick report's "source cell" badge). "" = omitted
+    // (unknown cell name, or pick attributes disabled). From s57.Cell.name.
+    cell: []const u8 = "",
     band: u8 = 0, // NOAA band rank (0 finest … 5 coarsest)
     date_start: []const u8 = "",
     date_end: []const u8 = "",
@@ -492,6 +495,11 @@ fn pickS57(a: Allocator, L: Layers, f: s57.Feature) ![]const u8 {
     return if (L.pick_attrs) encodeS57Attrs(a, f) else "";
 }
 
+/// The source-cell name for the pick report, or "" when pick attributes are disabled.
+fn pickCell(L: Layers, cell_name: []const u8) []const u8 {
+    return if (L.pick_attrs) cell_name else "";
+}
+
 test "encodeS57Attrs: acronym->value JSON; skips blank + unknown; escapes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -530,6 +538,7 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     try props.append(a, .{ .key = "band", .value = .{ .int = m.band } });
     if (m.class.len > 0) try props.append(a, .{ .key = "class", .value = .{ .string = m.class } });
     if (m.s57.len > 0) try props.append(a, .{ .key = "s57", .value = .{ .string = m.s57 } });
+    if (m.cell.len > 0) try props.append(a, .{ .key = "cell", .value = .{ .string = m.cell } });
     if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
     // bnd/pts are emitted only for the style-variant passes (0/1); the common case
     // (2) is left off so the client coalesces to 2 (always shown) — keeping every
@@ -869,6 +878,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         .scamin = scamin,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57 = try pickS57(a, L, f),
+        .cell = pickCell(L, cell.name),
         .band = L.band,
         .date_start = p.date_start,
         .date_end = p.date_end,
@@ -1536,7 +1546,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
     const points_l = if (scamin != null) L.points_scamin else L.points;
     const texts_l = if (scamin != null) L.texts_scamin else L.texts;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .band = L.band };
+    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .cell = pickCell(L, cell.name), .band = L.band };
 
     // Dashed CHGRD boundary on each ring (clipped to the tile). Best-band: drop the
     // stroke where a finer band covers the tile centre (suppress_lines).
@@ -1602,7 +1612,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 
     const scamin = featureScamin(f);
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .band = L.band };
+    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .cell = pickCell(L, cell.name), .band = L.band };
     for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
@@ -1768,6 +1778,7 @@ fn appendCellFeatures(
                 .cat = 2,
                 .class = "SOUNDG",
                 .s57 = try pickS57(a, L, f),
+                .cell = pickCell(L, cell.name),
                 .scamin = featureScamin(f),
                 .band = L.band,
             };
