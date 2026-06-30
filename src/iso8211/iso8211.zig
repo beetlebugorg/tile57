@@ -95,7 +95,13 @@ fn asciiInt(buf: []const u8) !usize {
     var v: usize = 0;
     var any = false;
     for (buf) |c| {
-        if (c == ' ' or c == 0) continue;
+        // A null byte in a numeric field means a corrupted or non-ISO-8211 record;
+        // the oracle (parseASCIIInt, leader.go:133) errors rather than treat it as a
+        // pad. Was silently skipped here. Spaces stay a pad (all-spaces -> 0), matching
+        // the oracle's all-spaces case; valid NOAA numerics are zero-padded so this is a
+        // no-op on reference data and only rejects corrupt input.
+        if (c == 0) return error.BadAsciiInt;
+        if (c == ' ') continue;
         if (c < '0' or c > '9') return error.BadAsciiInt;
         v = v * 10 + (c - '0');
         any = true;
