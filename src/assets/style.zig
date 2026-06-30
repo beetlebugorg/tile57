@@ -898,6 +898,19 @@ test "buildFromTemplate: feet depth unit -> contour label uses M_TO_FT" {
     try std.testing.expect(std.mem.indexOf(u8, out, "3.280839895") != null);
 }
 
+test "buildFromTemplate: feet picks the sounding feet glyph variant; metres doesn't" {
+    const a = std.testing.allocator;
+    const feet = try buildFromTemplate(a, cs_template, &.{ .depth_unit = .feet }, cs_ct, null, 1700000000);
+    defer a.free(feet);
+    try std.testing.expect(std.mem.indexOf(u8, feet, "sym_s_ft") != null);
+
+    // The default metres style swaps in the plain metres glyphs, not the feet variant.
+    const metres = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
+    defer a.free(metres);
+    try std.testing.expect(std.mem.indexOf(u8, metres, "sym_s_ft") == null);
+    try std.testing.expect(std.mem.indexOf(u8, metres, "sym_s") != null);
+}
+
 test "buildFromTemplate: enabled bands add a band filter" {
     const a = std.testing.allocator;
     const m = chartstyle.MarinerSettings{};

@@ -233,13 +233,18 @@ pub fn areasFillColor(b: B, palette: *const ObjectMap, m: *const MarinerSettings
 // ---- icon / label image expressions ----------------------------------------
 
 // SNDFRM04: a sounding <= the live safety depth uses the bold SOUNDS glyphs, else
-// the faint SOUNDG glyphs.
+// the faint SOUNDG glyphs. The safety split compares the raw metres `depth` (S-52
+// metres); when the mariner selects feet, the displayed digits come from the baked
+// whole-feet glyph variant (sym_s_ft/sym_g_ft) instead — a recreational unit option,
+// not ECDIS (see s57_mvt.appendSoundingProps), mirroring contourLabelField.
 pub fn soundingsIconImage(b: B, m: *const MarinerSettings) !Value {
+    const ss = if (m.depth_unit == .feet) "sym_s_ft" else "sym_s";
+    const sg = if (m.depth_unit == .feet) "sym_g_ft" else "sym_g";
     const depthLE = try b.arr(&.{ b.s("<="), try b.coalesce(try b.get("depth"), b.int(0)), try b.flt(m.safety_depth) });
     return b.arr(&.{
         b.s("case"),
-        try b.arr(&.{ b.s("has"), b.s("sym_s") }),
-        try b.arr(&.{ b.s("case"), depthLE, try b.get("sym_s"), try b.get("sym_g") }),
+        try b.arr(&.{ b.s("has"), b.s(ss) }),
+        try b.arr(&.{ b.s("case"), depthLE, try b.get(ss), try b.get(sg) }),
         try b.get("symbol_names"),
     });
 }

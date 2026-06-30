@@ -24,6 +24,13 @@ const s101_adapt = @import("s100").s101_adapt;
 // size 1.0), i.e. ~2.8x too large.
 const SYMBOL_SCALE: f64 = 0.02834627777338028;
 
+// Metres → feet. Soundings are stored + portrayed in metres (S-52/S-101 SNDFRM04 is
+// metres-only); this app additionally bakes a whole-feet glyph variant (sym_s_ft/
+// sym_g_ft) so the generated style can show soundings in feet when the mariner picks
+// that unit — a recreational-chartplotter convenience, not ECDIS behaviour, matching
+// the existing depth-contour feet conversion (chartstyle.contourLabelField).
+const M_TO_FT: f64 = 3.280839895;
+
 // Worst-case reach of a light's sector legs/arcs (emitAugFigures) as a fraction of a
 // tile — these are drawn at a fixed DISPLAY size (radius/length in mm), so the reach
 // is ~constant in tile units at every zoom (offset_tiles = mm * PX_PER_MM / 256).
@@ -144,35 +151,57 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc
     return std.mem.join(a, ",", toks.items);
 }
 
+/// SNDFRM04 quality flags for the whole feature: swept (TECSOU∈{4,18}) → B1 ring;
+/// low-accuracy (QUASOU∈{3,4,5,8,9} or STATUS∈{18}) → C2/C3 ring.
+fn soundingQualityFlags(f: s57.Feature) struct { swept: bool, low_acc: bool } {
+    return .{
+        .swept = listHasAny(f.attr(s57.ATTR_TECSOU) orelse "", &.{ 4, 18 }),
+        .low_acc = listHasAny(f.attr(s57.ATTR_QUASOU) orelse "", &.{ 3, 4, 5, 8, 9 }) or
+            listHasAny(f.attr(s57.ATTR_STATUS) orelse "", &.{18}),
+    };
+}
+
+/// Append the SNDFRM04 sounding-glyph properties for one depth (metres): the metres
+/// safe/general glyph lists (sym_s/sym_g), a WHOLE-FEET variant (sym_s_ft/sym_g_ft)
+/// the style swaps in when the mariner selects feet, and the raw metres `depth` the
+/// style's safety-depth split compares against. Returns false (nothing appended) when
+/// the depth composes to no glyphs. The safety split stays in metres (`depth`); only
+/// the displayed digits convert, rounded to whole feet like the contour feet label.
+fn appendSoundingProps(a: Allocator, props: *std.ArrayList(mvt.Prop), depth_m: f64, swept: bool, low_acc: bool) !bool {
+    const sym_s = try sndfrmSyms(a, "SOUNDS", depth_m, swept, low_acc);
+    if (sym_s.len == 0) return false;
+    const sym_g = try sndfrmSyms(a, "SOUNDG", depth_m, swept, low_acc);
+    const ft = @round(depth_m * M_TO_FT);
+    const sym_s_ft = try sndfrmSyms(a, "SOUNDS", ft, swept, low_acc);
+    const sym_g_ft = try sndfrmSyms(a, "SOUNDG", ft, swept, low_acc);
+    try props.append(a, .{ .key = "sym_s", .value = .{ .string = sym_s } });
+    try props.append(a, .{ .key = "sym_g", .value = .{ .string = sym_g } });
+    try props.append(a, .{ .key = "sym_s_ft", .value = .{ .string = sym_s_ft } });
+    try props.append(a, .{ .key = "sym_g_ft", .value = .{ .string = sym_g_ft } });
+    try props.append(a, .{ .key = "depth", .value = .{ .double = depth_m } });
+    return true;
+}
+
 /// Emit a SOUNDG feature's multipoint soundings into the `soundings` layer, one
-/// point per sounding, with sym_s/sym_g/depth so the style's SNDFRM glyphs and
-/// the mariner safety-depth switch (soundings_image) render the depth digits.
+/// point per sounding, with the SNDFRM glyph variants (see appendSoundingProps) so
+/// the style renders the depth digits and the mariner safety-depth + unit switches.
 fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, meta: Meta, z: u8, x: u32, y: u32, tb: [4]f64, out: *std.ArrayList(mvt.Feature)) !void {
     const snds = cell.soundingsFor(a, f) catch return;
-    // Per-feature quality flags (SNDFRM04): swept => B1, low-accuracy => C2/C3 ring.
-    // These attributes apply to the whole SOUNDG feature, so derive them once.
-    const swept = listHasAny(f.attr(s57.ATTR_TECSOU) orelse "", &.{ 4, 18 });
-    const low_acc = listHasAny(f.attr(s57.ATTR_QUASOU) orelse "", &.{ 3, 4, 5, 8, 9 }) or
-        listHasAny(f.attr(s57.ATTR_STATUS) orelse "", &.{18});
+    const q = soundingQualityFlags(f);
     for (snds) |s| {
         if (s.lon() < tb[0] or s.lon() > tb[2] or s.lat() < tb[1] or s.lat() > tb[3]) continue;
-        const sym_s = try sndfrmSyms(a, "SOUNDS", s.depth, swept, low_acc);
-        if (sym_s.len == 0) continue;
-        const sym_g = try sndfrmSyms(a, "SOUNDG", s.depth, swept, low_acc);
-        const pt = tile.project(s.lon(), s.lat(), z, x, y, tile.EXTENT);
-        const parts = try a.alloc([]const mvt.Point, 1);
-        const single = try a.alloc(mvt.Point, 1);
-        single[0] = pt;
-        parts[0] = single;
         var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(a, .{ .key = "sym_s", .value = .{ .string = sym_s } });
-        try props.append(a, .{ .key = "sym_g", .value = .{ .string = sym_g } });
-        try props.append(a, .{ .key = "depth", .value = .{ .double = s.depth } });
+        if (!try appendSoundingProps(a, &props, s.depth, q.swept, q.low_acc)) continue;
         try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
         // Shared S-52 mariner-filter metadata (draw priority / display category /
         // band / SCAMIN / class) so soundings honour the client's category + SCAMIN
         // gating like every other feature — oracle routeSoundingGroup (bake.go:894).
         try appendMeta(a, &props, meta);
+        const pt = tile.project(s.lon(), s.lat(), z, x, y, tile.EXTENT);
+        const parts = try a.alloc([]const mvt.Point, 1);
+        const single = try a.alloc(mvt.Point, 1);
+        single[0] = pt;
+        parts[0] = single;
         try out.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 }
