@@ -282,6 +282,51 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chartstyle", .module = chartstyle_mod },
     };
 
+    // Full engine surface (the pure root.zig packages + the embedded-Lua `portray`
+    // module) as ONE import named "engine", via bake_root.zig. Target-agnostic: it
+    // inherits each consumer's target, so the static-musl baker, libtile57.a (host
+    // target), and the shared bundle module below all compile it against their own
+    // target over the same singleton leaf packages.
+    const engine_full = b.createModule(.{
+        .root_source_file = b.path("src/bake_root.zig"),
+        .link_libc = true, // portray (embedded Lua) needs the C runtime
+    });
+    addPkgs(engine_full, &pure_pkgs);
+    engine_full.addImport("portray", portray_mod);
+
+    // The embedded S-52 colour profile. Built ONCE and shared: the C ABI imports it
+    // directly (tile57_colortables_default / tile57_style_template) AND it rides on
+    // catalog_embed below. A second embedDir for the same dir would create a second
+    // same-named module and collide in the libtile57.a build (where both are present).
+    const colorprofile_registry = embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml");
+
+    // The S-101 portrayal *assets* embedded into the binary: symbol SVGs, the palette
+    // CSS, line-style + area-fill XML, and the colour profile. The bundle pipeline
+    // emits colortables / sprites / patterns / style.json from these with no on-disk
+    // catalogue; a --catalog / positional dir still overrides (read from disk). Shared
+    // by the CLI baker AND libtile57.a (so the C ABI bake_bundle needs no catalogue).
+    const catalog_embed = b.createModule(.{ .root_source_file = b.path("tools/catalog_embed.zig") });
+    catalog_embed.addImport("symbols_registry", embedDir(b, "symbols_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".svg"));
+    catalog_embed.addImport("css_registry", embedDir(b, "css_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".css"));
+    catalog_embed.addImport("linestyles_registry", embedDir(b, "linestyles_registry", PORTRAYAL_CATALOG ++ "/LineStyles", ".xml"));
+    catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
+    catalog_embed.addImport("colorprofile_registry", colorprofile_registry);
+
+    // The chart-bundle pipeline as a library module (bundle.bakeBundle): tiles +
+    // assets + manifest. Target-agnostic + libc (the sprite atlas builder), so the
+    // CLI baker AND libtile57.a (the C ABI, tile57_bake_bundle) build the SAME bundle
+    // over the shared singleton packages. See src/bundle.zig.
+    const bundle_mod = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full },
+            .{ .name = "assets", .module = assets_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+        },
+    });
+
     // Pure-Zig public module (no libc). Used by the unit tests so that
     // Zig-linked test binary doesn't pull in the system crt.
     const mod = b.addModule("engine", .{
@@ -320,11 +365,15 @@ pub fn build(b: *std.Build) void {
     addPkgs(lib_mod, &pure_pkgs);
     lib_mod.addImport("portray", portray_mod);
     lib_mod.addImport("sprite", sprite_mod); // C ABI: sprite/pattern atlas generation
-    // Bake the S-52 colour profile into the library so the C ABI can generate the
-    // colortables + base style template with no on-disk catalogue
-    // (tile57_colortables_default / tile57_style_template). Only the ColorProfiles
-    // XML is needed for style JSON — symbols/linestyles ride the bake exe, not the lib.
-    lib_mod.addImport("colorprofile_registry", embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml"));
+    lib_mod.addImport("bundle", bundle_mod); // C ABI: the whole chart-bundle pipeline (bake_bundle)
+    // The full engine surface as a NAMED import (not a root.zig file-import), so the
+    // single root.zig file isn't claimed by both lib_mod and engine_full (which bundle
+    // pulls in) — Zig requires each file to belong to exactly one module per artifact.
+    lib_mod.addImport("engine", engine_full);
+    // The S-52 colour profile (shared module, built once above) so the C ABI can
+    // generate the colortables + base style template with no on-disk catalogue
+    // (tile57_colortables_default / tile57_style_template).
+    lib_mod.addImport("colorprofile_registry", colorprofile_registry);
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
 
@@ -346,42 +395,6 @@ pub fn build(b: *std.Build) void {
     else
         target;
 
-    const bake_engine = b.createModule(.{
-        .root_source_file = b.path("src/bake_root.zig"),
-        .target = bake_target,
-        .optimize = optimize,
-        .link_libc = true, // Lua needs the C runtime
-    });
-    addPkgs(bake_engine, &pure_pkgs);
-    bake_engine.addImport("portray", portray_mod);
-
-    // The S-101 portrayal *assets* embedded into the CLI: symbol SVGs, the palette
-    // CSS, line-style + area-fill XML, and the colour profile. tile57 emits
-    // colortables / sprites / patterns / style.json from these with no on-disk
-    // catalogue; a --catalog / positional dir still overrides (read from disk).
-    const catalog_embed = b.createModule(.{ .root_source_file = b.path("tools/catalog_embed.zig") });
-    catalog_embed.addImport("symbols_registry", embedDir(b, "symbols_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".svg"));
-    catalog_embed.addImport("css_registry", embedDir(b, "css_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".css"));
-    catalog_embed.addImport("linestyles_registry", embedDir(b, "linestyles_registry", PORTRAYAL_CATALOG ++ "/LineStyles", ".xml"));
-    catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
-    catalog_embed.addImport("colorprofile_registry", embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml"));
-
-    // The chart-bundle pipeline as a library module (asset emitters now; bakeRoot +
-    // bakeBundle next), so the CLI is a thin wrapper and the C ABI can build the same
-    // bundle. libc (the sprite atlas builder). See src/bundle.zig.
-    const bundle_mod = b.createModule(.{
-        .root_source_file = b.path("src/bundle.zig"),
-        .target = bake_target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
-            .{ .name = "engine", .module = bake_engine },
-            .{ .name = "assets", .module = assets_mod },
-            .{ .name = "sprite", .module = sprite_mod },
-            .{ .name = "catalog", .module = catalog_embed },
-        },
-    });
-
     const bake = b.addExecutable(.{
         .name = "tile57",
         .root_module = b.createModule(.{
@@ -390,7 +403,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "engine", .module = bake_engine },
+                .{ .name = "engine", .module = engine_full },
                 .{ .name = "assets", .module = assets_mod },
                 .{ .name = "sprite", .module = sprite_mod },
                 .{ .name = "catalog", .module = catalog_embed },
