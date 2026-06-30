@@ -182,6 +182,55 @@ fn appendSoundingProps(a: Allocator, props: *std.ArrayList(mvt.Prop), depth_m: f
     return true;
 }
 
+/// True for a SNDFRM04 sounding digit-glyph symbol name (SOUNDS* bold/shallow or
+/// SOUNDG* faint/deep). Mirrors the oracle's isSoundingName (bake.go:2628).
+fn isSoundingName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "SOUNDS") or std.mem.startsWith(u8, name, "SOUNDG");
+}
+
+/// Emit a feature's point-symbol instructions at the anchor geometry `parts`.
+/// Regular symbols go to `points_l`. SNDFRM04 sounding digit-glyphs (a wreck /
+/// obstruction / rock depth the rule drew via SNDFRM04) are instead coalesced into
+/// ONE `soundings`-layer feature built from the feature's VALSOU — so the depth lands
+/// in the soundings layer like the oracle (bake.go:797), honouring the safety-depth
+/// split and the mariner depth unit (sym_s_ft/sym_g_ft) just like a SOUNDG sounding,
+/// rather than leaking into point_symbols as fixed-metres glyphs. If the feature has
+/// no usable VALSOU the glyphs are left in point_symbols unchanged (no depth to recompose).
+fn emitFeaturePoints(a: Allocator, syms: []const s101.Point, parts: []const []const mvt.Point, f: s57.Feature, meta: Meta, points_l: *std.ArrayList(mvt.Feature), L: Layers) !void {
+    // Coalesce the rule's sounding glyphs into the soundings layer when the feature
+    // carries a depth to recompose from (VALSOU); else they stay in point_symbols.
+    var routed_sounding = false;
+    if (f.attrFloat(s57.ATTR_VALSOU)) |valsou| {
+        var has = false;
+        for (syms) |sym| {
+            if (isSoundingName(sym.symbol)) {
+                has = true;
+                break;
+            }
+        }
+        if (has) {
+            const q = soundingQualityFlags(f);
+            var props = std.ArrayList(mvt.Prop).empty;
+            if (try appendSoundingProps(a, &props, valsou, q.swept, q.low_acc)) {
+                try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+                try appendMeta(a, &props, meta); // class/draw_prio/cat/scamin from the feature's portrayal
+                try L.soundings.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+                routed_sounding = true;
+            }
+        }
+    }
+    for (syms) |sym| {
+        if (routed_sounding and isSoundingName(sym.symbol)) continue; // moved to the soundings layer
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
+        try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
+        if (sym.rot_north) try props.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } });
+        try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+        try appendMeta(a, &props, meta);
+        try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+    }
+}
+
 /// Emit a SOUNDG feature's multipoint soundings into the `soundings` layer, one
 /// point per sounding, with the SNDFRM glyph variants (see appendSoundingProps) so
 /// the style renders the depth digits and the mariner safety-depth + unit switches.
@@ -360,6 +409,10 @@ const Layers = struct {
     lines_scamin: *std.ArrayList(mvt.Feature),
     points_scamin: *std.ArrayList(mvt.Feature),
     texts_scamin: *std.ArrayList(mvt.Feature),
+    // The `soundings` layer (one list, no SCAMIN bucket — gated by the `scamin`
+    // property in the style). SOUNDG multipoints and wreck/obstruction/rock depth
+    // glyphs (coalesced from the portrayal, see emitFeaturePoints) both land here.
+    soundings: *std.ArrayList(mvt.Feature),
     // NOAA navigational band of the cell being appended (0=berthing/finest …
     // 5=overview/coarsest). Emitted as the MVT `band` property so the style's
     // fill-sort-key draws finer-band area fills over coarser ones at band overlaps
@@ -1053,16 +1106,10 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         single[0] = pt;
         parts[0] = single;
         // Best-band suppression: a finer band covers this whole tile, so drop this
-        // coarse cell's point symbols + text (the finer cell carries them).
-        if (!L.suppress_points) for (p.points) |sym| {
-            var props = std.ArrayList(mvt.Prop).empty;
-            try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
-            try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
-            if (sym.rot_north) try props.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } });
-            try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-            try appendMeta(a, &props, meta);
-            try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-        };
+        // coarse cell's point symbols + text (the finer cell carries them). A wreck/
+        // obstruction/rock depth the rule drew via SNDFRM04 is routed to the soundings
+        // layer (emitFeaturePoints) so it honours the depth unit + safety split.
+        if (!L.suppress_points) try emitFeaturePoints(a, p.points, parts, f, meta, points_l, L);
         if (!L.suppress_points) for (p.texts) |t| {
             var props = std.ArrayList(mvt.Prop).empty;
             try appendTextProps(a, &props, t);
@@ -1245,15 +1292,9 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
                 const single = try a.alloc(mvt.Point, 1);
                 single[0] = cpt;
                 parts[0] = single;
-                for (p.points) |sym| {
-                    var props = std.ArrayList(mvt.Prop).empty;
-                    try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
-                    try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
-                    if (sym.rot_north) try props.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } });
-                    try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-                    try appendMeta(a, &props, meta);
-                    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-                }
+                // Same split as the point path: an area OBSTRN's SNDFRM04 depth glyphs
+                // route to the soundings layer; other centred symbols to point_symbols.
+                try emitFeaturePoints(a, p.points, parts, f, meta, points_l, L);
             }
         }
     }
@@ -1909,6 +1950,7 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
         .lines_scamin = &lines_scamin,
         .points_scamin = &points_scamin,
         .texts_scamin = &texts_scamin,
+        .soundings = &soundings,
         .pick_attrs = pick_attrs,
     };
 
@@ -1919,7 +1961,7 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
         Lc.suppress_patterns = cr.suppress_patterns; // coarse band over finer M_COVR (centre): drop pattern
         Lc.suppress_lines = cr.suppress_lines; // (centre): drop coarse boundary/line strokes
         Lc.suppress_points = cr.suppress_points; // (whole-tile): drop coarse point symbols + text
-        try appendCellFeatures(a, Lc, &soundings, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(a, Lc, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 
     var layers = std.ArrayList(mvt.Layer).empty;
@@ -1984,7 +2026,6 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
 fn appendCellFeatures(
     a: Allocator,
     L: Layers,
-    soundings: *std.ArrayList(mvt.Feature),
     cell: *s57.Cell,
     portrayal: ?[]const ?[]const u8,
     portrayal_plain: ?[]const ?[]const u8,
@@ -2049,7 +2090,7 @@ fn appendCellFeatures(
                 .scamin = featureScamin(f),
                 .band = L.band,
             };
-            try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, soundings);
+            try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, L.soundings);
             continue;
         }
         // NEWOBJ with a producer SYMINS attribute: portray the explicit S-52 symbol
@@ -2292,11 +2333,13 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
     var lines_s = std.ArrayList(mvt.Feature).empty;
     var points_s = std.ArrayList(mvt.Feature).empty;
     var texts_s = std.ArrayList(mvt.Feature).empty;
+    var soundings_l = std.ArrayList(mvt.Feature).empty;
     const L = Layers{
         .areas = &areas,         .area_patterns = &area_patterns,        .lines = &lines,
         .points = &points,       .texts = &texts,
         .areas_scamin = &areas_s, .area_patterns_scamin = &apat_s,       .lines_scamin = &lines_s,
         .points_scamin = &points_s, .texts_scamin = &texts_s,
+        .soundings = &soundings_l,
     };
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
@@ -2361,11 +2404,13 @@ test "emitFromInstr tags pts 0/1 when a point's simplified symbol differs" {
     var lines_s = std.ArrayList(mvt.Feature).empty;
     var points_s = std.ArrayList(mvt.Feature).empty;
     var texts_s = std.ArrayList(mvt.Feature).empty;
+    var soundings_l = std.ArrayList(mvt.Feature).empty;
     const L = Layers{
         .areas = &areas,            .area_patterns = &area_patterns,    .lines = &lines,
         .points = &points,          .texts = &texts,
         .areas_scamin = &areas_s,   .area_patterns_scamin = &apat_s,    .lines_scamin = &lines_s,
         .points_scamin = &points_s, .texts_scamin = &texts_s,
+        .soundings = &soundings_l,
     };
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
@@ -2418,11 +2463,13 @@ test "emitFromInstr tags bnd 1/0 when an area's plain boundary differs" {
     var lines_s = std.ArrayList(mvt.Feature).empty;
     var points_s = std.ArrayList(mvt.Feature).empty;
     var texts_s = std.ArrayList(mvt.Feature).empty;
+    var soundings_l = std.ArrayList(mvt.Feature).empty;
     const L = Layers{
         .areas = &areas,            .area_patterns = &area_patterns,    .lines = &lines,
         .points = &points,          .texts = &texts,
         .areas_scamin = &areas_s,   .area_patterns_scamin = &apat_s,    .lines_scamin = &lines_s,
         .points_scamin = &points_s, .texts_scamin = &texts_s,
+        .soundings = &soundings_l,
     };
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
