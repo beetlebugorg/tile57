@@ -163,7 +163,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var fill_token: ?[]const u8 = null;
     var draw_prio: i64 = 0; // feature DrawingPriority = max seen in the stream
     var cat: i64 = -1; // most-visible display-category rank; -1 until a banded VG is seen
-    var vg: i64 = 0; // raw viewing group of the feature's first banded draw (first-wins)
+    var vg: i64 = 0; // controlling viewing group = most-visible draw's banded VG (band(vg)==cat)
     var date_start: []const u8 = "";
     var date_end: []const u8 = "";
     // running state set by modifier instructions, applied at the next verb
@@ -328,14 +328,23 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             const arg1 = std.mem.trim(u8, nthCsv(val, 1), " ");
             const vg0 = std.fmt.parseInt(i64, arg0, 10) catch continue;
             cur_tgrp = vg0; // for a text instruction, arg 0 is its S-52 text group
+            // The feature's display category AND its controlling viewing group come from
+            // the SAME most-visible (lowest-rank) draw, so band(vg) == cat always holds
+            // and the cat / viewing-group filters can never contradict (matches the Go
+            // baker's cat selection, s101build.go:400). arg0 is the banded draw VG for a
+            // non-text section; a text section puts its text group in arg0 (rank -1) so
+            // text never controls cat/vg — the banded text draw VG (arg1) is the separate
+            // tgrp axis. Replaces the old first-wins vg (see specs/viewing-groups.md §2.2).
             const rank = categoryRank(vg0);
-            if (rank >= 0 and (cat < 0 or rank < cat)) cat = rank;
-            // Primary draw viewing group: arg1 for a text section (arg0 is the text
-            // group there), else arg0. Record the FIRST one that is a real display
-            // group (a banded 1xxxx/2xxxx/3xxxx/9xxxx VG); first-wins.
+            if (rank >= 0 and (cat < 0 or rank < cat)) {
+                cat = rank;
+                vg = vg0;
+            }
+            // Current section's draw VG (arg1 for a text section, else arg0), carried by
+            // this section's aug figures — sector arcs filter on their OWN vg independent
+            // of the feature-level rule above.
             const draw_vg = if (arg1.len > 0) (std.fmt.parseInt(i64, arg1, 10) catch vg0) else vg0;
-            cur_draw_vg = draw_vg; // current section's draw VG (carried by aug figures)
-            if (vg == 0 and categoryRank(draw_vg) >= 0) vg = draw_vg;
+            cur_draw_vg = draw_vg;
         } else if (std.mem.eql(u8, key, "Date")) {
             // Feature-level validity period "start,end" (either bound may be empty).
             date_start = std.mem.trim(u8, nthCsv(val, 0), " ");
@@ -413,26 +422,33 @@ test "display category defaults to Standard when no banded viewing group" {
     try std.testing.expectEqual(@as(usize, 1), p.texts.len);
 }
 
-test "raw viewing group: first banded draw VG wins (arg0 non-text, arg1 text)" {
+test "viewing group: controlling VG = most-visible draw, band(vg)==cat (specs/viewing-groups.md §2.2)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Non-text section: ViewingGroup:<drawVG> — arg0 is the draw group (32050).
+    // Single non-text draw: ViewingGroup:<drawVG> — arg0 is the banded draw group
+    // (32050 = Other). vg = 32050 and categoryRank(32050) == cat.
     const ln = try parse(a, "ViewingGroup:32050;DrawingPriority:9;LineStyle:_simple_,,0.96,CHGRD;LineInstruction:_simple_");
     try std.testing.expectEqual(@as(i64, 32050), ln.vg);
+    try std.testing.expectEqual(categoryRank(32050), ln.cat);
 
-    // Text section: ViewingGroup:<textGroup>,<drawVG> — the draw group is arg1 (26070);
-    // arg0 (21) is the text group and carries no display band, so it must not win.
+    // Text-only draw: arg0 (21) is the text group (rank -1, never controls cat/vg) and
+    // arg1 (26070) is the tgrp axis, NOT the feature VG. So vg stays 0 (unbanded ->
+    // always shown by the deny-list filter), cat defaults to Standard.
     const tx = try parse(a, "ViewingGroup:21,26070;DrawingPriority:24;FontColor:CHBLK;TextInstruction:Foo");
-    try std.testing.expectEqual(@as(i64, 26070), tx.vg);
+    try std.testing.expectEqual(@as(i64, 0), tx.vg);
+    try std.testing.expectEqual(@as(i64, 1), tx.cat);
 
-    // First-wins across sections: an unbanded text group (21) precedes a banded draw
-    // (13030); vg takes the first banded draw VG, here 13030 (and 13030, not 90000).
+    // Most-visible across sections: a text group (21), then a Base draw (13030), then an
+    // Other draw (90000). vg is the Base draw 13030 (most visible), NOT the first banded
+    // draw — and band(vg) == cat == 0 (Base).
     const both = try parse(a,
         "ViewingGroup:21,29070;FontColor:CHBLK;TextInstruction:Bar;" ++
         "ViewingGroup:13030;ColorFill:DEPMS;ViewingGroup:90000;AreaFillReference:FOO");
-    try std.testing.expectEqual(@as(i64, 29070), both.vg); // the text draw VG (29070) is banded and comes first
+    try std.testing.expectEqual(@as(i64, 13030), both.vg);
+    try std.testing.expectEqual(categoryRank(13030), both.cat);
+    try std.testing.expectEqual(@as(i64, 0), both.cat); // Base
 
     // No banded VG at all -> vg stays 0.
     const none = try parse(a, "FontColor:CHBLK;TextInstruction:foo");
