@@ -79,6 +79,12 @@ pub const MarinerSettings = struct {
     date_dependent: bool = true,
     highlight_date_dependent: bool = false,
     date_view: []const u8 = "", // pinned viewing date "YYYYMMDD" (empty = today)
+
+    // -- SCAMIN gating override (host ?ignoreScamin debug toggle) — NOT an S-52
+    // display setting; a render-time transport flag the C ABI carries through to
+    // the style builder. When true, styleJson drops SCAMIN scale-gating so every
+    // feature shows in-band regardless of its 1:N min-display-scale. Default off.
+    ignore_scamin: bool = false,
 };
 
 // ---- expression DSL ---------------------------------------------------------

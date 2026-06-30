@@ -243,6 +243,9 @@ typedef struct {
     bool text_names, show_light_descriptions, text_other;
     bool date_dependent, highlight_date_dependent;
     char date_view[9]; /* "YYYYMMDD" or "" (empty -> today) */
+    bool ignore_scamin; /* host ?ignoreScamin debug toggle: drop SCAMIN scale-gating
+                         * so every feature shows in-band (the *_scamin layers become
+                         * a single ungated layer). NOT an S-52 setting. Default false. */
 } tile57_mariner;
 
 /* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.

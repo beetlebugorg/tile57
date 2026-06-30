@@ -107,6 +107,11 @@ pub const StyleOpts = struct {
     mariner: ?chartstyle.MarinerSettings = null,
     enabled_bands: ?[]const i32 = null, // mariner NOAA-band filter (null = all bands)
     now_unix: i64 = 0, // host wall-clock (epoch s) for the date filter's "today"
+    // §2 ?ignoreScamin host debug toggle: when true, disable SCAMIN scale-gating
+    // entirely — every *_scamin layer collapses to a single plain (ungated) layer,
+    // so all features show in-band regardless of their SCAMIN denominator (and
+    // regardless of whether a manifest is present). Default off = normal gating.
+    ignore_scamin: bool = false,
 };
 
 // Precomputed, mariner-aware style expressions shared by every layer of one
@@ -494,18 +499,24 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     const floor: f64 = @floatFromInt(opts.minzoom);
     var lows = std.ArrayList(u32).empty;
     var his = std.ArrayList(Bucket).empty;
-    for (opts.scamin) |v| {
+    if (!opts.ignore_scamin) for (opts.scamin) |v| {
         const mz = scaminDisplayZoom(@floatFromInt(v), opts.scamin_lat);
         if (mz <= floor + 1e-6) {
             try lows.append(ba, v);
         } else {
             try his.append(ba, .{ .sm = v, .minzoom = mz, .suffix = try std.fmt.allocPrint(ba, "#sm{d}", .{v}) });
         }
-    }
+    };
     const low_slice: []const u32 = lows.items;
     var allb = std.ArrayList(Bucket).empty;
     var sndb = std.ArrayList(Bucket).empty;
-    if (opts.scamin.len == 0) {
+    if (opts.ignore_scamin) {
+        // §2 ?ignoreScamin: no scale gating — every *_scamin layer is a single plain
+        // (ungated) bucket, so all features show in-band regardless of SCAMIN (this
+        // overrides both the per-value buckets and the no-manifest zoom-gate fallback).
+        try allb.append(ba, .{});
+        try sndb.append(ba, .{});
+    } else if (opts.scamin.len == 0) {
         // No manifest -> the per-feature zoom-filter fallback (still gates by value,
         // integer-zoom snap) on every SCAMIN-bearing layer, incl. soundings.
         try allb.append(ba, .{ .zoom_gate = true });
@@ -676,6 +687,7 @@ pub fn buildFromTemplate(
         .mariner = m.*,
         .enabled_bands = enabled_bands,
         .now_unix = now_unix,
+        .ignore_scamin = m.ignore_scamin,
     };
     if (parsed.value == .object) {
         const root = parsed.value.object;
@@ -731,6 +743,48 @@ test "styleJson: valid JSON, expected layers, palette-resolved colour" {
     try std.testing.expect(parsed.value.object.get("sprite") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"fill-areas\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "#c9edff") != null);
+}
+
+test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const sm = [_]u32{ 30000, 90000 };
+    const base = StyleOpts{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+    };
+
+    // Manifest present, gating ON -> per-value #sm buckets exist.
+    const gated = try styleJson(a, base);
+    defer a.free(gated);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "#sm30000") != null);
+
+    // Manifest present, ignore_scamin -> no buckets at all.
+    var ign = base;
+    ign.ignore_scamin = true;
+    const out_ign = try styleJson(a, ign);
+    defer a.free(out_ign);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "#sm") == null);
+
+    // No manifest, gating ON -> the per-feature zoom-gate fallback (log2) is present.
+    var nomanifest = base;
+    nomanifest.scamin = &.{};
+    const out_fb = try styleJson(a, nomanifest);
+    defer a.free(out_fb);
+    try std.testing.expect(std.mem.indexOf(u8, out_fb, "log2") != null);
+
+    // No manifest + ignore_scamin -> even the zoom-gate fallback is gone.
+    var nm_ign = nomanifest;
+    nm_ign.ignore_scamin = true;
+    const out_nm_ign = try styleJson(a, nm_ign);
+    defer a.free(out_nm_ign);
+    try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "log2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "#sm") == null);
 }
 
 // ---- single-builder (buildFromTemplate) tests — ported from the retired

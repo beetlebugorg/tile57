@@ -435,6 +435,7 @@ const CMariner = extern struct {
     date_dependent: bool,
     highlight_date_dependent: bool,
     date_view: [9]u8,
+    ignore_scamin: bool,
 };
 
 // "YYYYMMDD" or "" from the fixed char[9] field.
@@ -484,6 +485,7 @@ export fn tile57_build_style(
         .date_dependent = cm.date_dependent,
         .highlight_date_dependent = cm.highlight_date_dependent,
         .date_view = dateViewSlice(&cm.date_view),
+        .ignore_scamin = cm.ignore_scamin,
     };
     const tmpl = template_json[0..template_len];
     const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
@@ -566,5 +568,6 @@ export fn tile57_mariner_defaults(cm: *CMariner) callconv(.c) void {
         .date_dependent = d.date_dependent,
         .highlight_date_dependent = d.highlight_date_dependent,
         .date_view = [_]u8{0} ** 9,
+        .ignore_scamin = d.ignore_scamin,
     };
 }

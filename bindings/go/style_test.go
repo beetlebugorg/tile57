@@ -4,6 +4,7 @@ package tile57
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -34,4 +35,26 @@ func TestStyle(t *testing.T) {
 	}
 	t.Logf("style: %d bytes, version %d, %d sources, %d layers",
 		len(style), doc.Version, len(doc.Sources), len(doc.Layers))
+}
+
+// TestIgnoreScamin verifies the ?ignoreScamin toggle disables SCAMIN scale-gating
+// through the full C ABI: tile57_build_style carries no SCAMIN manifest, so the
+// gated style uses the per-feature zoom-gate fallback ("log2"); IgnoreScamin drops
+// it so every feature shows in-band.
+func TestIgnoreScamin(t *testing.T) {
+	build := func(ignore bool) string {
+		m := MarinerDefaults()
+		m.IgnoreScamin = ignore
+		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "", "", m, nil)
+		if err != nil {
+			t.Fatalf("Style(ignore=%v): %v", ignore, err)
+		}
+		return string(style)
+	}
+	if g := build(false); !strings.Contains(g, "log2") {
+		t.Fatalf("gated style should carry the SCAMIN zoom-gate (log2); not found")
+	}
+	if i := build(true); strings.Contains(i, "log2") {
+		t.Fatalf("ignore_scamin style should drop the SCAMIN zoom-gate (log2); still present")
+	}
 }
