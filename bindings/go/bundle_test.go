@@ -13,7 +13,7 @@ func TestSourceScamin(t *testing.T) {
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	src, err := OpenCells([]CellInput{{Base: data}}, "")
+	src, err := OpenCells([]CellInput{{Base: data}}, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestBakeBundle(t *testing.T) {
 			stage1Named = true
 		}
 	}
-	n, bbox, err := BakeBundle(testCell, out, "", "", "", 0, 16, progress)
+	n, bbox, err := BakeBundle(testCell, out, "", "", "", 0, 16, false, progress)
 	if err != nil {
 		t.Fatal(err)
 	}

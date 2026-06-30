@@ -273,6 +273,9 @@ pub const BakeOpts = struct {
     lru: usize = 64, // lazy-bake tuning: parsed cells held resident
     super_dz: u8 = 3, // lazy-bake tuning: spatial super-tile depth
     format: engine.s57_mvt.TileFormat = .mvt,
+    // Emit per-feature pick-report attrs (s57/cell) in the baked tiles. Defaults ON;
+    // a lean bake sets it false to drop the bulky s57 payload.
+    pick_attrs: bool = true,
     // Progress callback (stage 0 = loading cells, 1 = baking tiles). null = the
     // built-in console progress (stderr), matching the CLI; a host passes its own.
     progress: engine.bake_enc.Progress = null,
@@ -293,7 +296,7 @@ pub fn bakeBundle(io: std.Io, a: std.mem.Allocator, opts: BakeOpts) !BakeResult 
     const tiles_dir = try std.fs.path.join(a, &.{ opts.out_dir, "tiles" });
     try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
     const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
-    const rb = try bakeRoot(io, a, opts.input, tiles_path, opts.rules_dir, opts.minzoom, opts.maxzoom, opts.lru, opts.super_dz, true, opts.format, opts.progress, opts.progress_user);
+    const rb = try bakeRoot(io, a, opts.input, tiles_path, opts.rules_dir, opts.minzoom, opts.maxzoom, opts.lru, opts.super_dz, true, opts.format, opts.pick_attrs, opts.progress, opts.progress_user);
     const bounds = rb.bounds;
     const cells = rb.cells;
     const snd_stacks = rb.sounds; // sounding glyph stacks for sprite-mln
@@ -619,7 +622,7 @@ fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
 // StreamWriter — only the compressed data + small directory are held, not the raw
 // tiles). Returns the union bounds + cell stems + sounding stacks + SCAMIN denoms.
 // error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat, pick_attrs: bool, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
     // Progress sink: the caller's callback, else the built-in console writer (the CLI
     // path, byte-identical to before). Both only touch stderr — never the tile bytes.
     const prog: engine.bake_enc.Progress = progress orelse cliProgress;
@@ -738,6 +741,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .scamin = &scamin, .a = a, .gpa = gpa, .collect_sounds = collect_sounds and format == .mvt };
     var baker = Bands.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
     baker.format = format;
+    baker.pick_attrs = pick_attrs;
     defer baker.deinit();
 
     // Pass 2: bake each band finest → coarsest (best-band dedup via baker.emitted).

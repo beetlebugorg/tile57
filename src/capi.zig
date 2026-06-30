@@ -102,12 +102,13 @@ export fn tile57_source_open_cells(
     cells_ptr: [*]const CellInput,
     count: usize,
     rules_dir: ?[*:0]const u8,
+    omit_pick_attrs: c_int,
 ) callconv(.c) ?*Source {
     if (count == 0) return null;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return null;
-    return Source.openCells(cells, spanOpt(rules_dir)) catch null;
+    return Source.openCells(cells, spanOpt(rules_dir), omit_pick_attrs == 0) catch null;
 }
 
 /// Open a streaming ENC_ROOT source: host supplies per-cell metadata + a reader
@@ -119,9 +120,10 @@ export fn tile57_source_open_cells_streaming(
     read: source.CellReadFn,
     user: ?*anyopaque,
     rules_dir: ?[*:0]const u8,
+    omit_pick_attrs: c_int,
 ) callconv(.c) ?*Source {
     if (count == 0) return null;
-    return Source.openCellsStreaming(metas[0..count], read, user, spanOpt(rules_dir)) catch null;
+    return Source.openCellsStreaming(metas[0..count], read, user, spanOpt(rules_dir), omit_pick_attrs == 0) catch null;
 }
 
 // Progress callback for tile57_bake_cells / tile57_bake_bundle (matches the header
@@ -135,6 +137,7 @@ export fn tile57_bake_cells(
     rules_dir: ?[*:0]const u8,
     minzoom: u8,
     maxzoom: u8,
+    omit_pick_attrs: c_int,
     progress: BakeProgress,
     user: ?*anyopaque,
     out: *[*]u8,
@@ -143,7 +146,7 @@ export fn tile57_bake_cells(
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return -1;
-    const archive = source.bakeArchive(cells, spanOpt(rules_dir), minzoom, maxzoom, progress, user) catch return -1;
+    const archive = source.bakeArchive(cells, spanOpt(rules_dir), minzoom, maxzoom, omit_pick_attrs == 0, progress, user) catch return -1;
     if (archive) |a| {
         out.* = a.ptr;
         out_len.* = a.len;
@@ -172,6 +175,7 @@ export fn tile57_bake_bundle(
     created: ?[*:0]const u8,
     minzoom: u8,
     maxzoom: u8,
+    omit_pick_attrs: c_int,
     progress: BakeProgress,
     user: ?*anyopaque,
     out_cell_count: ?*u32,
@@ -195,6 +199,7 @@ export fn tile57_bake_bundle(
         .created = spanOpt(created) orelse "",
         .minzoom = minzoom,
         .maxzoom = maxzoom,
+        .pick_attrs = omit_pick_attrs == 0,
         .progress = progress,
         .progress_user = user,
     }) catch |err| return if (err == error.NoGeometry) 0 else -1;

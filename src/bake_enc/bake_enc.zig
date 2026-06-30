@@ -193,6 +193,7 @@ const TileGenCtx = struct {
     backends: []Backend,
     gpa: std.mem.Allocator,
     format: s57_mvt.TileFormat = .mvt,
+    pick_attrs: bool = true, // emit the per-feature pick-report attrs (s57/cell); off = lean tiles
     // Live progress emitted from inside the parallel batch (so a big super-tile
     // shows tiles flowing rather than appearing hung). `done` counts processed
     // tiles; `base` is the emitted count before this batch.
@@ -217,7 +218,7 @@ const TileGenCtx = struct {
         // the per-thread scratch arena — reset after this tile, no per-tile mmap.
         const refs = scratch.alloc(s57_mvt.CellRef, idxs.len) catch return;
         for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo, .geo_world = c.backends[idx].geo_world, .feat_bbox = c.backends[idx].feat_bbox };
-        const mvt_bytes = s57_mvt.generateTileMulti(scratch, scratch, refs, z, x, y, c.format) catch return;
+        const mvt_bytes = s57_mvt.generateTileMulti(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
         // collection then only dedups + writes the already-compressed tile. The
         // gzipped result must outlive the scratch reset, so it comes from `c.gpa`.
@@ -257,6 +258,7 @@ pub const Baker = struct {
     count: usize = 0, // tiles handed to the sink (cumulative across bands)
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
     format: s57_mvt.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
+    pick_attrs: bool = true, // emit per-feature pick-report attrs (s57/cell); off = lean tiles
     // Progress denominator (host §3): the caller sets these PER BAND before baking it
     // so the tiles-stage callback can report `done`/`total` as a per-band tile bar
     // (done = self.count - band_base; total = band_total, a planned estimate from
@@ -403,7 +405,7 @@ pub const Baker = struct {
         // NUL-terminated — @tagName is a comptime string literal, safe across the ABI).
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {

@@ -80,13 +80,27 @@ typedef struct {
     const char *name;
 } tile57_cell_input;
 
+/* ---- pick-report attributes ---------------------------------------------
+ *
+ * Every emitted MVT feature carries the per-feature cursor-pick / inspector
+ * properties used by the S-52 §10.8 pick report: `class` (object-class acronym),
+ * `cell` (source cell name, from tile57_cell_input.name / the bundle's file stem),
+ * and `s57` (a JSON object string of the feature's full S-57 attribute set,
+ * acronym -> value). These default ON. The `s57` blob is the bulk of a feature's
+ * size, so a lean deployment that doesn't need pick/inspect can drop ALL three by
+ * passing omit_pick_attrs != 0 to the open/bake call below. omit_pick_attrs == 0
+ * (the zero-initialised default) keeps them — so existing callers that pass 0 get
+ * the pick report for free. */
+
 /* Open an ENC_ROOT as a multi-cell source: every cell is overlaid when a tile is
  * generated, so a region spanning several cells renders them all. The host scans
  * the directory and reads the files (it owns file IO); this parses + portrays
- * each cell. `rules_dir` is as in tile57_source_open. Returns an opaque
- * handle, or NULL if no cell parses. Close with tile57_source_close. */
+ * each cell. `rules_dir` is as in tile57_source_open. `omit_pick_attrs` (see above)
+ * drops the per-feature pick attributes when non-zero. Returns an opaque handle, or
+ * NULL if no cell parses. Close with tile57_source_close. */
 tile57_source *tile57_source_open_cells(
-    const tile57_cell_input *cells, size_t count, const char *rules_dir);
+    const tile57_cell_input *cells, size_t count, const char *rules_dir,
+    int omit_pick_attrs);
 
 /* ---- streaming ENC_ROOT (low memory) ------------------------------------
  *
@@ -124,7 +138,8 @@ typedef bool (*tile57_cell_read_fn)(void *user, size_t index, tile57_cell_bytes 
  * NULL. Close with tile57_source_close. */
 tile57_source *tile57_source_open_cells_streaming(
     const tile57_cell_meta *metas, size_t count,
-    tile57_cell_read_fn read, void *user, const char *rules_dir);
+    tile57_cell_read_fn read, void *user, const char *rules_dir,
+    int omit_pick_attrs);
 
 /* Progress callback for tile57_bake_cells / tile57_bake_bundle. stage 0 =
  * loading/portraying cells, stage 1 = baking tiles. Stage 0 done/total count cells.
@@ -156,7 +171,7 @@ typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, siz
  * ENC_ROOT size; run it once and cache the archive. */
 int tile57_bake_cells(
     const tile57_cell_input *cells, size_t count, const char *rules_dir,
-    uint8_t minzoom, uint8_t maxzoom,
+    uint8_t minzoom, uint8_t maxzoom, int omit_pick_attrs,
     tile57_bake_progress progress, void *user,
     uint8_t **out, size_t *out_len);
 
@@ -178,7 +193,7 @@ int tile57_bake_cells(
 int tile57_bake_bundle(
     const char *input, const char *out_dir,
     const char *rules_dir, const char *catalog_dir, const char *created,
-    uint8_t minzoom, uint8_t maxzoom,
+    uint8_t minzoom, uint8_t maxzoom, int omit_pick_attrs,
     tile57_bake_progress progress, void *user,
     uint32_t *out_cell_count, double *out_bbox);
 

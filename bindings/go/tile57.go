@@ -96,8 +96,10 @@ func OpenBytes(data []byte, format Format, rulesDir string) (*Source, error) {
 
 // OpenCells opens an ENC_ROOT as a multi-cell source: every cell is overlaid when
 // a tile is generated, so a region spanning several cells renders them all. All
-// bytes are copied. rulesDir is as in [OpenBytes].
-func OpenCells(cells []CellInput, rulesDir string) (*Source, error) {
+// bytes are copied. rulesDir is as in [OpenBytes]. omitPickAttrs drops the
+// per-feature pick-report properties (class/cell/s57) when true; pass false to keep
+// them (the default — a working cursor-pick report).
+func OpenCells(cells []CellInput, rulesDir string, omitPickAttrs bool) (*Source, error) {
 	if len(cells) == 0 {
 		return nil, fmt.Errorf("tile57: no cells")
 	}
@@ -110,7 +112,7 @@ func OpenCells(cells []CellInput, rulesDir string) (*Source, error) {
 	arena := &cArena{}
 	defer arena.free()
 	inputs, base := arena.cellInputs(cells)
-	ptr := C.tile57_source_open_cells(base, C.size_t(len(inputs)), cRules)
+	ptr := C.tile57_source_open_cells(base, C.size_t(len(inputs)), cRules, cOmit(omitPickAttrs))
 	if ptr == nil {
 		return nil, fmt.Errorf("tile57: failed to open %d cell(s)", len(cells))
 	}

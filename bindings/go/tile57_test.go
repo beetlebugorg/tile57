@@ -28,34 +28,43 @@ func TestColortablesDefault(t *testing.T) {
 	}
 }
 
-// CellInput.Name rides through to the `cell` pick-report property on every feature.
+// CellInput.Name rides through to the `cell` pick-report property — and the
+// omitPickAttrs flag drops it (and the rest of the pick attrs).
 func TestCellInputName(t *testing.T) {
 	data, err := os.ReadFile(testCell)
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
 	const badge = "PICKCELLZZ" // distinctive token that can only come from the cell prop
-	src, err := OpenCells([]CellInput{{Base: data, Name: badge}}, "")
-	if err != nil {
-		t.Fatalf("OpenCells: %v", err)
-	}
-	defer src.Close()
 
-	w, s, e, n, _ := src.Bounds()
-	mn, mx := src.ZoomRange()
-	found := false
-	for z := mn; z <= mx && z <= 14 && !found; z++ {
-		tx, ty := lonLatToTile((w+e)/2, (s+n)/2, z)
-		body, err := src.Tile(z, tx, ty)
+	// badgePresent opens the cell (optionally omitting pick attrs) and reports
+	// whether the cell badge appears in any tile across the cell's zoom range.
+	badgePresent := func(omit bool) bool {
+		src, err := OpenCells([]CellInput{{Base: data, Name: badge}}, "", omit)
 		if err != nil {
-			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
+			t.Fatalf("OpenCells(omit=%v): %v", omit, err)
 		}
-		if bytes.Contains(body, []byte(badge)) {
-			found = true
+		defer src.Close()
+		w, s, e, n, _ := src.Bounds()
+		mn, mx := src.ZoomRange()
+		for z := mn; z <= mx && z <= 14; z++ {
+			tx, ty := lonLatToTile((w+e)/2, (s+n)/2, z)
+			body, err := src.Tile(z, tx, ty)
+			if err != nil {
+				t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
+			}
+			if bytes.Contains(body, []byte(badge)) {
+				return true
+			}
 		}
+		return false
 	}
-	if !found {
-		t.Fatal("cell badge not found in any tile — CellInput.Name not emitted as the `cell` prop")
+
+	if !badgePresent(false) {
+		t.Fatal("cell badge absent with pick attrs ON — CellInput.Name not emitted as the `cell` prop")
+	}
+	if badgePresent(true) {
+		t.Fatal("cell badge present with omitPickAttrs=true — the opt-out flag did not drop pick attrs")
 	}
 }
 
@@ -64,7 +73,7 @@ func TestOpenCellAndTile(t *testing.T) {
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	src, err := OpenCells([]CellInput{{Base: data}}, "")
+	src, err := OpenCells([]CellInput{{Base: data}}, "", false)
 	if err != nil {
 		t.Fatalf("OpenCells: %v", err)
 	}

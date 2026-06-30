@@ -14,8 +14,9 @@ void tile57GoBakeProgress(void *user, uint8_t stage, size_t done, size_t total,
 
 static int tile57_bake_cells_cb(const tile57_cell_input *cells, size_t count,
                                 const char *rules_dir, uint8_t minz, uint8_t maxz,
+                                int omit_pick_attrs,
                                 void *user, uint8_t **out, size_t *out_len) {
-    return tile57_bake_cells(cells, count, rules_dir, minz, maxz,
+    return tile57_bake_cells(cells, count, rules_dir, minz, maxz, omit_pick_attrs,
                              tile57GoBakeProgress, user, out, out_len);
 }
 
@@ -23,9 +24,10 @@ static int tile57_bake_cells_cb(const tile57_cell_input *cells, size_t count,
 static int tile57_bake_bundle_cb(const char *input, const char *out_dir,
                                  const char *rules_dir, const char *catalog_dir,
                                  const char *created, uint8_t minz, uint8_t maxz,
+                                 int omit_pick_attrs,
                                  void *user, uint32_t *out_cells, double *out_bbox) {
     return tile57_bake_bundle(input, out_dir, rules_dir, catalog_dir, created,
-                              minz, maxz,
+                              minz, maxz, omit_pick_attrs,
                               user ? tile57GoBakeProgress : (tile57_bake_progress)0,
                               user, out_cells, out_bbox);
 }
@@ -44,7 +46,7 @@ import (
 // clamp — the ABI treats 0/24 as unclamped, and 0 max means "no cap"). progress,
 // if non-nil, is called with a [BakeProgress] per update: stage 0 = loading/
 // portraying cells, stage 1 = baking tiles (per-band done/total + band label).
-func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, progress func(BakeProgress)) ([]byte, error) {
+func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, omitPickAttrs bool, progress func(BakeProgress)) ([]byte, error) {
 	if len(cells) == 0 {
 		return nil, fmt.Errorf("tile57: no cells to bake")
 	}
@@ -65,7 +67,7 @@ func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, progr
 	var out *C.uint8_t
 	var outLen C.size_t
 	rc := C.tile57_bake_cells_cb(base, C.size_t(len(cells)), cRules,
-		C.uint8_t(minZoom), C.uint8_t(maxZoom), user, &out, &outLen)
+		C.uint8_t(minZoom), C.uint8_t(maxZoom), cOmit(omitPickAttrs), user, &out, &outLen)
 	switch rc {
 	case 1:
 		return tileBytes(out, outLen), nil
@@ -95,7 +97,7 @@ func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, progr
 // a per-band percentage. BandIndex/BandCount/BandName give the band label
 // ("approach", band 3/6). The planned total slightly over-counts the emitted tiles
 // (empty tiles are skipped), matching the Go baker's planned bar.
-func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, maxZoom uint8, progress func(BakeProgress)) (cellCount int, bbox [4]float64, err error) {
+func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, maxZoom uint8, omitPickAttrs bool, progress func(BakeProgress)) (cellCount int, bbox [4]float64, err error) {
 	if input == "" || outDir == "" {
 		return 0, bbox, fmt.Errorf("tile57: BakeBundle needs input and out dir")
 	}
@@ -120,7 +122,7 @@ func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, ma
 	var cells C.uint32_t
 	var bb [4]C.double
 	rc := C.tile57_bake_bundle_cb(cIn, cOut, cRules, cCat, cCreated,
-		C.uint8_t(minZoom), C.uint8_t(maxZoom), user, &cells, &bb[0])
+		C.uint8_t(minZoom), C.uint8_t(maxZoom), cOmit(omitPickAttrs), user, &cells, &bb[0])
 	switch rc {
 	case 1:
 		return int(cells), [4]float64{float64(bb[0]), float64(bb[1]), float64(bb[2]), float64(bb[3])}, nil

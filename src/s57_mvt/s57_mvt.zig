@@ -1666,7 +1666,7 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
     const one = [_]CellRef{.{ .cell = cell, .portrayal = portrayal }};
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    return generateTileMulti(arena.allocator(), gpa, &one, z, x, y, .mvt);
+    return generateTileMulti(arena.allocator(), gpa, &one, z, x, y, .mvt, true);
 }
 
 /// Generate encoded tile bytes (uncompressed) for tile (z,x,y) overlaying one or
@@ -1677,7 +1677,7 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
 /// the per-layer feature lists). A batch baker passes a per-thread arena reset
 /// between tiles; `out` owns only the returned encoded bytes (pass `scratch` too
 /// when the result is consumed before the next reset, e.g. gzipped immediately).
-pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, format: TileFormat) ![]u8 {
+pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, format: TileFormat, pick_attrs: bool) ![]u8 {
     const a = scratch;
 
     const tb = tile.tileBoundsLonLat(z, x, y);
@@ -1705,6 +1705,7 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
         .lines_scamin = &lines_scamin,
         .points_scamin = &points_scamin,
         .texts_scamin = &texts_scamin,
+        .pick_attrs = pick_attrs,
     };
 
     for (cells) |cr| {

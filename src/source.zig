@@ -415,6 +415,10 @@ pub const Source = struct {
     data: ?[]u8 = null, // owned archive bytes (PMTiles backend only)
     cache: std.AutoHashMap(u64, []u8), // tile key -> MVT bytes (owned)
     cache_max: usize = 8192,
+    // Emit the per-feature pick-report attrs (s57/cell) on live-generated tiles.
+    // Defaults ON; the C ABI open can turn it off for lean tiles. (No effect on a
+    // PMTiles/reader backend — those tiles are already baked.)
+    pick_attrs: bool = true,
 
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
@@ -431,7 +435,7 @@ pub const Source = struct {
     /// Open an ENC_ROOT as a multi-cell source: cells are indexed cheaply (band +
     /// bbox) in parallel and parsed/portrayed lazily per tile. All bytes are
     /// copied. Errors if no cell's header parses.
-    pub fn openCells(cells_in: []const CellInput, rules_dir: ?[]const u8) !*Source {
+    pub fn openCells(cells_in: []const CellInput, rules_dir: ?[]const u8, pick_attrs: bool) !*Source {
         if (cells_in.len == 0) return error.OpenFailed;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
@@ -470,6 +474,7 @@ pub const Source = struct {
         src.* = .{
             .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy } },
             .cache = std.AutoHashMap(u64, []u8).init(gpa),
+            .pick_attrs = pick_attrs,
         };
         return src;
     }
@@ -479,7 +484,7 @@ pub const Source = struct {
     /// returns a cell's bytes on demand. Cell bytes are read only when a tile
     /// needs them and freed on LRU eviction, so the host holds the working set's
     /// bytes — not the whole ENC_ROOT. No bytes are read at open. Errors if empty.
-    pub fn openCellsStreaming(metas: []const CellMeta, reader: CellReadFn, user: ?*anyopaque, rules_dir: ?[]const u8) !*Source {
+    pub fn openCellsStreaming(metas: []const CellMeta, reader: CellReadFn, user: ?*anyopaque, rules_dir: ?[]const u8, pick_attrs: bool) !*Source {
         if (metas.len == 0) return error.OpenFailed;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
@@ -502,6 +507,7 @@ pub const Source = struct {
         src.* = .{
             .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy, .reader = reader, .reader_user = user } },
             .cache = std.AutoHashMap(u64, []u8).init(gpa),
+            .pick_attrs = pick_attrs,
         };
         return src;
     }
@@ -659,9 +665,9 @@ pub const Source = struct {
                 }};
                 var ar = std.heap.ArenaAllocator.init(gpa);
                 defer ar.deinit();
-                break :blk_cell s57_mvt.generateTileMulti(ar.allocator(), gpa, &one, z, x, y, .mvt) catch return error.TileGen;
+                break :blk_cell s57_mvt.generateTileMulti(ar.allocator(), gpa, &one, z, x, y, .mvt, self.pick_attrs) catch return error.TileGen;
             },
-            .cells => |*ls| try tileFromCells(ls, z, x, y),
+            .cells => |*ls| try tileFromCells(ls, z, x, y, self.pick_attrs),
         };
         if (self.cache.count() >= self.cache_max) {
             var cit = self.cache.valueIterator();
@@ -786,7 +792,7 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
 
 // Multi-cell tile generation: collect overlapping cells, lazily load them, apply
 // best-band M_COVR suppression, and overlay coarse→fine.
-fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32) ![]u8 {
+fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8 {
     const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
     var any_incl = false;
     var coarsest: ?bake_enc.Band = null;
@@ -848,7 +854,7 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32) ![]u8 {
     }
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
-    const mvt = s57_mvt.generateTileMulti(ar.allocator(), gpa, refs.items, z, x, y, .mvt) catch return error.TileGen;
+    const mvt = s57_mvt.generateTileMulti(ar.allocator(), gpa, refs.items, z, x, y, .mvt, pick_attrs) catch return error.TileGen;
     lazyEvict(ls, keep_from);
     return mvt;
 }
@@ -905,6 +911,7 @@ pub fn bakeArchive(
     rules_dir: ?[]const u8,
     minzoom: u8,
     maxzoom: u8,
+    pick_attrs: bool,
     progress: Progress,
     user: ?*anyopaque,
 ) !?[]u8 {
@@ -925,6 +932,7 @@ pub fn bakeArchive(
     var sw = pmtiles.StreamWriter.init(gpa);
     defer sw.deinit();
     var baker = bake_enc.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sw, .func = streamSink });
+    baker.pick_attrs = pick_attrs;
     defer baker.deinit();
 
     // Distinct SCAMIN denominators across all cells -> published in the archive

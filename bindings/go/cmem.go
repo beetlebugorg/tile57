@@ -46,6 +46,15 @@ func (a *cArena) str(s string) *C.char {
 	return (*C.char)(a.track(unsafe.Pointer(C.CString(s))))
 }
 
+// cOmit maps the Go "omit pick attributes" bool to the C omit_pick_attrs int:
+// 0 = include the per-feature pick attrs (default), non-zero = omit them.
+func cOmit(omit bool) C.int {
+	if omit {
+		return 1
+	}
+	return 0
+}
+
 // int32Array copies a Go []int32 into a malloc'd C int32_t array, returning the
 // base pointer + count (NULL/0 for an empty slice). Used for the enabled-bands and
 // SCAMIN-manifest inputs to tile57_build_style.
