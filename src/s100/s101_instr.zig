@@ -233,7 +233,11 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
                 });
             } else if (std.mem.eql(u8, val, "_simple_")) {
                 // mm -> px (Go SimpleLine.Width * pxPerMM); raw mm rendered ~3.78x too thin.
-                try lines.append(a, .{ .style = "solid", .width = cur_width * PX_PER_MM, .color = cur_color });
+                // dashFor (oracle s101emit.go:278): LineStyle DashLength>0 strokes dashed,
+                // else solid. The emit side maps an unregistered "dashed" style to a generic
+                // dashed stroke (s57_mvt.zig:923), matching StrokeLine{Dash: DashDashed}.
+                const simple_style: []const u8 = if (cur_dash_len > 0) "dashed" else "solid";
+                try lines.append(a, .{ .style = simple_style, .width = cur_width * PX_PER_MM, .color = cur_color });
             } else {
                 // named complex line pattern
                 try lines.append(a, .{ .style = val, .width = cur_width, .color = cur_color });
