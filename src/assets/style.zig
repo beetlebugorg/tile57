@@ -685,13 +685,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     // 6. light sector limit lines (no SCAMIN bucketing)
     try lineLayers(js, &s, "sector_lines", .{});
 
-    // 7. contour value labels (DEPCNT VALDCO) — text, needs glyphs.
-    if (glyphs_on) {
-        try contourLabelLayer(js, &s, "lines", .{});
-        for (all_buckets) |bkt| try contourLabelLayer(js, &s, "lines_scamin", bkt);
-    }
-
-    // 8. point symbols (non-light) + soundings (sprite required)
+    // 7. point symbols (non-light) + soundings (sprite required)
     if (sprite_on) {
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .non_lights);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .non_lights);
@@ -700,6 +694,15 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         // over a same-priority bridge that lives in a different scamin bucket layer.
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .lights_only);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .lights_only);
+    }
+
+    // 8. contour value labels (DEPCNT VALDCO) — text, needs glyphs. Emitted AFTER the
+    // point symbols + soundings (oracle layer order: point_symbols, soundings,
+    // contour-labels, text), so a depth-contour value reads on top of the symbol group
+    // rather than being hidden under it. Was before the symbols (labels masked).
+    if (glyphs_on) {
+        try contourLabelLayer(js, &s, "lines", .{});
+        for (all_buckets) |bkt| try contourLabelLayer(js, &s, "lines_scamin", bkt);
     }
 
     // 9. text labels — need an SDF glyph source.
