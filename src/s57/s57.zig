@@ -76,6 +76,13 @@ pub fn pointInRings(rings: []const []const LonLat, lon: f64, lat: f64) bool {
     return inside;
 }
 
+/// True if (lon,lat) is inside any of `polys` (each a feature's rings). Used for the
+/// per-cell M_COVR coverage test in best-band / per-scale cell quilting.
+pub fn coverageContains(polys: []const []const []const LonLat, lon: f64, lat: f64) bool {
+    for (polys) |rings| if (pointInRings(rings, lon, lat)) return true;
+    return false;
+}
+
 // --- Polygon geometry helpers (shared by MVT emission + portrayal) ----------
 
 /// Area centroid (centre of gravity) of a single ring via the shoelace formula;
@@ -647,6 +654,23 @@ pub const Cell = struct {
         }
         if (cur.items.len > 0) try parts.append(a, cur.items);
         return parts.items;
+    }
+
+    /// The cell's M_COVR (objl 302) data-coverage polygons with CATCOV(attr 18)==1,
+    /// for per-scale cell quilting — the finer cell (smaller CSCL) owns the area its
+    /// coverage contains, suppressing a coarser cell there. Each entry is one M_COVR
+    /// feature's rings. Allocated in `a` (assemble once per cell, reuse per tile).
+    pub fn mcovrCoverage(self: Cell, a: Allocator) []const []const []const LonLat {
+        var polys = std.ArrayList([]const []const LonLat).empty;
+        for (self.features) |f| {
+            if (f.objl != 302) continue; // M_COVR
+            const cv = f.attr(18) orelse continue; // CATCOV (S-57 attr 18)
+            const n = std.fmt.parseInt(i64, std.mem.trim(u8, cv, " "), 10) catch continue;
+            if (n != 1) continue; // 1 = coverage available (2 = no coverage)
+            const rings = self.lineGeometryParts(a, f) catch continue;
+            if (rings.len > 0) polys.append(a, rings) catch {};
+        }
+        return polys.items;
     }
 
     /// Legacy single-chain assembly (concatenate all FSPT edges). Prefer

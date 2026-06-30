@@ -433,6 +433,7 @@ const CellGeom = struct {
     geo_world: ?engine.s57_mvt.GeoWorld = null, // precomputed world coords (in geo_arena)
     geo_arena: ?*std.heap.ArenaAllocator,
     feat_bbox: []const ?[4]f64 = &.{}, // per-feature bbox for the per-tile cull (in geo_arena)
+    coverage: []const []const []const engine.s57.LonLat = &.{}, // M_COVR (cell.arena) for quilting
 };
 
 // Copy per-feature instruction streams into `a` (the sticky portrayal arena) so
@@ -509,7 +510,8 @@ const LoadWork = struct {
             feat_bbox = engine.s57_mvt.buildFeatBBox(ga.allocator(), &cell, geo) catch &.{};
             geo_arena = ga;
         } else |_| {}
-        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_world = geo_world, .geo_arena = geo_arena, .feat_bbox = feat_bbox };
+        const coverage = cell.mcovrCoverage(cell.arena.allocator()); // before the move (cell.arena-owned)
+        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_world = geo_world, .geo_arena = geo_arena, .feat_bbox = feat_bbox, .coverage = coverage };
 
         // Label-point cache: built from the (reused or fresh) portrayal — only features
         // whose base stream draws a Text/centred-symbol consult labelPoint, so cache just
@@ -896,6 +898,8 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     .geo_world = g.geo_world,
                     .feat_bbox = g.feat_bbox,
                     .bounds = if (p) |pp| pp.bounds else entries[ci].bbox,
+                    .cscl = g.cell.params.cscl,
+                    .coverage = g.coverage,
                 }) catch {};
             };
             baker.bakeBand(band, subset.items, .{ .zs = zs, .sx = sx, .sy = sy }, prog, progress_user) catch {};

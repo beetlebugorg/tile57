@@ -894,7 +894,11 @@ const BakeWork = struct {
             } else |_| {}
             if (c.build_geo) geo = s57_mvt.buildGeoCache(p.allocator(), &cell) catch null;
         }
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b };
+        // M_COVR coverage + scale for per-cell quilting (allocate into the cell's own
+        // arena before the move, so it outlives with the backend).
+        const coverage = cell.mcovrCoverage(cell.arena.allocator());
+        const cscl = cell.params.cscl;
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b, .cscl = cscl, .coverage = coverage };
         c.arenas[i] = pa;
     }
 };

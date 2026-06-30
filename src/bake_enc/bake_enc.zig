@@ -29,7 +29,32 @@ pub const Backend = struct {
     geo_world: ?s57_mvt.GeoWorld = null, // world coords parallel to geo (cheap reprojection)
     feat_bbox: ?[]const ?[4]f64 = null, // per-feature bbox for the per-tile spatial cull
     bounds: [4]f64,
+    cscl: i32 = 0, // compilation-scale denominator (1:N); 0 = unknown
+    // M_COVR(CATCOV=1) coverage polygons (cell.mcovrCoverage), for per-scale cell
+    // quilting: where a strictly-finer-CSCL cell's coverage contains a location, the
+    // coarser cell is suppressed there (the finer owns it; coarse only fills holes).
+    coverage: []const []const []const s57.LonLat = &.{},
 };
+
+/// The finest (smallest 1:N) compilation scale among `backends[idxs]` whose coverage
+/// contains (lon,lat); `maxInt` when none — so `finestCsclAt(...) < my_cscl` means "a
+/// strictly finer cell covers this point" (a cell never undercuts itself: its own
+/// cscl isn't < its own cscl). A cell with no M_COVR uses its bbox as coverage only
+/// when `include_derived` (the Go rule: derived extents count for points/lines, never
+/// fills). cscl<=0 (unknown) can't be a finer owner.
+fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
+    var best: i32 = std.math.maxInt(i32);
+    for (idxs) |i| {
+        const be = &backends[i];
+        if (be.cscl <= 0 or be.cscl >= best) continue;
+        const covered = if (be.coverage.len > 0)
+            s57.coverageContains(be.coverage, lon, lat)
+        else
+            include_derived and (lon >= be.bounds[0] and lon <= be.bounds[2] and lat >= be.bounds[1] and lat <= be.bounds[3]);
+        if (covered) best = be.cscl;
+    }
+    return best;
+}
 
 /// Native [minzoom, maxzoom] Web-Mercator span for a navigational-purpose band.
 pub const ZoomRange = struct { min: u8, max: u8 };
@@ -214,10 +239,30 @@ const TileGenCtx = struct {
         const x: u32 = @intCast((key >> 24) & 0xFFFFFF);
         const y: u32 = @intCast(key & 0xFFFFFF);
         const idxs = c.idx_lists[i];
+        // Per-scale cell quilting: where a strictly-finer-CSCL cell's M_COVR coverage
+        // contains a location, the coarser cell is suppressed there (so two cells of
+        // different scale that both digitise a feature don't double-draw it). The
+        // finest cscl covering the tile CENTRE gates lines/patterns (+ derived bbox
+        // extents); fills/points need a finer cell over ALL of centre+4 corners (no
+        // derived) so a partial seam keeps the coarse fill (no no-data hole).
+        const tbll = tile.tileBoundsLonLat(z, x, y); // [minlon, minlat, maxlon, maxlat]
+        const clon = (tbll[0] + tbll[2]) * 0.5;
+        const clat = (tbll[1] + tbll[3]) * 0.5;
+        const gf_centre_d = finestCsclAt(c.backends, idxs, clon, clat, true);
+        var gf_whole: i32 = finestCsclAt(c.backends, idxs, clon, clat, false);
+        const corners = [4][2]f64{ .{ tbll[0], tbll[1] }, .{ tbll[2], tbll[1] }, .{ tbll[0], tbll[3] }, .{ tbll[2], tbll[3] } };
+        for (corners) |cn| gf_whole = @max(gf_whole, finestCsclAt(c.backends, idxs, cn[0], cn[1], false));
+
         // refs + the encoded tile are transient (gzipped right below), so they ride
         // the per-thread scratch arena — reset after this tile, no per-tile mmap.
         const refs = scratch.alloc(s57_mvt.CellRef, idxs.len) catch return;
-        for (idxs, 0..) |idx, j| refs[j] = .{ .cell = &c.backends[idx].cell, .portrayal = c.backends[idx].portrayal, .portrayal_plain = c.backends[idx].portrayal_plain, .portrayal_simplified = c.backends[idx].portrayal_simplified, .geo = c.backends[idx].geo, .geo_world = c.backends[idx].geo_world, .feat_bbox = c.backends[idx].feat_bbox };
+        for (idxs, 0..) |idx, j| {
+            const be = &c.backends[idx];
+            const sc = be.cscl;
+            const supp_lines = sc > 0 and gf_centre_d < sc; // a finer cell covers the centre
+            const supp_whole = sc > 0 and gf_whole < sc; // a finer cell covers the whole tile
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = supp_whole, .suppress_patterns = supp_lines, .suppress_lines = supp_lines, .suppress_points = supp_whole };
+        }
         const mvt_bytes = s57_mvt.generateTileMulti(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
         // collection then only dedups + writes the already-compressed tile. The
