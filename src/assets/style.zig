@@ -939,19 +939,29 @@ test "buildFromTemplate: date resolution (pinned + today + off)" {
     try std.testing.expect(std.mem.indexOf(u8, o3, "date_recurring") == null);
 }
 
-test "buildFromTemplate: viewing-group filter (future-use scaffold) gates by vg" {
+test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
     const a = std.testing.allocator;
-    const vgs = [_]i32{ 26070, 27070 };
-    const m = chartstyle.MarinerSettings{ .viewing_groups = &vgs };
+    // A non-empty off-set hides the listed groups -> the style references the `vg`
+    // property and the off ids, negated (deny-list).
+    const off = [_]i32{ 26070, 27070 };
+    const m = chartstyle.MarinerSettings{ .viewing_groups_off = &off };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"vg\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "26070") != null);
-    // null viewing_groups -> no vg filter at all.
+    // The filter is a deny-list: ["!",["in",...]] so the off groups are EXCLUDED.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"in\"") != null);
+    // null off-set -> no vg filter at all.
     const m2 = chartstyle.MarinerSettings{};
     const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
     defer a.free(o2);
     try std.testing.expect(std.mem.indexOf(u8, o2, "\"vg\"") == null);
+    // empty off-set -> also no filter (show all).
+    const empty = [_]i32{};
+    const m3 = chartstyle.MarinerSettings{ .viewing_groups_off = &empty };
+    const o3 = try buildFromTemplate(a, cs_template, &m3, cs_ct, null, 1700000000);
+    defer a.free(o3);
+    try std.testing.expect(std.mem.indexOf(u8, o3, "\"vg\"") == null);
 }
 
 test "buildFromTemplateScamin: a manifest emits per-value buckets, no zoom-gate" {

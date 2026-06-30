@@ -68,12 +68,13 @@ pub const MarinerSettings = struct {
     show_light_descriptions: bool = true,
     text_other: bool = true,
 
-    // -- viewing groups (S-52 §14.5, fine-grained per-VG control) — FUTURE USE.
-    // null = every viewing group shown (current behaviour); a non-null list = show
-    // only features whose raw `vg` (the tile property, already baked) is selected.
-    // Features without a `vg` always show. No client UI wired yet — the style hook
-    // exists so per-viewing-group filtering can be turned on without an engine change.
-    viewing_groups: ?[]const i32 = null,
+    // -- viewing groups (S-52 §14.5, fine-grained per-VG control). A DENY-LIST: the
+    // groups the mariner has turned OFF. null/empty = every viewing group shown
+    // (default); a non-empty list hides features whose raw `vg` (the tile property,
+    // already baked) is in the off-set and shows everything else — so any new
+    // catalogue group defaults visible. Features without a `vg` always show. Matches
+    // the host's `viewingGroupsOff` model (specs/viewing-groups.md §2.1).
+    viewing_groups_off: ?[]const i32 = null,
 
     // -- date-dependent display (S-52 §10.4.1.1) --
     date_dependent: bool = true,
@@ -358,17 +359,21 @@ pub fn textGroupFilter(b: B, m: *const MarinerSettings) !Value {
     return .{ .array = any };
 }
 
-// S-52 §14.5 fine-grained viewing-group selection (FUTURE USE). null when the
-// mariner selects all viewing groups (no filter). When a set is given, a feature
-// shows iff it has no `vg` (unbanded — always shown) or its `vg` is in the set.
+// S-52 §14.5 fine-grained viewing-group selection — a DENY-LIST (the host's
+// `viewingGroupsOff` model, specs/viewing-groups.md §2.1). null/empty off-set =>
+// no filter (every group shown). Otherwise a feature shows iff it has no `vg`
+// (unbanded — always shown) OR its `vg` is NOT in the off-set, so any group the
+// host didn't list stays visible. Byte-identical to the host's s52-style.mjs
+// expression, so whichever backend builds the style produces the same filter.
 pub fn viewingGroupFilter(b: B, m: *const MarinerSettings) !?Value {
-    const sel = m.viewing_groups orelse return null;
+    const off = m.viewing_groups_off orelse return null;
+    if (off.len == 0) return null;
     var en = Array.init(b.a);
-    for (sel) |v| try en.append(b.int(v));
+    for (off) |v| try en.append(b.int(v));
     return try b.arr(&.{
         b.s("any"),
         try b.arr(&.{ b.s("!"), try b.arr(&.{ b.s("has"), b.s("vg") }) }),
-        try b.arr(&.{ b.s("in"), try b.get("vg"), try b.arr(&.{ b.s("literal"), .{ .array = en } }) }),
+        try b.arr(&.{ b.s("!"), try b.arr(&.{ b.s("in"), try b.get("vg"), try b.arr(&.{ b.s("literal"), .{ .array = en } }) }) }),
     });
 }
 
