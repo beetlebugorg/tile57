@@ -347,6 +347,11 @@ const Layers = struct {
     //     drawn on top, wins where it has data); no labels lost over a coverage gap.
     suppress_lines: bool = false,
     suppress_points: bool = false,
+    // Emit the per-feature pick-report attributes (the `s57` blob + `cell` name) for
+    // the S-52 §10.8 cursor pick + dev inspector. Defaults ON (host wants a working
+    // pick report in the local-first deployment); a lean bake can turn it off via the
+    // C ABI to drop the bulky `s57` payload. See encodeS57Attrs / pickS57.
+    pick_attrs: bool = true,
 };
 
 /// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
@@ -404,6 +409,10 @@ const Meta = struct {
     vg: i64 = 0, // raw S-101 viewing-group number of the feature's primary draw (0 = none)
     scamin: ?i64 = null,
     class: []const u8 = "", // S-57 object-class acronym (M_QUAL, LIGHTS, …)
+    // Cursor-pick report (S-52 §10.8) + dev feature inspector: the feature's full
+    // S-57 attribute set as compact acronym->value JSON. "" = omitted (no reportable
+    // attribute, or pick attributes disabled). See encodeS57Attrs / pickS57.
+    s57: []const u8 = "",
     band: u8 = 0, // NOAA band rank (0 finest … 5 coarsest)
     date_start: []const u8 = "",
     date_end: []const u8 = "",
@@ -433,6 +442,85 @@ fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) 
     try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
 }
 
+/// JSON-escape `s` (surrounding quotes included) into `buf`: escapes ", \, and the
+/// C0 control chars so an S-57 text value (OBJNAM, INFORM, …) is a valid JSON string.
+fn appendJsonString(a: Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(a, '"');
+    for (s) |c| switch (c) {
+        '"' => try buf.appendSlice(a, "\\\""),
+        '\\' => try buf.appendSlice(a, "\\\\"),
+        '\n' => try buf.appendSlice(a, "\\n"),
+        '\r' => try buf.appendSlice(a, "\\r"),
+        '\t' => try buf.appendSlice(a, "\\t"),
+        else => if (c < 0x20) {
+            var hb: [6]u8 = undefined;
+            try buf.appendSlice(a, std.fmt.bufPrint(&hb, "\\u{x:0>4}", .{c}) catch unreachable);
+        } else try buf.append(a, c),
+    };
+    try buf.append(a, '"');
+}
+
+/// Compact JSON of the feature's full S-57 attribute set (acronym -> value) for the
+/// S-52 §10.8 cursor-pick report + the dev feature inspector — host-canonical-backend
+/// "Still needed" #4. Mirrors the Go baker's encodeS57Attrs: skip an attr with no
+/// catalogue acronym or a blank value; "" when the feature has no reportable attribute
+/// (the caller omits the `s57` prop). Values are the raw trimmed S-57 strings — the
+/// Zig parser keeps ATTF/NATF values as text, so unlike the Go path there's no typed
+/// re-format; the client (web/s57-catalogue.json) maps acronyms->labels and displays
+/// the values verbatim. Caller owns the bytes (allocated in `a`).
+fn encodeS57Attrs(a: Allocator, f: s57.Feature) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    var n: usize = 0;
+    for (f.attrs) |at| {
+        const acr = catalogue.attrAcronym(at.code) orelse continue;
+        const v = std.mem.trim(u8, at.value, " \t\r\n");
+        if (v.len == 0) continue;
+        try buf.append(a, if (n == 0) '{' else ',');
+        try appendJsonString(a, &buf, acr);
+        try buf.append(a, ':');
+        try appendJsonString(a, &buf, v);
+        n += 1;
+    }
+    if (n == 0) return "";
+    try buf.append(a, '}');
+    return buf.items;
+}
+
+/// The `s57` pick-report blob for `f`, or "" when pick attributes are disabled
+/// (host opt-out flag) — so a lean bake stays free of the bulky attribute payload.
+fn pickS57(a: Allocator, L: Layers, f: s57.Feature) ![]const u8 {
+    return if (L.pick_attrs) encodeS57Attrs(a, f) else "";
+}
+
+test "encodeS57Attrs: acronym->value JSON; skips blank + unknown; escapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // DRVAL1 present, DRVAL2 blank (skipped), an out-of-range code with no acronym
+    // (skipped) -> only the one reportable attribute.
+    {
+        const attrs = [_]s57.Attr{
+            .{ .code = s57.ATTR_DRVAL1, .value = "9.1" },
+            .{ .code = s57.ATTR_DRVAL2, .value = "  " },
+            .{ .code = 65535, .value = "x" },
+        };
+        const f = s57.Feature{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 42, .attrs = &attrs };
+        try std.testing.expectEqualStrings("{\"DRVAL1\":\"9.1\"}", try encodeS57Attrs(a, f));
+    }
+    // No reportable attribute -> "" (the caller omits the s57 prop).
+    {
+        const f = s57.Feature{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 42, .attrs = &.{} };
+        try std.testing.expectEqualStrings("", try encodeS57Attrs(a, f));
+    }
+    // Quote/backslash in a value are JSON-escaped.
+    {
+        const attrs = [_]s57.Attr{.{ .code = s57.ATTR_DRVAL1, .value = "a\"b\\c" }};
+        const f = s57.Feature{ .rcnm = 100, .rcid = 3, .prim = 3, .objl = 42, .attrs = &attrs };
+        try std.testing.expectEqualStrings("{\"DRVAL1\":\"a\\\"b\\\\c\"}", try encodeS57Attrs(a, f));
+    }
+}
+
 fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
     try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
@@ -441,6 +529,7 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     if (m.vg != 0) try props.append(a, .{ .key = "vg", .value = .{ .int = m.vg } });
     try props.append(a, .{ .key = "band", .value = .{ .int = m.band } });
     if (m.class.len > 0) try props.append(a, .{ .key = "class", .value = .{ .string = m.class } });
+    if (m.s57.len > 0) try props.append(a, .{ .key = "s57", .value = .{ .string = m.s57 } });
     if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
     // bnd/pts are emitted only for the style-variant passes (0/1); the common case
     // (2) is left off so the client coalesces to 2 (always shown) — keeping every
@@ -779,6 +868,7 @@ fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?Geo
         .vg = p.vg,
         .scamin = scamin,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
+        .s57 = try pickS57(a, L, f),
         .band = L.band,
         .date_start = p.date_start,
         .date_end = p.date_end,
@@ -1446,7 +1536,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
     const points_l = if (scamin != null) L.points_scamin else L.points;
     const texts_l = if (scamin != null) L.texts_scamin else L.texts;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .band = L.band };
+    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .band = L.band };
 
     // Dashed CHGRD boundary on each ring (clipped to the tile). Best-band: drop the
     // stroke where a finer band covers the tile centre (suppress_lines).
@@ -1512,7 +1602,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 
     const scamin = featureScamin(f);
     const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .band = L.band };
+    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .band = L.band };
     for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
@@ -1677,6 +1767,7 @@ fn appendCellFeatures(
                 .prio = 18,
                 .cat = 2,
                 .class = "SOUNDG",
+                .s57 = try pickS57(a, L, f),
                 .scamin = featureScamin(f),
                 .band = L.band,
             };
