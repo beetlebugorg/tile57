@@ -378,21 +378,27 @@ fn isDir(io: std.Io, path: []const u8) bool {
 
 // Live bake-root progress context (file-level so the C-ABI Progress callback can
 // read the current band + super-tile position alongside the running tile count).
-const ProgressCtx = struct { band: []const u8 = "?", st: usize = 0, st_total: usize = 0 };
+const ProgressCtx = struct { band: []const u8 = "?", st: usize = 0, st_total: usize = 0, band_start: i64 = 0 };
 var g_prog: ProgressCtx = .{};
 var g_bake_start: i64 = 0;
 
 /// Console progress for bake-root: stage 0 = loading cells, 1 = baking tiles.
-/// Shows band, super-tile position, running tile count, throughput and elapsed.
+/// Shows band, super-tile position, the per-band tile bar (done/total %, host §3)
+/// and throughput. `done`/`total` for stage 1 are per-band (total 0 = unknown).
 fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void {
     _ = ctx;
-    _ = total;
-    const secs = @as(f64, @floatFromInt(@max(nowSec() - g_bake_start, 1)));
-    const rate = @as(f64, @floatFromInt(done)) / secs;
+    const elapsed = @as(f64, @floatFromInt(@max(nowSec() - g_bake_start, 1)));
     if (stage == 0) {
         std.debug.print("\r  {s}: loading {d} cells    ", .{ g_prog.band, done });
     } else {
-        std.debug.print("\r  {s}: super-tile {d}/{d}  {d} tiles  ({d:.0}/s, {d:.0}s)    ", .{ g_prog.band, g_prog.st, g_prog.st_total, done, rate, secs });
+        const band_secs = @as(f64, @floatFromInt(@max(nowSec() - g_prog.band_start, 1)));
+        const rate = @as(f64, @floatFromInt(done)) / band_secs;
+        if (total > 0) {
+            const pct = @as(f64, @floatFromInt(done)) * 100.0 / @as(f64, @floatFromInt(total));
+            std.debug.print("\r  {s}: super-tile {d}/{d}  {d}/{d} tiles ({d:.0}%)  ({d:.0}/s, {d:.0}s)    ", .{ g_prog.band, g_prog.st, g_prog.st_total, done, total, pct, rate, elapsed });
+        } else {
+            std.debug.print("\r  {s}: super-tile {d}/{d}  {d} tiles  ({d:.0}/s, {d:.0}s)    ", .{ g_prog.band, g_prog.st, g_prog.st_total, done, rate, elapsed });
+        }
     }
 }
 
@@ -792,7 +798,24 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         g_prog.band = @tagName(band);
         g_prog.st = 0;
         g_prog.st_total = stkeys.len;
-        std.debug.print("\n  band {s}: {d} cells, {d} super-tiles (z{d}-{d}) — baking…\n", .{ @tagName(band), entries.len, stkeys.len, zlo, zhi });
+        g_prog.band_start = nowSec();
+
+        // Per-band tile total for the progress bar (host §3): sum the planned tiles
+        // over the band's super-tiles (a planned estimate from the cheap peek bboxes,
+        // dedup'd against finer bands via the baker's `emitted` set, which is complete
+        // here since bands bake finest→coarsest). Set it on the baker so bakeBand
+        // reports done/total as a per-band percentage instead of "total 0 = unknown".
+        baker.band_base = baker.count;
+        var band_total: usize = 0;
+        for (stkeys) |stk| {
+            const cells = stmap.get(stk).?.items;
+            const bnds = gpa.alloc([4]f64, cells.len) catch continue;
+            defer gpa.free(bnds);
+            for (cells, 0..) |ci, j| bnds[j] = entries[ci].bbox;
+            band_total += baker.plannedTiles(band, bnds, .{ .zs = zs, .sx = @intCast(stk & 0xFFFFFFFF), .sy = @intCast(stk >> 32) });
+        }
+        baker.band_total = band_total;
+        std.debug.print("\n  band {s}: {d} cells, {d} super-tiles (z{d}-{d}), ~{d} tiles — baking…\n", .{ @tagName(band), entries.len, stkeys.len, zlo, zhi, band_total });
 
         // Per-band caches (index-aligned with `entries`): portrayal is RESIDENT
         // (computed once — the expensive Lua step — and cheap to keep); geometry is

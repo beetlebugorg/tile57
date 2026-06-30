@@ -106,7 +106,11 @@ pub fn cacheGeoForBand(band: Band) bool {
 }
 
 /// Progress callback. stage 0 = loading/portraying cells (driven by the caller),
-/// stage 1 = baking tiles (driven by Baker). `total` 0 means "unknown". C ABI safe.
+/// stage 1 = baking tiles (driven by Baker). For stage 1 `done`/`total` are PER BAND
+/// (reset each band): done = tiles baked in the current band, total = the band's
+/// planned tile count when the caller set Baker.band_total (else 0 = "unknown", the
+/// pre-host-§3 behaviour). The caller (bundle bake-root) sets band_base/band_total
+/// per band so a host import UI can show a per-band percentage. C ABI safe.
 pub const Progress = ?*const fn (ctx: ?*anyopaque, stage: u8, done: usize, total: usize) callconv(.c) void;
 
 fn lonLatToTile(lon: f64, lat: f64, z: u8) [2]u32 {
@@ -187,7 +191,9 @@ const TileGenCtx = struct {
     // tiles; `base` is the emitted count before this batch.
     progress: Progress = null,
     pctx: ?*anyopaque = null,
-    base: usize = 0,
+    base: usize = 0, // self.count at this super-tile's start (cumulative)
+    band_base: usize = 0, // self.count at the band's start (for the per-band done)
+    band_total: usize = 0, // the band's planned tile total (0 = unknown)
     done: ?*std.atomic.Value(usize) = null,
 
     fn gen(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
@@ -208,7 +214,10 @@ const TileGenCtx = struct {
         if (mvt_bytes.len > 0) c.results[i] = pmtiles.StreamWriter.gzipTile(c.gpa, mvt_bytes) catch null;
         if (c.done) |d| {
             const n = d.fetchAdd(1, .monotonic) + 1;
-            if (c.progress) |cb| if (n % 1024 == 0) cb(c.pctx, 1, c.base + n, 0);
+            // Per-band tile bar: done = tiles done in this band so far, total = the
+            // band's planned tile count (host §3). Live updates from inside the
+            // parallel batch so a big super-tile shows movement.
+            if (c.progress) |cb| if (n % 1024 == 0) cb(c.pctx, 1, (c.base - c.band_base) + n, c.band_total);
         }
     }
 };
@@ -235,9 +244,15 @@ pub const Baker = struct {
     maxzoom: u8,
     emitted: std.AutoHashMap(u64, void),
     sink: TileSink,
-    count: usize = 0, // tiles handed to the sink
+    count: usize = 0, // tiles handed to the sink (cumulative across bands)
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
     format: s57_mvt.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
+    // Progress denominator (host §3): the caller sets these PER BAND before baking it
+    // so the tiles-stage callback can report `done`/`total` as a per-band tile bar
+    // (done = self.count - band_base; total = band_total, a planned estimate from
+    // plannedTiles). band_total 0 => "unknown" (callback reports total 0, as before).
+    band_base: usize = 0,
+    band_total: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, minzoom: u8, maxzoom: u8, sink: TileSink) Baker {
         return .{
@@ -261,25 +276,23 @@ pub const Baker = struct {
     /// Bake one band's already-parsed+portrayed cells. Tiles a finer band already
     /// emitted are skipped (call bands finest → coarsest). The cells must stay
     /// valid for the duration of this call; the caller may free them afterward.
-    pub fn bakeBand(self: *Baker, band: Band, backends: []Backend, clip: ?TileClip, progress: Progress, ctx: ?*anyopaque) !void {
+    /// Build the tile→contributing-bounds-index map for one band: every not-yet-
+    /// emitted (z,x,y) over [minzoom..maxzoom]∩band, clipped to the super-tile when
+    /// `clip` is set. Shared by bakeBand (to bake) and plannedTiles (to count) so the
+    /// progress denominator can't drift from what's actually baked. `bounds[i]` =
+    /// [w,s,e,n]; the map values index into it. Caller frees the value lists + the map.
+    fn buildTileMap(self: *Baker, band: Band, bounds: []const [4]f64, clip: ?TileClip) !std.AutoHashMap(u64, std.ArrayList(u32)) {
         const zr = bandZooms(band);
         const zlo = @max(self.minzoom, zr.min);
         const zhi = @min(self.maxzoom, zr.max);
-        if (zlo > zhi or backends.len == 0) return;
-
-        // Map this band's not-yet-emitted tiles -> contributing cell indices.
         var tilemap = std.AutoHashMap(u64, std.ArrayList(u32)).init(self.gpa);
-        defer {
+        errdefer {
             var vit = tilemap.valueIterator();
             while (vit.next()) |v| v.deinit(self.gpa);
             tilemap.deinit();
         }
-        for (backends, 0..) |be, i| {
-            const b = be.bounds;
-            self.union_b[0] = @min(self.union_b[0], b[0]);
-            self.union_b[1] = @min(self.union_b[1], b[1]);
-            self.union_b[2] = @max(self.union_b[2], b[2]);
-            self.union_b[3] = @max(self.union_b[3], b[3]);
+        if (zlo > zhi) return tilemap;
+        for (bounds, 0..) |b, i| {
             var z = zlo;
             while (z <= zhi) : (z += 1) {
                 const nw = lonLatToTile(b[0], b[3], z);
@@ -310,6 +323,47 @@ pub const Baker = struct {
                 }
             }
         }
+        return tilemap;
+    }
+
+    /// Planned tile count for a band's cells (host §3 progress denominator): the
+    /// distinct not-yet-emitted tiles their bounds cover. A planned ESTIMATE — the
+    /// caller may pass cheap peek-bboxes while the real bake uses slightly tighter
+    /// loaded bounds — matching the Go baker's up-front planned count. 0 on OOM.
+    pub fn plannedTiles(self: *Baker, band: Band, bounds: []const [4]f64, clip: ?TileClip) usize {
+        var tm = self.buildTileMap(band, bounds, clip) catch return 0;
+        defer {
+            var vit = tm.valueIterator();
+            while (vit.next()) |v| v.deinit(self.gpa);
+            tm.deinit();
+        }
+        return tm.count();
+    }
+
+    pub fn bakeBand(self: *Baker, band: Band, backends: []Backend, clip: ?TileClip, progress: Progress, ctx: ?*anyopaque) !void {
+        const zr = bandZooms(band);
+        const zlo = @max(self.minzoom, zr.min);
+        const zhi = @min(self.maxzoom, zr.max);
+        if (zlo > zhi or backends.len == 0) return;
+
+        // Cell bounds (drive the tile map) + the running union bbox for the header.
+        const bounds = try self.gpa.alloc([4]f64, backends.len);
+        defer self.gpa.free(bounds);
+        for (backends, 0..) |be, i| {
+            bounds[i] = be.bounds;
+            self.union_b[0] = @min(self.union_b[0], be.bounds[0]);
+            self.union_b[1] = @min(self.union_b[1], be.bounds[1]);
+            self.union_b[2] = @max(self.union_b[2], be.bounds[2]);
+            self.union_b[3] = @max(self.union_b[3], be.bounds[3]);
+        }
+
+        // Map this band's not-yet-emitted tiles -> contributing cell indices.
+        var tilemap = try self.buildTileMap(band, bounds, clip);
+        defer {
+            var vit = tilemap.valueIterator();
+            while (vit.next()) |v| v.deinit(self.gpa);
+            tilemap.deinit();
+        }
 
         // Generate this band's tiles in parallel (each tile independent, cells read
         // read-only), then collect serially into the shared archive state.
@@ -331,7 +385,7 @@ pub const Baker = struct {
         @memset(results, null);
 
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .progress = progress, .pctx = ctx, .base = self.count, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
@@ -340,9 +394,11 @@ pub const Baker = struct {
             try self.sink.func(self.sink.ctx, @intCast(key >> 48), @intCast((key >> 24) & 0xFFFFFF), @intCast(key & 0xFFFFFF), mvt_bytes);
             try self.emitted.put(key, {});
             self.count += 1;
-            if (progress) |cb| if (self.count % 256 == 0) cb(ctx, 1, self.count, 0);
+            // Per-band tile bar (host §3): done = tiles done in this band, total = the
+            // band's planned count the caller set (0 = unknown -> total 0, as before).
+            if (progress) |cb| if (self.count % 256 == 0) cb(ctx, 1, self.count - self.band_base, self.band_total);
         }
-        if (progress) |cb| cb(ctx, 1, self.count, 0);
+        if (progress) |cb| cb(ctx, 1, self.count - self.band_base, self.band_total);
     }
 };
 

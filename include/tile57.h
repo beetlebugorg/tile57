@@ -119,8 +119,13 @@ tile57_source *tile57_source_open_cells_streaming(
     const tile57_cell_meta *metas, size_t count,
     tile57_cell_read_fn read, void *user, const char *rules_dir);
 
-/* Progress callback for tile57_bake_cells. stage 0 = loading/portraying cells,
- * stage 1 = baking tiles; done/total count cells (stage 0) or tiles (stage 1). */
+/* Progress callback for tile57_bake_cells / tile57_bake_bundle. stage 0 =
+ * loading/portraying cells, stage 1 = baking tiles. Stage 0 done/total count cells.
+ * Stage 1 done/total count tiles: for tile57_bake_bundle they are PER BAND (reset
+ * each band) with total = that band's planned tile count, so a host can draw a
+ * per-band percentage (the count is a planned estimate from cell bboxes — the actual
+ * emitted total is a little lower as empty tiles are skipped, like the Go baker's
+ * planned bar). total 0 means "unknown" (the tile57_bake_cells path). */
 typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, size_t total);
 
 /* Bake a whole ENC_ROOT (the same cells as tile57_source_open_cells) into ONE

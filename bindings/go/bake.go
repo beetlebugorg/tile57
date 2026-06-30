@@ -87,6 +87,12 @@ func BakeCells(cells []CellInput, rulesDir string, minZoom, maxZoom uint8, progr
 // the manifest timestamp unset. minZoom/maxZoom clamp the per-cell bands (0/0 → no
 // clamp). progress nil uses the lib's built-in console progress. Returns the cell
 // count and bbox (west,south,east,north).
+//
+// progress reports (stage, done, total): stage 0 = loading cells (done/total =
+// cells); stage 1 = baking tiles, where done/total are PER BAND (reset each band)
+// and total is that band's planned tile count — so a UI can show a per-band
+// percentage. The planned total slightly over-counts the emitted tiles (empty
+// tiles are skipped), matching the Go baker's planned bar.
 func BakeBundle(input, outDir, rulesDir, catalogDir, created string, minZoom, maxZoom uint8, progress func(stage uint8, done, total int)) (cellCount int, bbox [4]float64, err error) {
 	if input == "" || outDir == "" {
 		return 0, bbox, fmt.Errorf("tile57: BakeBundle needs input and out dir")
