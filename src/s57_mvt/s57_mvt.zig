@@ -368,6 +368,49 @@ pub fn featureScamin(f: s57.Feature) ?i64 {
     return if (n > 0) n else null;
 }
 
+/// S-52 §10.6.1.1: does the feature carry ancillary information warranting the
+/// SY(INFORM01) "additional information available" marker? True when it has a
+/// non-blank INFORM/NINFOM (textual note) or TXTDSC/NTXTDS/PICREP (referenced
+/// text/picture file). Mirrors Go hasAdditionalInfo (TrimSpace != "").
+fn hasAdditionalInfo(f: s57.Feature) bool {
+    for (f.attrs) |at| {
+        const acr = catalogue.attrAcronym(at.code) orelse continue;
+        const is_info = std.mem.eql(u8, acr, "INFORM") or std.mem.eql(u8, acr, "NINFOM") or
+            std.mem.eql(u8, acr, "TXTDSC") or std.mem.eql(u8, acr, "NTXTDS") or
+            std.mem.eql(u8, acr, "PICREP");
+        if (is_info and std.mem.trim(u8, at.value, " \t\n\r\x0b\x0c").len > 0) return true;
+    }
+    return false;
+}
+
+test "hasAdditionalInfo: INFORM/TXTDSC trigger; blank/absent/other don't" {
+    // Resolve the S-57 ATTL code for an acronym via the catalogue (no reverse map),
+    // so the test stays correct regardless of the numeric code assignment.
+    const codeFor = struct {
+        fn f(acr: []const u8) u16 {
+            var code: u16 = 1;
+            while (code < 2000) : (code += 1) {
+                if (catalogue.attrAcronym(code)) |a| if (std.mem.eql(u8, a, acr)) return code;
+            }
+            return 0;
+        }
+    }.f;
+    const inform = codeFor("INFORM");
+    const txtdsc = codeFor("TXTDSC");
+    try std.testing.expect(inform != 0 and txtdsc != 0);
+
+    // No info attribute → no marker.
+    try std.testing.expect(!hasAdditionalInfo(.{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 75, .attrs = &.{} }));
+    // A non-info attribute (DRVAL1) → no marker.
+    try std.testing.expect(!hasAdditionalInfo(.{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 42, .attrs = &.{.{ .code = s57.ATTR_DRVAL1, .value = "9.1" }} }));
+    // INFORM with text → marker.
+    try std.testing.expect(hasAdditionalInfo(.{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 75, .attrs = &.{.{ .code = inform, .value = "see chart note" }} }));
+    // TXTDSC (referenced file) → marker.
+    try std.testing.expect(hasAdditionalInfo(.{ .rcnm = 100, .rcid = 4, .prim = 3, .objl = 42, .attrs = &.{.{ .code = txtdsc, .value = "DESC01.TXT" }} }));
+    // INFORM present but blank (whitespace only) → no marker (matches Go TrimSpace != "").
+    try std.testing.expect(!hasAdditionalInfo(.{ .rcnm = 100, .rcid = 5, .prim = 1, .objl = 75, .attrs = &.{.{ .code = inform, .value = "  \t " }} }));
+}
+
 /// The vector layers this engine emits, in emit order — the source-layer ids the
 /// generated MapLibre style reads. Static: an archive may omit empties, but the
 /// TileJSON advertises the full set (mirrors the Go pmtiles metadataJSON, with this
@@ -1839,6 +1882,49 @@ fn appendCellFeatures(
         if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
             if (b[2] < tb[0] - ml or b[0] > tb[2] + ml or b[3] < tb[1] - mt or b[1] > tb[3] + mt) continue;
         };
+        // S-52 §10.6.1.1 additional-information indicator: a SY(INFORM01) "info
+        // available" marker at the feature's representative point whenever it carries
+        // a non-blank INFORM/NINFOM/TXTDSC/NTXTDS/PICREP. Always draw priority 8,
+        // category Other (overriding the feature's own category) so it clears Standard
+        // display and only shows when the mariner enables Other — matching the oracle's
+        // addInformSymbol + the bake's per-symbol category override (build.go:267 /
+        // bake.go:854). Emitted here, before the dispatch below, so EVERY feature gets
+        // it (Go wraps every buildFeature) regardless of which body path draws the
+        // feature — even an unportrayed/suppressed one. (suppress_points: a finer band
+        // covers the whole tile → drop this coarse cell's marker, like its symbols.)
+        if (!L.suppress_points and hasAdditionalInfo(f)) {
+            const rp: ?s57.LonLat = if (f.prim == 1)
+                cell.pointGeometry(f)
+            else rpblk: {
+                const gp = featureParts(a, cell.*, geo, fi, f) catch break :rpblk null;
+                break :rpblk labelPoint(a, cell.*, fi, gp);
+            };
+            if (rp) |p| {
+                if (p.lon() >= tb[0] and p.lon() <= tb[2] and p.lat() >= tb[1] and p.lat() <= tb[3]) {
+                    const scamin = featureScamin(f);
+                    const points_l = if (scamin != null) L.points_scamin else L.points;
+                    const pt = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
+                    const parts = try a.alloc([]const mvt.Point, 1);
+                    const single = try a.alloc(mvt.Point, 1);
+                    single[0] = pt;
+                    parts[0] = single;
+                    var props = std.ArrayList(mvt.Prop).empty;
+                    try props.append(a, .{ .key = "symbol_name", .value = .{ .string = "INFORM01" } });
+                    try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
+                    try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+                    try appendMeta(a, &props, .{
+                        .prio = 8,
+                        .cat = 2, // Other (overrides the feature's category)
+                        .scamin = scamin,
+                        .class = catalogue.acronymByObjl(f.objl) orelse "",
+                        .s57 = try pickS57(a, L, f),
+                        .cell = pickCell(L, cell.name),
+                        .band = L.band,
+                    });
+                    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+                }
+            }
+        }
         // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
         // the `soundings` layer (the flat S-101 instruction stream can't carry
         // per-sounding geometry). Bypasses the portrayal/classify dispatch.
