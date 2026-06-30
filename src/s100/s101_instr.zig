@@ -132,6 +132,20 @@ fn toFloat(s: []const u8) f64 {
     return std.fmt.parseFloat(f64, std.mem.trim(u8, s, " ")) catch 0;
 }
 
+/// Reverse the framework's EncodeDEFString escaping (`& ; : ,` -> `&a &s &c &m`),
+/// so text escaped to survive the ;/:/, tokenizing decodes back to the display
+/// string. The escape char (`&a` -> `&`) MUST be decoded LAST or an encoded
+/// separator like `&as` (== literal `&s`) would wrongly become `;`. Mirrors Go
+/// decodeDEF (pkg/s100/instructions/instructions.go:337). Allocates into `a`.
+fn decodeDEF(a: Allocator, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
+    var r = try std.mem.replaceOwned(u8, a, s, "&s", ";");
+    r = try std.mem.replaceOwned(u8, a, r, "&c", ":");
+    r = try std.mem.replaceOwned(u8, a, r, "&m", ",");
+    r = try std.mem.replaceOwned(u8, a, r, "&a", "&");
+    return r;
+}
+
 // S-101 simple-line widths are millimetres; the engine renders in pixels. Mirrors
 // Go's pxPerMM = float64(DefaultPxPerSymbolUnit)*100, DefaultPxPerSymbolUnit being
 // float32(0.01/0.26458) (~3.7796 px/mm). Kept in the float32->float64 form so the
@@ -293,7 +307,12 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         } else if (std.mem.eql(u8, key, "TextAlignVertical")) {
             cur_align_v = val;
         } else if (std.mem.eql(u8, key, "TextInstruction")) {
-            try texts.append(a, .{ .text = val, .color = cur_font, .group = cur_tgrp, .font_size = cur_font_size, .halign = mapHAlign(cur_align_h), .valign = mapVAlign(cur_align_v) });
+            // The reference is DEF-encoded (separators escaped); decode it. The
+            // oracle drops an OpText whose decoded reference is empty (s101emit.go:123,
+            // `if cmd.Reference == "" return nil`) — skip it here, equivalently.
+            const txt = try decodeDEF(a, val);
+            if (txt.len == 0) continue;
+            try texts.append(a, .{ .text = txt, .color = cur_font, .group = cur_tgrp, .font_size = cur_font_size, .halign = mapHAlign(cur_align_h), .valign = mapVAlign(cur_align_v) });
         } else if (std.mem.eql(u8, key, "DrawingPriority")) {
             // S-52 display priority. A feature draws across several viewing groups,
             // each with its own DrawingPriority; the feature's priority is the MAX
@@ -338,6 +357,30 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         .date_end = date_end,
         .aug_figures = aug_figures.items,
     };
+}
+
+test "decodeDEF reverses the framework escaping (escape char decoded last)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // No '&' -> returned verbatim.
+    try std.testing.expectEqualStrings("Fishing Creek", try decodeDEF(a, "Fishing Creek"));
+    // Each escaped separator decodes back.
+    try std.testing.expectEqualStrings("a;b:c,d", try decodeDEF(a, "a&sb&cc&md"));
+    // A literal ampersand (encoded &a) decodes; and the order matters: the encoded
+    // form of a literal "&s" is "&as", which must decode to "&s", not ";".
+    try std.testing.expectEqualStrings("R&D", try decodeDEF(a, "R&aD"));
+    try std.testing.expectEqualStrings("&s", try decodeDEF(a, "&as"));
+}
+
+test "TextInstruction decodes DEF and drops empty text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An escaped label decodes; an empty TextInstruction is dropped.
+    const p = try parse(a, "FontColor:CHBLK;TextInstruction:Smith&cs Cove;TextInstruction:");
+    try std.testing.expectEqual(@as(usize, 1), p.texts.len);
+    try std.testing.expectEqualStrings("Smith:s Cove", p.texts[0].text);
 }
 
 test "parse the real DEPARE03 instruction stream" {
