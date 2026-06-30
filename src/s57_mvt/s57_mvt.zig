@@ -23,6 +23,13 @@ const catalogue = @import("s100").catalogue;
 // size 1.0), i.e. ~2.8x too large.
 const SYMBOL_SCALE: f64 = 0.02834627777338028;
 
+// Worst-case reach of a light's sector legs/arcs (emitAugFigures) as a fraction of a
+// tile — these are drawn at a fixed DISPLAY size (radius/length in mm), so the reach
+// is ~constant in tile units at every zoom (offset_tiles = mm * PX_PER_MM / 256).
+// Used to widen the LIGHTS spatial-cull margin so an arc isn't dropped on the tiles it
+// crosses (S-52 legs ~25 mm / arcs ~20 mm ≈ 0.8 tile; 1.0 leaves headroom).
+const LIGHT_AUG_REACH_TILES: f64 = 1.0;
+
 // S-57 attribute code for SCAMIN (the minimum display scale 1:N, S-57 Appendix A
 // attr 133 / S-52 §8.4). Features carrying it are routed to a dedicated *_scamin
 // MVT layer so the style can drop them below their 1:N scale; the value travels on
@@ -1818,8 +1825,19 @@ fn appendCellFeatures(
     const mlat = (tb[3] - tb[1]) * @as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT));
     for (cell.features, 0..) |f, fi| {
         // Spatial cull: skip features whose precomputed bbox doesn't overlap the tile.
+        // LIGHTS (objl 75) carry sector legs/arcs (emitAugFigures) that radiate a fixed
+        // DISPLAY distance from the node — a near-constant tile fraction at any zoom,
+        // well beyond the node-only point bbox. Widen the cull margin for them so the
+        // feature is processed (and its arcs clipped in) on every tile the arcs cross,
+        // instead of being dropped one tile out -> sector lights cut off at seams.
+        var ml = mlon;
+        var mt = mlat;
+        if (f.objl == 75) {
+            ml = @max(ml, (tb[2] - tb[0]) * LIGHT_AUG_REACH_TILES);
+            mt = @max(mt, (tb[3] - tb[1]) * LIGHT_AUG_REACH_TILES);
+        }
         if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
-            if (b[2] < tb[0] - mlon or b[0] > tb[2] + mlon or b[3] < tb[1] - mlat or b[1] > tb[3] + mlat) continue;
+            if (b[2] < tb[0] - ml or b[0] > tb[2] + ml or b[3] < tb[1] - mt or b[1] > tb[3] + mt) continue;
         };
         // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
         // the `soundings` layer (the flat S-101 instruction stream can't carry
