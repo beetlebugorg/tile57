@@ -1,0 +1,219 @@
+//go:build cgo
+
+package tile57
+
+/*
+#include <stdlib.h>
+#include "tile57.h"
+*/
+import "C"
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+// Scheme selects the S-52 colour palette (day/dusk/night).
+type Scheme int32
+
+const (
+	SchemeDay   Scheme = C.TILE57_SCHEME_DAY
+	SchemeDusk  Scheme = C.TILE57_SCHEME_DUSK
+	SchemeNight Scheme = C.TILE57_SCHEME_NIGHT
+)
+
+// SchemeFromString maps "day"/"dusk"/"night" to a Scheme (default day).
+func SchemeFromString(s string) Scheme {
+	switch s {
+	case "dusk":
+		return SchemeDusk
+	case "night":
+		return SchemeNight
+	default:
+		return SchemeDay
+	}
+}
+
+// DepthUnit selects the contour-label unit.
+type DepthUnit int32
+
+const (
+	DepthMeters DepthUnit = C.TILE57_DEPTH_METERS
+	DepthFeet   DepthUnit = C.TILE57_DEPTH_FEET
+)
+
+// BoundaryStyle selects symbolized vs plain area boundaries.
+type BoundaryStyle int32
+
+const (
+	BoundarySymbolized BoundaryStyle = C.TILE57_BOUNDARY_SYMBOLIZED
+	BoundaryPlain      BoundaryStyle = C.TILE57_BOUNDARY_PLAIN
+)
+
+// Mariner is the S-52 mariner display selection that drives the style patch — the
+// Go mirror of tile57_mariner. Get a sensible default with [MarinerDefaults].
+type Mariner struct {
+	Scheme                                                  Scheme
+	ShallowContour, SafetyContour, DeepContour, SafetyDepth float64
+	FourShadeWater                                          bool
+	DepthUnit                                               DepthUnit
+	DisplayBase, DisplayStandard, DisplayOther              bool
+	DataQuality, ShowInformCallouts                         bool
+	ShowMetaBounds, ShowIsolatedDangersShallow              bool
+	BoundaryStyle                                           BoundaryStyle
+	SimplifiedPoints, ShowFullSectorLines                   bool
+	TextNames, ShowLightDescriptions, TextOther             bool
+	DateDependent, HighlightDateDependent                   bool
+	DateView                                                string // "YYYYMMDD" or "" (today)
+}
+
+// MarinerDefaults returns the canonical default mariner settings from libtile57.
+func MarinerDefaults() Mariner {
+	var cm C.tile57_mariner
+	C.tile57_mariner_defaults(&cm)
+	return marinerFromC(&cm)
+}
+
+// StyleTemplate returns the base MapLibre style template (layers + chart sources +
+// sprite/glyph URLs) for a scheme, from the catalogue baked into libtile57.
+// sourceTiles is the chart {z}/{x}/{y} URL; sprite/glyphs are base URLs ("" omits
+// the symbol/text layers); minZoom/maxZoom of 0 use the engine defaults.
+func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32) ([]byte, error) {
+	cSrc, f1 := cStringOrNil(sourceTiles)
+	defer f1()
+	cSpr, f2 := cStringOrNil(sprite)
+	defer f2()
+	cGly, f3 := cStringOrNil(glyphs)
+	defer f3()
+	var out *C.uint8_t
+	var n C.size_t
+	if C.tile57_style_template(C.tile57_scheme(scheme), cSrc, cSpr, cGly,
+		C.uint32_t(minZoom), C.uint32_t(maxZoom), &out, &n) != 1 {
+		return nil, fmt.Errorf("tile57: style_template failed")
+	}
+	return tileBytes(out, n), nil
+}
+
+// BuildStyle patches a style template with the mariner settings + S-52 colortables
+// into a concrete MapLibre style JSON. enabledBands (nil = show all) restricts the
+// output to features whose band rank is listed.
+func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []int32) ([]byte, error) {
+	if len(template) == 0 {
+		return nil, fmt.Errorf("tile57: empty style template")
+	}
+	cm := m.toC()
+	tmplPtr, tmplLen := charPtr(template)
+	ctPtr, ctLen := charPtr(colortables)
+
+	arena := &cArena{}
+	defer arena.free()
+	var bandsPtr *C.int32_t
+	var bandsN C.size_t
+	if n := len(enabledBands); n > 0 {
+		bp := (*C.int32_t)(arena.track(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.int32_t(0))))))
+		bs := unsafe.Slice(bp, n)
+		for i, b := range enabledBands {
+			bs[i] = C.int32_t(b)
+		}
+		bandsPtr, bandsN = bp, C.size_t(n)
+	}
+
+	var out *C.uint8_t
+	var outLen C.size_t
+	if C.tile57_build_style(tmplPtr, tmplLen, &cm, ctPtr, ctLen, bandsPtr, bandsN, &out, &outLen) != 1 {
+		return nil, fmt.Errorf("tile57: build_style failed")
+	}
+	return tileBytes(out, outLen), nil
+}
+
+// Style is a convenience that runs the whole pipeline — default colortables +
+// template (scheme, tiles/sprite/glyph URLs) patched by mariner + band filter — to
+// produce a complete MapLibre style JSON from libtile57's baked-in catalogue.
+func Style(scheme Scheme, sourceTiles, sprite, glyphs string, m Mariner, enabledBands []int32) ([]byte, error) {
+	ct, err := ColortablesDefault()
+	if err != nil {
+		return nil, err
+	}
+	tmpl, err := StyleTemplate(scheme, sourceTiles, sprite, glyphs, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	return BuildStyle(tmpl, m, ct, enabledBands)
+}
+
+// toC converts a Mariner to its C struct. cgo maps C _Bool to Go bool, so the
+// flag fields assign directly.
+func (m Mariner) toC() C.tile57_mariner {
+	var c C.tile57_mariner
+	c.scheme = C.tile57_scheme(m.Scheme)
+	c.shallow_contour = C.double(m.ShallowContour)
+	c.safety_contour = C.double(m.SafetyContour)
+	c.deep_contour = C.double(m.DeepContour)
+	c.safety_depth = C.double(m.SafetyDepth)
+	c.four_shade_water = C.bool(m.FourShadeWater)
+	c.depth_unit = C.tile57_depth_unit(m.DepthUnit)
+	c.display_base = C.bool(m.DisplayBase)
+	c.display_standard = C.bool(m.DisplayStandard)
+	c.display_other = C.bool(m.DisplayOther)
+	c.data_quality = C.bool(m.DataQuality)
+	c.show_inform_callouts = C.bool(m.ShowInformCallouts)
+	c.show_meta_bounds = C.bool(m.ShowMetaBounds)
+	c.show_isolated_dangers_shallow = C.bool(m.ShowIsolatedDangersShallow)
+	c.boundary_style = C.tile57_boundary_style(m.BoundaryStyle)
+	c.simplified_points = C.bool(m.SimplifiedPoints)
+	c.show_full_sector_lines = C.bool(m.ShowFullSectorLines)
+	c.text_names = C.bool(m.TextNames)
+	c.show_light_descriptions = C.bool(m.ShowLightDescriptions)
+	c.text_other = C.bool(m.TextOther)
+	c.date_dependent = C.bool(m.DateDependent)
+	c.highlight_date_dependent = C.bool(m.HighlightDateDependent)
+	for i := 0; i < len(m.DateView) && i < 8; i++ {
+		c.date_view[i] = C.char(m.DateView[i])
+	}
+	return c
+}
+
+// marinerFromC converts a C mariner struct back to Go.
+func marinerFromC(c *C.tile57_mariner) Mariner {
+	m := Mariner{
+		Scheme:                     Scheme(c.scheme),
+		ShallowContour:             float64(c.shallow_contour),
+		SafetyContour:              float64(c.safety_contour),
+		DeepContour:                float64(c.deep_contour),
+		SafetyDepth:                float64(c.safety_depth),
+		FourShadeWater:             bool(c.four_shade_water),
+		DepthUnit:                  DepthUnit(c.depth_unit),
+		DisplayBase:                bool(c.display_base),
+		DisplayStandard:            bool(c.display_standard),
+		DisplayOther:               bool(c.display_other),
+		DataQuality:                bool(c.data_quality),
+		ShowInformCallouts:         bool(c.show_inform_callouts),
+		ShowMetaBounds:             bool(c.show_meta_bounds),
+		ShowIsolatedDangersShallow: bool(c.show_isolated_dangers_shallow),
+		BoundaryStyle:              BoundaryStyle(c.boundary_style),
+		SimplifiedPoints:           bool(c.simplified_points),
+		ShowFullSectorLines:        bool(c.show_full_sector_lines),
+		TextNames:                  bool(c.text_names),
+		ShowLightDescriptions:      bool(c.show_light_descriptions),
+		TextOther:                  bool(c.text_other),
+		DateDependent:              bool(c.date_dependent),
+		HighlightDateDependent:     bool(c.highlight_date_dependent),
+	}
+	var dv []byte
+	for i := 0; i < len(c.date_view); i++ {
+		if c.date_view[i] == 0 {
+			break
+		}
+		dv = append(dv, byte(c.date_view[i]))
+	}
+	m.DateView = string(dv)
+	return m
+}
+
+// charPtr returns a C (char*, len) view of a read-only Go byte slice for the call.
+func charPtr(b []byte) (*C.char, C.size_t) {
+	if len(b) == 0 {
+		return nil, 0
+	}
+	return (*C.char)(unsafe.Pointer(&b[0])), C.size_t(len(b))
+}
