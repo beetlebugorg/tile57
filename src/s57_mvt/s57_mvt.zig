@@ -102,11 +102,16 @@ fn listHasAny(csv: []const u8, targets: []const i64) bool {
 /// a poor spatial quality-of-position still miss the ring; the direct attrs match.
 fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: bool, always_tenths: bool) ![]const u8 {
     const d = @abs(depth);
-    // Round to tenths: depth is an f64 (z/somf), so naive truncation would hit binary
-    // FP off-by-one on the tenths digit (12.3 stored as 12.299999…). Rounding d*10
-    // recovers the exact tenths for all 0.1 m-precision SOUNDG data (somf=10), which
-    // equals the oracle's decimal-string first-fractional digit (SNDFRM04:53-72).
-    const tenths: i64 = @intFromFloat(@round(d * 10.0));
+    // TRUNCATE to tenths (round DOWN), matching SNDFRM04: the rule splits the depth's
+    // decimal string and takes string.sub(fractional, 1, 1) — the FIRST fractional
+    // digit, discarding the rest (SNDFRM04.lua:53,72). So 4.57 m -> "4.5", never "4.6":
+    // a sounding always errs SHALLOW (toward the surface), the safe direction for
+    // navigation. The +1e-6 absorbs binary-FP error so an exact charted tenth stored a
+    // hair low (4.1 as 4.0999…) still truncates to itself, not a notch shallower — while
+    // a genuine sub-tenth value (a unit conversion, e.g. metres->feet) still floors down.
+    // Was @round (nearest), which rounded UP across the half (14.76 ft -> 14.8) — both a
+    // spec divergence AND the unsafe direction.
+    const tenths: i64 = @intFromFloat(@floor(d * 10.0 + 1e-6));
     const idepth: i64 = @divTrunc(tenths, 10);
     const frac: u8 = @intCast(@mod(tenths, 10));
     var dbuf: [12]u8 = undefined;
@@ -2322,8 +2327,9 @@ test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)
     defer arena.deinit();
     const a = arena.allocator();
 
-    // A 4.5 m obstruction: metres reads "4.5" (SOUNDS14,SOUNDS55); feet must read
-    // "14.8" (4.5*3.280839895 = 14.76 → SNDFRM04 tenths), NOT "15" pre-rounded whole.
+    // A 4.5 m obstruction: metres reads "4.5" (SOUNDS14,SOUNDS55); feet TRUNCATES to
+    // "14.7" (4.5*3.280839895 = 14.76 → SNDFRM04 takes the first fractional digit, round
+    // DOWN), NOT "14.8" (nearest) and NOT "15" (whole). Errs shallow = the safe direction.
     var props = std.ArrayList(mvt.Prop).empty;
     try std.testing.expect(try appendSoundingProps(a, &props, 4.5, false, false));
     var sym_s: []const u8 = "";
@@ -2333,7 +2339,7 @@ test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)
         if (std.mem.eql(u8, p.key, "sym_s_ft")) sym_s_ft = p.value.string;
     }
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS55", sym_s); // 4.5 m
-    try std.testing.expectEqualStrings("SOUNDS21,SOUNDS14,SOUNDS58", sym_s_ft); // 14.8 ft
+    try std.testing.expectEqualStrings("SOUNDS21,SOUNDS14,SOUNDS57", sym_s_ft); // 14.7 ft (truncated)
 }
 
 test "shortenName: buoy/light names reduce to the chart designation" {
