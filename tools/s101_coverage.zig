@@ -45,6 +45,11 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
     "verticalClearanceClosed", "verticalClearanceFixed",
     "verticalClearanceOpen",   "verticalClearanceValue",
     "horizontalClearanceFixed", "horizontalClearanceValue",
+    // Gate's HORCLR -> horizontalClearanceOpen (class-keyed; the other 8 classes that
+    // reference it bind …Fixed, so its absence there is an expected-absence)
+    "horizontalClearanceOpen",
+    // openingBridge synthesized from CATBRG 2..8 for BRIDGE->Bridge (s101_adapt.zig)
+    "openingBridge",
     // current velocity CURVEL -> speed.speedMaximum (s101_adapt.zig complex_from_simple)
     "speed",                   "speedMaximum",
     "speedMinimum",
@@ -105,8 +110,10 @@ const VALUE_REMAP = [_]AttrNote{
 // allowable list — so the "remap" concern is retired. The per-object RESTRICTED
 // allowable-list axis, if any, is still reported (a separate concern). Grow this as
 // the adapter grows transforms. (QUAPOS: no rule reads qualityOfHorizontalMeasurement
-// today, so it never surfaced at-risk; listed for when a reader appears.)
-const VALUE_REMAP_DONE = [_][]const u8{ "TECSOU", "QUASOU", "QUAPOS" };
+// today, so it never surfaced at-risk; listed for when a reader appears. CATBRG ->
+// categoryOfOpeningBridge is realized via filterPermitted [3,4,5,7] on Bridge once
+// BRIDGE routes to the Bridge class; no rule reads that attr either.)
+const VALUE_REMAP_DONE = [_][]const u8{ "TECSOU", "QUASOU", "QUAPOS", "CATBRG" };
 
 const AttrObjs = struct { acr: []const u8, objs: []const []const u8 };
 // Per-object restricted allowable-value lists (S-65 Table A-1/A-2; gaps doc §A.3).

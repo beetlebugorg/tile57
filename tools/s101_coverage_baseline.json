@@ -1,4 +1,4 @@
 {
-  "c_list": ["categoryOfCargo", "categoryOfMooringArea", "drawingInstruction", "dredgedDate", "flareBearing", "flareStack", "horizontalClearanceOpen", "majorLight", "measuredDistanceValue", "openingBridge", "updateType", "virtualAISAidToNavigationType"],
+  "c_list": ["categoryOfCargo", "categoryOfMooringArea", "drawingInstruction", "dredgedDate", "flareBearing", "flareStack", "majorLight", "measuredDistanceValue", "updateType", "virtualAISAidToNavigationType"],
   "at_risk": []
 }
