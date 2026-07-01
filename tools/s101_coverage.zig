@@ -50,6 +50,8 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
     // NATSUR list -> surfaceCharacteristics[].natureOfSurface for SeabedArea
     // (s101_adapt.zig buildSurfaceCharacteristics; off-list values dropped)
     "surfaceCharacteristics",
+    // CATMOR {1,2} -> categoryOfDolphin for MORFAC-routed Dolphin (same coding)
+    "categoryOfDolphin",
     // light sector + rhythm synthesis (s101_adapt.zig:376-431, 697-710)
     "sectorCharacteristics",   "lightSector",
     "sectorLimit",             "sectorLimitOne",

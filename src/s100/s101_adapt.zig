@@ -543,6 +543,16 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // the S-57 NATSUR list into per-value complex instances (off-list values drop).
         if (std.mem.eql(u8, code, "SeabedArea")) try buildSurfaceCharacteristics(a, &children, f);
 
+        // Dolphin reads feature.categoryOfDolphin to pick the deviation (2) vs
+        // mooring symbol. S-101 categoryOfDolphin shares CATMOR's 1=mooring /
+        // 2=deviation coding and the class only exists for CATMOR in {1,2}
+        // (resolveMooringClass), so forward the value directly — no S-57 alias
+        // maps to categoryOfDolphin, so it is synthesized here rather than sourced.
+        if (std.mem.eql(u8, code, "Dolphin")) {
+            const cm = attrTrim(f, s57.ATTR_CATMOR);
+            if (cm.len > 0) try attrs.append(a, .{ .name = "categoryOfDolphin", .value = cm });
+        }
+
         // TOPMAR folding: a co-located TOPMAR's shape/colour -> the parent's
         // S-101 `topmark` complex (read by the TOPMAR02 CSP, which picks the
         // topmark symbol from topmarkDaymarkShape). Mirrors s101/complex.go.
@@ -737,6 +747,34 @@ test "NATSUR splits into surfaceCharacteristics instances, off-list values drop"
     try std.testing.expectEqual(@as(usize, 2), root.childCount("surfaceCharacteristics"));
     try std.testing.expectEqualStrings("4", root.resolve("surfaceCharacteristics:1").?.simpleValue("natureOfSurface").?);
     try std.testing.expectEqualStrings("9", root.resolve("surfaceCharacteristics:2").?.simpleValue("natureOfSurface").?);
+}
+
+test "MORFAC CATMOR=2 routes to Dolphin carrying categoryOfDolphin=2" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const attrs = [_]s57.Attr{.{ .code = s57.ATTR_CATMOR, .value = "2" }}; // deviation dolphin
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = s57.OBJL_MORFAC, .refs = &node_ref, .attrs = &attrs },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("Dolphin", adapted[0].code);
+    try std.testing.expectEqualStrings("2", adapted[0].root.resolve("").?.simpleValue("categoryOfDolphin").?);
 }
 
 test "resolveLightClass routes by sector limits / CATLIT" {
