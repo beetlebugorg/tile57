@@ -125,6 +125,10 @@ const complex_from_simple = [_]ComplexFromSimple{
     .{ .code = s57.ATTR_VERCLR, .complex = "verticalClearanceFixed", .sub = "verticalClearanceValue" },
     .{ .code = s57.ATTR_VERCOP, .complex = "verticalClearanceOpen", .sub = "verticalClearanceValue" },
     .{ .code = s57.ATTR_HORCLR, .complex = "horizontalClearanceFixed", .sub = "horizontalClearanceValue" },
+    // Current velocity (knots) -> speed.speedMaximum: CurrentNonGravitational /
+    // TidalStreamFloodEbb read feature.speed.speedMaximum to place the "%4.1f kn"
+    // label. Same unit both sides, so a straight single-instance-complex wrap.
+    .{ .code = s57.ATTR_CURVEL, .complex = "speed", .sub = "speedMaximum" },
 };
 
 pub const Adapted = struct {
@@ -641,6 +645,37 @@ test "TOPMAR folds into co-located buoy as the topmark complex" {
     try std.testing.expectEqual(@as(usize, 1), root.childCount("topmark"));
     const tm = root.resolve("topmark:1").?;
     try std.testing.expectEqualStrings("2", tm.simpleValue("topmarkDaymarkShape").?);
+}
+
+test "CURVEL synthesizes the speed complex (speed.speedMaximum)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const cur_attrs = [_]s57.Attr{.{ .code = s57.ATTR_CURVEL, .value = "2.5" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 36, .refs = &node_ref, .attrs = &cur_attrs }, // CURENT
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("CurrentNonGravitational", adapted[0].code);
+    // feature.speed[1].speedMaximum resolves to the raw CURVEL value.
+    const root = &adapted[0].root;
+    try std.testing.expectEqual(@as(usize, 1), root.childCount("speed"));
+    try std.testing.expectEqualStrings("2.5", root.resolve("speed:1").?.simpleValue("speedMaximum").?);
 }
 
 test "resolveLightClass routes by sector limits / CATLIT" {
