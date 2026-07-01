@@ -194,6 +194,19 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         defer cell.deinit();
+        // objl 0 = histogram mode: emit every object class that appears as a POINT
+        // (prim 1) in this cell, one line each. One corpus sweep then aggregates which
+        // classes ever occur as points — cross-reference against S-101 rules with no
+        // Point branch to find latent "renders nothing" bugs (as for point DAMCON).
+        if (want_objl == 0) {
+            var hist = [_]usize{0} ** 1024;
+            for (cell.features) |f| if (f.prim == 1 and f.objl < 1024) {
+                hist[f.objl] += 1;
+            };
+            for (hist, 0..) |cnt, objl| if (cnt > 0)
+                std.debug.print("objl={d} point={d}\n", .{ objl, cnt });
+            return;
+        }
         var pc = [_]usize{0} ** 256;
         for (cell.features) |f| if (f.objl == want_objl) {
             pc[f.prim] += 1;
