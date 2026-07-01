@@ -452,6 +452,9 @@ const CMariner = extern struct {
     // end for ABI-append-safety. The pointee must outlive the tile57_build_style call.
     viewing_groups_off: [*c]const i32,
     viewing_groups_off_len: u32,
+    // scamin-layers.md: gate SCAMIN with a live client filter instead of per-value
+    // bucket layers (one *_scamin layer per render-type). Appended for ABI-append-safety.
+    scamin_filter_gate: bool,
 };
 
 // "YYYYMMDD" or "" from the fixed char[9] field.
@@ -494,6 +497,7 @@ fn marinerFromC(cm: *const CMariner) chartstyle.MarinerSettings {
         .highlight_date_dependent = cm.highlight_date_dependent,
         .date_view = dateViewSlice(&cm.date_view),
         .ignore_scamin = cm.ignore_scamin,
+        .scamin_filter_gate = cm.scamin_filter_gate,
         .size_scale = cm.size_scale,
         .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
             cm.viewing_groups_off[0..cm.viewing_groups_off_len]
@@ -666,5 +670,6 @@ export fn tile57_mariner_defaults(cm: *CMariner) callconv(.c) void {
         .size_scale = d.size_scale,
         .viewing_groups_off = null, // every viewing group shown
         .viewing_groups_off_len = 0,
+        .scamin_filter_gate = d.scamin_filter_gate,
     };
 }

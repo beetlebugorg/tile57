@@ -87,6 +87,13 @@ pub const MarinerSettings = struct {
     // feature shows in-band regardless of its 1:N min-display-scale. Default off.
     ignore_scamin: bool = false,
 
+    // -- scamin-layers.md: gate SCAMIN with a live client-driven filter instead of
+    // per-value bucket layers — NOT an S-52 display setting; a render-time transport
+    // flag the C ABI carries to the style builder. When true, styleJson emits one
+    // *_scamin layer per render-type (no minzoom buckets) and the client rewrites the
+    // SCAMIN clause on boundary crossings. Default off = per-value buckets.
+    scamin_filter_gate: bool = false,
+
     // -- physical-scale multiplier (host §4 _featureSizeScale) — NOT an S-52 setting;
     // a render-time transport flag applied to icon-size / line-width / text-size so
     // the host can match TRUE physical size from its calibrated CSS-pixel pitch.

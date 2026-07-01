@@ -862,6 +862,7 @@ pub fn buildFromTemplateScamin(
         .enabled_bands = enabled_bands,
         .now_unix = now_unix,
         .ignore_scamin = m.ignore_scamin,
+        .scamin_filter_gate = m.scamin_filter_gate,
         .size_scale = m.size_scale,
         .scamin = scamin,
         .scamin_lat = scamin_lat,

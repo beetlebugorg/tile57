@@ -292,6 +292,11 @@ typedef struct {
                          * pointee must outlive the tile57_build_style call. NULL/len 0 ->
                          * every viewing group shown. tile57_mariner_defaults sets NULL/0. */
     uint32_t viewing_groups_off_len;
+    bool scamin_filter_gate; /* scamin-layers.md: gate SCAMIN with a live client-driven
+                         * filter instead of per-value bucket layers — one *_scamin layer
+                         * per render-type (no minzoom buckets). The client rewrites the
+                         * SCAMIN clause on boundary crossings. NOT an S-52 setting.
+                         * tile57_mariner_defaults sets false (per-value buckets). */
 } tile57_mariner;
 
 /* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.
