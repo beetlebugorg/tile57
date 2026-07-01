@@ -134,6 +134,55 @@ func itoa(v int32) string {
 	return strconv.Itoa(int(v))
 }
 
+// TestStyleDiff verifies the flicker-free mariner-toggle op array through the full
+// C ABI (style-diff.md §5): no change -> "[]"; a display-category flip yields only
+// setFilter ops; a day->night scheme change yields setPaintProperty colour ops and
+// no filter change.
+func TestStyleDiff(t *testing.T) {
+	ct, err := ColortablesDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := StyleTemplate(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
+		"glyphs/{fontstack}/{range}.pbf", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := func(from, to Mariner) string {
+		ops, err := StyleDiff(tmpl, from, to, ct, nil, nil, 0)
+		if err != nil {
+			t.Fatalf("StyleDiff: %v", err)
+		}
+		var arr []map[string]any // the ops must be a valid JSON array
+		if err := json.Unmarshal(ops, &arr); err != nil {
+			t.Fatalf("diff ops not a JSON array: %v (%s)", err, ops)
+		}
+		return string(ops)
+	}
+	base := MarinerDefaults()
+
+	// No change -> empty op array.
+	if got := diff(base, base); got != "[]" {
+		t.Fatalf("diff(default,default) = %s; want []", got)
+	}
+
+	// display_other re-gates only category filters -> setFilter ops, no paint/layout.
+	other := base
+	other.DisplayOther = true
+	if got := diff(base, other); !strings.Contains(got, `"setFilter"`) ||
+		strings.Contains(got, `"setPaintProperty"`) || strings.Contains(got, `"setLayoutProperty"`) {
+		t.Fatalf("diff(default,display_other) should be setFilter-only; got %s", got)
+	}
+
+	// day -> night recolours -> setPaintProperty ops, no filter change.
+	night := base
+	night.Scheme = SchemeNight
+	if got := diff(base, night); !strings.Contains(got, `"setPaintProperty"`) ||
+		strings.Contains(got, `"setFilter"`) {
+		t.Fatalf("diff(day,night) should be setPaintProperty-only; got %s", got)
+	}
+}
+
 // TestSizeScale verifies the physical-scale multiplier wraps the size expressions
 // through the full C ABI: at the default 1.0 line-width is the verbatim coalesce
 // expression; a non-1.0 scale wraps it (and icon/text sizes) in ["*", scale, expr].

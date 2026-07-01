@@ -124,6 +124,35 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 	return tileBytes(out, outLen), nil
 }
 
+// StyleDiff returns the MapLibre mutation ops (a raw JSON array) to turn the style
+// for `from` into the style for `to`, sharing the template/colortables/bands/scamin
+// inputs of BuildStyle so the two styles are comparable. The result is "[]" when
+// nothing changed, one op per differing filter/paint/layout key, or
+// [{"op":"rebuild"}] when the host should fall back to a full setStyle. The host
+// applies each op with map.setFilter / setPaintProperty / setLayoutProperty (see
+// specs/style-diff.md); the raw JSON is returned so a server can forward it to the
+// browser untouched.
+func StyleDiff(template []byte, from, to Mariner, colortables []byte, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
+	if len(template) == 0 {
+		return nil, fmt.Errorf("tile57: empty style template: %w", ErrEmptyInput)
+	}
+	arena := &cArena{}
+	defer arena.free()
+	cFrom := from.toC(arena) // each owns its ViewingGroupsOff deny-list in the arena
+	cTo := to.toC(arena)
+	tmplPtr, tmplLen := charPtr(template)
+	ctPtr, ctLen := charPtr(colortables)
+	bandsPtr, bandsN := arena.int32Array(enabledBands)
+	scaminPtr, scaminN := arena.int32Array(scamin)
+
+	var out *C.uint8_t
+	var outLen C.size_t
+	if C.tile57_style_diff(tmplPtr, tmplLen, &cFrom, &cTo, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen) != 1 {
+		return nil, fmt.Errorf("tile57: style_diff failed")
+	}
+	return tileBytes(out, outLen), nil
+}
+
 // Style is a convenience that runs the whole pipeline — default colortables +
 // template (scheme, tiles/sprite/glyph URLs) patched by mariner + band filter — to
 // produce a complete MapLibre style JSON from libtile57's baked-in catalogue.
