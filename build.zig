@@ -537,6 +537,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chartstyle", .module = chartstyle_mod },
     });
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
+    // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
+    // rules end-to-end. It rides its own artifact because `portray` links libc + Lua +
+    // the rule registry (those settings + C sources propagate from portray_mod), unlike
+    // the libc-free pure-package tests above.
+    _ = addPkgTest(b, test_step, "src/portray/portray_golden_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+    });
     // bindings/ shared settings parser (used by the wasm engine + parity oracle).
     _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{
         .{ .name = "chartstyle", .module = chartstyle_mod },
