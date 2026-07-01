@@ -259,7 +259,25 @@ fn emitFeaturePoints(a: Allocator, syms: []const s101.Point, parts: []const []co
     for (syms) |sym| {
         if (routed_sounding and isSoundingName(sym.symbol)) continue; // moved to the soundings layer
         var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
+        // OBSTRN07/WRECKS05 pick DANGER01 (shallow) vs DANGER02 (deep) against the
+        // BAKE-TIME safety depth, but that split is a live mariner setting. Normalize
+        // the baked symbol to DANGER01 and tag danger_depth + sym_deep so the style's
+        // coalesce swaps to DANGER02 when the danger lies deeper than the LIVE safety
+        // contour (chartstyle.pointSymbolImage; port of the oracle's applyDangerDepth
+        // post-tag). Keyed to the danger classes with a usable VALSOU, like the oracle.
+        const is_danger01_02 = std.mem.eql(u8, sym.symbol, "DANGER01") or std.mem.eql(u8, sym.symbol, "DANGER02");
+        const danger_class = f.objl == 86 or f.objl == 153 or f.objl == 159; // OBSTRN / UWTROC / WRECKS
+        if (is_danger01_02 and danger_class) {
+            if (f.attrFloat(s57.ATTR_VALSOU)) |valsou| {
+                try props.append(a, .{ .key = "symbol_name", .value = .{ .string = "DANGER01" } });
+                try props.append(a, .{ .key = "danger_depth", .value = .{ .double = valsou } });
+                try props.append(a, .{ .key = "sym_deep", .value = .{ .string = "DANGER02" } });
+            } else {
+                try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
+            }
+        } else {
+            try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
+        }
         try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
         if (sym.rot_north) try props.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } });
         try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
@@ -2796,4 +2814,77 @@ test "QUASOU=5 no-bottom sounding draws the low-accuracy ring (S-65 DepthNoBotto
     try std.testing.expect(!q_ok.low_acc);
     try std.testing.expect(std.mem.startsWith(u8, try sndfrmSyms(a, "SOUNDG", 20.0, q_ok.swept, q_ok.low_acc, false), "SOUNDG"));
     try std.testing.expect(!std.mem.startsWith(u8, try sndfrmSyms(a, "SOUNDG", 20.0, q_ok.swept, q_ok.low_acc, false), "SOUNDGC2"));
+}
+
+test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for the live safety-contour swap" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
+        .edges = std.AutoHashMap(u32, usize).init(gpa),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
+        .arena = std.heap.ArenaAllocator.init(gpa),
+    };
+    defer cell.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
+
+    var areas = std.ArrayList(mvt.Feature).empty;
+    var area_patterns = std.ArrayList(mvt.Feature).empty;
+    var lines = std.ArrayList(mvt.Feature).empty;
+    var points = std.ArrayList(mvt.Feature).empty;
+    var texts = std.ArrayList(mvt.Feature).empty;
+    var areas_s = std.ArrayList(mvt.Feature).empty;
+    var apat_s = std.ArrayList(mvt.Feature).empty;
+    var lines_s = std.ArrayList(mvt.Feature).empty;
+    var points_s = std.ArrayList(mvt.Feature).empty;
+    var texts_s = std.ArrayList(mvt.Feature).empty;
+    var soundings_l = std.ArrayList(mvt.Feature).empty;
+    const L = Layers{
+        .areas = &areas,         .area_patterns = &area_patterns,        .lines = &lines,
+        .points = &points,       .texts = &texts,
+        .areas_scamin = &areas_s, .area_patterns_scamin = &apat_s,       .lines_scamin = &lines_s,
+        .points_scamin = &points_s, .texts_scamin = &texts_s,
+        .soundings = &soundings_l,
+    };
+    const tb = [4]f64{ -1, -1, 1, 1 };
+    const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
+
+    // A WRECKS point with VALSOU whose rule emitted the bake-time DANGER02 pick:
+    // normalized to DANGER01 + danger_depth/sym_deep so the client swaps live.
+    const f_wreck = s57.Feature{
+        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 159,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "15.1" }},
+    };
+    try emitFromInstr(a, cell, f_wreck, 0, null, null, "DrawingPriority:12;PointInstruction:DANGER02", null, null, 0, 0, 0, tb, box, L);
+    try std.testing.expectEqual(@as(usize, 1), points.items.len);
+    try std.testing.expectEqualStrings("DANGER01", findProp(points.items[0].properties, "symbol_name").?.string);
+    try std.testing.expectEqual(@as(f64, 15.1), findProp(points.items[0].properties, "danger_depth").?.double);
+    try std.testing.expectEqualStrings("DANGER02", findProp(points.items[0].properties, "sym_deep").?.string);
+
+    // No VALSOU -> the baked symbol passes through untagged (nothing to swap on).
+    const f_nodep = s57.Feature{
+        .rcnm = 0, .rcid = 2, .prim = 1, .objl = 159,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+    };
+    try emitFromInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, L);
+    try std.testing.expectEqual(@as(usize, 2), points.items.len);
+    try std.testing.expectEqualStrings("DANGER01", findProp(points.items[1].properties, "symbol_name").?.string);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[1].properties, "danger_depth"));
+
+    // A non-danger class (BOYLAT) never gets tagged even with VALSOU present.
+    const f_buoy = s57.Feature{
+        .rcnm = 0, .rcid = 3, .prim = 1, .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "4" }},
+    };
+    try emitFromInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, L);
+    try std.testing.expectEqual(@as(usize, 3), points.items.len);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[2].properties, "sym_deep"));
 }
