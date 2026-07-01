@@ -12,8 +12,8 @@ import (
 // scraping the message string.
 func TestSentinelErrors(t *testing.T) {
 	// ErrEmptyInput: no cells.
-	if _, err := BakeCells(nil, "", 0, 0, PickInclude, nil); !errors.Is(err, ErrEmptyInput) {
-		t.Errorf("BakeCells(nil): want ErrEmptyInput, got %v", err)
+	if _, err := BakePmtiles(nil, BakeOpts{}, nil); !errors.Is(err, ErrEmptyInput) {
+		t.Errorf("BakePmtiles(nil): want ErrEmptyInput, got %v", err)
 	}
 	if _, err := OpenChartBytes(nil); !errors.Is(err, ErrEmptyInput) {
 		t.Errorf("OpenChartBytes(nil): want ErrEmptyInput, got %v", err)

@@ -12,7 +12,7 @@ import (
 	"unsafe"
 )
 
-// BakeProgress is one progress report from [BakeCells] / [BakeBundle].
+// BakeProgress is one progress report from [BakePmtiles] / [BakeBundle].
 type BakeProgress struct {
 	Stage uint8 // 0 = loading/portraying cells, 1 = baking tiles
 	Done  int   // cells loaded (stage 0) or tiles baked in this band (stage 1)
@@ -27,7 +27,7 @@ type BakeProgress struct {
 }
 
 // tile57GoBakeProgress is the C-callable progress callback libtile57 invokes
-// during tile57_bake_cells / tile57_bake_bundle. The host's Go progress func is
+// during tile57_bake_pmtiles / tile57_bake_bundle. The host's Go progress func is
 // carried across the seam as a cgo.Handle, pointed to by `user`. NULL user = no
 // progress wanted.
 //

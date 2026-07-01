@@ -30,19 +30,6 @@ import (
 	"unsafe"
 )
 
-// PickAttrs selects whether baked/opened tiles carry the per-feature pick-report
-// properties (class / cell / s57) used for a cursor-pick report. The zero value
-// includes them — the common path — so PickInclude can be left unspoken.
-type PickAttrs int
-
-const (
-	// PickInclude (zero value) keeps the per-feature pick-report attrs — what a host
-	// serving a live, clickable chart wants.
-	PickInclude PickAttrs = iota
-	// PickOmit drops them for a leaner bake (smaller tiles, no cursor-pick report).
-	PickOmit
-)
-
 // Version returns the libtile57 version string (e.g. "0.1.0").
 func Version() string { return C.GoString(C.tile57_version()) }
 
@@ -70,9 +57,9 @@ type Source struct {
 	scaminDone bool
 }
 
-// CellInput is one ENC cell for [BakeCells]: the base .000 bytes
+// Cell is one ENC cell for [BakePmtiles]: the base .000 bytes
 // plus its sequential update files (.001, .002, … in order).
-type CellInput struct {
+type Cell struct {
 	Base    []byte
 	Updates [][]byte
 	// Name is the source cell name (e.g. "US4MD81M"), emitted as the `cell`

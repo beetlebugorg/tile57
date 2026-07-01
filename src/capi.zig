@@ -37,7 +37,7 @@ export fn tile57_version() callconv(.c) [*:0]const u8 {
     return version_string;
 }
 
-// One ENC cell's bytes for the C ABI. Mirrors tile57_cell_input in tile57.h.
+// One ENC cell's bytes for the C ABI. Mirrors tile57_cell in tile57.h.
 const CellInput = extern struct {
     base: [*]const u8,
     base_len: usize,
@@ -135,27 +135,50 @@ export fn tile57_chart_get_info(src: ?*Source, out: *CChartInfo) callconv(.c) vo
     }
 }
 
-// Progress callback for tile57_bake_cells / tile57_bake_bundle (matches the header
+// Progress callback for tile57_bake_pmtiles / tile57_bake_bundle (matches the header
 // typedef + source.Progress + bake_enc.Progress).
 const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
 
-/// Bake an ENC_ROOT into ONE PMTiles archive. See tile57.h. 1=ok, 0=empty, -1=error.
-export fn tile57_bake_cells(
-    cells_ptr: [*]const CellInput,
-    count: usize,
+// Shared bake options. Mirrors tile57_bake_opts in tile57.h. catalog_dir/created
+// are read only by tile57_bake_bundle.
+const CBakeOpts = extern struct {
     rules_dir: ?[*:0]const u8,
+    catalog_dir: ?[*:0]const u8,
+    created: ?[*:0]const u8,
     minzoom: u8,
     maxzoom: u8,
-    omit_pick_attrs: c_int,
+    omit_pick_attrs: bool,
     progress: BakeProgress,
-    user: ?*anyopaque,
+    progress_user: ?*anyopaque,
+};
+
+// The passed opts or all-defaults (matching NULL opts = every field at its default).
+fn bakeOptsOr(opts: ?*const CBakeOpts) CBakeOpts {
+    return if (opts) |p| p.* else .{
+        .rules_dir = null,
+        .catalog_dir = null,
+        .created = null,
+        .minzoom = 0,
+        .maxzoom = 0,
+        .omit_pick_attrs = false,
+        .progress = null,
+        .progress_user = null,
+    };
+}
+
+/// Bake an ENC_ROOT into ONE PMTiles archive. See tile57.h. 1=ok, 0=empty, -1=error.
+export fn tile57_bake_pmtiles(
+    cells_ptr: [*]const CellInput,
+    count: usize,
+    opts: ?*const CBakeOpts,
     out: *[*]u8,
     out_len: *usize,
 ) callconv(.c) c_int {
+    const o = bakeOptsOr(opts);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return -1;
-    const archive = source.bakeArchive(cells, spanOpt(rules_dir), minzoom, maxzoom, omit_pick_attrs == 0, progress, user) catch return -1;
+    const archive = source.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, !o.omit_pick_attrs, o.progress, o.progress_user) catch return -1;
     if (archive) |a| {
         out.* = a.ptr;
         out_len.* = a.len;
@@ -179,17 +202,11 @@ const generator = "tile57 " ++ version_string;
 export fn tile57_bake_bundle(
     input: [*:0]const u8,
     out_dir: [*:0]const u8,
-    rules_dir: ?[*:0]const u8,
-    catalog_dir: ?[*:0]const u8,
-    created: ?[*:0]const u8,
-    minzoom: u8,
-    maxzoom: u8,
-    omit_pick_attrs: c_int,
-    progress: BakeProgress,
-    user: ?*anyopaque,
+    opts: ?*const CBakeOpts,
     out_cell_count: ?*u32,
     out_bbox: ?*[4]f64,
 ) callconv(.c) c_int {
+    const o = bakeOptsOr(opts);
     // The bundle pipeline does filesystem I/O (read ENC, write the bundle dir); the
     // lib has no std.process.Init, so stand up a threaded std.Io for the call.
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -202,15 +219,15 @@ export fn tile57_bake_bundle(
     const res = bundle.bakeBundle(io, arena.allocator(), .{
         .input = std.mem.span(input),
         .out_dir = std.mem.span(out_dir),
-        .rules_dir = spanOpt(rules_dir) orelse "",
-        .catalog_dir = spanOpt(catalog_dir) orelse "",
+        .rules_dir = spanOpt(o.rules_dir) orelse "",
+        .catalog_dir = spanOpt(o.catalog_dir) orelse "",
         .generator = generator,
-        .created = spanOpt(created) orelse "",
-        .minzoom = minzoom,
-        .maxzoom = maxzoom,
-        .pick_attrs = omit_pick_attrs == 0,
-        .progress = progress,
-        .progress_user = user,
+        .created = spanOpt(o.created) orelse "",
+        .minzoom = o.minzoom,
+        .maxzoom = o.maxzoom,
+        .pick_attrs = !o.omit_pick_attrs,
+        .progress = o.progress,
+        .progress_user = o.progress_user,
     }) catch |err| return if (err == error.NoGeometry) 0 else -1;
     if (out_cell_count) |p| p.* = @intCast(res.cell_count);
     if (out_bbox) |p| p.* = res.bounds;

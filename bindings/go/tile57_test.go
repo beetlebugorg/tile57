@@ -30,7 +30,7 @@ func TestColortablesDefault(t *testing.T) {
 
 // A resident chart (OpenChartBytes) portrays live, so its generated tiles carry the
 // S-52 §10.8 pick-report attributes (class / cell / s57) on every feature by default.
-// The per-cell Name badge and the PickOmit opt-out were parameters of the dropped
+// The per-cell Name badge and the pick-attrs opt-out were parameters of the dropped
 // multi-cell open (chart-api.md); the surviving live-open surface always includes the
 // pick report.
 func TestPickAttrs(t *testing.T) {
@@ -158,9 +158,9 @@ func TestOpenPMTilesAndInfo(t *testing.T) {
 	rc.Close()
 
 	// Bake to a PMTiles file, then open it by path.
-	pm, err := BakeCells([]CellInput{{Base: data}}, "", 0, 24, PickInclude, nil)
+	pm, err := BakePmtiles([]Cell{{Base: data}}, BakeOpts{MaxZoom: 24}, nil)
 	if err != nil {
-		t.Fatalf("BakeCells: %v", err)
+		t.Fatalf("BakePmtiles: %v", err)
 	}
 	tmp := t.TempDir() + "/chart.pmtiles"
 	if err := os.WriteFile(tmp, pm, 0o644); err != nil {

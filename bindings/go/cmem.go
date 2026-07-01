@@ -46,10 +46,10 @@ func (a *cArena) str(s string) *C.char {
 	return (*C.char)(a.track(unsafe.Pointer(C.CString(s))))
 }
 
-// cPick maps the Go PickAttrs enum to the C omit_pick_attrs int: 0 = include the
-// per-feature pick attrs (PickInclude, the default), 1 = omit them (PickOmit).
-func cPick(p PickAttrs) C.int {
-	if p == PickOmit {
+// cOmit maps the Go BakeOpts.OmitPickAttrs bool to the C omit_pick_attrs int: 0 =
+// include the per-feature pick attrs (the default), 1 = omit them.
+func cOmit(omit bool) C.int {
+	if omit {
 		return 1
 	}
 	return 0
@@ -71,11 +71,11 @@ func (a *cArena) int32Array(v []int32) (*C.int32_t, C.size_t) {
 	return p, C.size_t(n)
 }
 
-// cellInputs builds a C tile57_cell_input array from cells. Returns the typed Go
-// view (for length bookkeeping) and the base pointer to hand to C.
-func (a *cArena) cellInputs(cells []CellInput) ([]C.tile57_cell_input, *C.tile57_cell_input) {
+// cellInputs builds a C tile57_cell array from cells. Returns the typed Go view
+// (for length bookkeeping) and the base pointer to hand to C.
+func (a *cArena) cellInputs(cells []Cell) ([]C.tile57_cell, *C.tile57_cell) {
 	n := len(cells)
-	base := (*C.tile57_cell_input)(a.track(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.tile57_cell_input{})))))
+	base := (*C.tile57_cell)(a.track(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.tile57_cell{})))))
 	inputs := unsafe.Slice(base, n)
 	for i, c := range cells {
 		in := &inputs[i]

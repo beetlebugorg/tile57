@@ -51,7 +51,7 @@ func TestBakeBundle(t *testing.T) {
 			stage1Named = true
 		}
 	}
-	n, bbox, err := BakeBundle(testCell, out, "", "", "", 0, 16, PickInclude, progress)
+	n, bbox, err := BakeBundle(testCell, out, BakeOpts{MaxZoom: 16}, progress)
 	if err != nil {
 		t.Fatal(err)
 	}

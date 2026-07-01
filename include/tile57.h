@@ -43,7 +43,7 @@ const char *tile57_version(void);
 /* Opaque chart handle. */
 typedef struct tile57_chart tile57_chart;
 
-/* One ENC cell for tile57_bake_cells: the base .000 bytes plus its
+/* One ENC cell for tile57_bake_pmtiles: the base .000 bytes plus its
  * sequential update files (.001, .002, … in order). `updates`/`update_lens` are
  * parallel arrays of length `update_count`; pass update_count = 0 (and NULL
  * arrays) for a base-only cell. All bytes are copied.
@@ -60,13 +60,13 @@ typedef struct {
     const size_t *update_lens;
     size_t update_count;
     const char *name;
-} tile57_cell_input;
+} tile57_cell;
 
 /* ---- pick-report attributes ---------------------------------------------
  *
  * Every emitted MVT feature carries the per-feature cursor-pick / inspector
  * properties used by the S-52 §10.8 pick report: `class` (object-class acronym),
- * `cell` (source cell name, from tile57_cell_input.name / the bundle's file stem),
+ * `cell` (source cell name, from tile57_cell.name / the bundle's file stem),
  * and `s57` (a JSON object string of the feature's full S-57 attribute set,
  * acronym -> value). These default ON. The `s57` blob is the bulk of a feature's
  * size, so a lean deployment that doesn't need pick/inspect can drop ALL three by
@@ -98,13 +98,13 @@ typedef struct {
 } tile57_chart_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_chart_info *out);
 
-/* Progress callback for tile57_bake_cells / tile57_bake_bundle. stage 0 =
+/* Progress callback for tile57_bake_pmtiles / tile57_bake_bundle. stage 0 =
  * loading/portraying cells, stage 1 = baking tiles. Stage 0 done/total count cells.
  * Stage 1 done/total count tiles: for tile57_bake_bundle they are PER BAND (reset
  * each band) with total = that band's planned tile count, so a host can draw a
  * per-band percentage (the count is a planned estimate from cell bboxes — the actual
  * emitted total is a little lower as empty tiles are skipped, like the Go baker's
- * planned bar). total 0 means "unknown" (the tile57_bake_cells path with no planned
+ * planned bar). total 0 means "unknown" (the tile57_bake_pmtiles path with no planned
  * count).
  *
  * band_index / band_count locate the current band among the bands that actually
@@ -118,18 +118,32 @@ typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, siz
                                      uint8_t band_index, uint8_t band_count,
                                      const char *band_name);
 
+/* Shared bake options for tile57_bake_pmtiles / tile57_bake_bundle. Pass NULL for
+ * all defaults (embedded rules/catalogue, no band clamp, pick attrs included, no
+ * progress). `catalog_dir` and `created` apply to tile57_bake_bundle only —
+ * tile57_bake_pmtiles ignores them. */
+typedef struct {
+    const char *rules_dir;      /* NULL = embedded portrayal rules */
+    const char *catalog_dir;    /* NULL = embedded S-101 catalogue (bundle only) */
+    const char *created;        /* NULL = manifest "created" unset (bundle only) */
+    uint8_t minzoom, maxzoom;   /* 0/0 = no band clamp */
+    bool omit_pick_attrs;
+    tile57_bake_progress progress;
+    void *progress_user;        /* NULL = default/none */
+} tile57_bake_opts;
+
 /* Bake an ENC_ROOT's in-memory cells into ONE PMTiles archive, zoom-banded per cell
  * by compilation scale, so the result opens cheaply (tile57_chart_open_pmtiles)
- * instead of holding every cell live. minzoom/maxzoom clamp the per-cell bands (pass
- * 0/24 for no clamp). `progress` may be NULL. On success returns 1 with the archive
- * in *out and *out_len (free with tile57_free); 0 if nothing covered; -1 on error.
- * Like the live open, this parses + portrays every cell, so peak memory tracks the
- * ENC_ROOT size; run it once and cache the archive. */
-int tile57_bake_cells(
-    const tile57_cell_input *cells, size_t count, const char *rules_dir,
-    uint8_t minzoom, uint8_t maxzoom, int omit_pick_attrs,
-    tile57_bake_progress progress, void *user,
-    uint8_t **out, size_t *out_len);
+ * instead of holding every cell live. `opts` may be NULL for all defaults; it reads
+ * rules_dir / minzoom / maxzoom / omit_pick_attrs / progress / progress_user (the
+ * catalog_dir and created fields are ignored — they apply to tile57_bake_bundle).
+ * minzoom/maxzoom of 0/0 leave the per-cell bands unclamped. On success returns 1
+ * with the archive in *out and *out_len (free with tile57_free); 0 if nothing
+ * covered; -1 on error. Like the live open, this parses + portrays every cell, so
+ * peak memory tracks the ENC_ROOT size; run it once and cache the archive. */
+int tile57_bake_pmtiles(const tile57_cell *cells, size_t count,
+                        const tile57_bake_opts *opts,
+                        uint8_t **out, size_t *out_len);
 
 /* Bake a single cell.000 OR a whole ENC_ROOT directory (`input`, an on-disk path)
  * into a self-contained chart bundle written under `out_dir` — the SAME package the
@@ -138,20 +152,18 @@ int tile57_bake_cells(
  *   out_dir/assets/colortables.json, linestyles.json, sprite-mln{,@2x}.{json,png}
  *   out_dir/assets/style-{day,dusk,night}.json   (per-scheme, SCAMIN-bucketed)
  *   out_dir/manifest.json         (schema_version, bbox, cells, styles)
- * The host registers chart.pmtiles and serves style-*.json verbatim. `rules_dir`
- * and `catalog_dir` NULL or "" use the catalogue embedded in the library (no
- * on-disk catalogue needed); a non-empty path overrides from disk. `created` NULL or
- * "" leaves the manifest "created" unset, else stamps it (e.g. an ISO8601 string).
- * minzoom/maxzoom clamp the per-cell bands (pass 0/24 for no clamp). `progress` may
- * be NULL (a built-in console progress is used). `out_cell_count` and `out_bbox`
- * (filled west,south,east,north) are optional — pass NULL to skip. Returns 1 on
- * success, 0 if nothing was covered (no geometry), -1 on error. */
-int tile57_bake_bundle(
-    const char *input, const char *out_dir,
-    const char *rules_dir, const char *catalog_dir, const char *created,
-    uint8_t minzoom, uint8_t maxzoom, int omit_pick_attrs,
-    tile57_bake_progress progress, void *user,
-    uint32_t *out_cell_count, double *out_bbox);
+ * The host registers chart.pmtiles and serves style-*.json verbatim. `opts` may be
+ * NULL for all defaults, else it reads every field: rules_dir/catalog_dir NULL or ""
+ * use the catalogue embedded in the library (no on-disk catalogue needed), a
+ * non-empty path overrides from disk; created NULL/"" leaves the manifest "created"
+ * unset, else stamps it (e.g. an ISO8601 string); minzoom/maxzoom of 0/0 leave the
+ * per-cell bands unclamped; progress NULL uses a built-in console progress.
+ * `out_cell_count` and `out_bbox` (filled west,south,east,north) are optional — pass
+ * NULL to skip. Returns 1 on success, 0 if nothing was covered (no geometry), -1 on
+ * error. */
+int tile57_bake_bundle(const char *input, const char *out_dir,
+                       const tile57_bake_opts *opts,
+                       uint32_t *out_cell_count, double *out_bbox);
 
 /* Release a chart and all cached tiles. Must not be called while any renderer
  * may still call tile57_chart_tile on it (see lifetime note above). */
