@@ -143,6 +143,18 @@ pub const StyleOpts = struct {
     // catalogue sizes verbatim (byte-identical output); other values wrap each size
     // expression in ["*", size_scale, expr].
     size_scale: f64 = 1.0,
+    // scamin-layers.md: gate SCAMIN with a live client-updated filter literal instead
+    // of per-value bucket layers. When true, each *_scamin source-layer emits ONE layer
+    // (no #sm buckets, no minzoom) carrying the clause
+    //   [">=", ["coalesce", ["get","scamin"], 1e12], scamin_cur_denom]
+    // — "show a feature when the current display scale is at least as fine as its SCAMIN".
+    // The live client recomputes the literal and setFilter's it only at the ~19 discrete
+    // SCAMIN boundary crossings (fractional-exact, ~1 layer/type instead of ~19). Overrides
+    // the manifest bucket path (scamin/scamin_lat unused). Default off = per-value buckets.
+    scamin_filter_gate: bool = false,
+    // The SCAMIN denominator baked into the filter-gate clause. The live client overwrites
+    // it via setFilter; this is only the standalone default (0 = show all, client-owned).
+    scamin_cur_denom: f64 = 0,
 };
 
 // Precomputed, mariner-aware style expressions shared by every layer of one
@@ -212,13 +224,34 @@ const Bucket = struct {
     sm: ?u32 = null, // per-value bucket: filter scamin == sm
     no_lows: ?[]const u32 = null, // #no bucket: !has(scamin) OR scamin in these folded low values
     zoom_gate: bool = false, // no-manifest fallback: AND the per-feature SCAMIN_GATE zoom filter
+    filter_gate: bool = false, // scamin-layers.md: the live client-driven SCAMIN clause (no minzoom, no suffix)
+    cur_denom: f64 = 0, // filter_gate: the current-display-scale denominator literal (client-overwritten)
     minzoom: ?f64 = null,
     suffix: []const u8 = "", // id suffix: "#sm<v>" / "#no" / "" (plain)
 };
 
+// coalesce fallback for a feature with no `scamin`: a denominator larger than any real
+// display scale, so `scamin >= curDenom` is always true (missing SCAMIN => always shown).
+const SCAMIN_COALESCE_MAX = 1000000000000; // 1e12
+
 // The scamin filter clause for a bucket: `["==",["get","scamin"],v]` (per-value) or
 // `["any", ["!",["has","scamin"]], ["in",["get","scamin"],["literal",[lows…]]]]` (#no).
 fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
+    if (bkt.filter_gate) {
+        // scamin-layers.md: [">=", ["coalesce", ["get","scamin"], 1e12], curDenom].
+        // The live client rewrites curDenom via setFilter at the discrete SCAMIN boundary
+        // crossings; the emitted literal is the standalone default (0 => show all).
+        try js.beginArray();
+        try js.write(">=");
+        try js.beginArray();
+        try js.write("coalesce");
+        try js.write(.{ "get", "scamin" });
+        try js.write(SCAMIN_COALESCE_MAX);
+        try js.endArray();
+        try js.write(bkt.cur_denom);
+        try js.endArray();
+        return;
+    }
     if (bkt.zoom_gate) {
         try js.write(SCAMIN_GATE);
         return;
@@ -254,7 +287,7 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
 // "all" wrapper) so a template layer is byte-identical to the pre-mariner output.
 // `has_base=false` for layers with no base predicate (fills/patterns/complex/soundings).
 fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, common: []const std.json.Value, extra: ?std.json.Value) !void {
-    const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate;
+    const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate or bkt.filter_gate;
     var n: usize = common.len;
     if (has_base) n += 1;
     if (has_clause) n += 1;
@@ -597,7 +630,9 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     const floor: f64 = @floatFromInt(opts.minzoom);
     var lows = std.ArrayList(u32).empty;
     var his = std.ArrayList(Bucket).empty;
-    if (!opts.ignore_scamin) for (opts.scamin) |v| {
+    // The per-value bucket split is only needed for the manifest bucket path; skip it
+    // for ignore_scamin (single plain bucket) and filter_gate (single live-clause layer).
+    if (!opts.ignore_scamin and !opts.scamin_filter_gate) for (opts.scamin) |v| {
         const mz = scaminDisplayZoom(@floatFromInt(v), opts.scamin_lat);
         if (mz <= floor + 1e-6) {
             try lows.append(ba, v);
@@ -614,6 +649,12 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         // overrides both the per-value buckets and the no-manifest zoom-gate fallback).
         try allb.append(ba, .{});
         try sndb.append(ba, .{});
+    } else if (opts.scamin_filter_gate) {
+        // scamin-layers.md: ONE layer per *_scamin render-type carrying the live
+        // client-driven SCAMIN clause — no per-value buckets, no minzoom. Collapses
+        // ~19×types bucket layers to ~1×type.
+        try allb.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
+        try sndb.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
     } else if (opts.scamin.len == 0) {
         // No manifest -> the per-feature zoom-filter fallback (still gates by value,
         // integer-zoom snap) on every SCAMIN-bearing layer, incl. soundings.
@@ -1328,4 +1369,83 @@ test "styleDiff: day vs night emits setPaintProperty colour ops, no filter chang
     defer a.free(ops);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setPaintProperty") != null);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setFilter") == null);
+}
+
+// ---- scamin_filter_gate tests (scamin-layers.md) ---------------------------
+
+fn layerCount(a: std.mem.Allocator, style: []const u8) !usize {
+    var p = try std.json.parseFromSlice(std.json.Value, a, style, .{});
+    defer p.deinit();
+    return p.value.object.get("layers").?.array.items.len;
+}
+
+test "styleJson: scamin_filter_gate collapses per-value buckets to one layer per render-type" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const sm = [_]u32{ 3000, 8000, 12000, 22000, 45000, 90000, 180000 }; // 7 denominators
+    const base = StyleOpts{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+    };
+
+    // Bucketed (default): per-value #sm layers, each with a native minzoom.
+    const bucketed = try styleJson(a, base);
+    defer a.free(bucketed);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "minzoom") != null);
+
+    // Filter-gate: no #sm buckets, no minzoom, the live SCAMIN clause instead.
+    var fg = base;
+    fg.scamin_filter_gate = true;
+    const gated = try styleJson(a, fg);
+    defer a.free(gated);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "#sm") == null); // no per-value buckets
+    try std.testing.expect(std.mem.indexOf(u8, gated, "minzoom") == null); // no native minzoom gating
+    // The live clause [">=",["coalesce",["get","scamin"],1e12],curDenom]. 1e12 (the coalesce
+    // max) is unique to it; plain "coalesce" also appears in line-width so it isn't a marker.
+    try std.testing.expect(std.mem.indexOf(u8, gated, "1000000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "\"scamin\"") != null);
+
+    // 7 denominators × ~9 SCAMIN render-types => buckets add ~7× the *_scamin layers;
+    // filter-gate adds 1×. So the bucketed style has far more layers.
+    const bn = try layerCount(a, bucketed);
+    const gn = try layerCount(a, gated);
+    try std.testing.expect(gn < bn);
+    try std.testing.expect(bn > gn * 2);
+}
+
+test "styleJson: scamin_filter_gate honors the cur_denom literal + ignore_scamin drops the clause" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const sm = [_]u32{ 45000, 90000 };
+    const base = StyleOpts{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+        .scamin_filter_gate = true,
+        .scamin_cur_denom = 50000,
+    };
+    const gated = try styleJson(a, base);
+    defer a.free(gated);
+    // The baked default denominator appears in the clause.
+    try std.testing.expect(std.mem.indexOf(u8, gated, "50000") != null);
+
+    // ignore_scamin overrides filter_gate: single plain layer, no SCAMIN clause at all.
+    var ign = base;
+    ign.ignore_scamin = true;
+    const out_ign = try styleJson(a, ign);
+    defer a.free(out_ign);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "1000000000000") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "#sm") == null);
 }
