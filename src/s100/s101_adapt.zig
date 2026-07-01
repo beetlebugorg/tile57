@@ -649,12 +649,28 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // route + bridge rules (NavigationLine, RecommendedTrack, SpanOpening) can
         // index feature.<complex>.<value> instead of erroring on a nil complex.
         for (complex_from_simple) |m| {
+            // Gate binds horizontalClearanceOpen, not …Fixed (handled just below), so
+            // don't wrap its HORCLR into the class-invalid Fixed complex.
+            if (m.code == s57.ATTR_HORCLR and std.mem.eql(u8, code, "Gate")) continue;
             const raw = f.attr(m.code) orelse continue;
             const v = std.mem.trim(u8, raw, " ");
             if (v.len == 0) continue;
             const subs = try a.alloc(NameVal, 1);
             subs[0] = .{ .name = m.sub, .value = v };
             try appendChild(a, &children, m.complex, .{ .simple = subs });
+        }
+        // Gate's HORCLR is a movable gate's clearance-when-open: its S-101 FeatureCatalogue
+        // binding permits horizontalClearanceOpen only (Canal/DockArea/Span… bind …Fixed,
+        // covered above). S-57 has a single HORCLR — no fixed/open split — so this is a
+        // class-keyed route, not a value split. Without it the framework drops the
+        // class-invalid Fixed complex and the "H.clr op" label never draws.
+        if (std.mem.eql(u8, code, "Gate")) {
+            const hc = attrTrim(f, s57.ATTR_HORCLR);
+            if (hc.len > 0) {
+                const subs = try a.alloc(NameVal, 1);
+                subs[0] = .{ .name = "horizontalClearanceValue", .value = hc };
+                try appendChild(a, &children, "horizontalClearanceOpen", .{ .simple = subs });
+            }
         }
         // SpanOpening (opening bridges) indexes feature.verticalClearanceClosed
         // unconditionally (a draft-rule bug), so guarantee the complex exists —
@@ -1012,6 +1028,39 @@ test "CTRPNT routes to Landmark with categoryOfLandmark synthesized from CATCTR 
     try std.testing.expectEqualStrings("22", adapted[0].root.resolve("").?.simpleValue("categoryOfLandmark").?);
     // CATCTR=3 -> no categoryOfLandmark (generic landmark default in the rule).
     try std.testing.expectEqual(@as(?[]const u8, null), adapted[1].root.resolve("").?.simpleValue("categoryOfLandmark"));
+}
+
+test "Gate routes HORCLR to horizontalClearanceOpen, not horizontalClearanceFixed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const attrs = [_]s57.Attr{.{ .code = s57.ATTR_HORCLR, .value = "12.5" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 61, .refs = &node_ref, .attrs = &attrs }, // GATCON -> Gate
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("Gate", adapted[0].code);
+    const root = &adapted[0].root;
+    // HORCLR -> horizontalClearanceOpen[1].horizontalClearanceValue (the bound attr)…
+    try std.testing.expectEqual(@as(usize, 1), root.childCount("horizontalClearanceOpen"));
+    try std.testing.expectEqualStrings("12.5", root.resolve("horizontalClearanceOpen:1").?.simpleValue("horizontalClearanceValue").?);
+    // …and NOT the class-invalid horizontalClearanceFixed.
+    try std.testing.expectEqual(@as(usize, 0), root.childCount("horizontalClearanceFixed"));
 }
 
 test "s65RemapValue: TECSOU/QUASOU S-65 value conversion" {
