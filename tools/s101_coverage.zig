@@ -54,6 +54,9 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
     "categoryOfDolphin",
     // VALLMA -> valueOfLocalMagneticAnomaly.magneticAnomalyValue (LocalMagneticAnomaly)
     "valueOfLocalMagneticAnomaly", "magneticAnomalyValue",
+    // inTheWater: producer spatial derivation (point over DEPARE and not over LNDARE),
+    // no S-57 source (s101_adapt.zig readsInTheWater); true-only, else absent
+    "inTheWater",
     // light sector + rhythm synthesis (s101_adapt.zig:376-431, 697-710)
     "sectorCharacteristics",   "lightSector",
     "sectorLimit",             "sectorLimitOne",

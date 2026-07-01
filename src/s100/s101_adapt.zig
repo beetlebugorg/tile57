@@ -182,14 +182,24 @@ const DepthIndex = struct {
         }
         return if (found) best else null;
     }
+
+    /// Whether (lon,lat) lies inside ANY indexed area (depth value irrelevant).
+    /// Used for the inTheWater land/water test over the LNDARE and DEPARE indices.
+    fn containsPoint(self: DepthIndex, lon: f64, lat: f64) bool {
+        for (self.areas) |area| {
+            if (lon < area.min_lon or lon > area.max_lon or lat < area.min_lat or lat > area.max_lat) continue;
+            if (s57.pointInRingsEvenOdd(lon, lat, area.rings)) return true;
+        }
+        return false;
+    }
 };
 
-/// Index the cell's DEPARE/DRGARE polygons (rings + DRVAL1 + bbox) for the
-/// shoalest-depth lookup. Allocates into `a`.
-fn buildDepthIndex(a: std.mem.Allocator, cell: *const s57.Cell) ![]DepthArea {
+/// Index the cell's polygons of the given S-57 object classes (rings + DRVAL1 +
+/// bbox), for the shoalest-depth and point-in-area lookups. Allocates into `a`.
+fn buildAreaIndex(a: std.mem.Allocator, cell: *const s57.Cell, objls: []const u16) ![]DepthArea {
     var areas = std.ArrayList(DepthArea).empty;
     for (cell.features) |f| {
-        if (f.objl != 42 and f.objl != 46) continue; // DEPARE / DRGARE
+        if (std.mem.indexOfScalar(u16, objls, f.objl) == null) continue;
         const rings = try cell.lineGeometryParts(a, f);
         if (rings.len == 0 or rings[0].len == 0) continue;
         var da = DepthArea{
@@ -267,6 +277,21 @@ fn isDangerCode(code: []const u8) bool {
     return std.mem.eql(u8, code, "Obstruction") or
         std.mem.eql(u8, code, "Wreck") or
         std.mem.eql(u8, code, "UnderwaterAwashRock");
+}
+
+// S-101 structure classes whose rule branches on feature.inTheWater (a producer-
+// computed boolean with no S-57 source): a structure in the water is a navigational
+// hazard (viewingGroup 12200 + AlertReference:NavHazard) rather than a land feature.
+const IN_THE_WATER_CLASSES = [_][]const u8{
+    "Building",  "BuiltUpArea", "Crane",    "FortifiedStructure",
+    "Landmark",  "SiloTank",    "SlopeTopline", "WindTurbine",
+};
+fn readsInTheWater(code: []const u8) bool {
+    return listHasStr(&IN_THE_WATER_CLASSES, code);
+}
+fn listHasStr(list: []const []const u8, want: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, want)) return true;
+    return false;
 }
 
 fn fmtFloat(a: std.mem.Allocator, v: f64) ![]const u8 {
@@ -510,7 +535,10 @@ fn buildRhythmOfLight(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry)
 /// Adapt all mappable features of a cell. Allocates into `a` (use an arena).
 pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
     var out = std.ArrayList(Adapted).empty;
-    const depth_index = DepthIndex{ .areas = try buildDepthIndex(a, cell) };
+    const depth_index = DepthIndex{ .areas = try buildAreaIndex(a, cell, &.{ 42, 46 }) }; // DEPARE / DRGARE = water
+    // Land areas, for the inTheWater test: a structure is "in the water" when its
+    // representative point is over a depth area AND over no LNDARE (S-65 §4.8.15).
+    const land_index = DepthIndex{ .areas = try buildAreaIndex(a, cell, &.{s57.OBJL_LNDARE}) };
     // TOPMAR features (built from the FULL feature set) fold into co-located
     // buoys/beacons below; the standalone features are then skipped.
     var topmark_index = try buildTopmarkIndex(a, cell);
@@ -616,6 +644,19 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
                 const subs = try a.alloc(NameVal, 1);
                 subs[0] = .{ .name = "magneticAnomalyValue", .value = vlma };
                 try appendChild(a, &children, "valueOfLocalMagneticAnomaly", .{ .simple = subs });
+            }
+        }
+
+        // inTheWater (S-65 §4.8.15): a structure over a depth area and over no land
+        // area is a navigational hazard, not a land feature. No S-57 source exists —
+        // it's a producer spatial computation — so derive it from the water/land
+        // indices. Emit true only when confidently in the water; otherwise leave the
+        // attribute absent (the rule's land-plane default). Never emit false: a false
+        // value would still be a positive assertion the ENC did not make.
+        if (readsInTheWater(code)) {
+            if (representativePoint(a, cell, f)) |pt| {
+                if (depth_index.containsPoint(pt.lon(), pt.lat()) and !land_index.containsPoint(pt.lon(), pt.lat()))
+                    try attrs.append(a, .{ .name = "inTheWater", .value = "true" });
             }
         }
 
@@ -1021,4 +1062,31 @@ test "DepthIndex shoalest DRVAL1 lookup" {
     };
     const idx2 = DepthIndex{ .areas = &no_drval };
     try t.expect(idx2.shoalestDrval1(5, 5) == null);
+}
+
+test "inTheWater predicate: containsPoint over water and land indices" {
+    const t = std.testing;
+    // Water = a 10x10 box; land = a 2..8 island nested inside it (overlapping ENC).
+    var water_ring = [_]s57.LonLat{
+        s57.LonLat.init(0, 0),  s57.LonLat.init(10, 0),
+        s57.LonLat.init(10, 10), s57.LonLat.init(0, 10),
+    };
+    var land_ring = [_]s57.LonLat{
+        s57.LonLat.init(2, 2), s57.LonLat.init(8, 2),
+        s57.LonLat.init(8, 8), s57.LonLat.init(2, 8),
+    };
+    var wparts = [_][]s57.LonLat{water_ring[0..]};
+    var lparts = [_][]s57.LonLat{land_ring[0..]};
+    const water = DepthIndex{ .areas = &[_]DepthArea{
+        .{ .drval1 = 0, .has_drval1 = false, .rings = wparts[0..], .min_lon = 0, .min_lat = 0, .max_lon = 10, .max_lat = 10 },
+    } };
+    const land = DepthIndex{ .areas = &[_]DepthArea{
+        .{ .drval1 = 0, .has_drval1 = false, .rings = lparts[0..], .min_lon = 2, .min_lat = 2, .max_lon = 8, .max_lat = 8 },
+    } };
+    // (1,1): in water, not on land -> in the water.
+    try t.expect(water.containsPoint(1, 1) and !land.containsPoint(1, 1));
+    // (5,5): in water AND on the nested island -> NOT in the water.
+    try t.expect(!(water.containsPoint(5, 5) and !land.containsPoint(5, 5)));
+    // (20,20): no water coverage -> not in the water (attribute stays absent).
+    try t.expect(!water.containsPoint(20, 20));
 }
