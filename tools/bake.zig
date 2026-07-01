@@ -215,10 +215,13 @@ pub fn main(init: std.process.Init) !void {
         const match = if (want_prim) |wp| pc[wp] > 0 else total > 0;
         if (match) {
             std.debug.print("{s} objl={d} point={d} line={d} area={d} none={d}\n", .{ path, want_objl, pc[1], pc[2], pc[3], pc[255] });
-            // Locate point-primitive matches (helps pin the tile a change lands in).
+            // Locate point matches + dump their attributes (helps pin the tile a change
+            // lands in, and identify an unknown object class by its attribute codes).
             for (cell.features) |f| if (f.objl == want_objl and f.prim == 1) {
                 if (cell.pointGeometry(f)) |p|
                     std.debug.print("    point @ lon={d:.6} lat={d:.6}\n", .{ p.lon(), p.lat() });
+                for (f.attrs) |at|
+                    std.debug.print("      attr {d} = \"{s}\"\n", .{ at.code, std.mem.trim(u8, at.value, " ") });
             };
         }
         return;
