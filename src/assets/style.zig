@@ -857,6 +857,170 @@ pub fn buildFromTemplateScamin(
     return styleJson(alloc, opts) catch alloc.dupe(u8, template_json);
 }
 
+// ---- style diff (style-diff.md) --------------------------------------------
+// Compute the minimal MapLibre style-mutation ops that turn one built style into
+// another. The engine knows both styles come from styleJson (same layer set +
+// deterministic key order), so a structural layer-by-layer compare yields exactly
+// the ops MapLibre's setStyle(diff:true) would — but scoped to the chart layers and
+// returned as data the host applies with setFilter / setPaintProperty /
+// setLayoutProperty (never setStyle), so overlays and sources are untouched.
+
+/// The `[{"op":"rebuild"}]` escape hatch: the two styles have a different SET of
+/// layer ids (not expected for any current mariner field — a safety valve telling
+/// the host to fall back to a full setStyle).
+const rebuild_ops = "[{\"op\":\"rebuild\"}]";
+
+fn layersOf(v: std.json.Value) ?std.json.Array {
+    if (v != .object) return null;
+    const l = v.object.get("layers") orelse return null;
+    if (l != .array) return null;
+    return l.array;
+}
+
+fn layerId(v: std.json.Value) ?[]const u8 {
+    if (v != .object) return null;
+    const idv = v.object.get("id") orelse return null;
+    if (idv != .string) return null;
+    return idv.string;
+}
+
+/// Structural deep-equality for two parsed JSON values. std.json.Value has no
+/// built-in equal; both operands here come from the same styleJson generator, so
+/// corresponding keys share a representation (integer stays integer, object key
+/// order matches) and a recursive compare is exact.
+fn jsonEql(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .bool => |x| b == .bool and b.bool == x,
+        .integer => |x| b == .integer and b.integer == x,
+        .float => |x| b == .float and b.float == x,
+        .number_string => |x| b == .number_string and std.mem.eql(u8, x, b.number_string),
+        .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .array => |x| blk: {
+            if (b != .array or x.items.len != b.array.items.len) break :blk false;
+            for (x.items, b.array.items) |ai, bi| if (!jsonEql(ai, bi)) break :blk false;
+            break :blk true;
+        },
+        .object => |x| blk: {
+            if (b != .object or x.count() != b.object.count()) break :blk false;
+            var it = x.iterator();
+            while (it.next()) |e| {
+                const bv = b.object.get(e.key_ptr.*) orelse break :blk false;
+                if (!jsonEql(e.value_ptr.*, bv)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn optJsonEql(a: ?std.json.Value, b: ?std.json.Value) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return jsonEql(a.?, b.?);
+}
+
+// {"op":op,"layer":id,"value":value}  (value null when the key was removed).
+fn emitFilterOp(js: *Stringify, id: []const u8, value: ?std.json.Value) !void {
+    try js.beginObject();
+    try js.objectField("op");
+    try js.write("setFilter");
+    try js.objectField("layer");
+    try js.write(id);
+    try js.objectField("value");
+    if (value) |v| try js.write(v) else try js.write(null);
+    try js.endObject();
+}
+
+// {"op":op,"layer":id,"property":key,"value":value}  (value null when removed).
+fn emitPropOp(js: *Stringify, op: []const u8, id: []const u8, key: []const u8, value: ?std.json.Value) !void {
+    try js.beginObject();
+    try js.objectField("op");
+    try js.write(op);
+    try js.objectField("layer");
+    try js.write(id);
+    try js.objectField("property");
+    try js.write(key);
+    try js.objectField("value");
+    if (value) |v| try js.write(v) else try js.write(null);
+    try js.endObject();
+}
+
+// Diff a layer's `paint` (or `layout`) sub-object: one prop op per key that
+// changed, was added (value = new), or was removed (value = null).
+fn diffSubObject(js: *Stringify, op: []const u8, id: []const u8, old_v: ?std.json.Value, new_v: ?std.json.Value) !void {
+    const old_o: ?std.json.ObjectMap = if (old_v) |v| (if (v == .object) v.object else null) else null;
+    const new_o: ?std.json.ObjectMap = if (new_v) |v| (if (v == .object) v.object else null) else null;
+    if (new_o) |no| {
+        var it = no.iterator();
+        while (it.next()) |e| {
+            const k = e.key_ptr.*;
+            const ov: ?std.json.Value = if (old_o) |oo| oo.get(k) else null;
+            if (ov == null or !jsonEql(ov.?, e.value_ptr.*))
+                try emitPropOp(js, op, id, k, e.value_ptr.*);
+        }
+    }
+    if (old_o) |oo| {
+        var it = oo.iterator();
+        while (it.next()) |e| {
+            const present = if (new_o) |no| no.get(e.key_ptr.*) != null else false;
+            if (!present) try emitPropOp(js, op, id, e.key_ptr.*, null);
+        }
+    }
+}
+
+/// Compute the minimal MapLibre style-mutation ops (a JSON array) to turn the
+/// serialized style `old_json` into `new_json`. Both must be styleJson output (same
+/// template/colortables/bands/scamin inputs, differing only in mariner). Returns
+/// allocator-owned bytes: `"[]"` when nothing differs; one op per differing
+/// `filter` / `paint.*` / `layout.*` key; `[{"op":"rebuild"}]` when the two styles
+/// carry a different SET of layer ids (the host then falls back to a full setStyle).
+pub fn styleDiff(alloc: std.mem.Allocator, old_json: []const u8, new_json: []const u8) ![]u8 {
+    var old_parsed = std.json.parseFromSlice(std.json.Value, alloc, old_json, .{}) catch
+        return alloc.dupe(u8, rebuild_ops);
+    defer old_parsed.deinit();
+    var new_parsed = std.json.parseFromSlice(std.json.Value, alloc, new_json, .{}) catch
+        return alloc.dupe(u8, rebuild_ops);
+    defer new_parsed.deinit();
+
+    const old_layers = layersOf(old_parsed.value) orelse return alloc.dupe(u8, rebuild_ops);
+    const new_layers = layersOf(new_parsed.value) orelse return alloc.dupe(u8, rebuild_ops);
+
+    // Index old layers by id; a differing layer-id set -> rebuild. Equal counts
+    // plus every new id present in old => the two sets are equal (no add/remove).
+    var old_by_id = std.StringHashMap(std.json.Value).init(alloc);
+    defer old_by_id.deinit();
+    for (old_layers.items) |lyr| {
+        const id = layerId(lyr) orelse continue;
+        try old_by_id.put(id, lyr);
+    }
+    var new_count: usize = 0;
+    for (new_layers.items) |lyr| {
+        const id = layerId(lyr) orelse continue;
+        new_count += 1;
+        if (!old_by_id.contains(id)) return alloc.dupe(u8, rebuild_ops);
+    }
+    if (new_count != old_by_id.count()) return alloc.dupe(u8, rebuild_ops);
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var stringify: Stringify = .{ .writer = &aw.writer };
+    const js = &stringify;
+
+    try js.beginArray();
+    for (new_layers.items) |lyr| {
+        const id = layerId(lyr) orelse continue;
+        const old_obj = old_by_id.get(id).?.object; // present: set-equality checked above
+        const new_obj = lyr.object;
+        const old_f = old_obj.get("filter");
+        const new_f = new_obj.get("filter");
+        if (!optJsonEql(old_f, new_f)) try emitFilterOp(js, id, new_f);
+        try diffSubObject(js, "setPaintProperty", id, old_obj.get("paint"), new_obj.get("paint"));
+        try diffSubObject(js, "setLayoutProperty", id, old_obj.get("layout"), new_obj.get("layout"));
+    }
+    try js.endArray();
+    return aw.toOwnedSlice();
+}
+
 test "styleJson: valid JSON, expected layers, palette-resolved colour" {
     const ct =
         \\{"day":{"DEPDW":"#c9edff","CHGRD":"#4c5b63","CHBLK":"#000000"},"dusk":{},"night":{"DEPDW":"#0a141e"}}
@@ -1072,4 +1236,96 @@ test "buildFromTemplateScamin: a manifest emits per-value buckets, no zoom-gate"
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm89999") != null);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm259999") != null);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "log2") == null);
+}
+
+// ---- styleDiff tests (style-diff.md §5) ------------------------------------
+
+test "styleDiff: filter + paint + layout changes emit precise, scoped ops" {
+    const a = std.testing.allocator;
+    const old_j =
+        \\{"layers":[
+        \\{"id":"areas","type":"fill","filter":["==","x",1],"paint":{"fill-color":"#111"},"layout":{"visibility":"visible"}},
+        \\{"id":"text","type":"symbol","paint":{"text-color":"#000"}}
+        \\]}
+    ;
+    const new_j =
+        \\{"layers":[
+        \\{"id":"areas","type":"fill","filter":["==","x",2],"paint":{"fill-color":"#222"},"layout":{"visibility":"none"}},
+        \\{"id":"text","type":"symbol","paint":{"text-color":"#000"}}
+        \\]}
+    ;
+    const ops = try styleDiff(a, old_j, new_j);
+    defer a.free(ops);
+    // areas: filter, paint fill-color, layout visibility all changed -> one op each.
+    try std.testing.expect(std.mem.indexOf(u8, ops, "{\"op\":\"setFilter\",\"layer\":\"areas\",\"value\":[\"==\",\"x\",2]}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "{\"op\":\"setPaintProperty\",\"layer\":\"areas\",\"property\":\"fill-color\",\"value\":\"#222\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "{\"op\":\"setLayoutProperty\",\"layer\":\"areas\",\"property\":\"visibility\",\"value\":\"none\"}") != null);
+    // text is byte-identical -> it must not appear in any op.
+    try std.testing.expect(std.mem.indexOf(u8, ops, "\"layer\":\"text\"") == null);
+}
+
+test "styleDiff: a removed paint key emits value:null" {
+    const a = std.testing.allocator;
+    const old_j = "{\"layers\":[{\"id\":\"l\",\"paint\":{\"fill-color\":\"#111\",\"fill-opacity\":0.5}}]}";
+    const new_j = "{\"layers\":[{\"id\":\"l\",\"paint\":{\"fill-color\":\"#111\"}}]}";
+    const ops = try styleDiff(a, old_j, new_j);
+    defer a.free(ops);
+    try std.testing.expectEqualStrings(
+        "[{\"op\":\"setPaintProperty\",\"layer\":\"l\",\"property\":\"fill-opacity\",\"value\":null}]",
+        ops,
+    );
+}
+
+test "styleDiff: a differing layer-id set -> rebuild" {
+    const a = std.testing.allocator;
+    // id renamed
+    const r1 = try styleDiff(a, "{\"layers\":[{\"id\":\"x\"}]}", "{\"layers\":[{\"id\":\"y\"}]}");
+    defer a.free(r1);
+    try std.testing.expectEqualStrings(rebuild_ops, r1);
+    // count differs
+    const r2 = try styleDiff(a, "{\"layers\":[{\"id\":\"x\"}]}", "{\"layers\":[{\"id\":\"x\"},{\"id\":\"z\"}]}");
+    defer a.free(r2);
+    try std.testing.expectEqualStrings(rebuild_ops, r2);
+}
+
+test "styleDiff: same mariner -> [] (no ops)" {
+    const a = std.testing.allocator;
+    const m = chartstyle.MarinerSettings{};
+    const s1 = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
+    defer a.free(s1);
+    const s2 = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
+    defer a.free(s2);
+    const ops = try styleDiff(a, s1, s2);
+    defer a.free(ops);
+    try std.testing.expectEqualStrings("[]", ops);
+}
+
+test "styleDiff: display_other flip emits only setFilter ops" {
+    const a = std.testing.allocator;
+    const base = chartstyle.MarinerSettings{};
+    const other = chartstyle.MarinerSettings{ .display_other = true };
+    const s1 = try buildFromTemplate(a, cs_template, &base, cs_ct, null, 1700000000);
+    defer a.free(s1);
+    const s2 = try buildFromTemplate(a, cs_template, &other, cs_ct, null, 1700000000);
+    defer a.free(s2);
+    const ops = try styleDiff(a, s1, s2);
+    defer a.free(ops);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "setFilter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "setPaintProperty") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "setLayoutProperty") == null);
+    try std.testing.expect(!std.mem.eql(u8, ops, "[]"));
+}
+
+test "styleDiff: day vs night emits setPaintProperty colour ops, no filter change" {
+    const a = std.testing.allocator;
+    const day = chartstyle.MarinerSettings{ .scheme = .day };
+    const night = chartstyle.MarinerSettings{ .scheme = .night };
+    const s1 = try buildFromTemplate(a, cs_template, &day, cs_ct, null, 1700000000);
+    defer a.free(s1);
+    const s2 = try buildFromTemplate(a, cs_template, &night, cs_ct, null, 1700000000);
+    defer a.free(s2);
+    const ops = try styleDiff(a, s1, s2);
+    defer a.free(ops);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "setPaintProperty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "setFilter") == null);
 }

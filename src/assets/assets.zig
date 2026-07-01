@@ -25,6 +25,7 @@ pub const StyleOpts = @import("style.zig").StyleOpts;
 pub const styleJson = @import("style.zig").styleJson;
 pub const buildFromTemplate = @import("style.zig").buildFromTemplate;
 pub const buildFromTemplateScamin = @import("style.zig").buildFromTemplateScamin;
+pub const styleDiff = @import("style.zig").styleDiff;
 
 // ---- colortables.json ----------------------------------------------------
 
