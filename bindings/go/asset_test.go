@@ -3,68 +3,39 @@
 package tile57
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
-// catalogDir is the synced S-101 PortrayalCatalog embedded by `make sync-s101`.
-const catalogDir = "../../vendor/S-101_Portrayal-Catalogue/PortrayalCatalog"
-
-func namedDir(t *testing.T, sub, ext string) []NamedBytes {
-	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(catalogDir, sub))
+// TestBakeAssets exercises the in-memory portrayal-asset bake against the
+// library's embedded S-101 catalogue: all six buffers must be non-empty, the JSON
+// ones must start with '{', and the atlas PNGs must carry the PNG magic.
+func TestBakeAssets(t *testing.T) {
+	a, err := BakeAssets("")
 	if err != nil {
-		t.Skipf("no catalogue %s: %v", sub, err)
+		t.Fatalf("BakeAssets: %v", err)
 	}
-	var out []NamedBytes
-	for _, e := range entries {
-		if e.IsDir() || !strings.EqualFold(filepath.Ext(e.Name()), ext) {
-			continue
+	jsons := []struct {
+		name string
+		b    []byte
+	}{
+		{"Colortables", a.Colortables},
+		{"Linestyles", a.Linestyles},
+		{"SpriteJSON", a.SpriteJSON},
+		{"PatternJSON", a.PatternJSON},
+	}
+	for _, j := range jsons {
+		if len(j.b) == 0 || j.b[0] != '{' {
+			t.Errorf("%s: want non-empty JSON object, got %d bytes", j.name, len(j.b))
 		}
-		b, err := os.ReadFile(filepath.Join(catalogDir, sub, e.Name()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		out = append(out, NamedBytes{ID: strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())), Data: b})
 	}
-	return out
-}
-
-func TestAssetGenerators(t *testing.T) {
-	xml, err := os.ReadFile(filepath.Join(catalogDir, "ColorProfiles/colorProfile.xml"))
-	if err != nil {
-		t.Skipf("no catalogue: %v", err)
+	if !isPNG(a.SpritePNG) {
+		t.Errorf("SpritePNG: not a PNG (%d bytes)", len(a.SpritePNG))
 	}
-	ct, err := Colortables(xml)
-	if err != nil || len(ct) == 0 || ct[0] != '{' {
-		t.Fatalf("Colortables: %v (%d bytes)", err, len(ct))
+	if !isPNG(a.PatternPNG) {
+		t.Errorf("PatternPNG: not a PNG (%d bytes)", len(a.PatternPNG))
 	}
-
-	lines := namedDir(t, "LineStyles", ".xml")
-	ls, err := Linestyles(lines)
-	if err != nil || len(ls) == 0 {
-		t.Fatalf("Linestyles: %v (%d styles -> %d bytes)", err, len(lines), len(ls))
-	}
-
-	css, err := os.ReadFile(filepath.Join(catalogDir, "Symbols/daySvgStyle.css"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	symbols := namedDir(t, "Symbols", ".svg")
-	sJSON, sPNG, err := SpriteAtlas(symbols, css)
-	if err != nil || len(sJSON) == 0 || !isPNG(sPNG) {
-		t.Fatalf("SpriteAtlas: %v (%d symbols -> json=%d png=%d)", err, len(symbols), len(sJSON), len(sPNG))
-	}
-	t.Logf("sprite atlas: %d symbols, json=%d bytes, png=%d bytes", len(symbols), len(sJSON), len(sPNG))
-
-	fills := namedDir(t, "AreaFills", ".xml")
-	pJSON, pPNG, err := PatternAtlas(fills, symbols, css)
-	if err != nil || len(pJSON) == 0 || !isPNG(pPNG) {
-		t.Fatalf("PatternAtlas: %v (%d fills -> json=%d png=%d)", err, len(fills), len(pJSON), len(pPNG))
-	}
-	t.Logf("pattern atlas: %d fills, json=%d bytes, png=%d bytes", len(fills), len(pJSON), len(pPNG))
+	t.Logf("assets: colortables=%d linestyles=%d sprite json=%d png=%d pattern json=%d png=%d",
+		len(a.Colortables), len(a.Linestyles), len(a.SpriteJSON), len(a.SpritePNG), len(a.PatternJSON), len(a.PatternPNG))
 }
 
 func isPNG(b []byte) bool {

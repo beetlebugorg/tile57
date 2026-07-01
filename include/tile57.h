@@ -165,6 +165,19 @@ int tile57_bake_bundle(const char *input, const char *out_dir,
                        const tile57_bake_opts *opts,
                        uint32_t *out_cell_count, double *out_bbox);
 
+/* All portrayal assets in memory (the same files bake_bundle writes to disk), from the
+ * library's embedded catalogue (catalog_dir NULL/"") or an on-disk one. Pairs with
+ * tile57_bake_pmtiles + tile57_style_build for a full in-memory bundle. Returns 1 with
+ * *out filled (free with tile57_assets_free), 0 on error. (chart-api.md) */
+typedef struct {
+    uint8_t *colortables;  size_t colortables_len;
+    uint8_t *linestyles;   size_t linestyles_len;
+    uint8_t *sprite_json;  size_t sprite_json_len;   uint8_t *sprite_png;  size_t sprite_png_len;
+    uint8_t *pattern_json; size_t pattern_json_len;  uint8_t *pattern_png; size_t pattern_png_len;
+} tile57_assets;
+int  tile57_bake_assets(const char *catalog_dir, tile57_assets *out);
+void tile57_assets_free(tile57_assets *out);
+
 /* Release a chart and all cached tiles. Must not be called while any renderer
  * may still call tile57_chart_tile on it (see lifetime note above). */
 void tile57_chart_close(tile57_chart *chart);
@@ -313,49 +326,6 @@ int tile57_style_template(tile57_scheme scheme, const char *source_tiles,
 /* Fill *m with the canonical default mariner settings (so a host needn't hardcode
  * them). date_view is set to "" (today). */
 void tile57_mariner_defaults(tile57_mariner *m);
-
-/* ---- portrayal asset generation -----------------------------------------
- *
- * Generate the S-101 portrayal assets at runtime from in-memory S-101 Portrayal
- * Catalogue bytes — the host reads the catalogue files; tile57 never touches the
- * filesystem. All outputs are owned by the library; free each buffer with
- * tile57_free (same length). The offline `tile57` CLI emits the same files.
- */
-
-/* A named blob: a NUL-terminated id (e.g. a file stem) + its bytes. */
-typedef struct {
-    const char *id;
-    const uint8_t *data;
-    size_t len;
-} tile57_named_bytes;
-
-/* colortables.json (S-52 colour token -> hex per day/dusk/night palette) from a
- * ColorProfiles colorProfile.xml. Returns 1 with out/out_len set, 0 on error. */
-int tile57_colortables(const uint8_t *xml, size_t xml_len,
-                       uint8_t **out, size_t *out_len);
-
-/* linestyles.json (dash patterns + placed symbols) from the S-101 LineStyles
- * (each `id` = the XML file stem). Returns 1 with out/out_len set, 0 on error. */
-int tile57_linestyles(const tile57_named_bytes *line_styles, size_t count,
-                      uint8_t **out, size_t *out_len);
-
-/* Sprite atlas: rasterize the S-101 Symbols (SVG) against a palette stylesheet
- * (css = a SvgStyle.css's content) and pack them. Returns 1 with the sprite.json
- * in out_json/out_json_len and the atlas PNG in out_png/out_png_len (free each
- * with tile57_free); 0 on error. */
-int tile57_sprite_atlas(const tile57_named_bytes *svgs, size_t count,
-                        const uint8_t *css, size_t css_len,
-                        uint8_t **out_json, size_t *out_json_len,
-                        uint8_t **out_png, size_t *out_png_len);
-
-/* Area-fill pattern atlas: tile each S-101 AreaFills XML's referenced symbol on
- * its v1/v2 lattice. `symbols` are the Symbols (SVG) the fills reference. Returns
- * 1 with patterns.json + patterns.png (free each with tile57_free); 0 on error. */
-int tile57_pattern_atlas(const tile57_named_bytes *fills, size_t fill_count,
-                         const tile57_named_bytes *symbols, size_t symbol_count,
-                         const uint8_t *css, size_t css_len,
-                         uint8_t **out_json, size_t *out_json_len,
-                         uint8_t **out_png, size_t *out_png_len);
 
 #ifdef __cplusplus
 }

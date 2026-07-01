@@ -9,7 +9,6 @@ const source = @import("source.zig");
 const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
 const chartstyle = @import("chartstyle");
 const assets = @import("assets");
-const sprite = @import("sprite");
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
@@ -289,42 +288,9 @@ export fn tile57_chart_clear_cache(chart: ?*Source) callconv(.c) void {
 
 // ---- portrayal asset generation (in-memory; mirrors tile57.h) --------------
 //
-// Generate the S-101 portrayal assets at runtime from in-memory catalogue bytes
-// (the host reads the files; capi never touches the filesystem). All outputs are
-// page-allocator-owned — free with tile57_free.
-
-// A named blob: NUL-terminated id + bytes. Mirrors tile57_named_bytes in tile57.h.
-const NamedBytes = extern struct {
-    id: [*:0]const u8,
-    data: [*]const u8,
-    len: usize,
-};
-
-fn lineStyleSrcs(a: std.mem.Allocator, items: []const NamedBytes) ?[]assets.LineStyleSrc {
-    const out = a.alloc(assets.LineStyleSrc, items.len) catch return null;
-    for (items, 0..) |it, i| out[i] = .{ .id = std.mem.span(it.id), .xml = it.data[0..it.len] };
-    return out;
-}
-
-fn svgSrcs(a: std.mem.Allocator, items: []const NamedBytes) ?[]sprite.SvgSrc {
-    const out = a.alloc(sprite.SvgSrc, items.len) catch return null;
-    for (items, 0..) |it, i| out[i] = .{ .id = std.mem.span(it.id), .svg = it.data[0..it.len] };
-    return out;
-}
-
-fn areaFillSrcs(a: std.mem.Allocator, items: []const NamedBytes) ?[]sprite.AreaFillSrc {
-    const out = a.alloc(sprite.AreaFillSrc, items.len) catch return null;
-    for (items, 0..) |it, i| out[i] = .{ .id = std.mem.span(it.id), .xml = it.data[0..it.len] };
-    return out;
-}
-
-/// colortables.json from a ColorProfiles/colorProfile.xml. 1=ok, 0=error.
-export fn tile57_colortables(xml: [*]const u8, xml_len: usize, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
-    const json = assets.colorTablesJson(gpa, xml[0..xml_len]) catch return 0;
-    out.* = json.ptr;
-    out_len.* = json.len;
-    return 1;
-}
+// Generate the S-101 portrayal assets from the library's embedded catalogue (or an
+// on-disk PortrayalCatalog override). Reuses the same bundle emitters bake_bundle
+// writes to disk, so the in-memory bundle matches the on-disk one byte-for-byte.
 
 // The S-52 colour profile baked into the library, or null if (somehow) absent.
 fn embeddedColorProfileXml() ?[]const u8 {
@@ -343,64 +309,78 @@ export fn tile57_colortables_default(out: *[*]u8, out_len: *usize) callconv(.c) 
     return 1;
 }
 
-/// linestyles.json from the S-101 LineStyles/*.xml (id = file stem). 1=ok, 0=error.
-export fn tile57_linestyles(srcs: [*]const NamedBytes, count: usize, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+// All portrayal assets in memory. Mirrors tile57_assets in tile57.h; each non-null
+// field is a gpa-owned buffer freed by tile57_assets_free (via source.freeBytes).
+const CAssets = extern struct {
+    colortables: ?[*]u8 = null,
+    colortables_len: usize = 0,
+    linestyles: ?[*]u8 = null,
+    linestyles_len: usize = 0,
+    sprite_json: ?[*]u8 = null,
+    sprite_json_len: usize = 0,
+    sprite_png: ?[*]u8 = null,
+    sprite_png_len: usize = 0,
+    pattern_json: ?[*]u8 = null,
+    pattern_json_len: usize = 0,
+    pattern_png: ?[*]u8 = null,
+    pattern_png_len: usize = 0,
+};
+
+// Dupe each generated (arena-owned) buffer into `gpa` so the C owner can free them
+// via source.freeBytes. Fills out.* in place; on OOM the caller frees via
+// tile57_assets_free (each field's len is set immediately after its ptr).
+fn fillAssets(out: *CAssets, ct: []const u8, ls: []const u8, spr_json: []const u8, spr_png: []const u8, pat_json: []const u8, pat_png: []const u8) !void {
+    out.colortables = (try gpa.dupe(u8, ct)).ptr;
+    out.colortables_len = ct.len;
+    out.linestyles = (try gpa.dupe(u8, ls)).ptr;
+    out.linestyles_len = ls.len;
+    out.sprite_json = (try gpa.dupe(u8, spr_json)).ptr;
+    out.sprite_json_len = spr_json.len;
+    out.sprite_png = (try gpa.dupe(u8, spr_png)).ptr;
+    out.sprite_png_len = spr_png.len;
+    out.pattern_json = (try gpa.dupe(u8, pat_json)).ptr;
+    out.pattern_json_len = pat_json.len;
+    out.pattern_png = (try gpa.dupe(u8, pat_png)).ptr;
+    out.pattern_png_len = pat_png.len;
+}
+
+/// All portrayal assets in memory (the same files bake_bundle writes to disk), from
+/// the embedded catalogue (catalog_dir NULL/"") or an on-disk one. 1=ok + *out filled
+/// (free with tile57_assets_free), 0=error. See tile57.h.
+export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: *CAssets) callconv(.c) c_int {
+    out.* = .{};
+    // The bundle emitters do filesystem I/O for an on-disk catalogue; the lib has no
+    // std.process.Init, so stand up a threaded std.Io for the call.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Scratch arena for generation; the final buffers are duped into gpa (C-owned).
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const list = lineStyleSrcs(arena.allocator(), srcs[0..count]) orelse return 0;
-    const json = assets.linestylesJson(gpa, list) catch return 0;
-    out.* = json.ptr;
-    out_len.* = json.len;
+    const a = arena.allocator();
+    const cd = spanOpt(catalog_dir) orelse "";
+
+    const ct = bundle.colorTablesBytes(io, a, cd) catch return 0;
+    const ls = bundle.linestylesBytes(io, a, cd) catch return 0;
+    const spr = bundle.spriteAtlasBytes(io, a, cd, bundle.DEFAULT_CSS) catch return 0;
+    const pat = bundle.patternAtlasBytes(io, a, cd, bundle.DEFAULT_CSS) catch return 0;
+
+    fillAssets(out, ct, ls, spr.json, spr.png, pat.json, pat.png) catch {
+        tile57_assets_free(out);
+        return 0;
+    };
     return 1;
 }
 
-/// Sprite atlas (sprite.json + sprite.png) from the S-101 Symbols/*.svg + a
-/// palette CSS. 1=ok with both buffers set (free each with tile57_free), 0=error.
-export fn tile57_sprite_atlas(
-    svgs: [*]const NamedBytes,
-    count: usize,
-    css: [*]const u8,
-    css_len: usize,
-    out_json: *[*]u8,
-    out_json_len: *usize,
-    out_png: *[*]u8,
-    out_png_len: *usize,
-) callconv(.c) c_int {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const list = svgSrcs(arena.allocator(), svgs[0..count]) orelse return 0;
-    const atlas = sprite.spriteAtlas(gpa, list, css[0..css_len]) catch return 0;
-    out_json.* = atlas.json.ptr;
-    out_json_len.* = atlas.json.len;
-    out_png.* = atlas.png.ptr;
-    out_png_len.* = atlas.png.len;
-    return 1;
-}
-
-/// Area-fill pattern atlas (patterns.json + patterns.png) from the AreaFills/*.xml
-/// + their referenced Symbols/*.svg + a palette CSS. 1=ok, 0=error.
-export fn tile57_pattern_atlas(
-    fills: [*]const NamedBytes,
-    fill_count: usize,
-    symbols: [*]const NamedBytes,
-    symbol_count: usize,
-    css: [*]const u8,
-    css_len: usize,
-    out_json: *[*]u8,
-    out_json_len: *usize,
-    out_png: *[*]u8,
-    out_png_len: *usize,
-) callconv(.c) c_int {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const fl = areaFillSrcs(arena.allocator(), fills[0..fill_count]) orelse return 0;
-    const sl = svgSrcs(arena.allocator(), symbols[0..symbol_count]) orelse return 0;
-    const atlas = sprite.patternAtlas(gpa, fl, sl, css[0..css_len]) catch return 0;
-    out_json.* = atlas.json.ptr;
-    out_json_len.* = atlas.json.len;
-    out_png.* = atlas.png.ptr;
-    out_png_len.* = atlas.png.len;
-    return 1;
+/// Free every non-null buffer in *out and zero the struct. See tile57.h.
+export fn tile57_assets_free(out: *CAssets) callconv(.c) void {
+    if (out.colortables) |p| source.freeBytes(p[0..out.colortables_len]);
+    if (out.linestyles) |p| source.freeBytes(p[0..out.linestyles_len]);
+    if (out.sprite_json) |p| source.freeBytes(p[0..out.sprite_json_len]);
+    if (out.sprite_png) |p| source.freeBytes(p[0..out.sprite_png_len]);
+    if (out.pattern_json) |p| source.freeBytes(p[0..out.pattern_json_len]);
+    if (out.pattern_png) |p| source.freeBytes(p[0..out.pattern_png_len]);
+    out.* = .{};
 }
 
 // ---- chart-style generation (mirrors tile57_mariner in tile57.h) -----------

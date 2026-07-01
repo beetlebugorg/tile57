@@ -104,19 +104,3 @@ func (a *cArena) cellInputs(cells []Cell) ([]C.tile57_cell, *C.tile57_cell) {
 	}
 	return inputs, base
 }
-
-// namedBytes builds a C tile57_named_bytes array (id + bytes) from items.
-func (a *cArena) namedBytes(items []NamedBytes) (*C.tile57_named_bytes, C.size_t) {
-	n := len(items)
-	if n == 0 {
-		return nil, 0
-	}
-	base := (*C.tile57_named_bytes)(a.track(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.tile57_named_bytes{})))))
-	arr := unsafe.Slice(base, n)
-	for i, it := range items {
-		arr[i].id = a.str(it.ID)
-		arr[i].data = a.bytes(it.Data)
-		arr[i].len = C.size_t(len(it.Data))
-	}
-	return base, C.size_t(n)
-}
