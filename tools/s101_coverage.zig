@@ -138,9 +138,14 @@ const RESTRICTED = [_]AttrObjs{
     .{ .acr = "BOYSHP", .objs = &.{"MORFAC"} },
 };
 
-const ObjAttr = struct { obj: []const u8, acr: []const u8 };
+// `enforced` = the adapter drops this attribute write-side (s101_adapt.zig DROP_ATTRS /
+// isDroppedAttr), so the value never reaches a rule and the slot is NOT at-risk even if
+// a rule reads it. Defaults true: every §E pair below is enforced. A future §E entry the
+// adapter hasn't wired yet sets `.enforced = false` and still flags (the CI safety net,
+// like VALUE_REMAP vs VALUE_REMAP_DONE). Keep this table in sync with s101_adapt.zig.
+const ObjAttr = struct { obj: []const u8, acr: []const u8, enforced: bool = true };
 // Per-object attribute drops — "will not be converted" for that feature (gaps doc §E).
-// Only bites when the rule actually reads it (adapter forwards an attr S-101 prohibits).
+// Enforced write-side by the adapter; the entries stay as the §E reference + safety net.
 const DROP = [_]ObjAttr{
     .{ .obj = "DEPARE", .acr = "QUASOU" }, .{ .obj = "CBLSUB", .acr = "DRVAL1" },
     .{ .obj = "CBLSUB", .acr = "DRVAL2" }, .{ .obj = "CONZNE", .acr = "STATUS" },
@@ -427,6 +432,7 @@ pub fn main(init: std.process.Init) !void {
                 var rk: ?[]const u8 = null;
                 var rn: []const u8 = "";
                 for (DROP) |d| if (listHas(acrs, d.acr) and listHas(objs, d.obj)) {
+                    if (d.enforced) continue; // adapter drops it write-side; never reaches the rule
                     rk = "drop";
                     rn = try std.fmt.allocPrint(a, "{s} prohibited on {s} (S-65 will-not-convert); adapter forwards it", .{ d.acr, cls });
                     break;
