@@ -327,6 +327,53 @@ fn resolveLightClass(f: s57.Feature) []const u8 {
     return "LightAllAround";
 }
 
+// --- S-65 Annex B value-level conversion (Gap A) ----------------------------
+// The adapter forwards attribute VALUES verbatim (name-translated only), but S-65
+// prohibits or remaps some raw S-57 enumerate values in S-101. Applied per S-57
+// attribute code so it covers every feature class that reads the attribute.
+//
+//   TECSOU (§2.2.3.5): 6 (swept by wire-drag) and 7 (found by laser) are prohibited
+//     in S-101 -> drop; 14 (computer generated) -> 17 (hyperspectral imagery). Every
+//     surviving S-57 value is already in the S-101 techniqueOfVerticalMeasurement list.
+//   QUASOU (§2.2.3.3): 5 (no bottom found) is prohibited for quality of vertical
+//     measurement -> drop. (On SOUNDG proper, S-65 re-routes the feature to
+//     DepthNoBottomFound; SOUNDG is emitted as a multipoint upstream of this adapter,
+//     so here — Wreck/Obstruction/UnderwaterAwashRock — the attribute simply drops.)
+//
+// TECSOU is an S-57 list, so map element-wise and rejoin; an all-dropped list (or a
+// single dropped value) yields "" and the caller omits the attribute.
+fn s65RemapValue(a: std.mem.Allocator, code: u16, v: []const u8) ![]const u8 {
+    if (code != s57.ATTR_TECSOU and code != s57.ATTR_QUASOU) return v;
+    var out = std.ArrayList(u8).empty;
+    var it = std.mem.splitScalar(u8, v, ',');
+    while (it.next()) |p| {
+        const t = std.mem.trim(u8, p, " ");
+        if (t.len == 0) continue;
+        const n = std.fmt.parseInt(i64, t, 10) catch {
+            if (out.items.len > 0) try out.append(a, ',');
+            try out.appendSlice(a, t); // non-numeric (unexpected): forward verbatim
+            continue;
+        };
+        const mapped: ?i64 = switch (code) {
+            s57.ATTR_TECSOU => switch (n) {
+                6, 7 => null, // prohibited in S-101
+                14 => 17, // computer generated -> hyperspectral imagery
+                else => n,
+            },
+            s57.ATTR_QUASOU => switch (n) {
+                5 => null, // "no bottom found" prohibited for quality of vertical measurement
+                else => n,
+            },
+            else => n,
+        };
+        if (mapped) |m| {
+            if (out.items.len > 0) try out.append(a, ',');
+            try out.appendSlice(a, try std.fmt.allocPrint(a, "{d}", .{m}));
+        }
+    }
+    return out.items;
+}
+
 /// First integer in the S-57 comma-separated list `csv`, or 0 if none.
 /// Port of complex.go firstListVal.
 fn firstListVal(csv: []const u8) i64 {
@@ -495,8 +542,13 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (v.len == 0) continue;
             if (at.code == s57.ATTR_OBJNAM) name = v; // OBJNAM -> featureName
             if (at.code == s57.ATTR_CATZOC) catzoc = v; // CATZOC -> zoneOfConfidence
-            if (catalogue.resolveAttrByCode(at.code)) |aname|
-                try attrs.append(a, .{ .name = aname, .value = v });
+            if (catalogue.resolveAttrByCode(at.code)) |aname| {
+                // S-65 Annex B value-level conversion: some raw S-57 values are
+                // invalid in S-101 and must be dropped or remapped before the rule
+                // reads them. "" means every value dropped -> omit the attribute.
+                const tv = try s65RemapValue(a, at.code, v);
+                if (tv.len > 0) try attrs.append(a, .{ .name = aname, .value = tv });
+            }
         }
 
         // featureName[1] from OBJNAM. language + nameUsage are mandatory: the
@@ -775,6 +827,56 @@ test "MORFAC CATMOR=2 routes to Dolphin carrying categoryOfDolphin=2" {
     try std.testing.expectEqual(@as(usize, 1), adapted.len);
     try std.testing.expectEqualStrings("Dolphin", adapted[0].code);
     try std.testing.expectEqualStrings("2", adapted[0].root.resolve("").?.simpleValue("categoryOfDolphin").?);
+}
+
+test "s65RemapValue: TECSOU/QUASOU S-65 value conversion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Non-remapped code passes through untouched.
+    try std.testing.expectEqualStrings("5", try s65RemapValue(a, s57.ATTR_VALSOU, "5"));
+    // TECSOU: 6/7 drop, 14->17, list order preserved, in-list values kept.
+    try std.testing.expectEqualStrings("3", try s65RemapValue(a, s57.ATTR_TECSOU, "3,6"));
+    try std.testing.expectEqualStrings("17", try s65RemapValue(a, s57.ATTR_TECSOU, "14"));
+    try std.testing.expectEqualStrings("3,17", try s65RemapValue(a, s57.ATTR_TECSOU, "3,7,14"));
+    try std.testing.expectEqualStrings("", try s65RemapValue(a, s57.ATTR_TECSOU, "6,7")); // all dropped -> omit
+    // QUASOU: 5 dropped, others kept.
+    try std.testing.expectEqualStrings("", try s65RemapValue(a, s57.ATTR_QUASOU, "5"));
+    try std.testing.expectEqualStrings("6", try s65RemapValue(a, s57.ATTR_QUASOU, "6"));
+}
+
+test "prohibited QUASOU=5 is dropped from an adapted Wreck" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_QUASOU, .value = "5" }, // prohibited -> dropped
+        .{ .code = s57.ATTR_TECSOU, .value = "3,6" }, // 6 dropped -> "3"
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 159, .refs = &node_ref, .attrs = &attrs }, // WRECKS
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("Wreck", adapted[0].code);
+    const root = adapted[0].root.resolve("").?;
+    try std.testing.expect(root.simpleValue("qualityOfVerticalMeasurement") == null); // dropped
+    try std.testing.expectEqualStrings("3", root.simpleValue("techniqueOfVerticalMeasurement").?);
 }
 
 test "resolveLightClass routes by sector limits / CATLIT" {

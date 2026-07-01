@@ -93,6 +93,13 @@ const VALUE_REMAP = [_]AttrNote{
     .{ .acr = "CATBRG", .note = "CATBRG -> categoryOfOpeningBridge restructure (4.8.10)" },
 };
 
+// Acronyms whose VALUE_REMAP the adapter now applies before the value reaches a
+// rule (s101_adapt.zig s65RemapValue): the prohibited/remapped values are dropped
+// or mapped, and every surviving value is inside the S-101 allowable list — so the
+// "remap" concern is retired. The per-object RESTRICTED allowable-list axis, if any,
+// is still reported (a separate concern). Grow this as the adapter grows transforms.
+const VALUE_REMAP_DONE = [_][]const u8{ "TECSOU", "QUASOU" };
+
 const AttrObjs = struct { acr: []const u8, objs: []const []const u8 };
 // Per-object restricted allowable-value lists (S-65 Table A-1/A-2; gaps doc §A.3).
 const RESTRICTED = [_]AttrObjs{
@@ -395,7 +402,7 @@ pub fn main(init: std.process.Init) !void {
                     rn = try std.fmt.allocPrint(a, "{s} prohibited on {s} (S-65 will-not-convert); adapter forwards it", .{ d.acr, cls });
                     break;
                 };
-                if (rk == null) for (VALUE_REMAP) |v| if (listHas(acrs, v.acr)) {
+                if (rk == null) for (VALUE_REMAP) |v| if (listHas(acrs, v.acr) and !listHas(&VALUE_REMAP_DONE, v.acr)) {
                     rk = "remap";
                     rn = v.note;
                     break;
