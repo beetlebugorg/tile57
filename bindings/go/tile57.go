@@ -149,6 +149,58 @@ func Open(path string) (*Source, error) {
 	return &Source{ptr: ptr}, nil
 }
 
+// OpenChartBytes opens one in-memory ENC cell (base .000 bytes) as a resident chart.
+// Bytes are copied. (chart-api.md)
+func OpenChartBytes(base []byte) (*Source, error) {
+	if len(base) == 0 {
+		return nil, fmt.Errorf("tile57: empty cell bytes: %w", ErrEmptyInput)
+	}
+	ptr := C.tile57_chart_open_bytes((*C.uint8_t)(unsafe.Pointer(&base[0])), C.size_t(len(base)))
+	if ptr == nil {
+		return nil, fmt.Errorf("tile57: failed to open cell (%d bytes)", len(base))
+	}
+	return &Source{ptr: ptr}, nil
+}
+
+// OpenPMTiles opens a baked PMTiles bundle from a file path. (chart-api.md)
+func OpenPMTiles(path string) (*Source, error) {
+	if path == "" {
+		return nil, fmt.Errorf("tile57: empty path: %w", ErrEmptyInput)
+	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	ptr := C.tile57_chart_open_pmtiles(cPath)
+	if ptr == nil {
+		return nil, fmt.Errorf("tile57: failed to open pmtiles at %q", path)
+	}
+	return &Source{ptr: ptr}, nil
+}
+
+// ChartInfo is a chart's fixed metadata (chart-api.md) — zoom range, bands, bounds,
+// and a good initial camera. HasBounds/HasAnchor guard the respective fields.
+type ChartInfo struct {
+	MinZoom, MaxZoom                 uint8
+	Bands                            uint32
+	HasBounds                        bool
+	West, South, East, North         float64
+	HasAnchor                        bool
+	AnchorLat, AnchorLon, AnchorZoom float64
+}
+
+// Info returns the chart's fixed metadata in one call.
+func (s *Source) Info() ChartInfo {
+	var ci C.tile57_chart_info
+	C.tile57_chart_get_info(s.ptr, &ci)
+	return ChartInfo{
+		MinZoom: uint8(ci.min_zoom), MaxZoom: uint8(ci.max_zoom),
+		Bands:     uint32(ci.bands),
+		HasBounds: bool(ci.has_bounds),
+		West:      float64(ci.west), South: float64(ci.south), East: float64(ci.east), North: float64(ci.north),
+		HasAnchor: bool(ci.has_anchor),
+		AnchorLat: float64(ci.anchor_lat), AnchorLon: float64(ci.anchor_lon), AnchorZoom: float64(ci.anchor_zoom),
+	}
+}
+
 // Tile fetches tile (z, x, y) as decompressed MVT bytes. (nil, nil) means a blank
 // tile (valid but empty) — the TileSource "no tile here" convention.
 func (s *Source) Tile(z uint8, x, y uint32) ([]byte, error) {

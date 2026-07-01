@@ -133,6 +133,67 @@ export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Source {
     return Source.openPath(p, null, true) catch null;
 }
 
+/// Open one in-memory ENC cell (base .000 bytes) as a resident chart. See tile57.h.
+export fn tile57_chart_open_bytes(base: [*]const u8, len: usize) callconv(.c) ?*Source {
+    if (len == 0) return null;
+    const cells = [_]source.CellInput{.{ .base = base[0..len] }};
+    return Source.openCells(&cells, null, true) catch null;
+}
+
+/// Open a baked PMTiles bundle from a file path. See tile57.h.
+export fn tile57_chart_open_pmtiles(path: ?[*:0]const u8) callconv(.c) ?*Source {
+    const p = spanOpt(path) orelse return null;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_path = std.fs.path.dirname(p) orelse ".";
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
+    defer dir.close(io);
+    const bytes = dir.readFileAlloc(io, std.fs.path.basename(p), gpa, .unlimited) catch return null;
+    defer gpa.free(bytes);
+    return Source.openBytes(bytes, .pmtiles, null) catch null;
+}
+
+// Fixed-size chart metadata (mirrors tile57_chart_info in tile57.h): folds the old
+// zoom_range / bounds / anchor / bands getters into one struct fill.
+const CChartInfo = extern struct {
+    min_zoom: u8,
+    max_zoom: u8,
+    bands: u32,
+    has_bounds: bool,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    has_anchor: bool,
+    anchor_lat: f64,
+    anchor_lon: f64,
+    anchor_zoom: f64,
+};
+
+/// Fill *out with the chart's fixed metadata (zoom range, bands, bounds, anchor). See tile57.h.
+export fn tile57_chart_get_info(src: ?*Source, out: *CChartInfo) callconv(.c) void {
+    out.* = std.mem.zeroes(CChartInfo);
+    const s = src orelse return;
+    const zr = s.zoomRange();
+    out.min_zoom = zr.min;
+    out.max_zoom = zr.max;
+    out.bands = s.bands();
+    if (s.bounds()) |b| {
+        out.has_bounds = true;
+        out.west = b[0];
+        out.south = b[1];
+        out.east = b[2];
+        out.north = b[3];
+    }
+    if (s.anchor()) |a| {
+        out.has_anchor = true;
+        out.anchor_lat = a.lat;
+        out.anchor_lon = a.lon;
+        out.anchor_zoom = a.zoom;
+    }
+}
+
 // Progress callback for tile57_bake_cells / tile57_bake_bundle (matches the header
 // typedef + source.Progress + bake_enc.Progress).
 const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
@@ -303,6 +364,13 @@ export fn tile57_tile_get(
 export fn tile57_tile_free(ptr: ?[*]u8, len: usize) callconv(.c) void {
     const p = ptr orelse return;
     source.freeBytes(p[0..len]);
+}
+
+/// Free any engine-returned buffer (tiles, style, scamin array, colortables, …). See tile57.h.
+/// (chart-api.md — the universal free; supersedes tile57_tile_free.)
+export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {
+    const p = ptr orelse return;
+    source.freeBytes(@as([*]u8, @ptrCast(p))[0..len]);
 }
 
 /// Drop the in-memory tile cache (bounds memory in long-running hosts).

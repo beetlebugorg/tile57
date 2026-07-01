@@ -145,6 +145,49 @@ func TestOpenPath(t *testing.T) {
 	}
 }
 
+// TestOpenPMTilesAndInfo bakes the fixture to a PMTiles file, opens it via the path,
+// and exercises the chart_get_info getter. Also covers OpenChartBytes.
+func TestOpenPMTilesAndInfo(t *testing.T) {
+	data, err := os.ReadFile(testCell)
+	if err != nil {
+		t.Skipf("no test cell: %v", err)
+	}
+	// OpenChartBytes (resident single cell) + Info.
+	rc, err := OpenChartBytes(data)
+	if err != nil {
+		t.Fatalf("OpenChartBytes: %v", err)
+	}
+	if info := rc.Info(); !info.HasBounds || info.MaxZoom < info.MinZoom {
+		t.Fatalf("resident chart info looks unset: %+v", info)
+	}
+	rc.Close()
+
+	// Bake to a PMTiles file, then open it by path.
+	pm, err := BakeCells([]CellInput{{Base: data}}, "", 0, 24, PickInclude, nil)
+	if err != nil {
+		t.Fatalf("BakeCells: %v", err)
+	}
+	tmp := t.TempDir() + "/chart.pmtiles"
+	if err := os.WriteFile(tmp, pm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := OpenPMTiles(tmp)
+	if err != nil {
+		t.Fatalf("OpenPMTiles: %v", err)
+	}
+	defer src.Close()
+
+	info := src.Info()
+	if info.MaxZoom < info.MinZoom || !info.HasBounds {
+		t.Fatalf("pmtiles chart info looks unset: %+v", info)
+	}
+	t.Logf("pmtiles: zoom %d..%d bounds W=%.4f E=%.4f anchor=%v", info.MinZoom, info.MaxZoom, info.West, info.East, info.HasAnchor)
+	tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, info.MaxZoom)
+	if _, err := src.Tile(info.MaxZoom, tx, ty); err != nil {
+		t.Fatalf("Tile: %v", err)
+	}
+}
+
 // lonLatToTile maps a lon/lat to its XYZ web-Mercator tile at zoom z.
 func lonLatToTile(lon, lat float64, z uint8) (x, y uint32) {
 	n := math.Exp2(float64(z))

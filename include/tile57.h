@@ -148,6 +148,23 @@ tile57_source *tile57_source_open_cells_streaming(
  * (chart-api.md — additive during the source->chart rename.) */
 tile57_source *tile57_chart_open(const char *path);
 
+/* Open one in-memory ENC cell (base .000 bytes) as a resident chart. Bytes are copied.
+ * NULL/failure -> NULL. (chart-api.md) */
+tile57_source *tile57_chart_open_bytes(const uint8_t *base, size_t len);
+
+/* Open a baked PMTiles bundle from a file path. NULL/failure -> NULL. (chart-api.md) */
+tile57_source *tile57_chart_open_pmtiles(const char *path);
+
+/* Fixed chart metadata (chart-api.md) — folds zoom_range/bands/bounds/anchor into one
+ * getter. Bounds/anchor validity are flagged (false -> those fields are 0). */
+typedef struct {
+    uint8_t  min_zoom, max_zoom;
+    uint32_t bands;                                       /* bitmask of navigational bands present */
+    bool     has_bounds; double west, south, east, north;
+    bool     has_anchor; double anchor_lat, anchor_lon, anchor_zoom;
+} tile57_chart_info;
+void tile57_chart_get_info(tile57_source *chart, tile57_chart_info *out);
+
 /* Progress callback for tile57_bake_cells / tile57_bake_bundle. stage 0 =
  * loading/portraying cells, stage 1 = baking tiles. Stage 0 done/total count cells.
  * Stage 1 done/total count tiles: for tile57_bake_bundle they are PER BAND (reset
@@ -256,6 +273,11 @@ tile57_tile_status tile57_tile_get(tile57_source *src, uint8_t z, uint32_t x, ui
 
 /* Free a buffer returned by tile57_tile_get (pass the same length). */
 void tile57_tile_free(uint8_t *ptr, size_t len);
+
+/* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
+ * colortables, atlases, …), passing the same length. The universal free —
+ * supersedes tile57_tile_free. (chart-api.md) */
+void tile57_free(void *ptr, size_t len);
 
 /* Drop the in-memory tile cache to bound memory in long-running hosts. Safe to
  * call any time; subsequent tile57_tile_get calls simply regenerate/decode. */
