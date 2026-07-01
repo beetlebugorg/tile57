@@ -1394,3 +1394,89 @@ test "inTheWater predicate: containsPoint over water and land indices" {
     // (20,20): no water coverage -> not in the water (attribute stays absent).
     try t.expect(!water.containsPoint(20, 20));
 }
+
+test "inTheWater end-to-end: a LNDMRK over DEPARE geometry gets inTheWater=true (land excludes)" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // DEPARE triangle A(0,0) B(10,0) C(5,10) via edges 10/11/12; a small LNDARE wedge
+    // G(0,0) H(3,0) I(0,3) via edges 20/21/22 (overlapping ENC, near the origin corner).
+    var nodes = std.AutoHashMap(u64, s57.LonLat).init(a);
+    try nodes.put((@as(u64, s57.RCNM_VC) << 32) | 1, s57.LonLat.init(0, 0));
+    try nodes.put((@as(u64, s57.RCNM_VC) << 32) | 2, s57.LonLat.init(10, 0));
+    try nodes.put((@as(u64, s57.RCNM_VC) << 32) | 3, s57.LonLat.init(5, 10));
+    try nodes.put((@as(u64, s57.RCNM_VC) << 32) | 4, s57.LonLat.init(0, 0));
+    try nodes.put((@as(u64, s57.RCNM_VC) << 32) | 5, s57.LonLat.init(3, 0));
+    try nodes.put((@as(u64, s57.RCNM_VC) << 32) | 6, s57.LonLat.init(0, 3));
+    // Isolated (VI) nodes for the three structure points.
+    try nodes.put((@as(u64, s57.RCNM_VI) << 32) | 100, s57.LonLat.init(5, 3)); // in water, not land
+    try nodes.put((@as(u64, s57.RCNM_VI) << 32) | 101, s57.LonLat.init(1, 1)); // in water AND land
+    try nodes.put((@as(u64, s57.RCNM_VI) << 32) | 102, s57.LonLat.init(20, 20)); // no coverage
+
+    const vecs = try a.alloc(s57.VectorRecord, 6);
+    vecs[0] = .{ .rcnm = s57.RCNM_VE, .rcid = 10, .points = &.{}, .soundings = &.{}, .begin_node = 1, .end_node = 2 };
+    vecs[1] = .{ .rcnm = s57.RCNM_VE, .rcid = 11, .points = &.{}, .soundings = &.{}, .begin_node = 2, .end_node = 3 };
+    vecs[2] = .{ .rcnm = s57.RCNM_VE, .rcid = 12, .points = &.{}, .soundings = &.{}, .begin_node = 3, .end_node = 1 };
+    vecs[3] = .{ .rcnm = s57.RCNM_VE, .rcid = 20, .points = &.{}, .soundings = &.{}, .begin_node = 4, .end_node = 5 };
+    vecs[4] = .{ .rcnm = s57.RCNM_VE, .rcid = 21, .points = &.{}, .soundings = &.{}, .begin_node = 5, .end_node = 6 };
+    vecs[5] = .{ .rcnm = s57.RCNM_VE, .rcid = 22, .points = &.{}, .soundings = &.{}, .begin_node = 6, .end_node = 4 };
+    var edges = std.AutoHashMap(u32, usize).init(a);
+    inline for (.{ .{ 10, 0 }, .{ 11, 1 }, .{ 12, 2 }, .{ 20, 3 }, .{ 21, 4 }, .{ 22, 5 } }) |e| try edges.put(e[0], e[1]);
+
+    const depare_refs = [_]s57.SpatialRef{
+        .{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 10 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 11 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 12 }, .ornt = 1 },
+    };
+    const lndare_refs = [_]s57.SpatialRef{
+        .{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 20 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 21 }, .ornt = 1 },
+        .{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 22 }, .ornt = 1 },
+    };
+    const depare_attrs = [_]s57.Attr{.{ .code = s57.ATTR_DRVAL1, .value = "5" }};
+    const s1 = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 100 }, .ornt = 255 }};
+    const s2 = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 101 }, .ornt = 255 }};
+    const s3 = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 102 }, .ornt = 255 }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 42, .refs = &depare_refs, .attrs = &depare_attrs }, // DEPARE
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = s57.OBJL_LNDARE, .refs = &lndare_refs }, // LNDARE
+        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 74, .refs = &s1 }, // LNDMRK in water
+        .{ .rcnm = 100, .rcid = 4, .prim = 1, .objl = 74, .refs = &s2 }, // LNDMRK over land
+        .{ .rcnm = 100, .rcid = 5, .prim = 1, .objl = 74, .refs = &s3 }, // LNDMRK no coverage
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = vecs,
+        .features = &feats,
+        .nodes = nodes,
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(t.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    var seen: usize = 0;
+    for (adapted) |ad| {
+        const itw = ad.root.resolve("").?.simpleValue("inTheWater");
+        switch (ad.feature_index) {
+            2 => { // over DEPARE, not over LNDARE -> in the water
+                try t.expectEqualStrings("Landmark", ad.code);
+                try t.expectEqualStrings("true", itw.?);
+                seen += 1;
+            },
+            3 => { // over DEPARE AND LNDARE -> land excludes, absent
+                try t.expectEqual(@as(?[]const u8, null), itw);
+                seen += 1;
+            },
+            4 => { // no water coverage -> absent
+                try t.expectEqual(@as(?[]const u8, null), itw);
+                seen += 1;
+            },
+            else => {},
+        }
+    }
+    try t.expectEqual(@as(usize, 3), seen); // all three structures were adapted and checked
+}
