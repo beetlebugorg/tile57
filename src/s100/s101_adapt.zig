@@ -737,6 +737,13 @@ fn buildQualityOfBathymetricData(a: std.mem.Allocator, attrs: *std.ArrayList(Nam
     }
     try appendChild(a, children, "zoneOfConfidence", zoc.build());
 
+    try buildSurveyDateRange(a, children, f);
+}
+
+/// surveyDateRange{dateStart<-SURSTA, dateEnd<-SUREND} for the quality meta classes
+/// (dateEnd is mandatory in S-101 for both Quality of Bathymetric Data and Quality of
+/// Survey, but stays null when SUREND is absent, per the conversion guidance).
+fn buildSurveyDateRange(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry), f: s57.Feature) !void {
     const sursta = attrTrim(f, s57.ATTR_SURSTA);
     const surend = attrTrim(f, s57.ATTR_SUREND);
     if (sursta.len > 0 or surend.len > 0) {
@@ -775,8 +782,10 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         var children = std.ArrayList(ChildEntry).empty;
         var name: []const u8 = "";
         // M_QUAL deconstructs (S-65 §2.2.3.1): five S-57 attributes feed the proper
-        // S-101 complexes below instead of the generic name-for-name loop.
+        // S-101 complexes below instead of the generic name-for-name loop. M_SREL ->
+        // Quality of Survey shares the surveyDateRange piece (§2.2.3.2).
         const qobd = std.mem.eql(u8, code, "QualityOfBathymetricData");
+        const qos = std.mem.eql(u8, code, "QualityOfSurvey");
         for (f.attrs) |at| {
             // A present-but-blank S-57 attribute (e.g. an unknown VALSOU, all
             // spaces) means "absent": serving "" would make the framework build a
@@ -791,6 +800,12 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             // SURSTA/SUREND the bare dateStart/dateEnd, CATZOC the bare category).
             if (qobd) switch (at.code) {
                 s57.ATTR_CATZOC, s57.ATTR_POSACC, s57.ATTR_SOUACC, s57.ATTR_SURSTA, s57.ATTR_SUREND => continue,
+                else => {},
+            };
+            // Quality of Survey likewise consumes SURSTA/SUREND into its mandatory
+            // surveyDateRange complex (S-65 §2.2.3.2) instead of flat dateStart/dateEnd.
+            if (qos) switch (at.code) {
+                s57.ATTR_SURSTA, s57.ATTR_SUREND => continue,
                 else => {},
             };
             if (catalogue.resolveAttrByCode(at.code)) |aname| {
@@ -823,6 +838,9 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // M_QUAL -> Quality of Bathymetric Data: deconstruct CATZOC into the
         // mandatory S-101 components + POSACC/SOUACC/SURSTA/SUREND (S-65 §2.2.3.1).
         if (qobd) try buildQualityOfBathymetricData(a, &attrs, &children, f);
+        // M_SREL -> Quality of Survey: the mandatory surveyDateRange from SURSTA/
+        // SUREND (§2.2.3.2). SURATH/SURTYP flow the generic loop (FC aliases).
+        if (qos) try buildSurveyDateRange(a, &children, f);
         // orientation / clearance complexes from their S-57 simple attrs, so the
         // route + bridge rules (NavigationLine, RecommendedTrack, SpanOpening) can
         // index feature.<complex>.<value> instead of erroring on a nil complex.
@@ -977,9 +995,13 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // 1/2/10 and collapses 3/6/7/8/9/11 to 4). The approximate-position dashed
         // line style is applied separately in the instruction-translation layer,
         // which reads the raw aggregate directly (s57_mvt cell.featureQuapos), so it
-        // is unaffected by this remap.
-        if (s65RemapQuapos(cell.featureQuapos(f))) |m|
-            try attrs.append(a, .{ .name = "qualityOfHorizontalMeasurement", .value = try std.fmt.allocPrint(a, "{d}", .{m}) });
+        // is unaffected by this remap. The per-class permitted list still applies —
+        // Quality of Survey allows only 4 (§2.2.3.2), so a doubtful-position 5 drops.
+        if (s65RemapQuapos(cell.featureQuapos(f))) |m| {
+            const qv = try std.fmt.allocPrint(a, "{d}", .{m});
+            const pv = try filterPermitted(a, code, "qualityOfHorizontalMeasurement", qv);
+            if (pv.len > 0) try attrs.append(a, .{ .name = "qualityOfHorizontalMeasurement", .value = pv });
+        }
 
         // Point geometry for `#P` spatial resolution: a point feature's node, with
         // z = VALSOU (a sounding/danger depth) when present. The framework needs a
@@ -1936,4 +1958,60 @@ test "Gap D: POSACC/SOUACC override the ZOC-derived uncertainties" {
     // double-emit at the root.
     try std.testing.expectEqual(@as(usize, 0), root.childCount("verticalUncertainty"));
     try std.testing.expectEqual(@as(?[]const u8, null), root.simpleValue("verticalUncertainty"));
+}
+
+test "Gap D: M_SREL adapts to QualityOfSurvey with surveyDateRange (render-neutral NullInstruction rule)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const attrs = [_]s57.Attr{
+        .{ .code = 150, .value = "NOAA" }, // SURATH -> surveyAuthority
+        .{ .code = 153, .value = "1" }, // SURTYP -> surveyType (1 = reconnaissance)
+        .{ .code = s57.ATTR_SUREND, .value = "19950601" },
+    };
+    const feats = [_]s57.Feature{.{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 310, .attrs = &attrs }}; // M_SREL
+    var cell = testCell(a, &feats);
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("QualityOfSurvey", adapted[0].code);
+    const root = &adapted[0].root;
+    try std.testing.expectEqualStrings("NOAA", root.simpleValue("surveyAuthority").?);
+    try std.testing.expectEqualStrings("1", root.simpleValue("surveyType").?);
+    const sdr = root.resolve("surveyDateRange:1").?;
+    try std.testing.expectEqualStrings("19950601", sdr.simpleValue("dateEnd").?);
+    // SUREND no longer forwards as a flat dateEnd.
+    try std.testing.expectEqual(@as(?[]const u8, null), root.simpleValue("dateEnd"));
+}
+
+test "Gap D: QualityOfSurvey restricts qualityOfHorizontalMeasurement to 4 (doubtful 5 drops)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A drawn VE edge with QUAPOS=5 (position doubtful): the aggregate remaps to 5,
+    // which the Quality of Survey permitted list [4] rejects — attribute absent.
+    const vectors = try a.alloc(s57.VectorRecord, 1);
+    vectors[0] = .{ .rcnm = s57.RCNM_VE, .rcid = 10, .points = &.{}, .soundings = &.{}, .quapos = 5 };
+    var edges = std.AutoHashMap(u32, usize).init(a);
+    try edges.put(10, 0);
+    const refs = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 10 }, .ornt = 1 }};
+    const feats = [_]s57.Feature{.{ .rcnm = 100, .rcid = 1, .prim = 2, .objl = 310, .refs = &refs }}; // M_SREL line
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = vectors,
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("QualityOfSurvey", adapted[0].code);
+    try std.testing.expectEqual(@as(?[]const u8, null), adapted[0].root.simpleValue("qualityOfHorizontalMeasurement"));
 }
