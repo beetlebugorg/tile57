@@ -68,3 +68,37 @@ test "golden Part-9 stream: opening vs fixed Bridge, DepthArea (BRIDGE->Bridge +
     try std.testing.expect(has(streams[2], "CHGRD"));
     try std.testing.expect(!has(streams[2], "BRIDGE01"));
 }
+
+test "golden Part-9 stream: M_QUAL quality fills (DQUAL from CATZOC, NODATA03 when absent)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const zoc_b = [_]s57.Attr{.{ .code = s57.ATTR_CATZOC, .value = "3" }}; // ZOC B
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 308, .attrs = &zoc_b }, // M_QUAL, assessed
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 308 }, // M_QUAL, bare (no CATZOC)
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 2), streams.len);
+
+    // [0] CATZOC=3 -> the DQUALB01 fill (unchanged by the Gap D deconstruction).
+    try std.testing.expect(has(streams[0], "AreaFillReference:DQUALB01"));
+
+    // [1] no CATZOC -> the NODATA03 "quality unknown" fill (S-52's bare-M_QUAL lookup
+    // line): the always-emitted zoneOfConfidence entry takes the rule's else branch.
+    // Before the deconstruction this feature emitted no fill at all (a silent miss).
+    try std.testing.expect(has(streams[1], "AreaFillReference:NODATA03"));
+}
