@@ -32,14 +32,19 @@ pub const Text = struct {
     offset_y: f64 = 0,
 };
 
-/// Map an S-101 TextAlignHorizontal to the tile `halign` value (oracle hAlign +
-/// halignName): "Center"->"center", "Right"->"right", anything else (incl. unset)
-/// ->"left".
+/// Map an S-100 Part 9 TextAlignHorizontal to the tile `halign`. The catalogue uses
+/// Start / Center / End (LTR: left / center / right) — it never emits the literal
+/// "Left"/"Right". "End" (right-aligned; 43 rules incl. every buoy/beacon name) must
+/// map to "right": otherwise it falls through to "left" and the label anchors on the
+/// wrong side of its symbol, landing over it. NOTE the oracle's hAlign shares this
+/// bug (handles "Center"/"Right" only, so End->left) — this deliberately diverges to
+/// the S-100-correct anchor so labels sit clear of their symbol (Right/Left kept for
+/// robustness).
 fn mapHAlign(s: []const u8) []const u8 {
     const t = std.mem.trim(u8, s, " ");
     if (std.mem.eql(u8, t, "Center")) return "center";
-    if (std.mem.eql(u8, t, "Right")) return "right";
-    return "left";
+    if (std.mem.eql(u8, t, "End") or std.mem.eql(u8, t, "Right")) return "right";
+    return "left"; // Start / Left / unset
 }
 
 /// Map an S-101 TextAlignVertical to the tile `valign` value (oracle vAlign +
@@ -579,4 +584,14 @@ test "parse OpText FontSize / TextAlign modifiers (and oracle left/bottom defaul
     // TextAlignVertical:Center maps to "middle" (not "center"), per valignName.
     const m = try parse(a, "TextAlignVertical:Center;TextInstruction:Baz");
     try std.testing.expectEqualStrings("middle", m.texts[0].valign);
+
+    // S-100 Part 9 Start/End (the catalogue's actual horizontal values, e.g. every
+    // buoy name uses End). End -> "right" (was falling through to "left"), Start ->
+    // "left". A buoy name (LocalOffset:-3.51,3.51;TextAlignHorizontal:End) resolves
+    // to halign "right" + loff "-1,1".
+    const e = try parse(a, "LocalOffset:-3.51,3.51;TextAlignHorizontal:End;TextInstruction:CR");
+    try std.testing.expectEqualStrings("right", e.texts[0].halign);
+    try std.testing.expectEqual(@as(f64, -3.51), e.texts[0].offset_x);
+    const st = try parse(a, "TextAlignHorizontal:Start;TextInstruction:Baz");
+    try std.testing.expectEqualStrings("left", st.texts[0].halign);
 }
