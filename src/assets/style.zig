@@ -580,12 +580,24 @@ fn contourLabelLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     try js.endObject();
 }
 
-// The soundings symbol layer (sprite required) for a SCAMIN bucket.
+// The soundings source-layer splits into two style layers by feature class.
+// Spot soundings (SOUNDG) are collision-culled (icon-allow-overlap false): the
+// dense spot field thins under MapLibre placement, a legibility trade. A DANGER
+// depth — a wreck/obstruction/rock sounding the baker routed here — is PART of
+// its S-52 symbol (WRECKS05/OBSTRN07 draw the digits with the DANGER01/02 mark),
+// so it is NEVER culled and rides its own always-on layer. With one shared
+// culled layer, a dense wreck field dropped most danger depths (observed: 33 of
+// 140 wreck digits surviving one Jamaica Bay creek view) and the bare danger
+// ovals read as "unknown hazard".
+const FILT_SPOT_SND = .{ "==", .{ "coalesce", .{ "get", "class" }, "SOUNDG" }, "SOUNDG" };
+const FILT_DANGER_SND = .{ "!=", .{ "coalesce", .{ "get", "class" }, "SOUNDG" }, "SOUNDG" };
+
+// The spot-soundings symbol layer (sprite required) for a SCAMIN bucket.
 fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, .{}, false, bkt, s.common, null);
+    try applyBucket(js, FILT_SPOT_SND, true, bkt, s.common, null);
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("icon-image");
@@ -594,6 +606,27 @@ fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     try writeScaled(js, ICON_SIZE, s.size_scale);
     try js.objectField("icon-allow-overlap");
     try js.write(false);
+    try js.endObject();
+    try js.endObject();
+}
+
+// The danger-depths symbol layer (see the class split above): same glyph
+// expression as spot soundings, but never collision-culled.
+fn dangerSoundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
+    var buf: [96]u8 = undefined;
+    try js.beginObject();
+    try layerHead(js, try std.fmt.bufPrint(&buf, "danger_soundings{s}", .{bkt.suffix}), "symbol", "soundings");
+    try applyBucket(js, FILT_DANGER_SND, true, bkt, s.common, null);
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("icon-image");
+    try js.write(s.sound_img);
+    try js.objectField("icon-size");
+    try writeScaled(js, ICON_SIZE, s.size_scale);
+    try js.objectField("icon-allow-overlap");
+    try js.write(true);
+    try js.objectField("icon-ignore-placement");
+    try js.write(true);
     try js.endObject();
     try js.endObject();
 }
@@ -774,6 +807,8 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .base);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .base);
         for (snd_buckets) |bkt| try soundingsLayer(js, &s, bkt);
+        // Danger depths — never collision-culled (see the soundings class split).
+        for (snd_buckets) |bkt| try dangerSoundingsLayer(js, &s, bkt);
         // Danger markers over soundings (hazard visibility — see DANGER_CLASSES).
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .dangers_only);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .dangers_only);
