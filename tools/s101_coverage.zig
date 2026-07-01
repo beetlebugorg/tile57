@@ -52,6 +52,8 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
     "surfaceCharacteristics",
     // CATMOR {1,2} -> categoryOfDolphin for MORFAC-routed Dolphin (same coding)
     "categoryOfDolphin",
+    // VALLMA -> valueOfLocalMagneticAnomaly.magneticAnomalyValue (LocalMagneticAnomaly)
+    "valueOfLocalMagneticAnomaly", "magneticAnomalyValue",
     // light sector + rhythm synthesis (s101_adapt.zig:376-431, 697-710)
     "sectorCharacteristics",   "lightSector",
     "sectorLimit",             "sectorLimitOne",

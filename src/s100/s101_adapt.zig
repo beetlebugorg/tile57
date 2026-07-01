@@ -605,6 +605,20 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (cm.len > 0) try attrs.append(a, .{ .name = "categoryOfDolphin", .value = cm });
         }
 
+        // LocalMagneticAnomaly reads feature.valueOfLocalMagneticAnomaly[1].magneticAnomalyValue
+        // to place the "(N°)" deviation label. S-57 VALLMA maps 1:1 to magneticAnomalyValue
+        // (same real degrees; FC alias), so wrap it as a single-instance complex. The
+        // optional referenceDirection (E/W) has no S-57 source and stays absent — the rule
+        // then formats the bare "(%.0f°)" branch.
+        if (std.mem.eql(u8, code, "LocalMagneticAnomaly")) {
+            const vlma = attrTrim(f, s57.ATTR_VALLMA);
+            if (vlma.len > 0) {
+                const subs = try a.alloc(NameVal, 1);
+                subs[0] = .{ .name = "magneticAnomalyValue", .value = vlma };
+                try appendChild(a, &children, "valueOfLocalMagneticAnomaly", .{ .simple = subs });
+            }
+        }
+
         // TOPMAR folding: a co-located TOPMAR's shape/colour -> the parent's
         // S-101 `topmark` complex (read by the TOPMAR02 CSP, which picks the
         // topmark symbol from topmarkDaymarkShape). Mirrors s101/complex.go.
@@ -827,6 +841,36 @@ test "MORFAC CATMOR=2 routes to Dolphin carrying categoryOfDolphin=2" {
     try std.testing.expectEqual(@as(usize, 1), adapted.len);
     try std.testing.expectEqualStrings("Dolphin", adapted[0].code);
     try std.testing.expectEqualStrings("2", adapted[0].root.resolve("").?.simpleValue("categoryOfDolphin").?);
+}
+
+test "VALLMA synthesizes valueOfLocalMagneticAnomaly[1].magneticAnomalyValue" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const attrs = [_]s57.Attr{.{ .code = s57.ATTR_VALLMA, .value = "7" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 78, .refs = &node_ref, .attrs = &attrs }, // LOCMAG
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("LocalMagneticAnomaly", adapted[0].code);
+    const root = &adapted[0].root;
+    try std.testing.expectEqual(@as(usize, 1), root.childCount("valueOfLocalMagneticAnomaly"));
+    try std.testing.expectEqualStrings("7", root.resolve("valueOfLocalMagneticAnomaly:1").?.simpleValue("magneticAnomalyValue").?);
 }
 
 test "s65RemapValue: TECSOU/QUASOU S-65 value conversion" {
