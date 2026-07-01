@@ -501,6 +501,18 @@ pub fn resolveClass(f: s57.Feature) ?[]const u8 {
         // to Landmark (its categoryOfLandmark is synthesized from CATCTR in adaptCell).
         // Without this it resolves to null and the feature is dropped entirely.
         s57.OBJL_CTRPNT => if (catalogue.hasFeature("Landmark")) return "Landmark",
+        // BRIDGE aliases three S-101 classes (Bridge/SpanFixed/SpanOpening); the
+        // catalogue's last-alias-wins map resolves objl 11 to SpanOpening, which draws
+        // EVERY bridge as an opening span (BRIDGE01 symbol) and leaves the primary
+        // Bridge structure rule dead. Route to the primary Bridge class (S-57 has no
+        // per-span object to fan out to); openingBridge is synthesized from CATBRG in
+        // adaptCell. A point bridge has no Bridge/Span primitive (Bridge.lua errors on
+        // Point), so re-model it to Landmark per S-65 §4.8.15.
+        s57.OBJL_BRIDGE => {
+            if (f.prim == 1) {
+                if (catalogue.hasFeature("Landmark")) return "Landmark";
+            } else if (catalogue.hasFeature("Bridge")) return "Bridge";
+        },
         else => {},
     }
     // Default: catalogue alias by numeric class, then by acronym for meta (M_*)
@@ -694,6 +706,17 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         if (std.mem.eql(u8, code, "Dolphin")) {
             const cm = attrTrim(f, s57.ATTR_CATMOR);
             if (cm.len > 0) try attrs.append(a, .{ .name = "categoryOfDolphin", .value = cm });
+        }
+
+        // Bridge.lua branches on feature.openingBridge to add the opening-bridge symbol
+        // (BRIDGE01). It has no S-57 alias (a producer boolean), so derive it from CATBRG
+        // per S-52 (Bridge.lua:55): categories 2..8 (opening / swing / lifting / bascule /
+        // pontoon / draw / transporter) are opening; 1 (fixed) is not. S-57 BRIDGE carries
+        // a single CATBRG. (categoryOfOpeningBridge, which aliases CATBRG, flows through the
+        // generic loop + filterPermitted [3,4,5,7] for a valid model, but no rule reads it.)
+        if (std.mem.eql(u8, code, "Bridge")) {
+            const cb = firstListVal(attrTrim(f, s57.ATTR_CATBRG));
+            if (cb >= 2 and cb <= 8) try attrs.append(a, .{ .name = "openingBridge", .value = "true" });
         }
 
         // CTRPNT -> Landmark reads feature.categoryOfLandmark to pick its symbol. That
@@ -1061,6 +1084,43 @@ test "Gate routes HORCLR to horizontalClearanceOpen, not horizontalClearanceFixe
     try std.testing.expectEqualStrings("12.5", root.resolve("horizontalClearanceOpen:1").?.simpleValue("horizontalClearanceValue").?);
     // …and NOT the class-invalid horizontalClearanceFixed.
     try std.testing.expectEqual(@as(usize, 0), root.childCount("horizontalClearanceFixed"));
+}
+
+test "BRIDGE re-models: line -> Bridge (openingBridge from CATBRG), point -> Landmark" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    const opening = [_]s57.Attr{.{ .code = s57.ATTR_CATBRG, .value = "2" }}; // opening
+    const fixed = [_]s57.Attr{.{ .code = s57.ATTR_CATBRG, .value = "1" }}; // fixed
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 2, .objl = s57.OBJL_BRIDGE, .attrs = &opening }, // line, opening
+        .{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = s57.OBJL_BRIDGE, .attrs = &fixed }, // line, fixed
+        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = s57.OBJL_BRIDGE, .refs = &node_ref }, // point
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 3), adapted.len);
+    // CATBRG=2 (opening): Bridge with openingBridge=true (drives the BRIDGE01 symbol).
+    try std.testing.expectEqualStrings("Bridge", adapted[0].code);
+    try std.testing.expectEqualStrings("true", adapted[0].root.resolve("").?.simpleValue("openingBridge").?);
+    // CATBRG=1 (fixed): Bridge, no openingBridge (drawn as a plain fixed bridge).
+    try std.testing.expectEqualStrings("Bridge", adapted[1].code);
+    try std.testing.expectEqual(@as(?[]const u8, null), adapted[1].root.resolve("").?.simpleValue("openingBridge"));
+    // Point bridge -> Landmark (Bridge.lua has no Point branch; S-65 §4.8.15).
+    try std.testing.expectEqualStrings("Landmark", adapted[2].code);
 }
 
 test "s65RemapValue: TECSOU/QUASOU S-65 value conversion" {

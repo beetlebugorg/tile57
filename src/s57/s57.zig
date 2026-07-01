@@ -500,9 +500,11 @@ pub const ATTR_SIGGRP: u16 = 141; // signal group -> signalGroup
 pub const ATTR_SIGPER: u16 = 142; // signal period -> signalPeriod
 pub const ATTR_VALNMR: u16 = 178; // value of nominal range -> valueOfNominalRange
 pub const ATTR_CATCTR: u16 = 16; // category of control point -> categoryOfLandmark (S-65 §4.3: 1->22, 5->23)
+pub const ATTR_CATBRG: u16 = 9; // category of bridge -> openingBridge (2..8 = opening) + categoryOfOpeningBridge
 
 pub const OBJL_ADMARE: u16 = 1; // ADMARE: administration area
 pub const OBJL_CTRPNT: u16 = 33; // CTRPNT: control point -> Landmark (S-65 §4.3)
+pub const OBJL_BRIDGE: u16 = 11; // BRIDGE: -> Bridge (line/area) / Landmark (point); openingBridge from CATBRG
 pub const OBJL_LNDARE: u16 = 71; // LNDARE: land area (inTheWater land/water test)
 pub const OBJL_LIGHTS: u16 = 75; // LIGHTS: attribute-dependent class routing
 pub const OBJL_MORFAC: u16 = 84; // MORFAC: mooring/warping facility (CATMOR-routed)
