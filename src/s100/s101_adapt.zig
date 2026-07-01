@@ -335,6 +335,32 @@ fn firstListVal(csv: []const u8) i64 {
     return std.fmt.parseInt(i64, std.mem.trim(u8, first, " "), 10) catch 0;
 }
 
+// S-101 natureOfSurface allowable enumerate list (FeatureCatalogue.xml). S-57
+// NATSUR can carry values off this list (10 marsh, 12/13, 15/16); S-65 Annex B
+// says off-list values "will not convert" — and SeabedArea.lua's abbrev table
+// (keyed by exactly this set) would nil-concat and error under pcall on one, so
+// dropping them is both conformance-correct and crash-safe.
+const NATURE_OF_SURFACE_ALLOWED = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14, 17, 18 };
+
+/// NATSUR (nature of surface) is an S-57 list; S-101 models each value as its own
+/// surfaceCharacteristics complex instance carrying one natureOfSurface (shared
+/// enum, no value remap). SeabedArea's rule iterates feature.surfaceCharacteristics
+/// and reads [i].natureOfSurface for the SEABED abbreviation text and rock-ledge
+/// fill; without this it silent-defaults to the plain fill. Off-list values drop.
+fn buildSurfaceCharacteristics(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry), f: s57.Feature) !void {
+    const natsur = attrTrim(f, s57.ATTR_NATSUR);
+    if (natsur.len == 0) return;
+    var it = std.mem.splitScalar(u8, natsur, ',');
+    while (it.next()) |p| {
+        const t = std.mem.trim(u8, p, " ");
+        const n = std.fmt.parseInt(i64, t, 10) catch continue;
+        if (std.mem.indexOfScalar(i64, &NATURE_OF_SURFACE_ALLOWED, n) == null) continue;
+        const subs = try a.alloc(NameVal, 1);
+        subs[0] = .{ .name = "natureOfSurface", .value = t };
+        try appendChild(a, children, "surfaceCharacteristics", .{ .simple = subs });
+    }
+}
+
 /// MORFAC (mooring/warping facility) decomposes by CATMOR into distinct point
 /// classes (no single alias). Port of complex.go resolveMooringClass.
 fn resolveMooringClass(f: s57.Feature) ?[]const u8 {
@@ -513,6 +539,10 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (!present) try appendChild(a, &children, "verticalClearanceClosed", .{});
         }
 
+        // SeabedArea reads feature.surfaceCharacteristics[i].natureOfSurface; split
+        // the S-57 NATSUR list into per-value complex instances (off-list values drop).
+        if (std.mem.eql(u8, code, "SeabedArea")) try buildSurfaceCharacteristics(a, &children, f);
+
         // TOPMAR folding: a co-located TOPMAR's shape/colour -> the parent's
         // S-101 `topmark` complex (read by the TOPMAR02 CSP, which picks the
         // topmark symbol from topmarkDaymarkShape). Mirrors s101/complex.go.
@@ -676,6 +706,37 @@ test "CURVEL synthesizes the speed complex (speed.speedMaximum)" {
     const root = &adapted[0].root;
     try std.testing.expectEqual(@as(usize, 1), root.childCount("speed"));
     try std.testing.expectEqualStrings("2.5", root.resolve("speed:1").?.simpleValue("speedMaximum").?);
+}
+
+test "NATSUR splits into surfaceCharacteristics instances, off-list values drop" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // NATSUR "4,10,9": 4 (sand) and 9 (rock) are S-101-allowable; 10 (marsh) is not.
+    const attrs = [_]s57.Attr{.{ .code = s57.ATTR_NATSUR, .value = "4,10,9" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 121, .attrs = &attrs }, // SBDARE surface
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("SeabedArea", adapted[0].code);
+    const root = &adapted[0].root;
+    // 10 dropped -> exactly two instances, order preserved (4 then 9).
+    try std.testing.expectEqual(@as(usize, 2), root.childCount("surfaceCharacteristics"));
+    try std.testing.expectEqualStrings("4", root.resolve("surfaceCharacteristics:1").?.simpleValue("natureOfSurface").?);
+    try std.testing.expectEqualStrings("9", root.resolve("surfaceCharacteristics:2").?.simpleValue("natureOfSurface").?);
 }
 
 test "resolveLightClass routes by sector limits / CATLIT" {

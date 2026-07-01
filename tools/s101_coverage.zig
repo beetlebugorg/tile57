@@ -47,6 +47,9 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
     // current velocity CURVEL -> speed.speedMaximum (s101_adapt.zig complex_from_simple)
     "speed",                   "speedMaximum",
     "speedMinimum",
+    // NATSUR list -> surfaceCharacteristics[].natureOfSurface for SeabedArea
+    // (s101_adapt.zig buildSurfaceCharacteristics; off-list values dropped)
+    "surfaceCharacteristics",
     // light sector + rhythm synthesis (s101_adapt.zig:376-431, 697-710)
     "sectorCharacteristics",   "lightSector",
     "sectorLimit",             "sectorLimitOne",

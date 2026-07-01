@@ -490,6 +490,7 @@ pub const ATTR_COLOUR: u16 = 75; // colour -> topmark.colour (and the simple `co
 pub const ATTR_CATLIT: u16 = 37; // category of light (1 directional, 6 air obstruction, 7 fog detector)
 pub const ATTR_CATMOR: u16 = 40; // category of mooring/warping facility -> MORFAC class routing
 pub const ATTR_CURVEL: u16 = 84; // current velocity (knots) -> speed.speedMaximum
+pub const ATTR_NATSUR: u16 = 113; // nature of surface (list) -> surfaceCharacteristics[].natureOfSurface
 pub const ATTR_SECTR1: u16 = 136; // sector limit one -> sectorLimitOne.sectorBearing
 pub const ATTR_SECTR2: u16 = 137; // sector limit two -> sectorLimitTwo.sectorBearing
 pub const ATTR_LITCHR: u16 = 107; // light characteristic -> lightCharacteristic
