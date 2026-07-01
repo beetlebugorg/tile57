@@ -63,8 +63,8 @@ long tile57_diag_lua_selftest(void) {
 const char *tile57_diag_lua_version(void) { return LUA_VERSION; }
 
 /* Value of the TILE57_S101_RULES env var (S-101 rules dir), or NULL. (Zig
- * 0.16's env access is behind Io; reading it here keeps tile57_source_open simple.)
- * Used only as a fallback when tile57_source_open's rules_dir argument is NULL. */
+ * 0.16's env access is behind Io; reading it here keeps the rules lookup simple.)
+ * Used only as a fallback when a caller's rules_dir argument is NULL. */
 const char *tg_env_rules(void) { return getenv("TILE57_S101_RULES"); }
 
 /* Suppress the per-cell "[s101] portrayed …" stderr summary. Set once before a

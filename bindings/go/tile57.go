@@ -10,9 +10,9 @@
 // below link it by a path relative to this package, so an importing module needs a
 // `replace` pointing at a local checkout (see this package's README).
 //
-// A [Source] opens a PMTiles archive or one-or-more raw S-57 cells and serves
-// decompressed Mapbox Vector Tiles by (z, x, y); its method set (Tile, Meta,
-// ZoomRange, Bounds, …) satisfies a host's tile-source interface directly. libtile57
+// A [Source] opens a path, in-memory ENC cell, or baked PMTiles bundle and serves
+// decompressed Mapbox Vector Tiles by (z, x, y); its method set (Tile, Info, Meta,
+// Scamin, …) satisfies a host's tile-source interface directly. libtile57
 // is NOT internally synchronized, so every call into a Source is guarded by a mutex.
 package tile57
 
@@ -28,15 +28,6 @@ import (
 	"fmt"
 	"sync"
 	"unsafe"
-)
-
-// Format selects (or reports) a Source's on-disk backend.
-type Format int
-
-const (
-	FormatAuto    Format = C.TILE57_FORMAT_AUTO     // sniff PMTiles then S-57
-	FormatPMTiles Format = C.TILE57_FORMAT_PMTILES  // a PMTiles archive
-	FormatS57Cell Format = C.TILE57_FORMAT_S57_CELL // a raw S-57 ENC cell
 )
 
 // PickAttrs selects whether baked/opened tiles carry the per-feature pick-report
@@ -67,19 +58,19 @@ type Meta struct {
 	Scamin           []uint32 // distinct SCAMIN denominators present (ascending)
 }
 
-// Source is an open libtile57 chart tile source. Construct it with [OpenBytes] or
-// [OpenCells]; release it with [Source.Close]. It is safe for concurrent use: the
+// Source is an open libtile57 chart. Construct it with [Open], [OpenChartBytes], or
+// [OpenPMTiles]; release it with [Source.Close]. It is safe for concurrent use: the
 // underlying handle is not thread-safe, so calls are serialized internally.
 type Source struct {
 	mu  sync.Mutex
-	ptr *C.tile57_source
+	ptr *C.tile57_chart
 	// scamin caches the SCAMIN manifest — for a cell/ENC_ROOT source the ABI scans
 	// every cell's features to compute it, so it is resolved once on first use.
 	scamin     []uint32
 	scaminDone bool
 }
 
-// CellInput is one ENC cell for [OpenCells] / [BakeCells]: the base .000 bytes
+// CellInput is one ENC cell for [BakeCells]: the base .000 bytes
 // plus its sequential update files (.001, .002, … in order).
 type CellInput struct {
 	Base    []byte
@@ -87,49 +78,6 @@ type CellInput struct {
 	// Name is the source cell name (e.g. "US4MD81M"), emitted as the `cell`
 	// pick-report property on every feature from this cell. "" = omit it.
 	Name string
-}
-
-// OpenBytes opens a tile source from in-memory bytes (a PMTiles archive or a raw
-// S-57 cell). rulesDir overrides the S-101 portrayal rules directory (used only
-// for S-57 cells); "" selects the built-in default. The bytes are copied.
-func OpenBytes(data []byte, format Format, rulesDir string) (*Source, error) {
-	if len(data) == 0 {
-		return nil, fmt.Errorf("tile57: empty source bytes: %w", ErrEmptyInput)
-	}
-	cRules, freeRules := cStringOrNil(rulesDir)
-	defer freeRules()
-	ptr := C.tile57_source_open(
-		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)),
-		C.tile57_format(format), cRules)
-	if ptr == nil {
-		return nil, fmt.Errorf("tile57: failed to open source (%d bytes)", len(data))
-	}
-	return &Source{ptr: ptr}, nil
-}
-
-// OpenCells opens an ENC_ROOT as a multi-cell source: every cell is overlaid when
-// a tile is generated, so a region spanning several cells renders them all. All
-// bytes are copied. rulesDir is as in [OpenBytes]. pick selects the per-feature
-// pick-report properties (class/cell/s57): [PickInclude] (the zero value) keeps them
-// for a cursor-pick report, [PickOmit] drops them for a leaner source.
-func OpenCells(cells []CellInput, rulesDir string, pick PickAttrs) (*Source, error) {
-	if len(cells) == 0 {
-		return nil, fmt.Errorf("tile57: no cells: %w", ErrEmptyInput)
-	}
-	cRules, freeRules := cStringOrNil(rulesDir)
-	defer freeRules()
-
-	// Build the C cell array entirely in C memory (CBytes / malloc), so the array
-	// passed to C holds only C pointers — Go pointers in C-passed memory would trip
-	// cgocheck. libtile57 copies everything during the call, so we free it after.
-	arena := &cArena{}
-	defer arena.free()
-	inputs, base := arena.cellInputs(cells)
-	ptr := C.tile57_source_open_cells(base, C.size_t(len(inputs)), cRules, cPick(pick))
-	if ptr == nil {
-		return nil, fmt.Errorf("tile57: failed to open %d cell(s)", len(cells))
-	}
-	return &Source{ptr: ptr}, nil
 }
 
 // Open opens an on-disk ENC_ROOT directory (or a single .000 file) as a STREAMING
@@ -211,7 +159,7 @@ func (s *Source) Tile(z uint8, x, y uint32) ([]byte, error) {
 	}
 	var out *C.uint8_t
 	var outLen C.size_t
-	st := C.tile57_tile_get(s.ptr, C.uint8_t(z), C.uint32_t(x), C.uint32_t(y), &out, &outLen)
+	st := C.tile57_chart_tile(s.ptr, C.uint8_t(z), C.uint32_t(x), C.uint32_t(y), &out, &outLen)
 	switch st {
 	case C.TILE57_TILE_OK:
 		return tileBytes(out, outLen), nil
@@ -234,12 +182,11 @@ func (s *Source) Meta() Meta {
 	if s.ptr == nil {
 		return m
 	}
-	var mn, mx C.uint8_t
-	C.tile57_source_zoom_range(s.ptr, &mn, &mx)
-	m.MinZoom, m.MaxZoom = uint8(mn), uint8(mx)
-	var w, so, e, n C.double
-	if bool(C.tile57_source_bounds(s.ptr, &w, &so, &e, &n)) {
-		m.W, m.S, m.E, m.N = float64(w), float64(so), float64(e), float64(n)
+	var ci C.tile57_chart_info
+	C.tile57_chart_get_info(s.ptr, &ci)
+	m.MinZoom, m.MaxZoom = uint8(ci.min_zoom), uint8(ci.max_zoom)
+	if bool(ci.has_bounds) {
+		m.W, m.S, m.E, m.N = float64(ci.west), float64(ci.south), float64(ci.east), float64(ci.north)
 	}
 	m.Scamin = s.scaminLocked()
 	return m
@@ -264,77 +211,16 @@ func (s *Source) scaminLocked() []uint32 {
 	s.scaminDone = true
 	var out *C.int32_t
 	var n C.size_t
-	if C.tile57_source_scamin(s.ptr, &out, &n) == 1 && out != nil && n > 0 {
+	if C.tile57_chart_scamin(s.ptr, &out, &n) == 1 && out != nil && n > 0 {
 		vals := unsafe.Slice(out, int(n))
 		res := make([]uint32, n)
 		for i, v := range vals {
 			res[i] = uint32(v)
 		}
-		C.tile57_tile_free((*C.uint8_t)(unsafe.Pointer(out)), n*C.size_t(unsafe.Sizeof(C.int32_t(0))))
+		C.tile57_free(unsafe.Pointer(out), n*C.size_t(unsafe.Sizeof(C.int32_t(0))))
 		s.scamin = res
 	}
 	return s.scamin
-}
-
-// ZoomRange reports the min/max zoom the source serves.
-func (s *Source) ZoomRange() (min, max uint8) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return 0, 0
-	}
-	var mn, mx C.uint8_t
-	C.tile57_source_zoom_range(s.ptr, &mn, &mx)
-	return uint8(mn), uint8(mx)
-}
-
-// Bands is a bitmask of the navigational bands present (bit r = band rank r has a
-// cell; 0=berthing/finest .. 5=overview/coarsest). 0 for a single cell / PMTiles.
-func (s *Source) Bands() uint32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return 0
-	}
-	return uint32(C.tile57_source_bands(s.ptr))
-}
-
-// Bounds reports the source's geographic extent (west, south, east, north in
-// degrees); ok is false when libtile57 reports a degenerate/near-global extent
-// (the caller should then choose its own camera).
-func (s *Source) Bounds() (west, south, east, north float64, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return 0, 0, 0, 0, false
-	}
-	var w, so, e, n C.double
-	ok = bool(C.tile57_source_bounds(s.ptr, &w, &so, &e, &n))
-	return float64(w), float64(so), float64(e), float64(n), ok
-}
-
-// Anchor returns a good initial camera (center lat/lon + zoom) for a lazy
-// ENC_ROOT source where fitting the whole extent would zoom out uselessly; ok is
-// false when the caller should fit-to-bounds instead.
-func (s *Source) Anchor() (lat, lon, zoom float64, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return 0, 0, 0, false
-	}
-	var la, lo, z C.double
-	ok = bool(C.tile57_source_anchor(s.ptr, &la, &lo, &z))
-	return float64(la), float64(lo), float64(z), ok
-}
-
-// Format reports the resolved backend (meaningful after a FormatAuto open).
-func (s *Source) Format() Format {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return FormatAuto
-	}
-	return Format(C.tile57_source_format(s.ptr))
 }
 
 // ClearCache drops the in-memory tile cache to bound memory in long-running hosts.
@@ -342,7 +228,7 @@ func (s *Source) ClearCache() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ptr != nil {
-		C.tile57_source_clear_cache(s.ptr)
+		C.tile57_chart_clear_cache(s.ptr)
 	}
 }
 
@@ -353,7 +239,7 @@ func (s *Source) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ptr != nil {
-		C.tile57_source_close(s.ptr)
+		C.tile57_chart_close(s.ptr)
 		s.ptr = nil
 	}
 	return nil
@@ -369,7 +255,7 @@ func tileBytes(p *C.uint8_t, n C.size_t) []byte {
 	if n > 0 {
 		b = C.GoBytes(unsafe.Pointer(p), C.int(n))
 	}
-	C.tile57_tile_free(p, n)
+	C.tile57_free(unsafe.Pointer(p), n)
 	return b
 }
 

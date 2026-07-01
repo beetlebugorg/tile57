@@ -2,7 +2,7 @@
 //!
 //! Contract: POD across the seam (ptr/len + status codes); Zig errors, slices
 //! and optionals stay inside source.zig. Public header: ../../include/tile57.h.
-//! The opaque `tile57_source` is a `*source.Source`.
+//! The opaque `tile57_chart` is a `*source.Source`.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -28,25 +28,6 @@ extern fn time(tloc: ?*c_long) callconv(.c) c_long;
 // Keep in sync with the TILE57_VERSION_* macros in tile57.h.
 const version_string = "0.1.0";
 
-// Mirrors tile57_format in tile57.h.
-const CFormat = enum(c_int) { auto = 0, pmtiles = 1, s57_cell = 2 };
-
-fn cFormat(f: source.Format) c_int {
-    return @intFromEnum(@as(CFormat, switch (f) {
-        .auto => .auto,
-        .pmtiles => .pmtiles,
-        .s57_cell => .s57_cell,
-    }));
-}
-
-fn zigFormat(format: c_int) source.Format {
-    return switch (format) {
-        @intFromEnum(CFormat.pmtiles) => .pmtiles,
-        @intFromEnum(CFormat.s57_cell) => .s57_cell,
-        else => .auto,
-    };
-}
-
 fn spanOpt(s: ?[*:0]const u8) ?[]const u8 {
     return if (s) |p| std.mem.span(p) else null;
 }
@@ -54,16 +35,6 @@ fn spanOpt(s: ?[*:0]const u8) ?[]const u8 {
 /// Return the library version string ("0.1.0").
 export fn tile57_version() callconv(.c) [*:0]const u8 {
     return version_string;
-}
-
-/// Open a chart tile source from in-memory bytes. See tile57.h.
-export fn tile57_source_open(
-    data_ptr: [*]const u8,
-    data_len: usize,
-    format: c_int,
-    rules_dir: ?[*:0]const u8,
-) callconv(.c) ?*Source {
-    return Source.openBytes(data_ptr[0..data_len], zigFormat(format), spanOpt(rules_dir)) catch null;
 }
 
 // One ENC cell's bytes for the C ABI. Mirrors tile57_cell_input in tile57.h.
@@ -97,37 +68,7 @@ fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]source.Cell
     return out;
 }
 
-/// Open an ENC_ROOT as a multi-cell source. See tile57.h.
-export fn tile57_source_open_cells(
-    cells_ptr: [*]const CellInput,
-    count: usize,
-    rules_dir: ?[*:0]const u8,
-    omit_pick_attrs: c_int,
-) callconv(.c) ?*Source {
-    if (count == 0) return null;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return null;
-    return Source.openCells(cells, spanOpt(rules_dir), omit_pick_attrs == 0) catch null;
-}
-
-/// Open a streaming ENC_ROOT source: host supplies per-cell metadata + a reader
-/// that returns a cell's bytes on demand (read on first tile use, freed on LRU
-/// eviction). See tile57.h. `metas`/`read`/`user` map to source.openCellsStreaming.
-export fn tile57_source_open_cells_streaming(
-    metas: [*]const source.CellMeta,
-    count: usize,
-    read: source.CellReadFn,
-    user: ?*anyopaque,
-    rules_dir: ?[*:0]const u8,
-    omit_pick_attrs: c_int,
-) callconv(.c) ?*Source {
-    if (count == 0) return null;
-    return Source.openCellsStreaming(metas[0..count], read, user, spanOpt(rules_dir), omit_pick_attrs == 0) catch null;
-}
-
 /// Open an on-disk ENC_ROOT directory (or single .000) as a streaming chart. See tile57.h.
-/// (chart-api.md — additive during the source->chart migration.)
 export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Source {
     const p = spanOpt(path) orelse return null;
     return Source.openPath(p, null, true) catch null;
@@ -276,40 +217,17 @@ export fn tile57_bake_bundle(
     return 1;
 }
 
-/// The resolved backend format (after a TILE57_FORMAT_AUTO sniff).
-export fn tile57_source_format(src: ?*Source) callconv(.c) c_int {
-    const s = src orelse return @intFromEnum(CFormat.auto);
-    return cFormat(s.format());
+/// Release a chart and all cached tiles. See tile57.h.
+export fn tile57_chart_close(chart: ?*Source) callconv(.c) void {
+    if (chart) |s| s.deinit();
 }
 
-export fn tile57_source_close(src: ?*Source) callconv(.c) void {
-    if (src) |s| s.deinit();
-}
-
-/// Min/max zoom served by the source.
-export fn tile57_source_zoom_range(src: ?*Source, min_z: *u8, max_z: *u8) callconv(.c) void {
-    const s = src orelse {
-        min_z.* = 0;
-        max_z.* = 0;
-        return;
-    };
-    const zr = s.zoomRange();
-    min_z.* = zr.min;
-    max_z.* = zr.max;
-}
-
-/// Bitmask of the navigational bands present in the source.
-export fn tile57_source_bands(src: ?*Source) callconv(.c) u32 {
-    const s = src orelse return 0;
-    return s.bands();
-}
-
-/// The distinct SCAMIN denominators present in the source (the live SCAMIN manifest;
+/// The distinct SCAMIN denominators present in the chart (the live SCAMIN manifest;
 /// see tile57.h). On success returns 1 with *out pointing at *out_len int32 values
-/// (ascending), 0 if there are none; -1 on error. Free *out with tile57_tile_free
+/// (ascending), 0 if there are none; -1 on error. Free *out with tile57_free
 /// ((uint8_t*)*out, *out_len * sizeof(int32_t)).
-export fn tile57_source_scamin(src: ?*Source, out: *[*]i32, out_len: *usize) callconv(.c) c_int {
-    const s = src orelse return -1;
+export fn tile57_chart_scamin(chart: ?*Source, out: *[*]i32, out_len: *usize) callconv(.c) c_int {
+    const s = chart orelse return -1;
     const vals = s.scamin() catch return -1;
     if (vals.len == 0) {
         source.freeBytes(@as([*]u8, @ptrCast(vals.ptr))[0 .. vals.len * @sizeOf(u32)]);
@@ -321,37 +239,16 @@ export fn tile57_source_scamin(src: ?*Source, out: *[*]i32, out_len: *usize) cal
     return 1;
 }
 
-/// Geographic bounds (west,south,east,north degrees); true when known.
-export fn tile57_source_bounds(src: ?*Source, w: *f64, s: *f64, e: *f64, n: *f64) callconv(.c) bool {
-    const so = src orelse return false;
-    const b = so.bounds() orelse return false;
-    w.* = b[0];
-    s.* = b[1];
-    e.* = b[2];
-    n.* = b[3];
-    return true;
-}
-
-/// A good initial camera (center lat/lon + zoom) on real data; true when set.
-export fn tile57_source_anchor(src: ?*Source, lat: *f64, lon: *f64, zoom: *f64) callconv(.c) bool {
-    const so = src orelse return false;
-    const a = so.anchor() orelse return false;
-    lat.* = a.lat;
-    lon.* = a.lon;
-    zoom.* = a.zoom;
-    return true;
-}
-
 /// Fetch tile (z,x,y) as MVT bytes. 1=OK + out/out_len, 0=empty, -1=error.
-export fn tile57_tile_get(
-    src: ?*Source,
+export fn tile57_chart_tile(
+    chart: ?*Source,
     z: u8,
     x: u32,
     y: u32,
     out: *[*]u8,
     out_len: *usize,
 ) callconv(.c) c_int {
-    const s = src orelse return -1;
+    const s = chart orelse return -1;
     const r = s.tile(z, x, y) catch return -1;
     if (r) |bytes| {
         out.* = bytes.ptr;
@@ -361,28 +258,23 @@ export fn tile57_tile_get(
     return 0;
 }
 
-export fn tile57_tile_free(ptr: ?[*]u8, len: usize) callconv(.c) void {
-    const p = ptr orelse return;
-    source.freeBytes(p[0..len]);
-}
-
 /// Free any engine-returned buffer (tiles, style, scamin array, colortables, …). See tile57.h.
-/// (chart-api.md — the universal free; supersedes tile57_tile_free.)
+/// (chart-api.md — the universal free.)
 export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {
     const p = ptr orelse return;
     source.freeBytes(@as([*]u8, @ptrCast(p))[0..len]);
 }
 
 /// Drop the in-memory tile cache (bounds memory in long-running hosts).
-export fn tile57_source_clear_cache(src: ?*Source) callconv(.c) void {
-    if (src) |s| s.clearCache();
+export fn tile57_chart_clear_cache(chart: ?*Source) callconv(.c) void {
+    if (chart) |s| s.clearCache();
 }
 
 // ---- portrayal asset generation (in-memory; mirrors tile57.h) --------------
 //
 // Generate the S-101 portrayal assets at runtime from in-memory catalogue bytes
 // (the host reads the files; capi never touches the filesystem). All outputs are
-// page-allocator-owned — free with tile57_tile_free.
+// page-allocator-owned — free with tile57_free.
 
 // A named blob: NUL-terminated id + bytes. Mirrors tile57_named_bytes in tile57.h.
 const NamedBytes = extern struct {
@@ -425,7 +317,7 @@ fn embeddedColorProfileXml() ?[]const u8 {
 
 /// S-52 colortables.json from the colour profile baked into the library — no
 /// on-disk catalogue needed. Pair with tile57_style_template / tile57_build_style.
-/// 1=ok + out/out_len (free with tile57_tile_free), 0=error.
+/// 1=ok + out/out_len (free with tile57_free), 0=error.
 export fn tile57_colortables_default(out: *[*]u8, out_len: *usize) callconv(.c) c_int {
     const xml = embeddedColorProfileXml() orelse return 0;
     const json = assets.colorTablesJson(gpa, xml) catch return 0;
@@ -446,7 +338,7 @@ export fn tile57_linestyles(srcs: [*]const NamedBytes, count: usize, out: *[*]u8
 }
 
 /// Sprite atlas (sprite.json + sprite.png) from the S-101 Symbols/*.svg + a
-/// palette CSS. 1=ok with both buffers set (free each with tile57_tile_free), 0=error.
+/// palette CSS. 1=ok with both buffers set (free each with tile57_free), 0=error.
 export fn tile57_sprite_atlas(
     svgs: [*]const NamedBytes,
     count: usize,
@@ -593,7 +485,7 @@ fn scaminBuf(scamin: ?[*]const i32, scamin_count: usize) ![]u32 {
 }
 
 /// Build a MapLibre style JSON from a template + mariner settings + colortables.
-/// 1=ok + out/out_len (free with tile57_tile_free), 0=error.
+/// 1=ok + out/out_len (free with tile57_free), 0=error.
 export fn tile57_build_style(
     template_json: [*]const u8,
     template_len: usize,
@@ -632,7 +524,7 @@ export fn tile57_build_style(
 /// Compute the minimal MapLibre style-mutation ops to turn the style for `old_m`
 /// into the style for `new_m` (same template/colortables/bands/scamin inputs as
 /// tile57_build_style, so the two styles are comparable). Writes a JSON op array to
-/// out/out_len (free with tile57_tile_free): "[]" when nothing changed, one op per
+/// out/out_len (free with tile57_free): "[]" when nothing changed, one op per
 /// differing filter/paint/layout key, or [{"op":"rebuild"}] when the two mariners
 /// would produce a different SET of layers (host falls back to a full setStyle).
 /// 1=ok, 0=error. See style-diff.md.
@@ -681,7 +573,7 @@ export fn tile57_style_diff(
 /// {z}/{x}/{y} chart tiles URL (NULL -> a default pmtiles:// source). `sprite` /
 /// `glyphs` are base URLs that enable the symbol / text layers (NULL omits them).
 /// `minzoom` / `maxzoom` of 0 -> engine defaults. 1=ok + out/out_len (free with
-/// tile57_tile_free), 0=error.
+/// tile57_free), 0=error.
 export fn tile57_style_template(
     scheme: c_int,
     source_tiles: ?[*:0]const u8,

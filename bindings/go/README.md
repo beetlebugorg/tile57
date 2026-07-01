@@ -38,7 +38,7 @@ import tile57 "github.com/beetlebugorg/chartplotter-native/bindings/go"
 cells, bbox, err := tile57.BakeBundle("/enc/ENC_ROOT", "/out/bundle", "", "", "", 0, 16, nil)
 
 // Or serve tiles live, and publish the SCAMIN manifest for the style.
-src, _ := tile57.OpenCells(inputs, "")
+src, _ := tile57.Open("/enc/ENC_ROOT")
 defer src.Close()
 mvt, _ := src.Tile(13, 2359, 3139)
 manifest := src.Scamin() // []uint32, ascending
@@ -46,8 +46,8 @@ manifest := src.Scamin() // []uint32, ascending
 
 ## Surface
 
-- **Sources** — `OpenBytes`, `OpenCells`, `OpenCellsStreaming`; `Source.Tile`,
-  `Meta`, `ZoomRange`, `Bounds`, `Anchor`, `Bands`, `Scamin`, `Format`,
+- **Charts** — `Open` (path, streaming), `OpenChartBytes` (one in-memory cell),
+  `OpenPMTiles` (baked bundle); `Source.Tile`, `Info`, `Meta`, `Scamin`,
   `ClearCache`, `Close`.
 - **Bake** — `BakeCells` (→ one PMTiles archive in memory), `BakeBundle` (→ a full
   on-disk bundle: tiles + assets + per-scheme styles + manifest).

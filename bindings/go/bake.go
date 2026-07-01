@@ -40,9 +40,9 @@ import (
 	"unsafe"
 )
 
-// BakeCells bakes a whole ENC_ROOT (the same cells [OpenCells] overlays) into ONE
-// zoom-banded PMTiles archive, so the result opens cheaply via [OpenBytes] with
-// [FormatPMTiles]. minZoom/maxZoom clamp the per-cell bands (pass 0/0 for no
+// BakeCells bakes an ENC_ROOT's in-memory cells into ONE zoom-banded PMTiles
+// archive (write it to a file and open cheaply via [OpenPMTiles], instead of
+// generating tiles live). minZoom/maxZoom clamp the per-cell bands (pass 0/0 for no
 // clamp — the ABI treats 0/24 as unclamped, and 0 max means "no cap"). progress,
 // if non-nil, is called with a [BakeProgress] per update: stage 0 = loading/
 // portraying cells, stage 1 = baking tiles (per-band done/total + band label).

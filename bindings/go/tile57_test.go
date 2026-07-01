@@ -28,44 +28,41 @@ func TestColortablesDefault(t *testing.T) {
 	}
 }
 
-// CellInput.Name rides through to the `cell` pick-report property — and the
-// omitPickAttrs flag drops it (and the rest of the pick attrs).
-func TestCellInputName(t *testing.T) {
+// A resident chart (OpenChartBytes) portrays live, so its generated tiles carry the
+// S-52 §10.8 pick-report attributes (class / cell / s57) on every feature by default.
+// The per-cell Name badge and the PickOmit opt-out were parameters of the dropped
+// multi-cell open (chart-api.md); the surviving live-open surface always includes the
+// pick report.
+func TestPickAttrs(t *testing.T) {
 	data, err := os.ReadFile(testCell)
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	const badge = "PICKCELLZZ" // distinctive token that can only come from the cell prop
+	src, err := OpenChartBytes(data)
+	if err != nil {
+		t.Fatalf("OpenChartBytes: %v", err)
+	}
+	defer src.Close()
 
-	// badgePresent opens the cell (optionally omitting pick attrs) and reports
-	// whether the cell badge appears in any tile across the cell's zoom range.
-	badgePresent := func(pick PickAttrs) bool {
-		src, err := OpenCells([]CellInput{{Base: data, Name: badge}}, "", pick)
-		if err != nil {
-			t.Fatalf("OpenCells(pick=%v): %v", pick, err)
-		}
-		defer src.Close()
-		w, s, e, n, _ := src.Bounds()
-		mn, mx := src.ZoomRange()
-		for z := mn; z <= mx && z <= 14; z++ {
-			tx, ty := lonLatToTile((w+e)/2, (s+n)/2, z)
-			body, err := src.Tile(z, tx, ty)
-			if err != nil {
-				t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
-			}
-			if bytes.Contains(body, []byte(badge)) {
-				return true
+	// Scan the tile grid covering the chart bounds until a tile carries the pick-report
+	// property keys (present on every feature when pick attrs are on).
+	info := src.Info()
+	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
+		x0, y0 := lonLatToTile(info.West, info.North, z)
+		x1, y1 := lonLatToTile(info.East, info.South, z)
+		for x := x0; x <= x1; x++ {
+			for y := y0; y <= y1; y++ {
+				body, err := src.Tile(z, x, y)
+				if err != nil {
+					t.Fatalf("Tile %d/%d/%d: %v", z, x, y, err)
+				}
+				if bytes.Contains(body, []byte("class")) && bytes.Contains(body, []byte("s57")) {
+					return // pick-report attributes present — done
+				}
 			}
 		}
-		return false
 	}
-
-	if !badgePresent(PickInclude) {
-		t.Fatal("cell badge absent with PickInclude — CellInput.Name not emitted as the `cell` prop")
-	}
-	if badgePresent(PickOmit) {
-		t.Fatal("cell badge present with PickOmit — the opt-out did not drop pick attrs")
-	}
+	t.Fatal("resident chart tiles carry no pick-report attributes (class/s57) — expected them by default")
 }
 
 func TestOpenCellAndTile(t *testing.T) {
@@ -73,29 +70,27 @@ func TestOpenCellAndTile(t *testing.T) {
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	src, err := OpenCells([]CellInput{{Base: data}}, "", PickInclude)
+	src, err := OpenChartBytes(data)
 	if err != nil {
-		t.Fatalf("OpenCells: %v", err)
+		t.Fatalf("OpenChartBytes: %v", err)
 	}
 	defer src.Close()
 
-	mn, mx := src.ZoomRange()
-	if mx < mn {
-		t.Fatalf("bad zoom range %d..%d", mn, mx)
+	info := src.Info()
+	if info.MaxZoom < info.MinZoom {
+		t.Fatalf("bad zoom range %d..%d", info.MinZoom, info.MaxZoom)
 	}
-	t.Logf("zoom %d..%d, bands=%#b, format=%d", mn, mx, src.Bands(), src.Format())
-
-	w, s, e, n, ok := src.Bounds()
-	if !ok {
+	if !info.HasBounds {
 		t.Fatal("expected known bounds for a single cell")
 	}
-	t.Logf("bounds W=%.4f S=%.4f E=%.4f N=%.4f", w, s, e, n)
+	t.Logf("zoom %d..%d, bands=%#b, bounds W=%.4f S=%.4f E=%.4f N=%.4f",
+		info.MinZoom, info.MaxZoom, info.Bands, info.West, info.South, info.East, info.North)
 
 	// Address the tile covering the cell's bounds centre at each zoom; assert at
 	// least one non-empty MVT is produced across the cell's range.
 	got := false
-	for z := mn; z <= mx && z <= 14; z++ {
-		tx, ty := lonLatToTile((w+e)/2, (s+n)/2, z)
+	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
+		tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, z)
 		body, err := src.Tile(z, tx, ty)
 		if err != nil {
 			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
@@ -122,16 +117,16 @@ func TestOpenPath(t *testing.T) {
 	}
 	defer src.Close()
 
-	mn, mx := src.ZoomRange()
-	w, s, e, n, ok := src.Bounds()
-	if !ok {
+	info := src.Info()
+	if !info.HasBounds {
 		t.Fatal("expected known bounds for the streamed ENC_ROOT")
 	}
-	t.Logf("streamed: zoom %d..%d bounds W=%.4f S=%.4f E=%.4f N=%.4f", mn, mx, w, s, e, n)
+	t.Logf("streamed: zoom %d..%d bounds W=%.4f S=%.4f E=%.4f N=%.4f",
+		info.MinZoom, info.MaxZoom, info.West, info.South, info.East, info.North)
 
 	got := false
-	for z := mn; z <= mx && z <= 14; z++ {
-		tx, ty := lonLatToTile((w+e)/2, (s+n)/2, z)
+	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
+		tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, z)
 		body, err := src.Tile(z, tx, ty)
 		if err != nil {
 			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)

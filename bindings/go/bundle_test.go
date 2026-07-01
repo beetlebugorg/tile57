@@ -13,7 +13,7 @@ func TestSourceScamin(t *testing.T) {
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	src, err := OpenCells([]CellInput{{Base: data}}, "", PickInclude)
+	src, err := OpenChartBytes(data)
 	if err != nil {
 		t.Fatal(err)
 	}
