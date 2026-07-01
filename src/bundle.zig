@@ -613,22 +613,6 @@ const BakeSink = struct {
     }
 };
 
-// NOAA cell naming: a US ENC's 3rd char is its navigational-purpose digit
-// (1=overview … 6=berthing), so the catalogue fast-path can band a cell from its
-// name without parsing its CSCL header. Null for non-conforming names.
-fn bandFromStem(stem: []const u8) ?engine.bake_enc.Band {
-    if (stem.len < 3 or (stem[0] != 'U' and stem[0] != 'u')) return null;
-    return switch (stem[2]) {
-        '6' => .berthing,
-        '5' => .harbor,
-        '4' => .approach,
-        '3' => .coastal,
-        '2' => .general,
-        '1' => .overview,
-        else => null,
-    };
-}
-
 // Bake an ENC_ROOT directory (or a single cell.000) into one band-streamed PMTiles
 // archive written straight to `out_path` (the data section streams through a
 // StreamWriter — only the compressed data + small directory are held, not the raw
@@ -653,10 +637,15 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
 
-    // Pass 1: learn each cell's band + bbox. Fast path: an exchange-set catalogue
-    // (CATALOG.031) gives every cell's coverage bbox in ONE file — band each from
-    // its NOAA name digit, no per-cell parse (matches the Go reference). Fallback
-    // (no catalogue): walk the dir and cheaply peek each cell (bbox + CSCL).
+    // Pass 1: learn each cell's band + bbox. An exchange-set catalogue (CATALOG.031)
+    // gives every cell's coverage bbox in ONE file (used verbatim), but NOT its
+    // compilation scale — so the band still comes from a per-cell CSCL peek. The Go
+    // reference always bands by BandForScale(CompilationScale) (bake.go:592,710),
+    // never the NOAA name digit: a US2/general-named cell at 1:240000-1:500000 bands
+    // COASTAL by scale, a US5/harbor-named cell at 1:40000 bands APPROACH — the name
+    // digit is only a coverage-purpose hint and straddles the bandOf thresholds.
+    // Fallback (no catalogue): walk the dir and peek each cell (bbox + CSCL). All
+    // three input paths band identically by bandOf(cscl).
     const Bands = engine.bake_enc;
     var band_cells: [Bands.bands_fine_to_coarse.len]std.ArrayList(CellEntry) = undefined;
     for (&band_cells) |*bc| bc.* = std.ArrayList(CellEntry).empty;
@@ -691,12 +680,16 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             ubox[1] = @min(ubox[1], bb[1]);
             ubox[2] = @max(ubox[2], bb[2]);
             ubox[3] = @max(ubox[3], bb[3]);
-            // Band from the name; for the rare non-NOAA name, peek that one cell.
-            const band = bandFromStem(e.stem) orelse fb: {
-                const cb = dir.readFileAlloc(io, e.path, gpa, .unlimited) catch break :fb Bands.bandOf(0);
+            // Band by the parsed CSCL (Go BandForScale), NOT the name digit: peek the
+            // cell for its compilation scale. The catalogue supplies the bbox but no
+            // scale, so this one cheap read per cell is what keeps the band correct
+            // (an unreadable cell -> bandOf(0) = approach, the same default the
+            // dir-walk + single-file paths use). Identical banding to those paths.
+            const band = bfs: {
+                const cb = dir.readFileAlloc(io, e.path, gpa, .unlimited) catch break :bfs Bands.bandOf(0);
                 defer gpa.free(cb);
                 const m = engine.s57.peekMeta(gpa, cb);
-                break :fb Bands.bandOf(if (m) |mm| mm.cscl else 0);
+                break :bfs Bands.bandOf(if (m) |mm| mm.cscl else 0);
             };
             try band_cells[@intFromEnum(band)].append(a, .{ .path = e.path, .bbox = bb });
         }
