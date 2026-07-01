@@ -417,6 +417,22 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bake.addArgs(args);
     b.step("run", "Run the bake CLI").dependOn(&run_bake.step);
 
+    // S-57 -> S-101 portrayal attribute-coverage check (conformance recon; see
+    // specs/conformance-testability.md). Pure std, no engine imports — it just
+    // reads vendor/s101/*.json + the vendored Lua rules from disk at run time.
+    // Runs from the repo root (build cwd), so its default relative paths resolve.
+    const cov = b.addExecutable(.{
+        .name = "s101-coverage",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/s101_coverage.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cov = b.addRunArtifact(cov);
+    if (b.args) |args| run_cov.addArgs(args);
+    b.step("s101-coverage", "Scan S-101 portrayal rules and check adapter attribute coverage").dependOn(&run_cov.step);
+
     // ---- JS/wasm style engine (bindings/) -----------------------------------
     //
     // A tiny entry point that compiles `chartstyle.buildStyle` to wasm so a
