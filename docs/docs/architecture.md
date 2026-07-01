@@ -70,12 +70,12 @@ pure test build. The top-level `tile57` module (`src/tile57.zig`) is the
 curated public surface; the C ABI (`src/capi.zig`) is a thin shim over the
 same Zig API.
 
-## The layering: Source / bake / style
+## The layering: Chart / bake / style
 
 The public surface composes the packages into three high-level entry points:
 
-- **`Source`** — open a chart from bytes (`openBytes`), a multi-cell ENC_ROOT
-  (`openCells` / `openCellsStreaming`), then `tile(z, x, y)`. This is the live
+- **`Chart`** — open a chart from a path (`openPath`), from bytes (`openBytes`), or
+  as a multi-cell ENC_ROOT (`openCells` / `openCellsStreaming`), then `tile(z, x, y)`. This is the live
   tile-generation path. It also reads a pre-baked **PMTiles** archive — the caller
   can't tell the difference.
 - **`bakeArchive`** (`bake_enc`) — bake a whole ENC_ROOT to one PMTiles archive
@@ -83,9 +83,9 @@ The public surface composes the packages into three high-level entry points:
 - **`style.build`** (`chartstyle`) + **`assets`** / **`sprite`** — generate the
   MapLibre style and the portrayal assets it references.
 
-The same three are exposed across the C ABI (`tile57_source_*`,
-`tile57_bake_cells`, `tile57_build_style`, `tile57_colortables` /
-`tile57_linestyles` / `tile57_sprite_atlas` / `tile57_pattern_atlas`).
+The same three are exposed across the C ABI (`tile57_chart_*`,
+`tile57_bake_pmtiles` / `tile57_bake_bundle`, `tile57_build_style`, and
+`tile57_bake_assets` for the portrayal assets).
 
 ## The memory design
 
@@ -98,15 +98,15 @@ tile57 is built to hold only its working set:
   ms); after that it is cached.
 - **Best-available band per tile.** Overlapping cells of different compilation
   scales are resolved per tile to the best band, not all overlaid blindly.
-- **Streaming open.** `openCellsStreaming` / `tile57_source_open_cells_streaming`
-  take per-cell metadata (bbox + scale) plus a reader callback; a cell's bytes are
-  read only on demand and freed on eviction. A host then holds only the working
-  set's bytes, not the whole catalogue — the right choice for a large ENC_ROOT.
+- **Streaming open.** `openCellsStreaming` (and its on-disk driver `openPath` /
+  `tile57_chart_open`) take per-cell metadata (bbox + scale) plus a reader; a cell's
+  bytes are read only on demand and freed on eviction. A host then holds only the
+  working set's bytes, not the whole catalogue — the right choice for a large ENC_ROOT.
 - **Band-streamed bakes.** `bakeArchive` streams band-by-band (finest →
   coarsest), so peak memory tracks the largest single band rather than the whole
   archive.
-- **Tile cache.** Generated/decoded tiles are memoized per source (keyed
-  `z<<48 | x<<24 | y`); `clearCache` / `tile57_source_clear_cache` drops it to
+- **Tile cache.** Generated/decoded tiles are memoized per chart (keyed
+  `z<<48 | x<<24 | y`); `clearCache` / `tile57_chart_clear_cache` drops it to
   bound long-running hosts.
 
 ## The offline chart bundle

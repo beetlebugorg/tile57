@@ -10,7 +10,7 @@
 // root.zig file-import: bundle (below) pulls in engine_full, which owns root.zig, so a
 // second file-import here would double-claim the file (one-module-per-file per artifact).
 pub const engine = @import("engine");
-pub const api = @import("tile57.zig"); // the public Zig API (Source/bake/style)
+pub const api = @import("tile57.zig"); // the public Zig API (Chart/bake/style)
 pub const capi = @import("capi.zig");
 pub const portray = @import("portray");
 pub const catalogue = @import("s100").catalogue;

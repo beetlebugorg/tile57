@@ -281,7 +281,7 @@ pub fn parse(gpa: Allocator, bytes: []const u8) !File {
         // swallowed every error and kept the partial result — a malformed record left a
         // truncated-but-accepted cell instead of being dropped. Match: break on the
         // EndOfRecords padding sentinel (== Go io.EOF), propagate any genuine error so the
-        // source.zig catch-return drops the whole cell, like the oracle's per-cell skip.
+        // chart.zig catch-return drops the whole cell, like the oracle's per-cell skip.
         const r = parseRecord(a, bytes, off) catch |e| {
             if (e == error.EndOfRecords) break;
             return e;

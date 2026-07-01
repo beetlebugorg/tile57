@@ -57,17 +57,17 @@ Add tile57 as a dependency and `@import("tile57")`:
 ```zig
 const tile57 = @import("tile57");
 
-// Open a source: a PMTiles archive, or a raw S-57 cell portrayed live.
-var src = try tile57.Source.openBytes(cell_bytes, .auto, null);
-defer src.deinit();
+// Open a chart: a PMTiles archive, or a raw S-57 cell portrayed live.
+var chart = try tile57.Chart.openBytes(cell_bytes, .auto, null);
+defer chart.deinit();
 
-if (try src.tile(z, x, y)) |mvt| {     // decompressed MVT bytes (or null if empty)
+if (try chart.tile(z, x, y)) |mvt| {     // decompressed MVT bytes (or null if empty)
     defer tile57.freeBytes(mvt);
     // … hand mvt to your renderer …
 }
 ```
 
-`Source.openCells` / `Source.openCellsStreaming` open a whole ENC_ROOT;
+`Chart.openPath` / `Chart.openCellsStreaming` open a whole ENC_ROOT;
 `tile57.bakeArchive` bakes one to a PMTiles archive; `tile57.assets`,
 `tile57.sprite`, and `tile57.style.build` generate the style + assets. See the
 [Zig API](./zig-api.md).
@@ -79,28 +79,28 @@ The same engine sits behind a thin C ABI ([`include/tile57.h`](../../include/til
 ```c
 #include "tile57.h"
 
-tile57_source *s = tile57_source_open(data, len, TILE57_FORMAT_AUTO, NULL);
+tile57_chart *c = tile57_chart_open_bytes(data, len);   /* one in-memory S-57 cell */
 
 uint8_t *mvt; size_t n;
-if (tile57_tile_get(s, z, x, y, &mvt, &n) == TILE57_TILE_OK) {
+if (tile57_chart_tile(c, z, x, y, &mvt, &n) == TILE57_TILE_OK) {
     /* … render the decompressed MVT bytes … */
-    tile57_tile_free(mvt, n);
+    tile57_free(mvt, n);
 }
-tile57_source_close(s);
+tile57_chart_close(c);
 ```
 
-Link against `libtile57.a`. The format is auto-detected
-(`TILE57_FORMAT_AUTO`): PMTiles first, then a raw S-57 cell generated live. See
-the [C API](./c-api.md) for the ENC_ROOT, streaming, bake, style, and
-asset-generation entry points.
+Link against `libtile57.a`. Three explicit openers cover the inputs:
+`tile57_chart_open_bytes` (one in-memory S-57 cell), `tile57_chart_open` (an
+on-disk ENC_ROOT directory or a single `.000`, streamed), and
+`tile57_chart_open_pmtiles` (a baked archive). See the [C API](./c-api.md) for the
+bake, style, and asset-generation entry points.
 
 ## ENC_ROOT and updates
 
 Open an ENC_ROOT (many cells, each with its sequential `.001`, `.002` … updates)
-with `Source.openCells` / `tile57_source_open_cells`, or its streaming variant
-for large catalogues. The host walks the directory and reads the files (Zig 0.16
-gates filesystem access behind `std.Io`); the engine parses, applies the updates,
-and serves the best-available scale band per tile.
+with `Chart.openPath` / `tile57_chart_open` — a single call that streams a whole
+on-disk catalogue, reading each cell's bytes on demand. The engine parses, applies
+the updates, and serves the best-available scale band per tile.
 
 See the [**Architecture**](./architecture.md) page for how the engine fits
 together.

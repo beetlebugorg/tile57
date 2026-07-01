@@ -6,6 +6,40 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Changed — chart-centric C ABI (breaking, pre-1.0)
+- **The tile-source C ABI (`include/tile57.h`) was reworked into a chart-centric
+  surface** (see `chart-api.md`); the internal Zig type `Source` in `src/source.zig`
+  is likewise renamed **`Chart`** in `src/chart.zig`, so the engine and the ABI use
+  the same word. The opaque handle is `tile57_chart` and the open/serve entry points
+  are prefixed `tile57_chart_*`.
+  - **Open** splits the old single `tile57_source_open(data, len, format, rules_dir)`
+    (and its `TILE57_FORMAT_*` enum) into three explicit functions:
+    `tile57_chart_open(path)` (an on-disk ENC_ROOT directory or a single `.000`,
+    streamed on demand), `tile57_chart_open_bytes(base, len)` (one in-memory S-57
+    cell), and `tile57_chart_open_pmtiles(path)` (a baked PMTiles bundle). The
+    many-cells / streaming C openers (`tile57_source_open_cells{,_streaming}`) and
+    the resolved-format getter `tile57_source_format` are gone.
+  - **Metadata** — the four `tile57_source_{zoom_range,bands,bounds,anchor}` getters
+    fold into one `tile57_chart_get_info(chart, &info)` filling a `tile57_chart_info`
+    struct; a new `tile57_chart_scamin` returns the live SCAMIN manifest.
+  - **Tiles / lifetime** — `tile57_tile_get` → `tile57_chart_tile`,
+    `tile57_source_clear_cache` → `tile57_chart_clear_cache`, `tile57_source_close`
+    → `tile57_chart_close`. The per-kind frees collapse into one universal
+    `tile57_free(ptr, len)` (replacing `tile57_tile_free`).
+- **Bake surface.** `tile57_bake_cells` → `tile57_bake_pmtiles`, now taking a
+  `tile57_cell` array (renamed from `tile57_cell_input`) plus a `tile57_bake_opts`
+  options struct (rules/catalog dir, zoom clamp, pick attrs, progress); the
+  `tile57_bake_progress` callback gains band index/count/name. New
+  `tile57_bake_bundle(input, out_dir, opts, …)` writes the full on-disk bundle the
+  `tile57 bake … -o out/` CLI emits.
+- **Portrayal assets folded.** The four generators (`tile57_colortables`,
+  `tile57_linestyles`, `tile57_sprite_atlas`, `tile57_pattern_atlas`) and the
+  `tile57_named_bytes` blob type are replaced by one `tile57_bake_assets(catalog_dir,
+  &assets)` filling a `tile57_assets` struct (colortables + linestyles + sprite +
+  pattern buffers), freed with `tile57_assets_free`. `tile57_colortables_default` /
+  `tile57_style_template` still build a style with no on-disk catalogue, and
+  `tile57_build_style` / `tile57_style_diff` take the SCAMIN manifest.
+
 ### Changed — repository split into the tile57 engine + the Qt demo
 - **chartplotter-native is now the standalone tile57 engine.** The Zig engine
   moved from `engine/` to the repository root, so a top-level **`zig build`**

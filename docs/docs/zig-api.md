@@ -11,38 +11,40 @@ Add it as a dependency and `@import("tile57")` for the curated public surface
 (`src/tile57.zig`). The [C ABI](./c-api.md) is a thin shim over this same
 API.
 
-## The high-level engine: `Source`
+## The high-level engine: `Chart`
 
-Open a chart **source** from bytes or cells, then fetch tiles by `(z, x, y)`:
+Open a **chart** from bytes, a path, or cells, then fetch tiles by `(z, x, y)`:
 
 ```zig
 const tile57 = @import("tile57");
 
 // A PMTiles archive, or a raw S-57 cell portrayed live (auto-sniffed).
-var src = try tile57.Source.openBytes(cell_bytes, .auto, null);
-defer src.deinit();
+var chart = try tile57.Chart.openBytes(cell_bytes, .auto, null);
+defer chart.deinit();
 
-if (try src.tile(z, x, y)) |mvt| {     // decompressed MVT bytes, or null if empty
+if (try chart.tile(z, x, y)) |mvt| {     // decompressed MVT bytes, or null if empty
     defer tile57.freeBytes(mvt);
     // … hand to your renderer …
 }
 ```
 
-`Source` methods:
+`Chart` methods:
 
 | Method | Purpose |
 |--------|---------|
-| `openBytes(bytes, format, rules_dir)` | open one chart (PMTiles or S-57 cell). |
-| `openCells(cells, rules_dir)` | open a multi-cell ENC_ROOT (each cell's `.001…` updates applied). |
-| `openCellsStreaming(metas, reader, user, rules_dir)` | low-memory ENC_ROOT: read each cell's bytes on demand, free on eviction. |
+| `openBytes(bytes, format, rules_dir)` | open one chart from bytes (PMTiles or S-57 cell). |
+| `openPath(path, rules_dir, pick_attrs)` | open an on-disk ENC_ROOT dir (or a single `.000`) as a streaming chart. |
+| `openCells(cells, rules_dir, pick_attrs)` | open a multi-cell ENC_ROOT from bytes (each cell's `.001…` updates applied). |
+| `openCellsStreaming(metas, reader, user, rules_dir, pick_attrs)` | low-memory ENC_ROOT: read each cell's bytes on demand, free on eviction. |
 | `tile(z, x, y) -> ?[]u8` | the tile's decompressed MVT bytes (null = empty). |
 | `bounds() -> ?[4]f64` | geographic extent `[w, s, e, n]`, if known. |
 | `anchor()` | a good initial camera (lat, lon, zoom) on real data. |
 | `bands() -> u32` | bitmask of navigational bands present. |
-| `zoomRange()` | the min/max zoom the source serves. |
+| `zoomRange()` | the min/max zoom the chart serves. |
+| `scamin() -> ![]u32` | the distinct SCAMIN denominators present (the live SCAMIN manifest). |
 | `format() -> Format` | the resolved backend (after `.auto`). |
 | `clearCache()` | drop the in-memory tile cache. |
-| `deinit()` | release the source and its cached tiles. |
+| `deinit()` | release the chart and its cached tiles. |
 
 `tile57.Format` is `.auto` / `.pmtiles` / `.s57_cell`. `rules_dir` is the S-101
 portrayal rules directory for live S-57 cells; `null` (or `""`) uses the rules

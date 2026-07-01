@@ -1,11 +1,11 @@
-//! C ABI for libtile57.a — a thin shim over the Zig engine API (source.zig).
+//! C ABI for libtile57.a — a thin shim over the Zig engine API (chart.zig).
 //!
 //! Contract: POD across the seam (ptr/len + status codes); Zig errors, slices
-//! and optionals stay inside source.zig. Public header: ../../include/tile57.h.
-//! The opaque `tile57_chart` is a `*source.Source`.
+//! and optionals stay inside chart.zig. Public header: ../../include/tile57.h.
+//! The opaque `tile57_chart` is a `*chart.Chart`.
 
 const std = @import("std");
-const source = @import("source.zig");
+const chart = @import("chart.zig");
 const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
 const chartstyle = @import("chartstyle");
 const assets = @import("assets");
@@ -15,10 +15,10 @@ const assets = @import("assets");
 const colorprofile_registry = @import("colorprofile_registry");
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the live
-// tile/source path makes many small, short-lived allocations; page_allocator
+// tile/chart path makes many small, short-lived allocations; page_allocator
 // would mmap each one. Matches the bake CLI's allocator choice.
 const gpa = std.heap.smp_allocator;
-const Source = source.Source;
+const Chart = chart.Chart;
 
 // Wall-clock time for "today" date resolution in tile57_build_style. Zig 0.16
 // keeps the clock behind Io; the lib links libc, so call time(3) directly.
@@ -49,11 +49,11 @@ const CellInput = extern struct {
     name: ?[*:0]const u8 = null,
 };
 
-// Convert the C CellInput[] into a Zig source.CellInput[] (slices into the host's
+// Convert the C CellInput[] into a Zig chart.CellInput[] (slices into the host's
 // borrowed buffers). Allocates the slice-of-slices into `a`; the engine copies
 // what it keeps, so the caller frees the conversion arrays after the call.
-fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]source.CellInput {
-    const out = a.alloc(source.CellInput, c_cells.len) catch return null;
+fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]chart.CellInput {
+    const out = a.alloc(chart.CellInput, c_cells.len) catch return null;
     for (c_cells, 0..) |cc, i| {
         var ups: []const []const u8 = &.{};
         if (cc.updates != null and cc.update_lens != null and cc.update_count > 0) {
@@ -68,20 +68,20 @@ fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]source.Cell
 }
 
 /// Open an on-disk ENC_ROOT directory (or single .000) as a streaming chart. See tile57.h.
-export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Source {
+export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
     const p = spanOpt(path) orelse return null;
-    return Source.openPath(p, null, true) catch null;
+    return Chart.openPath(p, null, true) catch null;
 }
 
 /// Open one in-memory ENC cell (base .000 bytes) as a resident chart. See tile57.h.
-export fn tile57_chart_open_bytes(base: [*]const u8, len: usize) callconv(.c) ?*Source {
+export fn tile57_chart_open_bytes(base: [*]const u8, len: usize) callconv(.c) ?*Chart {
     if (len == 0) return null;
-    const cells = [_]source.CellInput{.{ .base = base[0..len] }};
-    return Source.openCells(&cells, null, true) catch null;
+    const cells = [_]chart.CellInput{.{ .base = base[0..len] }};
+    return Chart.openCells(&cells, null, true) catch null;
 }
 
 /// Open a baked PMTiles bundle from a file path. See tile57.h.
-export fn tile57_chart_open_pmtiles(path: ?[*:0]const u8) callconv(.c) ?*Source {
+export fn tile57_chart_open_pmtiles(path: ?[*:0]const u8) callconv(.c) ?*Chart {
     const p = spanOpt(path) orelse return null;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -91,7 +91,7 @@ export fn tile57_chart_open_pmtiles(path: ?[*:0]const u8) callconv(.c) ?*Source 
     defer dir.close(io);
     const bytes = dir.readFileAlloc(io, std.fs.path.basename(p), gpa, .unlimited) catch return null;
     defer gpa.free(bytes);
-    return Source.openBytes(bytes, .pmtiles, null) catch null;
+    return Chart.openBytes(bytes, .pmtiles, null) catch null;
 }
 
 // Fixed-size chart metadata (mirrors tile57_chart_info in tile57.h): folds the old
@@ -112,7 +112,7 @@ const CChartInfo = extern struct {
 };
 
 /// Fill *out with the chart's fixed metadata (zoom range, bands, bounds, anchor). See tile57.h.
-export fn tile57_chart_get_info(src: ?*Source, out: *CChartInfo) callconv(.c) void {
+export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) void {
     out.* = std.mem.zeroes(CChartInfo);
     const s = src orelse return;
     const zr = s.zoomRange();
@@ -135,7 +135,7 @@ export fn tile57_chart_get_info(src: ?*Source, out: *CChartInfo) callconv(.c) vo
 }
 
 // Progress callback for tile57_bake_pmtiles / tile57_bake_bundle (matches the header
-// typedef + source.Progress + bake_enc.Progress).
+// typedef + chart.Progress + bake_enc.Progress).
 const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
 
 // Shared bake options. Mirrors tile57_bake_opts in tile57.h. catalog_dir/created
@@ -177,7 +177,7 @@ export fn tile57_bake_pmtiles(
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return -1;
-    const archive = source.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, !o.omit_pick_attrs, o.progress, o.progress_user) catch return -1;
+    const archive = chart.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, !o.omit_pick_attrs, o.progress, o.progress_user) catch return -1;
     if (archive) |a| {
         out.* = a.ptr;
         out_len.* = a.len;
@@ -234,19 +234,19 @@ export fn tile57_bake_bundle(
 }
 
 /// Release a chart and all cached tiles. See tile57.h.
-export fn tile57_chart_close(chart: ?*Source) callconv(.c) void {
-    if (chart) |s| s.deinit();
+export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {
+    if (handle) |s| s.deinit();
 }
 
 /// The distinct SCAMIN denominators present in the chart (the live SCAMIN manifest;
 /// see tile57.h). On success returns 1 with *out pointing at *out_len int32 values
 /// (ascending), 0 if there are none; -1 on error. Free *out with tile57_free
 /// ((uint8_t*)*out, *out_len * sizeof(int32_t)).
-export fn tile57_chart_scamin(chart: ?*Source, out: *[*]i32, out_len: *usize) callconv(.c) c_int {
-    const s = chart orelse return -1;
+export fn tile57_chart_scamin(handle: ?*Chart, out: *[*]i32, out_len: *usize) callconv(.c) c_int {
+    const s = handle orelse return -1;
     const vals = s.scamin() catch return -1;
     if (vals.len == 0) {
-        source.freeBytes(@as([*]u8, @ptrCast(vals.ptr))[0 .. vals.len * @sizeOf(u32)]);
+        chart.freeBytes(@as([*]u8, @ptrCast(vals.ptr))[0 .. vals.len * @sizeOf(u32)]);
         out_len.* = 0;
         return 0;
     }
@@ -257,14 +257,14 @@ export fn tile57_chart_scamin(chart: ?*Source, out: *[*]i32, out_len: *usize) ca
 
 /// Fetch tile (z,x,y) as MVT bytes. 1=OK + out/out_len, 0=empty, -1=error.
 export fn tile57_chart_tile(
-    chart: ?*Source,
+    handle: ?*Chart,
     z: u8,
     x: u32,
     y: u32,
     out: *[*]u8,
     out_len: *usize,
 ) callconv(.c) c_int {
-    const s = chart orelse return -1;
+    const s = handle orelse return -1;
     const r = s.tile(z, x, y) catch return -1;
     if (r) |bytes| {
         out.* = bytes.ptr;
@@ -278,12 +278,12 @@ export fn tile57_chart_tile(
 /// (chart-api.md — the universal free.)
 export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {
     const p = ptr orelse return;
-    source.freeBytes(@as([*]u8, @ptrCast(p))[0..len]);
+    chart.freeBytes(@as([*]u8, @ptrCast(p))[0..len]);
 }
 
 /// Drop the in-memory tile cache (bounds memory in long-running hosts).
-export fn tile57_chart_clear_cache(chart: ?*Source) callconv(.c) void {
-    if (chart) |s| s.clearCache();
+export fn tile57_chart_clear_cache(handle: ?*Chart) callconv(.c) void {
+    if (handle) |s| s.clearCache();
 }
 
 // ---- portrayal asset generation (in-memory; mirrors tile57.h) --------------
@@ -310,7 +310,7 @@ export fn tile57_colortables_default(out: *[*]u8, out_len: *usize) callconv(.c) 
 }
 
 // All portrayal assets in memory. Mirrors tile57_assets in tile57.h; each non-null
-// field is a gpa-owned buffer freed by tile57_assets_free (via source.freeBytes).
+// field is a gpa-owned buffer freed by tile57_assets_free (via chart.freeBytes).
 const CAssets = extern struct {
     colortables: ?[*]u8 = null,
     colortables_len: usize = 0,
@@ -327,7 +327,7 @@ const CAssets = extern struct {
 };
 
 // Dupe each generated (arena-owned) buffer into `gpa` so the C owner can free them
-// via source.freeBytes. Fills out.* in place; on OOM the caller frees via
+// via chart.freeBytes. Fills out.* in place; on OOM the caller frees via
 // tile57_assets_free (each field's len is set immediately after its ptr).
 fn fillAssets(out: *CAssets, ct: []const u8, ls: []const u8, spr_json: []const u8, spr_png: []const u8, pat_json: []const u8, pat_png: []const u8) !void {
     out.colortables = (try gpa.dupe(u8, ct)).ptr;
@@ -374,12 +374,12 @@ export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: *CAssets) callcon
 
 /// Free every non-null buffer in *out and zero the struct. See tile57.h.
 export fn tile57_assets_free(out: *CAssets) callconv(.c) void {
-    if (out.colortables) |p| source.freeBytes(p[0..out.colortables_len]);
-    if (out.linestyles) |p| source.freeBytes(p[0..out.linestyles_len]);
-    if (out.sprite_json) |p| source.freeBytes(p[0..out.sprite_json_len]);
-    if (out.sprite_png) |p| source.freeBytes(p[0..out.sprite_png_len]);
-    if (out.pattern_json) |p| source.freeBytes(p[0..out.pattern_json_len]);
-    if (out.pattern_png) |p| source.freeBytes(p[0..out.pattern_png_len]);
+    if (out.colortables) |p| chart.freeBytes(p[0..out.colortables_len]);
+    if (out.linestyles) |p| chart.freeBytes(p[0..out.linestyles_len]);
+    if (out.sprite_json) |p| chart.freeBytes(p[0..out.sprite_json_len]);
+    if (out.sprite_png) |p| chart.freeBytes(p[0..out.sprite_png_len]);
+    if (out.pattern_json) |p| chart.freeBytes(p[0..out.pattern_json_len]);
+    if (out.pattern_png) |p| chart.freeBytes(p[0..out.pattern_png_len]);
     out.* = .{};
 }
 

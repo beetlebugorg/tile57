@@ -12,7 +12,7 @@
 //! same Zig API (see capi.zig).
 //!
 //! Surface:
-//!   - High-level engine: `Source` (open → tile), `bakeArchive`, `buildStyle`   [Phase 2]
+//!   - High-level engine: `Chart` (open → tile), `bakeArchive`, `buildStyle`   [Phase 2]
 //!   - Portrayal assets:  `assets` (colortables, linestyles, sprite/pattern)
 //!   - Style patching:    `chartstyle`
 //!   - Tiling:            `mvt`, `tile`, `pmtiles`, `bake_enc`, `s57_mvt`
@@ -23,23 +23,23 @@ const std = @import("std");
 /// Library version (matches build.zig.zon and tile57_version()).
 pub const version = "0.1.0";
 
-// ---- high-level engine: open a Source, fetch tiles, bake, build a style ----
-const source = @import("source.zig");
-/// An embeddable chart tile source: `Source.openBytes` / `Source.openCells`,
-/// then `.tile(z,x,y)`. See source.zig.
-pub const Source = source.Source;
-pub const Format = source.Format;
-pub const CellInput = source.CellInput;
-pub const Progress = source.Progress;
+// ---- high-level engine: open a Chart, fetch tiles, bake, build a style ----
+const chart = @import("chart.zig");
+/// An embeddable chart tile source: `Chart.openBytes` / `Chart.openCells`,
+/// then `.tile(z,x,y)`. See chart.zig.
+pub const Chart = chart.Chart;
+pub const Format = chart.Format;
+pub const CellInput = chart.CellInput;
+pub const Progress = chart.Progress;
 // Streaming ENC_ROOT open (read cell bytes on demand, low memory): see
-// Source.openCellsStreaming.
-pub const CellMeta = source.CellMeta;
-pub const CellBytes = source.CellBytes;
-pub const CellReadFn = source.CellReadFn;
+// Chart.openCellsStreaming.
+pub const CellMeta = chart.CellMeta;
+pub const CellBytes = chart.CellBytes;
+pub const CellReadFn = chart.CellReadFn;
 /// Bake an ENC_ROOT into one band-streamed PMTiles archive.
-pub const bakeArchive = source.bakeArchive;
-/// Free bytes returned by `Source.tile` / `bakeArchive`.
-pub const freeBytes = source.freeBytes;
+pub const bakeArchive = chart.bakeArchive;
+/// Free bytes returned by `Chart.tile` / `bakeArchive`.
+pub const freeBytes = chart.freeBytes;
 
 /// MapLibre style generation from a template + mariner S-52 display settings.
 /// `build` is the single style builder (regenerates the full style with the mariner

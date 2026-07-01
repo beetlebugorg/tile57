@@ -1,4 +1,4 @@
-//! The tile57 engine API, in Zig. A `Source` is an embeddable nautical-chart
+//! The tile57 engine API, in Zig. A `Chart` is an embeddable nautical-chart
 //! tile source: open it from in-memory bytes (a PMTiles archive or raw S-57 ENC
 //! cells) and it serves decompressed Mapbox Vector Tiles by (z, x, y). Multi-cell
 //! ENC_ROOT sources index cells cheaply and parse + portray them lazily per
@@ -11,9 +11,9 @@
 //! general-purpose allocator internally — `tile`/`bakeArchive` return bytes owned
 //! by it; free them with `freeBytes`.
 //!
-//! Threading: a Source is NOT internally synchronized — don't call `tile` on the
-//! same Source from multiple threads concurrently (the tile cache + LRU mutate
-//! without a lock). Distinct sources are independent. `openCells`/`bakeArchive`
+//! Threading: a Chart is NOT internally synchronized — don't call `tile` on the
+//! same Chart from multiple threads concurrently (the tile cache + LRU mutate
+//! without a lock). Distinct charts are independent. `openCells`/`bakeArchive`
 //! parallelize internally over cores.
 
 const std = @import("std");
@@ -85,7 +85,7 @@ pub const CellBytes = extern struct {
 /// host holds only the working set's bytes — not the whole ENC_ROOT.
 pub const CellReadFn = *const fn (user: ?*anyopaque, index: usize, out: *CellBytes) callconv(.c) bool;
 
-/// Free bytes returned by `Source.tile` / `bakeArchive` (page-allocator owned).
+/// Free bytes returned by `Chart.tile` / `bakeArchive` (page-allocator owned).
 pub fn freeBytes(bytes: []u8) void {
     gpa.free(bytes);
 }
@@ -423,12 +423,12 @@ fn resolveRulesDir(rules_dir: ?[]const u8) []const u8 {
 
 // Open a PMTiles archive from owned bytes (takes ownership on success, frees on
 // failure). Returns null if the bytes are not a valid PMTiles archive.
-fn openPmtiles(copy: []u8) ?*Source {
+fn openPmtiles(copy: []u8) ?*Chart {
     const reader = pmtiles.Reader.init(gpa, copy) catch {
         gpa.free(copy);
         return null;
     };
-    const src = gpa.create(Source) catch {
+    const src = gpa.create(Chart) catch {
         var r = reader;
         r.deinit();
         gpa.free(copy);
@@ -465,9 +465,9 @@ fn freeCellBackend(cb: *CellBackend) void {
     }
 }
 
-fn openCell(bytes: []const u8, rules_dir: ?[]const u8) ?*Source {
+fn openCell(bytes: []const u8, rules_dir: ?[]const u8) ?*Chart {
     var cb = buildCellBackend(bytes, &.{}, resolveRulesDir(rules_dir)) orelse return null;
-    const src = gpa.create(Source) catch {
+    const src = gpa.create(Chart) catch {
         freeCellBackend(&cb);
         return null;
     };
@@ -511,9 +511,9 @@ const OpenWork = struct {
     }
 };
 
-/// The public tile source handle. Open with `openBytes`/`openCells`; release with
+/// The public chart handle. Open with `openBytes`/`openCells`; release with
 /// `deinit`.
-pub const Source = struct {
+pub const Chart = struct {
     backend: Backend,
     data: ?[]u8 = null, // owned archive bytes (PMTiles backend only)
     cache: std.AutoHashMap(u64, []u8), // tile key -> MVT bytes (owned)
@@ -526,7 +526,7 @@ pub const Source = struct {
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
     /// (null = TILE57_S101_RULES env, else the vendored default). Bytes are copied.
-    pub fn openBytes(bytes: []const u8, fmt: Format, rules_dir: ?[]const u8) !*Source {
+    pub fn openBytes(bytes: []const u8, fmt: Format, rules_dir: ?[]const u8) !*Chart {
         if (fmt == .pmtiles or fmt == .auto) {
             const copy = try gpa.dupe(u8, bytes);
             if (openPmtiles(copy)) |src| return src; // openPmtiles freed `copy` on failure
@@ -538,7 +538,7 @@ pub const Source = struct {
     /// Open an ENC_ROOT as a multi-cell source: cells are indexed cheaply (band +
     /// bbox) in parallel and parsed/portrayed lazily per tile. All bytes are
     /// copied. Errors if no cell's header parses.
-    pub fn openCells(cells_in: []const CellInput, rules_dir: ?[]const u8, pick_attrs: bool) !*Source {
+    pub fn openCells(cells_in: []const CellInput, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
         if (cells_in.len == 0) return error.OpenFailed;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
@@ -569,7 +569,7 @@ pub const Source = struct {
             j += 1;
         };
 
-        const src = gpa.create(Source) catch {
+        const src = gpa.create(Chart) catch {
             for (cells) |*lc| lazyFreeCell(lc);
             gpa.free(cells);
             return error.OpenFailed;
@@ -587,7 +587,7 @@ pub const Source = struct {
     /// returns a cell's bytes on demand. Cell bytes are read only when a tile
     /// needs them and freed on LRU eviction, so the host holds the working set's
     /// bytes — not the whole ENC_ROOT. No bytes are read at open. Errors if empty.
-    pub fn openCellsStreaming(metas: []const CellMeta, reader: CellReadFn, user: ?*anyopaque, rules_dir: ?[]const u8, pick_attrs: bool) !*Source {
+    pub fn openCellsStreaming(metas: []const CellMeta, reader: CellReadFn, user: ?*anyopaque, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
         if (metas.len == 0) return error.OpenFailed;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
@@ -603,7 +603,7 @@ pub const Source = struct {
                 .index = i,
             };
         }
-        const src = gpa.create(Source) catch {
+        const src = gpa.create(Chart) catch {
             gpa.free(cells);
             return error.OpenFailed;
         };
@@ -622,7 +622,7 @@ pub const Source = struct {
     /// over only a path and the engine holds only what tiles need. The chart owns the
     /// retained Io + Dir for its lifetime (freed in deinit). Errors if no cell parses.
     /// TODO(chart-api): unify the enumeration with the baker's bakeRoot (parity-gated).
-    pub fn openPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Source {
+    pub fn openPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
         const threaded = try gpa.create(std.Io.Threaded);
         errdefer gpa.destroy(threaded);
         threaded.* = .init(gpa, .{});
@@ -665,7 +665,7 @@ pub const Source = struct {
         if (metas.items.len == 0) return error.OpenFailed;
 
         // Reuse the streaming backend with the internal file reader; the returned
-        // Source owns the PathCtx (Io + Dir + paths) via ls.path_ctx, freed in deinit.
+        // Chart owns the PathCtx (Io + Dir + paths) via ls.path_ctx, freed in deinit.
         const src = try openCellsStreaming(metas.items, pathRead, null, rules_dir, pick_attrs);
         errdefer src.deinit();
         const ctx = try gpa.create(PathCtx);
@@ -677,7 +677,7 @@ pub const Source = struct {
     }
 
     /// Release the source and all cached tiles.
-    pub fn deinit(self: *Source) void {
+    pub fn deinit(self: *Chart) void {
         switch (self.backend) {
             .reader => |*r| r.deinit(),
             .cell => |*cb| freeCellBackend(cb),
@@ -696,7 +696,7 @@ pub const Source = struct {
     }
 
     /// The resolved backend format (after an `.auto` sniff).
-    pub fn format(self: *Source) Format {
+    pub fn format(self: *Chart) Format {
         return switch (self.backend) {
             .reader => .pmtiles,
             .cell, .cells => .s57_cell,
@@ -704,7 +704,7 @@ pub const Source = struct {
     }
 
     /// Min/max zoom served (PMTiles: archive range; cell: 0..18).
-    pub fn zoomRange(self: *Source) struct { min: u8, max: u8 } {
+    pub fn zoomRange(self: *Chart) struct { min: u8, max: u8 } {
         return switch (self.backend) {
             .reader => |r| .{ .min = r.header.min_zoom, .max = r.header.max_zoom },
             .cell, .cells => .{ .min = 0, .max = 18 },
@@ -713,7 +713,7 @@ pub const Source = struct {
 
     /// Bitmask of navigational bands present (bit r = band rank r has a cell;
     /// 0=berthing/finest … 5=overview/coarsest). 0 for a single cell / PMTiles.
-    pub fn bands(self: *Source) u32 {
+    pub fn bands(self: *Chart) u32 {
         return switch (self.backend) {
             .cells => |ls| blk: {
                 var mask: u32 = 0;
@@ -726,7 +726,7 @@ pub const Source = struct {
 
     /// Geographic bounds [west, south, east, north] degrees, or null if unknown /
     /// degenerate / near-global. PMTiles -> archive bounds; cell -> data extent.
-    pub fn bounds(self: *Source) ?[4]f64 {
+    pub fn bounds(self: *Chart) ?[4]f64 {
         var b: [4]f64 = undefined;
         switch (self.backend) {
             .reader => |r| {
@@ -760,7 +760,7 @@ pub const Source = struct {
     /// A good initial camera on real data (the smallest chart cell near the data
     /// median, at a navigable zoom), for when fitting the whole source would zoom
     /// out uselessly. null for PMTiles / single cell (use fit-to-bounds).
-    pub fn anchor(self: *Source) ?struct { lat: f64, lon: f64, zoom: f64 } {
+    pub fn anchor(self: *Chart) ?struct { lat: f64, lon: f64, zoom: f64 } {
         switch (self.backend) {
             .cells => |ls| {
                 var cnt: usize = 0;
@@ -813,7 +813,7 @@ pub const Source = struct {
     /// Fetch tile (z,x,y) as decompressed MVT bytes. Returns null for an empty /
     /// absent tile, else page-allocator-owned bytes (free with `freeBytes`).
     /// Cached per source, so re-requests are cheap and deterministic.
-    pub fn tile(self: *Source, z: u8, x: u32, y: u32) !?[]u8 {
+    pub fn tile(self: *Chart, z: u8, x: u32, y: u32) !?[]u8 {
         const key = tileKey(z, x, y);
         if (self.cache.get(key)) |cached| {
             if (cached.len == 0) return null;
@@ -845,7 +845,7 @@ pub const Source = struct {
     }
 
     /// Drop the in-memory tile cache (bounds memory in long-running hosts).
-    pub fn clearCache(self: *Source) void {
+    pub fn clearCache(self: *Chart) void {
         var it = self.cache.valueIterator();
         while (it.next()) |v| gpa.free(v.*);
         self.cache.clearRetainingCapacity();
@@ -858,7 +858,7 @@ pub const Source = struct {
     /// scans every cell's features (parsed without portrayal — SCAMIN is a plain S-57
     /// attribute), reading streamed cells transiently. Returns a gpa-owned slice; free
     /// the bytes with `freeBytes` (cast: `@ptrCast(vals.ptr)[0 .. vals.len * 4]`).
-    pub fn scamin(self: *Source) ![]u32 {
+    pub fn scamin(self: *Chart) ![]u32 {
         var set = std.AutoHashMap(u32, void).init(gpa);
         defer set.deinit();
         switch (self.backend) {
