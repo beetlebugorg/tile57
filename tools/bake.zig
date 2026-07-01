@@ -170,6 +170,47 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Lean corpus scan: count features of one object class (optionally one
+    // primitive) in a single cell, parse-only (no topology assembly), one line
+    // per matching cell — drive a whole ENC_ROOT with `find … | xargs -P`. Used
+    // to find real cells that exercise a conversion change (e.g. a point DAMCON).
+    if (std.mem.eql(u8, sub, "objlcount")) {
+        if (args.len < 4) {
+            std.debug.print("usage: tile57 objlcount <file.000> <objl> [prim]\n", .{});
+            return;
+        }
+        const path = args[2];
+        const want_objl = std.fmt.parseInt(u16, args[3], 10) catch {
+            std.debug.print("error: objl must be an integer\n", .{});
+            return;
+        };
+        const want_prim: ?u8 = if (args.len >= 5) (std.fmt.parseInt(u8, args[4], 10) catch null) else null;
+        const data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited) catch {
+            std.debug.print("{s} READ_ERROR\n", .{path});
+            return;
+        };
+        var cell = engine.s57.parseCell(arena, data) catch {
+            std.debug.print("{s} PARSE_ERROR\n", .{path});
+            return;
+        };
+        defer cell.deinit();
+        var pc = [_]usize{0} ** 256;
+        for (cell.features) |f| if (f.objl == want_objl) {
+            pc[f.prim] += 1;
+        };
+        const total = pc[1] + pc[2] + pc[3] + pc[255];
+        const match = if (want_prim) |wp| pc[wp] > 0 else total > 0;
+        if (match) {
+            std.debug.print("{s} objl={d} point={d} line={d} area={d} none={d}\n", .{ path, want_objl, pc[1], pc[2], pc[3], pc[255] });
+            // Locate point-primitive matches (helps pin the tile a change lands in).
+            for (cell.features) |f| if (f.objl == want_objl and f.prim == 1) {
+                if (cell.pointGeometry(f)) |p|
+                    std.debug.print("    point @ lon={d:.6} lat={d:.6}\n", .{ p.lon(), p.lat() });
+            };
+        }
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "cell")) {
         if (args.len < 3) {
             std.debug.print("usage: tile57 cell <file.000>\n", .{});
@@ -636,6 +677,7 @@ fn printUsage() void {
         \\      layers; --minzoom/--maxzoom.
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
+        \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)
         \\  tile57 version
         \\  tile57 help
         \\
