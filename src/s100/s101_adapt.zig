@@ -439,6 +439,56 @@ fn filterPermitted(a: std.mem.Allocator, class: []const u8, attr: []const u8, v:
     return out.items;
 }
 
+// --- S-65 Annex B §E per-object whole-attribute drop-list (Gap E) -----------
+// S-65 lists attributes that "will not be converted" for a given S-57 object: the
+// S-101 feature class either prohibits the attribute or has no home for it. The
+// generic attribute loop translates by NAME only, so absent this filter it would
+// forward the attribute and the adapted model would carry a value S-101 rejects for
+// that class (a rule reading it then renders a plausible-but-wrong chart). This is
+// the write-side analog of filterPermitted — that drops off-list VALUES, this drops
+// the whole ATTRIBUTE. Keyed by the raw S-57 (object acronym, attribute acronym)
+// pair, matching S-65 §E and tools/s101_coverage.zig's `DROP` table (keep the two in
+// sync: the coverage tool reports the read-side at-risk view, this enforces the write
+// side). SOUNDG/EXPSOU never fires here (SOUNDG is skipped upstream as a multipoint);
+// it is kept for a 1:1 correspondence with the coverage table.
+const AttrDrop = struct { obj: []const u8, acr: []const u8 };
+const DROP_ATTRS = [_]AttrDrop{
+    .{ .obj = "DEPARE", .acr = "QUASOU" },
+    .{ .obj = "CBLSUB", .acr = "DRVAL1" },
+    .{ .obj = "CBLSUB", .acr = "DRVAL2" },
+    .{ .obj = "CONZNE", .acr = "STATUS" },
+    .{ .obj = "BOYINB", .acr = "MARSYS" },
+    .{ .obj = "BOYINB", .acr = "VERLEN" },
+    .{ .obj = "PONTON", .acr = "NATCON" },
+    .{ .obj = "LNDRGN", .acr = "NATQUA" },
+    .{ .obj = "OFSPLF", .acr = "NATCON" },
+    .{ .obj = "RADSTA", .acr = "DATEND" },
+    .{ .obj = "RADSTA", .acr = "DATSTA" },
+    .{ .obj = "RDOSTA", .acr = "ORIENT" },
+    .{ .obj = "MAGVAR", .acr = "DATEND" },
+    .{ .obj = "MAGVAR", .acr = "DATSTA" },
+    .{ .obj = "SWPARE", .acr = "QUASOU" },
+    .{ .obj = "SWPARE", .acr = "SOUACC" },
+    .{ .obj = "SWPARE", .acr = "TECSOU" },
+    .{ .obj = "SOUNDG", .acr = "EXPSOU" },
+    .{ .obj = "DRYDOC", .acr = "HORACC" },
+    .{ .obj = "FLODOC", .acr = "HORACC" },
+    .{ .obj = "OBSTRN", .acr = "NATCON" },
+    .{ .obj = "OBSTRN", .acr = "NATQUA" },
+};
+
+/// Whether S-65 Annex B §E says S-57 attribute `attl` "will not convert" for S-57
+/// object `objl` — i.e. drop the whole attribute from the adapted feature model.
+/// Resolves both codes to their S-57 acronyms (the DROP_ATTRS key); an unknown code
+/// yields no acronym and so no drop (fail-open: never drop an attribute we can't name).
+fn isDroppedAttr(objl: u16, attl: u16) bool {
+    const obj = catalogue.acronymByObjl(objl) orelse return false;
+    const acr = catalogue.attrAcronym(attl) orelse return false;
+    for (DROP_ATTRS) |d|
+        if (std.mem.eql(u8, d.obj, obj) and std.mem.eql(u8, d.acr, acr)) return true;
+    return false;
+}
+
 /// First integer in the S-57 comma-separated list `csv`, or 0 if none.
 /// Port of complex.go firstListVal.
 fn firstListVal(csv: []const u8) i64 {
@@ -627,6 +677,11 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (at.code == s57.ATTR_OBJNAM) name = v; // OBJNAM -> featureName
             if (at.code == s57.ATTR_CATZOC) catzoc = v; // CATZOC -> zoneOfConfidence
             if (catalogue.resolveAttrByCode(at.code)) |aname| {
+                // S-65 Annex B §E: some attributes "will not convert" for this S-57
+                // object (S-101 prohibits them for the class) — drop the whole
+                // attribute so the adapted model never carries a value the class
+                // rejects. Precedes the value-level filters below.
+                if (isDroppedAttr(f.objl, at.code)) continue;
                 // S-65 Annex B value-level conversion: some raw S-57 values are
                 // invalid in S-101 and must be dropped or remapped before the rule
                 // reads them. First the global value remaps (TECSOU/QUASOU), then the
@@ -664,6 +719,9 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             // Gate binds horizontalClearanceOpen, not …Fixed (handled just below), so
             // don't wrap its HORCLR into the class-invalid Fixed complex.
             if (m.code == s57.ATTR_HORCLR and std.mem.eql(u8, code, "Gate")) continue;
+            // S-65 Annex B §E also drops these source attrs for some classes (e.g.
+            // RDOSTA drops ORIENT), so don't synthesize their complex either.
+            if (isDroppedAttr(f.objl, m.code)) continue;
             const raw = f.attr(m.code) orelse continue;
             const v = std.mem.trim(u8, raw, " ");
             if (v.len == 0) continue;
@@ -864,6 +922,96 @@ test "adapt a depth area" {
     try std.testing.expectEqualStrings("5", adapted[0].root.simple[0].value);
     // resolve("") returns the root itself; depthRangeMinimumValue reads back.
     try std.testing.expectEqualStrings("5", adapted[0].root.resolve("").?.simpleValue("depthRangeMinimumValue").?);
+}
+
+test "Gap E: isDroppedAttr matches the S-65 §E per-object drop-list" {
+    // On the list -> dropped (S-57 object / attribute numeric codes; see DROP_ATTRS).
+    try std.testing.expect(isDroppedAttr(42, 125)); // DEPARE / QUASOU
+    try std.testing.expect(isDroppedAttr(134, 125)); // SWPARE / QUASOU
+    try std.testing.expect(isDroppedAttr(134, 144)); // SWPARE / SOUACC
+    try std.testing.expect(isDroppedAttr(134, 156)); // SWPARE / TECSOU
+    try std.testing.expect(isDroppedAttr(22, 87)); // CBLSUB / DRVAL1
+    try std.testing.expect(isDroppedAttr(22, 88)); // CBLSUB / DRVAL2
+    try std.testing.expect(isDroppedAttr(105, 117)); // RDOSTA / ORIENT
+    try std.testing.expect(isDroppedAttr(86, 112)); // OBSTRN / NATCON
+    // Off the list -> kept.
+    try std.testing.expect(!isDroppedAttr(42, 87)); // DEPARE / DRVAL1 (kept: depth range)
+    try std.testing.expect(!isDroppedAttr(134, 87)); // SWPARE / DRVAL1 (not on the list)
+    try std.testing.expect(!isDroppedAttr(86, 156)); // OBSTRN / TECSOU (OBSTRN drops NATCON/NATQUA only)
+    try std.testing.expect(!isDroppedAttr(9999, 125)); // unknown object -> no acronym -> kept
+    try std.testing.expect(!isDroppedAttr(42, 9999)); // unknown attribute -> no acronym -> kept
+}
+
+test "Gap E: DepthArea drops QUASOU but keeps DRVAL1 through the adapter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // DEPARE carrying DRVAL1 (kept -> depthRangeMinimumValue) and QUASOU (S-65 §E:
+    // dropped for DEPARE). QUASOU=1 is a valid value with no per-class permitted
+    // restriction (permitted[DepthArea][qualityOfVerticalMeasurement] is absent), so
+    // absent the §E drop it WOULD be forwarded — this pins the drop, not filterPermitted.
+    const attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_DRVAL1, .value = "5" },
+        .{ .code = s57.ATTR_QUASOU, .value = "1" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 42, .attrs = &attrs }, // DEPARE
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    const root = &adapted[0].root;
+    try std.testing.expectEqualStrings("5", root.simpleValue("depthRangeMinimumValue").?);
+    try std.testing.expect(root.simpleValue("qualityOfVerticalMeasurement") == null);
+}
+
+test "Gap E: SweptArea drops QUASOU/SOUACC/TECSOU, keeps DRVAL1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // SWPARE: S-65 §E drops QUASOU, SOUACC, TECSOU. Non-remapped/permitted values
+    // (QUASOU=1 not the =5 drop; TECSOU=4 not a prohibited value) so the §E drop is
+    // what removes them. DRVAL1 stays as the least-depth control.
+    const attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_DRVAL1, .value = "7" },
+        .{ .code = s57.ATTR_QUASOU, .value = "1" },
+        .{ .code = 144, .value = "0.5" }, // SOUACC -> verticalUncertainty
+        .{ .code = s57.ATTR_TECSOU, .value = "4" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 134, .attrs = &attrs }, // SWPARE
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("SweptArea", adapted[0].code);
+    const root = &adapted[0].root;
+    try std.testing.expectEqualStrings("7", root.simpleValue("depthRangeMinimumValue").?);
+    try std.testing.expect(root.simpleValue("qualityOfVerticalMeasurement") == null);
+    try std.testing.expect(root.simpleValue("verticalUncertainty") == null);
+    try std.testing.expect(root.simpleValue("techniqueOfVerticalMeasurement") == null);
 }
 
 test "TOPMAR folds into co-located buoy as the topmark complex" {
