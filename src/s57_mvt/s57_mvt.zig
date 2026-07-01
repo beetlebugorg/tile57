@@ -177,11 +177,20 @@ fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc
 }
 
 /// SNDFRM04 quality flags for the whole feature: swept (TECSOU∈{4,18}) → B1 ring;
-/// low-accuracy (QUASOU∈{3,4,5,8,9} or STATUS∈{18}) → C2/C3 ring.
+/// low-accuracy (QUASOU∈{3,4,8,9}, no-bottom, or STATUS∈{18}) → C2/C3 ring.
 fn soundingQualityFlags(f: s57.Feature) struct { swept: bool, low_acc: bool } {
+    const quasou = f.attr(s57.ATTR_QUASOU) orelse "";
+    // QUASOU=5 ("no bottom found at the depth shown"): S-65 §2.2.3.3 re-routes such a
+    // sounding to the S-101 DepthNoBottomFound feature. SOUNDG bypasses S-101 portrayal
+    // here, but DepthNoBottomFound's portrayal is exactly the depth digits + the
+    // SNDFRM04 low-accuracy ring with NO NavHazard alert — and this soundings path emits
+    // no AlertReference for any sounding. So the re-route is realized by drawing the
+    // low-accuracy ring, recognized explicitly for QUASOU=5 (rather than only folded
+    // into the generic low-accuracy set) so the no-bottom mark survives changes to it.
+    const no_bottom = listHasAny(quasou, &.{5});
     return .{
         .swept = listHasAny(f.attr(s57.ATTR_TECSOU) orelse "", &.{ 4, 18 }),
-        .low_acc = listHasAny(f.attr(s57.ATTR_QUASOU) orelse "", &.{ 3, 4, 5, 8, 9 }) or
+        .low_acc = no_bottom or listHasAny(quasou, &.{ 3, 4, 8, 9 }) or
             listHasAny(f.attr(s57.ATTR_STATUS) orelse "", &.{18}),
     };
 }
@@ -2762,4 +2771,29 @@ test "buildSyminsPortrayal parses SY/TX/LS/LC/AC/AP" {
     const ps = (try buildSyminsPortrayal(a, f_semi)) orelse return error.NoPortrayal;
     try std.testing.expectEqual(@as(usize, 1), ps.texts.len);
     try std.testing.expectEqualStrings("a;b", ps.texts[0].text);
+}
+
+test "QUASOU=5 no-bottom sounding draws the low-accuracy ring (S-65 DepthNoBottomFound)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A SOUNDG feature with QUASOU=5 is the S-65 DepthNoBottomFound case: it must draw
+    // the SNDFRM04 low-accuracy ring (and, like every sounding here, no NavHazard).
+    const attrs = [_]s57.Attr{.{ .code = s57.ATTR_QUASOU, .value = "5" }};
+    const f = s57.Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 129, .attrs = &attrs };
+    const q = soundingQualityFlags(f);
+    try std.testing.expect(q.low_acc);
+    try std.testing.expect(!q.swept);
+    // The deep (SOUNDG) glyph leads with the C2 ring; the shallow (SOUNDS) glyph with C3.
+    try std.testing.expect(std.mem.startsWith(u8, try sndfrmSyms(a, "SOUNDG", 20.0, q.swept, q.low_acc, false), "SOUNDGC2"));
+    try std.testing.expect(std.mem.startsWith(u8, try sndfrmSyms(a, "SOUNDS", 4.0, q.swept, q.low_acc, false), "SOUNDSC3"));
+
+    // A normal surveyed sounding (QUASOU=1) gets no ring: the glyph starts with a digit.
+    const attrs_ok = [_]s57.Attr{.{ .code = s57.ATTR_QUASOU, .value = "1" }};
+    const f_ok = s57.Feature{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 129, .attrs = &attrs_ok };
+    const q_ok = soundingQualityFlags(f_ok);
+    try std.testing.expect(!q_ok.low_acc);
+    try std.testing.expect(std.mem.startsWith(u8, try sndfrmSyms(a, "SOUNDG", 20.0, q_ok.swept, q_ok.low_acc, false), "SOUNDG"));
+    try std.testing.expect(!std.mem.startsWith(u8, try sndfrmSyms(a, "SOUNDG", 20.0, q_ok.swept, q_ok.low_acc, false), "SOUNDGC2"));
 }
