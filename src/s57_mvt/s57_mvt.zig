@@ -644,6 +644,18 @@ fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) 
     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = font_px } });
     try props.append(a, .{ .key = "halign", .value = .{ .string = t.halign } });
     try props.append(a, .{ .key = "valign", .value = .{ .string = t.valign } });
+    // S-101 LocalOffset -> label-offset key in text-body units (3.51 mm = one text
+    // body height = 1 em): the style's text-offset match keys on "ux,uy" to shift a
+    // name clear of its symbol (PortrayFeatureName emits 0,-3.51 = one body up).
+    // Only emit when non-zero (most labels sit on their pivot). Sign is S-52 +x
+    // right / +y down, which matches MapLibre's text-offset.
+    {
+        const TEXT_BODY_MM = 3.51;
+        const ux: i64 = @intFromFloat(@round(t.offset_x / TEXT_BODY_MM));
+        const uy: i64 = @intFromFloat(@round(t.offset_y / TEXT_BODY_MM));
+        if (ux != 0 or uy != 0)
+            try props.append(a, .{ .key = "loff", .value = .{ .string = try std.fmt.allocPrint(a, "{d},{d}", .{ ux, uy }) } });
+    }
     // §10 text halo: the oracle attaches a CHWHT, 1px halo to text >= 10 px
     // (s101emit.go:130-133) and emits it as halo_color_token / halo_width tile
     // properties (bake.go:1147-1148); smaller text gets no halo ("" / 0). Our served
@@ -2352,6 +2364,33 @@ test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)
     }
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS55", sym_s); // 4.5 m
     try std.testing.expectEqualStrings("SOUNDS21,SOUNDS14,SOUNDS57", sym_s_ft); // 14.7 ft (truncated)
+}
+
+test "appendTextProps: LocalOffset (mm) -> loff key in text-body units (round mm/3.51)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cases = [_]struct { ox: f64, oy: f64, want: ?[]const u8 }{
+        .{ .ox = 0, .oy = -3.51, .want = "0,-1" }, // PortrayFeatureName name: one body up
+        .{ .ox = 3.51, .oy = 3.51, .want = "1,1" }, // down-right
+        .{ .ox = 7.02, .oy = 0, .want = "2,0" }, // two bodies right
+        .{ .ox = 0, .oy = 0, .want = null }, // on the pivot -> no loff prop
+    };
+    for (cases) |c| {
+        var props = std.ArrayList(mvt.Prop).empty;
+        try appendTextProps(a, &props, .{ .text = "x", .color = "CHBLK", .offset_x = c.ox, .offset_y = c.oy });
+        var loff: ?[]const u8 = null;
+        for (props.items) |p| {
+            if (std.mem.eql(u8, p.key, "loff")) loff = p.value.string;
+        }
+        if (c.want) |w| {
+            try std.testing.expect(loff != null);
+            try std.testing.expectEqualStrings(w, loff.?);
+        } else {
+            try std.testing.expect(loff == null);
+        }
+    }
 }
 
 test "appendTextProps: halo (CHWHT/1) gated on font_size >= 10, matching the oracle" {

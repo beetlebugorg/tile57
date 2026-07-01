@@ -81,6 +81,32 @@ const TEXT_ANCHOR = .{
 };
 const TEXT_SORT_KEY = .{ "-", .{ "match", .{ "coalesce", .{ "get", "tgrp" }, -1 }, 11, 0, .{ 21, 26, 29 }, 100, 23, 50, 150 }, .{ "coalesce", .{ "get", "font_size_px" }, 10 } };
 
+// S-101 LocalOffset -> MapLibre text-offset (em): shifts a label clear of its symbol
+// (e.g. a buoy name one text-body above the point). MVT properties are scalar and
+// MapLibre can't build an [x,y] array from two of them, so the bake emits a compact
+// `loff` key in text-body units (3.51 mm = 1 em; see appendTextProps) and we map it
+// to a literal offset. Keys are the catalogue's LocalOffset set / 3.51; rare non-
+// body-multiple offsets fall through to no shift. This COMBINES with TEXT_ANCHOR —
+// the S-52 model places text via alignment AND offset (the oracle's own client drops
+// the offset; we apply it for spec-compliant placement).
+const TEXT_OFFSET = .{
+    "match", .{ "coalesce", .{ "get", "loff" }, "0,0" },
+    "1,1",   .{ "literal", .{ 1, 1 } },
+    "0,1",   .{ "literal", .{ 0, 1 } },
+    "-1,1",  .{ "literal", .{ -1, 1 } },
+    "1,0",   .{ "literal", .{ 1, 0 } },
+    "2,0",   .{ "literal", .{ 2, 0 } },
+    "1,-1",  .{ "literal", .{ 1, -1 } },
+    "0,-1",  .{ "literal", .{ 0, -1 } },
+    "-1,-2", .{ "literal", .{ -1, -2 } },
+    "0,2",   .{ "literal", .{ 0, 2 } },
+    "2,1",   .{ "literal", .{ 2, 1 } },
+    "-2,0",  .{ "literal", .{ -2, 0 } },
+    "-1,2",  .{ "literal", .{ -1, 2 } },
+    "3,-1",  .{ "literal", .{ 3, -1 } },
+    .{ "literal", .{ 0, 0 } },
+};
+
 pub const StyleOpts = struct {
     scheme: []const u8, // "day" | "dusk" | "night"
     colortables_json: []const u8,
@@ -406,6 +432,8 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 11 }, s.size_scale);
     try js.objectField("text-anchor");
     try js.write(TEXT_ANCHOR);
+    try js.objectField("text-offset");
+    try js.write(TEXT_OFFSET);
     try js.objectField("symbol-sort-key");
     try js.write(TEXT_SORT_KEY);
     try js.objectField("text-allow-overlap");

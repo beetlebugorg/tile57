@@ -24,6 +24,12 @@ pub const Text = struct {
     font_size: f64 = 0,
     halign: []const u8 = "left",
     valign: []const u8 = "bottom",
+    // S-101 LocalOffset (mm, +x right / +y down): shifts the label off the feature's
+    // pivot so a name doesn't overprint its symbol (e.g. PortrayFeatureName's
+    // 0,-3.51 = one text-body up). Applied via the style's text-offset; combines
+    // with the TextAlign anchor, as the S-52 model intends.
+    offset_x: f64 = 0,
+    offset_y: f64 = 0,
 };
 
 /// Map an S-101 TextAlignHorizontal to the tile `halign` value (oracle hAlign +
@@ -316,7 +322,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // `if cmd.Reference == "" return nil`) — skip it here, equivalently.
             const txt = try decodeDEF(a, val);
             if (txt.len == 0) continue;
-            try texts.append(a, .{ .text = txt, .color = cur_font, .group = cur_tgrp, .font_size = cur_font_size, .halign = mapHAlign(cur_align_h), .valign = mapVAlign(cur_align_v) });
+            try texts.append(a, .{ .text = txt, .color = cur_font, .group = cur_tgrp, .font_size = cur_font_size, .halign = mapHAlign(cur_align_h), .valign = mapVAlign(cur_align_v), .offset_x = cur_ox, .offset_y = cur_oy });
         } else if (std.mem.eql(u8, key, "DrawingPriority")) {
             // S-52 display priority. A feature draws across several viewing groups,
             // each with its own DrawingPriority; the feature's priority is the MAX
