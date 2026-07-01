@@ -10,6 +10,11 @@ const std = @import("std");
 // outside the module's src/ root, so it can't be embedded by relative path).
 const json_bytes = @embedFile("catalogue_json");
 const s57codes_bytes = @embedFile("s57codes_json"); // {obj:{code:acronym}, attr:{code:acronym}}
+// Per-feature-class permitted enumerate values, distilled from the FeatureCatalogue
+// attributeBinding <permittedValues> (S-65 Table A-2 "restricted allowable values").
+// {className: {attrName: [values]}}; a present list means the adapter drops S-57
+// values off it before portrayal.
+const permitted_bytes = @embedFile("permitted_json");
 
 pub const Binding = struct { ref: []const u8, lower: i32, upper: i32 };
 
@@ -26,6 +31,8 @@ const Catalogue = struct {
     attr_alias: std.StringHashMap([]const u8),
     obj_acronym: std.AutoHashMap(u16, []const u8), // S-57 OBJL -> acronym
     attr_acronym: std.AutoHashMap(u16, []const u8), // S-57 ATTL -> acronym
+    permitted_parsed: ?std.json.Parsed(std.json.Value) = null,
+    permitted: std.StringHashMap(std.StringHashMap([]const i64)), // class -> attr -> permitted enum values
 };
 
 var g_cat: ?Catalogue = null;
@@ -93,6 +100,7 @@ fn ensureLoaded() void {
         .attr_alias = std.StringHashMap([]const u8).init(a),
         .obj_acronym = std.AutoHashMap(u16, []const u8).init(a),
         .attr_acronym = std.AutoHashMap(u16, []const u8).init(a),
+        .permitted = std.StringHashMap(std.StringHashMap([]const i64)).init(a),
     };
 
     // featureTypes
@@ -160,7 +168,38 @@ fn ensureLoaded() void {
         }
     } else |_| {}
 
+    // Per-class permitted enumerate values: {class:{attr:[ints]}}.
+    if (std.json.parseFromSlice(std.json.Value, a, permitted_bytes, .{})) |pp| {
+        cat.permitted_parsed = pp;
+        if (pp.value == .object) {
+            for (pp.value.object.keys()) |cls| {
+                const av = pp.value.object.get(cls).?;
+                if (av != .object) continue;
+                var attrs = std.StringHashMap([]const i64).init(a);
+                for (av.object.keys()) |attr| {
+                    const arr = av.object.get(attr).?;
+                    if (arr != .array) continue;
+                    var vals = std.ArrayList(i64).empty;
+                    for (arr.array.items) |x| if (x == .integer) vals.append(a, x.integer) catch {};
+                    attrs.put(attr, vals.items) catch {};
+                }
+                cat.permitted.put(cls, attrs) catch {};
+            }
+        }
+    } else |_| {}
+
     g_cat = cat;
+}
+
+/// The S-101 permitted enumerate values for `attr` on feature class `class`
+/// (FeatureCatalogue attributeBinding <permittedValues>), or null when the binding
+/// places no restriction. A forwarded S-57 value outside this list "will not
+/// convert" (S-65 Table A-2) and the adapter drops it.
+pub fn permittedValues(class: []const u8, attr: []const u8) ?[]const i64 {
+    ensureLoaded();
+    const c = &(g_cat orelse return null);
+    const attrs = c.permitted.getPtr(class) orelse return null;
+    return attrs.get(attr);
 }
 
 /// S-57 OBJL (numeric) -> S-101 feature class code, via acronym.
@@ -331,4 +370,14 @@ test "catalogue loads + resolves aliases + bindings" {
         if (std.mem.eql(u8, b.ref, "depthRangeMinimumValue")) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "permitted enumerate values load from the FC binding lists" {
+    // CableArea restricts categoryOfCable to {1,7,10} (S-65 Table A-2).
+    const cbl = permittedValues("CableArea", "categoryOfCable").?;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 7, 10 }, cbl);
+    // UnderwaterAwashRock restricts status to {18} only.
+    try std.testing.expectEqualSlices(i64, &.{18}, permittedValues("UnderwaterAwashRock", "status").?);
+    // An unrestricted (class, attr) pair returns null (no filtering).
+    try std.testing.expect(permittedValues("DepthArea", "depthRangeMinimumValue") == null);
 }

@@ -399,6 +399,31 @@ fn s65RemapValue(a: std.mem.Allocator, code: u16, v: []const u8) ![]const u8 {
     return out.items;
 }
 
+/// Drop enumerate values not on the S-101 per-class permitted list (FeatureCatalogue
+/// attributeBinding <permittedValues>; S-65 Table A-2 "restricted allowable values").
+/// List-valued attributes filter element-wise; a fully-emptied list returns "" and the
+/// caller omits the attribute. Attributes with no per-class restriction pass through,
+/// as do non-numeric elements (defensive — permitted lists only bind enumerations).
+/// Runs AFTER s65RemapValue, so a remapped value (TECSOU 14->17) is checked as 17.
+fn filterPermitted(a: std.mem.Allocator, class: []const u8, attr: []const u8, v: []const u8) ![]const u8 {
+    const allowed = catalogue.permittedValues(class, attr) orelse return v;
+    var out = std.ArrayList(u8).empty;
+    var it = std.mem.splitScalar(u8, v, ',');
+    while (it.next()) |p| {
+        const t = std.mem.trim(u8, p, " ");
+        if (t.len == 0) continue;
+        const n = std.fmt.parseInt(i64, t, 10) catch {
+            if (out.items.len > 0) try out.append(a, ',');
+            try out.appendSlice(a, t);
+            continue;
+        };
+        if (std.mem.indexOfScalar(i64, allowed, n) == null) continue; // off-list -> drop
+        if (out.items.len > 0) try out.append(a, ',');
+        try out.appendSlice(a, t);
+    }
+    return out.items;
+}
+
 /// First integer in the S-57 comma-separated list `csv`, or 0 if none.
 /// Port of complex.go firstListVal.
 fn firstListVal(csv: []const u8) i64 {
@@ -573,9 +598,12 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             if (catalogue.resolveAttrByCode(at.code)) |aname| {
                 // S-65 Annex B value-level conversion: some raw S-57 values are
                 // invalid in S-101 and must be dropped or remapped before the rule
-                // reads them. "" means every value dropped -> omit the attribute.
+                // reads them. First the global value remaps (TECSOU/QUASOU), then the
+                // per-class permitted-value restriction. "" => every value dropped, so
+                // omit the attribute.
                 const tv = try s65RemapValue(a, at.code, v);
-                if (tv.len > 0) try attrs.append(a, .{ .name = aname, .value = tv });
+                const pv = try filterPermitted(a, code, aname, tv);
+                if (pv.len > 0) try attrs.append(a, .{ .name = aname, .value = pv });
             }
         }
 
@@ -962,6 +990,34 @@ test "prohibited QUASOU=5 is dropped from an adapted Wreck" {
     const root = adapted[0].root.resolve("").?;
     try std.testing.expect(root.simpleValue("qualityOfVerticalMeasurement") == null); // dropped
     try std.testing.expectEqualStrings("3", root.simpleValue("techniqueOfVerticalMeasurement").?);
+}
+
+test "off-list enum values drop per the FC permitted-value list" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // CableArea (CBLARE) permits categoryOfCable in {1,7,10}; "2,7" -> "7".
+    const attrs = [_]s57.Attr{.{ .code = 11, .value = "2,7" }}; // 11 = CATCBL
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 20, .attrs = &attrs }, // CBLARE surface
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("CableArea", adapted[0].code);
+    // 2 is off the CableArea permitted list and drops; 7 survives.
+    try std.testing.expectEqualStrings("7", adapted[0].root.resolve("").?.simpleValue("categoryOfCable").?);
 }
 
 test "resolveLightClass routes by sector limits / CATLIT" {

@@ -33,6 +33,7 @@ const std = @import("std");
 
 const CATALOGUE = "vendor/s101/catalogue.json";
 const S57CODES = "vendor/s101/s57codes.json";
+const PERMITTED = "vendor/s101/permitted.json"; // per-class permitted enum values the adapter enforces
 const RULES_DIR = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
 
 // Attributes the adapter synthesizes/derives WITHOUT a direct S-57 alias.
@@ -293,6 +294,20 @@ pub fn main(init: std.process.Init) !void {
     const cat = try readJson(io, a, CATALOGUE);
     const s57 = try readJson(io, a, S57CODES);
 
+    // Per-class permitted enum values the adapter enforces (filterPermitted): a
+    // "Class.attr" here means an off-list value is dropped before portrayal, so the
+    // S-65 "restricted allowable value" concern for that slot is handled — retire it.
+    const permitted = readJson(io, a, PERMITTED) catch std.json.Value{ .null = {} };
+    var enforced = StrSet.init(a);
+    if (permitted == .object) {
+        for (permitted.object.keys()) |cls| {
+            const av = permitted.object.get(cls).?;
+            if (av != .object) continue;
+            for (av.object.keys()) |attr|
+                try enforced.put(try std.fmt.allocPrint(a, "{s}.{s}", .{ cls, attr }), {});
+        }
+    }
+
     var s57_acr = StrSet.init(a); // acronyms of real S-57 attributes
     if (s57.object.get("attr")) |av| if (av == .object) {
         var it = av.object.iterator();
@@ -412,7 +427,10 @@ pub fn main(init: std.process.Init) !void {
                     rn = v.note;
                     break;
                 };
-                if (rk == null) restr: for (RESTRICTED) |r| {
+                // The adapter enforces the FC per-class permitted list (filterPermitted),
+                // so a slot it covers is no longer at risk — skip the S-65 restricted flag.
+                const slot_key = try std.fmt.allocPrint(a, "{s}.{s}", .{ cls, attr });
+                if (rk == null and !enforced.contains(slot_key)) restr: for (RESTRICTED) |r| {
                     if (!listHas(acrs, r.acr)) continue;
                     for (r.objs) |o| if (listHas(objs, o)) {
                         rk = "restricted";

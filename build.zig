@@ -21,6 +21,7 @@ const lua_sources = [_][]const u8{
 fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
     mod.addAnonymousImport("catalogue_json", .{ .root_source_file = b.path("vendor/s101/catalogue.json") });
     mod.addAnonymousImport("s57codes_json", .{ .root_source_file = b.path("vendor/s101/s57codes.json") });
+    mod.addAnonymousImport("permitted_json", .{ .root_source_file = b.path("vendor/s101/permitted.json") });
 }
 
 // Attach the embedded Lua 5.4 interpreter + the portrayal C shim to a module.
