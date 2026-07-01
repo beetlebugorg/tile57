@@ -110,6 +110,41 @@ func TestOpenCellAndTile(t *testing.T) {
 	}
 }
 
+// TestOpenPath opens the testdata directory as a STREAMING chart (engine enumerates
+// + reads the .000 on demand) and asserts it tiles like the byte-opened cell.
+func TestOpenPath(t *testing.T) {
+	if _, err := os.Stat(testCell); err != nil {
+		t.Skipf("no test cell: %v", err)
+	}
+	src, err := Open("testdata")
+	if err != nil {
+		t.Fatalf("Open(testdata): %v", err)
+	}
+	defer src.Close()
+
+	mn, mx := src.ZoomRange()
+	w, s, e, n, ok := src.Bounds()
+	if !ok {
+		t.Fatal("expected known bounds for the streamed ENC_ROOT")
+	}
+	t.Logf("streamed: zoom %d..%d bounds W=%.4f S=%.4f E=%.4f N=%.4f", mn, mx, w, s, e, n)
+
+	got := false
+	for z := mn; z <= mx && z <= 14; z++ {
+		tx, ty := lonLatToTile((w+e)/2, (s+n)/2, z)
+		body, err := src.Tile(z, tx, ty)
+		if err != nil {
+			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
+		}
+		if len(body) > 0 {
+			got = true
+		}
+	}
+	if !got {
+		t.Fatal("no non-empty tile from the streamed chart")
+	}
+}
+
 // lonLatToTile maps a lon/lat to its XYZ web-Mercator tile at zoom z.
 func lonLatToTile(lon, lat float64, z uint8) (x, y uint32) {
 	n := math.Exp2(float64(z))

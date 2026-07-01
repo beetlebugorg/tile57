@@ -141,6 +141,13 @@ tile57_source *tile57_source_open_cells_streaming(
     tile57_cell_read_fn read, void *user, const char *rules_dir,
     int omit_pick_attrs);
 
+/* Open an on-disk ENC_ROOT directory (or a single .000 file) as a streaming chart:
+ * the engine enumerates the cells + peeks each one's bbox/scale at open, then reads
+ * cell bytes on demand (working set only), so RSS tracks what tiles need, not the
+ * whole ENC_ROOT. Rules are the library's embedded catalogue. NULL/failure -> NULL.
+ * (chart-api.md — additive during the source->chart rename.) */
+tile57_source *tile57_chart_open(const char *path);
+
 /* Progress callback for tile57_bake_cells / tile57_bake_bundle. stage 0 =
  * loading/portraying cells, stage 1 = baking tiles. Stage 0 done/total count cells.
  * Stage 1 done/total count tiles: for tile57_bake_bundle they are PER BAND (reset

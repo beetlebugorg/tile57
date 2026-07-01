@@ -135,6 +135,29 @@ const LazySource = struct {
     max_loaded: usize = 256, // LRU budget on parsed+portrayed cells (wide views)
     reader: ?CellReadFn = null, // streaming: read a cell's bytes on demand
     reader_user: ?*anyopaque = null,
+    // Path-backed streaming (chart-api.md): when the chart was opened from an on-disk
+    // ENC_ROOT, this owns the retained Io + Dir + per-cell paths and is the
+    // reader_user; freed in deinit. null for byte/reader-supplied streaming.
+    path_ctx: ?*PathCtx = null,
+};
+
+// Owned state for a path-backed streaming chart: the retained filesystem handles +
+// per-cell base .000 paths (index-aligned with the LazySource cells). Lives for the
+// chart's lifetime so cells can be read on demand; freed by deinit via PathCtx.deinit.
+const PathCtx = struct {
+    threaded: *std.Io.Threaded,
+    io: std.Io,
+    dir: std.Io.Dir,
+    paths: [][]u8, // base .000 path per cell, relative to `dir`
+
+    fn deinit(self: *PathCtx) void {
+        for (self.paths) |p| gpa.free(p);
+        gpa.free(self.paths);
+        self.dir.close(self.io);
+        self.threaded.deinit();
+        gpa.destroy(self.threaded);
+        gpa.destroy(self);
+    }
 };
 
 const Backend = union(enum) {
@@ -194,6 +217,86 @@ fn freeCellBytes(cb: *CellBytes) void {
         std.c.free(@constCast(@ptrCast(ups)));
     }
     if (cb.update_lens) |ul| std.c.free(@constCast(@ptrCast(ul)));
+}
+
+// ---- path-backed streaming helpers (chart-api.md) --------------------------
+
+fn isDirIo(io: std.Io, path: []const u8) bool {
+    var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    d.close(io);
+    return true;
+}
+
+// libc-malloc'd copy of `bytes` (the streaming reader transfers ownership to the
+// engine, which frees via freeCellBytes/std.c.free). null on OOM.
+fn cdup(bytes: []const u8) ?[*]u8 {
+    const p = std.c.malloc(bytes.len) orelse return null;
+    const dst: [*]u8 = @ptrCast(p);
+    @memcpy(dst[0..bytes.len], bytes);
+    return dst;
+}
+
+// Peek `relpath`'s bbox+scale; on success append an index-aligned meta + a gpa-owned
+// copy of the path. Cells that don't read / have no coverage bbox are skipped (both
+// lists), keeping meta[i] and paths[i] aligned with the streaming cell index.
+fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(CellMeta), paths: *std.ArrayList([]u8)) !void {
+    const bytes = dir.readFileAlloc(io, relpath, gpa, .unlimited) catch return;
+    defer gpa.free(bytes);
+    const m = s57.peekMeta(gpa, bytes) orelse return;
+    const bb = m.bounds orelse return;
+    try metas.append(gpa, .{ .west = bb[0], .south = bb[1], .east = bb[2], .north = bb[3], .cscl = m.cscl });
+    try paths.append(gpa, try gpa.dupe(u8, relpath));
+}
+
+// Internal CellReadFn for a path-backed chart: read cell `index`'s base .000 + its
+// sequential .001.. updates from the retained dir into libc-malloc'd buffers (the
+// engine frees them via freeCellBytes). Mirrors the baker's per-cell load.
+fn pathRead(user: ?*anyopaque, index: usize, out: *CellBytes) callconv(.c) bool {
+    const ctx: *PathCtx = @ptrCast(@alignCast(user orelse return false));
+    if (index >= ctx.paths.len) return false;
+    const bpath = ctx.paths[index];
+    const base = ctx.dir.readFileAlloc(ctx.io, bpath, gpa, .unlimited) catch return false;
+    defer gpa.free(base);
+    const cbase = cdup(base) orelse return false;
+    out.* = .{ .base = cbase, .base_len = base.len };
+
+    var ups = std.ArrayList([*]const u8).empty;
+    defer ups.deinit(gpa);
+    var ulens = std.ArrayList(usize).empty;
+    defer ulens.deinit(gpa);
+    const stem = bpath[0 .. bpath.len - 4]; // strip ".000"
+    var u: u32 = 1;
+    while (u <= 999) : (u += 1) {
+        const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
+        defer gpa.free(upn);
+        const ub = ctx.dir.readFileAlloc(ctx.io, upn, gpa, .unlimited) catch break;
+        defer gpa.free(ub);
+        const cub = cdup(ub) orelse break;
+        ulens.append(gpa, ub.len) catch {
+            std.c.free(cub);
+            break;
+        };
+        ups.append(gpa, cub) catch {
+            std.c.free(cub);
+            _ = ulens.pop();
+            break;
+        };
+    }
+    if (ups.items.len > 0) {
+        const uarr = std.c.malloc(ups.items.len * @sizeOf([*]const u8)) orelse return true;
+        const larr = std.c.malloc(ups.items.len * @sizeOf(usize)) orelse {
+            std.c.free(uarr);
+            return true;
+        };
+        const udst: [*][*]const u8 = @ptrCast(@alignCast(uarr));
+        const ldst: [*]usize = @ptrCast(@alignCast(larr));
+        @memcpy(udst[0..ups.items.len], ups.items);
+        @memcpy(ldst[0..ulens.items.len], ulens.items);
+        out.updates = @ptrCast(udst);
+        out.update_lens = ldst;
+        out.update_count = ups.items.len;
+    }
+    return true;
 }
 
 // Read a streaming cell's bytes via the host reader into gpa-owned base/updates
@@ -512,6 +615,67 @@ pub const Source = struct {
         return src;
     }
 
+    /// Open an on-disk ENC_ROOT directory (or a single `.000` file) as a STREAMING
+    /// chart: enumerate the cells (CATALOG.031, else a `*.000` walk; single file =
+    /// one cell), peek each one's bbox + compilation scale at open, then read cell
+    /// bytes on demand for the working set (freed on LRU eviction) — the caller hands
+    /// over only a path and the engine holds only what tiles need. The chart owns the
+    /// retained Io + Dir for its lifetime (freed in deinit). Errors if no cell parses.
+    /// TODO(chart-api): unify the enumeration with the baker's bakeRoot (parity-gated).
+    pub fn openPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Source {
+        const threaded = try gpa.create(std.Io.Threaded);
+        errdefer gpa.destroy(threaded);
+        threaded.* = .init(gpa, .{});
+        errdefer threaded.deinit();
+        const io = threaded.io();
+
+        const single_file = !isDirIo(io, path);
+        const dir_path = if (single_file) (std.fs.path.dirname(path) orelse ".") else path;
+        var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+        errdefer dir.close(io);
+
+        var metas = std.ArrayList(CellMeta).empty;
+        defer metas.deinit(gpa);
+        var paths = std.ArrayList([]u8).empty;
+        errdefer {
+            for (paths.items) |p| gpa.free(p);
+            paths.deinit(gpa);
+        }
+
+        if (single_file) {
+            try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths);
+        } else if (dir.readFileAlloc(io, "CATALOG.031", gpa, .unlimited)) |cbytes| {
+            defer gpa.free(cbytes);
+            var carena = std.heap.ArenaAllocator.init(gpa);
+            defer carena.deinit();
+            if (s57.parseCatalog(carena.allocator(), cbytes)) |entries| {
+                for (entries) |e| {
+                    if (e.is_cell) try addPathCell(io, dir, e.path, &metas, &paths);
+                }
+            }
+        } else |_| {
+            var walker = try dir.walk(gpa);
+            defer walker.deinit();
+            while (try walker.next(io)) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
+                try addPathCell(io, dir, entry.path, &metas, &paths);
+            }
+        }
+        if (metas.items.len == 0) return error.OpenFailed;
+
+        // Reuse the streaming backend with the internal file reader; the returned
+        // Source owns the PathCtx (Io + Dir + paths) via ls.path_ctx, freed in deinit.
+        const src = try openCellsStreaming(metas.items, pathRead, null, rules_dir, pick_attrs);
+        errdefer src.deinit();
+        const ctx = try gpa.create(PathCtx);
+        errdefer gpa.destroy(ctx);
+        ctx.* = .{ .threaded = threaded, .io = io, .dir = dir, .paths = try paths.toOwnedSlice(gpa) };
+        src.backend.cells.reader_user = ctx;
+        src.backend.cells.path_ctx = ctx;
+        return src;
+    }
+
     /// Release the source and all cached tiles.
     pub fn deinit(self: *Source) void {
         switch (self.backend) {
@@ -521,6 +685,7 @@ pub const Source = struct {
                 for (ls.cells) |*lc| lazyFreeCell(lc);
                 gpa.free(ls.cells);
                 gpa.free(ls.rules_dir);
+                if (ls.path_ctx) |c| c.deinit();
             },
         }
         var it = self.cache.valueIterator();

@@ -132,6 +132,23 @@ func OpenCells(cells []CellInput, rulesDir string, pick PickAttrs) (*Source, err
 	return &Source{ptr: ptr}, nil
 }
 
+// Open opens an on-disk ENC_ROOT directory (or a single .000 file) as a STREAMING
+// chart: the engine enumerates + peeks the cells at open, then reads cell bytes on
+// demand (working set only), so memory tracks what tiles need rather than the whole
+// ENC_ROOT. Rules are the library's embedded catalogue. (chart-api.md)
+func Open(path string) (*Source, error) {
+	if path == "" {
+		return nil, fmt.Errorf("tile57: empty path: %w", ErrEmptyInput)
+	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	ptr := C.tile57_chart_open(cPath)
+	if ptr == nil {
+		return nil, fmt.Errorf("tile57: failed to open chart at %q", path)
+	}
+	return &Source{ptr: ptr}, nil
+}
+
 // Tile fetches tile (z, x, y) as decompressed MVT bytes. (nil, nil) means a blank
 // tile (valid but empty) — the TileSource "no tile here" convention.
 func (s *Source) Tile(z uint8, x, y uint32) ([]byte, error) {

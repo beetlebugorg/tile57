@@ -126,6 +126,13 @@ export fn tile57_source_open_cells_streaming(
     return Source.openCellsStreaming(metas[0..count], read, user, spanOpt(rules_dir), omit_pick_attrs == 0) catch null;
 }
 
+/// Open an on-disk ENC_ROOT directory (or single .000) as a streaming chart. See tile57.h.
+/// (chart-api.md — additive during the source->chart migration.)
+export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Source {
+    const p = spanOpt(path) orelse return null;
+    return Source.openPath(p, null, true) catch null;
+}
+
 // Progress callback for tile57_bake_cells / tile57_bake_bundle (matches the header
 // typedef + source.Progress + bake_enc.Progress).
 const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
