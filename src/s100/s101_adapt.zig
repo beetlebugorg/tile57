@@ -399,6 +399,21 @@ fn s65RemapValue(a: std.mem.Allocator, code: u16, v: []const u8) ![]const u8 {
     return out.items;
 }
 
+/// S-65 §2.2.3 QUAPOS -> qualityOfHorizontalMeasurement value map (Gap A.1). The raw
+/// S-57 QUAPOS enumerate is NOT a valid S-101 value as-is: 3/6/7/8/9/11 collapse to 4
+/// (approximate), 4 and 5 pass through unchanged, and 1 (surveyed) / 2 (unsurveyed) /
+/// 10 (precisely known) have no S-101 quality-of-horizontal-measurement equivalent and
+/// drop (null, as does the 0 "absent" aggregate). Applied to the featureQuapos
+/// aggregate; the low-accuracy dashed-line switch reads that raw aggregate directly
+/// (s57_mvt), so this remap only shapes the value carried in the adapted feature model.
+fn s65RemapQuapos(q: i32) ?i64 {
+    return switch (q) {
+        3, 4, 6, 7, 8, 9, 11 => 4,
+        5 => 5,
+        else => null, // 0 absent; 1/2/10 have no S-101 equivalent
+    };
+}
+
 /// Drop enumerate values not on the S-101 per-class permitted list (FeatureCatalogue
 /// attributeBinding <permittedValues>; S-65 Table A-2 "restricted allowable values").
 /// List-valued attributes filter element-wise; a fully-emptied list returns "" and the
@@ -728,12 +743,15 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             try attrs.append(a, .{ .name = "defaultClearanceDepth", .value = try fmtFloat(a, clearance) });
         }
 
-        // Low-accuracy geometry (QUAPOS): expose the per-feature aggregate as a
-        // simple attribute so the approximate-position dashed line style can be
-        // applied. (S-52 draws low-accuracy lines dashed; the actual stroke ->
-        // dashed switch lives in the instruction-translation layer — see notes.)
-        const q = cell.featureQuapos(f);
-        if (q != 0) try attrs.append(a, .{ .name = "qualityOfHorizontalMeasurement", .value = try std.fmt.allocPrint(a, "{d}", .{q}) });
+        // Low-accuracy geometry (QUAPOS): expose the per-feature aggregate as the
+        // S-101 qualityOfHorizontalMeasurement, remapped per S-65 §2.2.3 (the raw
+        // S-57 QUAPOS enumerate is not a valid S-101 value — s65RemapQuapos drops
+        // 1/2/10 and collapses 3/6/7/8/9/11 to 4). The approximate-position dashed
+        // line style is applied separately in the instruction-translation layer,
+        // which reads the raw aggregate directly (s57_mvt cell.featureQuapos), so it
+        // is unaffected by this remap.
+        if (s65RemapQuapos(cell.featureQuapos(f))) |m|
+            try attrs.append(a, .{ .name = "qualityOfHorizontalMeasurement", .value = try std.fmt.allocPrint(a, "{d}", .{m}) });
 
         // Point geometry for `#P` spatial resolution: a point feature's node, with
         // z = VALSOU (a sounding/danger depth) when present. The framework needs a
@@ -957,6 +975,73 @@ test "s65RemapValue: TECSOU/QUASOU S-65 value conversion" {
     // QUASOU: 5 dropped, others kept.
     try std.testing.expectEqualStrings("", try s65RemapValue(a, s57.ATTR_QUASOU, "5"));
     try std.testing.expectEqualStrings("6", try s65RemapValue(a, s57.ATTR_QUASOU, "6"));
+}
+
+test "s65RemapQuapos: S-65 §2.2.3 QUAPOS -> qualityOfHorizontalMeasurement map" {
+    // 3/6/7/8/9/11 -> 4 (approximate); 4 and 5 pass through; 1/2/10 (+ 0 absent) drop.
+    try std.testing.expectEqual(@as(?i64, 4), s65RemapQuapos(3));
+    try std.testing.expectEqual(@as(?i64, 4), s65RemapQuapos(4));
+    try std.testing.expectEqual(@as(?i64, 5), s65RemapQuapos(5));
+    for ([_]i32{ 6, 7, 8, 9, 11 }) |q| try std.testing.expectEqual(@as(?i64, 4), s65RemapQuapos(q));
+    for ([_]i32{ 0, 1, 2, 10 }) |q| try std.testing.expectEqual(@as(?i64, null), s65RemapQuapos(q));
+}
+
+test "low-accuracy QUAPOS remaps to qualityOfHorizontalMeasurement=4 through the adapter" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One drawn VE edge carrying QUAPOS=3 (inadequately surveyed) -> featureQuapos
+    // returns 3 -> S-65 remaps to qualityOfHorizontalMeasurement "4".
+    const vectors = try a.alloc(s57.VectorRecord, 1);
+    vectors[0] = .{ .rcnm = s57.RCNM_VE, .rcid = 10, .points = &.{}, .soundings = &.{}, .quapos = 3 };
+    var edges = std.AutoHashMap(u32, usize).init(a);
+    try edges.put(10, 0);
+
+    const refs = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 10 }, .ornt = 1 }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 2, .objl = 22, .refs = &refs }, // CBLSUB -> CableSubmarine (Curve)
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = vectors,
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("CableSubmarine", adapted[0].code);
+    try std.testing.expectEqualStrings("4", adapted[0].root.resolve("").?.simpleValue("qualityOfHorizontalMeasurement").?);
+
+    // A surveyed edge (QUAPOS=1) is not low-accuracy: featureQuapos returns 0, so
+    // the attribute is absent (no positive S-101 assertion).
+    const vectors2 = try a.alloc(s57.VectorRecord, 1);
+    vectors2[0] = .{ .rcnm = s57.RCNM_VE, .rcid = 20, .points = &.{}, .soundings = &.{}, .quapos = 1 };
+    var edges2 = std.AutoHashMap(u32, usize).init(a);
+    try edges2.put(20, 0);
+    const refs2 = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 20 }, .ornt = 1 }};
+    const feats2 = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 22, .refs = &refs2 },
+    };
+    var cell2 = s57.Cell{
+        .params = .{},
+        .vectors = vectors2,
+        .features = &feats2,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = edges2,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell2.arena.deinit();
+
+    const adapted2 = try adaptCell(a, &cell2);
+    try std.testing.expectEqual(@as(usize, 1), adapted2.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), adapted2[0].root.resolve("").?.simpleValue("qualityOfHorizontalMeasurement"));
 }
 
 test "prohibited QUASOU=5 is dropped from an adapted Wreck" {

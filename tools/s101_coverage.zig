@@ -95,16 +95,18 @@ const AttrNote = struct { acr: []const u8, note: []const u8 };
 const VALUE_REMAP = [_]AttrNote{
     .{ .acr = "TECSOU", .note = "TECSOU 6/7 prohibited, 14->17 (S-65 2.2.3.5)" },
     .{ .acr = "QUASOU", .note = "QUASOU 5 prohibited -> DepthNoBottomFound/drop (2.2.3.3)" },
-    .{ .acr = "QUAPOS", .note = "QUAPOS remap 3/6/7/8/9/11->4, drop 1/2/10 (2.2.3); adapter forwards raw code" },
+    .{ .acr = "QUAPOS", .note = "QUAPOS remap 3/6/7/8/9/11->4, drop 1/2/10 (2.2.3)" },
     .{ .acr = "CATBRG", .note = "CATBRG -> categoryOfOpeningBridge restructure (4.8.10)" },
 };
 
 // Acronyms whose VALUE_REMAP the adapter now applies before the value reaches a
-// rule (s101_adapt.zig s65RemapValue): the prohibited/remapped values are dropped
-// or mapped, and every surviving value is inside the S-101 allowable list — so the
-// "remap" concern is retired. The per-object RESTRICTED allowable-list axis, if any,
-// is still reported (a separate concern). Grow this as the adapter grows transforms.
-const VALUE_REMAP_DONE = [_][]const u8{ "TECSOU", "QUASOU" };
+// rule (s101_adapt.zig s65RemapValue / s65RemapQuapos): the prohibited/remapped
+// values are dropped or mapped, and every surviving value is inside the S-101
+// allowable list — so the "remap" concern is retired. The per-object RESTRICTED
+// allowable-list axis, if any, is still reported (a separate concern). Grow this as
+// the adapter grows transforms. (QUAPOS: no rule reads qualityOfHorizontalMeasurement
+// today, so it never surfaced at-risk; listed for when a reader appears.)
+const VALUE_REMAP_DONE = [_][]const u8{ "TECSOU", "QUASOU", "QUAPOS" };
 
 const AttrObjs = struct { acr: []const u8, objs: []const []const u8 };
 // Per-object restricted allowable-value lists (S-65 Table A-1/A-2; gaps doc §A.3).
