@@ -24,8 +24,10 @@ const Catalogue = struct {
     feature_codes: [][]const u8,
     simple_codes: [][]const u8,
     complex_codes: [][]const u8,
+    info_codes: [][]const u8,
     feature_bindings: std.StringHashMap([]Binding),
     complex_bindings: std.StringHashMap([]Binding),
+    info_bindings: std.StringHashMap([]Binding),
     simple_valuetype: std.StringHashMap([]const u8),
     feature_alias: std.StringHashMap([]const u8), // UPPER(S-57 acronym) -> S-101 code
     attr_alias: std.StringHashMap([]const u8),
@@ -93,8 +95,10 @@ fn ensureLoaded() void {
         .feature_codes = &.{},
         .simple_codes = &.{},
         .complex_codes = &.{},
+        .info_codes = &.{},
         .feature_bindings = std.StringHashMap([]Binding).init(a),
         .complex_bindings = std.StringHashMap([]Binding).init(a),
+        .info_bindings = std.StringHashMap([]Binding).init(a),
         .simple_valuetype = std.StringHashMap([]const u8).init(a),
         .feature_alias = std.StringHashMap([]const u8).init(a),
         .attr_alias = std.StringHashMap([]const u8).init(a),
@@ -144,6 +148,18 @@ fn ensureLoaded() void {
             };
         }
         cat.complex_codes = codes.items;
+    };
+    // informationTypes (SpatialQuality etc.) — served to the Lua framework so
+    // spatial-quality information associations resolve (S-65 §2.2.3, Gap D).
+    if (root.get("informationTypes")) |itv| if (itv == .object) {
+        const it = itv.object;
+        var codes = std.ArrayList([]const u8).empty;
+        for (it.keys()) |code| {
+            const entry = it.get(code).?.object;
+            codes.append(a, code) catch {};
+            cat.info_bindings.put(code, parseBindings(a, entry.get("bindings") orelse .null)) catch {};
+        }
+        cat.info_codes = codes.items;
     };
 
     // S-57 numeric code -> acronym tables.
@@ -322,8 +338,23 @@ export fn tgc_complex_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
     return s.ptr;
 }
 
+export fn tgc_info_count() callconv(.c) usize {
+    ensureLoaded();
+    return if (g_cat) |c| c.info_codes.len else 0;
+}
+export fn tgc_info_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const s = g_cat.?.info_codes[i];
+    out_len.* = s.len;
+    return s.ptr;
+}
+
 fn bindingsOf(map: *std.StringHashMap([]Binding), code: []const u8) []Binding {
     return map.get(code) orelse &.{};
+}
+
+export fn tgc_info_binding_count(code_ptr: [*]const u8, code_len: usize) callconv(.c) usize {
+    const c = &(g_cat orelse return 0);
+    return bindingsOf(&c.info_bindings, code_ptr[0..code_len]).len;
 }
 
 export fn tgc_feature_binding_count(code_ptr: [*]const u8, code_len: usize) callconv(.c) usize {
@@ -335,11 +366,15 @@ export fn tgc_complex_binding_count(code_ptr: [*]const u8, code_len: usize) call
     return bindingsOf(&c.complex_bindings, code_ptr[0..code_len]).len;
 }
 
-/// Fill ref/lower/upper for binding j of feature/complex `code`. kind 0=feature,1=complex.
+/// Fill ref/lower/upper for binding j of `code`. kind 0=feature, 1=complex, 2=information type.
 export fn tgc_binding(kind: u8, code_ptr: [*]const u8, code_len: usize, j: usize, ref_out: *[*]const u8, ref_len: *usize, lower: *i32, upper_out: *i32) callconv(.c) void {
     const c = &(g_cat orelse return);
     const code = code_ptr[0..code_len];
-    const b = if (kind == 0) bindingsOf(&c.feature_bindings, code) else bindingsOf(&c.complex_bindings, code);
+    const b = switch (kind) {
+        0 => bindingsOf(&c.feature_bindings, code),
+        1 => bindingsOf(&c.complex_bindings, code),
+        else => bindingsOf(&c.info_bindings, code),
+    };
     if (j >= b.len) return;
     ref_out.* = b[j].ref.ptr;
     ref_len.* = b[j].ref.len;

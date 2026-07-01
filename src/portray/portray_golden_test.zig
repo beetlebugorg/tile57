@@ -102,3 +102,55 @@ test "golden Part-9 stream: M_QUAL quality fills (DQUAL from CATZOC, NODATA03 wh
     // Before the deconstruction this feature emitted no fill at all (a silent miss).
     try std.testing.expect(has(streams[1], "AreaFillReference:NODATA03"));
 }
+
+test "golden Part-9 stream: low-accuracy QUAPOS lights the SpatialQuality rule branches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two coastlines drawn over VE edges: one carrying QUAPOS=3 (inadequately
+    // surveyed -> remapped qualityOfHorizontalMeasurement=4), one surveyed (QUAPOS=1
+    // -> no spatial quality). QUALIN02 must draw LOWACC21 for the first and the
+    // solid CSTLN line for the second. A low-accuracy wreck point must gain
+    // QUAPNT02's LOWACC01 quality mark next to its danger symbol.
+    var vectors = try a.alloc(s57.VectorRecord, 2);
+    vectors[0] = .{ .rcnm = s57.RCNM_VE, .rcid = 10, .points = &.{}, .soundings = &.{}, .quapos = 3 };
+    vectors[1] = .{ .rcnm = s57.RCNM_VE, .rcid = 20, .points = &.{}, .soundings = &.{}, .quapos = 1 };
+    var edges = std.AutoHashMap(u32, usize).init(a);
+    try edges.put(10, 0);
+    try edges.put(20, 1);
+
+    const refs_low = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 10 }, .ornt = 1 }};
+    const refs_ok = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VE, .rcid = 20 }, .ornt = 1 }};
+    const wreck_attrs = [_]s57.Attr{.{ .code = 71, .value = "2" }}; // CATWRK=2 dangerous wreck
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 2, .objl = 30, .refs = &refs_low }, // COALNE, low accuracy
+        .{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 30, .refs = &refs_ok }, // COALNE, surveyed
+        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 159, .refs = &refs_low, .attrs = &wreck_attrs }, // WRECKS, low accuracy
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = vectors,
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = edges,
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 3), streams.len);
+
+    // [0] low-accuracy coastline: QUALIN02's LOWACC21 linestyle, no solid CSTLN.
+    try std.testing.expect(has(streams[0], "LineInstruction:LOWACC21"));
+    try std.testing.expect(!has(streams[0], "CSTLN"));
+
+    // [1] surveyed coastline: the normal solid CSTLN simple line, no LOWACC21.
+    try std.testing.expect(has(streams[1], "CSTLN"));
+    try std.testing.expect(!has(streams[1], "LOWACC21"));
+
+    // [2] low-accuracy wreck: QUAPNT02 adds the LOWACC01 accuracy mark (90011).
+    try std.testing.expect(has(streams[2], "PointInstruction:LOWACC01"));
+}

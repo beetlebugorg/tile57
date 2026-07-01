@@ -32,8 +32,11 @@ extern size_t tgc_simple_count(void);
 extern const char *tgc_simple_code(size_t i, size_t *len);
 extern size_t tgc_complex_count(void);
 extern const char *tgc_complex_code(size_t i, size_t *len);
+extern size_t tgc_info_count(void);
+extern const char *tgc_info_code(size_t i, size_t *len);
 extern size_t tgc_feature_binding_count(const char *code, size_t code_len);
 extern size_t tgc_complex_binding_count(const char *code, size_t code_len);
+extern size_t tgc_info_binding_count(const char *code, size_t code_len);
 extern void tgc_binding(unsigned char kind, const char *code, size_t code_len, size_t j,
                         const char **ref, size_t *ref_len, int *lower, int *upper);
 extern const char *tgc_simple_valuetype(const char *code, size_t code_len, size_t *len);
@@ -407,10 +410,11 @@ int tile57_diag_portray_demo(const char *dir) {
  *      real Feature Catalogue via tgc_* accessors) ------------------------- */
 
 /* Build {ref -> {UpperMultiplicity, LowerMultiplicity}} for a feature(0)/
- * complex(1) code from the catalogue. The AttributeBindings table is at -1. */
+ * complex(1)/information(2) code from the catalogue. AttributeBindings is at -1. */
 static void bindings_from_cat(lua_State *L, unsigned char kind, const char *code, size_t clen) {
-    size_t n = (kind == 0) ? tgc_feature_binding_count(code, clen)
-                           : tgc_complex_binding_count(code, clen);
+    size_t n = (kind == 0)   ? tgc_feature_binding_count(code, clen)
+               : (kind == 1) ? tgc_complex_binding_count(code, clen)
+                             : tgc_info_binding_count(code, clen);
     for (size_t j = 0; j < n; j++) {
         const char *ref = "";
         size_t rl = 0;
@@ -478,6 +482,30 @@ static int lp_feature_info(lua_State *L) { /* HostGetFeatureTypeInfo(code) */
     push_binding_if_absent(L, "inTheWater");
     push_binding_if_absent(L, "orientationValue");
     push_binding_if_absent(L, "topmark");
+    lua_setfield(L, -2, "AttributeBindings");
+    return 1;
+}
+static int lp_info_codes(lua_State *L) { /* HostGetInformationTypeCodes() */
+    size_t n = tgc_info_count();
+    lua_newtable(L);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *c = tgc_info_code(i, &len);
+        lua_pushlstring(L, c, len);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    return 1;
+}
+static int lp_info_info(lua_State *L) { /* HostGetInformationTypeInfo(code) */
+    size_t clen = 0;
+    const char *code = luaL_checklstring(L, 1, &clen);
+    lua_newtable(L);
+    lua_pushstring(L, "InformationTypeInfo");
+    lua_setfield(L, -2, "Type");
+    lua_pushlstring(L, code, clen);
+    lua_setfield(L, -2, "Code");
+    lua_newtable(L);
+    bindings_from_cat(L, 2, code, clen);
     lua_setfield(L, -2, "AttributeBindings");
     return 1;
 }
@@ -667,8 +695,11 @@ int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int si
     lua_register(L, "tg_store", lp_store);
     lua_register(L, "HostGetComplexAttributeTypeCodes", lp_complex_codes);
     lua_register(L, "HostGetComplexAttributeTypeInfo", lp_complex_info);
+    /* information types (SpatialQuality etc., served from the catalogue); the
+     * spatial-quality association functions themselves are Lua glue below. */
+    lua_register(L, "HostGetInformationTypeCodes", lp_info_codes);
+    lua_register(L, "HostGetInformationTypeInfo", lp_info_info);
     /* empty catalogue tables */
-    lua_register(L, "HostGetInformationTypeCodes", l_empty_table);
     lua_register(L, "HostGetRoleTypeCodes", l_empty_table);
     lua_register(L, "HostGetInformationAssociationTypeCodes", l_empty_table);
     lua_register(L, "HostGetFeatureAssociationTypeCodes", l_empty_table);
@@ -717,7 +748,32 @@ int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int si
         "    local pts=_HostFeaturePoints(fid)\n"
         "    if pts[1] then return CreatePoint(pts[1][1],pts[1][2],pts[1][3]) end\n"
         "    return CreatePoint('0','0',nil)\n  end\n"
-        "  return nil\nend\n";
+        "  return nil\nend\n"
+        /* Spatial Quality on geometry (S-65 §2.2.3, Gap D): S-57 QUAPOS lives on the
+         * spatial records; S-101 models it as a SpatialQuality information type
+         * associated with each spatial. The adapter already aggregates the feature's
+         * edge/node QUAPOS to a remapped qualityOfHorizontalMeasurement on the
+         * feature root (s101_adapt s65RemapQuapos), so a feature that carries it
+         * exposes ONE SpatialQuality association on every spatial of its geometry —
+         * the same per-feature granularity as the s57_mvt force_dash approximation.
+         * This lights the real rule branches: QUAPNT02's LOWACC01 mark, QUALIN02's
+         * LOWACC21 coastline, DEPCNT03/DEPARE03's dashed low-accuracy contours. */
+        "function HostSpatialGetAssociatedInformationIDs(sid, assoc, role)\n"
+        "  if assoc~='SpatialAssociation' then return nil end\n"
+        "  local fid=string.match(sid,'^(.-)#')\n"
+        "  if not fid then return nil end\n"
+        "  local v=HostFeatureGetSimpleAttribute(fid,'','qualityOfHorizontalMeasurement')\n"
+        "  if v and v[1] then return { fid..'#SQ' } end\n"
+        "  return nil\nend\n"
+        "function HostInformationTypeGetCode(iid)\n"
+        "  if string.sub(iid,-3)=='#SQ' then return 'SpatialQuality' end\n"
+        "  return ''\nend\n"
+        "function HostInformationTypeGetSimpleAttribute(iid, path, code)\n"
+        "  if code=='qualityOfHorizontalMeasurement' then\n"
+        "    local fid=string.match(iid,'^(.-)#SQ$')\n"
+        "    if fid then return HostFeatureGetSimpleAttribute(fid,'',code) end\n"
+        "  end\n"
+        "  return {}\nend\n";
     if (luaL_dostring(L, glue) != LUA_OK) {
         fprintf(stderr, "[s101] glue: %s\n", lua_tostring(L, -1));
         lua_close(L);
