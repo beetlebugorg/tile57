@@ -460,23 +460,12 @@ fn dateViewSlice(buf: *const [9]u8) []const u8 {
     return buf[0..@min(n, 8)];
 }
 
-/// Build a MapLibre style JSON from a template + mariner settings + colortables.
-/// 1=ok + out/out_len (free with tile57_tile_free), 0=error.
-export fn tile57_build_style(
-    template_json: [*]const u8,
-    template_len: usize,
-    cm: *const CMariner,
-    colortables_json: ?[*]const u8,
-    colortables_len: usize,
-    enabled_bands: ?[*]const i32,
-    enabled_band_count: usize,
-    scamin: ?[*]const i32,
-    scamin_count: usize,
-    scamin_lat: f64,
-    out: *[*]u8,
-    out_len: *usize,
-) callconv(.c) c_int {
-    const m = chartstyle.MarinerSettings{
+// Translate the extern CMariner into the internal chartstyle.MarinerSettings the
+// style builders take. The returned value borrows `cm`'s date_view and
+// viewing_groups_off storage, so `cm` (and its viewing_groups_off array) must
+// outlive every use of the result — true within a single ABI call.
+fn marinerFromC(cm: *const CMariner) chartstyle.MarinerSettings {
+    return .{
         .scheme = switch (cm.scheme) {
             1 => .dusk,
             2 => .night,
@@ -511,6 +500,36 @@ export fn tile57_build_style(
         else
             null,
     };
+}
+
+// The distinct SCAMIN denominators the host passed (host i32 -> u32 styleJson
+// buckets on). Returns an empty slice for NULL/count 0. Caller frees a non-empty
+// result with gpa.free.
+fn scaminBuf(scamin: ?[*]const i32, scamin_count: usize) ![]u32 {
+    const p = scamin orelse return &.{};
+    if (scamin_count == 0) return &.{};
+    const buf = try gpa.alloc(u32, scamin_count);
+    for (p[0..scamin_count], 0..) |v, i| buf[i] = @intCast(v);
+    return buf;
+}
+
+/// Build a MapLibre style JSON from a template + mariner settings + colortables.
+/// 1=ok + out/out_len (free with tile57_tile_free), 0=error.
+export fn tile57_build_style(
+    template_json: [*]const u8,
+    template_len: usize,
+    cm: *const CMariner,
+    colortables_json: ?[*]const u8,
+    colortables_len: usize,
+    enabled_bands: ?[*]const i32,
+    enabled_band_count: usize,
+    scamin: ?[*]const i32,
+    scamin_count: usize,
+    scamin_lat: f64,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const m = marinerFromC(cm);
     const tmpl = template_json[0..template_len];
     const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
     const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
@@ -519,12 +538,8 @@ export fn tile57_build_style(
     // buckets on. Empty/NULL -> the *_scamin layers stay ungated (host §"Still
     // needed" #1: the runtime build_style now emits the SAME per-value native-minzoom
     // buckets the offline bundle does when given the manifest).
-    var scamin_buf: []u32 = &.{};
+    const scamin_buf = scaminBuf(scamin, scamin_count) catch return 0;
     defer if (scamin_buf.len > 0) gpa.free(scamin_buf);
-    if (scamin) |p| if (scamin_count > 0) {
-        scamin_buf = gpa.alloc(u32, scamin_count) catch return 0;
-        for (p[0..scamin_count], 0..) |v, i| scamin_buf[i] = @intCast(v);
-    };
     const now_unix: i64 = @intCast(time(null));
     // Single style builder: regenerate the full style with the mariner baked in
     // (chartstyle.buildStyle's template-patch pass is retired). buildFromTemplate lifts
@@ -532,6 +547,50 @@ export fn tile57_build_style(
     const style = assets.buildFromTemplateScamin(gpa, tmpl, &m, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
     out.* = style.ptr;
     out_len.* = style.len;
+    return 1;
+}
+
+/// Compute the minimal MapLibre style-mutation ops to turn the style for `old_m`
+/// into the style for `new_m` (same template/colortables/bands/scamin inputs as
+/// tile57_build_style, so the two styles are comparable). Writes a JSON op array to
+/// out/out_len (free with tile57_tile_free): "[]" when nothing changed, one op per
+/// differing filter/paint/layout key, or [{"op":"rebuild"}] when the two mariners
+/// would produce a different SET of layers (host falls back to a full setStyle).
+/// 1=ok, 0=error. See style-diff.md.
+export fn tile57_style_diff(
+    template_json: [*]const u8,
+    template_len: usize,
+    old_m: *const CMariner,
+    new_m: *const CMariner,
+    colortables_json: ?[*]const u8,
+    colortables_len: usize,
+    enabled_bands: ?[*]const i32,
+    enabled_band_count: usize,
+    scamin: ?[*]const i32,
+    scamin_count: usize,
+    scamin_lat: f64,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const om = marinerFromC(old_m);
+    const nm = marinerFromC(new_m);
+    const tmpl = template_json[0..template_len];
+    const cts: []const u8 = if (colortables_json) |p| p[0..colortables_len] else "";
+    const bands: ?[]const i32 = if (enabled_bands) |p| p[0..enabled_band_count] else null;
+    const scamin_buf = scaminBuf(scamin, scamin_count) catch return 0;
+    defer if (scamin_buf.len > 0) gpa.free(scamin_buf);
+    // One wall-clock read shared by both builds so "today" date resolution matches
+    // on both sides — otherwise a clock tick could show as a spurious date-filter op.
+    const now_unix: i64 = @intCast(time(null));
+
+    const old_style = assets.buildFromTemplateScamin(gpa, tmpl, &om, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
+    defer gpa.free(old_style);
+    const new_style = assets.buildFromTemplateScamin(gpa, tmpl, &nm, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
+    defer gpa.free(new_style);
+
+    const ops = assets.styleDiff(gpa, old_style, new_style) catch return 0;
+    out.* = ops.ptr;
+    out_len.* = ops.len;
     return 1;
 }
 

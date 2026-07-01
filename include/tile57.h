@@ -314,6 +314,28 @@ int tile57_build_style(const char *template_json, size_t template_len,
                        const int32_t *scamin, size_t scamin_count, double scamin_lat,
                        uint8_t **out, size_t *out_len);
 
+/* Compute the minimal MapLibre style-mutation ops to turn the style for `old_m`
+ * into the style for `new_m` — same template/colortables/bands/scamin inputs as
+ * tile57_build_style, so the two styles are comparable. For a flicker-free mariner
+ * toggle the host applies each op in place (map.setFilter / setPaintProperty /
+ * setLayoutProperty) instead of re-setStyle-ing, leaving overlays and sources
+ * untouched. The output is a JSON array; each element is one mutation:
+ *   {"op":"setFilter",        "layer":<id>,"value":<filter|null>}
+ *   {"op":"setPaintProperty", "layer":<id>,"property":<key>,"value":<v|null>}
+ *   {"op":"setLayoutProperty","layer":<id>,"property":<key>,"value":<v|null>}
+ * Only layers whose filter / a paint prop / a layout prop differ appear; an
+ * unchanged toggle yields "[]". If the two mariners would produce a DIFFERENT SET
+ * of layers (not expected for any current mariner field — a safety valve), the
+ * result is [{"op":"rebuild"}], signalling the host to fall back to a full setStyle.
+ * On success returns 1 with the op array in *out / *out_len (free with
+ * tile57_tile_free); 0 on error. */
+int tile57_style_diff(const char *template_json, size_t template_len,
+                      const tile57_mariner *old_m, const tile57_mariner *new_m,
+                      const char *colortables_json, size_t colortables_len,
+                      const int32_t *enabled_bands, size_t enabled_band_count,
+                      const int32_t *scamin, size_t scamin_count, double scamin_lat,
+                      uint8_t **out, size_t *out_len);
+
 /* The S-52 colortables and base style template are baked into the library, so a
  * host can generate a complete style with no on-disk catalogue or template file:
  *   tile57_colortables_default(&ct,&ctn);
