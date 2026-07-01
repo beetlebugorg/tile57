@@ -505,6 +505,7 @@ pub const ATTR_CATBRG: u16 = 9; // category of bridge -> openingBridge (2..8 = o
 pub const OBJL_ADMARE: u16 = 1; // ADMARE: administration area
 pub const OBJL_CTRPNT: u16 = 33; // CTRPNT: control point -> Landmark (S-65 §4.3)
 pub const OBJL_BRIDGE: u16 = 11; // BRIDGE: -> Bridge (line/area) / Landmark (point); openingBridge from CATBRG
+pub const OBJL_DAMCON: u16 = 38; // DAMCON: dam -> Dam (line/area) / Landmark (point, S-65 §4.8.15)
 pub const OBJL_LNDARE: u16 = 71; // LNDARE: land area (inTheWater land/water test)
 pub const OBJL_LIGHTS: u16 = 75; // LIGHTS: attribute-dependent class routing
 pub const OBJL_MORFAC: u16 = 84; // MORFAC: mooring/warping facility (CATMOR-routed)

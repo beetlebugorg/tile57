@@ -563,6 +563,18 @@ pub fn resolveClass(f: s57.Feature) ?[]const u8 {
                 if (catalogue.hasFeature("Landmark")) return "Landmark";
             } else if (catalogue.hasFeature("Bridge")) return "Bridge";
         },
+        // DAMCON (dam) aliases the S-101 Dam class, whose rule handles only Curve/Surface
+        // and errors on a Point (Dam.lua:55). A point dam therefore has no valid Dam
+        // portrayal, so S-65 §4.8.15 re-models it to Landmark (the generic point-structure
+        // fallback, as for point BRIDGE). Line/area DAMCON stays Dam. Any CONVIS flows
+        // through the generic loop as visualProminence; categoryOfLandmark isn't sourced
+        // (DAMCON has no CATLMK) so Landmark draws its generic POSGEN01 mark. Note: CRANES
+        // and VEGATN are NOT re-modelled — Crane.lua / Vegetation.lua handle Point natively.
+        s57.OBJL_DAMCON => {
+            if (f.prim == 1) {
+                if (catalogue.hasFeature("Landmark")) return "Landmark";
+            } else if (catalogue.hasFeature("Dam")) return "Dam";
+        },
         else => {},
     }
     // Default: catalogue alias by numeric class, then by acronym for meta (M_*)
@@ -1012,6 +1024,37 @@ test "Gap E: SweptArea drops QUASOU/SOUACC/TECSOU, keeps DRVAL1" {
     try std.testing.expect(root.simpleValue("qualityOfVerticalMeasurement") == null);
     try std.testing.expect(root.simpleValue("verticalUncertainty") == null);
     try std.testing.expect(root.simpleValue("techniqueOfVerticalMeasurement") == null);
+}
+
+test "Gap B: point DAMCON re-models to Landmark; line/area DAMCON stays Dam" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Dam.lua has no Point branch (errors on Point), so S-65 §4.8.15 routes a point
+    // dam to Landmark; a line/area dam stays Dam (which handles Curve/Surface).
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = s57.OBJL_DAMCON }, // point -> Landmark
+        .{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = s57.OBJL_DAMCON }, // line  -> Dam
+        .{ .rcnm = 100, .rcid = 3, .prim = 3, .objl = s57.OBJL_DAMCON }, // area  -> Dam
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 3), adapted.len);
+    try std.testing.expectEqualStrings("Landmark", adapted[0].code); // point
+    try std.testing.expectEqualStrings("Point", adapted[0].primitive);
+    try std.testing.expectEqualStrings("Dam", adapted[1].code); // line
+    try std.testing.expectEqualStrings("Dam", adapted[2].code); // area
 }
 
 test "TOPMAR folds into co-located buoy as the topmark complex" {
