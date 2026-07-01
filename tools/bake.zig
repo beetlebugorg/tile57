@@ -215,11 +215,15 @@ pub fn main(init: std.process.Init) !void {
         const match = if (want_prim) |wp| pc[wp] > 0 else total > 0;
         if (match) {
             std.debug.print("{s} objl={d} point={d} line={d} area={d} none={d}\n", .{ path, want_objl, pc[1], pc[2], pc[3], pc[255] });
-            // Locate point matches + dump their attributes (helps pin the tile a change
-            // lands in, and identify an unknown object class by its attribute codes).
-            for (cell.features) |f| if (f.objl == want_objl and f.prim == 1) {
-                if (cell.pointGeometry(f)) |p|
-                    std.debug.print("    point @ lon={d:.6} lat={d:.6}\n", .{ p.lon(), p.lat() });
+            // Locate matches of the requested primitive (default point) + dump their
+            // attributes, one delimitable block per feature (helps pin the tile a change
+            // lands in, identify an unknown class by its attribute codes, and scan the
+            // corpus for per-feature attribute presence on line/area classes too).
+            const dump_prim: u8 = want_prim orelse 1;
+            for (cell.features) |f| if (f.objl == want_objl and f.prim == dump_prim) {
+                std.debug.print("    feature rcid={d} prim={d}\n", .{ f.rcid, f.prim });
+                if (f.prim == 1) if (cell.pointGeometry(f)) |p|
+                    std.debug.print("      point @ lon={d:.6} lat={d:.6}\n", .{ p.lon(), p.lat() });
                 for (f.attrs) |at|
                     std.debug.print("      attr {d} = \"{s}\"\n", .{ at.code, std.mem.trim(u8, at.value, " ") });
             };
