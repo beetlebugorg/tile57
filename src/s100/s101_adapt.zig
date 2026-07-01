@@ -1057,6 +1057,45 @@ test "Gap B: point DAMCON re-models to Landmark; line/area DAMCON stays Dam" {
     try std.testing.expectEqualStrings("Dam", adapted[2].code); // area
 }
 
+test "TS_FEB (objl 160) resolves to TidalStreamFloodEbb with synthesized attrs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // objl 160 = TS_FEB (tidal stream flood/ebb): was missing from s57codes.json's
+    // object map, so it resolved to null and rendered as the QUESMRK1 unknown mark.
+    // With the code added it routes to TidalStreamFloodEbb, whose rule reads
+    // categoryOfTidalStream (CAT_TS), orientationValue (ORIENT), speed.speedMaximum
+    // (CURVEL) — all synthesized by the adapter.
+    const attrs = [_]s57.Attr{
+        .{ .code = 188, .value = "1" }, // CAT_TS -> categoryOfTidalStream (1 = flood)
+        .{ .code = s57.ATTR_ORIENT, .value = "195" }, // ORIENT -> orientationValue
+        .{ .code = s57.ATTR_CURVEL, .value = "1.5" }, // CURVEL -> speed.speedMaximum
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 160, .attrs = &attrs },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("TidalStreamFloodEbb", adapted[0].code);
+    const root = &adapted[0].root;
+    try std.testing.expectEqualStrings("1", root.simpleValue("categoryOfTidalStream").?);
+    try std.testing.expectEqualStrings("195", root.simpleValue("orientationValue").?);
+    // speed complex from CURVEL: feature.speed.speedMaximum
+    try std.testing.expectEqualStrings("1.5", root.resolve("speed:1").?.simpleValue("speedMaximum").?);
+}
+
 test "TOPMAR folds into co-located buoy as the topmark complex" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
