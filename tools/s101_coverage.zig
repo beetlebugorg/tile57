@@ -1,7 +1,9 @@
 //! S-57 -> S-101 portrayal attribute-coverage check
 //! (Tasks 2-3 of the conformance-testability brief; see
 //! specs/conformance-testability.md). Run it: `zig build s101-coverage`
-//! (append `-- --json out.json` / `-- --fail-on-new specs/coverage-baseline.json`).
+//! (append `-- --json out.json` / `-- --fail-on-new tools/s101_coverage_baseline.json`).
+//! The gate baseline lives at tools/s101_coverage_baseline.json (tracked; /specs/
+//! is gitignored). Regenerate it after an intended change with --write-baseline.
 //!
 //! 1. STATIC READ-SET (Task 2): scan the vendored S-101 Portrayal Catalogue Lua
 //!    rules and, per feature-class rule, collect every attribute the rule reads
