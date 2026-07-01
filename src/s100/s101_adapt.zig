@@ -497,6 +497,10 @@ pub fn resolveClass(f: s57.Feature) ?[]const u8 {
         s57.OBJL_ADMARE => if (catalogue.hasFeature("AdministrationArea")) return "AdministrationArea",
         s57.OBJL_MORFAC => if (resolveMooringClass(f)) |code| return code,
         s57.OBJL_TSELNE, s57.OBJL_TSEZNE => if (catalogue.hasFeature("SeparationZoneOrLine")) return "SeparationZoneOrLine",
+        // CTRPNT (control point) has no S-101 class of its own; S-65 §4.3 re-models it
+        // to Landmark (its categoryOfLandmark is synthesized from CATCTR in adaptCell).
+        // Without this it resolves to null and the feature is dropped entirely.
+        s57.OBJL_CTRPNT => if (catalogue.hasFeature("Landmark")) return "Landmark",
         else => {},
     }
     // Default: catalogue alias by numeric class, then by acronym for meta (M_*)
@@ -674,6 +678,22 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         if (std.mem.eql(u8, code, "Dolphin")) {
             const cm = attrTrim(f, s57.ATTR_CATMOR);
             if (cm.len > 0) try attrs.append(a, .{ .name = "categoryOfDolphin", .value = cm });
+        }
+
+        // CTRPNT -> Landmark reads feature.categoryOfLandmark to pick its symbol. That
+        // attribute aliases CATLMK (not CATCTR), so the generic attribute loop never
+        // sources it for a control point; synthesize it from CATCTR per S-65 §4.3:
+        // 1 (triangulation point) -> 22 (triangulation mark), 5 (boundary mark) -> 23
+        // (boundary mark). Other CATCTR values have no S-101 landmark category and stay
+        // absent (Landmark.lua's generic POSGEN01 default). Gated on CTRPNT so a native
+        // LNDMRK's CATLMK-sourced categoryOfLandmark is untouched.
+        if (f.objl == s57.OBJL_CTRPNT) {
+            const mapped: ?[]const u8 = switch (firstListVal(attrTrim(f, s57.ATTR_CATCTR))) {
+                1 => "22",
+                5 => "23",
+                else => null,
+            };
+            if (mapped) |m| try attrs.append(a, .{ .name = "categoryOfLandmark", .value = m });
         }
 
         // LocalMagneticAnomaly reads feature.valueOfLocalMagneticAnomaly[1].magneticAnomalyValue
@@ -958,6 +978,40 @@ test "VALLMA synthesizes valueOfLocalMagneticAnomaly[1].magneticAnomalyValue" {
     const root = &adapted[0].root;
     try std.testing.expectEqual(@as(usize, 1), root.childCount("valueOfLocalMagneticAnomaly"));
     try std.testing.expectEqualStrings("7", root.resolve("valueOfLocalMagneticAnomaly:1").?.simpleValue("magneticAnomalyValue").?);
+}
+
+test "CTRPNT routes to Landmark with categoryOfLandmark synthesized from CATCTR (S-65 §4.3)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    // CATCTR=1 (triangulation point) -> categoryOfLandmark 22; CATCTR=3 (fixed point)
+    // has no S-101 landmark category -> absent. Two co-located control points.
+    const attrs_a = [_]s57.Attr{.{ .code = s57.ATTR_CATCTR, .value = "1" }};
+    const attrs_b = [_]s57.Attr{.{ .code = s57.ATTR_CATCTR, .value = "3" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = s57.OBJL_CTRPNT, .refs = &node_ref, .attrs = &attrs_a },
+        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = s57.OBJL_CTRPNT, .refs = &node_ref, .attrs = &attrs_b },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.5, 39.0));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 2), adapted.len);
+    try std.testing.expectEqualStrings("Landmark", adapted[0].code);
+    try std.testing.expectEqualStrings("22", adapted[0].root.resolve("").?.simpleValue("categoryOfLandmark").?);
+    // CATCTR=3 -> no categoryOfLandmark (generic landmark default in the rule).
+    try std.testing.expectEqual(@as(?[]const u8, null), adapted[1].root.resolve("").?.simpleValue("categoryOfLandmark"));
 }
 
 test "s65RemapValue: TECSOU/QUASOU S-65 value conversion" {
