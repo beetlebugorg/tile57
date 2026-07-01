@@ -134,6 +134,50 @@ func itoa(v int32) string {
 	return strconv.Itoa(int(v))
 }
 
+// TestScaminFilterGate verifies the scamin-layers.md flag through the full C ABI:
+// with a manifest, ScaminFilterGate collapses the per-value #sm bucket layers to one
+// live-filtered layer per render-type — far fewer layers, no #sm, no native minzoom.
+func TestScaminFilterGate(t *testing.T) {
+	ct, _ := ColortablesDefault()
+	tmpl, err := StyleTemplate(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
+		"glyphs/{fontstack}/{range}.pbf", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scamin := []int32{4000, 12000, 30000, 90000, 180000} // 5 denominators
+	layers := func(b []byte) int {
+		var d struct {
+			Layers []map[string]any `json:"layers"`
+		}
+		if err := json.Unmarshal(b, &d); err != nil {
+			t.Fatalf("style not valid JSON: %v", err)
+		}
+		return len(d.Layers)
+	}
+	build := func(gate bool) []byte {
+		m := MarinerDefaults()
+		m.ScaminFilterGate = gate
+		s, err := BuildStyle(tmpl, m, ct, nil, scamin, 38.0)
+		if err != nil {
+			t.Fatalf("BuildStyle(gate=%v): %v", gate, err)
+		}
+		return s
+	}
+	buck, gate := build(false), build(true)
+	if !strings.Contains(string(buck), "#sm") {
+		t.Fatal("bucketed style should carry per-value #sm bucket layers")
+	}
+	if strings.Contains(string(gate), "#sm") {
+		t.Fatal("filter-gate style should have no #sm bucket layers")
+	}
+	if !strings.Contains(string(gate), "1000000000000") {
+		t.Fatal("filter-gate style should carry the SCAMIN coalesce-max clause")
+	}
+	if lb, lg := layers(buck), layers(gate); lg >= lb {
+		t.Fatalf("filter-gate should have far fewer layers: bucketed=%d gate=%d", lb, lg)
+	}
+}
+
 // TestStyleDiff verifies the flicker-free mariner-toggle op array through the full
 // C ABI (style-diff.md §5): no change -> "[]"; a display-category flip yields only
 // setFilter ops; a day->night scheme change yields setPaintProperty colour ops and
