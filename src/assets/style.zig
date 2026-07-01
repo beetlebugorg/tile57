@@ -807,11 +807,15 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .base);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .base);
         for (snd_buckets) |bkt| try soundingsLayer(js, &s, bkt);
-        // Danger depths — never collision-culled (see the soundings class split).
-        for (snd_buckets) |bkt| try dangerSoundingsLayer(js, &s, bkt);
-        // Danger markers over soundings (hazard visibility — see DANGER_CLASSES).
+        // Danger markers over the spot soundings (hazard visibility — see DANGER_CLASSES).
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .dangers_only);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .dangers_only);
+        // Danger depths ABOVE the danger markers: DANGER01/02 have an OPAQUE
+        // DEPVS-filled interior (the S-52 oval masks the chart under it), and the
+        // rules draw the marker FIRST then the digits on top (WRECKS05/OBSTRN07
+        // instruction order) — below the ovals the depths were invisible. Never
+        // collision-culled (see the soundings class split).
+        for (snd_buckets) |bkt| try dangerSoundingsLayer(js, &s, bkt);
         // LIGHTS on top: emitted after every other point symbol so a light always draws
         // over a same-priority bridge that lives in a different scamin bucket layer.
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .lights_only);
