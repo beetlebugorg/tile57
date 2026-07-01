@@ -158,6 +158,7 @@ const DROP = [_]ObjAttr{
     .{ .obj = "SWPARE", .acr = "TECSOU" }, .{ .obj = "SOUNDG", .acr = "EXPSOU" },
     .{ .obj = "DRYDOC", .acr = "HORACC" }, .{ .obj = "FLODOC", .acr = "HORACC" },
     .{ .obj = "OBSTRN", .acr = "NATCON" }, .{ .obj = "OBSTRN", .acr = "NATQUA" },
+    .{ .obj = "M_QUAL", .acr = "TECSOU" }, // prohibited for Quality of Bathymetric Data (S-65 §2.2.3.1)
 };
 
 const NO_STRS: []const []const u8 = &.{};

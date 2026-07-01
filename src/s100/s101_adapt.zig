@@ -475,6 +475,11 @@ const DROP_ATTRS = [_]AttrDrop{
     .{ .obj = "FLODOC", .acr = "HORACC" },
     .{ .obj = "OBSTRN", .acr = "NATCON" },
     .{ .obj = "OBSTRN", .acr = "NATQUA" },
+    // techniqueOfVerticalMeasurement is prohibited for Quality of Bathymetric Data
+    // (S-65 §2.2.3.1); producers wanting to keep it re-encode it on the individual
+    // dangers or a Quality of Survey. NOT dropped for M_SREL: S-101 *allows* it on
+    // Quality of Survey (S-57 prohibits TECSOU on M_SREL anyway, so it never occurs).
+    .{ .obj = "M_QUAL", .acr = "TECSOU" },
 };
 
 /// Whether S-65 Annex B §E says S-57 attribute `attl` "will not convert" for S-57
@@ -650,6 +655,98 @@ fn buildRhythmOfLight(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry)
     try appendChild(a, children, "rhythmOfLight", rol.build());
 }
 
+/// Position/depth accuracy a ZOC category asserts, per the ZOC table (S-57 App. A
+/// Ch. 2, as amended by Supplement 3): ±(fixed + factor·depth) metres. D (5) and
+/// U (6) are unquantified ("worse than ZOC C" / "unassessed") — no row, so no
+/// uncertainty is emitted for them. An empty factor means the row has no
+/// depth-dependent term (addSimple drops empties).
+const ZocAccuracy = struct { hfix: []const u8, hvar: []const u8, vfix: []const u8, vvar: []const u8 };
+fn zocAccuracy(catzoc: i64) ?ZocAccuracy {
+    return switch (catzoc) {
+        1 => .{ .hfix = "5", .hvar = "0.05", .vfix = "0.5", .vvar = "0.01" }, // A1
+        2 => .{ .hfix = "20", .hvar = "", .vfix = "1.0", .vvar = "0.02" }, // A2
+        3 => .{ .hfix = "50", .hvar = "", .vfix = "1.0", .vvar = "0.02" }, // B
+        4 => .{ .hfix = "500", .hvar = "", .vfix = "2.0", .vvar = "0.05" }, // C
+        else => null,
+    };
+}
+
+/// M_QUAL -> Quality of Bathymetric Data (S-65 §2.2.3.1, "one of the most significant
+/// changes from S-57 to S-101"): deconstruct CATZOC into its component parts, per the
+/// ZOC table each category encodes. categoryOfZoneOfConfidenceInData stays identical
+/// to CATZOC — ECDIS portrayal derives from it (the dual-fuel discipline) — and the
+/// deconstructed mandatory components ride alongside:
+///   - dataAssessment: 1 (assessed) for ZOC A1..D; 3 (unassessed) for U or absent.
+///     (2 "assessed (oceanic)" needs a producer decision no converter can make.)
+///   - categoryOfTemporalVariation: 5 (unlikely to change), or 6 (unassessed) for U.
+///   - fullSeafloorCoverageAchieved + featuresDetected: A1/A2 = full area search with
+///     significant features detected and least depths measured (true); B/C/D = not
+///     (false — that IS the ZOC row's assertion, not an invention); U/absent = omitted
+///     (unassessed; "populated as empty (null)" per the guidance).
+///   - zoneOfConfidence[1].horizontal/verticalUncertainty from the ZOC row's accuracy
+///     formula; a populated POSACC/SOUACC (a measured accuracy) overrides the row's
+///     class bound (§2.2.3.1).
+///   - surveyDateRange{dateStart<-SURSTA, dateEnd<-SUREND} when populated (dateEnd is
+///     mandatory in S-101 but stays null when SUREND is absent, per the guidance).
+/// zoneOfConfidence itself is ALWAYS emitted for this class: the rule draws the
+/// NODATA03 "quality unknown" fill from an entry with no category
+/// (QualityOfBathymetricData.lua:57, mirroring S-52's bare-M_QUAL lookup line), so
+/// omitting the entry when CATZOC is absent rendered nothing at all — a silent miss.
+/// An off-list CATZOC (outside 1..6) is treated as absent: the rule would
+/// concatenate a nil symbol name and error.
+fn buildQualityOfBathymetricData(a: std.mem.Allocator, attrs: *std.ArrayList(NameVal), children: *std.ArrayList(ChildEntry), f: s57.Feature) !void {
+    const catzoc_raw = attrTrim(f, s57.ATTR_CATZOC);
+    const catzoc = firstListVal(catzoc_raw);
+    const assessed = catzoc >= 1 and catzoc <= 5;
+    try attrs.append(a, .{ .name = "dataAssessment", .value = if (assessed) "1" else "3" });
+    try attrs.append(a, .{ .name = "categoryOfTemporalVariation", .value = if (assessed) "5" else "6" });
+    if (assessed) {
+        const full = catzoc <= 2; // A1/A2: full area search undertaken
+        const fv = if (full) "true" else "false";
+        try attrs.append(a, .{ .name = "fullSeafloorCoverageAchieved", .value = fv });
+        var fd = NodeBuilder{ .a = a };
+        try fd.addSimple("significantFeaturesDetected", fv);
+        try fd.addSimple("leastDepthOfDetectedFeaturesMeasured", fv);
+        try appendChild(a, children, "featuresDetected", fd.build());
+    }
+
+    var zoc = NodeBuilder{ .a = a };
+    if (catzoc >= 1 and catzoc <= 6) try zoc.addSimple("categoryOfZoneOfConfidenceInData", catzoc_raw);
+    const acc = zocAccuracy(catzoc);
+    const posacc = attrTrim(f, s57.ATTR_POSACC);
+    if (posacc.len > 0 or acc != null) {
+        var h = NodeBuilder{ .a = a };
+        if (posacc.len > 0) {
+            try h.addSimple("uncertaintyFixed", posacc);
+        } else {
+            try h.addSimple("uncertaintyFixed", acc.?.hfix);
+            try h.addSimple("uncertaintyVariableFactor", acc.?.hvar);
+        }
+        try zoc.addChild("horizontalPositionUncertainty", h.build());
+    }
+    const souacc = attrTrim(f, s57.ATTR_SOUACC);
+    if (souacc.len > 0 or acc != null) {
+        var vu = NodeBuilder{ .a = a };
+        if (souacc.len > 0) {
+            try vu.addSimple("uncertaintyFixed", souacc);
+        } else {
+            try vu.addSimple("uncertaintyFixed", acc.?.vfix);
+            try vu.addSimple("uncertaintyVariableFactor", acc.?.vvar);
+        }
+        try zoc.addChild("verticalUncertainty", vu.build());
+    }
+    try appendChild(a, children, "zoneOfConfidence", zoc.build());
+
+    const sursta = attrTrim(f, s57.ATTR_SURSTA);
+    const surend = attrTrim(f, s57.ATTR_SUREND);
+    if (sursta.len > 0 or surend.len > 0) {
+        var sdr = NodeBuilder{ .a = a };
+        try sdr.addSimple("dateStart", sursta);
+        try sdr.addSimple("dateEnd", surend);
+        try appendChild(a, children, "surveyDateRange", sdr.build());
+    }
+}
+
 /// Adapt all mappable features of a cell. Allocates into `a` (use an arena).
 pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
     var out = std.ArrayList(Adapted).empty;
@@ -677,7 +774,9 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         var attrs = std.ArrayList(NameVal).empty;
         var children = std.ArrayList(ChildEntry).empty;
         var name: []const u8 = "";
-        var catzoc: []const u8 = "";
+        // M_QUAL deconstructs (S-65 §2.2.3.1): five S-57 attributes feed the proper
+        // S-101 complexes below instead of the generic name-for-name loop.
+        const qobd = std.mem.eql(u8, code, "QualityOfBathymetricData");
         for (f.attrs) |at| {
             // A present-but-blank S-57 attribute (e.g. an unknown VALSOU, all
             // spaces) means "absent": serving "" would make the framework build a
@@ -687,7 +786,13 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             const v = std.mem.trim(u8, at.value, " ");
             if (v.len == 0) continue;
             if (at.code == s57.ATTR_OBJNAM) name = v; // OBJNAM -> featureName
-            if (at.code == s57.ATTR_CATZOC) catzoc = v; // CATZOC -> zoneOfConfidence
+            // Consumed by buildQualityOfBathymetricData: forwarding them flat would be
+            // model-noise (SOUACC aliases the *complex* verticalUncertainty itself,
+            // SURSTA/SUREND the bare dateStart/dateEnd, CATZOC the bare category).
+            if (qobd) switch (at.code) {
+                s57.ATTR_CATZOC, s57.ATTR_POSACC, s57.ATTR_SOUACC, s57.ATTR_SURSTA, s57.ATTR_SUREND => continue,
+                else => {},
+            };
             if (catalogue.resolveAttrByCode(at.code)) |aname| {
                 // S-65 Annex B §E: some attributes "will not convert" for this S-57
                 // object (S-101 prohibits them for the class) — drop the whole
@@ -715,15 +820,9 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             subs[2] = .{ .name = "nameUsage", .value = "1" }; // selected even if language differs
             try appendChild(a, &children, "featureName", .{ .simple = subs });
         }
-        // zoneOfConfidence[1].categoryOfZoneOfConfidenceInData from M_QUAL CATZOC,
-        // so QualityOfBathymetricData reads the data-quality zone (S-57 stores it
-        // flat). The optional nested fixedDateRange (DATSTA/DATEND) is not
-        // synthesized — it's not needed to pick the DQUAL fill pattern.
-        if (catzoc.len > 0) {
-            const subs = try a.alloc(NameVal, 1);
-            subs[0] = .{ .name = "categoryOfZoneOfConfidenceInData", .value = catzoc };
-            try appendChild(a, &children, "zoneOfConfidence", .{ .simple = subs });
-        }
+        // M_QUAL -> Quality of Bathymetric Data: deconstruct CATZOC into the
+        // mandatory S-101 components + POSACC/SOUACC/SURSTA/SUREND (S-65 §2.2.3.1).
+        if (qobd) try buildQualityOfBathymetricData(a, &attrs, &children, f);
         // orientation / clearance complexes from their S-57 simple attrs, so the
         // route + bridge rules (NavigationLine, RecommendedTrack, SpanOpening) can
         // index feature.<complex>.<value> instead of erroring on a nil complex.
@@ -1709,4 +1808,132 @@ test "inTheWater end-to-end: a LNDMRK over DEPARE geometry gets inTheWater=true 
         }
     }
     try t.expectEqual(@as(usize, 3), seen); // all three structures were adapted and checked
+}
+
+/// Minimal geometry-less cell over `feats` for adapter-only tests.
+fn testCell(a: std.mem.Allocator, feats: []const s57.Feature) s57.Cell {
+    return .{
+        .params = .{},
+        .vectors = &.{},
+        .features = feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+}
+
+test "Gap D: CATZOC=1 (ZOC A1) deconstructs into the full Quality of Bathymetric Data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_CATZOC, .value = "1" },
+        .{ .code = s57.ATTR_SUREND, .value = "20230415" },
+        .{ .code = s57.ATTR_SURSTA, .value = "20220101" },
+        .{ .code = s57.ATTR_TECSOU, .value = "3" }, // prohibited for QoBD -> dropped
+        .{ .code = s57.ATTR_DRVAL1, .value = "10" }, // still flows the generic loop
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 308, .attrs = &attrs }, // M_QUAL (Surface)
+    };
+    var cell = testCell(a, &feats);
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len);
+    try std.testing.expectEqualStrings("QualityOfBathymetricData", adapted[0].code);
+    const root = &adapted[0].root;
+
+    // Deconstructed mandatory components (ZOC A1 row).
+    try std.testing.expectEqualStrings("1", root.simpleValue("dataAssessment").?);
+    try std.testing.expectEqualStrings("5", root.simpleValue("categoryOfTemporalVariation").?);
+    try std.testing.expectEqualStrings("true", root.simpleValue("fullSeafloorCoverageAchieved").?);
+    const fd = root.resolve("featuresDetected:1").?;
+    try std.testing.expectEqualStrings("true", fd.simpleValue("significantFeaturesDetected").?);
+    try std.testing.expectEqualStrings("true", fd.simpleValue("leastDepthOfDetectedFeaturesMeasured").?);
+
+    // zoneOfConfidence carries the identical category + the A1 accuracy formula.
+    const zoc = root.resolve("zoneOfConfidence:1").?;
+    try std.testing.expectEqualStrings("1", zoc.simpleValue("categoryOfZoneOfConfidenceInData").?);
+    const hpu = root.resolve("zoneOfConfidence:1;horizontalPositionUncertainty:1").?;
+    try std.testing.expectEqualStrings("5", hpu.simpleValue("uncertaintyFixed").?);
+    try std.testing.expectEqualStrings("0.05", hpu.simpleValue("uncertaintyVariableFactor").?);
+    const vu = root.resolve("zoneOfConfidence:1;verticalUncertainty:1").?;
+    try std.testing.expectEqualStrings("0.5", vu.simpleValue("uncertaintyFixed").?);
+    try std.testing.expectEqualStrings("0.01", vu.simpleValue("uncertaintyVariableFactor").?);
+
+    // surveyDateRange from SURSTA/SUREND.
+    const sdr = root.resolve("surveyDateRange:1").?;
+    try std.testing.expectEqualStrings("20220101", sdr.simpleValue("dateStart").?);
+    try std.testing.expectEqualStrings("20230415", sdr.simpleValue("dateEnd").?);
+
+    // Consumed/prohibited attributes do NOT forward flat.
+    try std.testing.expectEqual(@as(?[]const u8, null), root.simpleValue("techniqueOfVerticalMeasurement"));
+    try std.testing.expectEqual(@as(?[]const u8, null), root.simpleValue("categoryOfZoneOfConfidenceInData"));
+    try std.testing.expectEqual(@as(?[]const u8, null), root.simpleValue("dateEnd"));
+    try std.testing.expectEqual(@as(?[]const u8, null), root.simpleValue("dateStart"));
+    // DRVAL1 is not consumed by the deconstruction: the rule reads it for the
+    // safety-contour intersection, via the generic loop.
+    try std.testing.expectEqualStrings("10", root.simpleValue("depthRangeMinimumValue").?);
+}
+
+test "Gap D: CATZOC=6 / absent M_QUAL is unassessed; zoneOfConfidence still draws NODATA03" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ZOC U: unassessed - no coverage/features/uncertainty assertions.
+    const attrs_u = [_]s57.Attr{.{ .code = s57.ATTR_CATZOC, .value = "6" }};
+    const feats_u = [_]s57.Feature{.{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 308, .attrs = &attrs_u }};
+    var cell_u = testCell(a, &feats_u);
+    defer cell_u.arena.deinit();
+    const root_u = &(try adaptCell(a, &cell_u))[0].root;
+    try std.testing.expectEqualStrings("3", root_u.simpleValue("dataAssessment").?);
+    try std.testing.expectEqualStrings("6", root_u.simpleValue("categoryOfTemporalVariation").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), root_u.simpleValue("fullSeafloorCoverageAchieved"));
+    try std.testing.expectEqual(@as(usize, 0), root_u.childCount("featuresDetected"));
+    const zoc_u = root_u.resolve("zoneOfConfidence:1").?;
+    try std.testing.expectEqualStrings("6", zoc_u.simpleValue("categoryOfZoneOfConfidenceInData").?);
+    try std.testing.expectEqual(@as(usize, 0), zoc_u.childCount("horizontalPositionUncertainty"));
+    try std.testing.expectEqual(@as(usize, 0), zoc_u.childCount("verticalUncertainty"));
+
+    // No CATZOC at all: the zoneOfConfidence entry must still exist (category absent)
+    // so the rule's NODATA03 "quality unknown" branch fires instead of rendering nothing.
+    const feats_n = [_]s57.Feature{.{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 308 }};
+    var cell_n = testCell(a, &feats_n);
+    defer cell_n.arena.deinit();
+    const root_n = &(try adaptCell(a, &cell_n))[0].root;
+    try std.testing.expectEqual(@as(usize, 1), root_n.childCount("zoneOfConfidence"));
+    const zoc_n = root_n.resolve("zoneOfConfidence:1").?;
+    try std.testing.expectEqual(@as(?[]const u8, null), zoc_n.simpleValue("categoryOfZoneOfConfidenceInData"));
+    try std.testing.expectEqualStrings("3", root_n.simpleValue("dataAssessment").?);
+}
+
+test "Gap D: POSACC/SOUACC override the ZOC-derived uncertainties" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ZOC A2 would give h=20 / v=1.0+0.02d; measured POSACC/SOUACC replace both.
+    const attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_CATZOC, .value = "2" },
+        .{ .code = s57.ATTR_POSACC, .value = "10" },
+        .{ .code = s57.ATTR_SOUACC, .value = "0.3" },
+    };
+    const feats = [_]s57.Feature{.{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 308, .attrs = &attrs }};
+    var cell = testCell(a, &feats);
+    defer cell.arena.deinit();
+    const root = &(try adaptCell(a, &cell))[0].root;
+    const hpu = root.resolve("zoneOfConfidence:1;horizontalPositionUncertainty:1").?;
+    try std.testing.expectEqualStrings("10", hpu.simpleValue("uncertaintyFixed").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), hpu.simpleValue("uncertaintyVariableFactor"));
+    const vu = root.resolve("zoneOfConfidence:1;verticalUncertainty:1").?;
+    try std.testing.expectEqualStrings("0.3", vu.simpleValue("uncertaintyFixed").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), vu.simpleValue("uncertaintyVariableFactor"));
+    // The flat SOUACC alias (verticalUncertainty is itself the alias target) must not
+    // double-emit at the root.
+    try std.testing.expectEqual(@as(usize, 0), root.childCount("verticalUncertainty"));
+    try std.testing.expectEqual(@as(?[]const u8, null), root.simpleValue("verticalUncertainty"));
 }
