@@ -158,14 +158,13 @@ the ten Surface methods and you receive the full semantic stream — this is
 how MVT and MLT are done (`MvtSurface` in `src/scene/scene.zig`), and how a
 GeoJSON debug dump or a GPU display list would be done.
 
-**From the C ABI?** Not today — honestly. Surface and Canvas are Zig
-interfaces; the C ABI exposes the *products* (tiles, PNG, PDF, styles,
-assets) and the *inputs* (charts, mariner settings), not the interfaces
-themselves. A C-callback Canvas (your C function pointers receiving resolved
-paths and glyph runs) is a feasible future addition — the boundary was
-designed so that would be mechanical — but it does not exist yet. If you need a
-custom output, today the answer is a small Zig file in `src/render/`; the
-build wires it in one place.
+**From the C ABI:** not currently supported. Surface and Canvas are Zig
+interfaces; the C ABI exposes the products (tiles, PNG, PDF, styles, assets)
+and the inputs (charts, mariner settings), not the interfaces themselves. A
+C-callback Canvas — C function pointers receiving resolved paths and glyph
+runs — would be a mechanical addition and may come later. Until then, a
+custom output format means a small Zig file in `src/render/`, wired into the
+build in one place.
 
 ## What's deliberately not here (yet)
 
