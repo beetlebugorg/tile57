@@ -139,6 +139,35 @@ pub fn quantizeHandoff(ladders: []const []const u32, cscl_fine: i32) i64 {
     return if (best == std.math.maxInt(i64)) cscl_fine else best;
 }
 
+/// S-52 overscale factor at/above which AP(OVERSC01) marks a scale boundary.
+///
+/// IHO S-52 PresLib e4.0.0 Part I §10.1.10.2: '"grossly enlarged" and "grossly
+/// overscale" must be taken to mean that the display scale is enlarged/overscale
+/// by X2 or more with respect to the compilation scale.' (Confirmed by S-52 Ed
+/// 6.1.1 §3.2.3(8b): the "overscale area" symbol identifies "any part of the
+/// chart display shown at two or more times the compilation scale".)
+///
+/// This is the SCALE-BOUNDARY pattern, distinct from the §10.1.10.1 "overscale
+/// indication" readout (the HUD "X n"), which fires from 1x (any overscale) for
+/// the mariner's own deliberate zoom and must NOT draw the pattern. So the gate
+/// is X2, not X1 — set to 1 for the looser IMO-PS-readout threshold.
+pub const OVERSCALE_FACTOR = 2;
+
+/// The display-scale denominator at/below which a cell of compilation scale
+/// `cscl` (1:cscl) is "grossly overscale" per §10.1.10.2 — i.e. cscl /
+/// OVERSCALE_FACTOR. Baked as the `oscl` gate tag: the AP(OVERSC01) hatch shows
+/// while the live display denominator is finer (smaller) than this value
+/// (style clause `oscl > DENOM`; resolve.osclVisible `denom < oscl`).
+///
+/// Baking the halved value (rather than the raw cscl quantized UP the SCAMIN
+/// ladder, the old behaviour) fixes the "fires early" defect: the zoom-derived
+/// clause `oscl > K/2^zoom` now flips EXACTLY at 2x and never before 1x
+/// (specs/overscale.md v3 defect 1). 0 when the compilation scale is unknown.
+pub fn overscaleGateDenom(cscl: i32) i64 {
+    if (cscl <= 0) return 0;
+    return @divTrunc(cscl, OVERSCALE_FACTOR);
+}
+
 /// One cell's per-tile quilting decision against the finest covering finer-scale
 /// coverage — shared by the baker (TileGenCtx.gen) and the live path (chart.zig
 /// tileRefs) so the two can't drift. `gf_centre` / `gf_whole` are finestCsclAt
@@ -478,11 +507,23 @@ const TileGenCtx = struct {
         for (idxs, 0..) |idx, j| {
             const be = &c.backends[idx];
             const g = carryGate(be.cscl, gf_centre_d, gf_whole, display_denom, ladders);
-            // Overscale tag: the cell's compilation scale quantized UP the tile's
-            // scamin ladder (like the smax handoff), so the client's discrete
-            // crossing machinery fires exactly at the emitted value.
-            const oscl: i64 = if (be.cscl > 0) quantizeHandoff(ladders, be.cscl) else 0;
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .overscale_hatch = !reach_only[j] and be.cscl > 0 and gf_tile < be.cscl, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
+            // Overscale tag (S-52 §10.1.10.2): the display denominator at/below
+            // which this cell is grossly overscale (cscl / OVERSCALE_FACTOR = X2).
+            // A real ladder crossing (BakeSink scans emitted `oscl` into the SCAMIN
+            // manifest), so the client flip is exact and never fires before 1x.
+            const oscl: i64 = overscaleGateDenom(be.cscl);
+            // Hatch this cell's OVERSC01 coverage only where it is the DISPLAYED
+            // (best-available) data AT a scale boundary (specs/overscale.md v3):
+            //   gf_tile < cscl   — a strictly-finer cell rides the tile (a scale
+            //                      boundary exists; else it is whole-view overscale,
+            //                      the HUD readout's job — §10.1.10.1).
+            //   gf_whole >= cscl — this cell WINS the quilt at some sampled point
+            //                      (its fills are not suppressed everywhere): the
+            //                      PURE quilt result, before carryGate's band-floor
+            //                      flip, so a coarse overview occluded by finer fills
+            //                      (even when carried) contributes NO hatch.
+            const wins_somewhere = gf_whole >= be.cscl; // == !pure_suppress_whole (cscl>0)
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .overscale_hatch = !reach_only[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
         }
         if (n_ov > 0) {
             const floor_denom = assets.displayDenomZ(z + 1, clat);
@@ -986,46 +1027,28 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     try std.testing.expect(sink.tiles.get(tileKey(7, t7[0], t7[1])) != null);
 }
 
-test "overscale: only cells undercut by a finer contributor hatch OVERSC01 (scale boundaries)" {
+test "overscale: a coarse cell occluded everywhere by finer coverage emits NO hatch (specs/overscale.md v3 defect 2)" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // The band-handoff scenario again (coastal 1:200k + general 1:1.2M over the
-    // same spot), each cell now carrying an M_COVR(CATCOV=1) area feature whose
-    // polygon is supplied via the geo cache. Scale-boundary refinement
-    // (specs/overscale.md): the z9 handoff tile carries ONLY the coarse cell's
-    // AP(OVERSC01) hatch — the fine cell contributes to the same tile with a
-    // strictly finer cscl, so the coarse hatch marks its scale-boundary patches;
-    // tagged oscl = 1200000 (no ladder value reaches 1.2M -> raw cscl) + the
-    // carry handoff smax — it hides with the rest of the carried copy. The fine
-    // cell is the tile's finest contributor, so it emits NO hatch (whole-view
-    // overscale over it is the HUD readout's job, not the pattern's) — same for
-    // the fine-only z10 coastal tile, which must stay hatch-free entirely.
+    // IDENTICAL coverage: the fine 1:200k cell wins the quilt over the whole tile,
+    // so the coarse 1:1.2M cell is the DISPLAYED data NOWHERE. Even though the
+    // band-floor carry keeps a coarse copy alive at z9 (its SCAMIN-declutter fill),
+    // S-52 §10.1.10.2 shows AP(OVERSC01) only on the smaller-scale ENC area that is
+    // actually displayed — so the coarse cell must emit NO hatch (the old carry
+    // heuristic bled one through every gap in the finer fills). The fine cell is
+    // the finest contributor, so it never hatches either.
     const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
+    const coarse_attr = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
     const catcov_attr = [_]s57.Attr{.{ .code = 18, .value = "1" }}; // CATCOV=1
     const fine_feats = [_]s57.Feature{
-        .{
-            .rcnm = 0,
-            .rcid = 1,
-            .prim = 1,
-            .objl = 14,
-            .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
-            .attrs = &scamin_attr,
-        },
+        .{ .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }}, .attrs = &scamin_attr },
         .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 302, .attrs = &catcov_attr },
     };
-    const coarse_attr = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
     const coarse_feats = [_]s57.Feature{
-        .{
-            .rcnm = 0,
-            .rcid = 1,
-            .prim = 1,
-            .objl = 14,
-            .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
-            .attrs = &coarse_attr,
-        },
+        .{ .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }}, .attrs = &coarse_attr },
         .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 302, .attrs = &catcov_attr },
     };
     var fine_cell = try testCell(gpa, 0.35, 0.35, 200_000, &fine_feats);
@@ -1033,23 +1056,80 @@ test "overscale: only cells undercut by a finer contributor hatch OVERSC01 (scal
     var coarse_cell = try testCell(gpa, 0.35, 0.35, 1_200_000, &coarse_feats);
     defer coarse_cell.deinit();
 
-    var ring = [_]s57.LonLat{
-        s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2),
-        s57.LonLat.init(3, 3),   s57.LonLat.init(-2, 3),
-        s57.LonLat.init(-2, -2),
-    };
+    // Both cells cover the whole tile (same big ring).
+    var ring = [_]s57.LonLat{ s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2), s57.LonLat.init(3, 3), s57.LonLat.init(-2, 3), s57.LonLat.init(-2, -2) };
     const rings = [_][]const s57.LonLat{&ring};
     const cover = [_][]const []const s57.LonLat{&rings};
-    // Geo cache: the M_COVR feature (index 1) gets the same ring as its polygon.
     var mparts = [_][]s57.LonLat{&ring};
     const geo = [_]?[][]s57.LonLat{ null, &mparts };
     const bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
     const streams = [_]?[]const u8{ "DrawingPriority:7;PointInstruction:BOYLAT01", null };
     const fine_scamins = [_]u32{260_000};
     const coarse_scamins = [_]u32{800_000};
-
     var fine = Backend{ .cell = fine_cell, .portrayal = &streams, .geo = &geo, .bounds = bounds, .cscl = 200_000, .coverage = &cover, .scamins = &fine_scamins };
     const coarse = Backend{ .cell = coarse_cell, .portrayal = &streams, .geo = &geo, .bounds = bounds, .cscl = 1_200_000, .coverage = &cover, .scamins = &coarse_scamins };
+
+    var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
+    var baker = Baker.init(gpa, 7, 10, .{ .ctx = &sink, .func = CollectSink.run });
+    defer baker.deinit();
+    try baker.bakeBand(.coastal, (&fine)[0..1], 1, .defer_down, null, null, null);
+    var both = [_]Backend{ coarse, fine };
+    try baker.bakeBand(.general, &both, 1, .extend_min, null, null, null);
+
+    // z9 (band-floor carry) and z10 (whole-view, §10.1.10.1) must BOTH be hatch-free.
+    const t9 = lonLatToTile(0.35, 0.35, 9);
+    try std.testing.expectEqual(@as(usize, 0), try countOverscHatches(a, &sink, 9, t9[0], t9[1]));
+    const t10 = lonLatToTile(0.35, 0.35, 10);
+    try std.testing.expectEqual(@as(usize, 0), try countOverscHatches(a, &sink, 10, t10[0], t10[1]));
+}
+
+test "overscale: a coarse-only patch beside finer coverage hatches at the X2 gate (S-52 §10.1.10.2)" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Genuine scale boundary: the fine 1:200k cell covers only the EAST of the tile
+    // (lon >= 0.5); the coarse 1:1.2M cell covers all of it. Over the west/centre
+    // the coarse cell WINS the quilt (it is the displayed smaller-scale data) and,
+    // with a strictly-finer cell riding the tile, it hatches its coarse-only patch.
+    // The hatch carries the X2 gate tag oscl = cscl/OVERSCALE_FACTOR = 600000 (never
+    // 1.2M quantized-up, defect 1) and NO smax (it wins outright, not a carry). The
+    // fine cell, the finest contributor, still emits no hatch.
+    const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
+    const coarse_attr = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
+    const catcov_attr = [_]s57.Attr{.{ .code = 18, .value = "1" }};
+    const fine_feats = [_]s57.Feature{
+        .{ .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }}, .attrs = &scamin_attr },
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 302, .attrs = &catcov_attr },
+    };
+    const coarse_feats = [_]s57.Feature{
+        .{ .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }}, .attrs = &coarse_attr },
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 302, .attrs = &catcov_attr },
+    };
+    var fine_cell = try testCell(gpa, 0.35, 0.35, 200_000, &fine_feats);
+    defer fine_cell.deinit();
+    var coarse_cell = try testCell(gpa, 0.35, 0.35, 1_200_000, &coarse_feats);
+    defer coarse_cell.deinit();
+
+    // Coarse covers everything; fine covers only lon >= 0.5 (east of the ~0.35
+    // tile centre) so the west + centre sample points are coarse-only.
+    var big = [_]s57.LonLat{ s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2), s57.LonLat.init(3, 3), s57.LonLat.init(-2, 3), s57.LonLat.init(-2, -2) };
+    var east = [_]s57.LonLat{ s57.LonLat.init(0.5, -2), s57.LonLat.init(3, -2), s57.LonLat.init(3, 3), s57.LonLat.init(0.5, 3), s57.LonLat.init(0.5, -2) };
+    const big_rings = [_][]const s57.LonLat{&big};
+    const east_rings = [_][]const s57.LonLat{&east};
+    const coarse_cover = [_][]const []const s57.LonLat{&big_rings};
+    const fine_cover = [_][]const []const s57.LonLat{&east_rings};
+    var big_parts = [_][]s57.LonLat{&big};
+    var east_parts = [_][]s57.LonLat{&east};
+    const coarse_geo = [_]?[][]s57.LonLat{ null, &big_parts };
+    const fine_geo = [_]?[][]s57.LonLat{ null, &east_parts };
+    const bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
+    const streams = [_]?[]const u8{ "DrawingPriority:7;PointInstruction:BOYLAT01", null };
+    const fine_scamins = [_]u32{260_000};
+    const coarse_scamins = [_]u32{800_000};
+    var fine = Backend{ .cell = fine_cell, .portrayal = &streams, .geo = &fine_geo, .bounds = bounds, .cscl = 200_000, .coverage = &fine_cover, .scamins = &fine_scamins };
+    const coarse = Backend{ .cell = coarse_cell, .portrayal = &streams, .geo = &coarse_geo, .bounds = bounds, .cscl = 1_200_000, .coverage = &coarse_cover, .scamins = &coarse_scamins };
 
     var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
     var baker = Baker.init(gpa, 7, 10, .{ .ctx = &sink, .func = CollectSink.run });
@@ -1074,36 +1154,31 @@ test "overscale: only cells undercut by a finer contributor hatch OVERSC01 (scal
             if (!is_oversc) continue;
             const oscl = findIntProp(f.properties, "oscl") orelse return error.TestUnexpectedResult;
             const smax = findIntProp(f.properties, "smax");
-            if (oscl == 260_000) {
-                // Fine cell: the tile's finest contributor never hatches.
+            if (oscl == 100_000) { // fine 200k -> X2 gate 100000
                 fine_hatch += 1;
-            } else if (oscl == 1_200_000) {
-                // Carried coarse cell: raw-cscl fallback + the carry handoff smax.
-                try std.testing.expectEqual(@as(?i64, 260_000), smax);
+            } else if (oscl == 600_000) { // coarse 1.2M -> X2 gate 600000
+                try std.testing.expectEqual(@as(?i64, null), smax); // wins outright, not carried
                 coarse_hatch += 1;
             } else return error.TestUnexpectedResult;
         }
     }
     try std.testing.expectEqual(@as(usize, 0), fine_hatch);
     try std.testing.expectEqual(@as(usize, 1), coarse_hatch);
+}
 
-    // Whole-view overscale: the fine-only z10 coastal tile has no finer
-    // contributor, so it must carry NO OVERSC01 hatch at all (however far the
-    // display zooms past 1:200k, the HUD readout indicates it — not the pattern).
-    const t10 = lonLatToTile(0.35, 0.35, 10);
-    const bytes10 = sink.tiles.get(tileKey(10, t10[0], t10[1])) orelse return error.TestUnexpectedResult;
-    const raw10 = try gzip.decompress(a, bytes10);
-    const layers10 = try mvt.decode(a, raw10);
-    var lone_hatch: usize = 0;
-    for (layers10) |L| {
+// Count AP(OVERSC01) hatch features in a baked tile (0 when the tile is absent).
+fn countOverscHatches(a: std.mem.Allocator, sink: *CollectSink, z: u8, x: u32, y: u32) !usize {
+    const bytes = sink.tiles.get(tileKey(z, x, y)) orelse return 0;
+    const raw = try gzip.decompress(a, bytes);
+    const layers = try mvt.decode(a, raw);
+    var n: usize = 0;
+    for (layers) |L| {
         if (!std.mem.eql(u8, L.name, "area_patterns")) continue;
-        for (L.features) |f| {
-            for (f.properties) |pr| if (std.mem.eql(u8, pr.key, "pattern_name")) {
-                if (std.mem.eql(u8, pr.value.string, "OVERSC01")) lone_hatch += 1;
-            };
-        }
+        for (L.features) |f| for (f.properties) |pr| {
+            if (std.mem.eql(u8, pr.key, "pattern_name") and std.mem.eql(u8, pr.value.string, "OVERSC01")) n += 1;
+        };
     }
-    try std.testing.expectEqual(@as(usize, 0), lone_hatch);
+    return n;
 }
 
 test "scamin standalone: one deduped feature per tile, scale-window included" {

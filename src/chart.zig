@@ -1381,8 +1381,8 @@ fn appendCellGeoJson(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *s57.C
 fn collectScaminCell(cell: *const s57.Cell, set: *std.AutoHashMap(u32, void)) void {
     for (cell.features) |f| if (scene.featureScamin(f)) |sc| if (sc > 0) set.put(@intCast(sc), {}) catch {};
     // The cell's compilation scale, quantized UP its own SCAMIN ladder — the value
-    // the overscale (`oscl`) and raw-cscl smax fallback tags are emitted at, so the
-    // live client ladder has a crossing to flip them on (see bakeArchive's fold).
+    // the raw-cscl smax handoff tag hands off at, so the live client ladder has a
+    // crossing to flip carried copies on (see bakeArchive's fold).
     const cscl = cell.params.cscl;
     if (cscl > 0) {
         var best: i64 = std.math.maxInt(i64);
@@ -1390,6 +1390,12 @@ fn collectScaminCell(cell: *const s57.Cell, set: *std.AutoHashMap(u32, void)) vo
             if (sc >= cscl and sc < best) best = sc;
         };
         set.put(if (best != std.math.maxInt(i64)) @intCast(best) else @intCast(cscl), {}) catch {};
+        // The overscale (`oscl`) X2 gate denominator (cscl/OVERSCALE_FACTOR): the
+        // AP(OVERSC01) hatch must flip on at a client crossing exactly at 2x, so
+        // the live SCAMIN ladder needs this value too (the bake path picks it up
+        // from the emitted tiles; the live path is precomputed from cells here).
+        const gate = bake_enc.overscaleGateDenom(cscl);
+        if (gate > 0) set.put(@intCast(gate), {}) catch {};
     }
 }
 
@@ -1605,10 +1611,15 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 .suppress_lines = g.suppress_centre,
                 .suppress_points = g.suppress_whole,
                 .smax = g.smax,
-                // Overscale tag: compilation scale quantized UP the tile's scamin
-                // ladder (same crossing alignment as the smax handoff).
-                .oscl = if (lc.cscl > 0) bake_enc.quantizeHandoff(ladders, lc.cscl) else 0,
-                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl,
+                // Overscale tag (S-52 §10.1.10.2): the X2 gate denominator
+                // (cscl / OVERSCALE_FACTOR). collectScaminCell adds it to the live
+                // SCAMIN ladder so the client crossing is exact + never fires early.
+                .oscl = bake_enc.overscaleGateDenom(lc.cscl),
+                // Hatch only where this cell is the best-available data at a scale
+                // boundary: a finer cell rides the tile (gf_tile < cscl) AND this
+                // cell wins the pure quilt somewhere (gf_whole >= cscl, pre-carry) —
+                // an occluded coarse overview contributes no hatch (specs/overscale.md v3).
+                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl and gf_whole >= lc.cscl,
                 // SCAMIN standalone: the overlay below owns prim==1 SCAMIN features.
                 .skip_scamin_points = true,
                 .light_range_m = lc.light_range_m,
@@ -1635,7 +1646,7 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 .suppress_lines = g.suppress_centre,
                 .suppress_points = g.suppress_whole,
                 .smax = g.smax,
-                .oscl = if (lc.cscl > 0) bake_enc.quantizeHandoff(ladders, lc.cscl) else 0,
+                .oscl = bake_enc.overscaleGateDenom(lc.cscl),
                 .overscale_hatch = false,
                 .skip_scamin_points = true,
                 .light_range_m = lc.light_range_m,

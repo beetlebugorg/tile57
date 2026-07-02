@@ -139,12 +139,12 @@ pub fn smaxVisible(smax: i64, zoom: f64) bool {
     return zoom < std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(smax)));
 }
 
-/// Overscale gate (S-52 §10.1.10) — the AP(OVERSC01) hatch over a cell's M_COVR
-/// coverage shows only while the display is FINER than the cell's (quantized)
-/// compilation scale: denom(zoom) < oscl, i.e. zoom > log2(DENOM_Z0 / oscl).
-/// Exactly at 1:oscl the display is at compilation scale — no indication (the
-/// style clause is a strict `>`: oscl > DENOM). oscl 0 (unknown) never shows.
-/// Mirrors the style oscl clause (assets/style.zig writeOsclClause).
+/// Overscale gate (S-52 §10.1.10.2) — the AP(OVERSC01) hatch over a cell's M_COVR
+/// coverage shows only while the display is grossly overscale: denom(zoom) < oscl,
+/// i.e. zoom > log2(DENOM_Z0 / oscl). `oscl` is the baked X2 gate denominator
+/// (bake_enc.overscaleGateDenom = cscl/OVERSCALE_FACTOR), so this fires from X2 and
+/// NEVER before 1x compilation scale. The style clause is a strict `>` (oscl >
+/// DENOM); oscl 0 (unknown) never shows. Mirrors assets/style.zig writeOsclClause.
 pub fn osclVisible(oscl: i64, zoom: f64) bool {
     if (oscl <= 0) return false;
     return zoom > std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(oscl)));
@@ -268,31 +268,41 @@ test "smaxVisible is scaminVisible's mirror: carried copy hides past the handoff
     try std.testing.expect(smaxVisible(0, 0)); // untagged -> always
 }
 
-test "osclVisible: the overscale hatch shows only past the compilation scale" {
-    // 1:260000 data: the display reads finer than 1:260000 past zoom
-    // log2(279541132/260000) ~= 10.07 — the hatch turns ON there (denom < oscl).
-    const cross = std.math.log2(DENOM_Z0 / 260000.0);
-    try std.testing.expect(!osclVisible(260000, 9.5));
-    try std.testing.expect(osclVisible(260000, 10.5));
-    // Exactly AT compilation scale there is no overscale (strict >, like the
-    // style clause [">", oscl, DENOM]).
-    try std.testing.expect(!osclVisible(260000, cross));
+test "osclVisible: the X2 hatch never fires at/below 1x, fires past 2x (specs/overscale.md v3)" {
+    // A 1:260000 cell bakes oscl = cscl / OVERSCALE_FACTOR (X2) = 130000 (see
+    // bake_enc.overscaleGateDenom). The hatch (denom < oscl) must:
+    //   - stay OFF at & below 1x compilation scale (denom >= 260000), and
+    //   - turn ON only once grossly overscale (denom < 130000, i.e. X2+).
+    const cscl: i64 = 260000;
+    const oscl: i64 = @divTrunc(cscl, 2); // 130000
+    const z_1x = std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(cscl))); // denom == cscl
+    const z_2x = std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(oscl))); // denom == cscl/2
+    // At and below 1x: no hatch (the "no hatch at/below 1x cscl" pin).
+    try std.testing.expect(!osclVisible(oscl, z_1x - 0.5));
+    try std.testing.expect(!osclVisible(oscl, z_1x));
+    // Between 1x and 2x: still no hatch (not yet grossly overscale, §10.1.10.2).
+    try std.testing.expect(!osclVisible(oscl, (z_1x + z_2x) / 2.0));
+    // Exactly at 2x: strict `>` -> off; just past 2x: on.
+    try std.testing.expect(!osclVisible(oscl, z_2x));
+    try std.testing.expect(osclVisible(oscl, z_2x + 0.5));
     // Unknown scale never hatches.
     try std.testing.expect(!osclVisible(0, 16.0));
 }
 
 test "visible: the overscale hatch honours show_overscale + the oscl gate" {
     const m = MarinerSettings{};
-    const hatch = rs.FeatureMeta{ .cat = 0, .oscl = 260000, .overscale = true };
-    try std.testing.expect(!visible(&hatch, null, 9.5, &m)); // display coarser: no hatch
-    try std.testing.expect(visible(&hatch, null, 12.0, &m)); // overscaled: hatch shows
+    // Baked X2 gate denom for a 1:260000 cell (cscl/OVERSCALE_FACTOR = 130000).
+    // z_2x ~= log2(279541132/130000) ~= 11.07 — grossly overscale past there.
+    const hatch = rs.FeatureMeta{ .cat = 0, .oscl = 130000, .overscale = true };
+    try std.testing.expect(!visible(&hatch, null, 10.5, &m)); // < 2x: no hatch
+    try std.testing.expect(visible(&hatch, null, 12.0, &m)); // grossly overscale: hatch shows
     const off = MarinerSettings{ .show_overscale = false };
     try std.testing.expect(!visible(&hatch, null, 12.0, &off));
     const ign = MarinerSettings{ .ignore_scamin = true };
     try std.testing.expect(!visible(&hatch, null, 12.0, &ign)); // debug view: no hatch
     // An ordinary fill carrying the oscl TAG (not the hatch) is never oscl-gated.
-    const fill = rs.FeatureMeta{ .cat = 0, .oscl = 260000 };
-    try std.testing.expect(visible(&fill, null, 9.5, &m));
+    const fill = rs.FeatureMeta{ .cat = 0, .oscl = 130000 };
+    try std.testing.expect(visible(&fill, null, 10.5, &m));
     try std.testing.expect(visible(&fill, null, 12.0, &m));
 }
 
