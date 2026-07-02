@@ -2048,36 +2048,79 @@ pub fn generateTileSurface(scratch: Allocator, out: Allocator, cells: []const Ce
 /// px_per_tile of 256 * 2^(zoom - round(zoom)) * supersample; this positions
 /// each covering tile via ps.setOrigin and drives the engine per tile.
 pub fn generateViewSurface(scratch: Allocator, out: Allocator, cells: []const CellRef, center_lon: f64, center_lat: f64, zoom: f64, pick_attrs: bool, ps: *render.pixel.PixelSurface) ![]u8 {
-    const zi: u8 = @intFromFloat(std.math.clamp(@round(zoom), 0, 22));
-    const n_tiles: f64 = @floatFromInt(@as(u32, 1) << @intCast(zi));
-    const pt: f64 = @floatCast(ps.px_per_tile);
-    const world = tile.lonLatToWorld(center_lon, center_lat); // [0,1] web-mercator
-    const cx = world[0] * n_tiles * pt;
-    const cy = world[1] * n_tiles * pt;
-    const wf: f64 = @floatFromInt(ps.w_px);
-    const hf: f64 = @floatFromInt(ps.h_px);
-    const left = cx - wf / 2;
-    const top = cy - hf / 2;
-
+    var vt = ViewTiles.init(center_lon, center_lat, zoom, ps.w_px, ps.h_px, ps.px_per_tile);
     const surf = ps.asSurface();
-    try surf.beginScene(zi);
-    const tx0: i64 = @intFromFloat(@floor(left / pt));
-    const ty0: i64 = @intFromFloat(@floor(top / pt));
-    const tx1: i64 = @intFromFloat(@floor((left + wf - 0.001) / pt));
-    const ty1: i64 = @intFromFloat(@floor((top + hf - 0.001) / pt));
-    const max_t: i64 = @as(i64, 1) << @intCast(zi);
-    var ty = ty0;
-    while (ty <= ty1) : (ty += 1) {
-        if (ty < 0 or ty >= max_t) continue;
-        var tx = tx0;
-        while (tx <= tx1) : (tx += 1) {
-            if (tx < 0 or tx >= max_t) continue;
-            ps.setOrigin(@floatCast(@as(f64, @floatFromInt(tx)) * pt - left), @floatCast(@as(f64, @floatFromInt(ty)) * pt - top));
-            try appendTileSurface(scratch, cells, zi, @intCast(tx), @intCast(ty), pick_attrs, surf);
-        }
+    try surf.beginScene(vt.z);
+    while (vt.next()) |t| {
+        ps.setOrigin(t.origin_x, t.origin_y);
+        try appendTileSurface(scratch, cells, t.z, t.x, t.y, pick_attrs, surf);
     }
     return surf.endScene(out);
 }
+
+/// The tiles covering a view (centre + fractional zoom + output px), with each
+/// tile's canvas origin — shared by generateViewSurface and the lib's
+/// chart-level renderView (which re-selects cells per tile).
+pub const ViewTiles = struct {
+    z: u8,
+    pt: f64, // px per tile
+    left: f64,
+    top: f64,
+    tx0: i64,
+    tx1: i64,
+    ty1: i64,
+    max_t: i64,
+    tx: i64,
+    ty: i64,
+
+    pub const Tile = struct { z: u8, x: u32, y: u32, origin_x: f32, origin_y: f32 };
+
+    pub fn init(center_lon: f64, center_lat: f64, zoom: f64, w_px: u32, h_px: u32, px_per_tile: f32) ViewTiles {
+        const zi: u8 = @intFromFloat(std.math.clamp(@round(zoom), 0, 22));
+        const n_tiles: f64 = @floatFromInt(@as(u32, 1) << @intCast(zi));
+        const pt: f64 = @floatCast(px_per_tile);
+        const world = tile.lonLatToWorld(center_lon, center_lat); // [0,1] web-mercator
+        const wf: f64 = @floatFromInt(w_px);
+        const hf: f64 = @floatFromInt(h_px);
+        const left = world[0] * n_tiles * pt - wf / 2;
+        const top = world[1] * n_tiles * pt - hf / 2;
+        const tx0: i64 = @intFromFloat(@floor(left / pt));
+        const ty0: i64 = @intFromFloat(@floor(top / pt));
+        return .{
+            .z = zi,
+            .pt = pt,
+            .left = left,
+            .top = top,
+            .tx0 = tx0,
+            .tx1 = @intFromFloat(@floor((left + wf - 0.001) / pt)),
+            .ty1 = @intFromFloat(@floor((top + hf - 0.001) / pt)),
+            .max_t = @as(i64, 1) << @intCast(zi),
+            .tx = tx0,
+            .ty = ty0,
+        };
+    }
+
+    pub fn next(self: *ViewTiles) ?Tile {
+        while (self.ty <= self.ty1) {
+            const cur_tx = self.tx;
+            const cur_ty = self.ty;
+            self.tx += 1;
+            if (self.tx > self.tx1) {
+                self.tx = self.tx0;
+                self.ty += 1;
+            }
+            if (cur_ty < 0 or cur_ty >= self.max_t or cur_tx < 0 or cur_tx >= self.max_t) continue;
+            return .{
+                .z = self.z,
+                .x = @intCast(cur_tx),
+                .y = @intCast(cur_ty),
+                .origin_x = @floatCast(@as(f64, @floatFromInt(cur_tx)) * self.pt - self.left),
+                .origin_y = @floatCast(@as(f64, @floatFromInt(cur_ty)) * self.pt - self.top),
+            };
+        }
+        return null;
+    }
+};
 
 /// Emit one centred point symbol at the feature's anchor — its node (point), line
 /// middle vertex, or area representative point (see featureAnchor) — routed to the

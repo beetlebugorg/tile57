@@ -204,6 +204,21 @@ typedef enum {
 tile57_tile_status tile57_chart_tile(tile57_chart *chart, uint8_t z, uint32_t x, uint32_t y,
                            uint8_t **out, size_t *out_len);
 
+/* Render a VIEW of the chart — centre + fractional zoom + pixel size — to a
+ * PNG through the native S-52 pixel path: the mariner settings evaluate LIVE
+ * (real safety contour + category/SCAMIN/text-group gates + day/dusk/night
+ * palette), catalogue symbols replay as vectors, and labels declutter over
+ * the whole canvas (no tile seams). `m` NULL = canonical defaults (see
+ * tile57_mariner_defaults; declared below). Physical calibration / @2x is
+ * m->size_scale. Returns 0 with *out and *out_len set (free with tile57_free);
+ * -1 bad handle, -2 render failure, -3 unsupported source (a baked PMTiles
+ * chart carries no portrayal to render from). */
+struct tile57_mariner; /* fwd; defined in the chart-style section below */
+int tile57_chart_render_view(tile57_chart *chart, double lon, double lat, double zoom,
+                             uint32_t width, uint32_t height,
+                             const struct tile57_mariner *m,
+                             uint8_t **out, size_t *out_len);
+
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
  * colortables, atlases, …), passing the same length. The universal free. (chart-api.md) */
 void tile57_free(void *ptr, size_t len);
@@ -227,7 +242,7 @@ typedef enum { TILE57_SCHEME_DAY=0, TILE57_SCHEME_DUSK=1, TILE57_SCHEME_NIGHT=2 
 typedef enum { TILE57_DEPTH_METERS=0, TILE57_DEPTH_FEET=1 } tile57_depth_unit;
 typedef enum { TILE57_BOUNDARY_SYMBOLIZED=0, TILE57_BOUNDARY_PLAIN=1 } tile57_boundary_style;
 
-typedef struct {
+typedef struct tile57_mariner {
     tile57_scheme scheme;
     double shallow_contour, safety_contour, deep_contour, safety_depth;
     bool four_shade_water;

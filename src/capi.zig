@@ -274,6 +274,43 @@ export fn tile57_chart_tile(
     return 0;
 }
 
+/// Render a VIEW of the chart (centre + fractional zoom + pixel size) to PNG
+/// through the native S-52 pixel path: the mariner settings evaluate LIVE
+/// (real safety contour, category/SCAMIN/text-group gates, palette), symbols
+/// replay as vectors, labels declutter over the whole canvas. `m` NULL =
+/// defaults. Returns 0 with *out/*out_len set (free with tile57_free);
+/// -1 bad handle, -2 render failure, -3 unsupported source (a baked PMTiles
+/// chart carries no portrayal to render from).
+export fn tile57_chart_render_view(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
+    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const palette: RenderPalette = switch (settings.scheme) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings) catch |e| switch (e) {
+        error.Unsupported => return -3,
+        else => return -2,
+    };
+    out.* = bytes.ptr;
+    out_len.* = bytes.len;
+    return 0;
+}
+
+const RenderPalette = @import("render").resolve.PaletteId;
+
 /// Free any engine-returned buffer (tiles, style, scamin array, colortables, …). See tile57.h.
 /// (chart-api.md — the universal free.)
 export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {

@@ -359,6 +359,7 @@ pub fn build(b: *std.Build) void {
     // generate the colortables + base style template with no on-disk catalogue
     // (tile57_colortables_default / tile57_style_template).
     lib_mod.addImport("colorprofile_registry", colorprofile_registry);
+    lib_mod.addImport("catalog", catalog_embed); // chart.renderView symbol/pattern store
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     b.installArtifact(lib);
 

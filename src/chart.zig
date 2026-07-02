@@ -25,6 +25,9 @@ const portray = @import("portray");
 const bake_enc = @import("s57_mvt").bake_enc;
 const catalogue = @import("s100").catalogue;
 const tile = @import("tiles").tile;
+const render = @import("render");
+const sprite = @import("sprite");
+const embedded_assets = @import("catalog"); // S-101 portrayal assets (renderView store)
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
 // makes many small, short-lived allocations (tile cache, cell dupes, index
@@ -844,6 +847,70 @@ pub const Chart = struct {
         return try gpa.dupe(u8, bytes);
     }
 
+    /// Render a VIEW of the chart — centre + fractional zoom + pixel size —
+    /// through the native S-52 pixel path: real portrayal, vector symbols,
+    /// labels + declutter over the whole canvas. Returns PNG bytes (gpa-owned;
+    /// free with freeBytes). Cell-backed sources only; a baked PMTiles source
+    /// has no portrayal to render from (bundle-sourced rendering is future work).
+    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings) ![]u8 {
+        if (self.backend == .reader) return error.Unsupported;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+        const css_name = switch (palette) {
+            .day => "daySvgStyle",
+            .dusk => "duskSvgStyle",
+            .night => "nightSvgStyle",
+        };
+        var css_data: []const u8 = "";
+        for (embedded_assets.css) |e| {
+            if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
+        }
+        const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+        for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+        const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+        for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+        const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+        defer store.deinit();
+
+        // Continuous scaling between integer zooms; the host applies physical
+        // calibration / @2x via settings.size_scale.
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, @import("tiles").tile.EXTENT);
+        ps.store = store.asStore();
+
+        switch (self.backend) {
+            .reader => unreachable,
+            .cell => |*cb| {
+                const one = [_]s57_mvt.CellRef{.{
+                    .cell = &cb.cell,
+                    .portrayal = cb.portrayal,
+                    .portrayal_plain = cb.portrayal_plain,
+                    .portrayal_simplified = cb.portrayal_simplified,
+                }};
+                return s57_mvt.generateViewSurface(a, gpa, &one, lon, lat, zoom, self.pick_attrs, &ps) catch error.TileGen;
+            },
+            .cells => |*ls| {
+                const keep_from = ls.tick + 1;
+                var vt = s57_mvt.ViewTiles.init(lon, lat, zoom, w, h, pt);
+                const surf = ps.asSurface();
+                try surf.beginScene(vt.z);
+                while (vt.next()) |t| {
+                    var refs = std.ArrayList(s57_mvt.CellRef).empty;
+                    defer refs.deinit(gpa);
+                    if (!try tileRefs(ls, t.z, t.x, t.y, &refs)) continue;
+                    ps.setOrigin(t.origin_x, t.origin_y);
+                    s57_mvt.appendTileSurface(a, refs.items, t.z, t.x, t.y, self.pick_attrs, surf) catch return error.TileGen;
+                }
+                const bytes = surf.endScene(gpa) catch return error.TileGen;
+                lazyEvict(ls, keep_from);
+                return bytes;
+            },
+        }
+    }
+
     /// Drop the in-memory tile cache (bounds memory in long-running hosts).
     pub fn clearCache(self: *Chart) void {
         var it = self.cache.valueIterator();
@@ -957,7 +1024,11 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
 
 // Multi-cell tile generation: collect overlapping cells, lazily load them, apply
 // best-band M_COVR suppression, and overlay coarse→fine.
-fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8 {
+// Select + load the cells contributing to tile (z,x,y) and append their
+// band-quilted CellRefs (suppression flags computed against the finer-band
+// coverage). Returns false when nothing overlaps. Factored from tileFromCells
+// so renderView can reuse the exact same selection per covering tile.
+fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(s57_mvt.CellRef)) !bool {
     const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
     var any_incl = false;
     var coarsest: ?bake_enc.Band = null;
@@ -967,7 +1038,7 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8
         if (z >= zr.min and z <= zr.max) any_incl = true;
         if (coarsest == null or @intFromEnum(lc.band) > @intFromEnum(coarsest.?)) coarsest = lc.band;
     }
-    const cband = coarsest orelse return try gpa.alloc(u8, 0);
+    const cband = coarsest orelse return false;
 
     var idxs = std.ArrayList(u32).empty;
     defer idxs.deinit(gpa);
@@ -983,7 +1054,6 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8
         }
     }.lt);
 
-    const keep_from = ls.tick + 1;
     for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
 
     const w = tb[0];
@@ -998,8 +1068,6 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8
         cov_whole = @min(cov_whole, finestCoverageBand(ls, idxs.items, corner[0], corner[1]));
     }
 
-    var refs = std.ArrayList(s57_mvt.CellRef).empty;
-    defer refs.deinit(gpa);
     for (idxs.items) |i| {
         const lc = &ls.cells[i];
         if (lc.cell) |*c| {
@@ -1017,6 +1085,14 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8
             }) catch {};
         }
     }
+    return true;
+}
+
+fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8 {
+    const keep_from = ls.tick + 1;
+    var refs = std.ArrayList(s57_mvt.CellRef).empty;
+    defer refs.deinit(gpa);
+    if (!try tileRefs(ls, z, x, y, &refs)) return try gpa.alloc(u8, 0);
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const mvt = s57_mvt.generateTileMulti(ar.allocator(), gpa, refs.items, z, x, y, .mvt, pick_attrs) catch return error.TileGen;
