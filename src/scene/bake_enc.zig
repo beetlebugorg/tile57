@@ -195,13 +195,6 @@ pub fn bandZooms(band: Band) ZoomRange {
     };
 }
 
-/// A band's native max zoom (Go covMeta.bandMax) — the "fineness" key for
-/// best-band coverage suppression. Finer bands have a LARGER value (berthing 18 …
-/// overview 7), so a cell is suppressed where a band with a higher max covers it.
-pub fn bandMaxZoom(band: Band) u8 {
-    return bandZooms(band).max;
-}
-
 /// What a band's pass does with its own FLOOR zoom (bandZooms(band).min — the
 /// zoom it shares with the next-coarser band):
 ///   .defer_down — skip it: the caller runs the next-coarser band's pass with
@@ -243,25 +236,6 @@ pub fn passHasWork(band: Band, minzoom: u8, maxzoom: u8, own_n: usize, carry_n: 
         if (zlo <= zhi) return true;
     }
     return carry_n > 0 and zr.max >= minzoom and zr.max <= maxzoom;
-}
-
-/// Best-available area suppression (Go bake.go best-available rule): a coarser-band
-/// cell's AREA fills/patterns yield at tile zoom `z` wherever a strictly-finer
-/// band's real M_COVR data-coverage is present. `cell_natmax` is the cell's own
-/// band max; `finest_cov_natmax` is the largest band-max whose coverage contains
-/// the relevant test point(s), 0 = none. Suppress only when the cell is OVERZOOMED
-/// past its native band (z >= its max) AND a finer band covers, so a coarse area is
-/// kept everywhere a finer chart has a genuine coverage gap.
-///
-/// FILLS pass `finest_cov_natmax` = the MIN over the tile centre + 4 corners (Go's
-/// whole-tile fill test): suppress only where a finer band covers the WHOLE tile,
-/// so a partly-covered seam tile keeps its coarse fill and the finer fill (drawn on
-/// top via the band sort-key) occludes it — no seam gap, no visible cross-band fill.
-/// PATTERNS pass the tile-centre value: area_patterns draw ABOVE all fills, so a
-/// coarse pattern must yield wherever finer data exists or it laps over finer land;
-/// a pattern dropped on a thin seam is harmless (the underlying fill remains).
-pub fn coarseAreaSuppressed(cell_natmax: u8, z: u8, finest_cov_natmax: u8) bool {
-    return z >= cell_natmax and cell_natmax < finest_cov_natmax;
 }
 
 /// Whether to cache assembled geometry for a band. The fine bands have many small
@@ -641,20 +615,6 @@ pub const Baker = struct {
         if (progress) |cb| cb(ctx, 1, self.count - self.band_base, self.band_total, self.band_index, self.band_count, bname);
     }
 };
-
-test "coarseAreaSuppressed: finer coverage suppresses overzoomed coarse area" {
-    const gen = bandMaxZoom(.general); // 9
-    const app = bandMaxZoom(.approach); // 13
-    // z within the coarse band's native range: never suppressed.
-    try std.testing.expect(!coarseAreaSuppressed(gen, 8, app));
-    // z past the coarse band's max, finer (approach) coverage present: suppressed.
-    try std.testing.expect(coarseAreaSuppressed(gen, 12, app));
-    // z past the coarse band's max but NO finer coverage (0): kept (best-available).
-    try std.testing.expect(!coarseAreaSuppressed(gen, 12, 0));
-    // The finer cell itself is never suppressed by an equal-or-coarser band.
-    try std.testing.expect(!coarseAreaSuppressed(app, 18, gen));
-    try std.testing.expect(!coarseAreaSuppressed(app, 18, app));
-}
 
 test "quantizeHandoff: smallest ladder value >= cscl, raw-cscl fallback" {
     const fine = [_]u32{ 90_000, 260_000, 350_000 };
