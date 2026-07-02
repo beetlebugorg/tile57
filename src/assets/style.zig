@@ -808,7 +808,13 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         .smax = if (opts.ignore_scamin)
             .off
         else if (opts.scamin_filter_gate)
-            .{ .denom = opts.scamin_cur_denom }
+            // The boot/diff placeholder denominator is 0 — show-all for the
+            // scamin clause (scamin >= 0) but show-NOTHING for this one
+            // (smax < 0 fails every feature), which blanked the chart between
+            // a style diff landing and the client's live injection. Map the
+            // placeholder to this clause's own show-all literal; the client
+            // rewrites both clauses to the live denominator regardless.
+            .{ .denom = if (opts.scamin_cur_denom == 0) 1e12 else opts.scamin_cur_denom }
         else if (opts.scamin.len > 0)
             .{ .zoom_k = M_PER_PX_Z0 * @cos(opts.scamin_lat * std.math.pi / 180.0) / (DEFAULT_PX_PITCH_MM / 1000.0) }
         else
@@ -1430,6 +1436,24 @@ test "styleJson: the filter-gate smax clause has the EXACT client-matched shape"
     // the SAME injected literal as the scamin clause's.
     try std.testing.expect(std.mem.indexOf(u8, gated, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],50000]") != null);
     try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],50000]") != null);
+
+    // The boot/diff PLACEHOLDER (cur_denom 0) must be show-all for BOTH clauses:
+    // scamin keeps the 0 literal (scamin >= 0 passes everything) while smax maps
+    // to its own show-all end (smax < 1e12) — a 0 literal there hides every
+    // feature and blanked the chart until the client's live injection.
+    const boot = try styleJson(a, .{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+        .scamin_filter_gate = true,
+        .scamin_cur_denom = 0,
+    });
+    defer a.free(boot);
+    try std.testing.expect(std.mem.indexOf(u8, boot, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],1000000000000]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, boot, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],0]") != null);
 
     // The gate rides the BASE layers too: a carried copy of an ungated feature
     // (fills, plain symbols) lands there and must still hand off.
