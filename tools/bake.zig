@@ -394,11 +394,28 @@ pub fn main(init: std.process.Init) !void {
                     var sym: []const u8 = "";
                     var celln: []const u8 = "";
                     for (feat.properties) |pr| {
-                        if (std.mem.eql(u8, pr.key, "scamin")) scamin = switch (pr.value) { .int => |v| v, .uint => |v| @intCast(v), else => 0 };
-                        if (std.mem.eql(u8, pr.key, "smax")) smax = switch (pr.value) { .int => |v| v, .uint => |v| @intCast(v), else => 0 };
-                        if (std.mem.eql(u8, pr.key, "class")) class = switch (pr.value) { .string => |v| v, else => "" };
-                        if (std.mem.eql(u8, pr.key, "symbol_name")) sym = switch (pr.value) { .string => |v| v, else => "" };
-                        if (std.mem.eql(u8, pr.key, "cell")) celln = switch (pr.value) { .string => |v| v, else => "" };
+                        if (std.mem.eql(u8, pr.key, "scamin")) scamin = switch (pr.value) {
+                            .int => |v| v,
+                            .uint => |v| @intCast(v),
+                            else => 0,
+                        };
+                        if (std.mem.eql(u8, pr.key, "smax")) smax = switch (pr.value) {
+                            .int => |v| v,
+                            .uint => |v| @intCast(v),
+                            else => 0,
+                        };
+                        if (std.mem.eql(u8, pr.key, "class")) class = switch (pr.value) {
+                            .string => |v| v,
+                            else => "",
+                        };
+                        if (std.mem.eql(u8, pr.key, "symbol_name")) sym = switch (pr.value) {
+                            .string => |v| v,
+                            else => "",
+                        };
+                        if (std.mem.eql(u8, pr.key, "cell")) celln = switch (pr.value) {
+                            .string => |v| v,
+                            else => "",
+                        };
                     }
                     if (sym.len == 0 or class.len == 0) continue;
                     const px = feat.parts[0][0];

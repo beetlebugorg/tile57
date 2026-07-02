@@ -971,7 +971,6 @@ test "overscale: contributing cells emit OVERSC01 coverage hatches tagged quanti
     try std.testing.expectEqual(@as(usize, 1), coarse_hatch);
 }
 
-
 test "scamin standalone: one deduped feature per tile, scale-window included" {
     const scamin_pts = scene.scamin_pts;
     const gpa = std.testing.allocator;
@@ -987,18 +986,30 @@ test "scamin standalone: one deduped feature per tile, scale-window included" {
     // (no fine copy) capped at the fine chart's handoff (smax 260000).
     const fine_attrs = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
     const fine_feats = [_]s57.Feature{.{
-        .rcnm = 100, .rcid = 1, .prim = 1, .objl = 14, .foid = 0xBEEF,
+        .rcnm = 100,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .foid = 0xBEEF,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &fine_attrs,
     }};
     const coarse_attrs = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
     const coarse_only_attrs = [_]s57.Attr{.{ .code = 133, .value = "900000" }};
     const coarse_feats = [_]s57.Feature{ .{
-        .rcnm = 100, .rcid = 1, .prim = 1, .objl = 14, .foid = 0xBEEF,
+        .rcnm = 100,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .foid = 0xBEEF,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &coarse_attrs,
     }, .{
-        .rcnm = 100, .rcid = 2, .prim = 1, .objl = 14, .foid = 0xD00D,
+        .rcnm = 100,
+        .rcid = 2,
+        .prim = 1,
+        .objl = 14,
+        .foid = 0xD00D,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 2 }, .ornt = 255 }},
         .attrs = &coarse_only_attrs,
     } };
@@ -1107,7 +1118,6 @@ test "scamin standalone: one deduped feature per tile, scale-window included" {
     try std.testing.expect(sink.tiles.get(tileKey(9, t9[0], t9[1])) != null);
     try std.testing.expect(800_000.0 >= assets.displayDenomZ(10, 0.35));
 }
-
 
 test "bandOf / bandZooms match the Go reference bands" {
     try std.testing.expectEqual(Band.harbor, bandOf(12_000)); // [13,16]
