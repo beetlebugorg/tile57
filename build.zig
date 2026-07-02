@@ -199,6 +199,13 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mvt", .module = mvt_mod }},
     });
 
+    // Render engine Surface vtable contract (src/render/surface.zig).
+    // Pure; consumed by s57_mvt (mvt/mlt surface) and the noop surface.
+    const render_surface_mod = b.addModule("render_surface", .{
+        .root_source_file = b.path("src/render/surface.zig"),
+        .imports = &.{.{ .name = "mvt", .module = mvt_mod }},
+    });
+
     // S-57 -> MVT tile generation (s57_mvt) + the banded ENC_ROOT baker (bake_enc,
     // mirrors the Go oracle's internal/engine/baker). Pure; s57_mvt <- bake_enc.
     const s57_mvt_mod = b.addModule("s57_mvt", .{
@@ -209,6 +216,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "mvt", .module = mvt_mod },
             .{ .name = "mlt", .module = mlt_mod },
             .{ .name = "tile", .module = tile_mod },
+            .{ .name = "render_surface", .module = render_surface_mod },
         },
     });
     const bake_enc_mod = b.addModule("bake_enc", .{
@@ -526,6 +534,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mvt", .module = mvt_mod },
         .{ .name = "mlt", .module = mlt_mod },
         .{ .name = "tile", .module = tile_mod },
+        .{ .name = "render_surface", .module = render_surface_mod },
     });
     _ = addPkgTest(b, test_step, "src/bake_enc/bake_enc.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
