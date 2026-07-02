@@ -29,18 +29,25 @@ pub const Symbol = struct {
     pivot: cv.Point,
 };
 
-/// The lookup seam: name -> parsed symbol (null = unknown; the caller decides
-/// the fallback). Implementations own caching and the returned memory.
+/// The lookup seam: name -> parsed symbol / rendered pattern cell (null =
+/// unknown; the caller decides the fallback). Implementations own caching and
+/// the returned memory.
 pub const SymbolStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         get: *const fn (*anyopaque, name: []const u8) ?*const Symbol,
+        /// An S-101 AreaFill's seamless repeat cell, rasterized at `px_per_mm`
+        /// device density (the canvas's screen scale).
+        getPattern: *const fn (*anyopaque, name: []const u8, px_per_mm: f32) ?*const cv.Pattern,
     };
 
     pub fn get(self: SymbolStore, name: []const u8) ?*const Symbol {
         return self.vtable.get(self.ptr, name);
+    }
+    pub fn getPattern(self: SymbolStore, name: []const u8, px_per_mm: f32) ?*const cv.Pattern {
+        return self.vtable.getPattern(self.ptr, name, px_per_mm);
     }
 };
 

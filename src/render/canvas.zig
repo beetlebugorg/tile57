@@ -29,6 +29,11 @@ pub const Point = struct { x: f32, y: f32 };
 /// subpaths, which nonzero would fill solid.
 pub const FillRule = enum { nonzero, even_odd };
 
+/// A seamless repeat cell (straight-alpha RGBA8) for pattern fills — one
+/// S-101 AreaFill tiled at the canvas's pixel density. Tiling phase is
+/// anchored to the canvas origin so adjacent polygons pattern seamlessly.
+pub const Pattern = struct { w: u32, h: u32, rgba: []const u8 };
+
 pub const Canvas = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -36,6 +41,9 @@ pub const Canvas = struct {
     pub const VTable = struct {
         /// Fill closed rings with `color` under `rule` (see FillRule).
         fillPath: *const fn (*anyopaque, rings: []const []const Point, color: Color, rule: FillRule) anyerror!void,
+        /// Fill closed rings (nonzero) with a repeating pattern cell,
+        /// canvas-anchored phase.
+        fillPattern: *const fn (*anyopaque, rings: []const []const Point, pattern: *const Pattern) anyerror!void,
         /// Stroke polylines `width_px` wide with round joins and round caps.
         /// `dash` is an [on, off] pixel pattern anchored at each line's start
         /// (null = solid).
@@ -44,6 +52,9 @@ pub const Canvas = struct {
 
     pub fn fillPath(self: Canvas, rings: []const []const Point, color: Color, rule: FillRule) anyerror!void {
         return self.vtable.fillPath(self.ptr, rings, color, rule);
+    }
+    pub fn fillPattern(self: Canvas, rings: []const []const Point, pattern: *const Pattern) anyerror!void {
+        return self.vtable.fillPattern(self.ptr, rings, pattern);
     }
     pub fn strokePath(self: Canvas, lines: []const []const Point, width_px: f32, dash: ?[2]f32, color: Color) anyerror!void {
         return self.vtable.strokePath(self.ptr, lines, width_px, dash, color);

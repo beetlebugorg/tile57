@@ -684,6 +684,7 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     var size: u32 = 256;
     var palette: render.resolve.PaletteId = .day;
     var rules: ?[]const u8 = null;
+    var dq = false;
     var f = Flags{ .args = args, .i = 5 }; // positionals end at args[5]
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
@@ -696,6 +697,8 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
             palette = std.meta.stringToEnum(render.resolve.PaletteId, v) orelse return usageErr("palette must be day|dusk|night");
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules = f.next() orelse return usageErr("--rules needs a dir");
+        } else if (std.mem.eql(u8, arg, "--dq")) {
+            dq = true; // S-52 data-quality overlay (M_QUAL DQUAL* patterns)
         } else return usageErr("unknown flag");
     }
     const out = out_path orelse return usageErr("-o <out.png> is required");
@@ -709,7 +712,7 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     var colors = try render.resolve.Colors.init(a, catalog_embed.colorprofile[0].bytes);
     // Display "other" on by default: spot soundings are S-52 category Other,
     // and this is the recreational verify path (the host enables Other too).
-    const settings = render.resolve.MarinerSettings{ .display_other = true };
+    const settings = render.resolve.MarinerSettings{ .display_other = true, .data_quality = dq };
     var ps = render.pixel.PixelSurface.init(a, &colors, palette, &settings, @floatFromInt(z), size, engine.tile.EXTENT);
 
     // Vector symbol store over the embedded catalogue, palette-matched CSS.
@@ -724,7 +727,9 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     }
     const sym_srcs = try a.alloc(sprite.SvgSrc, catalog_embed.symbols.len);
     for (catalog_embed.symbols, 0..) |e, si| sym_srcs[si] = .{ .id = e.name, .svg = e.bytes };
-    const store = try sprite.CatalogStore.init(a, sym_srcs, css_data);
+    const fill_srcs = try a.alloc(sprite.AreaFillSrc, catalog_embed.areafills.len);
+    for (catalog_embed.areafills, 0..) |e, fi| fill_srcs[fi] = .{ .id = e.name, .xml = e.bytes };
+    const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
     defer store.deinit();
     ps.store = store.asStore();
 

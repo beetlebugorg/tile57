@@ -37,6 +37,7 @@ pub const RasterCanvas = struct {
 
     const vtable = cv.Canvas.VTable{
         .fillPath = fillPathImpl,
+        .fillPattern = fillPatternImpl,
         .strokePath = strokePathImpl,
     };
 
@@ -81,7 +82,15 @@ pub const RasterCanvas = struct {
         const self = sp(ctx);
         self.edges.clearRetainingCapacity();
         for (rings) |ring| try self.addRing(ring);
-        try self.rasterize(color, rule);
+        try self.rasterize(.{ .solid = color }, rule);
+    }
+
+    fn fillPatternImpl(ctx: *anyopaque, rings: []const []const cv.Point, pattern: *const cv.Pattern) anyerror!void {
+        const self = sp(ctx);
+        if (pattern.w == 0 or pattern.h == 0) return;
+        self.edges.clearRetainingCapacity();
+        for (rings) |ring| try self.addRing(ring);
+        try self.rasterize(.{ .pattern = pattern }, .nonzero);
     }
 
     fn strokePathImpl(ctx: *anyopaque, lines: []const []const cv.Point, width_px: f32, dash: ?[2]f32, color: cv.Color) anyerror!void {
@@ -95,7 +104,7 @@ pub const RasterCanvas = struct {
                 try self.strokeRun(line, width_px);
             }
         }
-        try self.rasterize(color, .nonzero);
+        try self.rasterize(.{ .solid = color }, .nonzero);
     }
 
     // ---- edge building ------------------------------------------------------
@@ -201,8 +210,11 @@ pub const RasterCanvas = struct {
 
     // ---- scanline rasterization ----------------------------------------------
 
-    fn rasterize(self: *RasterCanvas, color: cv.Color, rule: cv.FillRule) !void {
-        if (self.edges.items.len == 0 or color.a == 0) return;
+    const Paint = union(enum) { solid: cv.Color, pattern: *const cv.Pattern };
+
+    fn rasterize(self: *RasterCanvas, paint: Paint, rule: cv.FillRule) !void {
+        if (self.edges.items.len == 0) return;
+        if (paint == .solid and paint.solid.a == 0) return;
         const wf: f32 = @floatFromInt(self.w);
         const hf: f32 = @floatFromInt(self.h);
 
@@ -281,7 +293,7 @@ pub const RasterCanvas = struct {
                     }
                 }
             }
-            self.compositeRow(y, color);
+            self.compositeRow(y, paint);
         }
     }
 
@@ -306,12 +318,22 @@ pub const RasterCanvas = struct {
         if (last < self.w) self.cov[last] += (xb - @as(f32, @floatFromInt(last))) * SUB_WEIGHT;
     }
 
-    // Straight-alpha src-over of the row's accumulated coverage.
-    fn compositeRow(self: *RasterCanvas, y: u32, color: cv.Color) void {
+    // Straight-alpha src-over of the row's accumulated coverage. Solid paint
+    // uses one color; pattern paint samples the repeat cell at (x mod w,
+    // y mod h) — the phase is canvas-anchored so adjacent fills tile as one.
+    fn compositeRow(self: *RasterCanvas, y: u32, paint: Paint) void {
         const row = self.px[@as(usize, y) * self.w * 4 ..];
-        const sa: f32 = @as(f32, @floatFromInt(color.a)) / 255.0;
         for (self.cov, 0..) |c, i| {
             if (c <= 0) continue;
+            var src: [4]u8 = undefined;
+            switch (paint) {
+                .solid => |color| src = .{ color.r, color.g, color.b, color.a },
+                .pattern => |pat| {
+                    const pxi = ((@as(usize, y) % pat.h) * pat.w + (i % pat.w)) * 4;
+                    src = pat.rgba[pxi..][0..4].*;
+                },
+            }
+            const sa: f32 = @as(f32, @floatFromInt(src[3])) / 255.0;
             const ca = @min(c, 1) * sa;
             if (ca <= 0) continue;
             const p = row[i * 4 ..][0..4];
@@ -319,11 +341,7 @@ pub const RasterCanvas = struct {
             const oa = ca + da * (1 - ca);
             if (oa <= 0) continue;
             inline for (0..3) |ch| {
-                const sc: f32 = @floatFromInt(@field(color, switch (ch) {
-                    0 => "r",
-                    1 => "g",
-                    else => "b",
-                }));
+                const sc: f32 = @floatFromInt(src[ch]);
                 const dc: f32 = @floatFromInt(p[ch]);
                 p[ch] = @intFromFloat(@round((sc * ca + dc * da * (1 - ca)) / oa));
             }
@@ -432,4 +450,23 @@ test "determinism: identical scene twice -> identical buffers" {
         bufs[n] = std.hash.Wyhash.hash(0, rc.px);
     }
     try std.testing.expectEqual(bufs[0], bufs[1]);
+}
+
+test "fillPattern: canvas-anchored repeat, clipped to the polygon" {
+    const a = std.testing.allocator;
+    var rc = try RasterCanvas.init(a, 16, 16);
+    defer rc.deinit();
+    rc.clear(.{ .r = 0, .g = 0, .b = 0 });
+    // 2x2 checker: (0,0) red opaque, others transparent.
+    const cell = [_]u8{ 255, 0, 0, 255 } ++ ([_]u8{ 0, 0, 0, 0 } ** 3);
+    const pat = cv.Pattern{ .w = 2, .h = 2, .rgba = &cell };
+    const ring = [_]cv.Point{ .{ .x = 4, .y = 4 }, .{ .x = 12, .y = 4 }, .{ .x = 12, .y = 12 }, .{ .x = 4, .y = 12 } };
+    const rings = [_][]const cv.Point{&ring};
+    try rc.asCanvas().fillPattern(&rings, &pat);
+    // Inside: even/even canvas coords are red, odd are background.
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pxAt(&rc, 6, 6));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pxAt(&rc, 7, 6));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pxAt(&rc, 6, 7));
+    // Outside the polygon: untouched even at even/even coords.
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pxAt(&rc, 2, 2));
 }

@@ -35,6 +35,7 @@ const DASH_OFF = 3.0;
 
 const OpKind = union(enum) {
     fill: struct { rings: []const []const cv.Point, color: cv.Color, rule: cv.FillRule = .nonzero },
+    pattern: struct { rings: []const []const cv.Point, cell: *const cv.Pattern },
     stroke: struct { lines: []const []const cv.Point, width: f32, dash: ?[2]f32, color: cv.Color },
 };
 
@@ -140,7 +141,16 @@ pub const PixelSurface = struct {
         try self.push(.{ .fill = .{ .rings = try self.toCanvas(rings), .color = self.resolveColor(token) } });
     }
 
-    fn fillPattern(_: *anyopaque, _: rs.SymbolName, _: []const []const rs.TilePoint) anyerror!void {} // P3
+    fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        const store = self.store orelse return;
+        if (!self.cur_visible) return;
+        // The pattern cell rasterizes at this scene's screen density, so it
+        // repeats at the same on-screen period as the MapLibre fill-pattern.
+        const ppm: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * @as(f64, @floatFromInt(self.size_px)) / 256.0);
+        const cell = store.getPattern(name, ppm) orelse return;
+        try self.push(.{ .pattern = .{ .rings = try self.toCanvas(rings), .cell = cell } });
+    }
 
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
         _ = valdco; // contour labels are text (P4)
@@ -237,6 +247,7 @@ pub const PixelSurface = struct {
         const canvas = rc.asCanvas();
         for (self.ops.items) |op| switch (op.kind) {
             .fill => |f| try canvas.fillPath(f.rings, f.color, f.rule),
+            .pattern => |p| try canvas.fillPattern(p.rings, p.cell),
             .stroke => |s| try canvas.strokePath(s.lines, s.width, s.dash, s.color),
         };
         return png.encodeRgba(out, rc.px, rc.w, rc.h);
@@ -336,7 +347,10 @@ test "drawSymbol: pivot/scale/rotate transform, even-odd fill, danger swap, soun
         square: sym.Symbol,
         hits: std.ArrayList([]const u8),
         alloc: Allocator,
-        const vt = sym.SymbolStore.VTable{ .get = get };
+        const vt = sym.SymbolStore.VTable{ .get = get, .getPattern = getPattern };
+        fn getPattern(_: *anyopaque, _: []const u8, _: f32) ?*const cv.Pattern {
+            return null;
+        }
         fn get(ctx: *anyopaque, name: []const u8) ?*const sym.Symbol {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.hits.append(self.alloc, self.alloc.dupe(u8, name) catch return null) catch return null;

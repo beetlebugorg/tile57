@@ -309,13 +309,13 @@ fn lessByHeightDesc(_: void, a: NamedCell, b: NamedCell) bool {
 
 const RenderedSym = struct { w: u32, h: u32, pivot_x: f64, pivot_y: f64, rgba: []u8 };
 
-// Flatten + rasterize one symbol SVG into arena-owned straight-alpha RGBA. null
-// on parse/raster failure or a degenerate (zero-size) result.
-fn renderSym(ar: std.mem.Allocator, svg: []const u8, css: *std.StringHashMap([]const u8)) ?RenderedSym {
+// Flatten + rasterize one symbol SVG into arena-owned straight-alpha RGBA at
+// `ppm` device px per mm. null on parse/raster failure or a degenerate result.
+fn renderSymAt(ar: std.mem.Allocator, svg: []const u8, css: *std.StringHashMap([]const u8), ppm: f64) ?RenderedSym {
     const flat = flatten(ar, svg, css) catch return null;
     var w: c_int = 0;
     var h: c_int = 0;
-    const px = tg_svg_rasterize(flat.svg.ptr, @floatCast(px_per_mm), &w, &h) orelse return null;
+    const px = tg_svg_rasterize(flat.svg.ptr, @floatCast(ppm), &w, &h) orelse return null;
     defer tg_svg_free(px);
     const uw: u32 = @intCast(@max(w, 0));
     const uh: u32 = @intCast(@max(h, 0));
@@ -323,7 +323,12 @@ fn renderSym(ar: std.mem.Allocator, svg: []const u8, css: *std.StringHashMap([]c
     const n = @as(usize, uw) * uh * 4;
     const buf = ar.alloc(u8, n) catch return null;
     @memcpy(buf, px[0..n]);
-    return .{ .w = uw, .h = uh, .pivot_x = -flat.vb[0] * px_per_mm, .pivot_y = -flat.vb[1] * px_per_mm, .rgba = buf };
+    return .{ .w = uw, .h = uh, .pivot_x = -flat.vb[0] * ppm, .pivot_y = -flat.vb[1] * ppm, .rgba = buf };
+}
+
+// The atlas scale (8 px/mm — the historical fixed density).
+fn renderSym(ar: std.mem.Allocator, svg: []const u8, css: *std.StringHashMap([]const u8)) ?RenderedSym {
+    return renderSymAt(ar, svg, css, px_per_mm);
 }
 
 /// Build a sprite atlas from S-101 symbol SVGs and a palette stylesheet.
@@ -670,8 +675,14 @@ const Tile = struct { w: u32, h: u32, rgba: []u8 };
 // edges. A staggered v2 (v2.x != 0) doubles the tile height and half-drops the
 // second row. Mirrors the Go seamlessTile. null for a degenerate/oversized cell.
 fn seamlessTile(ar: std.mem.Allocator, sym: RenderedSym, af: AreaFill) ?Tile {
-    const wf = @round(af.v1x * px_per_mm);
-    const row_hf = @round(af.v2y * px_per_mm);
+    return seamlessTileAt(ar, sym, af, px_per_mm);
+}
+
+// Tile the symbol on the v1/v2 lattice at `ppm` device px per mm (the symbol
+// must have been rendered at the same ppm).
+fn seamlessTileAt(ar: std.mem.Allocator, sym: RenderedSym, af: AreaFill, ppm: f64) ?Tile {
+    const wf = @round(af.v1x * ppm);
+    const row_hf = @round(af.v2y * ppm);
     if (wf < 1 or row_hf < 1) return null;
     const w: u32 = @intFromFloat(wf);
     const row_h: u32 = @intFromFloat(row_hf);
@@ -867,15 +878,17 @@ pub fn parseSymbol(a: std.mem.Allocator, svg: []const u8, css: *std.StringHashMa
 pub const CatalogStore = struct {
     arena: std.heap.ArenaAllocator,
     css: std.StringHashMap([]const u8),
-    by_name: std.StringHashMap([]const u8), // id -> svg source bytes
+    by_name: std.StringHashMap([]const u8), // symbol id -> svg source bytes
+    fills: std.StringHashMap([]const u8), // area-fill id -> xml source bytes
     cache: std.StringHashMap(?*render.symbols.Symbol),
+    pattern_cache: std.StringHashMap(?*render.canvas.Pattern),
 
-    const vtable = render.symbols.SymbolStore.VTable{ .get = getImpl };
+    const vtable = render.symbols.SymbolStore.VTable{ .get = getImpl, .getPattern = getPatternImpl };
 
     /// Self-owning: the store is allocated inside its own arena, so the
     /// hashmaps' captured allocators point at a STABLE arena (returning an
     /// ArenaAllocator by value would leave them dangling on the old stack).
-    pub fn init(gpa: std.mem.Allocator, srcs: []const SvgSrc, css_data: []const u8) !*CatalogStore {
+    pub fn init(gpa: std.mem.Allocator, srcs: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8) !*CatalogStore {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const self = try arena.allocator().create(CatalogStore);
@@ -883,8 +896,11 @@ pub const CatalogStore = struct {
         const a = self.arena.allocator();
         self.css = try loadCss(a, css_data);
         self.by_name = std.StringHashMap([]const u8).init(a);
+        self.fills = std.StringHashMap([]const u8).init(a);
         self.cache = std.StringHashMap(?*render.symbols.Symbol).init(a);
+        self.pattern_cache = std.StringHashMap(?*render.canvas.Pattern).init(a);
         for (srcs) |s| try self.by_name.put(s.id, s.svg);
+        for (fills) |f| try self.fills.put(f.id, f.xml);
         return self;
     }
 
@@ -914,5 +930,30 @@ pub const CatalogStore = struct {
         boxed.* = parsed;
         self.cache.put(key, boxed) catch {};
         return boxed;
+    }
+
+    fn getPatternImpl(ctx: *anyopaque, name: []const u8, ppm: f32) ?*const render.canvas.Pattern {
+        const self: *CatalogStore = @ptrCast(@alignCast(ctx));
+        const a = self.arena.allocator();
+        // Cache per (name, density): one render scene uses one density, but a
+        // reused store across sizes stays correct.
+        const key = std.fmt.allocPrint(a, "{s}@{d}", .{ name, ppm }) catch return null;
+        if (self.pattern_cache.get(key)) |hit| return hit;
+        const xml = self.fills.get(name) orelse {
+            self.pattern_cache.put(key, null) catch {};
+            return null;
+        };
+        const af = parseAreaFill(xml);
+        const cell: ?*render.canvas.Pattern = blk: {
+            if (af.symbol_ref.len == 0) break :blk null;
+            const svg = self.by_name.get(af.symbol_ref) orelse break :blk null;
+            const sym = renderSymAt(a, svg, &self.css, ppm) orelse break :blk null;
+            const tile = seamlessTileAt(a, sym, af, ppm) orelse break :blk null;
+            const boxed = a.create(render.canvas.Pattern) catch break :blk null;
+            boxed.* = .{ .w = tile.w, .h = tile.h, .rgba = tile.rgba };
+            break :blk boxed;
+        };
+        self.pattern_cache.put(key, cell) catch {};
+        return cell;
     }
 };
