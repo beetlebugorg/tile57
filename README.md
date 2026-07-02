@@ -1,9 +1,10 @@
 <h1 align="center">tile57</h1>
 
 <p align="center">
-  <b>⚓ A high-performance, low-memory S-57/S-101 → MVT vector-tile + S-52 style engine.</b><br>
-  tile57 turns IHO S-57 ENC cells into Mapbox Vector Tiles plus a MapLibre S-52
-  style and its portrayal assets — embeddable from Zig, C, or Go, targeting native and WASM.
+  <b>⚓ A high-performance, low-memory S-57/S-101 chart engine: vector tiles, S-52 styles, PNG and PDF.</b><br>
+  tile57 turns IHO S-57 ENC cells into Mapbox Vector Tiles with a matching MapLibre S-52
+  style, or renders finished charts directly to PNG and PDF — one Zig library with a
+  C ABI, compiled natively or to WASM.
 </p>
 
 <p align="center">
