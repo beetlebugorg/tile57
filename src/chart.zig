@@ -938,6 +938,154 @@ pub const Chart = struct {
         }
     }
 
+    /// The chart's per-cell metadata as a JSON array (host-s57-handoff §1):
+    /// [{"name","scale","edition","update","issueDate","agency","bbox"?}, …].
+    /// DSID fields reflect the applied update chain; bbox is the cell's
+    /// geometry extent, omitted when none parses. Returns null when the chart
+    /// has no cells (a PMTiles chart carries no cell files — its manifest is
+    /// the host-side sidecar). gpa-owned; free with freeBytes.
+    pub fn cellsJson(self: *Chart) !?[]u8 {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var infos = std.ArrayList(s57.CellInfo).empty;
+        switch (self.backend) {
+            .reader => return null,
+            .cell => |*cb| {
+                // A bytes-open keeps only the parsed cell: read the identity
+                // from its merged DSID + params.
+                const d = cb.cell.dsid;
+                const ext = std.fs.path.extension(d.dsnm);
+                try infos.append(a, .{
+                    .name = d.dsnm[0 .. d.dsnm.len - ext.len],
+                    .edition = d.edtn,
+                    .update = d.updn,
+                    .issue_date = d.isdt,
+                    .agency = d.agen,
+                    .scale = cb.cell.params.cscl,
+                    .bounds = cb.cell.bounds(),
+                });
+            },
+            .cells => |*ls| {
+                for (ls.cells) |*lc| {
+                    if (lc.base.len > 0) {
+                        if (s57.peekCellInfo(a, lc.base, lc.updates)) |ci| try infos.append(a, ci);
+                    } else if (lc.cell) |*c| {
+                        const d = c.dsid;
+                        const ext = std.fs.path.extension(d.dsnm);
+                        try infos.append(a, .{
+                            .name = d.dsnm[0 .. d.dsnm.len - ext.len],
+                            .edition = d.edtn,
+                            .update = d.updn,
+                            .issue_date = d.isdt,
+                            .agency = d.agen,
+                            .scale = c.params.cscl,
+                            .bounds = c.bounds(),
+                        });
+                    } else {
+                        // Streaming cell: read transiently (collectScaminCells pattern).
+                        const rd = ls.reader orelse continue;
+                        var cb: CellBytes = .{};
+                        if (!rd(ls.reader_user, lc.index, &cb)) continue;
+                        defer freeCellBytes(&cb);
+                        var ups: []const []const u8 = &.{};
+                        var ups_arr: ?[][]const u8 = null;
+                        if (cb.update_count > 0 and cb.updates != null and cb.update_lens != null) {
+                            if (gpa.alloc([]const u8, cb.update_count)) |arr| {
+                                for (arr, 0..) |*u, k| u.* = cb.updates.?[k][0..cb.update_lens.?[k]];
+                                ups = arr;
+                                ups_arr = arr;
+                            } else |_| {}
+                        }
+                        defer if (ups_arr) |arr| gpa.free(arr);
+                        if (s57.peekCellInfo(a, cb.base[0..cb.base_len], ups)) |ci| try infos.append(a, ci);
+                    }
+                }
+            },
+        }
+        if (infos.items.len == 0) return null;
+
+        var out = std.ArrayList(u8).empty;
+        try out.append(a, '[');
+        for (infos.items, 0..) |ci, i| {
+            if (i > 0) try out.append(a, ',');
+            try out.appendSlice(a, "{\"name\":");
+            try appendJsonStr(a, &out, ci.name);
+            try out.print(a, ",\"scale\":{d},\"edition\":", .{ci.scale});
+            try appendJsonStr(a, &out, ci.edition);
+            try out.appendSlice(a, ",\"update\":");
+            try appendJsonStr(a, &out, ci.update);
+            try out.appendSlice(a, ",\"issueDate\":");
+            try appendJsonStr(a, &out, ci.issue_date);
+            try out.print(a, ",\"agency\":{d}", .{ci.agency});
+            if (ci.bounds) |b| try out.print(a, ",\"bbox\":[{d},{d},{d},{d}]", .{ b[0], b[1], b[2], b[3] });
+            try out.append(a, '}');
+        }
+        try out.append(a, ']');
+        return try gpa.dupe(u8, out.items);
+    }
+
+    /// The chart's features for the given comma-separated object-class
+    /// acronyms, as a GeoJSON FeatureCollection (host-s57-handoff §3):
+    /// geometry in lon/lat, properties = {"class": …, plus the feature's full
+    /// S-57 acronym→value attribute map}. Parsed without portrayal. Polygon
+    /// rings are emitted largest-first (exterior heuristic). Returns null when
+    /// nothing matched. gpa-owned; free with freeBytes.
+    pub fn featuresJson(self: *Chart, classes: []const u8) !?[]u8 {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Wanted object-class acronyms (matched against each feature's class).
+        var want = std.ArrayList([]const u8).empty;
+        var it = std.mem.splitScalar(u8, classes, ',');
+        while (it.next()) |acr_raw| {
+            const acr = std.mem.trim(u8, acr_raw, " ");
+            if (acr.len > 0) try want.append(a, acr);
+        }
+        if (want.items.len == 0) return null;
+
+        var out = std.ArrayList(u8).empty;
+        try out.appendSlice(a, "{\"type\":\"FeatureCollection\",\"features\":[");
+        var n: usize = 0;
+        switch (self.backend) {
+            .reader => return null,
+            .cell => |*cb| try appendCellGeoJson(a, &out, &cb.cell, want.items, &n),
+            .cells => |*ls| {
+                for (ls.cells) |*lc| {
+                    if (lc.cell) |*c| {
+                        try appendCellGeoJson(a, &out, c, want.items, &n);
+                    } else if (lc.base.len > 0) {
+                        var cell = s57.parseCellWithUpdates(gpa, lc.base, lc.updates) catch continue;
+                        defer cell.deinit();
+                        try appendCellGeoJson(a, &out, &cell, want.items, &n);
+                    } else {
+                        const rd = ls.reader orelse continue;
+                        var cb: CellBytes = .{};
+                        if (!rd(ls.reader_user, lc.index, &cb)) continue;
+                        defer freeCellBytes(&cb);
+                        var ups: []const []const u8 = &.{};
+                        var ups_arr: ?[][]const u8 = null;
+                        if (cb.update_count > 0 and cb.updates != null and cb.update_lens != null) {
+                            if (gpa.alloc([]const u8, cb.update_count)) |arr| {
+                                for (arr, 0..) |*u, k| u.* = cb.updates.?[k][0..cb.update_lens.?[k]];
+                                ups = arr;
+                                ups_arr = arr;
+                            } else |_| {}
+                        }
+                        defer if (ups_arr) |arr| gpa.free(arr);
+                        var cell = s57.parseCellWithUpdates(gpa, cb.base[0..cb.base_len], ups) catch continue;
+                        defer cell.deinit();
+                        try appendCellGeoJson(a, &out, &cell, want.items, &n);
+                    }
+                }
+            },
+        }
+        if (n == 0) return null;
+        try out.appendSlice(a, "]}");
+        return try gpa.dupe(u8, out.items);
+    }
+
     /// Drop the in-memory tile cache (bounds memory in long-running hosts).
     pub fn clearCache(self: *Chart) void {
         var it = self.cache.valueIterator();
@@ -968,6 +1116,123 @@ pub const Chart = struct {
         return vals;
     }
 };
+
+fn appendJsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(a, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(a, "\\\""),
+        '\\' => try out.appendSlice(a, "\\\\"),
+        else => if (c < 0x20) {
+            try out.print(a, "\\u{x:0>4}", .{c});
+        } else try out.append(a, c),
+    };
+    try out.append(a, '"');
+}
+
+// Append one cell's matching features to a GeoJSON feature array (comma-led
+// after the first). Geometry: prim 1 -> Point (SOUNDG -> MultiPoint of its
+// 3-D soundings), prim 2 -> LineString/MultiLineString, prim 3 -> Polygon with
+// rings ordered largest-|area|-first (exterior heuristic; ample for coverage /
+// water-mask consumers). Properties: class + the full S-57 attribute map.
+fn appendCellGeoJson(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *s57.Cell, want: []const []const u8, n: *usize) !void {
+    for (cell.features, 0..) |f, fi| {
+        const acr = catalogue.acronymByObjl(f.objl) orelse continue;
+        var hit = false;
+        for (want) |w| {
+            if (std.mem.eql(u8, w, acr)) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) continue;
+
+        var geom = std.ArrayList(u8).empty;
+        if (f.prim == 1) {
+            if (f.objl == 129) {
+                const snds = cell.soundingsFor(a, f) catch continue;
+                if (snds.len == 0) continue;
+                try geom.appendSlice(a, "{\"type\":\"MultiPoint\",\"coordinates\":[");
+                for (snds, 0..) |sd, i| {
+                    if (i > 0) try geom.append(a, ',');
+                    try geom.print(a, "[{d},{d},{d}]", .{ sd.lon(), sd.lat(), sd.depth });
+                }
+                try geom.appendSlice(a, "]}");
+            } else {
+                const pg = cell.pointGeometry(f) orelse continue;
+                try geom.print(a, "{{\"type\":\"Point\",\"coordinates\":[{d},{d}]}}", .{ pg.lon(), pg.lat() });
+            }
+        } else {
+            const parts = scene.featureParts(a, cell.*, null, fi, f) catch continue;
+            if (parts.len == 0) continue;
+            if (f.prim == 3) {
+                // Rings largest-first: |shoelace| descending.
+                const areas = try a.alloc(f64, parts.len);
+                for (parts, 0..) |ring, i| {
+                    var s2: f64 = 0;
+                    for (0..ring.len -| 1) |j| s2 += ring[j].lon() * ring[j + 1].lat() - ring[j + 1].lon() * ring[j].lat();
+                    areas[i] = @abs(s2);
+                }
+                const order = try a.alloc(usize, parts.len);
+                for (order, 0..) |*o, i| o.* = i;
+                std.mem.sort(usize, order, areas, struct {
+                    fn lt(ar: []f64, x: usize, y: usize) bool {
+                        return ar[x] > ar[y];
+                    }
+                }.lt);
+                try geom.appendSlice(a, "{\"type\":\"Polygon\",\"coordinates\":[");
+                var emitted: usize = 0;
+                for (order) |oi| {
+                    const ring = parts[oi];
+                    if (ring.len < 4) continue;
+                    if (emitted > 0) try geom.append(a, ',');
+                    try geom.append(a, '[');
+                    for (ring, 0..) |p, i| {
+                        if (i > 0) try geom.append(a, ',');
+                        try geom.print(a, "[{d},{d}]", .{ p.lon(), p.lat() });
+                    }
+                    try geom.append(a, ']');
+                    emitted += 1;
+                }
+                try geom.appendSlice(a, "]}");
+                if (emitted == 0) continue;
+            } else {
+                const multi = parts.len > 1;
+                if (multi) {
+                    try geom.appendSlice(a, "{\"type\":\"MultiLineString\",\"coordinates\":[");
+                } else {
+                    try geom.appendSlice(a, "{\"type\":\"LineString\",\"coordinates\":");
+                }
+                for (parts, 0..) |line, li| {
+                    if (li > 0) try geom.append(a, ',');
+                    try geom.append(a, '[');
+                    for (line, 0..) |p, i| {
+                        if (i > 0) try geom.append(a, ',');
+                        try geom.print(a, "[{d},{d}]", .{ p.lon(), p.lat() });
+                    }
+                    try geom.append(a, ']');
+                }
+                if (multi) try geom.append(a, ']');
+                try geom.append(a, '}');
+            }
+        }
+        if (geom.items.len == 0) continue;
+
+        if (n.* > 0) try out.append(a, ',');
+        n.* += 1;
+        try out.appendSlice(a, "{\"type\":\"Feature\",\"geometry\":");
+        try out.appendSlice(a, geom.items);
+        // properties = {"class":ACR, ...full attr map} — splice class into the
+        // engine's existing acronym->value pick blob.
+        const attrs = scene.encodeS57Attrs(a, f) catch "{}";
+        try out.appendSlice(a, ",\"properties\":{\"class\":");
+        try appendJsonStr(a, out, acr);
+        if (attrs.len > 2) {
+            try out.append(a, ',');
+            try out.appendSlice(a, attrs[1 .. attrs.len - 1]);
+        }
+        try out.appendSlice(a, "}}");
+    }
+}
 
 // Collect a parsed cell's distinct SCAMIN denominators into `set`.
 fn collectScaminCell(cell: *const s57.Cell, set: *std.AutoHashMap(u32, void)) void {

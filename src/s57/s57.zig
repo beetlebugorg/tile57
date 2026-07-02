@@ -568,6 +568,8 @@ pub const Feature = struct {
 
 pub const Cell = struct {
     params: DatasetParams,
+    /// DSID identification after the applied update chain (strings arena-owned).
+    dsid: Dsid = .{},
     /// Source ENC cell name (dataset name, e.g. "US4MD81M") for the cursor-pick
     /// report's "source cell" badge. Set by the loader from the filename stem after
     /// parse (the parser sees only bytes); "" when unknown (the `cell` prop is omitted).
@@ -1142,10 +1144,105 @@ pub fn peekMeta(gpa: Allocator, bytes: []const u8) ?CellMeta {
     return m;
 }
 
+/// DSID dataset-identification strings + producing agency, as recorded in a
+/// cell (or update) file. Layout per S-57 §7.3.1.1: RCNM(1) RCID(4) EXPP(1)
+/// INTU(1), then UT-terminated DSNM/EDTN/UPDN, fixed UADT(8) ISDT(8) STED(4),
+/// PRSP(1), UT-terminated PSDN/PRED, PROF(1), AGEN(2 LE), COMT.
+pub const Dsid = struct {
+    dsnm: []const u8 = "",
+    edtn: []const u8 = "",
+    updn: []const u8 = "",
+    isdt: []const u8 = "",
+    agen: u16 = 0,
+};
+
+fn parseDSID(a: Allocator, data: []const u8) ?Dsid {
+    if (data.len < 7) return null;
+    var d = Dsid{};
+    var off: usize = 7; // RCNM+RCID+EXPP+INTU
+    const ascii = struct {
+        fn next(buf: []const u8, o: *usize) []const u8 {
+            const start = o.*;
+            while (o.* < buf.len and buf[o.*] != 0x1f) o.* += 1;
+            const s = buf[start..o.*];
+            if (o.* < buf.len) o.* += 1; // skip UT
+            return s;
+        }
+    }.next;
+    d.dsnm = a.dupe(u8, ascii(data, &off)) catch return null;
+    d.edtn = a.dupe(u8, ascii(data, &off)) catch return null;
+    d.updn = a.dupe(u8, ascii(data, &off)) catch return null;
+    off += 8; // UADT A(8), fixed
+    if (off + 8 <= data.len) {
+        d.isdt = a.dupe(u8, std.mem.trimEnd(u8, data[off .. off + 8], "\x00 ")) catch return null;
+        off += 8;
+    }
+    off += 4; // STED R(4), fixed
+    off += 1; // PRSP
+    _ = ascii(data, &off); // PSDN
+    _ = ascii(data, &off); // PRED
+    off += 1; // PROF
+    if (off + 2 <= data.len) d.agen = u16le(data, off);
+    return d;
+}
+
+/// A cell's identity + coverage, cheaply peeked (no topology): DSID after the
+/// update chain (each update's non-empty EDTN/UPDN/ISDT wins, matching how an
+/// applied update revises the dataset identification), DSPM scale, and the
+/// geometry bounding box. Strings are allocator-owned. Null if unparseable.
+pub const CellInfo = struct {
+    name: []const u8 = "", // DSNM stem (extension trimmed)
+    edition: []const u8 = "",
+    update: []const u8 = "",
+    issue_date: []const u8 = "",
+    agency: u16 = 0,
+    scale: i32 = 0,
+    bounds: ?[4]f64 = null,
+};
+
+pub fn peekCellInfo(a: Allocator, base: []const u8, updates: []const []const u8) ?CellInfo {
+    const m = peekMeta(a, base) orelse return null;
+    var info = CellInfo{ .scale = m.cscl, .bounds = m.bounds };
+    {
+        var file = iso.parse(a, base) catch return null;
+        defer file.deinit();
+        for (file.records) |rec| {
+            if (rec.field("DSID")) |raw| {
+                if (parseDSID(a, raw)) |d| {
+                    const ext = std.fs.path.extension(d.dsnm);
+                    info.name = d.dsnm[0 .. d.dsnm.len - ext.len];
+                    info.edition = d.edtn;
+                    info.update = d.updn;
+                    info.issue_date = d.isdt;
+                    info.agency = d.agen;
+                }
+                break;
+            }
+        }
+    }
+    for (updates) |ub| {
+        var file = iso.parse(a, ub) catch continue;
+        defer file.deinit();
+        for (file.records) |rec| {
+            if (rec.field("DSID")) |raw| {
+                if (parseDSID(a, raw)) |d| {
+                    if (d.edtn.len > 0) info.edition = d.edtn;
+                    if (d.updn.len > 0) info.update = d.updn;
+                    if (d.isdt.len > 0) info.issue_date = d.isdt;
+                }
+                break;
+            }
+        }
+    }
+    return info;
+}
+
 /// One CATD (catalogue-directory) record from an exchange-set catalogue.
 pub const CatalogEntry = struct {
     stem: []const u8, // cell name without extension (e.g. "US5MD1MC"); allocator-owned
     path: []const u8, // ENC_ROOT-relative path, '/'-normalised; allocator-owned
+    long_name: []const u8, // LFIL — the human chart title ("" when absent); allocator-owned
+    impl: []const u8, // "BIN" (a cell) / "ASC" / "TXT" ("" when absent); allocator-owned
     bbox: ?[4]f64, // [west, south, east, north]; null for non-cell / no coverage
     is_cell: bool, // BIN .000 base cell
 };
@@ -1193,8 +1290,10 @@ fn decodeCATD(a: Allocator, raw_in: []const u8) ?CatalogEntry {
 
     var bbox: ?[4]f64 = null;
     var is_cell = false;
+    var impl: []const u8 = "";
     if (parts[3].len >= 3) {
-        is_cell = std.mem.eql(u8, parts[3][0..3], "BIN") and std.mem.endsWith(u8, base, ".000");
+        impl = a.dupe(u8, parts[3][0..3]) catch return null;
+        is_cell = std.mem.eql(u8, impl, "BIN") and std.mem.endsWith(u8, base, ".000");
         if (parseFloatOpt(parts[3][3..])) |s|
             if (parseFloatOpt(parts[4])) |w|
                 if (parseFloatOpt(parts[5])) |n|
@@ -1202,7 +1301,8 @@ fn decodeCATD(a: Allocator, raw_in: []const u8) ?CatalogEntry {
                         bbox = .{ w, s, e2, n };
                     };
     }
-    return .{ .stem = stem, .path = norm, .bbox = bbox, .is_cell = is_cell };
+    const long_name = a.dupe(u8, parts[1]) catch return null;
+    return .{ .stem = stem, .path = norm, .long_name = long_name, .impl = impl, .bbox = bbox, .is_cell = is_cell };
 }
 
 /// Parse an S-57 exchange-set catalogue (CATALOG.031): one CATD record per file,
@@ -1439,8 +1539,10 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // DSPM (coordinate factors) from the base cell.
+    // DSPM (coordinate factors) + DSID (identity) from the base cell; each
+    // update's DSID revises the non-empty identity fields below.
     var params = DatasetParams{};
+    var dsid = Dsid{};
     {
         var bf = try iso.parse(gpa, base_bytes);
         defer bf.deinit();
@@ -1448,6 +1550,12 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
             if (rec.field("DSPM")) |d| {
                 params = parseDSPM(d);
                 break; // use the FIRST DSPM found (oracle extractDatasetParams)
+            }
+        }
+        for (bf.records) |rec| {
+            if (rec.field("DSID")) |d| {
+                if (parseDSID(a, d)) |pd| dsid = pd;
+                break;
             }
         }
     }
@@ -1463,7 +1571,22 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     defer vidx.deinit();
 
     try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, base_bytes, comf, somf, false);
-    for (updates) |u| try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true);
+    for (updates) |u| {
+        try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true);
+        // Merge the update's DSID: non-empty identity fields revise the base.
+        var uf = iso.parse(gpa, u) catch continue;
+        defer uf.deinit();
+        for (uf.records) |rec| {
+            if (rec.field("DSID")) |d| {
+                if (parseDSID(a, d)) |pd| {
+                    if (pd.edtn.len > 0) dsid.edtn = pd.edtn;
+                    if (pd.updn.len > 0) dsid.updn = pd.updn;
+                    if (pd.isdt.len > 0) dsid.isdt = pd.isdt;
+                }
+                break;
+            }
+        }
+    }
 
     // Flatten the surviving records (skip tombstones) into the final arrays.
     var vectors = std.ArrayList(VectorRecord).empty;
@@ -1497,7 +1620,7 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
         for (f.refs) |ref| if (ref.name.rcnm == RCNM_VE) try coast_edges.put(a, ref.name.rcid, {});
     }
 
-    return .{ .params = params, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .arena = arena };
+    return .{ .params = params, .dsid = dsid, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .arena = arena };
 }
 
 // ---- tests --------------------------------------------------------------

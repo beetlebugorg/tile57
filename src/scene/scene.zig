@@ -761,7 +761,7 @@ fn appendJsonString(a: Allocator, buf: *std.ArrayList(u8), s: []const u8) !void 
 /// Zig parser keeps ATTF/NATF values as text, so unlike the Go path there's no typed
 /// re-format; the client (web/s57-catalogue.json) maps acronyms->labels and displays
 /// the values verbatim. Caller owns the bytes (allocated in `a`).
-fn encodeS57Attrs(a: Allocator, f: s57.Feature) ![]const u8 {
+pub fn encodeS57Attrs(a: Allocator, f: s57.Feature) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     var n: usize = 0;
     for (f.attrs) |at| {
@@ -988,7 +988,7 @@ pub fn buildGeoWorld(a: Allocator, geo: GeoParts) !GeoWorld {
 
 /// The feature's assembled line/area parts: the baker's cached copy if present,
 /// else assembled now (the live path).
-fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.Feature) ![][]s57.LonLat {
+pub fn featureParts(a: Allocator, cell: s57.Cell, geo: ?GeoParts, fi: usize, f: s57.Feature) ![][]s57.LonLat {
     if (geo) |g| if (fi < g.len) if (g[fi]) |p| return p;
     return cell.geometryParts(a, f);
 }

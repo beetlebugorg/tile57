@@ -119,6 +119,76 @@ pub fn main(init: std.process.Init) !void {
         return runRender(io, arena, args, .pdf);
     }
 
+    if (std.mem.eql(u8, sub, "cells")) {
+        // Per-cell metadata JSON (the tile57_chart_cells ABI, host-s57-handoff §1).
+        if (args.len < 3) {
+            std.debug.print("usage: tile57 cells <cell.000 | ENC_ROOT>\n", .{});
+            return;
+        }
+        engine.portray.setQuiet(true);
+        const c = chart.Chart.openPath(args[2], null, false) catch {
+            std.debug.print("cannot open {s}\n", .{args[2]});
+            return;
+        };
+        defer c.deinit();
+        const json = (c.cellsJson() catch null) orelse {
+            std.debug.print("no cells\n", .{});
+            return;
+        };
+        defer chart.freeBytes(json);
+        var stdout = std.Io.File.stdout();
+        stdout.writeStreamingAll(io, json) catch {};
+        stdout.writeStreamingAll(io, "\n") catch {};
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "catalog")) {
+        // Exchange-set catalogue JSON (the tile57_catalog_entries ABI, §2).
+        if (args.len < 3) {
+            std.debug.print("usage: tile57 catalog <CATALOG.031>\n", .{});
+            return;
+        }
+        const data = try std.Io.Dir.cwd().readFileAlloc(io, args[2], arena, .unlimited);
+        const entries = engine.s57.parseCatalog(arena, data) orelse {
+            std.debug.print("parse error\n", .{});
+            return;
+        };
+        var out = std.ArrayList(u8).empty;
+        try out.append(arena, '[');
+        for (entries, 0..) |e, i| {
+            if (i > 0) try out.appendSlice(arena, ",\n ");
+            try out.print(arena, "{{\"file\":\"{s}\",\"longName\":\"{s}\",\"impl\":\"{s}\"", .{ e.path, e.long_name, e.impl });
+            if (e.bbox) |b| try out.print(arena, ",\"bbox\":[{d},{d},{d},{d}]", .{ b[0], b[1], b[2], b[3] });
+            try out.append(arena, '}');
+        }
+        try out.appendSlice(arena, "]\n");
+        std.Io.File.stdout().writeStreamingAll(io, out.items) catch {};
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "features")) {
+        // GeoJSON feature query (the tile57_chart_features ABI, §3).
+        if (args.len < 4) {
+            std.debug.print("usage: tile57 features <cell.000 | ENC_ROOT> <ACR[,ACR...]>\n", .{});
+            return;
+        }
+        engine.portray.setQuiet(true);
+        const c = chart.Chart.openPath(args[2], null, false) catch {
+            std.debug.print("cannot open {s}\n", .{args[2]});
+            return;
+        };
+        defer c.deinit();
+        const json = (c.featuresJson(args[3]) catch null) orelse {
+            std.debug.print("no matching features\n", .{});
+            return;
+        };
+        defer chart.freeBytes(json);
+        var stdout = std.Io.File.stdout();
+        stdout.writeStreamingAll(io, json) catch {};
+        stdout.writeStreamingAll(io, "\n") catch {};
+        return;
+    }
+
     if (std.mem.eql(u8, sub, "inspect")) {
         if (args.len < 3) {
             std.debug.print("usage: tile57 inspect <file.pmtiles> [z x y]\n", .{});

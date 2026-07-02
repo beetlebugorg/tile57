@@ -227,6 +227,41 @@ int tile57_chart_render_pdf(tile57_chart *chart, double lon, double lat, double 
                             const struct tile57_mariner *m,
                             uint8_t **out, size_t *out_len);
 
+/* The chart's per-cell metadata as a JSON array, one object per cell:
+ *   [{"name":"US5MD1MC","scale":12000,"edition":"13","update":"3",
+ *     "issueDate":"20240105","agency":550,"bbox":[west,south,east,north]}, ...]
+ * `name` is the DSNM stem; `scale` is DSPM CSCL; edition/update/issueDate/
+ * agency are DSID EDTN/UPDN/ISDT/AGEN after the cell's update chain is
+ * applied; `bbox` is the cell's geographic extent, omitted when none parses.
+ * Returns 1 with *out/*out_len holding the JSON (free with tile57_free);
+ * 0 if the chart has no cells (e.g. a PMTiles chart — its bundle manifest
+ * carries the cell inventory); -1 on error. */
+int tile57_chart_cells(tile57_chart *chart, uint8_t **out, size_t *out_len);
+
+/* Decode a CATALOG.031 exchange-set catalogue (raw bytes) into a JSON array
+ * of its CATD entries:
+ *   [{"file":"US5MD1MC/US5MD1MC.000","longName":"Annapolis Harbor",
+ *     "impl":"BIN","bbox":[west,south,east,north]}, ...]
+ * `file` is the recorded path with separators normalised to '/'; `longName`
+ * is LFIL (the human chart title; empty when absent); `impl` is BIN/ASC/TXT;
+ * `bbox` is omitted when SLAT/WLON/NLAT/ELON are not all present (aux files).
+ * Not chart-scoped: the catalogue describes an exchange set, not an open
+ * chart. Returns 1 with *out/*out_len holding the JSON (free with
+ * tile57_free); 0 if the file holds no CATD records; -1 on parse error. */
+int tile57_catalog_entries(const uint8_t *catalog_031, size_t len,
+                           uint8_t **out, size_t *out_len);
+
+/* The chart's features for the given object classes (comma-separated
+ * acronyms, e.g. "DEPARE,DRGARE") as a GeoJSON FeatureCollection: geometry
+ * in lon/lat (Polygon rings largest-first, MultiPoint with depths for
+ * soundings, LineString/Point as encoded), properties = {"class":"DEPARE",
+ * ...the feature's full S-57 acronym->value attribute map}. Parsed without
+ * portrayal; a whole-ENC_ROOT query walks every cell — the caller owns that
+ * cost. Returns 1 with *out/*out_len holding the JSON (free with
+ * tile57_free); 0 if no features matched; -1 on error. */
+int tile57_chart_features(tile57_chart *chart, const char *classes,
+                          uint8_t **out, size_t *out_len);
+
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
  * colortables, atlases, …), passing the same length. The universal free. (chart-api.md) */
 void tile57_free(void *ptr, size_t len);

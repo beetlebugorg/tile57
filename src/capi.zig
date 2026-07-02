@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const chart = @import("chart.zig");
+const s57 = @import("s57");
 const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
 const chartstyle = @import("assets").chartstyle;
 const assets = @import("assets");
@@ -310,6 +311,77 @@ export fn tile57_chart_render_view(
 }
 
 const RenderPalette = @import("render").resolve.PaletteId;
+
+/// The chart's per-cell metadata as JSON (host-s57-handoff §1):
+/// [{"name","scale","edition","update","issueDate","agency","bbox"?}, …].
+/// DSID fields reflect the applied update chain. Returns 1 with *out/*out_len
+/// set (free with tile57_free); 0 when the chart has no cells (e.g. a PMTiles
+/// chart — its manifest is the sidecar); -1 on error/bad handle.
+export fn tile57_chart_cells(handle: ?*Chart, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    const bytes = (c.cellsJson() catch return -1) orelse return 0;
+    out.* = bytes.ptr;
+    out_len.* = bytes.len;
+    return 1;
+}
+
+/// Decode a CATALOG.031 exchange-set catalogue into a JSON array of its CATD
+/// entries (host-s57-handoff §2):
+/// [{"file","longName","impl","bbox"?}, …]. Not chart-scoped. Returns 1 with
+/// *out/*out_len set (free with tile57_free); 0 when no CATD records; -1 on
+/// parse error.
+export fn tile57_catalog_entries(catalog_031: [*]const u8, len: usize, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = s57.parseCatalog(a, catalog_031[0..len]) orelse return -1;
+    if (entries.len == 0) return 0;
+    var buf = std.ArrayList(u8).empty;
+    buf.append(a, '[') catch return -1;
+    for (entries, 0..) |e, i| {
+        if (i > 0) buf.append(a, ',') catch return -1;
+        buf.appendSlice(a, "{\"file\":") catch return -1;
+        jsonStr(a, &buf, e.path) catch return -1;
+        buf.appendSlice(a, ",\"longName\":") catch return -1;
+        jsonStr(a, &buf, e.long_name) catch return -1;
+        buf.appendSlice(a, ",\"impl\":") catch return -1;
+        jsonStr(a, &buf, e.impl) catch return -1;
+        if (e.bbox) |b| buf.print(a, ",\"bbox\":[{d},{d},{d},{d}]", .{ b[0], b[1], b[2], b[3] }) catch return -1;
+        buf.append(a, '}') catch return -1;
+    }
+    buf.append(a, ']') catch return -1;
+    const bytes = gpa.dupe(u8, buf.items) catch return -1;
+    out.* = bytes.ptr;
+    out_len.* = bytes.len;
+    return 1;
+}
+
+fn jsonStr(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(a, '"');
+    for (s) |ch| switch (ch) {
+        '"' => try buf.appendSlice(a, "\\\""),
+        '\\' => try buf.appendSlice(a, "\\\\"),
+        else => if (ch < 0x20) {
+            try buf.print(a, "\\u{x:0>4}", .{ch});
+        } else try buf.append(a, ch),
+    };
+    try buf.append(a, '"');
+}
+
+/// The chart's features for the given comma-separated object-class acronyms
+/// (e.g. "DEPARE,DRGARE") as a GeoJSON FeatureCollection (host-s57-handoff §3):
+/// lon/lat geometry, properties = {"class", …the full S-57 attribute map}.
+/// Parsed without portrayal; a whole-ENC_ROOT query walks every cell — the
+/// caller owns that cost. Returns 1 with *out/*out_len set (free with
+/// tile57_free); 0 when nothing matched; -1 on error.
+export fn tile57_chart_features(handle: ?*Chart, classes: ?[*:0]const u8, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    const cls = classes orelse return -1;
+    const bytes = (c.featuresJson(std.mem.span(cls)) catch return -1) orelse return 0;
+    out.* = bytes.ptr;
+    out_len.* = bytes.len;
+    return 1;
+}
 
 /// tile57_chart_render_view's vector twin: the SAME scene emitted as a
 /// deterministic single-page PDF (1 px = 1 pt, 72 dpi page; vector fills,
