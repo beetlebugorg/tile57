@@ -938,7 +938,7 @@ pub const Chart = struct {
         }
     }
 
-    /// The chart's per-cell metadata as a JSON array (host-s57-handoff §1):
+    /// The chart's per-cell metadata as a JSON array:
     /// [{"name","scale","edition","update","issueDate","agency","bbox"?}, …].
     /// DSID fields reflect the applied update chain; bbox is the cell's
     /// geometry extent, omitted when none parses. Returns null when the chart
@@ -1026,7 +1026,7 @@ pub const Chart = struct {
     }
 
     /// The chart's features for the given comma-separated object-class
-    /// acronyms, as a GeoJSON FeatureCollection (host-s57-handoff §3):
+    /// acronyms, as a GeoJSON FeatureCollection:
     /// geometry in lon/lat, properties = {"class": …, plus the feature's full
     /// S-57 acronym→value attribute map}. Parsed without portrayal. Polygon
     /// rings are emitted largest-first (exterior heuristic). Returns null when

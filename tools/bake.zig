@@ -120,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, sub, "cells")) {
-        // Per-cell metadata JSON (the tile57_chart_cells ABI, host-s57-handoff §1).
+        // Per-cell metadata JSON (the tile57_chart_cells ABI).
         if (args.len < 3) {
             std.debug.print("usage: tile57 cells <cell.000 | ENC_ROOT>\n", .{});
             return;
@@ -143,7 +143,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, sub, "catalog")) {
-        // Exchange-set catalogue JSON (the tile57_catalog_entries ABI, §2).
+        // Exchange-set catalogue JSON (the tile57_catalog_entries ABI).
         if (args.len < 3) {
             std.debug.print("usage: tile57 catalog <CATALOG.031>\n", .{});
             return;
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, sub, "features")) {
-        // GeoJSON feature query (the tile57_chart_features ABI, §3).
+        // GeoJSON feature query (the tile57_chart_features ABI).
         if (args.len < 4) {
             std.debug.print("usage: tile57 features <cell.000 | ENC_ROOT> <ACR[,ACR...]>\n", .{});
             return;

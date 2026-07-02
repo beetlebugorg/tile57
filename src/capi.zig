@@ -312,7 +312,7 @@ export fn tile57_chart_render_view(
 
 const RenderPalette = @import("render").resolve.PaletteId;
 
-/// The chart's per-cell metadata as JSON (host-s57-handoff §1):
+/// The chart's per-cell metadata as JSON:
 /// [{"name","scale","edition","update","issueDate","agency","bbox"?}, …].
 /// DSID fields reflect the applied update chain. Returns 1 with *out/*out_len
 /// set (free with tile57_free); 0 when the chart has no cells (e.g. a PMTiles
@@ -326,7 +326,7 @@ export fn tile57_chart_cells(handle: ?*Chart, out: *[*]u8, out_len: *usize) call
 }
 
 /// Decode a CATALOG.031 exchange-set catalogue into a JSON array of its CATD
-/// entries (host-s57-handoff §2):
+/// entries:
 /// [{"file","longName","impl","bbox"?}, …]. Not chart-scoped. Returns 1 with
 /// *out/*out_len set (free with tile57_free); 0 when no CATD records; -1 on
 /// parse error.
@@ -369,7 +369,7 @@ fn jsonStr(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
 }
 
 /// The chart's features for the given comma-separated object-class acronyms
-/// (e.g. "DEPARE,DRGARE") as a GeoJSON FeatureCollection (host-s57-handoff §3):
+/// (e.g. "DEPARE,DRGARE") as a GeoJSON FeatureCollection:
 /// lon/lat geometry, properties = {"class", …the full S-57 attribute map}.
 /// Parsed without portrayal; a whole-ENC_ROOT query walks every cell — the
 /// caller owns that cost. Returns 1 with *out/*out_len set (free with

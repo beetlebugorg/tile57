@@ -2,7 +2,7 @@
 
 package tile57
 
-// The host-S-57-handoff surface: per-cell metadata, exchange-set catalogue
+// Chart metadata + raw S-57 access: per-cell metadata, exchange-set catalogue
 // decode, and raw feature access — everything a host previously parsed from
 // S-57/ISO-8211 itself. With these, a host's S-57 knowledge shrinks to file
 // staging conventions (.000/.NNN, ENC_ROOT/, CATALOG.031 as opaque bytes).
