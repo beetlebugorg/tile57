@@ -68,6 +68,8 @@ pub const FeatureMeta = struct {
     cat: i64 = 1,            // display category: 0 base, 1 standard, 2 other
     vg: i64 = 0,             // raw viewing group (0 = none)
     scamin: ?i64 = null,     // SCAMIN 1:N denominator (null = no display limit)
+    smax: i64 = 0,           // band-handoff denominator: a carried coarser-band copy
+                             // hides once the display is finer than 1:smax (0 = none)
     class: []const u8 = "",  // S-57 object-class acronym (e.g. "LIGHTS")
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""
     cell_name: []const u8 = "", // source ENC cell name or ""

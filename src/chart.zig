@@ -28,6 +28,7 @@ const tile = @import("tiles").tile;
 const render = @import("render");
 const sprite = @import("sprite");
 const embedded_assets = @import("catalog"); // S-101 portrayal assets (renderView store)
+const assets = @import("assets"); // displayDenomZ (the physical display-scale formula)
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
 // makes many small, short-lived allocations (tile cache, cell dupes, index
@@ -114,6 +115,7 @@ const LazyCell = struct {
     name: []const u8 = "",
     bbox: [4]f64, // [west, south, east, north]
     band: bake_enc.Band,
+    cscl: i32 = 0, // compilation-scale denominator (peeked; 0 = unknown)
     cell: ?s57.Cell = null,
     portrayal: ?[]const ?[]const u8 = null,
     portrayal_plain: ?[]const ?[]const u8 = null,
@@ -123,6 +125,9 @@ const LazyCell = struct {
     // M_COVR(CATCOV=1) coverage polygons, assembled once from `cell` for best-band
     // suppression. Lives in cell.arena, freed (and reset) when the cell unloads.
     coverage: ?[]const []const []const s57.LonLat = null,
+    // Distinct SCAMIN denominators (cell.arena, computed on load) — the cell's
+    // slice of the band-handoff quantization ladder (bake_enc.quantizeHandoff).
+    scamins: []const u32 = &.{},
     // Streaming: when the source has a reader, `base`/`updates` are empty until the
     // cell is first needed (read on demand into gpa, freed on eviction), so only
     // the LRU working set's bytes are held. `index` is passed to the reader.
@@ -195,14 +200,22 @@ fn coverageContains(polys: []const []const []const s57.LonLat, lon: f64, lat: f6
     return false;
 }
 
-// The FINEST band (largest band-max zoom) among the indexed cells whose M_COVR
-// coverage contains (lon,lat); 0 = none. (Go coverageBandAt.)
-fn finestCoverageBand(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64) u8 {
-    var best: u8 = 0;
+// The finest (smallest 1:N) compilation scale among the indexed cells whose
+// M_COVR coverage contains (lon,lat); maxInt when none — the live twin of
+// bake_enc.finestCsclAt, same derived-extent rule (a cell with no M_COVR counts
+// via its bbox only when `include_derived`: points/lines, never fills), so the
+// live path quilts + band-hands-off exactly like the baker.
+fn finestCsclAtLive(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
+    var best: i32 = std.math.maxInt(i32);
     for (idxs) |i| {
-        const nm = bake_enc.bandMaxZoom(ls.cells[i].band);
-        if (nm <= best) continue;
-        if (coverageContains(lazyCellCoverage(&ls.cells[i]), lon, lat)) best = nm;
+        const lc = &ls.cells[i];
+        if (lc.cscl <= 0 or lc.cscl >= best) continue;
+        const cov = lazyCellCoverage(lc);
+        const covered = if (cov.len > 0)
+            coverageContains(cov, lon, lat)
+        else
+            include_derived and (lon >= lc.bbox[0] and lon <= lc.bbox[2] and lat >= lc.bbox[1] and lat <= lc.bbox[3]);
+        if (covered) best = lc.cscl;
     }
     return best;
 }
@@ -359,6 +372,10 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
             gpa.destroy(p);
         }
     } else |_| {}
+    // The cell's SCAMIN ladder slice + authoritative scale (cheap feature scan;
+    // cell.arena-owned, so it unloads with the cell).
+    lc.scamins = bake_enc.collectScamins(cell.arena.allocator(), &cell) catch &.{};
+    if (cell.params.cscl > 0) lc.cscl = cell.params.cscl;
     lc.cell = cell;
     ls.loaded += 1;
 }
@@ -368,6 +385,7 @@ fn lazyUnload(lc: *LazyCell) void {
     lc.cell = null;
     lc.portrayal = null;
     lc.coverage = null; // backing memory lived in cell.arena, freed by c.deinit()
+    lc.scamins = &.{}; // ditto (cell.arena)
     lc.portrayal_plain = null;
     lc.portrayal_simplified = null;
     if (lc.arena) |p| {
@@ -509,7 +527,7 @@ const OpenWork = struct {
             ups = arr;
         }
         const name = if (in.name.len > 0) (gpa.dupe(u8, in.name) catch "") else "";
-        c.out[i] = .{ .base = base, .updates = ups, .name = name, .bbox = bbox, .band = bake_enc.bandOf(meta.cscl) };
+        c.out[i] = .{ .base = base, .updates = ups, .name = name, .bbox = bbox, .band = bake_enc.bandOf(meta.cscl), .cscl = meta.cscl };
         c.ok[i] = true;
     }
 };
@@ -602,6 +620,7 @@ pub const Chart = struct {
                 .updates = &.{},
                 .bbox = .{ m.west, m.south, m.east, m.north },
                 .band = bake_enc.bandOf(m.cscl),
+                .cscl = m.cscl,
                 .streaming = true,
                 .index = i,
             };
@@ -1380,11 +1399,12 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
 }
 
 // Multi-cell tile generation: collect overlapping cells, lazily load them, apply
-// best-band M_COVR suppression, and overlay coarse→fine.
+// per-scale M_COVR quilting + the scamin-aware band handoff, and overlay
+// coarse→fine.
 // Select + load the cells contributing to tile (z,x,y) and append their
-// band-quilted CellRefs (suppression flags computed against the finer-band
-// coverage). Returns false when nothing overlaps. Factored from tileFromCells
-// so renderView can reuse the exact same selection per covering tile.
+// quilted CellRefs (suppression/carry computed against the finest covering
+// compilation scale, bake_enc.carryGate). Returns false when nothing overlaps.
+// Factored from tileFromCells so renderView reuses the exact same selection.
 fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.CellRef)) !bool {
     const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
     var any_incl = false;
@@ -1413,32 +1433,42 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
 
     for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
 
+    // Per-scale quilting + scamin-aware band handoff, the same rules as the baker
+    // (bake_enc TileGenCtx.gen): the finest covering cscl gates lines/patterns at
+    // the tile centre (derived extents count) and fills/points over the whole tile
+    // (real M_COVR only); carryGate turns blanket suppression into an smax-tagged
+    // carry where the tile's display window opens coarser than that cscl.
     const w = tb[0];
     const s_ = tb[1];
     const e = tb[2];
     const nlat = tb[3];
     const clon = (w + e) / 2;
     const clat = (s_ + nlat) / 2;
-    const cov_centre = finestCoverageBand(ls, idxs.items, clon, clat);
-    var cov_whole: u8 = cov_centre;
+    const gf_centre = finestCsclAtLive(ls, idxs.items, clon, clat, true);
+    var gf_whole: i32 = finestCsclAtLive(ls, idxs.items, clon, clat, false);
     for ([_][2]f64{ .{ w, nlat }, .{ e, nlat }, .{ w, s_ }, .{ e, s_ } }) |corner| {
-        cov_whole = @min(cov_whole, finestCoverageBand(ls, idxs.items, corner[0], corner[1]));
+        gf_whole = @max(gf_whole, finestCsclAtLive(ls, idxs.items, corner[0], corner[1], false));
     }
+    const display_denom = assets.displayDenomZ(z, clat);
+    const ladders = gpa.alloc([]const u32, idxs.items.len) catch return false;
+    defer gpa.free(ladders);
+    for (idxs.items, 0..) |i, j| ladders[j] = ls.cells[i].scamins;
 
     for (idxs.items) |i| {
         const lc = &ls.cells[i];
         if (lc.cell) |*c| {
-            const nm = bake_enc.bandMaxZoom(lc.band);
+            const g = bake_enc.carryGate(lc.cscl, gf_centre, gf_whole, display_denom, ladders);
             refs.append(gpa, .{
                 .cell = c,
                 .portrayal = lc.portrayal,
                 .portrayal_plain = lc.portrayal_plain,
                 .portrayal_simplified = lc.portrayal_simplified,
                 .band = @intFromEnum(lc.band),
-                .suppress_fills = bake_enc.coarseAreaSuppressed(nm, z, cov_whole),
-                .suppress_patterns = bake_enc.coarseAreaSuppressed(nm, z, cov_centre),
-                .suppress_lines = bake_enc.coarseAreaSuppressed(nm, z, cov_centre),
-                .suppress_points = bake_enc.coarseAreaSuppressed(nm, z, cov_whole),
+                .suppress_fills = g.suppress_whole,
+                .suppress_patterns = g.suppress_centre,
+                .suppress_lines = g.suppress_centre,
+                .suppress_points = g.suppress_whole,
+                .smax = g.smax,
             }) catch {};
         }
     }
@@ -1495,8 +1525,9 @@ const BakeWork = struct {
         // M_COVR coverage + scale for per-cell quilting (allocate into the cell's own
         // arena before the move, so it outlives with the backend).
         const coverage = cell.mcovrCoverage(cell.arena.allocator());
+        const scamins = bake_enc.collectScamins(cell.arena.allocator(), &cell) catch &.{};
         const cscl = cell.params.cscl;
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b, .cscl = cscl, .coverage = coverage };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins };
         c.arenas[i] = pa;
     }
 };
@@ -1504,8 +1535,9 @@ const BakeWork = struct {
 /// Bake an ENC_ROOT (the same cells as `openCells`) into ONE PMTiles archive,
 /// zoom-banded per cell by compilation scale. Returns the archive bytes (free
 /// with `freeBytes`), or null if nothing was covered. Streams band-by-band
-/// (finest → coarsest, best-band dedup), holding only one band's parsed cells at
-/// a time — peak memory tracks the largest single band, not the whole catalogue.
+/// (finest → coarsest, best-band dedup + the scamin-aware band handoff), holding
+/// at most two adjacent bands' parsed cells at a time (a band's cells ride into
+/// the next-coarser pass for its deferred floor tiles), not the whole catalogue.
 /// `progress` (nullable) fires during the load+portray phase (stage 0) and the
 /// tile-bake phase (stage 1). The caller owns the input bytes for the call.
 pub fn bakeArchive(
@@ -1544,22 +1576,69 @@ pub fn bakeArchive(
     var scamin_set = std.AutoHashMap(u32, void).init(gpa);
     defer scamin_set.deinit();
 
-    // Band label (host §3): how many bands actually have cells, so the callback can
-    // report "band <i>/<band_count> <name>" (skip-empty bands aren't counted).
-    var band_count: u8 = 0;
+    // The coarsest populated band gets .extend_min (fill down to minzoom — the
+    // live tileRefs coarsest-band fallback); every other populated band defers its
+    // floor into the next-coarser pass (.defer_down, the band handoff).
+    var coarsest_pop: ?bake_enc.Band = null;
     for (bake_enc.bands_fine_to_coarse) |band| {
-        if (band_idx[@intFromEnum(band)].items.len > 0) band_count += 1;
+        if (band_idx[@intFromEnum(band)].items.len > 0) coarsest_pop = band;
+    }
+    // Band label (host §3): count the passes that actually bake — a band with no
+    // cells still runs when the next-finer band deferred its floor tiles into it.
+    var band_count: u8 = 0;
+    {
+        var carry_n: usize = 0;
+        for (bake_enc.bands_fine_to_coarse) |band| {
+            const own_n = band_idx[@intFromEnum(band)].items.len;
+            const floor: bake_enc.FloorMode = if (coarsest_pop == band) .extend_min else .defer_down;
+            if (bake_enc.passHasWork(band, minzoom, maxzoom, own_n, carry_n, floor)) band_count += 1;
+            carry_n = if (own_n > 0 and floor == .defer_down and bake_enc.floorDeferred(band, minzoom, maxzoom)) own_n else 0;
+        }
     }
     baker.band_count = band_count;
+
+    // Band-handoff carry: the previous (finer) band's parsed backends + portrayal
+    // arenas, kept alive through this pass so its deferred floor tiles bake with
+    // both bands' cells. Peak memory: two adjacent bands.
+    var carry_backs = std.ArrayList(bake_enc.Backend).empty;
+    var carry_arenas = std.ArrayList(?*std.heap.ArenaAllocator).empty;
+    defer {
+        for (carry_backs.items) |*be| be.cell.deinit();
+        for (carry_arenas.items) |pa| if (pa) |p| {
+            p.deinit();
+            gpa.destroy(p);
+        };
+        carry_backs.deinit(gpa);
+        carry_arenas.deinit(gpa);
+    }
 
     var loaded: usize = 0;
     var band_ord: u8 = 0;
     for (bake_enc.bands_fine_to_coarse) |band| {
         const idxs = band_idx[@intFromEnum(band)].items;
-        if (idxs.len == 0) continue;
-        baker.band_index = band_ord;
-        band_ord += 1;
+        const floor: bake_enc.FloorMode = if (coarsest_pop == band) .extend_min else .defer_down;
+        // Whether this band's cells must outlive their own pass (floor deferred
+        // into the next one). A no-work pass can still defer (fully-clamped range).
+        const deferred = idxs.len > 0 and floor == .defer_down and bake_enc.floorDeferred(band, minzoom, maxzoom);
+        const has_work = bake_enc.passHasWork(band, minzoom, maxzoom, idxs.len, carry_backs.items.len, floor);
+        if (!has_work and !deferred) {
+            // Nothing bakes here and nothing rides on: drop a consumed-less carry.
+            for (carry_backs.items) |*be| be.cell.deinit();
+            for (carry_arenas.items) |pa| if (pa) |p| {
+                p.deinit();
+                gpa.destroy(p);
+            };
+            carry_backs.clearRetainingCapacity();
+            carry_arenas.clearRetainingCapacity();
+            continue;
+        }
+        if (has_work) {
+            baker.band_index = band_ord;
+            band_ord += 1;
+        }
 
+        // Parse + portray this band's own cells (also when the pass itself bakes
+        // nothing but defers them — the next-coarser pass consumes them as carry).
         var sources = std.ArrayList(BakeSource).empty;
         defer {
             for (sources.items) |s| gpa.free(s.updates);
@@ -1581,7 +1660,7 @@ pub fn bakeArchive(
         var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir, .build_geo = bake_enc.cacheGeoForBand(band) };
         bake_enc.parallelFor(gpa, sources.items.len, &bw, BakeWork.run);
         loaded += idxs.len;
-        if (progress) |cb| cb(user, 0, loaded, cells_in.len, band_ord - 1, band_count, @tagName(band).ptr);
+        if (progress) |cb| if (has_work) cb(user, 0, loaded, cells_in.len, band_ord - 1, band_count, @tagName(band).ptr);
 
         var backs = std.ArrayList(bake_enc.Backend).empty;
         var band_arenas = std.ArrayList(?*std.heap.ArenaAllocator).empty;
@@ -1594,12 +1673,42 @@ pub fn bakeArchive(
         for (backs.items) |be| for (be.cell.features) |f| {
             if (scene.featureScamin(f)) |sc| scamin_set.put(@intCast(sc), {}) catch {};
         };
-        baker.bakeBand(band, backs.items, null, progress, user) catch {};
-        for (backs.items) |*be| be.cell.deinit();
-        for (band_arenas.items) |pa| if (pa) |p| {
+        if (has_work) {
+            // Own cells first, then the finer band's carry (bakeBand own_len split).
+            var all = std.ArrayList(bake_enc.Backend).empty;
+            defer all.deinit(gpa);
+            all.appendSlice(gpa, backs.items) catch {};
+            all.appendSlice(gpa, carry_backs.items) catch {};
+            baker.bakeBand(band, all.items, backs.items.len, floor, null, progress, user) catch {};
+        }
+        // The carry block's ride ends here; the own block becomes the NEXT pass's
+        // carry (deferred) or is freed with it.
+        for (carry_backs.items) |*be| be.cell.deinit();
+        for (carry_arenas.items) |pa| if (pa) |p| {
             p.deinit();
             gpa.destroy(p);
         };
+        carry_backs.clearRetainingCapacity();
+        carry_arenas.clearRetainingCapacity();
+        if (deferred) {
+            carry_backs.appendSlice(gpa, backs.items) catch {
+                for (backs.items) |*be| be.cell.deinit();
+                backs.clearRetainingCapacity();
+            };
+            carry_arenas.appendSlice(gpa, band_arenas.items) catch {
+                for (band_arenas.items) |pa| if (pa) |p| {
+                    p.deinit();
+                    gpa.destroy(p);
+                };
+                band_arenas.clearRetainingCapacity();
+            };
+        } else {
+            for (backs.items) |*be| be.cell.deinit();
+            for (band_arenas.items) |pa| if (pa) |p| {
+                p.deinit();
+                gpa.destroy(p);
+            };
+        }
         backs.deinit(gpa);
         band_arenas.deinit(gpa);
     }

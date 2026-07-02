@@ -129,6 +129,16 @@ pub fn scaminVisible(scamin: ?i64, zoom: f64) bool {
     return zoom >= std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(s)));
 }
 
+/// Band-handoff (smax) gate — the mirror image of scaminVisible: a carried
+/// coarser-band copy shows only while the display is still COARSER than its
+/// handoff denominator (denom(zoom) > smax, i.e. zoom < log2(DENOM_Z0 / smax)),
+/// then hands off to the finer band's own content. Untagged features (0) always
+/// show. Mirrors the style smax clause (assets/style.zig writeSmaxClause).
+pub fn smaxVisible(smax: i64, zoom: f64) bool {
+    if (smax <= 0) return true;
+    return zoom < std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(smax)));
+}
+
 /// Viewing-group gate (S-52 §14.5) — the deny-list model of
 /// chartstyle.MarinerSettings.viewing_groups_off (the host's viewingGroupsOff model):
 /// a feature with no viewing group (vg 0) always shows; otherwise it hides iff
@@ -159,6 +169,7 @@ pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64,
     if (!categoryVisible(meta.cat, meta.class, symbol_name, m)) return false;
     if (!viewingGroupVisible(meta.vg, m.viewing_groups_off)) return false;
     if (!m.ignore_scamin and !scaminVisible(meta.scamin, zoom)) return false;
+    if (!m.ignore_scamin and !smaxVisible(meta.smax, zoom)) return false;
     // S-52 display-variant passes (mirrors chartstyle.boundaryFilter /
     // pointStyleFilter): a feature portrayed twice carries bnd 1/0 (symbolized/
     // plain boundary) or pts 0/1 (paper/simplified points); show the common
@@ -224,6 +235,18 @@ test "scaminVisible mirrors the style SCAMIN_GATE" {
     try std.testing.expect(scaminVisible(30000, 13.2));
     try std.testing.expect(scaminVisible(null, 0)); // no SCAMIN -> always
     try std.testing.expect(scaminVisible(0, 0)); // degenerate 0 -> always
+}
+
+test "smaxVisible is scaminVisible's mirror: carried copy hides past the handoff" {
+    // A copy carried with smax 260000 shows while the display is coarser than
+    // 1:260000 (zoom < log2(279541132/260000) ~= 10.07) and hides beyond.
+    try std.testing.expect(smaxVisible(260000, 9.5));
+    try std.testing.expect(!smaxVisible(260000, 10.5));
+    // Exactly at the crossing the copy hands off (scaminVisible turns true there).
+    const cross = std.math.log2(DENOM_Z0 / 260000.0);
+    try std.testing.expect(!smaxVisible(260000, cross));
+    try std.testing.expect(scaminVisible(260000, cross));
+    try std.testing.expect(smaxVisible(0, 0)); // untagged -> always
 }
 
 test "viewingGroupVisible: deny-list, vg 0 always shows" {

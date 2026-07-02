@@ -6,6 +6,28 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Fixed — scamin-aware band handoff (the band-floor blank window)
+- **Zooming through a band boundary no longer blanks the chart** while the finer
+  band's SCAMIN-gated bulk is still hidden. Each band's floor-zoom tiles now bake
+  in the next-coarser band's pass with BOTH bands' cells alive; where a tile's
+  display window opens coarser than the covering finer cell's compilation scale,
+  the coarser band's features are carried down tagged with a new integer tile
+  property **`smax`** (the handoff denominator, quantized up onto the archive's
+  real SCAMIN ladder) instead of being best-band suppressed. Styles gate it with
+  `["<", ["coalesce",["get","smax"],0], DENOM]` beside the scamin clause (the
+  same injected literal in filter-gate mode; a zoom-derived denominator on the
+  bucket/fallback paths), so the copy hands off at the exact crossing where the
+  finer content activates — no hole, no double-draw. The live cells backend
+  applies the same rule per request (`bake_enc.carryGate`, shared).
+- **Bundle bakes no longer lose every zoom below the coarsest populated band's
+  floor.** The coarsest band with cells now extends down to the archive minzoom
+  (mirroring the live path's coarsest-band fallback), so a pack without overview
+  cells still gets low-zoom tiles instead of blank basemap.
+- Bake callers hold at most **two adjacent bands'** cells at once (the deferred
+  band rides into the next pass; portrayal is reused, never recomputed).
+  `Baker.bakeBand`/`plannedTiles` grew an own/carry split (`own_len`) and a
+  `FloorMode` (`defer_down`/`extend_min`).
+
 ### Changed — chart-centric C ABI (breaking, pre-1.0)
 - **The tile-source C ABI (`include/tile57.h`) was reworked into a chart-centric
   surface** (see `chart-api.md`); the internal Zig type `Source` in `src/source.zig`

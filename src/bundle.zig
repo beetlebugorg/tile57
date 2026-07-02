@@ -434,6 +434,49 @@ const CellGeom = struct {
     geo_arena: ?*std.heap.ArenaAllocator,
     feat_bbox: []const ?[4]f64 = &.{}, // per-feature bbox for the per-tile cull (in geo_arena)
     coverage: []const []const []const engine.s57.LonLat = &.{}, // M_COVR (cell.arena) for quilting
+    scamins: []const u32 = &.{}, // distinct SCAMIN denoms (cell.arena) — the handoff ladder
+};
+
+// A deferred band's cells riding into the next-coarser pass (the band handoff):
+// entries + resident portrayal + surviving geometry, index-aligned. The consuming
+// pass appends them behind its own cells (bakeBand own_len) so the deferred floor
+// tiles bake with BOTH bands' cells — WITHOUT re-portraying (the expensive step) —
+// then frees them at its end. Peak memory: two adjacent bands, as specced.
+const CarryState = struct {
+    entries: []const CellEntry,
+    portray: []?CellPortray,
+    geom: []?CellGeom,
+    gave_up: []bool,
+
+    // Fresh all-null state for entries whose own pass never loaded them (a fully
+    // deferred zoom clamp): the consuming pass loads + portrays them itself.
+    fn initEmpty(gpa: std.mem.Allocator, entries: []const CellEntry) !CarryState {
+        const po = try gpa.alloc(?CellPortray, entries.len);
+        @memset(po, null);
+        const ge = try gpa.alloc(?CellGeom, entries.len);
+        @memset(ge, null);
+        const gu = try gpa.alloc(bool, entries.len);
+        @memset(gu, false);
+        return .{ .entries = entries, .portray = po, .geom = ge, .gave_up = gu };
+    }
+
+    // Free the surviving cells + portrayal arenas + the slices themselves.
+    fn deinit(self: *const CarryState, gpa: std.mem.Allocator) void {
+        for (self.geom) |*g| if (g.*) |*gg| {
+            gg.cell.deinit();
+            if (gg.geo_arena) |ga| {
+                ga.deinit();
+                gpa.destroy(ga);
+            }
+        };
+        for (self.portray) |p| if (p) |pp| {
+            pp.arena.deinit();
+            gpa.destroy(pp.arena);
+        };
+        gpa.free(self.portray);
+        gpa.free(self.geom);
+        gpa.free(self.gave_up);
+    }
 };
 
 // Copy per-feature instruction streams into `a` (the sticky portrayal arena) so
@@ -511,7 +554,10 @@ const LoadWork = struct {
             geo_arena = ga;
         } else |_| {}
         const coverage = cell.mcovrCoverage(cell.arena.allocator()); // before the move (cell.arena-owned)
-        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_world = geo_world, .geo_arena = geo_arena, .feat_bbox = feat_bbox, .coverage = coverage };
+        // Distinct SCAMIN denominators (the band-handoff quantization ladder) —
+        // cheap feature scan, rebuilt with the cell on every re-parse.
+        const scamins = engine.bake_enc.collectScamins(cell.arena.allocator(), &cell) catch &.{};
+        c.geom[ci] = .{ .cell = cell, .geo = geo, .geo_world = geo_world, .geo_arena = geo_arena, .feat_bbox = feat_bbox, .coverage = coverage, .scamins = scamins };
 
         // Label-point cache: built from the (reused or fresh) portrayal — only features
         // whose base stream draws a Text/centred-symbol consult labelPoint, so cache just
@@ -579,8 +625,11 @@ const BakeSink = struct {
                 const is_snd = std.mem.eql(u8, L.name, "soundings");
                 for (L.features) |feat| for (feat.properties) |p| {
                     // Distinct SCAMIN denominators across EVERY layer -> the client's
-                    // per-SCAMIN bucket manifest (host-canonical-backend.md §2).
-                    if (std.mem.eql(u8, p.key, "scamin")) {
+                    // per-SCAMIN bucket manifest (host-canonical-backend.md §2). smax
+                    // handoff denominators join the same ladder: they are quantized
+                    // onto real SCAMIN values (usually already present), but a raw-
+                    // CSCL fallback still needs its client crossing to hand off at.
+                    if (std.mem.eql(u8, p.key, "scamin") or std.mem.eql(u8, p.key, "smax")) {
                         switch (p.value) {
                             .int => |iv| if (iv > 0) self.scamin.put(@intCast(iv), {}) catch {},
                             else => {},
@@ -759,36 +808,71 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // so they fall back to loading them together.
     std.debug.print("  (lazy bake: lru={d} cells, super-dz={d})\n", .{ lru_budget, super_dz });
     g_bake_start = nowSec();
-    // Band label (host §3): count the bands that will actually bake (non-empty AND
-    // their zoom range survives the minzoom/maxzoom clamp), so the progress callback
-    // reports "band <i>/<band_count>"; band_ord is the ordinal of the current one.
-    var band_count: u8 = 0;
+    // The coarsest populated band gets .extend_min (fill down to minzoom — the
+    // live tileRefs coarsest-band fallback); every other populated band defers its
+    // floor into the next-coarser pass (.defer_down, the band handoff).
+    var coarsest_pop: ?Bands.Band = null;
     for (Bands.bands_fine_to_coarse) |band| {
-        const entries = band_cells[@intFromEnum(band)].items;
-        if (entries.len == 0) continue;
-        const zr = Bands.bandZooms(band);
-        if (@max(minzoom, zr.min) > @min(maxzoom, zr.max)) continue;
-        band_count += 1;
+        if (band_cells[@intFromEnum(band)].items.len > 0) coarsest_pop = band;
+    }
+    // Band label (host §3): count the passes that will actually bake — a band with
+    // no cells still runs when the next-finer band deferred its floor tiles into it.
+    var band_count: u8 = 0;
+    {
+        var carry_n: usize = 0;
+        for (Bands.bands_fine_to_coarse) |band| {
+            const own_n = band_cells[@intFromEnum(band)].items.len;
+            const floor: Bands.FloorMode = if (coarsest_pop == band) .extend_min else .defer_down;
+            if (Bands.passHasWork(band, minzoom, maxzoom, own_n, carry_n, floor)) band_count += 1;
+            carry_n = if (own_n > 0 and floor == .defer_down and Bands.floorDeferred(band, minzoom, maxzoom)) own_n else 0;
+        }
     }
     baker.band_count = band_count;
+    var carry: ?CarryState = null; // the finer band's cells riding into this pass
     var band_ord: u8 = 0;
     var done_cells: usize = 0;
     for (Bands.bands_fine_to_coarse) |band| {
         const entries = band_cells[@intFromEnum(band)].items;
-        if (entries.len == 0) continue;
-        const parses0 = g_parses.load(.monotonic);
-        const band_start = nowSec();
-
-        const zr = Bands.bandZooms(band);
-        const zlo = @max(minzoom, zr.min);
-        const zhi = @min(maxzoom, zr.max);
-        if (zlo > zhi) {
+        const carry_entries: []const CellEntry = if (carry) |c| c.entries else &.{};
+        const floor: Bands.FloorMode = if (coarsest_pop == band) .extend_min else .defer_down;
+        // Whether this band's own floor rides on into the NEXT pass (its cells must
+        // then outlive this one). .extend_min never defers — nothing coarser runs.
+        const deferred = entries.len > 0 and floor == .defer_down and Bands.floorDeferred(band, minzoom, maxzoom);
+        if (!Bands.passHasWork(band, minzoom, maxzoom, entries.len, carry_entries.len, floor)) {
+            // Nothing bakes here. Drop a consumed-less carry; when this band still
+            // defers (its whole clamped range IS the deferred floor), hand its
+            // entries on with fresh state — the next pass loads them itself.
+            if (carry) |*c| c.deinit(gpa);
+            carry = if (deferred) try CarryState.initEmpty(gpa, entries) else null;
             done_cells += entries.len;
             continue;
         }
+        const parses0 = g_parses.load(.monotonic);
+        const band_start = nowSec();
         baker.band_index = band_ord;
         band_ord += 1;
-        const zs: u8 = if (zlo >= super_dz) zlo - super_dz else 0;
+
+        // Effective zoom span (deferral/extension applied) — drives the super-tile
+        // zoom zs. A carry-only pass bakes just the deferred floor (this band's max).
+        const zr = Bands.bandZooms(band);
+        var zlo = @max(minzoom, zr.min);
+        const zhi = @min(maxzoom, zr.max);
+        switch (floor) {
+            .defer_down => if (zlo == zr.min and zlo <= zhi) {
+                zlo += 1;
+            },
+            .extend_min => zlo = minzoom,
+        }
+        const z_first: u8 = if (entries.len > 0 and zlo <= zhi) zlo else zr.max;
+        const zs: u8 = if (z_first >= super_dz) z_first - super_dz else 0;
+
+        // Combined pass cells: own first (indices < n_own), then the finer band's
+        // carry — every state array below is index-aligned with this slice.
+        const n_own = entries.len;
+        const n_all = n_own + carry_entries.len;
+        const pass_entries = try a.alloc(CellEntry, n_all);
+        @memcpy(pass_entries[0..n_own], entries);
+        @memcpy(pass_entries[n_own..], carry_entries);
 
         // Inverted index: super-tile (sx,sy at zs) → the cell indices overlapping it.
         var stmap = std.AutoHashMap(u64, std.ArrayList(u32)).init(gpa);
@@ -797,7 +881,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             while (vit.next()) |v| v.deinit(gpa);
             stmap.deinit();
         }
-        for (entries, 0..) |e, i| {
+        for (pass_entries, 0..) |e, i| {
             const nw = lonLatToTile(e.bbox[0], e.bbox[3], zs);
             const se = lonLatToTile(e.bbox[2], e.bbox[1], zs);
             var sy = nw[1];
@@ -833,34 +917,53 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         // dedup'd against finer bands via the baker's `emitted` set, which is complete
         // here since bands bake finest→coarsest). Set it on the baker so bakeBand
         // reports done/total as a per-band percentage instead of "total 0 = unknown".
+        // A super-tile's index list is ascending, so its own cells precede its carry
+        // cells — the own_len split plannedTiles/bakeBand key on.
         baker.band_base = baker.count;
         var band_total: usize = 0;
         for (stkeys) |stk| {
             const cells = stmap.get(stk).?.items;
             const bnds = gpa.alloc([4]f64, cells.len) catch continue;
             defer gpa.free(bnds);
-            for (cells, 0..) |ci, j| bnds[j] = entries[ci].bbox;
-            band_total += baker.plannedTiles(band, bnds, .{ .zs = zs, .sx = @intCast(stk & 0xFFFFFFFF), .sy = @intCast(stk >> 32) });
+            var st_own: usize = 0;
+            for (cells, 0..) |ci, j| {
+                bnds[j] = pass_entries[ci].bbox;
+                if (ci < n_own) st_own += 1;
+            }
+            band_total += baker.plannedTiles(band, bnds, st_own, floor, .{ .zs = zs, .sx = @intCast(stk & 0xFFFFFFFF), .sy = @intCast(stk >> 32) });
         }
         baker.band_total = band_total;
-        std.debug.print("\n  band {s}: {d} cells, {d} super-tiles (z{d}-{d}), ~{d} tiles — baking…\n", .{ @tagName(band), entries.len, stkeys.len, zlo, zhi, band_total });
+        std.debug.print("\n  band {s}: {d}+{d} cells, {d} super-tiles (z{d}-{d}), ~{d} tiles — baking…\n", .{ @tagName(band), entries.len, carry_entries.len, stkeys.len, @min(z_first, zhi), zhi, band_total });
 
-        // Per-band caches (index-aligned with `entries`): portrayal is RESIDENT
+        // Per-pass caches (index-aligned with `pass_entries`): portrayal is RESIDENT
         // (computed once — the expensive Lua step — and cheap to keep); geometry is
         // the heavy part, held in an LRU and re-parsed (NOT re-portrayed) on demand.
-        const portray = try gpa.alloc(?CellPortray, entries.len);
+        // The carry block adopts the finer band's surviving state wholesale.
+        const portray = try gpa.alloc(?CellPortray, n_all);
         defer gpa.free(portray);
         @memset(portray, null);
-        const geom = try gpa.alloc(?CellGeom, entries.len);
+        const geom = try gpa.alloc(?CellGeom, n_all);
         defer gpa.free(geom);
         @memset(geom, null);
-        const used = try gpa.alloc(u64, entries.len); // LRU tick per cell (geometry)
+        const used = try gpa.alloc(u64, n_all); // LRU tick per cell (geometry)
         defer gpa.free(used);
         @memset(used, 0);
-        const gave_up = try gpa.alloc(bool, entries.len); // parse failed: don't retry
+        const gave_up = try gpa.alloc(bool, n_all); // parse failed: don't retry
         defer gpa.free(gave_up);
         @memset(gave_up, false);
         var n_geom: usize = 0; // loaded-geometry count (the LRU target)
+        if (carry) |c| {
+            @memcpy(portray[n_own..], c.portray);
+            @memcpy(geom[n_own..], c.geom);
+            @memcpy(gave_up[n_own..], c.gave_up);
+            gpa.free(c.portray);
+            gpa.free(c.geom);
+            gpa.free(c.gave_up);
+            carry = null; // consumed — the combined arrays own the state now
+            for (geom[n_own..]) |g| {
+                if (g != null) n_geom += 1;
+            }
+        }
         var tick: u64 = 0;
 
         for (stkeys, 0..) |stk, st_i| {
@@ -877,7 +980,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             defer miss.deinit(gpa);
             for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(gpa, ci) catch {};
             if (miss.items.len > 0) {
-                var lw = LoadWork{ .cells = miss.items, .entries = entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = gpa };
+                var lw = LoadWork{ .cells = miss.items, .entries = pass_entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = gpa };
                 Bands.parallelFor(gpa, miss.items.len, &lw, LoadWork.run);
                 for (miss.items) |ci| {
                     if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
@@ -887,9 +990,11 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             for (cells) |ci| used[ci] = tick;
 
             // Generate this super-tile's tiles from its loaded cells (clipped, parallel):
-            // pair each cell's geometry with its resident portrayal.
+            // pair each cell's geometry with its resident portrayal. `cells` ascends, so
+            // own cells land before carry cells; st_own is bakeBand's own_len split.
             var subset = std.ArrayList(Bands.Backend).empty;
             defer subset.deinit(gpa);
+            var st_own: usize = 0;
             for (cells) |ci| if (geom[ci]) |g| {
                 const p = portray[ci];
                 subset.append(gpa, .{
@@ -900,12 +1005,14 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     .geo = g.geo,
                     .geo_world = g.geo_world,
                     .feat_bbox = g.feat_bbox,
-                    .bounds = if (p) |pp| pp.bounds else entries[ci].bbox,
+                    .bounds = if (p) |pp| pp.bounds else pass_entries[ci].bbox,
                     .cscl = g.cell.params.cscl,
                     .coverage = g.coverage,
-                }) catch {};
+                    .scamins = g.scamins,
+                }) catch continue;
+                if (ci < n_own) st_own += 1;
             };
-            baker.bakeBand(band, subset.items, .{ .zs = zs, .sx = sx, .sy = sy }, prog, progress_user) catch {};
+            baker.bakeBand(band, subset.items, st_own, floor, .{ .zs = zs, .sx = sx, .sy = sy }, prog, progress_user) catch {};
 
             // Evict least-recently-used GEOMETRY beyond the budget (never this
             // super-tile's, which carry the current tick). Portrayal stays resident.
@@ -932,8 +1039,10 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             }
         }
 
-        // Free remaining geometry + all resident portrayal at the end of the band.
-        for (geom, 0..) |g, ci| if (g != null) {
+        // The carry block's ride ends here: free the finer band's remaining
+        // geometry + portrayal. The own block either becomes the NEXT pass's carry
+        // (deferred — its floor tiles bake there) or is freed with it.
+        for (geom[n_own..], n_own..) |g, ci| if (g != null) {
             if (geom[ci]) |*gg| {
                 gg.cell.deinit();
                 if (gg.geo_arena) |p| {
@@ -942,19 +1051,43 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                 }
             }
         };
-        for (portray, 0..) |p, ci| if (p != null) {
+        for (portray[n_own..], n_own..) |p, ci| if (p != null) {
             portray[ci].?.arena.deinit();
             gpa.destroy(portray[ci].?.arena);
         };
+        if (deferred) {
+            const po = try gpa.alloc(?CellPortray, n_own);
+            @memcpy(po, portray[0..n_own]);
+            const ge = try gpa.alloc(?CellGeom, n_own);
+            @memcpy(ge, geom[0..n_own]);
+            const gu = try gpa.alloc(bool, n_own);
+            @memcpy(gu, gave_up[0..n_own]);
+            carry = .{ .entries = entries, .portray = po, .geom = ge, .gave_up = gu };
+        } else {
+            for (geom[0..n_own], 0..) |g, ci| if (g != null) {
+                if (geom[ci]) |*gg| {
+                    gg.cell.deinit();
+                    if (gg.geo_arena) |p| {
+                        p.deinit();
+                        gpa.destroy(p);
+                    }
+                }
+            };
+            for (portray[0..n_own], 0..) |p, ci| if (p != null) {
+                portray[ci].?.arena.deinit();
+                gpa.destroy(portray[ci].?.arena);
+            };
+        }
         const parses = g_parses.load(.monotonic) - parses0;
         const band_secs = nowSec() - band_start;
         std.debug.print(
-            "\r  band {s} done: {d} cells, {d} super-tiles, {d} tiles total, {d} parses ({d:.2}x), {d}s\n",
-            .{ @tagName(band), entries.len, stkeys.len, baker.count, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(entries.len, 1))), band_secs },
+            "\r  band {s} done: {d}+{d} cells, {d} super-tiles, {d} tiles total, {d} parses ({d:.2}x), {d}s\n",
+            .{ @tagName(band), entries.len, carry_entries.len, stkeys.len, baker.count, parses, @as(f64, @floatFromInt(parses)) / @as(f64, @floatFromInt(@max(n_all, 1))), band_secs },
         );
         done_cells += entries.len;
         if (prog) |cb| cb(progress_user, 0, done_cells, total_cells, band_ord - 1, band_count, @tagName(band).ptr);
     }
+    if (carry) |*c| c.deinit(gpa); // overview never defers, but stay leak-proof
 
     // Assemble out_path = prefix (header + directory + metadata) ++ the data
     // section streamed to data_tmp. The prefix is small; the data is copied in
