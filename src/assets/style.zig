@@ -1406,6 +1406,85 @@ test "buildFromTemplateScamin: a manifest emits per-value buckets, no zoom-gate"
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "log2") == null);
 }
 
+// ---- band-handoff smax gate tests -------------------------------------------
+
+test "styleJson: the filter-gate smax clause has the EXACT client-matched shape" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const sm = [_]u32{ 45000, 90000 };
+    const gated = try styleJson(a, .{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+        .scamin_filter_gate = true,
+        .scamin_cur_denom = 50000,
+    });
+    defer a.free(gated);
+    // The band-handoff gate, verbatim — chartplotter-go pattern-matches this shape
+    // (band-handoff contract) to rewrite DENOM beside the scamin clause. DENOM is
+    // the SAME injected literal as the scamin clause's.
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],50000]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],50000]") != null);
+
+    // The gate rides the BASE layers too: a carried copy of an ungated feature
+    // (fills, plain symbols) lands there and must still hand off.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, gated, .{});
+    defer parsed.deinit();
+    for (parsed.value.object.get("layers").?.array.items) |lyr| {
+        const id = lyr.object.get("id").?.string;
+        if (std.mem.eql(u8, id, "fill-areas")) {
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(a);
+            var aw: std.Io.Writer.Allocating = .init(a);
+            defer aw.deinit();
+            var st: Stringify = .{ .writer = &aw.writer };
+            try st.write(lyr.object.get("filter").?);
+            try std.testing.expect(std.mem.indexOf(u8, aw.writer.buffered(), "smax") != null);
+        }
+    }
+}
+
+test "styleJson: bucket/zoom-gate modes derive the smax denominator from zoom; ignore_scamin drops it" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const sm = [_]u32{ 45000, 90000 };
+    const base = StyleOpts{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+    };
+    // Bucket mode: DENOM = K/2^zoom at the manifest latitude (physical formula).
+    const bucketed = try styleJson(a, base);
+    defer a.free(bucketed);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\"^\",2,[\"zoom\"]]") != null);
+
+    // No-manifest fallback: same clause with the OGC z0 denominator constant.
+    var nm = base;
+    nm.scamin = &.{};
+    const fb = try styleJson(a, nm);
+    defer a.free(fb);
+    try std.testing.expect(std.mem.indexOf(u8, fb, "\"smax\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fb, "279541132") != null);
+
+    // ignore_scamin: the debug toggle shows everything — no smax gate anywhere.
+    var ign = base;
+    ign.ignore_scamin = true;
+    const out_ign = try styleJson(a, ign);
+    defer a.free(out_ign);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "smax") == null);
+}
+
 // ---- styleDiff tests (style-diff.md §5) ------------------------------------
 
 test "styleDiff: filter + paint + layout changes emit precise, scoped ops" {
