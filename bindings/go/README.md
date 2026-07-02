@@ -27,12 +27,12 @@ inside the module cache):
 
 ```go
 // go.mod
-require github.com/beetlebugorg/chartplotter-native/bindings/go v0.0.0
-replace github.com/beetlebugorg/chartplotter-native/bindings/go => /path/to/chartplotter-native/bindings/go
+require github.com/beetlebugorg/tile57/bindings/go v0.0.0
+replace github.com/beetlebugorg/tile57/bindings/go => /path/to/chartplotter-native/bindings/go
 ```
 
 ```go
-import tile57 "github.com/beetlebugorg/chartplotter-native/bindings/go"
+import tile57 "github.com/beetlebugorg/tile57/bindings/go"
 
 // Bake a single cell.000 or a whole ENC_ROOT dir into a self-contained bundle.
 cells, bbox, err := tile57.BakeBundle("/enc/ENC_ROOT", "/out/bundle", "", "", "", 0, 16, nil)

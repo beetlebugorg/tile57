@@ -39,3 +39,6 @@ __pycache__/
 /charts/
 /test/
 /05CGD_ENCs.zip
+
+# render outputs dropped at the repo root during dev
+/a.pdf

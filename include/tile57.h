@@ -79,14 +79,14 @@ typedef struct {
  * the engine enumerates the cells + peeks each one's bbox/scale at open, then reads
  * cell bytes on demand (working set only), so RSS tracks what tiles need, not the
  * whole ENC_ROOT. Rules are the library's embedded catalogue. NULL/failure -> NULL.
- * (chart-api.md) */
+ * */
 tile57_chart *tile57_chart_open(const char *path);
 
 /* Open one in-memory ENC cell (base .000 bytes) as a resident chart. Bytes are copied.
- * NULL/failure -> NULL. (chart-api.md) */
+ * NULL/failure -> NULL. */
 tile57_chart *tile57_chart_open_bytes(const uint8_t *base, size_t len);
 
-/* Open a baked PMTiles bundle from a file path. NULL/failure -> NULL. (chart-api.md) */
+/* Open a baked PMTiles bundle from a file path. NULL/failure -> NULL. */
 tile57_chart *tile57_chart_open_pmtiles(const char *path);
 
 /* Tile encodings served by tile57_chart_tile / produced by the bakes. */
@@ -95,7 +95,7 @@ typedef enum {
     TILE57_TILE_TYPE_MLT = 2, /* MapLibre Tile (the default bake format) */
 } tile57_tile_type;
 
-/* Fixed chart metadata (chart-api.md) — folds zoom_range/bands/bounds/anchor into one
+/* Fixed chart metadata — folds zoom_range/bands/bounds/anchor into one
  * getter. Bounds/anchor validity are flagged (false -> those fields are 0).
  * tile_type is the encoding tile57_chart_tile returns (a tile57_tile_type): a
  * PMTiles-backed chart reports its archive's stored type; a cell-backed chart
@@ -183,8 +183,8 @@ int tile57_bake_bundle(const char *input, const char *out_dir,
 
 /* All portrayal assets in memory (the same files bake_bundle writes to disk), from the
  * library's embedded catalogue (catalog_dir NULL/"") or an on-disk one. Pairs with
- * tile57_bake_pmtiles + tile57_style_build for a full in-memory bundle. Returns 1 with
- * *out filled (free with tile57_assets_free), 0 on error. (chart-api.md) */
+ * tile57_bake_pmtiles + tile57_build_style for a full in-memory bundle. Returns 1 with
+ * *out filled (free with tile57_assets_free), 0 on error. */
 typedef struct {
     uint8_t *colortables;  size_t colortables_len;
     uint8_t *linestyles;   size_t linestyles_len;
@@ -262,7 +262,7 @@ int tile57_chart_render_pdf(tile57_chart *chart, double lon, double lat, double 
  * `name` is the DSNM stem; `scale` is DSPM CSCL; edition/update/issueDate/
  * agency are DSID EDTN/UPDN/ISDT/AGEN after the cell's update chain is
  * applied; `bbox` is the cell's geographic extent, omitted when none parses.
- * Returns 1 with *out/*out_len holding the JSON (free with tile57_free);
+ * Returns 1 with *out / *out_len holding the JSON (free with tile57_free);
  * 0 if the chart has no cells (e.g. a PMTiles chart — its bundle manifest
  * carries the cell inventory); -1 on error. */
 int tile57_chart_cells(tile57_chart *chart, uint8_t **out, size_t *out_len);
@@ -275,7 +275,7 @@ int tile57_chart_cells(tile57_chart *chart, uint8_t **out, size_t *out_len);
  * is LFIL (the human chart title; empty when absent); `impl` is BIN/ASC/TXT;
  * `bbox` is omitted when SLAT/WLON/NLAT/ELON are not all present (aux files).
  * Not chart-scoped: the catalogue describes an exchange set, not an open
- * chart. Returns 1 with *out/*out_len holding the JSON (free with
+ * chart. Returns 1 with *out / *out_len holding the JSON (free with
  * tile57_free); 0 if the file holds no CATD records; -1 on parse error. */
 int tile57_catalog_entries(const uint8_t *catalog_031, size_t len,
                            uint8_t **out, size_t *out_len);
@@ -286,13 +286,13 @@ int tile57_catalog_entries(const uint8_t *catalog_031, size_t len,
  * soundings, LineString/Point as encoded), properties = {"class":"DEPARE",
  * ...the feature's full S-57 acronym->value attribute map}. Parsed without
  * portrayal; a whole-ENC_ROOT query walks every cell — the caller owns that
- * cost. Returns 1 with *out/*out_len holding the JSON (free with
+ * cost. Returns 1 with *out / *out_len holding the JSON (free with
  * tile57_free); 0 if no features matched; -1 on error. */
 int tile57_chart_features(tile57_chart *chart, const char *classes,
                           uint8_t **out, size_t *out_len);
 
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
- * colortables, atlases, …), passing the same length. The universal free. (chart-api.md) */
+ * colortables, atlases, …), passing the same length. The universal free. */
 void tile57_free(void *ptr, size_t len);
 
 /* Drop the in-memory tile cache to bound memory in long-running hosts. Safe to

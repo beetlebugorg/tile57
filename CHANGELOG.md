@@ -59,7 +59,7 @@ C ABI is not yet frozen.
 
 ### Changed — chart-centric C ABI (breaking, pre-1.0)
 - **The tile-source C ABI (`include/tile57.h`) was reworked into a chart-centric
-  surface** (see `chart-api.md`); the internal Zig type `Source` in `src/source.zig`
+  surface** (see `docs/docs/c-api.md`); the internal Zig type `Source` in `src/source.zig`
   is likewise renamed **`Chart`** in `src/chart.zig`, so the engine and the ABI use
   the same word. The opaque handle is `tile57_chart` and the open/serve entry points
   are prefixed `tile57_chart_*`.
