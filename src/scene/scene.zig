@@ -19,6 +19,11 @@ const rs = render.surface;
 /// batch driver of this engine). Re-exported for the CLI + lib root.
 pub const bake_enc = @import("bake_enc.zig");
 
+/// SCAMIN standalone (specs/scamin-standalone.md): cross-cell point-object
+/// matching + SCAMIN union + scale-window eligibility for the *_scamin point/
+/// text layers. Shared by the bake pre-pass and the live per-tile dedup.
+pub const scamin_pts = @import("scamin_pts.zig");
+
 /// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile (optional).
 pub const TileFormat = enum { mvt, mlt };
 const s101 = @import("s100").s101_instr;
@@ -3042,6 +3047,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
 
 test {
     _ = bake_enc;
+    _ = scamin_pts;
 }
 
 // ---- bundle-sourced replay (baked tile -> Surface calls) --------------------

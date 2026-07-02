@@ -552,6 +552,11 @@ pub const Feature = struct {
     rcid: u32,
     prim: u8, // 1=point, 2=line, 3=area, 255=none
     objl: u16, // S-57 object class code
+    /// FOID composite key (AGEN<<48 | FIDN<<32-ish, see foidKey) — the world-wide
+    /// unique feature-object identity (S-57 §7.6.2). The SAME real-world object
+    /// charted in several cells (US3/US4/US5 copies) carries the SAME FOID, so
+    /// cross-cell object matching keys on it. 0 = record had no/short FOID field.
+    foid: u64 = 0,
     refs: []const SpatialRef = &.{}, // FSPT spatial pointers
     attrs: []const Attr = &.{}, // ATTF attributes
 
@@ -1479,7 +1484,13 @@ fn mergeFile(
             }
             const ruin: u8 = if (is_update) frid[11] else 1;
             var f = Feature{ .rcnm = frid[0], .rcid = u32le(frid, 1), .prim = frid[5], .objl = u16le(frid, 7) };
-            const key = if (rec.field("FOID")) |fo| foidKey(fo) else vkey.of(f.rcnm, f.rcid);
+            // Merge key: FOID when the field is present (a short/garbled FOID keys
+            // as 0, matching the historical behaviour), else (RCNM,RCID).
+            var key = vkey.of(f.rcnm, f.rcid);
+            if (rec.field("FOID")) |fo| {
+                f.foid = foidKey(fo);
+                key = f.foid;
+            }
 
             if (ruin == 2) {
                 // See the spatial-delete note: drop the index entry so re-INSERT
