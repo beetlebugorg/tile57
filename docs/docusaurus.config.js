@@ -51,7 +51,7 @@ const config = {
         title: 'tile57',
         items: [
           {
-            href: 'https://github.com/beetlebugorg/chartplotter',
+            href: 'https://github.com/beetlebugorg/chartplotter-go',
             label: 'chartplotter-go',
             position: 'right',
           },
@@ -81,8 +81,8 @@ const config = {
                 href: 'https://github.com/beetlebugorg/tile57',
               },
               {
-                label: 'chartplotter-go (reference impl)',
-                href: 'https://github.com/beetlebugorg/chartplotter',
+                label: 'chartplotter-go (the chart-plotter app)',
+                href: 'https://github.com/beetlebugorg/chartplotter-go',
               },
             ],
           },
