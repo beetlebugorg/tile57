@@ -119,6 +119,10 @@ pub fn main(init: std.process.Init) !void {
         return runRender(io, arena, args, .pdf);
     }
 
+    if (std.mem.eql(u8, sub, "ascii")) {
+        return runAscii(io, arena, args);
+    }
+
     if (std.mem.eql(u8, sub, "cells")) {
         // Per-cell metadata JSON (the tile57_chart_cells ABI).
         if (args.len < 3) {
@@ -962,6 +966,67 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
     }
 }
 
+// tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom>
+//     [--size COLSxROWS] [--palette day|dusk|night] [--ansi] [--rules DIR]
+// The chart on stdout as a Unicode text grid — the render-engine EXAMPLE
+// backend (src/render/ascii.zig): the same chart layer + view driver as
+// `tile57 png`, with the AsciiSurface at the end instead of the pixel one.
+fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS] [--palette day|dusk|night] [--ansi] [--rules DIR]\n", .{});
+        return;
+    }
+    const path = args[2];
+    var cols: u32 = 100;
+    var rows: u32 = 36;
+    var palette: render.resolve.PaletteId = .day;
+    var rules: ?[]const u8 = null;
+    var ansi = false;
+    var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
+    var f = Flags{ .args = args, .i = 2 };
+    while (f.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--view")) {
+            const v = f.next() orelse return usageErr("--view needs lon,lat,zoom");
+            var it = std.mem.splitScalar(u8, v, ',');
+            const lon = std.fmt.parseFloat(f64, it.next() orelse "") catch return usageErr("bad --view lon");
+            const lat = std.fmt.parseFloat(f64, it.next() orelse "") catch return usageErr("bad --view lat");
+            const zm = std.fmt.parseFloat(f64, it.next() orelse "") catch return usageErr("bad --view zoom");
+            view = .{ .lon = lon, .lat = lat, .zoom = zm };
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            const v = f.next() orelse return usageErr("--size needs COLSxROWS");
+            const xi = std.mem.indexOfScalar(u8, v, 'x') orelse return usageErr("bad --size");
+            cols = std.fmt.parseInt(u32, v[0..xi], 10) catch return usageErr("bad --size");
+            rows = std.fmt.parseInt(u32, v[xi + 1 ..], 10) catch return usageErr("bad --size");
+        } else if (std.mem.eql(u8, arg, "--palette")) {
+            const v = f.next() orelse return usageErr("--palette needs a value");
+            palette = std.meta.stringToEnum(render.resolve.PaletteId, v) orelse return usageErr("palette must be day|dusk|night");
+        } else if (std.mem.eql(u8, arg, "--rules")) {
+            rules = f.next() orelse return usageErr("--rules needs a dir");
+        } else if (std.mem.eql(u8, arg, "--ansi")) {
+            ansi = true;
+        } else return usageErr("unknown flag");
+    }
+    const v = view orelse return usageErr("--view lon,lat,zoom is required");
+    if (cols == 0 or rows == 0) return usageErr("--size must be positive");
+
+    engine.portray.setQuiet(true);
+    const c = if (std.mem.endsWith(u8, path, ".pmtiles")) blk: {
+        const data = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
+        break :blk chart.Chart.openBytes(data, .pmtiles, rules) catch return usageErr("cannot open bundle");
+    } else chart.Chart.openPath(path, rules, false) catch return usageErr("cannot open source");
+    defer c.deinit();
+
+    var m = render.resolve.MarinerSettings{ .display_other = true };
+    m.scheme = switch (palette) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+    const text = c.renderAscii(v.lon, v.lat, v.zoom, cols, rows, palette, &m, ansi) catch return usageErr("render failed");
+    defer chart.freeBytes(text);
+    std.Io.File.stdout().writeStreamingAll(io, text) catch {};
+}
+
 fn usageErr(msg: []const u8) void {
     std.debug.print("error: {s}\n\n", .{msg});
     printUsage();
@@ -1005,6 +1070,9 @@ fn printUsage() void {
         \\      Sources: an S-57 cell (live portrayal) or a baked .pmtiles
         \\      bundle (tile replay). --dq data-quality overlay; --scale F
         \\      physical-size multiplier; --palette day|dusk|night.
+        \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS] [--ansi]
+        \\      The chart on stdout as a Unicode text grid (the example render
+        \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
         \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)

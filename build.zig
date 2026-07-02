@@ -547,6 +547,16 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tiles", .module = tiles_mod },
     });
     pixel_golden.addImport("colorprofile_registry", colorprofile_registry);
+    // The ASCII backend's engine test: same fixture-cell pattern as the pixel
+    // golden, but asserting structural grid properties, never golden bytes.
+    const ascii_view = addPkgTest(b, test_step, "src/render/ascii_view_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "scene", .module = scene_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+    });
+    ascii_view.addImport("colorprofile_registry", colorprofile_registry);
     // bindings/ shared settings parser (used by the wasm engine + parity oracle).
     _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{
         .{ .name = "assets", .module = assets_mod },
