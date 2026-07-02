@@ -1306,6 +1306,64 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             }
         }
 
+        // Fill-down: an area charted only by bands FINER than the globally-coarsest
+        // populated band (e.g. a bay with just coastal/approach cells while the
+        // pack's overview cells lie elsewhere) gets no tiles below this band's
+        // window — the district-pack "empty z6–z8 hole". extend_min only reaches
+        // the ONE coarsest band; here each defer_down band fills its below-window
+        // zooms where no strictly-coarser band covers (bake_enc.bakeFillDown,
+        // mirroring the live tileRefs fallbackBand). Only cells not blanketed by a
+        // coarser band participate, so the extra load stays bounded.
+        if (floor == .defer_down and n_own > 0 and Bands.fillDownZooms(band, minzoom, maxzoom) != null) {
+            var coarser = std.ArrayList(Bands.CoarserBox).empty;
+            defer coarser.deinit(gpa);
+            for (Bands.bands_fine_to_coarse) |cb| {
+                if (@intFromEnum(cb) <= @intFromEnum(band)) continue; // strictly coarser
+                const mz = Bands.bandZooms(cb).max;
+                for (band_cells[@intFromEnum(cb)].items) |ce| coarser.append(gpa, .{ .bbox = ce.bbox, .max_z = mz }) catch {};
+            }
+            var fd = std.ArrayList(u32).empty; // own cells with area a coarser band leaves uncovered
+            defer fd.deinit(gpa);
+            for (0..n_own) |ci| {
+                if (!Bands.coveredByCoarser(pass_entries[ci].bbox, coarser.items)) fd.append(gpa, @intCast(ci)) catch {};
+            }
+            if (fd.items.len > 0) {
+                // (Re)load the uncovered cells' geometry (portrayal is resident) —
+                // fill-down tiles are broad low-zoom, so no super-tile clip applies.
+                var miss = std.ArrayList(u32).empty;
+                defer miss.deinit(gpa);
+                for (fd.items) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(gpa, ci) catch {};
+                if (miss.items.len > 0) {
+                    var lw = LoadWork{ .cells = miss.items, .entries = pass_entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = gpa };
+                    Bands.parallelFor(gpa, miss.items.len, &lw, LoadWork.run);
+                    for (miss.items) |ci| {
+                        if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
+                    }
+                }
+                var subset = std.ArrayList(Bands.Backend).empty;
+                defer subset.deinit(gpa);
+                for (fd.items) |ci| if (geom[ci]) |g| {
+                    const p = portray[ci];
+                    subset.append(gpa, .{
+                        .cell = g.cell,
+                        .portrayal = if (p) |pp| pp.base else null,
+                        .portrayal_plain = if (p) |pp| pp.plain else null,
+                        .portrayal_simplified = if (p) |pp| pp.simplified else null,
+                        .geo = g.geo,
+                        .geo_world = g.geo_world,
+                        .feat_bbox = g.feat_bbox,
+                        .bounds = if (p) |pp| pp.bounds else pass_entries[ci].bbox,
+                        .cscl = g.cell.params.cscl,
+                        .coverage = g.coverage,
+                        .scamins = g.scamins,
+                        .light_bbox = if (p) |pp| pp.light.bbox else pass_entries[ci].light.bbox,
+                        .light_range_m = if (p) |pp| pp.light.range_m else pass_entries[ci].light.range_m,
+                    }) catch continue;
+                };
+                baker.bakeFillDown(band, subset.items, coarser.items, prog, progress_user) catch {};
+            }
+        }
+
         // The carry block's ride ends here: free the finer band's remaining
         // geometry + portrayal. The own block either becomes the NEXT pass's carry
         // (deferred — its floor tiles bake there) or is freed with it.

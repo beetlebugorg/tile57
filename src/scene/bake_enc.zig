@@ -812,7 +812,164 @@ pub const Baker = struct {
         }
         if (progress) |cb| cb(ctx, 1, self.count - self.band_base, self.band_total, self.band_index, self.band_count, bname);
     }
+
+    /// Bake a band's FILL-DOWN tiles: the zooms BELOW its native window
+    /// (bandZooms(band).min) at the areas where it is the coarsest band covering
+    /// the ground. `extend_min` gives the *globally* coarsest populated band a
+    /// fill to minzoom, but a location covered only by bands FINER than that one
+    /// (e.g. a bay charted just by coastal/approach cells while the pack's only
+    /// overview cells lie elsewhere) gets no low-zoom tiles — the district-pack
+    /// "empty z6–z8 hole". The live tileRefs path fills such a tile from the
+    /// coarsest cell whose bbox overlaps it (fallbackBand); this mirrors that in
+    /// the banded bake so a bundle bake matches the live oracle.
+    ///
+    /// `coarser` = the footprints of every strictly-coarser populated band's
+    /// cells (bbox + that band's max zoom). A fill-down tile is skipped where any
+    /// such box with `max_z >= z` overlaps it — that coarser band produces the
+    /// tile (natively or via its own fill), so it owns it (coarsest-covering
+    /// wins). `backends` should already be filtered by the caller to the cells
+    /// not wholly blanketed by a coarser band (coveredByCoarser) so no work is
+    /// wasted loading fully-covered cells. Call AFTER the band's bakeBand pass
+    /// (finest→coarsest), with the same overlay/emitted state.
+    pub fn bakeFillDown(self: *Baker, band: Band, backends: []Backend, coarser: []const CoarserBox, progress: Progress, ctx: ?*anyopaque) !void {
+        if (backends.len == 0) return;
+        if (fillDownZooms(band, self.minzoom, self.maxzoom) == null) return;
+
+        const spans = try self.gpa.alloc(CellSpan, backends.len);
+        defer self.gpa.free(spans);
+        for (backends, 0..) |be, i| {
+            // These cells were already union'd into the header by their bakeBand
+            // pass; re-min/max is idempotent, so union stays correct even for a
+            // cell that only ever contributes fill-down tiles.
+            spans[i] = .{ .bounds = be.bounds, .light_bbox = be.light_bbox, .light_range_m = be.light_range_m };
+            self.union_b[0] = @min(self.union_b[0], be.bounds[0]);
+            self.union_b[1] = @min(self.union_b[1], be.bounds[1]);
+            self.union_b[2] = @max(self.union_b[2], be.bounds[2]);
+            self.union_b[3] = @max(self.union_b[3], be.bounds[3]);
+        }
+
+        var tilemap = try self.buildFillDownMap(band, spans, coarser);
+        defer {
+            var vit = tilemap.valueIterator();
+            while (vit.next()) |v| v.deinit(self.gpa);
+            tilemap.deinit();
+        }
+
+        // Generate + collect exactly like bakeBand (kept separate so bakeBand
+        // stays byte-identical; fill-down tiles are below the band's window so no
+        // finer cell rides them — the overscale-hatch default of "off" is right).
+        const n = tilemap.count();
+        if (n == 0) return;
+        const keys = try self.gpa.alloc(u64, n);
+        defer self.gpa.free(keys);
+        const idx_lists = try self.gpa.alloc([]const u32, n);
+        defer self.gpa.free(idx_lists);
+        {
+            var it = tilemap.iterator();
+            var j: usize = 0;
+            while (it.next()) |e| : (j += 1) {
+                keys[j] = e.key_ptr.*;
+                idx_lists[j] = e.value_ptr.items;
+            }
+        }
+        const results = try self.gpa.alloc(?[]u8, n);
+        defer self.gpa.free(results);
+        @memset(results, null);
+
+        const bname: [*:0]const u8 = @tagName(band).ptr;
+        var done = std.atomic.Value(usize).init(0);
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
+        parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
+
+        for (keys, results) |key, mvt_opt| {
+            const mvt_bytes = mvt_opt orelse continue;
+            defer self.gpa.free(mvt_bytes);
+            try self.sink.func(self.sink.ctx, @intCast(key >> 48), @intCast((key >> 24) & 0xFFFFFF), @intCast(key & 0xFFFFFF), mvt_bytes);
+            try self.emitted.put(key, {});
+            self.count += 1;
+        }
+        if (progress) |cb| cb(ctx, 1, self.count - self.band_base, self.band_total, self.band_index, self.band_count, bname);
+    }
+
+    /// Build the fill-down tile→contributor map (see bakeFillDown): every
+    /// not-yet-emitted (z,x,y) with z in [minzoom .. band.min-1] a cell's bbox
+    /// covers, EXCEPT those a strictly-coarser producing band already owns.
+    fn buildFillDownMap(self: *Baker, band: Band, spans: []const CellSpan, coarser: []const CoarserBox) !std.AutoHashMap(u64, std.ArrayList(u32)) {
+        var tilemap = std.AutoHashMap(u64, std.ArrayList(u32)).init(self.gpa);
+        errdefer {
+            var vit = tilemap.valueIterator();
+            while (vit.next()) |v| v.deinit(self.gpa);
+            tilemap.deinit();
+        }
+        const fz = fillDownZooms(band, self.minzoom, self.maxzoom) orelse return tilemap;
+        for (spans, 0..) |sp, i| {
+            const b = sp.bounds;
+            var z = fz.min;
+            while (z <= fz.max) : (z += 1) {
+                const nw = lonLatToTile(b[0], b[3], z);
+                const se = lonLatToTile(b[2], b[1], z);
+                var ty = nw[1];
+                while (ty <= se[1]) : (ty += 1) {
+                    var tx = nw[0];
+                    while (tx <= se[0]) : (tx += 1) {
+                        const key = tileKey(z, tx, ty);
+                        if (self.emitted.contains(key)) continue; // a finer/coarser band has it
+                        const tb = tile.tileBoundsLonLat(z, tx, ty); // [w,s,e,n]
+                        var gated = false;
+                        for (coarser) |cb| {
+                            if (cb.max_z >= z and bboxOverlap(cb.bbox, tb)) {
+                                gated = true;
+                                break;
+                            }
+                        }
+                        if (gated) continue; // the coarser band owns this tile
+                        const gop = try tilemap.getOrPut(key);
+                        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                        try gop.value_ptr.append(self.gpa, @intCast(i));
+                    }
+                }
+            }
+        }
+        return tilemap;
+    }
 };
+
+/// A strictly-coarser band's cell footprint for the fill-down gate: the cell's
+/// bbox [w,s,e,n] and the max zoom its band produces tiles at
+/// (bandZooms(band).max). A fill-down tile at zoom z is owned by the coarser
+/// band where any such box with `max_z >= z` overlaps it (that band produces the
+/// tile natively or via its own fill), matching the live fallbackBand
+/// "coarsest-covering wins".
+pub const CoarserBox = struct { bbox: [4]f64, max_z: u8 };
+
+fn bboxOverlap(a: [4]f64, b: [4]f64) bool {
+    return a[0] <= b[2] and a[2] >= b[0] and a[1] <= b[3] and a[3] >= b[1];
+}
+
+/// Whether a cell's bbox is wholly inside some single strictly-coarser cell's
+/// bbox — the cheap driver-side pre-filter that skips loading a cell for the
+/// fill-down pass when a coarser band certainly blankets it (the per-tile gate
+/// would suppress all its fill-down tiles anyway). Conservative: a cell covered
+/// only by a UNION of coarser boxes is still loaded, then contributes nothing.
+pub fn coveredByCoarser(bbox: [4]f64, coarser: []const CoarserBox) bool {
+    for (coarser) |c| {
+        if (bbox[0] >= c.bbox[0] and bbox[2] <= c.bbox[2] and
+            bbox[1] >= c.bbox[1] and bbox[3] <= c.bbox[3]) return true;
+    }
+    return false;
+}
+
+/// A band's fill-down zoom span under the archive clamp: [minzoom ..
+/// min(maxzoom, band.min-1)] — the zooms below its native window it must fill
+/// where it is the coarsest covering band. Null when the band is the coarsest
+/// (min==0, nothing below) or the span is empty under the clamp.
+pub fn fillDownZooms(band: Band, minzoom: u8, maxzoom: u8) ?ZoomRange {
+    const fl = bandZooms(band).min;
+    if (fl == 0) return null;
+    const zhi = @min(maxzoom, fl - 1);
+    if (minzoom > zhi) return null;
+    return .{ .min = minzoom, .max = zhi };
+}
 
 test "quantizeHandoff: smallest ladder value >= cscl, raw-cscl fallback" {
     const fine = [_]u32{ 90_000, 260_000, 350_000 };
@@ -1025,6 +1182,145 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     // coarsest-band extension even though nothing coarser was baked).
     const t7 = lonLatToTile(0.35, 0.35, 7);
     try std.testing.expect(sink.tiles.get(tileKey(7, t7[0], t7[1])) != null);
+}
+
+test "fillDownZooms / coveredByCoarser" {
+    // Below-window fill span = [minzoom .. band.min-1], clamped; coarsest band and
+    // clamped-out spans yield null.
+    try std.testing.expectEqual(@as(?ZoomRange, .{ .min = 0, .max = 8 }), fillDownZooms(.coastal, 0, 12));
+    try std.testing.expectEqual(@as(?ZoomRange, .{ .min = 3, .max = 8 }), fillDownZooms(.coastal, 3, 12));
+    try std.testing.expectEqual(@as(?ZoomRange, null), fillDownZooms(.overview, 0, 12)); // coarsest: nothing below
+    try std.testing.expectEqual(@as(?ZoomRange, null), fillDownZooms(.coastal, 9, 12)); // minzoom >= floor
+    try std.testing.expectEqual(@as(?ZoomRange, .{ .min = 8, .max = 10 }), fillDownZooms(.approach, 8, 12)); // below approach.min=11
+    try std.testing.expectEqual(@as(?ZoomRange, null), fillDownZooms(.approach, 11, 12)); // clamped out (min>=floor)
+
+    const boxes = [_]CoarserBox{.{ .bbox = .{ -80, 30, -70, 40 }, .max_z = 7 }};
+    try std.testing.expect(coveredByCoarser(.{ -76, 38, -75, 39 }, &boxes)); // inside
+    try std.testing.expect(!coveredByCoarser(.{ -76, 38, -69, 39 }, &boxes)); // spills east
+    try std.testing.expect(!coveredByCoarser(.{ -76, 38, -75, 39 }, &.{})); // nothing coarser
+}
+
+test "fill-down map: coastal-only area fills below its window; a covering coarser band gates it" {
+    const gpa = std.testing.allocator;
+    var sink = CollectSink{ .a = gpa, .tiles = std.AutoHashMap(u64, []u8).init(gpa) };
+    defer sink.tiles.deinit();
+    var baker = Baker.init(gpa, 0, 12, .{ .ctx = &sink, .func = CollectSink.run });
+    defer baker.deinit();
+
+    // A coastal cell over a bay (~ -76.45, 38.90). Fill-down zooms are 0..8.
+    const bay = [4]f64{ -76.6, 38.8, -76.3, 39.0 };
+    const spans = [_]CellSpan{.{ .bounds = bay }};
+    const t8 = lonLatToTile(-76.45, 38.90, 8);
+    const t6 = lonLatToTile(-76.45, 38.90, 6);
+
+    const freeMap = struct {
+        fn f(m: *std.AutoHashMap(u64, std.ArrayList(u32)), g: std.mem.Allocator) void {
+            var vit = m.valueIterator();
+            while (vit.next()) |v| v.deinit(g);
+            m.deinit();
+        }
+    }.f;
+
+    // No coarser band covers the bay: every z0..8 tile it touches fills (the fix —
+    // old behavior baked none of these, leaving the district-pack z6–z8 hole).
+    {
+        var m = try baker.buildFillDownMap(.coastal, &spans, &.{});
+        defer freeMap(&m, gpa);
+        try std.testing.expect(m.count() > 0);
+        try std.testing.expect(m.contains(tileKey(8, t8[0], t8[1])));
+        try std.testing.expect(m.contains(tileKey(6, t6[0], t6[1])));
+    }
+
+    // An OVERVIEW cell (max zoom 7) whose bbox covers the bay owns z0..7 — but not
+    // z8 (7 < 8), so the coastal cell still fills the inter-band-gap zoom.
+    {
+        const ov = [_]CoarserBox{.{ .bbox = .{ -78, 38, -75, 40 }, .max_z = bandZooms(.overview).max }};
+        var m = try baker.buildFillDownMap(.coastal, &spans, &ov);
+        defer freeMap(&m, gpa);
+        try std.testing.expect(m.contains(tileKey(8, t8[0], t8[1]))); // z8: not gated
+        try std.testing.expect(!m.contains(tileKey(6, t6[0], t6[1]))); // z6: overview owns it
+    }
+
+    // A GENERAL cell (max zoom 9) covering the bay produces every z0..8 tile, so
+    // the coastal fill-down is fully gated — the reason a subset WITH the general
+    // cell present (51-/340-cell sets) never reproduces the hole.
+    {
+        const gen = [_]CoarserBox{.{ .bbox = .{ -78, 38, -75, 40 }, .max_z = bandZooms(.general).max }};
+        var m = try baker.buildFillDownMap(.coastal, &spans, &gen);
+        defer freeMap(&m, gpa);
+        try std.testing.expectEqual(@as(usize, 0), m.count());
+    }
+
+    // A tile a coarser pass already emitted is never re-baked.
+    {
+        try baker.emitted.put(tileKey(8, t8[0], t8[1]), {});
+        var m = try baker.buildFillDownMap(.coastal, &spans, &.{});
+        defer freeMap(&m, gpa);
+        try std.testing.expect(!m.contains(tileKey(8, t8[0], t8[1])));
+    }
+}
+
+test "fill-down bake: a coastal-only bay gets low-zoom tiles the overview extend_min misses" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A coastal 1:200k cell over a bay near (0.35,0.35); the pack's only OVERVIEW
+    // cell sits far away (10.5,10.5) — populated (so IT is the globally-coarsest
+    // band the extend_min fill rides), but it does not cover the bay. Without
+    // fill-down the bay has no tiles below coastal's window (z<9): the reported
+    // district-pack z6–z8 hole.
+    const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
+    const feats = [_]s57.Feature{.{
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &scamin_attr,
+    }};
+    var bay_cell = try testCell(gpa, 0.35, 0.35, 200_000, &feats);
+    defer bay_cell.deinit();
+    var ov_cell = try testCell(gpa, 10.5, 10.5, 3_000_000, &feats);
+    defer ov_cell.deinit();
+
+    const ring = [_]s57.LonLat{
+        s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2),
+        s57.LonLat.init(3, 3),   s57.LonLat.init(-2, 3),
+        s57.LonLat.init(-2, -2),
+    };
+    const rings = [_][]const s57.LonLat{&ring};
+    const cover = [_][]const []const s57.LonLat{&rings};
+    const bay_bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
+    const ov_bounds = [4]f64{ 10.2, 10.2, 10.8, 10.8 };
+    const streams = [_]?[]const u8{"DrawingPriority:7;PointInstruction:BOYLAT01"};
+    const scamins = [_]u32{260_000};
+
+    var bay = Backend{ .cell = bay_cell, .portrayal = &streams, .bounds = bay_bounds, .cscl = 200_000, .coverage = &cover, .scamins = &scamins };
+    var ov = Backend{ .cell = ov_cell, .portrayal = &streams, .bounds = ov_bounds, .cscl = 3_000_000, .coverage = &cover, .scamins = &scamins };
+
+    var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
+    var baker = Baker.init(gpa, 0, 12, .{ .ctx = &sink, .func = CollectSink.run });
+    defer baker.deinit();
+
+    // Driver order (finest→coarsest): coastal native pass, coastal fill-down gated
+    // by the strictly-coarser overview footprint, then the overview extend_min pass.
+    const overview_box = [_]CoarserBox{.{ .bbox = ov_bounds, .max_z = bandZooms(.overview).max }};
+    try baker.bakeBand(.coastal, (&bay)[0..1], 1, .defer_down, null, null, null);
+    try baker.bakeFillDown(.coastal, (&bay)[0..1], &overview_box, null, null);
+    try baker.bakeBand(.overview, (&ov)[0..1], 1, .extend_min, null, null, null);
+
+    // The bay's below-window tiles now carry content (the fix). Old behavior: none.
+    for ([_]u8{ 6, 7, 8 }) |z| {
+        const t = lonLatToTile(0.35, 0.35, z);
+        try std.testing.expect(sink.tiles.get(tileKey(z, t[0], t[1])) != null);
+    }
+    // The far-away overview extend_min tiles did not spill onto the bay column.
+    const ov_t6 = lonLatToTile(10.5, 10.5, 6);
+    const bay_t6 = lonLatToTile(0.35, 0.35, 6);
+    try std.testing.expect(sink.tiles.get(tileKey(6, ov_t6[0], ov_t6[1])) != null);
+    try std.testing.expect(ov_t6[0] != bay_t6[0] or ov_t6[1] != bay_t6[1]);
 }
 
 test "overscale: a coarse cell occluded everywhere by finer coverage emits NO hatch (specs/overscale.md v3 defect 2)" {
