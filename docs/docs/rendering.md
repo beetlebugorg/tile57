@@ -1,10 +1,9 @@
 # The Rendering Engine
 
-tile57 doesn't just make vector tiles anymore. It contains a full **native
-S-52 rendering engine** that can draw a finished chart — raster PNG or vector
-PDF — straight from ENC cells, with no MapLibre, browser, or GPU involved.
-This page explains how it works in plain language, how to use it, and how to
-extend it.
+tile57 contains a full **native S-52 rendering engine**: it draws a finished
+chart — raster PNG or vector PDF — straight from ENC cells, with no MapLibre,
+browser, or GPU involved. This page explains how it works, how to use it, and
+how to extend it.
 
 ## The one-paragraph version
 
