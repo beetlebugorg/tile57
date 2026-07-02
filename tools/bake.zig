@@ -123,6 +123,10 @@ pub fn main(init: std.process.Init) !void {
         return runAscii(io, arena, args);
     }
 
+    if (std.mem.eql(u8, sub, "explore") or std.mem.eql(u8, sub, "inspect-s57")) {
+        return runExplore(io, arena, args);
+    }
+
     if (std.mem.eql(u8, sub, "cells")) {
         // Per-cell metadata JSON (the tile57_chart_cells ABI).
         if (args.len < 3) {
@@ -1555,6 +1559,707 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
     }
 }
 
+// ===========================================================================
+// `tile57 explore` — the S-57 + S-101 learning / debug tool.
+//
+// For every feature of a cell it surfaces THREE data levels the engine already
+// computes (it invents nothing):
+//   1. Raw S-57       — object-class acronym + the acronym→value attribute map
+//                       + geometry primitive (s57.Cell + catalogue).
+//   2. S-101 portrayal — the ';'-separated Key:Value instruction stream the Lua
+//                       rules emit (portray.portrayCell), RAW and PARSED into
+//                       symbols / lines / fills / texts / aug figures
+//                       (s101_instr.parse).
+//   3. Lowered calls  — what the portrayal BECOMES after geometry resolution:
+//                       the Surface vtable calls, captured by the recording
+//                       InspectSurface (render/inspect.zig) driven through
+//                       scene.appendTile, matched back to each feature by its
+//                       S-57 attribute fingerprint (FeatureMeta.s57_json).
+// ===========================================================================
+
+const ExAttr = struct { acr: []const u8, code: u16, value: []const u8 };
+
+const ExLevel3 = struct {
+    calls: []const render.inspect.Call,
+    z: u8,
+    x: u32,
+    y: u32,
+    matched: bool, // this feature was found in the sampled tile (else out of view)
+};
+
+const ExRow = struct {
+    cell_name: []const u8,
+    index: usize, // feature index within its cell
+    rcid: u32,
+    foid: u64,
+    prim: u8,
+    objl: u16,
+    class: []const u8, // S-57 acronym ("LIGHTS") or "?<objl>"
+    s101: []const u8, // S-101 feature-class name ("Light") or ""
+    attrs: []const ExAttr,
+    raw: ?[]const u8, // level 2: raw instruction stream
+    parsed: ?engine.s101_instr.Portrayal, // level 2: parsed
+    lowered: ?ExLevel3, // level 3
+};
+
+const ExFilters = struct {
+    classes: ?[]const u8 = null, // comma-separated acronym allow-list
+    obj: ?u64 = null, // match feature index OR rcid OR foid
+    zoom: ?f64 = null, // override the auto fit-zoom for the lowering pass
+    do_lower: bool = true,
+};
+
+fn exPrimName(p: u8) []const u8 {
+    return switch (p) {
+        1 => "point",
+        2 => "line",
+        3 => "area",
+        255 => "none",
+        else => "?",
+    };
+}
+
+fn exCatName(c: i64) []const u8 {
+    return switch (c) {
+        0 => "base",
+        1 => "standard",
+        2 => "other",
+        else => "?",
+    };
+}
+
+// The largest zoom (<= `cap`) at which the whole cell bbox falls inside a SINGLE
+// web-mercator tile — so one appendTile pass records every feature, and at the
+// finest such zoom the cell nearly fills the 4096-unit tile (geometry stays crisp
+// rather than collapsing). bounds = [west, south, east, north].
+fn exFitTile(bounds: [4]f64, cap: u8) ExLevel3 {
+    const nw = engine.tile.lonLatToWorld(bounds[0], bounds[3]); // (min x, min y: y grows south)
+    const se = engine.tile.lonLatToWorld(bounds[2], bounds[1]); // (max x, max y)
+    var z: u8 = cap;
+    while (true) : (z -= 1) {
+        const n = @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+        const x0: i64 = @intFromFloat(@floor(nw[0] * n));
+        const x1: i64 = @intFromFloat(@floor(se[0] * n));
+        const y0: i64 = @intFromFloat(@floor(nw[1] * n));
+        const y1: i64 = @intFromFloat(@floor(se[1] * n));
+        if ((x0 == x1 and y0 == y1) or z == 0)
+            return .{ .calls = &.{}, .z = z, .x = @intCast(@max(0, x0)), .y = @intCast(@max(0, y0)), .matched = false };
+    }
+}
+
+// The tile containing the cell centre at an explicit zoom (--zoom override).
+fn exTileAt(bounds: [4]f64, zoom: f64) ExLevel3 {
+    const z: u8 = @intFromFloat(std.math.clamp(@round(zoom), 0, 22));
+    const c = engine.tile.lonLatToWorld((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0);
+    const n = @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+    return .{ .calls = &.{}, .z = z, .x = @intFromFloat(@floor(c[0] * n)), .y = @intFromFloat(@floor(c[1] * n)), .matched = false };
+}
+
+fn exClassMatches(list: []const u8, acr: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |w| {
+        const t = std.mem.trim(u8, w, " ");
+        if (t.len > 0 and std.ascii.eqlIgnoreCase(t, acr)) return true;
+    }
+    return false;
+}
+
+// Feature fingerprint = class + NUL + acronym→value blob. The SAME key the
+// recording surface sees (FeatureMeta.class / .s57_json), so a recorded draw pass
+// matches its source feature. Allocated into `a`.
+fn exKey(a: std.mem.Allocator, class: []const u8, s57_json: []const u8) []const u8 {
+    return std.fmt.allocPrint(a, "{s}\x00{s}", .{ class, s57_json }) catch class;
+}
+
+const ExQueue = struct { idxs: std.ArrayList(usize) = .empty, head: usize = 0 };
+
+// Collect one parsed cell's features into `rows` (levels 1+2 always; level 3 when
+// do_lower and the cell has bounds). Strings a Row keeps are duped into `a`, so
+// the caller may deinit the cell afterwards.
+fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8, rules: []const u8, F: ExFilters, rows: *std.ArrayList(ExRow)) !void {
+    // Level 2 — S-101 instruction streams, indexed by feature index.
+    const portrayal: ?[]const ?[]const u8 = engine.portray.portrayCell(a, cell, rules) catch null;
+
+    // Level 3 — drive the recording surface once over the whole cell, then index
+    // the recorded passes by fingerprint for per-feature lookup below.
+    var recorded: []const render.inspect.RecordedFeature = &.{};
+    var qmap = std.StringHashMap(ExQueue).init(a);
+    var lower_view: ?ExLevel3 = null;
+    if (F.do_lower) {
+        if (cell.bounds()) |b| {
+            const v = if (F.zoom) |zz| exTileAt(b, zz) else exFitTile(b, 19);
+            var is = render.inspect.InspectSurface.init(a);
+            const surf = is.asSurface();
+            surf.beginScene(v.z) catch {};
+            const one = [_]engine.scene.CellRef{.{ .cell = cell, .portrayal = portrayal }};
+            engine.scene.appendTile(surf, a, &one, v.z, v.x, v.y, true) catch {};
+            _ = surf.endScene(a) catch {};
+            recorded = is.features.items;
+            for (recorded, 0..) |rf, ri| {
+                const key = exKey(a, rf.meta.class, rf.meta.s57_json);
+                const gop = try qmap.getOrPut(key);
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                try gop.value_ptr.idxs.append(a, ri);
+            }
+            lower_view = v;
+        }
+    }
+
+    const cell_name = try a.dupe(u8, if (name.len > 0) name else cell.name);
+
+    for (cell.features, 0..) |f, fi| {
+        const class = engine.catalogue.acronymByObjl(f.objl);
+        if (F.classes) |cl| {
+            if (class == null or !exClassMatches(cl, class.?)) continue;
+        }
+        if (F.obj) |want| {
+            if (fi != want and f.rcid != want and f.foid != want) continue;
+        }
+
+        var attrs = std.ArrayList(ExAttr).empty;
+        for (f.attrs) |at| {
+            const acr = engine.catalogue.attrAcronym(at.code) orelse
+                std.fmt.allocPrint(a, "?{d}", .{at.code}) catch "?";
+            try attrs.append(a, .{ .acr = acr, .code = at.code, .value = try a.dupe(u8, std.mem.trim(u8, at.value, " ")) });
+        }
+
+        const raw: ?[]const u8 = if (portrayal) |p| (if (fi < p.len) p[fi] else null) else null;
+        const parsed: ?engine.s101_instr.Portrayal = if (raw) |s| (engine.s101_instr.parse(a, s) catch null) else null;
+
+        var lowered: ?ExLevel3 = null;
+        if (lower_view) |lv| {
+            var matched = false;
+            var call_items: []const render.inspect.Call = &.{};
+            if (class) |cls| {
+                const s57_json = engine.scene.encodeS57Attrs(a, f) catch "";
+                const key = exKey(a, cls, s57_json);
+                if (qmap.getPtr(key)) |q| if (q.head < q.idxs.items.len) {
+                    // Fold this feature's consecutive recorded passes (boundary/point
+                    // variant passes + constructed sector figures are emitted adjacently)
+                    // into one call list. Caveat: two neighbouring features that share a
+                    // class AND identical attributes (mostly attribute-less areas like
+                    // LNDARE) can merge — attributed features (the tool's focus) are
+                    // distinct, so this is exact for them.
+                    var calls = std.ArrayList(render.inspect.Call).empty;
+                    var idx = q.idxs.items[q.head];
+                    q.head += 1;
+                    try calls.appendSlice(a, recorded[idx].calls.items);
+                    while (q.head < q.idxs.items.len and q.idxs.items[q.head] == idx + 1) {
+                        idx = q.idxs.items[q.head];
+                        q.head += 1;
+                        try calls.appendSlice(a, recorded[idx].calls.items);
+                    }
+                    matched = true;
+                    call_items = calls.items;
+                };
+            }
+            lowered = .{ .calls = call_items, .z = lv.z, .x = lv.x, .y = lv.y, .matched = matched };
+        }
+
+        try rows.append(a, .{
+            .cell_name = cell_name,
+            .index = fi,
+            .rcid = f.rcid,
+            .foid = f.foid,
+            .prim = f.prim,
+            .objl = f.objl,
+            .class = class orelse (std.fmt.allocPrint(a, "?{d}", .{f.objl}) catch "?"),
+            .s101 = engine.catalogue.resolveFeatureByObjl(f.objl) orelse "",
+            .attrs = attrs.items,
+            .raw = raw,
+            .parsed = parsed,
+            .lowered = lowered,
+        });
+    }
+}
+
+// A short list label for a feature: its name (OBJNAM) if any, else a FOID/index.
+fn exLabel(a: std.mem.Allocator, row: ExRow) []const u8 {
+    for (row.attrs) |at| {
+        if (std.mem.eql(u8, at.acr, "OBJNAM") and at.value.len > 0)
+            return std.fmt.allocPrint(a, "{s} {s}", .{ row.class, at.value }) catch row.class;
+    }
+    if (row.foid != 0)
+        return std.fmt.allocPrint(a, "{s} foid:{x}", .{ row.class, row.foid }) catch row.class;
+    return std.fmt.allocPrint(a, "{s} #{d}", .{ row.class, row.index }) catch row.class;
+}
+
+// Format one recorded Surface call in S-52 shorthand (SY/LS/AC/AP/TX + args).
+fn exAppendCall(a: std.mem.Allocator, out: *std.ArrayList(u8), call: render.inspect.Call) !void {
+    switch (call) {
+        .fill_area => |c| {
+            try out.print(a, "    fillArea AC({s})  rings={d} verts={d}", .{ c.token, c.rings, c.verts });
+            if (c.depth) |d| try out.print(a, "  depth={d}..{d}m", .{ d.d1, d.d2 });
+            try out.append(a, '\n');
+        },
+        .fill_pattern => |c| try out.print(a, "    fillPattern AP({s})  rings={d} verts={d}\n", .{ c.name, c.rings, c.verts }),
+        .stroke_line => |c| {
+            try out.print(a, "    strokeLine LS({s},{d:.2},{s})  segs={d} verts={d}", .{ c.token, c.width_px, @tagName(c.dash), c.lines, c.verts });
+            if (c.valdco) |v| try out.print(a, "  valdco={d}", .{v});
+            try out.append(a, '\n');
+        },
+        .draw_symbol => |c| {
+            try out.print(a, "    drawSymbol SY({s}) @({d},{d}) rot={d:.0}{s} scale={d:.2} {s}", .{ c.name, c.at.x, c.at.y, c.rot_deg, if (c.rot_north) "N" else "", c.scale, @tagName(c.placement) });
+            if (c.danger_depth) |d| try out.print(a, " danger={d}m", .{d});
+            try out.append(a, '\n');
+        },
+        .draw_sounding => |c| {
+            try out.print(a, "    drawSounding {d}m", .{c.depth_m});
+            if (c.swept) try out.appendSlice(a, " swept");
+            if (c.low_acc) try out.appendSlice(a, " lowAcc");
+            try out.print(a, " @({d},{d})\n", .{ c.at.x, c.at.y });
+        },
+        .draw_text => |c| try out.print(a, "    drawText TX(\"{s}\") {s} size={d:.0} {s}/{s} @({d},{d})\n", .{ c.text, c.color, c.font_size, c.halign, c.valign, c.at.x, c.at.y }),
+    }
+}
+
+// The full three-level detail for one feature as plain text (shared by the
+// console dump and the TUI right pane).
+fn exFormatDetail(a: std.mem.Allocator, row: ExRow) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+
+    try out.print(a, "[{s} #{d}] {s}", .{ row.cell_name, row.index, row.class });
+    if (row.s101.len > 0) try out.print(a, " ({s})", .{row.s101});
+    try out.print(a, "  prim={s} objl={d} rcid={d}", .{ exPrimName(row.prim), row.objl, row.rcid });
+    if (row.foid != 0) try out.print(a, " foid={x}", .{row.foid});
+    try out.append(a, '\n');
+
+    // Level 1 — raw S-57 attributes.
+    try out.appendSlice(a, "  1. S-57 attributes:\n");
+    if (row.attrs.len == 0) {
+        try out.appendSlice(a, "     (none)\n");
+    } else for (row.attrs) |at| {
+        try out.print(a, "     {s} = {s}\n", .{ at.acr, at.value });
+    }
+
+    // Level 2 — S-101 portrayal instruction stream (raw + parsed).
+    try out.appendSlice(a, "  2. S-101 portrayal instructions:\n");
+    if (row.raw) |raw| {
+        try out.print(a, "     raw: {s}\n", .{raw});
+    } else {
+        try out.appendSlice(a, "     raw: (class unmapped, or emitted nothing)\n");
+    }
+    if (row.parsed) |p| {
+        try out.print(a, "     parsed: prio={d} cat={s} vg={d}", .{ p.draw_prio, exCatName(p.cat), p.vg });
+        if (p.date_start.len > 0 or p.date_end.len > 0) try out.print(a, " date=[{s}..{s}]", .{ p.date_start, p.date_end });
+        try out.append(a, '\n');
+        if (p.fill_token) |t| try out.print(a, "       fill:   AC({s})\n", .{t});
+        for (p.patterns) |pat| try out.print(a, "       pattern: AP({s})\n", .{pat});
+        for (p.lines) |ln| try out.print(a, "       line:   LS({s}, w={d:.2}, {s})\n", .{ ln.style, ln.width, ln.color });
+        for (p.points) |pt| try out.print(a, "       symbol: SY({s}) rot={d:.0}{s} off={d:.2},{d:.2}\n", .{ pt.symbol, pt.rotation, if (pt.rot_north) "N" else "", pt.offset_x, pt.offset_y });
+        for (p.texts) |tx| try out.print(a, "       text:   TX(\"{s}\") {s} size={d:.0} {s}/{s} grp={d}\n", .{ tx.text, tx.color, tx.font_size, tx.halign, tx.valign, tx.group });
+        if (p.aug_figures.len > 0) {
+            var rays: usize = 0;
+            var arcs: usize = 0;
+            for (p.aug_figures) |fig| if (fig.is_ray) {
+                rays += 1;
+            } else {
+                arcs += 1;
+            };
+            try out.print(a, "       augmented: {d} ray(s), {d} arc(s) (light sector figure)\n", .{ rays, arcs });
+        }
+    }
+
+    // Level 3 — lowered Surface calls.
+    try out.appendSlice(a, "  3. Lowered Surface calls:\n");
+    if (row.lowered) |lo| {
+        if (!lo.matched) {
+            try out.print(a, "     (not in the sampled tile z{d} {d}/{d}/{d}; use --zoom to sample a tile it covers)\n", .{ lo.z, lo.z, lo.x, lo.y });
+        } else if (lo.calls.len == 0) {
+            try out.print(a, "     (no draw calls at z{d} tile {d}/{d}/{d} — gated or geometry clipped)\n", .{ lo.z, lo.z, lo.x, lo.y });
+        } else {
+            try out.print(a, "     (z{d} tile {d}/{d}/{d})\n", .{ lo.z, lo.z, lo.x, lo.y });
+            for (lo.calls) |c| try exAppendCall(a, &out, c);
+        }
+    } else {
+        try out.appendSlice(a, "     (lowering disabled / cell has no bounds)\n");
+    }
+
+    return out.items;
+}
+
+fn exJsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(a, '"');
+    for (s) |ch| switch (ch) {
+        '"' => try out.appendSlice(a, "\\\""),
+        '\\' => try out.appendSlice(a, "\\\\"),
+        '\n' => try out.appendSlice(a, "\\n"),
+        else => if (ch < 0x20) try out.print(a, "\\u{x:0>4}", .{ch}) else try out.append(a, ch),
+    };
+    try out.append(a, '"');
+}
+
+fn exWriteJson(a: std.mem.Allocator, rows: []const ExRow) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.appendSlice(a, "[");
+    for (rows, 0..) |row, i| {
+        if (i > 0) try out.appendSlice(a, ",\n");
+        try out.print(a, "{{\"cell\":\"{s}\",\"index\":{d},\"rcid\":{d},\"foid\":\"{x}\",\"prim\":\"{s}\",\"objl\":{d},\"class\":", .{ row.cell_name, row.index, row.rcid, row.foid, exPrimName(row.prim), row.objl });
+        try exJsonStr(a, &out, row.class);
+        try out.appendSlice(a, ",\"s101\":");
+        try exJsonStr(a, &out, row.s101);
+        // Level 1.
+        try out.appendSlice(a, ",\"attrs\":{");
+        for (row.attrs, 0..) |at, j| {
+            if (j > 0) try out.append(a, ',');
+            try exJsonStr(a, &out, at.acr);
+            try out.append(a, ':');
+            try exJsonStr(a, &out, at.value);
+        }
+        try out.appendSlice(a, "}");
+        // Level 2.
+        try out.appendSlice(a, ",\"portrayal_raw\":");
+        if (row.raw) |raw| try exJsonStr(a, &out, raw) else try out.appendSlice(a, "null");
+        if (row.parsed) |p| {
+            try out.print(a, ",\"portrayal\":{{\"prio\":{d},\"cat\":\"{s}\",\"vg\":{d},\"fill\":", .{ p.draw_prio, exCatName(p.cat), p.vg });
+            if (p.fill_token) |t| try exJsonStr(a, &out, t) else try out.appendSlice(a, "null");
+            try out.appendSlice(a, ",\"symbols\":[");
+            for (p.points, 0..) |pt, j| {
+                if (j > 0) try out.append(a, ',');
+                try exJsonStr(a, &out, pt.symbol);
+            }
+            try out.appendSlice(a, "],\"texts\":[");
+            for (p.texts, 0..) |tx, j| {
+                if (j > 0) try out.append(a, ',');
+                try exJsonStr(a, &out, tx.text);
+            }
+            try out.print(a, "],\"lines\":{d},\"patterns\":{d},\"aug_figures\":{d}}}", .{ p.lines.len, p.patterns.len, p.aug_figures.len });
+        } else try out.appendSlice(a, ",\"portrayal\":null");
+        // Level 3.
+        if (row.lowered) |lo| {
+            try out.print(a, ",\"lowered\":{{\"z\":{d},\"x\":{d},\"y\":{d},\"matched\":{},\"calls\":[", .{ lo.z, lo.x, lo.y, lo.matched });
+            for (lo.calls, 0..) |c, j| {
+                if (j > 0) try out.append(a, ',');
+                try exJsonStr(a, &out, @tagName(std.meta.activeTag(c)));
+            }
+            try out.appendSlice(a, "]}");
+        } else try out.appendSlice(a, ",\"lowered\":null");
+        try out.appendSlice(a, "}");
+    }
+    try out.appendSlice(a, "]\n");
+    return out.items;
+}
+
+// Read a base cell's sequential .001.. update files from `dir` (auto-discovery,
+// like the streaming chart loader). Missing = end of chain.
+fn exReadUpdates(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []const u8) []const []const u8 {
+    if (!std.mem.endsWith(u8, base_rel, ".000")) return &.{};
+    const stem = base_rel[0 .. base_rel.len - 4];
+    var list = std.ArrayList([]const u8).empty;
+    var u: u32 = 1;
+    while (u <= 999) : (u += 1) {
+        const upn = std.fmt.allocPrint(a, "{s}.{d:0>3}", .{ stem, u }) catch break;
+        const ub = dir.readFileAlloc(io, upn, a, .unlimited) catch break;
+        list.append(a, ub) catch break;
+    }
+    return list.items;
+}
+
+// Parse `base_rel` from `dir` (with its updates) and collect its features.
+fn exLoadCell(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []const u8, rules: []const u8, F: ExFilters, rows: *std.ArrayList(ExRow)) void {
+    const base = dir.readFileAlloc(io, base_rel, a, .unlimited) catch {
+        std.debug.print("cannot read {s}\n", .{base_rel});
+        return;
+    };
+    const updates = exReadUpdates(io, a, dir, base_rel);
+    var cell = engine.s57.parseCellWithUpdates(a, base, updates) catch {
+        std.debug.print("cannot parse {s}\n", .{base_rel});
+        return;
+    };
+    defer cell.deinit();
+    exProcessCell(a, &cell, std.fs.path.basename(base_rel), rules, F, rows) catch {};
+}
+
+fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--no-lower] [--rules DIR]\n", .{});
+        return;
+    }
+    const path = args[2];
+    var F = ExFilters{};
+    var json = false;
+    var tui = false;
+    var rules_flag: ?[]const u8 = null;
+    var f = Flags{ .args = args, .i = 2 };
+    while (f.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--class")) {
+            F.classes = f.val("--class") orelse return;
+        } else if (std.mem.eql(u8, arg, "--object")) {
+            const v = f.val("--object") orelse return;
+            F.obj = std.fmt.parseInt(u64, v, 0) catch return usageErr("--object must be an integer (FOID/RCID/index; 0x.. for hex FOID)");
+        } else if (std.mem.eql(u8, arg, "--zoom")) {
+            const v = f.val("--zoom") orelse return;
+            F.zoom = std.fmt.parseFloat(f64, v) catch return usageErr("--zoom must be a number");
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (std.mem.eql(u8, arg, "--tui")) {
+            tui = true;
+        } else if (std.mem.eql(u8, arg, "--no-lower")) {
+            F.do_lower = false;
+        } else if (std.mem.eql(u8, arg, "--rules")) {
+            rules_flag = f.val("--rules") orelse return;
+        } else return usageErr("unknown flag");
+    }
+
+    engine.portray.setQuiet(true);
+    engine.catalogue.warmUp();
+    const rules = resolveRulesDir(rules_flag);
+
+    var rows = std.ArrayList(ExRow).empty;
+    if (std.mem.endsWith(u8, path, ".000")) {
+        const dirp = std.fs.path.dirname(path) orelse ".";
+        var dir = std.Io.Dir.cwd().openDir(io, dirp, .{}) catch return usageErr("cannot open cell directory");
+        defer dir.close(io);
+        exLoadCell(io, a, dir, std.fs.path.basename(path), rules, F, &rows);
+    } else {
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return usageErr("source must be a .000 file or an ENC_ROOT directory");
+        defer dir.close(io);
+        var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
+            exLoadCell(io, a, dir, entry.path, rules, F, &rows);
+        }
+    }
+
+    if (rows.items.len == 0) {
+        std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
+        return;
+    }
+
+    if (tui) return exploreTui(io, a, rows.items);
+
+    var stdout = std.Io.File.stdout();
+    if (json) {
+        const j = try exWriteJson(a, rows.items);
+        stdout.writeStreamingAll(io, j) catch {};
+        return;
+    }
+
+    var out = std.ArrayList(u8).empty;
+    try out.print(a, "{d} feature(s)\n", .{rows.items.len});
+    for (rows.items) |row| {
+        try out.appendSlice(a, "\n────────────────────────────────────────────────────────────────\n");
+        try out.appendSlice(a, try exFormatDetail(a, row));
+    }
+    stdout.writeStreamingAll(io, out.items) catch {};
+}
+
+// `tile57 explore --tui`: a two-pane feature explorer. Left = the scrollable,
+// class-filterable feature list; right = the selected feature's three-level
+// detail. Arrow/j/k move the selection, PgUp/PgDn page, / filters by class,
+// q (or ctrl-c) quits. Same termios raw-mode + alt-screen scaffolding as
+// `tile57 ascii --tui`; dependency-free.
+fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow) !void {
+    const stdout = std.Io.File.stdout();
+    const stdin_fd = std.Io.File.stdin().handle;
+    const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
+    var raw = old;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.ISIG = false; // ctrl-c arrives as 0x03 → clean quit through the defers
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    std.posix.tcsetattr(stdin_fd, .NOW, raw) catch return usageErr("--tui needs a terminal");
+    defer std.posix.tcsetattr(stdin_fd, .NOW, old) catch {};
+    stdout.writeStreamingAll(io, "\x1b[?1049h\x1b[?25l") catch {}; // alt screen, hide cursor
+    defer stdout.writeStreamingAll(io, "\x1b[?25h\x1b[?1049l") catch {};
+
+    // Pre-format each feature's label + detail-lines once (rows are immutable).
+    const labels = try a.alloc([]const u8, rows.len);
+    const details = try a.alloc([]const []const u8, rows.len);
+    for (rows, 0..) |row, i| {
+        labels[i] = exLabel(a, row);
+        details[i] = try splitLines(a, try exFormatDetail(a, row));
+    }
+
+    var filt_buf: [64]u8 = undefined;
+    var filt_len: usize = 0;
+    var filtering = false; // typing into the class filter
+    var sel: usize = 0; // index into the FILTERED view
+    var top: usize = 0; // first visible list row
+    var det_top: usize = 0; // detail scroll offset
+
+    // The filtered view: indices into rows whose class contains the filter.
+    var view = std.ArrayList(usize).empty;
+    while (true) {
+        const filt = filt_buf[0..filt_len];
+        view.clearRetainingCapacity();
+        for (rows, 0..) |row, i| {
+            if (filt.len == 0 or indexOfIgnoreCase(row.class, filt) != null) try view.append(a, i);
+        }
+        if (view.items.len == 0) {
+            sel = 0;
+        } else if (sel >= view.items.len) sel = view.items.len - 1;
+
+        const ts = terminalSize(io) orelse .{ 100, 37, 0, 0 };
+        const cols: usize = @max(40, ts[0]);
+        const term_rows: usize = @max(8, ts[1]);
+        const body_h = term_rows - 2; // one title row, one status row
+        const left_w = @min(@as(usize, 40), cols / 2);
+        const right_w = cols - left_w - 3; // " │ " separator
+
+        // Keep the selection on screen.
+        if (sel < top) top = sel;
+        if (sel >= top + body_h) top = sel + 1 - body_h;
+
+        var buf = std.ArrayList(u8).empty;
+        try buf.appendSlice(a, "\x1b[H");
+        // Title row.
+        try buf.print(a, "\x1b[7m tile57 explore — {d}/{d} feature(s) ", .{ view.items.len, rows.len });
+        try padTo(a, &buf, 24, cols);
+        try buf.appendSlice(a, "\x1b[0m\x1b[K\n");
+
+        const det = if (view.items.len > 0) details[view.items[sel]] else &[_][]const u8{"(no features match the filter)"};
+        var r: usize = 0;
+        while (r < body_h) : (r += 1) {
+            // Left: the feature list, windowed around `top`.
+            var lw: usize = 0;
+            const li = top + r;
+            if (li < view.items.len) {
+                const selected = li == sel;
+                if (selected) try buf.appendSlice(a, "\x1b[7m");
+                const label = clip(labels[view.items[li]], left_w);
+                try buf.appendSlice(a, label);
+                lw = label.len;
+                if (selected) {
+                    while (lw < left_w) : (lw += 1) try buf.append(a, ' ');
+                    try buf.appendSlice(a, "\x1b[0m");
+                }
+            }
+            while (lw < left_w) : (lw += 1) try buf.append(a, ' ');
+            try buf.appendSlice(a, " │ ");
+            // Right: the detail pane, windowed around `det_top`.
+            const di = det_top + r;
+            if (di < det.len) try buf.appendSlice(a, clip(det[di], right_w));
+            try buf.appendSlice(a, "\x1b[K\n");
+        }
+
+        // Status / filter row.
+        try buf.appendSlice(a, "\x1b[7m");
+        if (filtering) {
+            try buf.print(a, " filter class: {s}_  (enter=apply esc=clear) ", .{filt});
+        } else {
+            try buf.print(a, " ↑↓/jk select  PgUp/PgDn page  /=filter  q=quit ", .{});
+            if (filt.len > 0) try buf.print(a, " [class~{s}] ", .{filt});
+        }
+        try padTo(a, &buf, 8, cols);
+        try buf.appendSlice(a, "\x1b[0m\x1b[K");
+        try buf.appendSlice(a, "\x1b[J"); // clear anything below
+        stdout.writeStreamingAll(io, buf.items) catch {};
+
+        // Input.
+        var b: [64]u8 = undefined;
+        const n = std.posix.read(stdin_fd, &b) catch break;
+        if (n == 0) break;
+        var i: usize = 0;
+        var moved = false;
+        while (i < n) {
+            const c = b[i];
+            if (filtering) {
+                switch (c) {
+                    0x0d, 0x0a => filtering = false, // enter (CR or LF): apply
+                    0x1b => {
+                        filt_len = 0;
+                        filtering = false;
+                    }, // esc: clear
+                    0x7f, 0x08 => filt_len -|= 1, // backspace
+                    else => if (c >= 0x20 and c < 0x7f and filt_len < filt_buf.len) {
+                        filt_buf[filt_len] = c;
+                        filt_len += 1;
+                    },
+                }
+                i += 1;
+                continue;
+            }
+            // Nav mode. Arrow escape sequences first.
+            if (c == 0x1b and i + 2 < n and b[i + 1] == '[') {
+                switch (b[i + 2]) {
+                    'A' => {
+                        sel -|= 1;
+                        moved = true;
+                    },
+                    'B' => {
+                        sel += 1;
+                        moved = true;
+                    },
+                    '5' => {
+                        sel -|= body_h;
+                        moved = true;
+                    }, // PgUp (ESC[5~)
+                    '6' => {
+                        sel += body_h;
+                        moved = true;
+                    }, // PgDn (ESC[6~)
+                    else => {},
+                }
+                i += 3;
+                continue;
+            }
+            switch (c) {
+                'k' => {
+                    sel -|= 1;
+                    moved = true;
+                },
+                'j' => {
+                    sel += 1;
+                    moved = true;
+                },
+                'g' => {
+                    sel = 0;
+                    moved = true;
+                },
+                'G' => {
+                    sel = if (view.items.len > 0) view.items.len - 1 else 0;
+                    moved = true;
+                },
+                '[' => det_top -|= 1, // scroll detail up
+                ']' => det_top += 1, // scroll detail down
+                '/' => {
+                    filtering = true;
+                    filt_len = 0;
+                },
+                'q', 'Q', 0x03 => return,
+                else => {},
+            }
+            i += 1;
+        }
+        if (view.items.len > 0 and sel >= view.items.len) sel = view.items.len - 1;
+        if (moved) det_top = 0; // reset detail scroll when the selection changes
+    }
+}
+
+// Split text into lines (no trailing empty line for a final '\n'). Arena-owned.
+fn splitLines(a: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| try out.append(a, line);
+    if (out.items.len > 0 and out.items[out.items.len - 1].len == 0) _ = out.pop();
+    return out.items;
+}
+
+// Byte-clip a string to at most `w` bytes (a debug TUI; wide/UTF-8 clipping is
+// best-effort, the terminal tolerates it).
+fn clip(s: []const u8, w: usize) []const u8 {
+    return if (s.len <= w) s else s[0..w];
+}
+
+fn padTo(a: std.mem.Allocator, buf: *std.ArrayList(u8), from: usize, to: usize) !void {
+    var i = from;
+    while (i < to) : (i += 1) try buf.append(a, ' ');
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
 // A lon/lat's Web-Mercator world-pixel position on a `world`-pixel globe.
 fn worldPxOf(lon: f64, lat: f64, world: f64) [2]f64 {
     const rad = lat * std.math.pi / 180.0;
@@ -1652,6 +2357,12 @@ fn printUsage() void {
         \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi] [--kitty]
         \\      The chart on stdout as a Unicode text grid (the example render
         \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
+        \\  tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]
+        \\      Dump, per feature, the RAW S-57 (class + attributes), the S-101
+        \\      portrayal instruction stream (raw + parsed), and the lowered
+        \\      Surface draw calls. --zoom N picks the lowering tile; --json;
+        \\      --no-lower skips the draw-call pass; --tui opens the two-pane
+        \\      explorer (arrows select, / filters by class, q quits).
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
         \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)

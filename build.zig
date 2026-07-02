@@ -7,11 +7,11 @@ const PORTRAYAL_CATALOG = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog";
 
 // Lua 5.4 core sources (vendored from lua.org), minus the standalone mains.
 const lua_sources = [_][]const u8{
-    "lapi.c",    "lauxlib.c", "lbaselib.c", "lcode.c",   "lcorolib.c", "lctype.c",
-    "ldblib.c",  "ldebug.c",  "ldo.c",      "ldump.c",   "lfunc.c",    "lgc.c",
-    "linit.c",   "liolib.c",  "llex.c",     "lmathlib.c", "lmem.c",    "loadlib.c",
-    "lobject.c", "lopcodes.c", "loslib.c",  "lparser.c", "lstate.c",   "lstring.c",
-    "lstrlib.c", "ltable.c",  "ltablib.c",  "ltm.c",     "lundump.c",  "lutf8lib.c",
+    "lapi.c",    "lauxlib.c",  "lbaselib.c", "lcode.c",    "lcorolib.c", "lctype.c",
+    "ldblib.c",  "ldebug.c",   "ldo.c",      "ldump.c",    "lfunc.c",    "lgc.c",
+    "linit.c",   "liolib.c",   "llex.c",     "lmathlib.c", "lmem.c",     "loadlib.c",
+    "lobject.c", "lopcodes.c", "loslib.c",   "lparser.c",  "lstate.c",   "lstring.c",
+    "lstrlib.c", "ltable.c",   "ltablib.c",  "ltm.c",      "lundump.c",  "lutf8lib.c",
     "lvm.c",     "lzio.c",
 };
 
@@ -572,6 +572,17 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tiles", .module = tiles_mod },
     });
     ascii_view.addImport("colorprofile_registry", colorprofile_registry);
+    // The recording backend's engine test (render/inspect.zig, the `tile57 explore`
+    // tool): real rules -> scene.appendTile -> InspectSurface, asserting the 3-level
+    // record. libc for the same reason as the pixel/ascii golden tests (portray).
+    _ = addPkgTest(b, test_step, "src/render/inspect_view_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "scene", .module = scene_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+    });
     // bindings/ shared settings parser (used by the wasm engine + parity oracle).
     _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{
         .{ .name = "assets", .module = assets_mod },
