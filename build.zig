@@ -190,6 +190,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/render/render.zig"),
         .imports = &.{.{ .name = "tiles", .module = tiles_mod }},
     });
+    // The embedded label face (render/font.zig @embedFile's it; OFL 1.1 —
+    // see THIRD_PARTY_LICENSES.md).
+    const addFont = struct {
+        fn f(bb: *std.Build, m: *std.Build.Module) void {
+            m.addAnonymousImport("font_ttf", .{ .root_source_file = bb.path("vendor/fonts/NotoSans-Regular.ttf") });
+        }
+    }.f;
+    addFont(b, render_mod);
 
     // The tile engine (src/s57_mvt/): S-57 -> tile-surface generation plus the
     // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
@@ -491,10 +499,11 @@ pub fn build(b: *std.Build) void {
     // The render module: Surface contract + noop lifecycle smoke test (pins
     // the contract), resolver gates/colors, Canvas + RasterCanvas + PNG +
     // PixelSurface.
-    _ = addPkgTest(b, test_step, "src/render/render.zig", target, optimize, &.{
+    const render_test = addPkgTest(b, test_step, "src/render/render.zig", target, optimize, &.{
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "assets", .module = assets_mod },
     });
+    addFont(b, render_test);
     // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
     // rules end-to-end. It rides its own artifact because `portray` links libc + Lua +
     // the rule registry (those settings + C sources propagate from portray_mod), unlike

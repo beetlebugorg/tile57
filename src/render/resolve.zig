@@ -142,6 +142,16 @@ pub fn viewingGroupVisible(vg: i64, off: ?[]const i32) bool {
     return true;
 }
 
+/// S-52 §14.5 text-group gate — mirrors chartstyle.textGroupFilter: important
+/// text (group 11) is always on; 21/26/29 ride text_names; 23 rides
+/// show_light_descriptions; everything else rides text_other.
+pub fn textGroupVisible(group: i64, m: *const MarinerSettings) bool {
+    if (group == 11) return true;
+    if (group == 21 or group == 26 or group == 29) return m.text_names;
+    if (group == 23) return m.show_light_descriptions;
+    return m.text_other;
+}
+
 /// Combined per-feature gate for pixel surfaces: display category + viewing
 /// group + SCAMIN at the scene zoom. `symbol_name` is the symbol about to be
 /// drawn (null for fills/lines/text) — only consulted for the ISODGR01 case.

@@ -16,11 +16,15 @@ the same change (see the polylabel entry as the worked example).
 | Lua | 5.4.7 | `vendor/lua/` | MIT (© 1994–2024 Lua.org, PUC-Rio) |
 | nanosvg | 2013–14 (Mikko Mononen) | `vendor/nanosvg/` | zlib |
 | stb_image_write | v1.16 (Sean Barrett) | `vendor/stb/` | public domain (MIT alternative) |
+| Noto Sans Regular | 2026.05.01 (Google) | `vendor/fonts/NotoSans-Regular.ttf` | SIL Open Font License 1.1 |
 
 - **Lua** is built from source and driven through `src/portray/lua_shim.c` to run
   the S-101 portrayal rules engine.
 - **nanosvg** rasterizes the S-101 SVG symbols into the sprite atlas; it embeds
   Anti-Grain Geometry rasterizer math by Maxim Shemanarev (also permissive).
+- **Noto Sans Regular** is `@embedFile`'d into the binary as the render
+  engine's single label face (glyph outlines parsed by `src/render/font.zig`,
+  a from-scratch TrueType outline reader — no font library is vendored).
 - **stb_image_write** writes the PNG sprite atlases.
 
 `vendor/lua/LICENSE.html` carries Lua's full notice; the nanosvg and stb licenses

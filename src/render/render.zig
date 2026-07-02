@@ -27,6 +27,7 @@ pub const png = @import("png.zig");
 pub const pixel = @import("pixel.zig");
 pub const symbols = @import("symbols.zig");
 pub const sndfrm = @import("sndfrm.zig");
+pub const font = @import("font.zig");
 
 test {
     _ = surface;
@@ -38,4 +39,5 @@ test {
     _ = pixel;
     _ = symbols;
     _ = sndfrm;
+    _ = font;
 }
