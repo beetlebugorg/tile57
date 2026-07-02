@@ -342,6 +342,10 @@ typedef struct tile57_mariner {
                          * per render-type (no minzoom buckets). The client rewrites the
                          * SCAMIN clause on boundary crossings. NOT an S-52 setting.
                          * tile57_mariner_defaults sets false (per-value buckets). */
+    bool show_overscale; /* S-52 §10.1.10 overscale indication: the AP(OVERSC01)
+                         * vertical-line hatch over regions displayed finer than their
+                         * compilation scale (drives the `overscale` layer's visibility).
+                         * tile57_mariner_defaults sets true. */
 } tile57_mariner;
 
 /* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.

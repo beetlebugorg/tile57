@@ -339,6 +339,13 @@ pub const CellOpts = struct {
     /// the handoff denominator — the `smax` tile property the style gates on (hide
     /// once the display is finer than 1:smax). 0 = not carried (no tag emitted).
     smax: i64 = 0,
+    /// The cell's compilation-scale denominator quantized UP the scamin ladder
+    /// (bake_enc.quantizeHandoff over the participating cells' ladders, so the
+    /// client's crossing machinery fires exactly at the emitted value); 0 = unknown.
+    /// Tagged as the `oscl` tile property on area fills + patterns, and emitted as
+    /// the AP(OVERSC01) overscale hatch's gate (S-52 §10.1.10: hatch shows while
+    /// the display is FINER than 1:oscl). See emitOverscaleHatch.
+    oscl: i64 = 0,
     /// Emit the per-feature pick-report attributes (the `s57` blob + `cell` name) for
     /// the S-52 §10.8 cursor pick + dev inspector. Defaults ON (host wants a working
     /// pick report in the local-first deployment); a lean bake can turn it off via the
@@ -399,24 +406,45 @@ pub const TileSurface = struct {
         return .{ .ptr = self, .vtable = &mvt_vtable };
     }
 
-    fn sp(ctx: *anyopaque) *TileSurface { return @ptrCast(@alignCast(ctx)); }
+    fn sp(ctx: *anyopaque) *TileSurface {
+        return @ptrCast(@alignCast(ctx));
+    }
 
-    fn areasL(s: *TileSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.areas_scamin else &s.areas; }
-    fn apatL(s: *TileSurface) *std.ArrayList(mvt.Feature)         { return if (s.cur.scamin != null) &s.area_patterns_scamin else &s.area_patterns; }
-    fn linesL(s: *TileSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.lines_scamin else &s.lines; }
-    fn pointsL(s: *TileSurface) *std.ArrayList(mvt.Feature)       { return if (s.cur.scamin != null) &s.points_scamin else &s.points; }
-    fn textsL(s: *TileSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.texts_scamin else &s.texts; }
+    fn areasL(s: *TileSurface) *std.ArrayList(mvt.Feature) {
+        return if (s.cur.scamin != null) &s.areas_scamin else &s.areas;
+    }
+    fn apatL(s: *TileSurface) *std.ArrayList(mvt.Feature) {
+        return if (s.cur.scamin != null) &s.area_patterns_scamin else &s.area_patterns;
+    }
+    fn linesL(s: *TileSurface) *std.ArrayList(mvt.Feature) {
+        return if (s.cur.scamin != null) &s.lines_scamin else &s.lines;
+    }
+    fn pointsL(s: *TileSurface) *std.ArrayList(mvt.Feature) {
+        return if (s.cur.scamin != null) &s.points_scamin else &s.points;
+    }
+    fn textsL(s: *TileSurface) *std.ArrayList(mvt.Feature) {
+        return if (s.cur.scamin != null) &s.texts_scamin else &s.texts;
+    }
 
     fn beginScene(_: *anyopaque, _: u8) anyerror!void {}
 
     fn beginFeature(ctx: *anyopaque, meta: *const rs.FeatureMeta) anyerror!void {
         const s = sp(ctx);
         s.cur = .{
-            .prio = meta.draw_prio, .cat = meta.cat, .vg = meta.vg,
-            .scamin = meta.scamin, .smax = meta.smax, .class = meta.class, .s57 = meta.s57_json,
-            .cell = meta.cell_name, .band = meta.band,
-            .date_start = meta.date_start, .date_end = meta.date_end,
-            .bnd = meta.bnd, .pts = meta.pts,
+            .prio = meta.draw_prio,
+            .cat = meta.cat,
+            .vg = meta.vg,
+            .scamin = meta.scamin,
+            .smax = meta.smax,
+            .oscl = meta.oscl,
+            .class = meta.class,
+            .s57 = meta.s57_json,
+            .cell = meta.cell_name,
+            .band = meta.band,
+            .date_start = meta.date_start,
+            .date_end = meta.date_end,
+            .bnd = meta.bnd,
+            .pts = meta.pts,
         };
     }
 
@@ -428,6 +456,11 @@ pub const TileSurface = struct {
             try props.append(s.a, .{ .key = "drval1", .value = .{ .float = d.d1 } });
             try props.append(s.a, .{ .key = "drval2", .value = .{ .float = d.d2 } });
         }
+        // The cell's quantized compilation scale: the style's overscale machinery
+        // splits area fills into a below-the-hatch (overscaled) and an above-the-
+        // hatch (at-scale) pass on this tag — so a finer cell's opaque fill
+        // occludes a coarser cell's OVERSC01 hatch (specs/overscale.md).
+        if (s.cur.oscl > 0) try props.append(s.a, .{ .key = "oscl", .value = .{ .int = s.cur.oscl } });
         try appendMeta(s.a, &props, s.cur);
         try s.areasL().append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
     }
@@ -436,6 +469,9 @@ pub const TileSurface = struct {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try props.append(s.a, .{ .key = "pattern_name", .value = .{ .string = name } });
+        // The cell's quantized compilation scale — on the OVERSC01 hatch this is
+        // the style's show gate (denom < oscl); other patterns just carry the tag.
+        if (s.cur.oscl > 0) try props.append(s.a, .{ .key = "oscl", .value = .{ .int = s.cur.oscl } });
         try appendMeta(s.a, &props, s.cur);
         try s.apatL().append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
     }
@@ -445,7 +481,10 @@ pub const TileSurface = struct {
         var props = std.ArrayList(mvt.Prop).empty;
         try props.append(s.a, .{ .key = "color_token", .value = .{ .string = token } });
         try props.append(s.a, .{ .key = "width_px", .value = .{ .double = width_px } });
-        const dash_str: []const u8 = switch (dash) { .solid => "solid", .dashed => "dashed" };
+        const dash_str: []const u8 = switch (dash) {
+            .solid => "solid",
+            .dashed => "dashed",
+        };
         try props.append(s.a, .{ .key = "dash", .value = .{ .string = dash_str } });
         if (valdco) |v| try props.append(s.a, .{ .key = "valdco", .value = .{ .double = v } });
         try appendMeta(s.a, &props, s.cur);
@@ -514,17 +553,17 @@ pub const TileSurface = struct {
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const s = sp(ctx);
         var layers = std.ArrayList(mvt.Layer).empty;
-        if (s.areas.items.len > 0)               try layers.append(s.a, .{ .name = "areas",                   .features = s.areas.items });
-        if (s.areas_scamin.items.len > 0)        try layers.append(s.a, .{ .name = "areas_scamin",            .features = s.areas_scamin.items });
-        if (s.area_patterns.items.len > 0)       try layers.append(s.a, .{ .name = "area_patterns",           .features = s.area_patterns.items });
-        if (s.area_patterns_scamin.items.len > 0)try layers.append(s.a, .{ .name = "area_patterns_scamin",    .features = s.area_patterns_scamin.items });
-        if (s.lines.items.len > 0)               try layers.append(s.a, .{ .name = "lines",                   .features = s.lines.items });
-        if (s.lines_scamin.items.len > 0)        try layers.append(s.a, .{ .name = "lines_scamin",            .features = s.lines_scamin.items });
-        if (s.points.items.len > 0)              try layers.append(s.a, .{ .name = "point_symbols",           .features = s.points.items });
-        if (s.points_scamin.items.len > 0)       try layers.append(s.a, .{ .name = "point_symbols_scamin",    .features = s.points_scamin.items });
-        if (s.soundings.items.len > 0)           try layers.append(s.a, .{ .name = "soundings",               .features = s.soundings.items });
-        if (s.texts.items.len > 0)               try layers.append(s.a, .{ .name = "text",                    .features = s.texts.items });
-        if (s.texts_scamin.items.len > 0)        try layers.append(s.a, .{ .name = "text_scamin",             .features = s.texts_scamin.items });
+        if (s.areas.items.len > 0) try layers.append(s.a, .{ .name = "areas", .features = s.areas.items });
+        if (s.areas_scamin.items.len > 0) try layers.append(s.a, .{ .name = "areas_scamin", .features = s.areas_scamin.items });
+        if (s.area_patterns.items.len > 0) try layers.append(s.a, .{ .name = "area_patterns", .features = s.area_patterns.items });
+        if (s.area_patterns_scamin.items.len > 0) try layers.append(s.a, .{ .name = "area_patterns_scamin", .features = s.area_patterns_scamin.items });
+        if (s.lines.items.len > 0) try layers.append(s.a, .{ .name = "lines", .features = s.lines.items });
+        if (s.lines_scamin.items.len > 0) try layers.append(s.a, .{ .name = "lines_scamin", .features = s.lines_scamin.items });
+        if (s.points.items.len > 0) try layers.append(s.a, .{ .name = "point_symbols", .features = s.points.items });
+        if (s.points_scamin.items.len > 0) try layers.append(s.a, .{ .name = "point_symbols_scamin", .features = s.points_scamin.items });
+        if (s.soundings.items.len > 0) try layers.append(s.a, .{ .name = "soundings", .features = s.soundings.items });
+        if (s.texts.items.len > 0) try layers.append(s.a, .{ .name = "text", .features = s.texts.items });
+        if (s.texts_scamin.items.len > 0) try layers.append(s.a, .{ .name = "text_scamin", .features = s.texts_scamin.items });
         if (layers.items.len == 0) return out.alloc(u8, 0);
         return switch (s.format) {
             .mvt => mvt.encode(out, .{ .layers = layers.items }),
@@ -589,9 +628,9 @@ test "hasAdditionalInfo: INFORM/TXTDSC trigger; blank/absent/other don't" {
 /// engine's actual layer split — points/text get _scamin buckets, complex lines fold
 /// into `lines`). Keep in sync with the layer appends in appendCellFeatures' finalize.
 pub const VECTOR_LAYERS = [_][]const u8{
-    "areas",         "areas_scamin",  "area_patterns", "area_patterns_scamin",
-    "lines",         "lines_scamin",  "point_symbols", "point_symbols_scamin",
-    "soundings",     "text",          "text_scamin",
+    "areas",     "areas_scamin", "area_patterns", "area_patterns_scamin",
+    "lines",     "lines_scamin", "point_symbols", "point_symbols_scamin",
+    "soundings", "text",         "text_scamin",
 };
 
 /// PMTiles archive metadata JSON: the static vector_layers list MapLibre reads from
@@ -633,6 +672,10 @@ const Meta = struct {
     // Band-handoff carry-down tag: the handoff denominator a carried coarser-band
     // feature hides beyond (the style's smax gate). 0 = not carried (omitted).
     smax: i64 = 0,
+    // The source cell's compilation scale quantized up the scamin ladder (0 =
+    // unknown/omitted). Emitted on area fills + patterns only (fillArea /
+    // fillPattern), NOT via appendMeta — points/lines/text don't need it.
+    oscl: i64 = 0,
     class: []const u8 = "", // S-57 object-class acronym (M_QUAL, LIGHTS, …)
     // Cursor-pick report (S-52 §10.8) + dev feature inspector: the feature's full
     // S-57 attribute set as compact acronym->value JSON. "" = omitted (no reportable
@@ -694,8 +737,8 @@ fn lastIndexOfCI(haystack: []const u8, needle: []const u8) ?usize {
 fn expandSeabedText(a: Allocator, class: []const u8, text: []const u8) ![]const u8 {
     if (!std.mem.eql(u8, class, "SBDARE")) return text;
     const names = [_][2][]const u8{
-        .{ "M", "mud" },     .{ "Cy", "clay" },   .{ "Si", "silt" },
-        .{ "S", "sand" },    .{ "St", "stone" },  .{ "G", "gravel" },
+        .{ "M", "mud" },     .{ "Cy", "clay" },    .{ "Si", "silt" },
+        .{ "S", "sand" },    .{ "St", "stone" },   .{ "G", "gravel" },
         .{ "P", "pebbles" }, .{ "Cb", "cobbles" }, .{ "R", "rock" },
         .{ "Co", "coral" },  .{ "Sh", "shells" },
     };
@@ -1255,11 +1298,20 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     const s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "";
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
-        .draw_prio = p.draw_prio, .cat = p.cat, .vg = p.vg, .scamin = scamin,
+        .draw_prio = p.draw_prio,
+        .cat = p.cat,
+        .vg = p.vg,
+        .scamin = scamin,
         .smax = opts.smax,
+        .oscl = opts.oscl,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57_json = s57_json, .cell_name = cell_name, .band = opts.band,
-        .date_start = p.date_start, .date_end = p.date_end, .bnd = bnd, .pts = pts,
+        .s57_json = s57_json,
+        .cell_name = cell_name,
+        .band = opts.band,
+        .date_start = p.date_start,
+        .date_end = p.date_end,
+        .bnd = bnd,
+        .pts = pts,
     };
 
     // ── Point features ──────────────────────────────────────────────────────────
@@ -1274,7 +1326,12 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             var routed_sounding = false;
             if (f.attrFloat(s57.ATTR_VALSOU)) |valsou| {
                 var has = false;
-                for (p.points) |sym| { if (isSoundingName(sym.symbol)) { has = true; break; } }
+                for (p.points) |sym| {
+                    if (isSoundingName(sym.symbol)) {
+                        has = true;
+                        break;
+                    }
+                }
                 if (has and std.math.isFinite(valsou)) {
                     const q = soundingQualityFlags(f);
                     try surf.beginFeature(&fmeta);
@@ -1294,9 +1351,13 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             }
             for (p.texts) |t| {
                 const style = rs.TextStyle{
-                    .color = t.color, .font_size = t.font_size,
-                    .halign = t.halign, .valign = t.valign,
-                    .offset_x = t.offset_x, .offset_y = t.offset_y, .group = t.group,
+                    .color = t.color,
+                    .font_size = t.font_size,
+                    .halign = t.halign,
+                    .valign = t.valign,
+                    .offset_x = t.offset_x,
+                    .offset_y = t.offset_y,
+                    .group = t.group,
                 };
                 try surf.beginFeature(&fmeta);
                 try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, pt);
@@ -1406,9 +1467,13 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 for (p.texts) |t| {
                     const style = rs.TextStyle{
-                        .color = t.color, .font_size = t.font_size,
-                        .halign = t.halign, .valign = t.valign,
-                        .offset_x = t.offset_x, .offset_y = t.offset_y, .group = t.group,
+                        .color = t.color,
+                        .font_size = t.font_size,
+                        .halign = t.halign,
+                        .valign = t.valign,
+                        .offset_x = t.offset_x,
+                        .offset_y = t.offset_y,
+                        .group = t.group,
                     };
                     try surf.beginFeature(&fmeta);
                     try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, cpt);
@@ -1425,7 +1490,12 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 var routed_sounding = false;
                 if (f.attrFloat(s57.ATTR_VALSOU)) |valsou| {
                     var has = false;
-                    for (p.points) |sym| { if (isSoundingName(sym.symbol)) { has = true; break; } }
+                    for (p.points) |sym| {
+                        if (isSoundingName(sym.symbol)) {
+                            has = true;
+                            break;
+                        }
+                    }
                     if (has and std.math.isFinite(valsou)) {
                         const q = soundingQualityFlags(f);
                         try surf.beginFeature(&fmeta);
@@ -2038,6 +2108,54 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
     try surf.endFeature();
 }
 
+/// Whether a feature is an M_COVR (objl 302) area with CATCOV=1 ("coverage
+/// available") — the data-coverage polygon the S-52 §10.1.10 overscale hatch is
+/// drawn over. Mirrors s57.Cell.mcovrCoverage's selection (CATCOV = S-57 attr 18).
+fn isCoverageFeature(f: s57.Feature) bool {
+    if (f.objl != 302 or f.prim != 3) return false;
+    const cv = f.attr(18) orelse return false;
+    const n = std.fmt.parseInt(i64, std.mem.trim(u8, cv, " "), 10) catch return false;
+    return n == 1;
+}
+
+/// S-52 §10.1.10 overscale indication: emit one AP(OVERSC01) area-pattern feature
+/// over an M_COVR(CATCOV=1) coverage polygon, clipped to the tile, tagged `oscl` =
+/// the cell's compilation scale quantized up the scamin ladder (CellOpts.oscl).
+/// The style shows it only while the display is FINER than 1:oscl and paints it
+/// ABOVE overscaled cells' fills but BELOW at-scale (finer) cells' fills — the
+/// occlusion trick that leaves the hatch only on coarse-only patches
+/// (specs/overscale.md). Rides the cell's carry tag (smax) so a band-handoff copy
+/// hides with the rest of the cell's content past its handoff.
+fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
+    if (geo_parts.len == 0) return;
+    var rings = std.ArrayList([]const mvt.Point).empty;
+    for (geo_parts) |gp| {
+        if (gp.len < 3) continue;
+        if (!overlaps(geomBounds(gp), tb)) continue;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
+        const ring = try clipSimplifyPoly(a, proj, box);
+        if (ring.len >= 3) try rings.append(a, ring);
+    }
+    if (rings.items.len == 0) return;
+    const parts = try orientAreaRings(a, rings.items);
+    const fmeta = rs.FeatureMeta{
+        // S-52 §10.1.10.2: the overscale pattern draws at display priority 3 in
+        // DISPLAY BASE (the indication is never optional content). No class/pick
+        // payload — the hatch is an indication, not a chartable feature.
+        .draw_prio = 3,
+        .cat = 0,
+        .smax = opts.smax,
+        .band = opts.band,
+        .oscl = opts.oscl,
+        .overscale = true,
+    };
+    try surf.beginFeature(&fmeta);
+    try surf.fillPattern("OVERSC01", parts);
+    try surf.endFeature();
+}
+
 /// One cell plus its optional per-feature S-101 instruction streams. `portrayal`
 /// is the default pass; `portrayal_plain` / `portrayal_simplified` are the
 /// boundary-style (area) and point-style (point) display variants (null when not
@@ -2066,6 +2184,9 @@ pub const CellRef = struct {
     /// Band-handoff carry-down tag (see CellOpts.smax): the handoff denominator
     /// stamped on every feature this cell emits into the tile; 0 = not carried.
     smax: i64 = 0,
+    /// The cell's quantized compilation scale (see CellOpts.oscl): tags area
+    /// fills/patterns + gates the AP(OVERSC01) overscale hatch; 0 = unknown.
+    oscl: i64 = 0,
 };
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
@@ -2097,6 +2218,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
             .smax = cr.smax,
+            .oscl = cr.oscl,
             .pick_attrs = pick_attrs,
         };
         try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
@@ -2121,6 +2243,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
             .smax = cr.smax,
+            .oscl = cr.oscl,
             .pick_attrs = pick_attrs,
         };
         try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
@@ -2291,12 +2414,24 @@ fn appendCellFeatures(
         if (!opts.suppress_points and hasAdditionalInfo(f)) {
             try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, opts, surf);
         }
+        // S-52 §10.1.10 overscale indication: every contributing cell's M_COVR
+        // (CATCOV=1) coverage polygon rides the tile as an AP(OVERSC01) hatch
+        // gated on `oscl` — emitted BESIDE the feature's normal portrayal (the
+        // M_COVR boundary lines still draw). Gated like the cell's fills (the
+        // whole-tile suppression rule) so hatch and fills appear/carry together.
+        if (opts.oscl > 0 and !opts.suppress_fills and isCoverageFeature(f)) {
+            try emitOverscaleHatch(a, cell.*, f, fi, geo, z, x, y, tb, box, opts, surf);
+        }
         if (f.objl == 129) {
             const smeta = rs.FeatureMeta{
-                .draw_prio = 18, .cat = 2, .class = "SOUNDG",
+                .draw_prio = 18,
+                .cat = 2,
+                .class = "SOUNDG",
                 .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
                 .cell_name = if (opts.pick_attrs) cell.name else "",
-                .scamin = featureScamin(f), .smax = opts.smax, .band = opts.band,
+                .scamin = featureScamin(f),
+                .smax = opts.smax,
+                .band = opts.band,
             };
             try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, surf);
             continue;
@@ -2362,6 +2497,8 @@ fn appendCellFeatures(
             // Band-handoff carry-down tag — the classify() schema predates appendMeta
             // but a carried copy still must hide past its handoff (style smax gate).
             if (opts.smax > 0) try aprops.append(a, .{ .key = "smax", .value = .{ .int = opts.smax } });
+            // Quantized compilation scale (overscale fill ordering — see fillArea).
+            if (opts.oscl > 0) try aprops.append(a, .{ .key = "oscl", .value = .{ .int = opts.oscl } });
             try appendDepthVals(a, &aprops, f);
             try ms.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
             continue;
@@ -2540,7 +2677,7 @@ test "orientAreaRings subtracts a hole: exterior CW (+), interior CCW (-)" {
     // A sea-area exterior square (CCW as authored) with a smaller island hole
     // inside it (also CCW as authored). y is down in tile space.
     const ext = [_]mvt.Point{
-        .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 100 },
+        .{ .x = 0, .y = 0 },     .{ .x = 0, .y = 100 },
         .{ .x = 100, .y = 100 }, .{ .x = 100, .y = 0 },
     };
     const hole = [_]mvt.Point{
@@ -2619,7 +2756,10 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
 
     // SCAMIN-carrying point -> point_symbols_scamin, with draw_prio=7 + scamin=22000.
     const f_sc = s57.Feature{
-        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14,
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
     };
@@ -2631,7 +2771,10 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
 
     // No SCAMIN -> base point_symbols layer, draw_prio default 0, no scamin.
     const f_base = s57.Feature{
-        .rcnm = 0, .rcid = 2, .prim = 1, .objl = 14,
+        .rcnm = 0,
+        .rcid = 2,
+        .prim = 1,
+        .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
     try processFeatureInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, .{}, surf);
@@ -2673,7 +2816,10 @@ test "processFeatureInstr tags pts 0/1 when a point's simplified symbol differs"
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
     const f = s57.Feature{
-        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14,
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
     // Paper -> BOYLAT01; simplified -> BOYLAT11. Two passes: pts=0 then pts=1.
@@ -2854,7 +3000,10 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
     // A WRECKS point with VALSOU whose rule emitted the bake-time DANGER02 pick:
     // normalized to DANGER01 + danger_depth/sym_deep so the client swaps live.
     const f_wreck = s57.Feature{
-        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 159,
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 159,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "15.1" }},
     };
@@ -2866,7 +3015,10 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
 
     // No VALSOU -> the baked symbol passes through untagged (nothing to swap on).
     const f_nodep = s57.Feature{
-        .rcnm = 0, .rcid = 2, .prim = 1, .objl = 159,
+        .rcnm = 0,
+        .rcid = 2,
+        .prim = 1,
+        .objl = 159,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
     try processFeatureInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, .{}, surf);
@@ -2876,7 +3028,10 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
 
     // A non-danger class (BOYLAT) never gets tagged even with VALSOU present.
     const f_buoy = s57.Feature{
-        .rcnm = 0, .rcid = 3, .prim = 1, .objl = 14,
+        .rcnm = 0,
+        .rcid = 3,
+        .prim = 1,
+        .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "4" }},
     };

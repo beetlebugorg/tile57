@@ -55,9 +55,9 @@ pub const TextStyle = struct {
     font_size: f64,
     halign: []const u8 = "", // "left" | "center" | "right" ("" = minimal label)
     valign: []const u8 = "", // "top" | "middle" | "bottom"
-    offset_x: f64 = 0,       // S-52 LocalOffset in mm (+x right / +y down)
+    offset_x: f64 = 0, // S-52 LocalOffset in mm (+x right / +y down)
     offset_y: f64 = 0,
-    group: i64 = 0,          // S-101 text group (§14.5)
+    group: i64 = 0, // S-101 text group (§14.5)
 };
 
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
@@ -65,15 +65,22 @@ pub const TextStyle = struct {
 /// surfaces need not import s57/s100.
 pub const FeatureMeta = struct {
     draw_prio: i64 = 0,
-    cat: i64 = 1,            // display category: 0 base, 1 standard, 2 other
-    vg: i64 = 0,             // raw viewing group (0 = none)
-    scamin: ?i64 = null,     // SCAMIN 1:N denominator (null = no display limit)
-    smax: i64 = 0,           // band-handoff denominator: a carried coarser-band copy
-                             // hides once the display is finer than 1:smax (0 = none)
-    class: []const u8 = "",  // S-57 object-class acronym (e.g. "LIGHTS")
+    cat: i64 = 1, // display category: 0 base, 1 standard, 2 other
+    vg: i64 = 0, // raw viewing group (0 = none)
+    scamin: ?i64 = null, // SCAMIN 1:N denominator (null = no display limit)
+    smax: i64 = 0, // band-handoff denominator: a carried coarser-band copy
+    // hides once the display is finer than 1:smax (0 = none)
+    oscl: i64 = 0, // the source cell's compilation-scale denominator, quantized
+    // UP the scamin ladder (0 = unknown): tagged on area fills +
+    // patterns so the style can order/gate by overscale state;
+    // on the OVERSC01 hatch (overscale=true) it is the show gate
+    overscale: bool = false, // this feature IS the S-52 §10.1.10 overscale hatch
+    // (AP(OVERSC01) over the cell's M_COVR coverage), shown only
+    // while the display is FINER than 1:oscl (denom < oscl)
+    class: []const u8 = "", // S-57 object-class acronym (e.g. "LIGHTS")
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""
     cell_name: []const u8 = "", // source ENC cell name or ""
-    band: u8 = 0,            // NOAA navigational band (0 = finest)
+    band: u8 = 0, // NOAA navigational band (0 = finest)
     date_start: []const u8 = "",
     date_end: []const u8 = "",
     // S-52 boundary (§8.6.1) and point-symbol (§11.2.2) variant tags:

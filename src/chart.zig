@@ -1357,6 +1357,17 @@ fn appendCellGeoJson(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *s57.C
 // Collect a parsed cell's distinct SCAMIN denominators into `set`.
 fn collectScaminCell(cell: *const s57.Cell, set: *std.AutoHashMap(u32, void)) void {
     for (cell.features) |f| if (scene.featureScamin(f)) |sc| if (sc > 0) set.put(@intCast(sc), {}) catch {};
+    // The cell's compilation scale, quantized UP its own SCAMIN ladder — the value
+    // the overscale (`oscl`) and raw-cscl smax fallback tags are emitted at, so the
+    // live client ladder has a crossing to flip them on (see bakeArchive's fold).
+    const cscl = cell.params.cscl;
+    if (cscl > 0) {
+        var best: i64 = std.math.maxInt(i64);
+        for (cell.features) |f| if (scene.featureScamin(f)) |sc| {
+            if (sc >= cscl and sc < best) best = sc;
+        };
+        set.put(if (best != std.math.maxInt(i64)) @intCast(best) else @intCast(cscl), {}) catch {};
+    }
 }
 
 // Scan every cell of a lazy/streaming source for SCAMIN. Loaded cells are read
@@ -1505,6 +1516,9 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 .suppress_lines = g.suppress_centre,
                 .suppress_points = g.suppress_whole,
                 .smax = g.smax,
+                // Overscale tag: compilation scale quantized UP the tile's scamin
+                // ladder (same crossing alignment as the smax handoff).
+                .oscl = if (lc.cscl > 0) bake_enc.quantizeHandoff(ladders, lc.cscl) else 0,
             }) catch {};
         }
     }
@@ -1708,9 +1722,20 @@ pub fn bakeArchive(
             backs.appendAssumeCapacity(be);
             band_arenas.appendAssumeCapacity(pa);
         };
-        for (backs.items) |be| for (be.cell.features) |f| {
-            if (scene.featureScamin(f)) |sc| scamin_set.put(@intCast(sc), {}) catch {};
-        };
+        for (backs.items) |be| {
+            for (be.cell.features) |f| {
+                if (scene.featureScamin(f)) |sc| scamin_set.put(@intCast(sc), {}) catch {};
+            }
+            // The cell's quantized compilation scale joins the ladder too: the
+            // overscale (`oscl`) and raw-cscl smax fallback tags need a client
+            // crossing at their emitted value. Quantizing against the cell's OWN
+            // ladder covers every per-tile result — a cross-cell quantization can
+            // only land on another cell's ladder value, folded above already.
+            if (be.cscl > 0) {
+                const q = bake_enc.quantizeHandoff(&.{be.scamins}, be.cscl);
+                if (q > 0) scamin_set.put(@intCast(q), {}) catch {};
+            }
+        }
         if (has_work) {
             // Own cells first, then the finer band's carry (bakeBand own_len split).
             var all = std.ArrayList(bake_enc.Backend).empty;
