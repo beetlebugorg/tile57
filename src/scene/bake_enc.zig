@@ -49,7 +49,33 @@ pub const Backend = struct {
     // SCAMIN standalone (scene.scamin_pts): per-feature smax caps for an overlay
     // mini-cell Backend (Baker.overlay); null for regular cells.
     feat_smax: ?[]const i64 = null,
+    // Sector-figure reach (scene.LightReach / collectLightReach): bbox of the
+    // features whose portrayal constructs light-sector legs/arcs (null = none)
+    // and the max ground-distance leg length. Figures extend beyond their anchors
+    // — up to LIGHT_AUG_REACH_TILES tiles for display-mm figures plus the ground
+    // legs' per-zoom span — so buildTileMap must address the neighbouring tiles
+    // they cross (else legs/arcs clip exactly at the cell-bbox tile boundary).
+    light_bbox: ?[4]f64 = null,
+    light_range_m: f64 = 0,
 };
+
+/// One cell's tile-addressing span for a bake pass: its raw bounds plus the
+/// sector-figure reach summary (see Backend.light_bbox). buildTileMap addresses
+/// the raw-bbox tile range as before, PLUS a reach ring around light_bbox whose
+/// members are tagged REACH_FLAG — the cell rides those tiles for its figures
+/// only (excluded from the tile-level quilting ladder / overscale scale).
+pub const CellSpan = struct {
+    bounds: [4]f64,
+    light_bbox: ?[4]f64 = null,
+    light_range_m: f64 = 0,
+};
+
+/// Tag bit on a buildTileMap contributor index: the cell joined this tile only
+/// through its sector-figure reach ring (its raw bbox misses the tile). The
+/// tile generator masks it off for the Backend index and excludes such cells
+/// from tile-level decisions (scamin ladders, the overscale finest-scale scan)
+/// so a reach-only neighbour can't perturb tiles it has no real coverage in.
+pub const REACH_FLAG: u32 = 1 << 31;
 
 /// The finest (smallest 1:N) compilation scale among `backends[idxs]` whose coverage
 /// contains (lon,lat); `maxInt` when none — so `finestCsclAt(...) < my_cscl` means "a
@@ -198,6 +224,20 @@ pub fn bandZooms(band: Band) ZoomRange {
     };
 }
 
+/// The live-path fallback band for a tile whose zoom sits OUTSIDE every
+/// overlapping cell's native window (chart.zig tileRefs). ABOVE every window
+/// (z > the finest band's max — band maxima are monotonic in fineness, so the
+/// finest band's max IS the highest window top) the FINEST band wins: its
+/// content is the best available there, where the coarsest would render a
+/// near-blank sliver of general/overview data beside finer coverage. Anywhere
+/// else (below every window, or a gap between non-adjacent bands) the coarsest
+/// fills — the baker's extend_min low-zoom fallback, which only ever extends
+/// DOWNWARD.
+pub fn fallbackBand(finest: Band, coarsest: Band, z: u8) Band {
+    if (z > bandZooms(finest).max) return finest;
+    return coarsest;
+}
+
 /// What a band's pass does with its own FLOOR zoom (bandZooms(band).min — the
 /// zoom it shares with the next-coarser band):
 ///   .defer_down — skip it: the caller runs the next-coarser band's pass with
@@ -328,6 +368,17 @@ pub fn parallelFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *co
     for (threads[0..spawned]) |t| t.join();
 }
 
+// Whether a SCAMIN-overlay mini cell joins tile `tbll`: its bounds padded by the
+// mini's sector-figure reach — one tile for display-mm legs/arcs, the honest
+// per-zoom span for ground-length directional legs (scene.lightReachTiles).
+fn overlayNear(ov: *const Backend, tbll: [4]f64, z: u8, clat: f64) bool {
+    const reach = scene.lightReachTiles(ov.light_range_m, z, clat);
+    const pad_lon = (tbll[2] - tbll[0]) * reach;
+    const pad_lat = (tbll[3] - tbll[1]) * reach;
+    return ov.bounds[0] <= tbll[2] + pad_lon and ov.bounds[2] >= tbll[0] - pad_lon and
+        ov.bounds[1] <= tbll[3] + pad_lat and ov.bounds[3] >= tbll[1] - pad_lat;
+}
+
 // Worker context for parallel per-tile MVT generation. Each index is an
 // independent tile; encodeTile only reads the cells, so this is race-free.
 const TileGenCtx = struct {
@@ -362,7 +413,17 @@ const TileGenCtx = struct {
         const z: u8 = @intCast(key >> 48);
         const x: u32 = @intCast((key >> 24) & 0xFFFFFF);
         const y: u32 = @intCast(key & 0xFFFFFF);
-        const idxs = c.idx_lists[i];
+        // Decode the REACH_FLAG tags (buildTileMap): a reach-only cell rides this
+        // tile for its sector figures alone — it joins the refs (so its legs/arcs
+        // draw across the boundary) but stays out of the tile-level decisions
+        // below (scamin ladders, the overscale finest-contributor scan).
+        const raw_idxs = c.idx_lists[i];
+        const idxs = scratch.alloc(u32, raw_idxs.len) catch return;
+        const reach_only = scratch.alloc(bool, raw_idxs.len) catch return;
+        for (raw_idxs, 0..) |v, j| {
+            idxs[j] = v & ~REACH_FLAG;
+            reach_only[j] = (v & REACH_FLAG) != 0;
+        }
         // Per-scale cell quilting: where a strictly-finer-CSCL cell's M_COVR coverage
         // contains a location, the coarser cell is suppressed there (so two cells of
         // different scale that both digitise a feature don't double-draw it). The
@@ -384,15 +445,17 @@ const TileGenCtx = struct {
         // participating cells' SCAMIN ladders quantize the handoff (quantizeHandoff).
         const display_denom = assets.displayDenomZ(z, clat);
         const ladders = scratch.alloc([]const u32, idxs.len) catch return;
-        for (idxs, 0..) |idx, j| ladders[j] = c.backends[idx].scamins;
+        for (idxs, 0..) |idx, j| ladders[j] = if (reach_only[j]) &.{} else c.backends[idx].scamins;
         // Scale-boundary overscale refinement (specs/overscale.md): the finest
         // compilation scale CONTRIBUTING to this tile — over the quilting's own
-        // participant list (any overlapping cell), not point-sampled coverage. A
-        // cell hatches its OVERSC01 coverage only when a strictly-finer cell also
-        // rides this tile (gf_tile < its cscl); whole-view overscale (no finer
-        // data anywhere in the tile) emits no hatch — the HUD readout's job.
+        // participant list (any overlapping cell, reach-only riders excluded),
+        // not point-sampled coverage. A cell hatches its OVERSC01 coverage only
+        // when a strictly-finer cell also rides this tile (gf_tile < its cscl);
+        // whole-view overscale (no finer data anywhere in the tile) emits no
+        // hatch — the HUD readout's job.
         var gf_tile: i32 = std.math.maxInt(i32);
-        for (idxs) |idx| {
+        for (idxs, 0..) |idx, j| {
+            if (reach_only[j]) continue;
             const cs = c.backends[idx].cscl;
             if (cs > 0 and cs < gf_tile) gf_tile = cs;
         }
@@ -403,14 +466,13 @@ const TileGenCtx = struct {
         // SCAMIN point mini cells join EVERY tile whose bounds they touch —
         // independent of bands/emitted-skip — gated per feature by the tile's
         // display window (scamin_floor = D(z+1, φ_tile); the CellRef clamp).
-        // Padded by one tile so a light's sector legs/arcs reach neighbours
-        // (mirrors the LIGHT_AUG_REACH margin in the feature cull).
-        const pad_lon = tbll[2] - tbll[0];
-        const pad_lat = tbll[3] - tbll[1];
+        // Padded by the mini's sector-figure reach — one tile for display-mm
+        // legs/arcs (mirrors the LIGHT_AUG_REACH margin in the feature cull),
+        // the honest per-zoom span for ground-length directional legs — so a
+        // deduped light's figures reach the neighbouring tiles they cross.
         var n_ov: usize = 0;
         for (c.overlay) |*ov| {
-            if (ov.bounds[0] <= tbll[2] + pad_lon and ov.bounds[2] >= tbll[0] - pad_lon and
-                ov.bounds[1] <= tbll[3] + pad_lat and ov.bounds[3] >= tbll[1] - pad_lat) n_ov += 1;
+            if (overlayNear(ov, tbll, z, clat)) n_ov += 1;
         }
         const refs = scratch.alloc(scene.CellRef, idxs.len + n_ov) catch return;
         for (idxs, 0..) |idx, j| {
@@ -420,15 +482,14 @@ const TileGenCtx = struct {
             // scamin ladder (like the smax handoff), so the client's discrete
             // crossing machinery fires exactly at the emitted value.
             const oscl: i64 = if (be.cscl > 0) quantizeHandoff(ladders, be.cscl) else 0;
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .overscale_hatch = be.cscl > 0 and gf_tile < be.cscl, .skip_scamin_points = c.standalone };
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .overscale_hatch = !reach_only[j] and be.cscl > 0 and gf_tile < be.cscl, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
         }
         if (n_ov > 0) {
             const floor_denom = assets.displayDenomZ(z + 1, clat);
             var j = idxs.len;
             for (c.overlay) |*ov| {
-                if (!(ov.bounds[0] <= tbll[2] + pad_lon and ov.bounds[2] >= tbll[0] - pad_lon and
-                    ov.bounds[1] <= tbll[3] + pad_lat and ov.bounds[3] >= tbll[1] - pad_lat)) continue;
-                refs[j] = .{ .cell = @constCast(&ov.cell), .portrayal = ov.portrayal, .portrayal_simplified = ov.portrayal_simplified, .feat_bbox = ov.feat_bbox, .feat_smax = ov.feat_smax, .scamin_floor = floor_denom };
+                if (!overlayNear(ov, tbll, z, clat)) continue;
+                refs[j] = .{ .cell = @constCast(&ov.cell), .portrayal = ov.portrayal, .portrayal_simplified = ov.portrayal_simplified, .feat_bbox = ov.feat_bbox, .feat_smax = ov.feat_smax, .scamin_floor = floor_denom, .light_range_m = ov.light_range_m };
                 j += 1;
             }
         }
@@ -518,13 +579,19 @@ pub const Baker = struct {
     /// (to count) so the progress denominator can't drift from what's actually
     /// baked. `bounds[i]` = [w,s,e,n]; the map values index into it.
     ///
-    /// Band handoff: `bounds[own_len..]` are the next-FINER band's carry cells —
+    /// Band handoff: `spans[own_len..]` are the next-FINER band's carry cells —
     /// they contribute ONLY at this band's max zoom (the finer band's deferred
     /// floor tiles, which this pass bakes with both bands' cells). The own cells'
     /// floor zoom is skipped (.defer_down — the next-coarser pass bakes it the
     /// same way) or the range is extended down to Baker.minzoom (.extend_min, the
     /// coarsest populated band). Caller frees the value lists + the map.
-    fn buildTileMap(self: *Baker, band: Band, bounds: []const [4]f64, own_len: usize, floor: FloorMode, clip: ?TileClip) !std.AutoHashMap(u64, std.ArrayList(u32)) {
+    ///
+    /// Sector-figure reach: a cell with light figures (span.light_bbox) also
+    /// joins a ring of ceil(lightReachTiles) tiles around that bbox, tagged
+    /// REACH_FLAG — legs/arcs generated per tile (emitAugFigures) cross into
+    /// neighbouring tiles the raw bbox never touches, and without the ring the
+    /// geometry clips exactly at the cell-bbox tile boundary.
+    fn buildTileMap(self: *Baker, band: Band, spans: []const CellSpan, own_len: usize, floor: FloorMode, clip: ?TileClip) !std.AutoHashMap(u64, std.ArrayList(u32)) {
         const zr = bandZooms(band);
         var zlo = @max(self.minzoom, zr.min);
         const zhi = @min(self.maxzoom, zr.max);
@@ -545,7 +612,8 @@ pub const Baker = struct {
             while (vit.next()) |v| v.deinit(self.gpa);
             tilemap.deinit();
         }
-        for (bounds, 0..) |b, i| {
+        for (spans, 0..) |sp, i| {
+            const b = sp.bounds;
             var z = zlo;
             var zend = zhi;
             if (i >= own_len) {
@@ -579,18 +647,52 @@ pub const Baker = struct {
                         try gop.value_ptr.append(self.gpa, @intCast(i));
                     }
                 }
+                // Sector-figure reach ring: the tiles within ceil(reach) of the
+                // cell's light bbox that the raw span above did NOT address. The
+                // cell rides them tagged REACH_FLAG (figures only) so its legs/
+                // arcs continue across the bbox tile boundary.
+                const lb = sp.light_bbox orelse continue;
+                const reach = scene.lightReachTiles(sp.light_range_m, z, (lb[1] + lb[3]) * 0.5);
+                const m: u32 = @intFromFloat(@ceil(reach));
+                const max_idx: u32 = @intCast((@as(u64, 1) << @intCast(z)) - 1);
+                const lnw = lonLatToTile(lb[0], lb[3], z);
+                const lse = lonLatToTile(lb[2], lb[1], z);
+                var rxlo = lnw[0] -| m;
+                var rxhi = @min(lse[0] +| m, max_idx);
+                var rylo = lnw[1] -| m;
+                var ryhi = @min(lse[1] +| m, max_idx);
+                if (clip) |cl| {
+                    const shift: u5 = @intCast(z - cl.zs);
+                    rxlo = @max(rxlo, cl.sx << shift);
+                    rxhi = @min(rxhi, ((cl.sx + 1) << shift) - 1);
+                    rylo = @max(rylo, cl.sy << shift);
+                    ryhi = @min(ryhi, ((cl.sy + 1) << shift) - 1);
+                }
+                var ry = rylo;
+                while (ry <= ryhi) : (ry += 1) {
+                    var rx = rxlo;
+                    while (rx <= rxhi) : (rx += 1) {
+                        if (rx >= xlo and rx <= xhi and ry >= ylo and ry <= yhi) continue; // raw span has it
+                        const key = tileKey(z, rx, ry);
+                        if (self.emitted.contains(key)) continue; // a finer band has it
+                        const gop = try tilemap.getOrPut(key);
+                        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                        try gop.value_ptr.append(self.gpa, @as(u32, @intCast(i)) | REACH_FLAG);
+                    }
+                }
             }
         }
         return tilemap;
     }
 
     /// Planned tile count for a band's pass (host §3 progress denominator): the
-    /// distinct not-yet-emitted tiles their bounds cover. A planned ESTIMATE — the
-    /// caller may pass cheap peek-bboxes while the real bake uses slightly tighter
-    /// loaded bounds — matching the Go baker's up-front planned count. `own_len` /
-    /// `floor` mirror bakeBand (bounds[own_len..] = the carry cells). 0 on OOM.
-    pub fn plannedTiles(self: *Baker, band: Band, bounds: []const [4]f64, own_len: usize, floor: FloorMode, clip: ?TileClip) usize {
-        var tm = self.buildTileMap(band, bounds, own_len, floor, clip) catch return 0;
+    /// distinct not-yet-emitted tiles their spans cover. A planned ESTIMATE — the
+    /// caller may pass cheap peek-bboxes (+ attr-scan light reach) while the real
+    /// bake uses slightly tighter loaded bounds — matching the Go baker's up-front
+    /// planned count. `own_len` / `floor` mirror bakeBand (spans[own_len..] = the
+    /// carry cells). 0 on OOM.
+    pub fn plannedTiles(self: *Baker, band: Band, spans: []const CellSpan, own_len: usize, floor: FloorMode, clip: ?TileClip) usize {
+        var tm = self.buildTileMap(band, spans, own_len, floor, clip) catch return 0;
         defer {
             var vit = tm.valueIterator();
             while (vit.next()) |v| v.deinit(self.gpa);
@@ -611,11 +713,12 @@ pub const Baker = struct {
     pub fn bakeBand(self: *Baker, band: Band, backends: []Backend, own_len: usize, floor: FloorMode, clip: ?TileClip, progress: Progress, ctx: ?*anyopaque) !void {
         if (backends.len == 0) return;
 
-        // Cell bounds (drive the tile map) + the running union bbox for the header.
-        const bounds = try self.gpa.alloc([4]f64, backends.len);
-        defer self.gpa.free(bounds);
+        // Cell spans (drive the tile map: bounds + light-figure reach) + the
+        // running union bbox for the header.
+        const spans = try self.gpa.alloc(CellSpan, backends.len);
+        defer self.gpa.free(spans);
         for (backends, 0..) |be, i| {
-            bounds[i] = be.bounds;
+            spans[i] = .{ .bounds = be.bounds, .light_bbox = be.light_bbox, .light_range_m = be.light_range_m };
             self.union_b[0] = @min(self.union_b[0], be.bounds[0]);
             self.union_b[1] = @min(self.union_b[1], be.bounds[1]);
             self.union_b[2] = @max(self.union_b[2], be.bounds[2]);
@@ -623,7 +726,7 @@ pub const Baker = struct {
         }
 
         // Map this pass's not-yet-emitted tiles -> contributing cell indices.
-        var tilemap = try self.buildTileMap(band, bounds, own_len, floor, clip);
+        var tilemap = try self.buildTileMap(band, spans, own_len, floor, clip);
         defer {
             var vit = tilemap.valueIterator();
             while (vit.next()) |v| v.deinit(self.gpa);
@@ -1149,6 +1252,141 @@ test "scamin standalone: one deduped feature per tile, scale-window included" {
     const t9 = lonLatToTile(0.35, 0.35, 9);
     try std.testing.expect(sink.tiles.get(tileKey(9, t9[0], t9[1])) != null);
     try std.testing.expect(800_000.0 >= assets.displayDenomZ(10, 0.35));
+}
+
+test "buildTileMap reach ring: a light cell contributes one ring beyond its bbox" {
+    const gpa = std.testing.allocator;
+    const nop = struct {
+        fn run(_: ?*anyopaque, _: u8, _: u32, _: u32, _: []const u8) anyerror!void {}
+    };
+    var baker = Baker.init(gpa, 13, 13, .{ .ctx = null, .func = nop.run });
+    defer baker.deinit();
+
+    // A cell spanning exactly one z13 tile near (0.02, 0.02).
+    const t = lonLatToTile(0.02, 0.02, 13);
+    const tb = tile.tileBoundsLonLat(13, t[0], t[1]);
+    const inner = [4]f64{
+        tb[0] + (tb[2] - tb[0]) * 0.25, tb[1] + (tb[3] - tb[1]) * 0.25,
+        tb[0] + (tb[2] - tb[0]) * 0.75, tb[1] + (tb[3] - tb[1]) * 0.75,
+    };
+
+    // No light figures: exactly the one tile its bbox touches.
+    const plain = [_]CellSpan{.{ .bounds = inner }};
+    try std.testing.expectEqual(@as(usize, 1), baker.plannedTiles(.harbor, &plain, 1, .extend_min, null));
+
+    // Display-mm figures (reach_tiles = 1): the bbox tile + its 3x3 ring.
+    const lit = [_]CellSpan{.{ .bounds = inner, .light_bbox = inner }};
+    try std.testing.expectEqual(@as(usize, 9), baker.plannedTiles(.harbor, &lit, 1, .extend_min, null));
+
+    // The ring members carry REACH_FLAG; the home tile doesn't.
+    var tm = try baker.buildTileMap(.harbor, &lit, 1, .extend_min, null);
+    defer {
+        var vit = tm.valueIterator();
+        while (vit.next()) |v| v.deinit(gpa);
+        tm.deinit();
+    }
+    var it = tm.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        const home = (k >> 48) == 13 and ((k >> 24) & 0xFFFFFF) == t[0] and (k & 0xFFFFFF) == t[1];
+        try std.testing.expectEqual(@as(usize, 1), e.value_ptr.items.len);
+        const v = e.value_ptr.items[0];
+        try std.testing.expectEqual(home, (v & REACH_FLAG) == 0);
+        try std.testing.expectEqual(@as(u32, 0), v & ~REACH_FLAG);
+    }
+
+    // Ground-length legs widen the ring honestly: 9 nmi at z13 near the equator
+    // ≈ 3.4 tiles -> ceil 4 -> a 9x9 block around the one-tile bbox.
+    const ground = [_]CellSpan{.{ .bounds = inner, .light_bbox = inner, .light_range_m = 9.0 * 1852.0 }};
+    try std.testing.expectEqual(@as(usize, 9 * 9), baker.plannedTiles(.harbor, &ground, 1, .extend_min, null));
+}
+
+test "ground-length directional leg bakes across every tile it crosses" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A directional light at a z13 tile centre near (0.30, 0.30) whose portrayal
+    // draws a 20 km GeographicCRS leg due east — ~4.1 z13-tiles, far beyond the
+    // one-tile display-mm reach. Every tile the leg crosses must carry it.
+    const feats = [_]s57.Feature{.{
+        .rcnm = 100,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 75,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+    }};
+    const home = lonLatToTile(0.30, 0.30, 13);
+    const htb = tile.tileBoundsLonLat(13, home[0], home[1]);
+    const anchor_lon = (htb[0] + htb[2]) * 0.5;
+    const anchor_lat = (htb[1] + htb[3]) * 0.5;
+    var cell = try testCell(gpa, anchor_lon, anchor_lat, 12_000, &feats);
+    defer cell.deinit();
+
+    const streams = [_]?[]const u8{
+        "ViewingGroup:27070;DrawingPriority:8;LineStyle:dash,3.51,0.32,CHBLK;AugmentedRay:GeographicCRS,90.0,GeographicCRS,20000;LineInstruction:_simple_;ClearGeometry",
+    };
+    const fbb = [_]?[4]f64{.{ anchor_lon, anchor_lat, anchor_lon, anchor_lat }};
+    // Exact reach from the streams — what the real bake paths compute.
+    const lr = scene.collectLightReach(&cell, &streams);
+    try std.testing.expectEqual(@as(f64, 20_000), lr.range_m);
+    const bounds = [4]f64{ htb[0], htb[1], htb[2], htb[3] }; // one-tile cell bbox
+    var be = Backend{
+        .cell = cell,
+        .portrayal = &streams,
+        .feat_bbox = &fbb,
+        .bounds = bounds,
+        .cscl = 12_000,
+        .light_bbox = lr.bbox,
+        .light_range_m = lr.range_m,
+    };
+
+    var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
+    var baker = Baker.init(gpa, 13, 13, .{ .ctx = &sink, .func = CollectSink.run });
+    defer baker.deinit();
+    try baker.bakeBand(.harbor, (&be)[0..1], 1, .extend_min, null, null, null);
+
+    // 20 km at z13/lat 0.3 = 4.088 tiles from the anchor (tile centre): the leg
+    // crosses the home tile + 4 eastward neighbours and stops inside the 4th.
+    var dx: u32 = 0;
+    while (dx <= 4) : (dx += 1) {
+        const bytes = sink.tiles.get(tileKey(13, home[0] + dx, home[1])) orelse return error.TestUnexpectedResult;
+        const raw = try gzip.decompress(a, bytes);
+        const layers = try mvt.decode(a, raw);
+        var legs: usize = 0;
+        for (layers) |L| {
+            if (std.mem.eql(u8, L.name, "lines")) legs += L.features.len;
+        }
+        try std.testing.expect(legs > 0);
+    }
+    // One tile past the leg's end: addressed by the ceil(4.088)=5 ring but the
+    // clipped geometry is empty, so no tile is emitted.
+    try std.testing.expect(sink.tiles.get(tileKey(13, home[0] + 5, home[1])) == null);
+}
+
+test "lightReachTiles: ground-leg tile spans at z13/z16" {
+    // 9 nmi = 16668 m at lat 39.2: ~4.4 tiles at z13, ~35 tiles at z16 (the
+    // proven US4MD1EC directional-leg reach), and never below the 1-tile
+    // display-mm floor.
+    const m = 9.0 * 1852.0;
+    try std.testing.expectApproxEqAbs(@as(f64, 4.397), scene.lightReachTiles(m, 13, 39.2), 0.05);
+    try std.testing.expectApproxEqAbs(@as(f64, 35.18), scene.lightReachTiles(m, 16, 39.2), 0.4);
+    try std.testing.expectEqual(@as(f64, 1.0), scene.lightReachTiles(0, 16, 39.2));
+    try std.testing.expectEqual(@as(f64, 1.0), scene.lightReachTiles(100.0, 8, 39.2)); // tiny leg: mm floor wins
+}
+
+test "fallbackBand: finest above all windows, coarsest below / in gaps" {
+    // The defect-3 scenario: approach (11-13) + general (7-9) coverage, z14 —
+    // above every window, the finest (approach) must win, NOT near-blank general.
+    try std.testing.expectEqual(Band.approach, fallbackBand(.approach, .general, 14));
+    // Below every window: the coarsest fills down (extend_min behaviour).
+    try std.testing.expectEqual(Band.general, fallbackBand(.approach, .general, 3));
+    // A gap between non-adjacent bands (approach 11-13 vs berthing 16-18, z14):
+    // not above the finest window, so the coarsest still fills.
+    try std.testing.expectEqual(Band.approach, fallbackBand(.berthing, .approach, 14));
+    // Above even berthing's top: finest.
+    try std.testing.expectEqual(Band.berthing, fallbackBand(.berthing, .approach, 19));
 }
 
 test "bandOf / bandZooms match the Go reference bands" {

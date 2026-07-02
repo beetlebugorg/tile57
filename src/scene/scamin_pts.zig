@@ -330,6 +330,11 @@ pub const CellScan = struct {
     cov_bounds: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // bbox over the coverage rings
     ladder: []const u32 = &.{}, // distinct SCAMIN denoms, ascending (collectScamins)
     cscl: i32 = 0,
+    // Conservative sector-figure reach from the raw LIGHTS attributes
+    // (scene.scanLightReachAttrs) — the bundle baker's super-tile index +
+    // planned-tile estimate widen a cell's span by it so light legs/arcs
+    // crossing tile (and super-tile) boundaries stay addressed.
+    light: scene.LightReach = .{},
 };
 
 /// Scan one parsed cell for the pre-pass (bake drivers run this per cell, in
@@ -341,6 +346,7 @@ pub fn scanCell(a: Allocator, cell: *const s57.Cell, cell_idx: u32) !CellScan {
         .coverage = cell.mcovrCoverage(a),
         .ladder = try bake_enc.collectScamins(a, cell),
         .cscl = cscl,
+        .light = scene.scanLightReachAttrs(cell),
     };
     for (s.coverage) |rings| for (rings) |ring| for (ring) |p| {
         s.cov_bounds[0] = @min(s.cov_bounds[0], p.lon());

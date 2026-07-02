@@ -413,8 +413,13 @@ fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize, band_inde
 
 // One ENC_ROOT base cell: its `.000` path (updates are <stem>.001…, found on load)
 // and the cheap peek bbox [w,s,e,n], used to assign it to spatial super-tiles
-// without a full parse.
-const CellEntry = struct { path: []const u8, bbox: [4]f64 };
+// without a full parse. `light` (patched in from the scamin pre-pass, which
+// parses every cell once) is the conservative attr-based sector-figure reach
+// (scene.scanLightReachAttrs): the super-tile index + planned-tile estimate
+// widen the cell's span by it so light legs/arcs crossing tile / super-tile
+// boundaries stay addressed (and the cell is loaded for the neighbouring
+// super-tiles its figures reach into).
+const CellEntry = struct { path: []const u8, bbox: [4]f64, light: engine.scene.LightReach = .{} };
 
 // ---- SCAMIN standalone pre-pass (specs/scamin-standalone.md) ----------------
 // Disk-sourced twin of chart.zig's buildBakeOverlay: before ANY band pass bakes
@@ -536,7 +541,10 @@ const RootOverlay = struct {
 
 // Run the whole pre-pass over the root's cell entries. Best-effort: an empty
 // overlay on failure (the bake then behaves band-quilted for points).
-fn buildRootOverlay(io: std.Io, dir: std.Io.Dir, entries: []const CellEntry, rules_dir: []const u8) RootOverlay {
+// `light_out` (optional, `entries`-aligned) receives each cell's attr-based
+// sector-figure reach (CellScan.light) — the pre-pass parses every cell once
+// anyway, so the reach the super-tile index needs rides along for free.
+fn buildRootOverlay(io: std.Io, dir: std.Io.Dir, entries: []const CellEntry, rules_dir: []const u8, light_out: ?[]engine.scene.LightReach) RootOverlay {
     const n = entries.len;
     if (n == 0) return .{};
     const gpa = std.heap.smp_allocator;
@@ -554,6 +562,11 @@ fn buildRootOverlay(io: std.Io, dir: std.Io.Dir, entries: []const CellEntry, rul
     @memset(scans, scamin_pts.CellScan{});
     var sw = OverlayScanWork{ .entries = entries, .dir = dir, .io = io, .arenas = scan_arenas, .scans = scans };
     engine.bake_enc.parallelFor(gpa, n, &sw, OverlayScanWork.run);
+    if (light_out) |lo| {
+        for (scans, 0..) |s, i| {
+            if (i < lo.len) lo[i] = s.light;
+        }
+    }
 
     const winners = scamin_pts.resolveWinners(gpa, sa, scans, n) catch return .{};
 
@@ -571,6 +584,10 @@ fn buildRootOverlay(io: std.Io, dir: std.Io.Dir, entries: []const CellEntry, rul
     for (minis, mini_arenas) |m, pa| {
         const mini = m orelse continue;
         if (pa == null) continue;
+        // Deduped LIGHTS winners keep their sector-figure reach: the tile pad
+        // (bake_enc.overlayNear) widens to the ground-leg span so a directional
+        // light's leg isn't chopped where the mini's bounds end.
+        const lr = engine.scene.collectLightReach(&mini.cell, mini.portrayal);
         backends.append(gpa, .{
             .cell = mini.cell,
             .portrayal = mini.portrayal,
@@ -579,6 +596,8 @@ fn buildRootOverlay(io: std.Io, dir: std.Io.Dir, entries: []const CellEntry, rul
             .feat_smax = mini.feat_smax,
             .bounds = mini.bounds,
             .cscl = mini.cell.params.cscl,
+            .light_bbox = lr.bbox,
+            .light_range_m = lr.range_m,
         }) catch break;
     }
     return .{ .backends = backends.toOwnedSlice(gpa) catch &.{}, .arenas = mini_arenas };
@@ -594,6 +613,11 @@ const CellPortray = struct {
     plain: ?[]const ?[]const u8,
     simplified: ?[]const ?[]const u8,
     bounds: [4]f64,
+    // EXACT sector-figure reach from the portrayal streams
+    // (scene.collectLightReach) — drives the Backend's buildTileMap reach ring
+    // and the LIGHTS feature-cull margin. Resident with the streams so a
+    // geometry re-parse doesn't recompute it.
+    light: engine.scene.LightReach = .{},
 };
 
 // A cell's parsed geometry (the heavy part): the S-57 model + assembled geo cache.
@@ -752,6 +776,7 @@ const LoadWork = struct {
                 .plain = if (cp.plain) |p| (copyStreams(sa, p) catch null) else null,
                 .simplified = if (cp.simplified) |p| (copyStreams(sa, p) catch null) else null,
                 .bounds = b,
+                .light = engine.scene.collectLightReach(&cell, cp.base),
             };
         } else |_| {
             // Portrayal failed: a resident entry with no streams (classify() fallback);
@@ -986,8 +1011,20 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var all_entries = std.ArrayList(CellEntry).empty;
     defer all_entries.deinit(gpa);
     for (band_cells) |bc| all_entries.appendSlice(gpa, bc.items) catch break;
-    var overlay = buildRootOverlay(io, dir, all_entries.items, rules_dir);
+    const entry_lights: []engine.scene.LightReach = a.alloc(engine.scene.LightReach, all_entries.items.len) catch &.{};
+    @memset(entry_lights, .{});
+    var overlay = buildRootOverlay(io, dir, all_entries.items, rules_dir, entry_lights);
     defer overlay.deinit();
+    // Patch each cell's attr-based sector-figure reach back into its band entry
+    // (band_cells order == the all_entries concatenation order): the super-tile
+    // index + planned-tile spans below widen the cell's span by it.
+    {
+        var k: usize = 0;
+        for (&band_cells) |*bc| for (bc.items) |*e| {
+            if (k < entry_lights.len) e.light = entry_lights[k];
+            k += 1;
+        };
+    }
     baker.overlay = overlay.backends;
     baker.scamin_standalone = true;
     var overlay_pts: usize = 0;
@@ -1095,6 +1132,32 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     try gop.value_ptr.append(gpa, @intCast(i));
                 }
             }
+            // Sector-figure reach: ALSO assign the cell to the super-tiles its
+            // light legs/arcs reach into (buildTileMap addresses those tiles via
+            // its reach ring, but only for cells loaded in that super-tile's
+            // pass). Margin in zs-tiles: the ground legs scale with 2^z so their
+            // zs-tile count is zoom-independent; the display-mm figures span at
+            // most one tile at the pass's coarsest zoom < one zs-tile; +1 covers
+            // the z-tile -> super-tile rounding. Raw-span members are skipped.
+            const lb = e.light.bbox orelse continue;
+            const m: u32 = 1 + @as(u32, @intFromFloat(@ceil(engine.scene.lightReachTiles(e.light.range_m, zs, (lb[1] + lb[3]) * 0.5))));
+            const max_idx: u32 = @intCast((@as(u64, 1) << @intCast(zs)) - 1);
+            const lnw = lonLatToTile(lb[0], lb[3], zs);
+            const lse = lonLatToTile(lb[2], lb[1], zs);
+            const rxlo = lnw[0] -| m;
+            const rxhi = @min(lse[0] +| m, max_idx);
+            var ry = lnw[1] -| m;
+            const ryhi = @min(lse[1] +| m, max_idx);
+            while (ry <= ryhi) : (ry += 1) {
+                var rx = rxlo;
+                while (rx <= rxhi) : (rx += 1) {
+                    if (rx >= nw[0] and rx <= se[0] and ry >= nw[1] and ry <= se[1]) continue; // raw span has it
+                    const k = (@as(u64, ry) << 32) | rx;
+                    const gop = try stmap.getOrPut(k);
+                    if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                    try gop.value_ptr.append(gpa, @intCast(i));
+                }
+            }
         }
         const stkeys = try gpa.alloc(u64, stmap.count());
         defer gpa.free(stkeys);
@@ -1124,14 +1187,15 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         var band_total: usize = 0;
         for (stkeys) |stk| {
             const cells = stmap.get(stk).?.items;
-            const bnds = gpa.alloc([4]f64, cells.len) catch continue;
-            defer gpa.free(bnds);
+            const spans = gpa.alloc(Bands.CellSpan, cells.len) catch continue;
+            defer gpa.free(spans);
             var st_own: usize = 0;
             for (cells, 0..) |ci, j| {
-                bnds[j] = pass_entries[ci].bbox;
+                const pe = pass_entries[ci];
+                spans[j] = .{ .bounds = pe.bbox, .light_bbox = pe.light.bbox, .light_range_m = pe.light.range_m };
                 if (ci < n_own) st_own += 1;
             }
-            band_total += baker.plannedTiles(band, bnds, st_own, floor, .{ .zs = zs, .sx = @intCast(stk & 0xFFFFFFFF), .sy = @intCast(stk >> 32) });
+            band_total += baker.plannedTiles(band, spans, st_own, floor, .{ .zs = zs, .sx = @intCast(stk & 0xFFFFFFFF), .sy = @intCast(stk >> 32) });
         }
         baker.band_total = band_total;
         std.debug.print("\n  band {s}: {d}+{d} cells, {d} super-tiles (z{d}-{d}), ~{d} tiles — baking…\n", .{ @tagName(band), entries.len, carry_entries.len, stkeys.len, @min(z_first, zhi), zhi, band_total });
@@ -1210,6 +1274,8 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     .cscl = g.cell.params.cscl,
                     .coverage = g.coverage,
                     .scamins = g.scamins,
+                    .light_bbox = if (p) |pp| pp.light.bbox else pass_entries[ci].light.bbox,
+                    .light_range_m = if (p) |pp| pp.light.range_m else pass_entries[ci].light.range_m,
                 }) catch continue;
                 if (ci < n_own) st_own += 1;
             };
