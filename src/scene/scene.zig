@@ -351,6 +351,14 @@ pub const CellOpts = struct {
     /// the AP(OVERSC01) overscale hatch's gate (S-52 §10.1.10: hatch shows while
     /// the display is FINER than 1:oscl). See emitOverscaleHatch.
     oscl: i64 = 0,
+    /// Scale-boundary overscale refinement (specs/overscale.md): emit this cell's
+    /// AP(OVERSC01) coverage hatch into the tile. Set only when a strictly-finer-
+    /// CSCL cell also contributes to the SAME tile (the quilting's finest
+    /// contributing scale undercuts this cell), so the hatch marks scale-boundary
+    /// coarse-only patches beside finer coverage. Whole-view overscale — no finer
+    /// data anywhere in the tile — emits NO hatch; the HUD "overscale ×n" readout
+    /// owns that case.
+    overscale_hatch: bool = false,
     /// SCAMIN standalone (specs/scamin-standalone.md): this is a REGULAR cell in a
     /// pipeline that emits deduped SCAMIN point objects from a scamin_pts overlay,
     /// so its own prim==1 SCAMIN-carrying features are skipped entirely (the overlay
@@ -2207,6 +2215,9 @@ pub const CellRef = struct {
     /// The cell's quantized compilation scale (see CellOpts.oscl): tags area
     /// fills/patterns + gates the AP(OVERSC01) overscale hatch; 0 = unknown.
     oscl: i64 = 0,
+    /// Emit this cell's AP(OVERSC01) coverage hatch (see CellOpts.overscale_hatch):
+    /// a strictly-finer-CSCL cell also contributes to this tile (scale boundary).
+    overscale_hatch: bool = false,
     /// SCAMIN standalone (see the CellOpts twins): regular cells set
     /// skip_scamin_points when a scamin_pts overlay owns their SCAMIN point
     /// features; overlay mini-cell refs carry the tile's eligibility floor
@@ -2246,6 +2257,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .suppress_points = cr.suppress_points,
             .smax = cr.smax,
             .oscl = cr.oscl,
+            .overscale_hatch = cr.overscale_hatch,
             .skip_scamin_points = cr.skip_scamin_points,
             .scamin_floor = cr.scamin_floor,
             .feat_smax = cr.feat_smax,
@@ -2274,6 +2286,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .suppress_points = cr.suppress_points,
             .smax = cr.smax,
             .oscl = cr.oscl,
+            .overscale_hatch = cr.overscale_hatch,
             .skip_scamin_points = cr.skip_scamin_points,
             .scamin_floor = cr.scamin_floor,
             .feat_smax = cr.feat_smax,
@@ -2464,12 +2477,16 @@ fn appendCellFeatures(
         if (!fopts.suppress_points and hasAdditionalInfo(f)) {
             try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, fopts, surf);
         }
-        // S-52 §10.1.10 overscale indication: every contributing cell's M_COVR
-        // (CATCOV=1) coverage polygon rides the tile as an AP(OVERSC01) hatch
-        // gated on `oscl` — emitted BESIDE the feature's normal portrayal (the
-        // M_COVR boundary lines still draw). Gated like the cell's fills (the
-        // whole-tile suppression rule) so hatch and fills appear/carry together.
-        if (fopts.oscl > 0 and !fopts.suppress_fills and isCoverageFeature(f)) {
+        // S-52 §10.1.10 overscale indication, scale-boundary refinement
+        // (specs/overscale.md): a cell's M_COVR (CATCOV=1) coverage polygon rides
+        // the tile as an AP(OVERSC01) hatch gated on `oscl` ONLY when a strictly-
+        // finer-CSCL cell also contributes to this tile (overscale_hatch, set by
+        // the quilting) — the hatch marks coarse-only patches at scale boundaries;
+        // whole-view overscale emits no hatch (the HUD readout's job). Emitted
+        // BESIDE the feature's normal portrayal (the M_COVR boundary lines still
+        // draw). Gated like the cell's fills (the whole-tile suppression rule) so
+        // hatch and fills appear/carry together.
+        if (fopts.oscl > 0 and fopts.overscale_hatch and !fopts.suppress_fills and isCoverageFeature(f)) {
             try emitOverscaleHatch(a, cell.*, f, fi, geo, z, x, y, tb, box, fopts, surf);
         }
         if (f.objl == 129) {
