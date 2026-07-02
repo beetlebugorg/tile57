@@ -1,5 +1,5 @@
 //! Golden portrayal-instruction test — conformance-testability assertion #5
-//! (specs/conformance-testability.md §1, §6.5). Drive the REAL embedded S-101 Lua
+//! Drive the REAL embedded S-101 Lua
 //! rules over a tiny in-memory fixture cell and assert the pre-raster S-100 Part-9
 //! instruction stream that `portrayCell` returns, BEFORE any MVT/raster mapping.
 //!

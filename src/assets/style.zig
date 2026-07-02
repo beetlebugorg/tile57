@@ -3,7 +3,7 @@
 //! / text layer set. Ported from the chartplotter web frontend's s52-style.mjs /
 //! chart-style.mjs (and the now-removed style/build_style.py, kept in git history;
 //! it was verified layer-for-layer identical during the port). The sole style
-//! generator now. Part of the `assets` module. See ../../../specs/bundle-bake.md.
+//! generator now. Part of the `assets` module.
 //!
 //! MapLibre expressions are written as Zig comptime tuples — `.{ "get", "drval1" }`
 //! serialises to `["get","drval1"]` — through std.json's Stringify write-stream,

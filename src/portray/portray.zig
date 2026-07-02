@@ -31,11 +31,25 @@ threadlocal var g_ctx: ?*Ctx = null;
 
 // Implemented in C (lua_shim.c): loads the framework + rules from `dir`,
 // dispatches every feature exposed by the tgp_* accessors, and calls tgp_emit
-// for each. `plain_boundaries` / `simplified_symbols` (0/1) override the S-101
-// PlainBoundaries / SimplifiedSymbols context parameters so the caller can
-// portray the plain-boundary / simplified-point-symbol display variants (both 0
-// = the default pass). Returns 0 on success.
-extern fn tg_portray_run(dir_ptr: [*]const u8, dir_len: usize, plain_boundaries: c_int, simplified_symbols: c_int) callconv(.c) c_int;
+// for each. `ctx` carries the pass's S-101 context parameters (null = the
+// fixed bake context). Returns 0 on success.
+extern fn tg_portray_run(dir_ptr: [*]const u8, dir_len: usize, ctx: ?*const CContext) callconv(.c) c_int;
+
+// Mirror of lua_shim.c's tg_portray_ctx (keep field order/types in sync).
+const CContext = extern struct {
+    plain_boundaries: c_int,
+    simplified_symbols: c_int,
+    radar_overlay: c_int,
+    four_shades: c_int,
+    full_light_lines: c_int,
+    ignore_scale_minimum: c_int,
+    shallow_water_dangers: c_int,
+    safety_contour: f64,
+    safety_depth: f64,
+    shallow_contour: f64,
+    deep_contour: f64,
+    safety_height: f64,
+};
 
 // Suppress the per-cell "[s101] portrayed …" stderr summary (extern in lua_shim.c).
 extern fn tg_set_quiet(q: c_int) callconv(.c) void;
@@ -118,17 +132,49 @@ export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(
 
 // ---- entry point ---------------------------------------------------------
 
-/// S-101 context-parameter overrides for a portrayal pass. Both false is the
-/// default pass (symbolized boundaries + paper-chart point symbols).
-pub const Overrides = struct {
-    plain_boundaries: bool = false,
-    simplified_symbols: bool = false,
+/// S-101 context parameters for a portrayal pass. The DEFAULTS are the fixed
+/// bake context (SafetyContour/Depth 30 etc. — see live-mariner-swap: the tile
+/// path bakes with this context and defers mariner choices to swappable props),
+/// so `.{}` reproduces baked output exactly. A native render (render-engine
+/// P1+) passes the mariner's REAL settings here — the rules then evaluate the
+/// actual safety contour, boundary style, and point-symbol style, with no
+/// prop-swap machinery.
+pub const Context = struct {
+    plain_boundaries: bool = false, // S-52 §8.6.1 boundary symbolization
+    simplified_symbols: bool = false, // S-52 §11.2.2 point-symbol style
+    radar_overlay: bool = false,
+    four_shades: bool = true,
+    full_light_lines: bool = false,
+    ignore_scale_minimum: bool = false,
+    shallow_water_dangers: bool = false,
+    safety_contour: f64 = 30,
+    safety_depth: f64 = 30,
+    shallow_contour: f64 = 2,
+    deep_contour: f64 = 30,
+    safety_height: f64 = 0,
+
+    fn toC(self: Context) CContext {
+        return .{
+            .plain_boundaries = @intFromBool(self.plain_boundaries),
+            .simplified_symbols = @intFromBool(self.simplified_symbols),
+            .radar_overlay = @intFromBool(self.radar_overlay),
+            .four_shades = @intFromBool(self.four_shades),
+            .full_light_lines = @intFromBool(self.full_light_lines),
+            .ignore_scale_minimum = @intFromBool(self.ignore_scale_minimum),
+            .shallow_water_dangers = @intFromBool(self.shallow_water_dangers),
+            .safety_contour = self.safety_contour,
+            .safety_depth = self.safety_depth,
+            .shallow_contour = self.shallow_contour,
+            .deep_contour = self.deep_contour,
+            .safety_height = self.safety_height,
+        };
+    }
 };
 
 /// Run the S-101 rules over `adapted` with `ov`, returning a stream array indexed
 /// by cell.features index (null where the adapted subset doesn't cover a feature,
 /// or it emitted nothing). `features_len` is cell.features.len.
-fn runAdapted(arena: std.mem.Allocator, adapted: []adapt.Adapted, features_len: usize, rules_dir: []const u8, ov: Overrides) ![]?[]const u8 {
+fn runAdapted(arena: std.mem.Allocator, adapted: []adapt.Adapted, features_len: usize, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
     const results = try arena.alloc([]const u8, adapted.len);
     for (results) |*r| r.* = "";
 
@@ -136,7 +182,8 @@ fn runAdapted(arena: std.mem.Allocator, adapted: []adapt.Adapted, features_len: 
     g_ctx = &ctx;
     defer g_ctx = null;
 
-    _ = tg_portray_run(rules_dir.ptr, rules_dir.len, @intFromBool(ov.plain_boundaries), @intFromBool(ov.simplified_symbols));
+    const cctx = pctx.toC();
+    _ = tg_portray_run(rules_dir.ptr, rules_dir.len, &cctx);
 
     // Re-key adapted-index results to cell feature index.
     const by_feature = try arena.alloc(?[]const u8, features_len);
@@ -153,6 +200,15 @@ fn runAdapted(arena: std.mem.Allocator, adapted: []adapt.Adapted, features_len: 
 pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) ![]?[]const u8 {
     const adapted = try adapt.adaptCell(arena, cell);
     return runAdapted(arena, adapted, cell.features.len, rules_dir, .{});
+}
+
+/// Portray a cell with an explicit S-101 context — the native-render entry
+/// point: the mariner's REAL safety contour / depth /
+/// boundary + point styles evaluate inside the rules, so the output needs none
+/// of the tile path's live-swap props. One pass, one context.
+pub fn portrayCellWith(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8, ctx: Context) ![]?[]const u8 {
+    const adapted = try adapt.adaptCell(arena, cell);
+    return runAdapted(arena, adapted, cell.features.len, rules_dir, ctx);
 }
 
 /// A cell's default portrayal plus its display-variant passes. `plain` is the

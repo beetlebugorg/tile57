@@ -349,7 +349,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // baker's cat selection, s101build.go:400). arg0 is the banded draw VG for a
             // non-text section; a text section puts its text group in arg0 (rank -1) so
             // text never controls cat/vg — the banded text draw VG (arg1) is the separate
-            // tgrp axis. Replaces the old first-wins vg (see specs/viewing-groups.md §2.2).
+            // tgrp axis. Replaces the old first-wins vg (controlling-VG model).
             const rank = categoryRank(vg0);
             if (rank >= 0 and (cat < 0 or rank < cat)) {
                 cat = rank;
@@ -437,7 +437,7 @@ test "display category defaults to Standard when no banded viewing group" {
     try std.testing.expectEqual(@as(usize, 1), p.texts.len);
 }
 
-test "viewing group: controlling VG = most-visible draw, band(vg)==cat (specs/viewing-groups.md §2.2)" {
+test "viewing group: controlling VG = most-visible draw, band(vg)==cat" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

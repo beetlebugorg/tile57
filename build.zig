@@ -163,7 +163,7 @@ pub fn build(b: *std.Build) void {
     // optimize so the same module objects compile under both the glibc test/lib
     // build and the static-musl baker build, inheriting each consumer's target.
     // DAG: iso8211 <- s57 <- s100. The embedded catalogue JSON rides on s100
-    // (its only @embedFile user is s100/catalogue.zig). See specs/bundle-bake.md.
+    // (its only @embedFile user is s100/catalogue.zig).
     const iso8211_mod = b.addModule("iso8211", .{
         .root_source_file = b.path("src/iso8211/iso8211.zig"),
     });
@@ -439,7 +439,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the bake CLI").dependOn(&run_bake.step);
 
     // S-57 -> S-101 portrayal attribute-coverage check (conformance recon; see
-    // specs/conformance-testability.md). Pure std, no engine imports — it just
+    // conformance-testability plan). Pure std, no engine imports — it just
     // reads vendor/s101/*.json + the vendored Lua rules from disk at run time.
     // Runs from the repo root (build cwd), so its default relative paths resolve.
     const cov = b.addExecutable(.{
@@ -560,11 +560,11 @@ pub fn build(b: *std.Build) void {
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
     // Noop surface: compile-checks the Surface contract + a lifecycle smoke
     // test, so the contract can't bit-rot as it evolves (it has no other
-    // consumer yet). See specs/render-engine.md §Non-goals / Verification gates.
+    // consumer yet).
     _ = addPkgTest(b, test_step, "src/surfaces/noop.zig", target, optimize, &.{
         .{ .name = "render_surface", .module = render_surface_mod },
     });
-    // Render resolver: colors at palette + display gates (specs/render-engine.md P1).
+    // Render resolver: colors at palette + display gates for pixel surfaces.
     _ = addPkgTest(b, test_step, "src/render/resolve.zig", target, optimize, &.{
         .{ .name = "render_surface", .module = render_surface_mod },
         .{ .name = "chartstyle", .module = chartstyle_mod },

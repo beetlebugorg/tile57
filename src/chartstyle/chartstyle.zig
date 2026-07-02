@@ -73,7 +73,7 @@ pub const MarinerSettings = struct {
     // (default); a non-empty list hides features whose raw `vg` (the tile property,
     // already baked) is in the off-set and shows everything else — so any new
     // catalogue group defaults visible. Features without a `vg` always show. Matches
-    // the host's `viewingGroupsOff` model (specs/viewing-groups.md §2.1).
+    // the host's `viewingGroupsOff` model.
     viewing_groups_off: ?[]const i32 = null,
 
     // -- date-dependent display (S-52 §10.4.1.1) --
@@ -371,7 +371,7 @@ pub fn textGroupFilter(b: B, m: *const MarinerSettings) !Value {
 }
 
 // S-52 §14.5 fine-grained viewing-group selection — a DENY-LIST (the host's
-// `viewingGroupsOff` model, specs/viewing-groups.md §2.1). null/empty off-set =>
+// `viewingGroupsOff` model). null/empty off-set =>
 // no filter (every group shown). Otherwise a feature shows iff it has no `vg`
 // (unbanded — always shown) OR its `vg` is NOT in the off-set, so any group the
 // host didn't list stays visible. Byte-identical to the host's s52-style.mjs

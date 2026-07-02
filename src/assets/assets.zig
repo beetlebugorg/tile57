@@ -1,7 +1,7 @@
 //! assets — offline portrayal-asset generation for the chart bundle. Mirrors the
 //! Go oracle's internal/engine/assets (EmitS101): the rendering half of the
 //! tile/style contract, emitted from the same S-101 catalogue that drives the
-//! tiles so the two can't drift. See ../../../specs/bundle-bake.md.
+//! tiles so the two can't drift. Mirrors the Go oracle's bundle assets.
 //!
 //! Pure Zig (no libc/fs): callers read the catalogue bytes and pass them in, the
 //! same shape as s100/catalogue.zig. RGB lives ONLY in colortables.json; the
@@ -10,7 +10,7 @@
 //! Implemented now: colortables.json (token -> hex, per day/dusk/night palette),
 //! the MapLibre style.json layer set (style.zig), and manifest.json (pins
 //! schema_version; couples tiles <-> portrayal). TODO, tracked in
-//! specs/bundle-bake.md: linestyles.json, sprite/pattern atlases (SVG raster),
+//! next: linestyles.json, sprite/pattern atlases (SVG raster),
 //! and glyphs (SDF) — to light up the symbol/text/pattern layers.
 
 const std = @import("std");

@@ -76,6 +76,54 @@ const char *tg_env_rules(void) { return getenv("TILE57_S101_RULES"); }
 static int g_portray_quiet = 0;
 void tg_set_quiet(int q) { g_portray_quiet = q; }
 
+/* S-101 context parameters for one tg_portray_run pass — the values the
+ * driver's cp() lines hand to the rules. Field order/types mirror the Zig
+ * extern struct in portray.zig (keep in sync). A NULL ctx means the DEFAULTS
+ * below, which reproduce the fixed bake context byte-for-byte; a native
+ * render passes the mariner's real settings. */
+typedef struct tg_portray_ctx {
+    int plain_boundaries;      /* S-52 §8.6.1 boundary symbolization */
+    int simplified_symbols;    /* S-52 §11.2.2 point-symbol style */
+    int radar_overlay;
+    int four_shades;
+    int full_light_lines;
+    int ignore_scale_minimum;
+    int shallow_water_dangers;
+    double safety_contour;
+    double safety_depth;
+    double shallow_contour;
+    double deep_contour;
+    double safety_height;
+} tg_portray_ctx;
+
+static const tg_portray_ctx tg_default_ctx = {
+    /* bools */ 0, 0, 0, 1, 0, 0, 0,
+    /* reals */ 30, 30, 2, 30, 0,
+};
+
+/* Push the context into Lua globals for the driver's cp() lines. Reals are
+ * pre-formatted with %g so the default context yields the exact strings the
+ * old static driver used ('30', '2', '0') — byte-identical rule behavior. */
+static void tg_set_ctx_globals(lua_State *L, const tg_portray_ctx *ctx) {
+    char num[64];
+#define TG_SET_BOOL(name, v) do { lua_pushboolean(L, (v)); lua_setglobal(L, name); } while (0)
+#define TG_SET_REAL(name, v) do { snprintf(num, sizeof num, "%g", (v)); lua_pushstring(L, num); lua_setglobal(L, name); } while (0)
+    TG_SET_BOOL("PLAIN_BOUNDARIES", ctx->plain_boundaries);
+    TG_SET_BOOL("SIMPLIFIED_SYMBOLS", ctx->simplified_symbols);
+    TG_SET_BOOL("RADAR_OVERLAY", ctx->radar_overlay);
+    TG_SET_BOOL("FOUR_SHADES", ctx->four_shades);
+    TG_SET_BOOL("FULL_LIGHT_LINES", ctx->full_light_lines);
+    TG_SET_BOOL("IGNORE_SCALE_MINIMUM", ctx->ignore_scale_minimum);
+    TG_SET_BOOL("SHALLOW_WATER_DANGERS", ctx->shallow_water_dangers);
+    TG_SET_REAL("SAFETY_CONTOUR", ctx->safety_contour);
+    TG_SET_REAL("SAFETY_DEPTH", ctx->safety_depth);
+    TG_SET_REAL("SHALLOW_CONTOUR", ctx->shallow_contour);
+    TG_SET_REAL("DEEP_CONTOUR", ctx->deep_contour);
+    TG_SET_REAL("SAFETY_HEIGHT", ctx->safety_height);
+#undef TG_SET_BOOL
+#undef TG_SET_REAL
+}
+
 /* Stub Host* callbacks (used to prove the framework EXECUTES, not just loads).
  * The real ones, backed by the Zig S-57 cell + catalogue, replace these. */
 static int l_empty_table(lua_State *L) {
@@ -652,12 +700,12 @@ static int lp_store(lua_State *L) { /* tg_store(index, instr) */
 }
 
 /* Run the S-101 rules over the adapted cell features (tgp_*), storing each
- * feature's instruction stream via tgp_emit. `plain_boundaries` /
- * `simplified_symbols` (0/1) override the S-101 PlainBoundaries /
- * SimplifiedSymbols context parameters so the caller can portray the
- * plain-boundary (S-52 §8.6.1) and simplified-point-symbol (§11.2.2) display
- * variants; both 0 reproduces the default pass unchanged. Returns 0 on success. */
-int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int simplified_symbols) {
+ * feature's instruction stream via tgp_emit. `ctx` carries the S-101 context
+ * parameters for the pass (see tg_portray_ctx): the display-variant axes
+ * (PlainBoundaries §8.6.1 / SimplifiedSymbols §11.2.2) plus the mariner
+ * depth/light/danger parameters. NULL reproduces the fixed bake context
+ * unchanged. Returns 0 on success. */
+int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
     char dbuf[4096];
     if (dir_len >= sizeof dbuf) return -1;
     memcpy(dbuf, dir, dir_len);
@@ -782,14 +830,18 @@ int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int si
     static const char *driver =
         "local cps={Type='array:ContextParameter'}\n"
         "local function cp(n,t,d) table.insert(cps, PortrayalCreateContextParameter(n,t,d)) end\n"
-        "cp('RadarOverlay','boolean','false')\n"
-        "cp('PlainBoundaries','boolean', PLAIN_BOUNDARIES and 'true' or 'false')\n"
-        "cp('SimplifiedSymbols','boolean', SIMPLIFIED_SYMBOLS and 'true' or 'false')\n"
-        "cp('FourShades','boolean','true')\n"
-        "cp('FullLightLines','boolean','false'); cp('IgnoreScaleMinimum','boolean','false')\n"
-        "cp('ShallowWaterDangers','boolean','false'); cp('SafetyContour','real','30')\n"
-        "cp('SafetyDepth','real','30'); cp('ShallowContour','real','2')\n"
-        "cp('DeepContour','real','30'); cp('SafetyHeight','real','0')\n"
+        "local function b(v) return v and 'true' or 'false' end\n"
+        /* Context values come from the tg_portray_ctx globals (tg_set_ctx_globals);
+         * reals arrive pre-formatted as strings so the default pass hands the rules
+         * the exact literals the old static driver did. */
+        "cp('RadarOverlay','boolean', b(RADAR_OVERLAY))\n"
+        "cp('PlainBoundaries','boolean', b(PLAIN_BOUNDARIES))\n"
+        "cp('SimplifiedSymbols','boolean', b(SIMPLIFIED_SYMBOLS))\n"
+        "cp('FourShades','boolean', b(FOUR_SHADES))\n"
+        "cp('FullLightLines','boolean', b(FULL_LIGHT_LINES)); cp('IgnoreScaleMinimum','boolean', b(IGNORE_SCALE_MINIMUM))\n"
+        "cp('ShallowWaterDangers','boolean', b(SHALLOW_WATER_DANGERS)); cp('SafetyContour','real', SAFETY_CONTOUR)\n"
+        "cp('SafetyDepth','real', SAFETY_DEPTH); cp('ShallowContour','real', SHALLOW_CONTOUR)\n"
+        "cp('DeepContour','real', DEEP_CONTOUR); cp('SafetyHeight','real', SAFETY_HEIGHT)\n"
         "cp('PreferredLanguage','text','eng')\n"
         "PortrayalInitializeContextParameters(cps)\n"
         "local ctx=portrayalContext.ContextParameters\n"
@@ -827,14 +879,9 @@ int tg_portray_run(const char *dir, size_t dir_len, int plain_boundaries, int si
         "end\n";
     lua_pushboolean(L, g_portray_quiet);
     lua_setglobal(L, "QUIET");
-    // Display-variant context overrides (S-52 §8.6.1 / §11.2.2): the driver's
-    // cp() lines read these globals for the PlainBoundaries / SimplifiedSymbols
-    // context parameters. Both 0 => the default pass (symbolized boundaries +
-    // paper-chart point symbols).
-    lua_pushboolean(L, plain_boundaries);
-    lua_setglobal(L, "PLAIN_BOUNDARIES");
-    lua_pushboolean(L, simplified_symbols);
-    lua_setglobal(L, "SIMPLIFIED_SYMBOLS");
+    /* The pass's S-101 context parameters, read by the driver's cp() lines.
+     * NULL => the fixed bake context (see tg_default_ctx). */
+    tg_set_ctx_globals(L, ctx ? ctx : &tg_default_ctx);
     int rc = 0;
     if (luaL_dostring(L, driver) != LUA_OK) {
         fprintf(stderr, "[s101] dispatch: %s\n", lua_tostring(L, -1));

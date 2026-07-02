@@ -10,7 +10,6 @@
 //! fact the calls don't carry, that's an engine bug — extend the contract.
 //!
 //! Mirrors the original Go RenderSurface interface (internal/s52render).
-//! See specs/render-engine.md.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

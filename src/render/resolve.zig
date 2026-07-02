@@ -7,7 +7,7 @@
 //! and the MapLibre client resolves live (assets/colortables.json + the
 //! chartstyle expressions). The resolver mirrors those exact semantics so the
 //! two styling paths can't silently drift; each gate cites the expression it
-//! mirrors. See specs/render-engine.md (P1).
+//! mirrors.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -130,7 +130,7 @@ pub fn scaminVisible(scamin: ?i64, zoom: f64) bool {
 }
 
 /// Viewing-group gate (S-52 §14.5) — the deny-list model of
-/// chartstyle.MarinerSettings.viewing_groups_off (specs/viewing-groups.md §2.1):
+/// chartstyle.MarinerSettings.viewing_groups_off (the host's viewingGroupsOff model):
 /// a feature with no viewing group (vg 0) always shows; otherwise it hides iff
 /// its group is in the mariner's off-list. Any group not listed defaults ON.
 pub fn viewingGroupVisible(vg: i64, off: ?[]const i32) bool {

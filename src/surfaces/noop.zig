@@ -3,8 +3,6 @@
 //! Used for benchmarking the engine in isolation — run the same scene with
 //! the noop surface to measure pure engine cost (portray + parse + project/clip).
 //! Subtract from the MVT or PNG surface cost to get the per-format overhead.
-//!
-//! See specs/render-engine.md §Non-goals (v1) and §Verification gates.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
