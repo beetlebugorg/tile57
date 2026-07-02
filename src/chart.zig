@@ -2010,9 +2010,19 @@ pub fn bakeArchive(
     var band_idx: [bake_enc.bands_fine_to_coarse.len]std.ArrayList(usize) = undefined;
     for (&band_idx) |*bi| bi.* = std.ArrayList(usize).empty;
     defer for (&band_idx) |*bi| bi.deinit(gpa);
+    // Per-cell band + peek bbox: the bbox feeds the fill-down gate (a finer band
+    // fills below its window only where no strictly-coarser band's footprint
+    // covers). An empty bbox (no geometry) can't cover anything, so it never gates.
+    const cbands = gpa.alloc(bake_enc.Band, cells_in.len) catch return error.BakeFailed;
+    defer gpa.free(cbands);
+    const cbboxes = gpa.alloc([4]f64, cells_in.len) catch return error.BakeFailed;
+    defer gpa.free(cbboxes);
     for (cells_in, 0..) |in, i| {
-        const cscl = s57.peekScale(gpa, in.base) orelse 0;
-        band_idx[@intFromEnum(bake_enc.bandOf(cscl))].append(gpa, i) catch return error.BakeFailed;
+        const m = s57.peekMeta(gpa, in.base);
+        const band = bake_enc.bandOf(if (m) |mm| mm.cscl else 0);
+        cbands[i] = band;
+        cbboxes[i] = if (m) |mm| (mm.bounds orelse .{ 1e9, 1e9, -1e9, -1e9 }) else .{ 1e9, 1e9, -1e9, -1e9 };
+        band_idx[@intFromEnum(band)].append(gpa, i) catch return error.BakeFailed;
     }
 
     catalogue.warmUp();
@@ -2164,6 +2174,25 @@ pub fn bakeArchive(
             all.appendSlice(gpa, backs.items) catch {};
             all.appendSlice(gpa, carry_backs.items) catch {};
             baker.bakeBand(band, all.items, backs.items.len, floor, null, progress, user) catch {};
+        }
+        // Fill-down: this band fills its below-window zooms where it is the
+        // coarsest band covering the ground (no strictly-coarser band's footprint
+        // overlaps) — the district-pack empty-low-zoom hole that extend_min (the
+        // single globally-coarsest band) can't reach. Mirrors the live tileRefs
+        // fallbackBand; only cells a coarser band doesn't blanket participate.
+        if (floor == .defer_down and backs.items.len > 0 and bake_enc.fillDownZooms(band, minzoom, maxzoom) != null) {
+            var coarser = std.ArrayList(bake_enc.CoarserBox).empty;
+            defer coarser.deinit(gpa);
+            for (cbands, cbboxes) |cb, bx| {
+                if (@intFromEnum(cb) > @intFromEnum(band)) // strictly coarser
+                    coarser.append(gpa, .{ .bbox = bx, .max_z = bake_enc.bandZooms(cb).max }) catch {};
+            }
+            var fd = std.ArrayList(bake_enc.Backend).empty;
+            defer fd.deinit(gpa);
+            for (backs.items) |be| {
+                if (!bake_enc.coveredByCoarser(be.bounds, coarser.items)) fd.append(gpa, be) catch {};
+            }
+            if (fd.items.len > 0) baker.bakeFillDown(band, fd.items, coarser.items, progress, user) catch {};
         }
         // The carry block's ride ends here; the own block becomes the NEXT pass's
         // carry (deferred) or is freed with it.
