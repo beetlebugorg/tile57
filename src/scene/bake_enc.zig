@@ -46,6 +46,9 @@ pub const Backend = struct {
     // quantizeHandoff). Empty = the cell carries no SCAMIN (quantize falls back to
     // the covering cell's raw CSCL).
     scamins: []const u32 = &.{},
+    // SCAMIN standalone (scene.scamin_pts): per-feature smax caps for an overlay
+    // mini-cell Backend (Baker.overlay); null for regular cells.
+    feat_smax: ?[]const i64 = null,
 };
 
 /// The finest (smallest 1:N) compilation scale among `backends[idxs]` whose coverage
@@ -335,6 +338,11 @@ const TileGenCtx = struct {
     gpa: std.mem.Allocator,
     format: scene.TileFormat = .mvt,
     pick_attrs: bool = true, // emit the per-feature pick-report attrs (s57/cell); off = lean tiles
+    // SCAMIN standalone (Baker.overlay/scamin_standalone): the deduped SCAMIN
+    // point mini cells joining EVERY tile by per-feature scale-window
+    // eligibility, and the flag that makes regular cells skip their own copies.
+    overlay: []const Backend = &.{},
+    standalone: bool = false,
     // Live progress emitted from inside the parallel batch (so a big super-tile
     // shows tiles flowing rather than appearing hung). `done` counts processed
     // tiles; `base` is the emitted count before this batch.
@@ -380,7 +388,20 @@ const TileGenCtx = struct {
 
         // refs + the encoded tile are transient (gzipped right below), so they ride
         // the per-thread scratch arena — reset after this tile, no per-tile mmap.
-        const refs = scratch.alloc(scene.CellRef, idxs.len) catch return;
+        // SCAMIN-standalone overlay (specs/scamin-standalone.md): the deduped
+        // SCAMIN point mini cells join EVERY tile whose bounds they touch —
+        // independent of bands/emitted-skip — gated per feature by the tile's
+        // display window (scamin_floor = D(z+1, φ_tile); the CellRef clamp).
+        // Padded by one tile so a light's sector legs/arcs reach neighbours
+        // (mirrors the LIGHT_AUG_REACH margin in the feature cull).
+        const pad_lon = tbll[2] - tbll[0];
+        const pad_lat = tbll[3] - tbll[1];
+        var n_ov: usize = 0;
+        for (c.overlay) |*ov| {
+            if (ov.bounds[0] <= tbll[2] + pad_lon and ov.bounds[2] >= tbll[0] - pad_lon and
+                ov.bounds[1] <= tbll[3] + pad_lat and ov.bounds[3] >= tbll[1] - pad_lat) n_ov += 1;
+        }
+        const refs = scratch.alloc(scene.CellRef, idxs.len + n_ov) catch return;
         for (idxs, 0..) |idx, j| {
             const be = &c.backends[idx];
             const g = carryGate(be.cscl, gf_centre_d, gf_whole, display_denom, ladders);
@@ -388,7 +409,17 @@ const TileGenCtx = struct {
             // scamin ladder (like the smax handoff), so the client's discrete
             // crossing machinery fires exactly at the emitted value.
             const oscl: i64 = if (be.cscl > 0) quantizeHandoff(ladders, be.cscl) else 0;
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl };
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .skip_scamin_points = c.standalone };
+        }
+        if (n_ov > 0) {
+            const floor_denom = assets.displayDenomZ(z + 1, clat);
+            var j = idxs.len;
+            for (c.overlay) |*ov| {
+                if (!(ov.bounds[0] <= tbll[2] + pad_lon and ov.bounds[2] >= tbll[0] - pad_lon and
+                    ov.bounds[1] <= tbll[3] + pad_lat and ov.bounds[3] >= tbll[1] - pad_lat)) continue;
+                refs[j] = .{ .cell = @constCast(&ov.cell), .portrayal = ov.portrayal, .portrayal_simplified = ov.portrayal_simplified, .feat_bbox = ov.feat_bbox, .feat_smax = ov.feat_smax, .scamin_floor = floor_denom };
+                j += 1;
+            }
         }
         const mvt_bytes = scene.encodeTile(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
@@ -431,6 +462,14 @@ pub const Baker = struct {
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
     format: scene.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
     pick_attrs: bool = true, // emit per-feature pick-report attrs (s57/cell); off = lean tiles
+    // SCAMIN standalone (specs/scamin-standalone.md): the deduped SCAMIN point
+    // mini cells (scene.scamin_pts, one Backend per contributing source cell),
+    // set ONCE by the driver before any pass and joined into every tile by
+    // per-feature scale-window eligibility. `scamin_standalone` makes regular
+    // cells skip their own prim==1 SCAMIN features (the overlay owns them);
+    // drivers set it whenever they built an overlay (even an empty one).
+    overlay: []const Backend = &.{},
+    scamin_standalone: bool = false,
     // Progress denominator (host §3): the caller sets these PER BAND before baking it
     // so the tiles-stage callback can report `done`/`total` as a per-band tile bar
     // (done = self.count - band_base; total = band_total, a planned estimate from
@@ -603,7 +642,7 @@ pub const Baker = struct {
         // NUL-terminated — @tagName is a comptime string literal, safe across the ABI).
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
@@ -930,6 +969,154 @@ test "overscale: contributing cells emit OVERSC01 coverage hatches tagged quanti
     }
     try std.testing.expectEqual(@as(usize, 1), fine_hatch);
     try std.testing.expectEqual(@as(usize, 1), coarse_hatch);
+}
+
+test "scamin standalone: one deduped feature per tile, scale-window included" {
+    const scamin_pts = scene.scamin_pts;
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The acceptance shape in miniature: the SAME object (one FOID) charted in a
+    // coastal 1:200k cell (SCAMIN 260000) and a general 1:1.2M cell (SCAMIN
+    // 800000). Standalone model: ONE deduped feature — fine geometry/attrs,
+    // effective scamin 800000 — in every tile whose window it reaches; the
+    // regular band path emits NO copy of its own. Plus a coarse-only object
+    // (no fine copy) capped at the fine chart's handoff (smax 260000).
+    const fine_attrs = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
+    const fine_feats = [_]s57.Feature{.{
+        .rcnm = 100,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .foid = 0xBEEF,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &fine_attrs,
+    }};
+    const coarse_attrs = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
+    const coarse_only_attrs = [_]s57.Attr{.{ .code = 133, .value = "900000" }};
+    const coarse_feats = [_]s57.Feature{ .{
+        .rcnm = 100,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .foid = 0xBEEF,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &coarse_attrs,
+    }, .{
+        .rcnm = 100,
+        .rcid = 2,
+        .prim = 1,
+        .objl = 14,
+        .foid = 0xD00D,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 2 }, .ornt = 255 }},
+        .attrs = &coarse_only_attrs,
+    } };
+    var fine_cell = try testCell(gpa, 0.35, 0.35, 200_000, &fine_feats);
+    defer fine_cell.deinit();
+    var coarse_cell = try testCell(gpa, 0.35, 0.35, 1_200_000, &coarse_feats);
+    defer coarse_cell.deinit();
+    // The coarse-only object sits a bit away from the shared one, still covered.
+    try coarse_cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 2, s57.LonLat.init(0.36, 0.36));
+
+    const ring = [_]s57.LonLat{
+        s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2),
+        s57.LonLat.init(3, 3),   s57.LonLat.init(-2, 3),
+        s57.LonLat.init(-2, -2),
+    };
+    const rings = [_][]const s57.LonLat{&ring};
+    const cover = [_][]const []const s57.LonLat{&rings};
+    const bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
+    const streams = [_]?[]const u8{ "DrawingPriority:7;PointInstruction:BOYLAT01", "DrawingPriority:7;PointInstruction:BOYLAT01" };
+    const fine_scamins = [_]u32{260_000};
+    const coarse_scamins = [_]u32{ 800_000, 900_000 };
+
+    var fine = Backend{ .cell = fine_cell, .portrayal = streams[0..1], .bounds = bounds, .cscl = 200_000, .coverage = &cover, .scamins = &fine_scamins };
+    const coarse = Backend{ .cell = coarse_cell, .portrayal = &streams, .bounds = bounds, .cscl = 1_200_000, .coverage = &cover, .scamins = &coarse_scamins };
+
+    // Build the overlay the way the drivers do: collect recs, dedup, cap, minis.
+    var recs = std.ArrayList(scamin_pts.Rec).empty;
+    try recs.appendSlice(a, try scamin_pts.collectRecs(a, &fine_cell, 200_000, 0));
+    try recs.appendSlice(a, try scamin_pts.collectRecs(a, &coarse_cell, 1_200_000, 1));
+    try scamin_pts.dedup(gpa, recs.items);
+    var minis = std.ArrayList(Backend).empty;
+    const ladders = [_][]const u32{&fine_scamins};
+    for (0..2) |ci| {
+        var entries = std.ArrayList(scamin_pts.MiniEntry).empty;
+        for (recs.items) |r| {
+            if (!r.winner or r.cell != ci) continue;
+            // Both points are covered by the fine 1:200k coverage; a group whose
+            // finest copy is coarser than that gets the quantized cap.
+            const cap = scamin_pts.capFor(if (r.foid == 0xBEEF) 200_000 else 1_200_000, 200_000, &ladders);
+            try entries.append(a, .{ .feat = r.feat, .lon = r.lon, .lat = r.lat, .effective = r.effective, .smax = cap });
+        }
+        if (entries.items.len == 0) continue;
+        const src: *const s57.Cell = if (ci == 0) &fine_cell else &coarse_cell;
+        const mini = try scamin_pts.buildMini(a, src, entries.items, &streams, null);
+        try minis.append(a, .{ .cell = mini.cell, .portrayal = mini.portrayal, .portrayal_simplified = mini.portrayal_simplified, .feat_bbox = mini.feat_bbox, .feat_smax = mini.feat_smax, .bounds = mini.bounds, .cscl = src.params.cscl });
+    }
+    // The shared object's winner is the FINE copy; the coarse-only one is capped.
+    try std.testing.expectEqual(@as(usize, 2), minis.items.len);
+
+    var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
+    var baker = Baker.init(gpa, 7, 10, .{ .ctx = &sink, .func = CollectSink.run });
+    defer baker.deinit();
+    baker.overlay = minis.items;
+    baker.scamin_standalone = true;
+
+    try baker.bakeBand(.coastal, (&fine)[0..1], 1, .defer_down, null, null, null);
+    var both = [_]Backend{ coarse, fine };
+    try baker.bakeBand(.general, &both, 1, .extend_min, null, null, null);
+
+    // Per tile zoom: the deduped feature (scamin 800000, NO smax) appears exactly
+    // once from its eligibility floor (D(z+1) <= 800k near the equator => z >= 9)
+    // to maxzoom, across BOTH passes — no band handoff, no double-draw. The
+    // capped coarse-only object (scamin 900000, smax 260000) rides the same
+    // tiles while their windows open coarser than its cap.
+    var z: u8 = 7;
+    while (z <= 10) : (z += 1) {
+        // Count each object in ITS OWN tile (the two points diverge into
+        // different tiles at z10), summing distinct tiles once.
+        var deduped: usize = 0;
+        var capped: usize = 0;
+        var seen = std.AutoHashMap(u64, void).init(a);
+        for ([_][2]f64{ .{ 0.35, 0.35 }, .{ 0.36, 0.36 } }) |pt| {
+            const t = lonLatToTile(pt[0], pt[1], z);
+            const key = tileKey(z, t[0], t[1]);
+            if ((try seen.getOrPut(key)).found_existing) continue;
+            const bytes = sink.tiles.get(key) orelse {
+                try std.testing.expect(z <= 8); // the low zooms may legitimately be empty
+                continue;
+            };
+            const raw = try gzip.decompress(a, bytes);
+            const layers = try mvt.decode(a, raw);
+            for (layers) |L| {
+                if (!std.mem.eql(u8, L.name, "point_symbols_scamin")) continue;
+                for (L.features) |ft| {
+                    const sc = findIntProp(ft.properties, "scamin") orelse continue;
+                    const sm = findIntProp(ft.properties, "smax");
+                    if (sc == 800_000) {
+                        try std.testing.expectEqual(@as(?i64, null), sm); // never capped/carried
+                        deduped += 1;
+                    } else if (sc == 900_000) {
+                        try std.testing.expectEqual(@as(?i64, 260_000), sm); // fine chart owns past 260k
+                        capped += 1;
+                    } else {
+                        // The fine cell's own 260000 copy must NEVER appear — the overlay owns it.
+                        try std.testing.expect(sc != 260_000);
+                    }
+                }
+            }
+        }
+        const floor_denom = assets.displayDenomZ(z + 1, 0.35);
+        try std.testing.expectEqual(@as(usize, if (800_000.0 >= floor_denom) 1 else 0), deduped);
+        try std.testing.expectEqual(@as(usize, if (scene.scamin_pts.eligibleAt(900_000, 260_000, floor_denom)) 1 else 0), capped);
+    }
+    // Sanity: the window really opens during the test range (z9/z10 carry it).
+    const t9 = lonLatToTile(0.35, 0.35, 9);
+    try std.testing.expect(sink.tiles.get(tileKey(9, t9[0], t9[1])) != null);
+    try std.testing.expect(800_000.0 >= assets.displayDenomZ(10, 0.35));
 }
 
 test "bandOf / bandZooms match the Go reference bands" {

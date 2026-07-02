@@ -254,7 +254,7 @@ pub fn buildDirectories(a: Allocator, entries: []const Entry) !Directories {
     }
 }
 
-fn deserializeDir(a: Allocator, buf: []const u8) ![]Entry {
+pub fn deserializeDir(a: Allocator, buf: []const u8) ![]Entry {
     var r = VarReader{ .buf = buf };
     const n: usize = @intCast(r.read());
     const entries = try a.alloc(Entry, n);

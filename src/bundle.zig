@@ -416,6 +416,174 @@ fn cliProgress(ctx: ?*anyopaque, stage: u8, done: usize, total: usize, band_inde
 // without a full parse.
 const CellEntry = struct { path: []const u8, bbox: [4]f64 };
 
+// ---- SCAMIN standalone pre-pass (specs/scamin-standalone.md) ----------------
+// Disk-sourced twin of chart.zig's buildBakeOverlay: before ANY band pass bakes
+// a tile, every cell is read+parsed once (parallel, transient) and scanned for
+// SCAMIN point records; the union is deduped globally (FOID identity across the
+// US3/US4/US5 copies), winners get their effective (MAX) scamin + smax cap, and
+// the winner-owning cells are re-parsed to portray JUST the winners
+// (portrayCellSubset) into overlay mini cells the Baker joins into every tile
+// by per-feature scale-window eligibility. Global and up-front because the
+// finest bands bake first: a z16 tile already needs the effective scamin the
+// coarsest cells contribute.
+
+const scamin_pts = engine.scene.scamin_pts;
+
+// Read + parse one cell (base .000 + sequential updates) from `dir`; null on
+// any failure. The parsed cell allocates from smp_allocator (thread-safe).
+fn readParseCell(io: std.Io, dir: std.Io.Dir, bpath: []const u8) ?engine.s57.Cell {
+    const gpa = std.heap.smp_allocator;
+    const base = dir.readFileAlloc(io, bpath, gpa, .unlimited) catch return null;
+    defer gpa.free(base);
+    if (base.len == 0) return null;
+    var ups = std.ArrayList([]const u8).empty;
+    defer {
+        for (ups.items) |ub| gpa.free(ub);
+        ups.deinit(gpa);
+    }
+    const stem = bpath[0 .. bpath.len - 4];
+    var u: u32 = 1;
+    while (u <= 999) : (u += 1) {
+        const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
+        defer gpa.free(upn);
+        const ub = dir.readFileAlloc(io, upn, gpa, .unlimited) catch break;
+        ups.append(gpa, ub) catch {
+            gpa.free(ub);
+            break;
+        };
+    }
+    return engine.s57.parseCellWithUpdates(gpa, base, ups.items) catch null;
+}
+
+const OverlayScanWork = struct {
+    entries: []const CellEntry,
+    dir: std.Io.Dir,
+    io: std.Io,
+    arenas: []?*std.heap.ArenaAllocator,
+    scans: []scamin_pts.CellScan,
+
+    fn run(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
+        _ = scratch;
+        const c: *OverlayScanWork = @ptrCast(@alignCast(uptr));
+        const gpa = std.heap.smp_allocator;
+        var cell = readParseCell(c.io, c.dir, c.entries[i].path) orelse return;
+        defer cell.deinit();
+        const pa = gpa.create(std.heap.ArenaAllocator) catch return;
+        pa.* = std.heap.ArenaAllocator.init(gpa);
+        c.scans[i] = scamin_pts.scanCell(pa.allocator(), &cell, @intCast(i)) catch {
+            pa.deinit();
+            gpa.destroy(pa);
+            return;
+        };
+        c.arenas[i] = pa;
+    }
+};
+
+const OverlayMiniWork = struct {
+    entries: []const CellEntry,
+    dir: std.Io.Dir,
+    io: std.Io,
+    winners: []const []const scamin_pts.MiniEntry,
+    rules_dir: []const u8,
+    arenas: []?*std.heap.ArenaAllocator,
+    minis: []?scamin_pts.Mini,
+
+    fn run(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
+        _ = scratch;
+        const c: *OverlayMiniWork = @ptrCast(@alignCast(uptr));
+        if (c.winners[i].len == 0) return;
+        const gpa = std.heap.smp_allocator;
+        var cell = readParseCell(c.io, c.dir, c.entries[i].path) orelse return;
+        defer cell.deinit();
+        cell.name = std.fs.path.stem(std.fs.path.basename(c.entries[i].path));
+        const pa = gpa.create(std.heap.ArenaAllocator) catch return;
+        pa.* = std.heap.ArenaAllocator.init(gpa);
+        const a = pa.allocator();
+        var ok = false;
+        defer if (!ok) {
+            pa.deinit();
+            gpa.destroy(pa);
+        };
+        const mask = a.alloc(bool, cell.features.len) catch return;
+        @memset(mask, false);
+        for (c.winners[i]) |e| {
+            if (e.feat < mask.len) mask[e.feat] = true;
+        }
+        var tmp = std.heap.ArenaAllocator.init(gpa);
+        defer tmp.deinit();
+        const cp = engine.portray.portrayCellSubset(tmp.allocator(), &cell, c.rules_dir, mask) catch engine.portray.CellPortrayal{ .base = &.{} };
+        c.minis[i] = scamin_pts.buildMini(a, &cell, c.winners[i], cp.base, cp.simplified) catch return;
+        c.arenas[i] = pa;
+        ok = true;
+    }
+};
+
+// The overlay a bakeRoot run holds: the mini-cell Backends + owning arenas.
+const RootOverlay = struct {
+    backends: []engine.bake_enc.Backend = &.{},
+    arenas: []?*std.heap.ArenaAllocator = &.{},
+
+    fn deinit(self: *RootOverlay) void {
+        const gpa = std.heap.smp_allocator;
+        for (self.arenas) |pa| if (pa) |p| {
+            p.deinit();
+            gpa.destroy(p);
+        };
+        if (self.arenas.len > 0) gpa.free(self.arenas);
+        if (self.backends.len > 0) gpa.free(self.backends);
+    }
+};
+
+// Run the whole pre-pass over the root's cell entries. Best-effort: an empty
+// overlay on failure (the bake then behaves band-quilted for points).
+fn buildRootOverlay(io: std.Io, dir: std.Io.Dir, entries: []const CellEntry, rules_dir: []const u8) RootOverlay {
+    const n = entries.len;
+    if (n == 0) return .{};
+    const gpa = std.heap.smp_allocator;
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    const scan_arenas = sa.alloc(?*std.heap.ArenaAllocator, n) catch return .{};
+    @memset(scan_arenas, null);
+    defer for (scan_arenas) |pa| if (pa) |p| {
+        p.deinit();
+        gpa.destroy(p);
+    };
+    const scans = sa.alloc(scamin_pts.CellScan, n) catch return .{};
+    @memset(scans, scamin_pts.CellScan{});
+    var sw = OverlayScanWork{ .entries = entries, .dir = dir, .io = io, .arenas = scan_arenas, .scans = scans };
+    engine.bake_enc.parallelFor(gpa, n, &sw, OverlayScanWork.run);
+
+    const winners = scamin_pts.resolveWinners(gpa, sa, scans, n) catch return .{};
+
+    const mini_arenas = gpa.alloc(?*std.heap.ArenaAllocator, n) catch return .{};
+    @memset(mini_arenas, null);
+    const minis = sa.alloc(?scamin_pts.Mini, n) catch {
+        gpa.free(mini_arenas);
+        return .{};
+    };
+    @memset(minis, null);
+    var mw = OverlayMiniWork{ .entries = entries, .dir = dir, .io = io, .winners = winners, .rules_dir = rules_dir, .arenas = mini_arenas, .minis = minis };
+    engine.bake_enc.parallelFor(gpa, n, &mw, OverlayMiniWork.run);
+
+    var backends = std.ArrayList(engine.bake_enc.Backend).empty;
+    for (minis, mini_arenas) |m, pa| {
+        const mini = m orelse continue;
+        if (pa == null) continue;
+        backends.append(gpa, .{
+            .cell = mini.cell,
+            .portrayal = mini.portrayal,
+            .portrayal_simplified = mini.portrayal_simplified,
+            .feat_bbox = mini.feat_bbox,
+            .feat_smax = mini.feat_smax,
+            .bounds = mini.bounds,
+            .cscl = mini.cell.params.cscl,
+        }) catch break;
+    }
+    return .{ .backends = backends.toOwnedSlice(gpa) catch &.{}, .arenas = mini_arenas };
+}
+
 // A cell's portrayal: the per-feature S-101 instruction streams (+ display
 // variants), computed ONCE by the Lua engine and kept resident for the whole band
 // in `arena`. Compact relative to geometry, and the expensive thing to produce —
@@ -809,6 +977,27 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     baker.format = format;
     baker.pick_attrs = pick_attrs;
     defer baker.deinit();
+
+    // SCAMIN standalone: global pre-pass building the deduped point overlay
+    // (must exist before the FIRST band pass — see buildRootOverlay). The smax
+    // caps also join the crossing ladder: they are quantized onto real SCAMIN
+    // values, but a raw-CSCL fallback still needs its client crossing.
+    const prepass_start = nowSec();
+    var all_entries = std.ArrayList(CellEntry).empty;
+    defer all_entries.deinit(gpa);
+    for (band_cells) |bc| all_entries.appendSlice(gpa, bc.items) catch break;
+    var overlay = buildRootOverlay(io, dir, all_entries.items, rules_dir);
+    defer overlay.deinit();
+    baker.overlay = overlay.backends;
+    baker.scamin_standalone = true;
+    var overlay_pts: usize = 0;
+    for (overlay.backends) |be| {
+        overlay_pts += be.cell.features.len;
+        if (be.feat_smax) |fs| for (fs) |v| {
+            if (v > 0) scamin.put(@intCast(v), {}) catch {};
+        };
+    }
+    std.debug.print("  scamin overlay: {d} deduped point objects from {d} cells ({d}s)\n", .{ overlay_pts, overlay.backends.len, nowSec() - prepass_start });
 
     // Pass 2: bake each band finest → coarsest (best-band dedup via baker.emitted).
     // Within a band, walk spatial "super-tiles" (one tile at zoom zs = zlo - SUPER_DZ):
