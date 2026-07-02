@@ -29,15 +29,34 @@ $T assets     -o assets/   # colortables + linestyles + sprite + patterns
 $T sprite-mln -o assets/   # the MapLibre sprite sheet
 # (pass a /path/to/PortrayalCatalog to use an on-disk catalogue instead)
 
+# Render a finished chart — no browser or GPU needed
+$T png CELL.000 --view -76.48,38.974,15 --size 1600x1200 -o chart.png
+$T pdf CELL.000 --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
+
 # Inspect / summarise
 $T inspect out/tiles/chart.pmtiles  # zoom range + tile counts
 $T cell    CELL.000             # summarise an S-57 cell
 $T version
 ```
 
-Run `tile57 help` for the full subcommand list (`bake`,
-`assets`, `sprite`, `pattern`, `sprite-mln`, `style`, `inspect`, `cell`,
-`version`, `help`).
+Run `tile57 help` for usage. The full subcommand list: `bake`, `assets`,
+`sprite`, `pattern`, `sprite-mln`, `style`, `png`, `pdf`, `ascii`, `cells`,
+`catalog`, `features`, `inspect`, `cell`, `objlcount`, `version`, `help`.
+
+:::info Tiles are MLT by default
+Bakes encode [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec)
+(MLT) by default; rendering them needs **MapLibre GL JS ≥ 5.12** (which decodes
+MLT natively — the generated styles carry the source `encoding` hint). Pass
+`--format mvt` to bake Mapbox Vector Tiles for older or other consumers.
+:::
+
+And a crowd-pleaser — the chart in your terminal, as a Unicode grid with
+ANSI colour, with `--tui` for an interactive pan/zoom loop (`--kitty` paints
+real S-52 pixels inline on kitty-graphics terminals like Ghostty or Kitty):
+
+```sh
+$T ascii CELL.000 --view -76.48,38.974,13 --ansi --tui
+```
 
 A **bundle** is a relocatable directory in which the tiles and the portrayal that
 renders them travel together:
@@ -61,11 +80,15 @@ const tile57 = @import("tile57");
 var chart = try tile57.Chart.openBytes(cell_bytes, .auto, null);
 defer chart.deinit();
 
-if (try chart.tile(z, x, y)) |mvt| {     // decompressed MVT bytes (or null if empty)
-    defer tile57.freeBytes(mvt);
-    // … hand mvt to your renderer …
+if (try chart.tile(z, x, y)) |bytes| {   // decompressed tile bytes (or null if empty)
+    defer tile57.freeBytes(bytes);
+    // … hand the tile to your renderer …
 }
 ```
+
+Tiles come back in the chart's tile encoding — a baked PMTiles archive serves
+its stored format (MLT by default), a live cell-backed chart opens generating
+MVT and opts in to MLT via `setTileFormat`; `tileType()` tells you which.
 
 `Chart.openPath` / `Chart.openCellsStreaming` open a whole ENC_ROOT;
 `tile57.bakeArchive` bakes one to a PMTiles archive; `tile57.assets`,
@@ -81,10 +104,11 @@ The same engine sits behind a thin C ABI ([`include/tile57.h`](../../include/til
 
 tile57_chart *c = tile57_chart_open_bytes(data, len);   /* one in-memory S-57 cell */
 
-uint8_t *mvt; size_t n;
-if (tile57_chart_tile(c, z, x, y, &mvt, &n) == TILE57_TILE_OK) {
-    /* … render the decompressed MVT bytes … */
-    tile57_free(mvt, n);
+uint8_t *tile; size_t n;
+if (tile57_chart_tile(c, z, x, y, &tile, &n) == TILE57_TILE_OK) {
+    /* … render the decompressed tile bytes (MVT or MLT —
+       see tile57_chart_info.tile_type) … */
+    tile57_free(tile, n);
 }
 tile57_chart_close(c);
 ```
