@@ -3,7 +3,7 @@
 //! (e.g. `ColorFill:DEPMS;AreaFillReference:DIAMOND1;LineStyle:_simple_,,0.96,
 //! CHGRD;LineInstruction:_simple_;PointInstruction:BCNCAR01`). This parses one
 //! feature's stream into fills / patterns / lines / points / texts that
-//! s57_mvt maps onto the chart's MVT layers (color_token, etc.).
+//! scene maps onto the chart's MVT layers (color_token, etc.).
 //!
 //! Mirrors internal/engine/portrayal/s101emit.go (the instruction interpreter).
 
@@ -264,7 +264,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
                 // mm -> px (Go SimpleLine.Width * pxPerMM); raw mm rendered ~3.78x too thin.
                 // dashFor (oracle s101emit.go:278): LineStyle DashLength>0 strokes dashed,
                 // else solid. The emit side maps an unregistered "dashed" style to a generic
-                // dashed stroke (s57_mvt.zig:923), matching StrokeLine{Dash: DashDashed}.
+                // dashed stroke (scene.zig:923), matching StrokeLine{Dash: DashDashed}.
                 const simple_style: []const u8 = if (cur_dash_len > 0) "dashed" else "solid";
                 try lines.append(a, .{ .style = simple_style, .width = cur_width * PX_PER_MM, .color = cur_color });
             } else {

@@ -2,7 +2,7 @@
 //! (src/mvt/mvt.zig). MLT v1 (spec stable Oct 2025) is decoded by MapLibre Native
 //! + GL JS via a source `"encoding": "mlt"`. This encodes the SAME logical model
 //! tile57 builds for MVT (mvt.Tile/Layer/Feature), so it's a parallel encoder at
-//! one seam (s57_mvt.generateTileMulti).
+//! one seam (scene.generateTileMulti).
 //!
 //! Wire format mirrors the reference impl (github.com/maplibre/maplibre-tile-spec):
 //! a tile is a sequence of blocks `[varint blockLength][varint tag=1][body]`; the

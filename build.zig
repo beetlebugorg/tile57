@@ -162,7 +162,7 @@ pub fn build(b: *std.Build) void {
     // libc/Lua) and target-agnostic: they omit target/optimize so the same module
     // objects compile under both the glibc test/lib build and the static-musl
     // baker build, inheriting each consumer's target.
-    // DAG: s57 (incl. iso8211) <- s100; tiles (leaf) <- render <- s57_mvt.
+    // DAG: s57 (incl. iso8211) <- s100; tiles (leaf) <- render <- scene.
     // The embedded catalogue JSON rides on s100 (catalogue.zig @embedFile's it).
     const s57_mod = b.addModule("s57", .{
         .root_source_file = b.path("src/s57/s57.zig"),
@@ -199,11 +199,11 @@ pub fn build(b: *std.Build) void {
     }.f;
     addFont(b, render_mod);
 
-    // The tile engine (src/s57_mvt/): S-57 -> tile-surface generation plus the
+    // The tile engine (src/scene/): S-57 -> tile-surface generation plus the
     // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
     // internal/engine/baker — folded in as the engine's batch driver).
-    const s57_mvt_mod = b.addModule("s57_mvt", .{
-        .root_source_file = b.path("src/s57_mvt/s57_mvt.zig"),
+    const scene_mod = b.addModule("scene", .{
+        .root_source_file = b.path("src/scene/scene.zig"),
         .imports = &.{
             .{ .name = "s57", .module = s57_mod },
             .{ .name = "s100", .module = s100_mod },
@@ -262,7 +262,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
         .{ .name = "s100", .module = s100_mod },
         .{ .name = "tiles", .module = tiles_mod },
-        .{ .name = "s57_mvt", .module = s57_mvt_mod },
+        .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "assets", .module = assets_mod },
     };
@@ -477,7 +477,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&b.addInstallArtifact(parity, .{}).step);
 
     // Tests. The engine module (root.zig) covers its own files — the relative-
-    // imported gzip/pmtiles/tile/s57_mvt/bake_enc + the MVT parity test. Each
+    // imported gzip/pmtiles/tile/scene/bake_enc + the MVT parity test. Each
     // standalone package is tested through its own root (addPkgTest), since a
     // module import does NOT pull another module's `test {}` blocks in.
     const test_step = b.step("test", "Run unit tests");
@@ -490,7 +490,7 @@ pub fn build(b: *std.Build) void {
     addCatalogueJson(b, s100_test); // catalogue.zig @embedFile's the JSON
     const tiles_test = addPkgTest(b, test_step, "src/tiles/tiles.zig", target, optimize, &.{});
     addMvtFixture(b, tiles_test); // pmtiles.zig's round-trip test embeds it
-    _ = addPkgTest(b, test_step, "src/s57_mvt/s57_mvt.zig", target, optimize, &.{
+    _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
         .{ .name = "s100", .module = s100_mod },
         .{ .name = "tiles", .module = tiles_mod },
@@ -518,7 +518,7 @@ pub fn build(b: *std.Build) void {
     const pixel_golden = addPkgTest(b, test_step, "src/render/pixel_golden_test.zig", target, optimize, &.{
         .{ .name = "portray", .module = portray_mod },
         .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s57_mvt", .module = s57_mvt_mod },
+        .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "tiles", .module = tiles_mod },
     });

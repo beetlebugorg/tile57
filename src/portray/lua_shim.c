@@ -772,7 +772,7 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
     // (never nil): the framework's GetSpatial does `self.Spatial = sa.Spatial`
     // then re-reads `self.Spatial`, and a nil leaves the field absent so the
     // re-read re-enters GetSpatial forever (the OBSTRN/WRECKS "C stack overflow").
-    // Line/area boundary geometry isn't read here — s57_mvt attaches it directly.
+    // Line/area boundary geometry isn't read here — scene attaches it directly.
     static const char *glue =
         "function HostFeatureGetSpatialAssociations(fid)\n"
         "  local pt=_HostFeaturePrimitive(fid); if pt=='' then return nil end\n"
@@ -803,7 +803,7 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
          * edge/node QUAPOS to a remapped qualityOfHorizontalMeasurement on the
          * feature root (s101_adapt s65RemapQuapos), so a feature that carries it
          * exposes ONE SpatialQuality association on every spatial of its geometry —
-         * the same per-feature granularity as the s57_mvt force_dash approximation.
+         * the same per-feature granularity as the scene force_dash approximation.
          * This lights the real rule branches: QUAPNT02's LOWACC01 mark, QUALIN02's
          * LOWACC21 coastline, DEPCNT03/DEPARE03's dashed low-accuracy contours. */
         "function HostSpatialGetAssociatedInformationIDs(sid, assoc, role)\n"

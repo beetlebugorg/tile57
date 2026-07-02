@@ -39,6 +39,7 @@ pub const RasterCanvas = struct {
         .fillPath = fillPathImpl,
         .fillPattern = fillPatternImpl,
         .strokePath = strokePathImpl,
+        .drawGlyphRun = drawGlyphRunImpl,
     };
 
     pub fn init(a: Allocator, w: u32, h: u32) !RasterCanvas {
@@ -105,6 +106,13 @@ pub const RasterCanvas = struct {
             }
         }
         try self.rasterize(.{ .solid = color }, .nonzero);
+    }
+
+    // A raster canvas paints the run's pre-flattened outlines: halo as an
+    // under-stroke, glyph bodies as nonzero fills.
+    fn drawGlyphRunImpl(ctx: *anyopaque, run: *const cv.GlyphRun) anyerror!void {
+        if (run.halo) |hc| try strokePathImpl(ctx, run.rings, run.halo_w * 2, null, hc);
+        try fillPathImpl(ctx, run.rings, run.color, .nonzero);
     }
 
     // ---- edge building ------------------------------------------------------

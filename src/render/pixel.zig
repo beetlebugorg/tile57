@@ -39,9 +39,9 @@ const OpKind = union(enum) {
     fill: struct { rings: []const []const cv.Point, color: cv.Color, rule: cv.FillRule = .nonzero },
     pattern: struct { rings: []const []const cv.Point, cell: *const cv.Pattern },
     stroke: struct { lines: []const []const cv.Point, width: f32, dash: ?[2]f32, color: cv.Color },
-    /// A shaped label: glyph outline contours in canvas px, pre-anchored.
-    /// `bbox` [minx,miny,maxx,maxy] feeds the endScene collision pass.
-    text: struct { rings: []const []const cv.Point, color: cv.Color, halo: ?cv.Color, halo_w: f32, bbox: [4]f32 },
+    /// A shaped label (outlines for raster + the glyph run for text-object
+    /// canvases). `bbox` [minx,miny,maxx,maxy] feeds the collision pass.
+    text: struct { run: cv.GlyphRun, bbox: [4]f32 },
 };
 
 /// Paint class, mirroring the tile style's LAYER order (areas ->
@@ -337,15 +337,15 @@ pub const PixelSurface = struct {
         const px = font_px_css * @as(f32, @floatCast(self.devScale()));
         if (px <= 1) return;
 
-        // Shape: glyph ids + pen positions.
-        var gids = std.ArrayList(struct { gid: u16, x: f32 }).empty;
-        defer gids.deinit(self.a);
+        // Shape: glyph ids + pen positions (+ the PDF 1000/em advances).
+        var gids = std.ArrayList(cv.Glyph).empty;
         var pen: f32 = 0;
         var it = (std.unicode.Utf8View.init(text) catch return).iterator();
         while (it.nextCodepoint()) |cp| {
             const gid = f.glyphIndex(cp);
-            try gids.append(self.a, .{ .gid = gid, .x = pen });
-            pen += f.advance(gid) * px;
+            const adv = f.advance(gid);
+            try gids.append(self.a, .{ .gid = gid, .cp = cp, .x = pen, .w1000 = @intFromFloat(std.math.clamp(@round(adv * 1000.0), 0, 65535)) });
+            pen += adv * px;
         }
         if (gids.items.len == 0) return;
 
@@ -382,10 +382,16 @@ pub const PixelSurface = struct {
         if (rings.items.len == 0) return;
         const halo_w = @as(f32, @floatCast(self.devScale())); // 1 CSS px
         try self.push(.text, .{ .text = .{
-            .rings = rings.items,
-            .color = color,
-            .halo = if (haloed) self.resolveColor("CHWHT") else null,
-            .halo_w = halo_w,
+            .run = .{
+                .rings = rings.items,
+                .glyphs = try gids.toOwnedSlice(self.a),
+                .origin = .{ .x = x0, .y = baseline },
+                .size = px,
+                .color = color,
+                .halo = if (haloed) self.resolveColor("CHWHT") else null,
+                .halo_w = halo_w,
+                .text = try self.a.dupe(u8, text),
+            },
             .bbox = .{ bbox[0] - halo_w, bbox[1] - halo_w, bbox[2] + halo_w, bbox[3] + halo_w },
         } });
     }
@@ -399,11 +405,9 @@ pub const PixelSurface = struct {
             .fill => |f| try canvas.fillPath(f.rings, f.color, f.rule),
             .pattern => |p| try canvas.fillPattern(p.rings, p.cell),
             .stroke => |s| try canvas.strokePath(s.lines, s.width, s.dash, s.color),
-            .text => |t| {
+            .text => |*t| {
                 if (dropped.contains(op.seq)) continue;
-                // Halo = under-stroke (2x the halo width, centered on the edge).
-                if (t.halo) |hc| try canvas.strokePath(t.rings, t.halo_w * 2, null, hc);
-                try canvas.fillPath(t.rings, t.color, .nonzero);
+                try canvas.drawGlyphRun(&t.run);
             },
         };
     }
@@ -459,6 +463,7 @@ pub const PixelSurface = struct {
             },
             .pdf => {
                 var pc = pdf.PdfCanvas.init(self.a, self.w_px, self.h_px);
+                pc.font_data = fontmod.notosans; // labels become REAL text objects
                 const canvas = pc.asCanvas();
                 // NODTA page background.
                 const bg = [_]cv.Point{
@@ -652,8 +657,9 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     try surf.endFeature();
     try std.testing.expectEqual(@as(usize, 1), ps.ops.items.len);
     const t = ps.ops.items[0].kind.text;
-    try std.testing.expect(t.rings.len >= 6); // R,e,e,f,1,2 (space has none)
-    try std.testing.expect(t.halo != null); // 12px >= 10 -> haloed
+    try std.testing.expect(t.run.rings.len >= 6); // R,e,e,f,1,2 (space has none)
+    try std.testing.expect(t.run.glyphs.len == 7); // incl. the space glyph
+    try std.testing.expect(t.run.halo != null); // 12px >= 10 -> haloed
     try std.testing.expect(t.bbox[2] > t.bbox[0] and t.bbox[3] > t.bbox[1]);
     try std.testing.expect(t.bbox[0] >= 99); // halign left: extends right of x=100
 

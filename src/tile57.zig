@@ -15,7 +15,7 @@
 //!   - High-level engine: `Chart` (open → tile), `bakeArchive`, `buildStyle`   [Phase 2]
 //!   - Portrayal assets:  `assets` (colortables, linestyles, sprite/pattern)
 //!   - Style patching:    `chartstyle`
-//!   - Tiling:            `mvt`, `tile`, `pmtiles`, `bake_enc`, `s57_mvt`
+//!   - Tiling:            `mvt`, `tile`, `pmtiles`, `bake_enc`, `scene`
 //!   - Raw formats:       `formats.{iso8211, s57, s100}`
 
 const std = @import("std");
@@ -58,8 +58,8 @@ pub const chartstyle = @import("assets").chartstyle; // mariner-driven MapLibre 
 pub const mvt = @import("tiles").mvt; // Mapbox Vector Tile encode/decode
 pub const tile = @import("tiles").tile; // web-mercator tiling + clipping
 pub const pmtiles = @import("tiles").pmtiles; // PMTiles read/write
-pub const bake_enc = @import("s57_mvt").bake_enc; // banded multi-cell ENC_ROOT → PMTiles
-pub const s57_mvt = @import("s57_mvt"); // S-57 feature → MVT tile
+pub const bake_enc = @import("scene").bake_enc; // banded multi-cell ENC_ROOT → PMTiles
+pub const scene = @import("scene"); // S-57 feature → MVT tile
 
 // ---- raw S-57 / S-100 formats (advanced) ---------------------------------
 pub const formats = struct {

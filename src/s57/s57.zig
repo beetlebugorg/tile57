@@ -584,7 +584,7 @@ pub const Cell = struct {
     /// cells with no coast.
     coast_edges: std.AutoHashMapUnmanaged(u32, void) = .{},
     /// Per-feature area representative (label) point, indexed by feature index; built
-    /// once per cell by the baker (s57_mvt.buildLabelCache) so the per-tile emit reuses
+    /// once per cell by the baker (scene.buildLabelCache) so the per-tile emit reuses
     /// it instead of re-running the pole-of-inaccessibility (polylabel) search for every
     /// tile a feature touches — the dominant bake cost. null = not built (the live
     /// single-tile path falls back to an on-demand search). Allocated in the baker's

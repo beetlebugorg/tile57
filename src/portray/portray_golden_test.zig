@@ -11,7 +11,7 @@
 //! dedicated test artifact rather than the libc-free pure-package tests.
 //!
 //! No geometry is built: the instruction stream is emitted from a feature's attributes
-//! and primitive type; geometry is attached later (s57_mvt), downstream of this seam.
+//! and primitive type; geometry is attached later (scene), downstream of this seam.
 
 const std = @import("std");
 const s57 = @import("s57");

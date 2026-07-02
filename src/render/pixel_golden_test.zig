@@ -12,7 +12,7 @@
 const std = @import("std");
 const s57 = @import("s57");
 const portray = @import("portray");
-const s57_mvt = @import("s57_mvt");
+const scene = @import("scene");
 const render = @import("render");
 const tile = @import("tiles").tile;
 
@@ -81,8 +81,8 @@ test "golden PNG: depth-area fill + coastline stroke through the pixel path" {
     const settings = render.resolve.MarinerSettings{};
     var ps = render.pixel.PixelSurface.init(a, &colors, .day, &settings, @floatFromInt(z), 256, tile.EXTENT);
 
-    const cells = [_]s57_mvt.CellRef{.{ .cell = &cell, .portrayal = streams, .geo = geo }};
-    const bytes = try s57_mvt.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
+    const cells = [_]scene.CellRef{.{ .cell = &cell, .portrayal = streams, .geo = geo }};
+    const bytes = try scene.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
 
     // Always drop the image for eyeballing / re-blessing.
     {

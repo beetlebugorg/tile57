@@ -49,12 +49,12 @@ pub fn embeddedLinestyles(a: std.mem.Allocator) ![]assets.LineStyleSrc {
 }
 
 // Build the complex-line tessellation table (id -> LsInfo) from `srcs` and register
-// it with s57_mvt before baking, so a named (symbolised) linestyle is drawn as its
+// it with scene before baking, so a named (symbolised) linestyle is drawn as its
 // real dash runs + embedded symbols instead of a generic dashed stroke. Mirrors Go
 // lsInfoFromCatalog; mm geometry is converted at the PresLib feature scale. Best
 // effort — a malformed/short style is simply skipped. `gpa` outlives the bake.
 pub fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const assets.LineStyleSrc) void {
-    const px = engine.s57_mvt.LINESTYLE_PX_PER_MM;
+    const px = engine.scene.LINESTYLE_PX_PER_MM;
     for (srcs) |s| {
         const parsed = assets.parseLineStyle(gpa, s.xml) catch continue;
         const period = parsed.interval_length * px;
@@ -65,11 +65,11 @@ pub fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const assets.LineStyle
             const hi = (d.start + d.length) * px;
             if (hi - lo > 1e-6) runs.append(gpa, .{ lo, hi }) catch {};
         }
-        var syms = std.ArrayList(engine.s57_mvt.LsSym).empty;
+        var syms = std.ArrayList(engine.scene.LsSym).empty;
         for (parsed.symbols) |sym| syms.append(gpa, .{ .name = sym.reference, .offset_px = sym.position * px }) catch {};
         var width = parsed.pen_width * px;
         if (width < 0.6) width = 0.9; // S-52 minimum pen
-        engine.s57_mvt.registerLinestyle(gpa, s.id, .{
+        engine.scene.registerLinestyle(gpa, s.id, .{
             .period_px = period,
             .on_runs = runs.items,
             .symbols = syms.items,
@@ -272,7 +272,7 @@ pub const BakeOpts = struct {
     maxzoom: u8 = 16,
     lru: usize = 64, // lazy-bake tuning: parsed cells held resident
     super_dz: u8 = 3, // lazy-bake tuning: spatial super-tile depth
-    format: engine.s57_mvt.TileFormat = .mvt,
+    format: engine.scene.TileFormat = .mvt,
     // Emit per-feature pick-report attrs (s57/cell) in the baked tiles. Defaults ON;
     // a lean bake sets it false to drop the bulky s57 payload.
     pick_attrs: bool = true,
@@ -429,8 +429,8 @@ const CellPortray = struct {
 // EVICTABLE under LRU pressure and re-parsed on demand (cheap — no re-portrayal).
 const CellGeom = struct {
     cell: engine.s57.Cell, // cell.arena owns the geometry
-    geo: ?engine.s57_mvt.GeoParts,
-    geo_world: ?engine.s57_mvt.GeoWorld = null, // precomputed world coords (in geo_arena)
+    geo: ?engine.scene.GeoParts,
+    geo_world: ?engine.scene.GeoWorld = null, // precomputed world coords (in geo_arena)
     geo_arena: ?*std.heap.ArenaAllocator,
     feat_bbox: []const ?[4]f64 = &.{}, // per-feature bbox for the per-tile cull (in geo_arena)
     coverage: []const []const []const engine.s57.LonLat = &.{}, // M_COVR (cell.arena) for quilting
@@ -495,19 +495,19 @@ const LoadWork = struct {
             cell.deinit();
             return;
         };
-        var geo: ?engine.s57_mvt.GeoParts = null;
-        var geo_world: ?engine.s57_mvt.GeoWorld = null;
+        var geo: ?engine.scene.GeoParts = null;
+        var geo_world: ?engine.scene.GeoWorld = null;
         var geo_arena: ?*std.heap.ArenaAllocator = null;
         var feat_bbox: []const ?[4]f64 = &.{};
         if (c.gpa.create(std.heap.ArenaAllocator)) |ga| {
             ga.* = std.heap.ArenaAllocator.init(c.gpa);
             // Assemble line/area geometry once + its world coords, so every tile
             // reprojects cheaply (no per-point tan/log) — the bake's biggest cost.
-            if (engine.s57_mvt.buildGeoCache(ga.allocator(), &cell)) |g| {
+            if (engine.scene.buildGeoCache(ga.allocator(), &cell)) |g| {
                 geo = g;
-                geo_world = engine.s57_mvt.buildGeoWorld(ga.allocator(), g) catch null;
+                geo_world = engine.scene.buildGeoWorld(ga.allocator(), g) catch null;
             } else |_| {}
-            feat_bbox = engine.s57_mvt.buildFeatBBox(ga.allocator(), &cell, geo) catch &.{};
+            feat_bbox = engine.scene.buildFeatBBox(ga.allocator(), &cell, geo) catch &.{};
             geo_arena = ga;
         } else |_| {}
         const coverage = cell.mcovrCoverage(cell.arena.allocator()); // before the move (cell.arena-owned)
@@ -515,11 +515,11 @@ const LoadWork = struct {
 
         // Label-point cache: built from the (reused or fresh) portrayal — only features
         // whose base stream draws a Text/centred-symbol consult labelPoint, so cache just
-        // those (see s57_mvt.buildLabelCache). Set on the STORED cell so the per-tile emit
+        // those (see scene.buildLabelCache). Set on the STORED cell so the per-tile emit
         // reuses it instead of re-running the dominant polylabel search every tile.
         if (c.portray[ci]) |pc| { // already portrayed — reuse it (the speed win)
             if (c.geom[ci]) |*g| if (g.geo_arena) |ga| {
-                g.cell.label_cache = engine.s57_mvt.buildLabelCache(ga.allocator(), &g.cell, g.geo, pc.base) catch null;
+                g.cell.label_cache = engine.scene.buildLabelCache(ga.allocator(), &g.cell, g.geo, pc.base) catch null;
             };
             return;
         }
@@ -542,7 +542,7 @@ const LoadWork = struct {
             c.portray[ci] = .{ .arena = sticky, .base = null, .plain = null, .simplified = null, .bounds = b };
         }
         if (c.geom[ci]) |*g| if (g.geo_arena) |ga| {
-            g.cell.label_cache = engine.s57_mvt.buildLabelCache(ga.allocator(), &g.cell, g.geo, c.portray[ci].?.base) catch null;
+            g.cell.label_cache = engine.scene.buildLabelCache(ga.allocator(), &g.cell, g.geo, c.portray[ci].?.base) catch null;
         };
     }
 };
@@ -618,7 +618,7 @@ const BakeSink = struct {
 // StreamWriter — only the compressed data + small directory are held, not the raw
 // tiles). Returns the union bounds + cell stems + sounding stacks + SCAMIN denoms.
 // error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.s57_mvt.TileFormat, pick_attrs: bool, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.scene.TileFormat, pick_attrs: bool, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
     // Progress sink: the caller's callback, else the built-in console writer (the CLI
     // path, byte-identical to before). Both only touch stderr — never the tile bytes.
     const prog: engine.bake_enc.Progress = progress orelse cliProgress;
@@ -968,7 +968,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         while (it.next()) |k| try scamin_vals.append(a, k.*);
         std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
     }
-    const meta = try engine.s57_mvt.metadataJson(a, scamin_vals.items);
+    const meta = try engine.scene.metadataJson(a, scamin_vals.items);
     const opts = engine.pmtiles.WriteOptions{
         .metadata_json = meta,
         .min_lon_e7 = toE7(ubox[0]),

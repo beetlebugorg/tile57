@@ -110,8 +110,12 @@ pub fn main(init: std.process.Init) !void {
         return runStyle(io, arena, args);
     }
 
-    if (std.mem.eql(u8, sub, "renderpng")) {
-        return runRenderPng(io, arena, args);
+    if (std.mem.eql(u8, sub, "png") or std.mem.eql(u8, sub, "renderpng")) {
+        return runRender(io, arena, args, .png);
+    }
+
+    if (std.mem.eql(u8, sub, "pdf")) {
+        return runRender(io, arena, args, .pdf);
     }
 
     if (std.mem.eql(u8, sub, "inspect")) {
@@ -552,7 +556,7 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var maxzoom: u8 = DEFAULT_MAXZOOM;
     var lru: usize = DEFAULT_LRU_BUDGET; // lazy-bake tuning: parsed cells held resident
     var super_dz: u8 = DEFAULT_SUPER_DZ; // lazy-bake tuning: spatial super-tile depth
-    var format: engine.s57_mvt.TileFormat = .mvt; // tile encoding: mvt (default) or mlt
+    var format: engine.scene.TileFormat = .mvt; // tile encoding: mvt (default) or mlt
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -665,17 +669,17 @@ fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     std.debug.print("wrote {s} ({s}, {d} bytes)\n", .{ out_path, scheme, style.len });
 }
 
-// tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [flags]        (one tile)
-// tile57 renderpng <cell.000> --view <lon,lat,zoom> --size WxH -o out.png (a view)
-// The render-engine pixel path over ONE cell (no band quilting): parse +
-// portray the cell (fixed bake context for now), drive the engine through
-// PixelSurface -> RasterCanvas -> PNG. A view renders ONE whole scene across
-// every covering tile (labels + declutter over the full canvas, no seams).
-// The in-repo render-to-PNG verify path.
-fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+// tile57 png|pdf <cell.000 | bundle.pmtiles> <z> <x> <y> -o <out> [flags]  (one tile)
+// tile57 png|pdf <source> --view <lon,lat,zoom> --size WxH -o <out> [flags] (a view)
+// The render-engine pixel path: parse + portray a cell (or replay a baked
+// PMTiles bundle), drive the engine through PixelSurface -> RasterCanvas ->
+// PNG, or the same op stream -> PdfCanvas -> a deterministic vector PDF with
+// real text objects. A view renders ONE whole scene across every covering
+// tile (labels + declutter over the full canvas, no seams).
+fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output: render.pixel.Output) !void {
     if (args.len < 4) {
-        std.debug.print("usage: tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--scale F]\n" ++
-            "       tile57 renderpng <cell.000> --view <lon,lat,zoom> --size WxH -o <out.png> [flags]\n", .{});
+        std.debug.print("usage: tile57 {s} <cell.000|bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--scale F]\n" ++
+            "       tile57 {s} <source> --view <lon,lat,zoom> --size WxH -o <out> [flags]\n", .{ @tagName(output), @tagName(output) });
         return;
     }
     const path = args[2];
@@ -733,11 +737,18 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     const out = out_path orelse return usageErr("-o <out.png> is required");
     if (!tile_mode and view == null) return usageErr("--view lon,lat,zoom is required without z x y");
 
+    const from_bundle = std.mem.endsWith(u8, path, ".pmtiles");
+    if (from_bundle and view == null) return usageErr("a .pmtiles source needs --view");
+
     const data = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
-    var cell = try engine.s57.parseCell(a, data);
-    defer cell.deinit();
-    engine.portray.setQuiet(true);
-    const streams = try engine.portray.portrayCell(a, &cell, resolveRulesDir(rules));
+    var cell: engine.s57.Cell = undefined;
+    var streams: []const ?[]const u8 = &.{};
+    if (!from_bundle) {
+        cell = try engine.s57.parseCell(a, data);
+        engine.portray.setQuiet(true);
+        streams = try engine.portray.portrayCell(a, &cell, resolveRulesDir(rules));
+    }
+    defer if (!from_bundle) cell.deinit();
 
     var colors = try render.resolve.Colors.init(a, catalog_embed.colorprofile[0].bytes);
     // Display "other" on by default: spot soundings are S-52 category Other,
@@ -770,13 +781,36 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
     defer store.deinit();
     ps.store = store.asStore();
-    if (std.mem.endsWith(u8, out, ".pdf")) ps.output = .pdf;
+    ps.output = output;
 
-    const cells = [_]engine.s57_mvt.CellRef{.{ .cell = &cell, .portrayal = streams }};
-    const bytes = if (view) |v|
-        try engine.s57_mvt.generateViewSurface(a, a, &cells, v.lon, v.lat, v.zoom, false, &ps)
-    else
-        try engine.s57_mvt.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
+    const bytes = if (from_bundle) blk: {
+        // Bundle-sourced replay: decode each covering baked tile and re-emit
+        // it as Surface calls (bake context frozen; live-swappable props —
+        // danger depth, sounding composition/unit — re-evaluate here).
+        const v = view.?;
+        var rd = try engine.pmtiles.Reader.init(a, data);
+        defer rd.deinit();
+        var vt = engine.scene.ViewTiles.init(v.lon, v.lat, v.zoom, size_w, size_h, ps.px_per_tile);
+        const surf = ps.asSurface();
+        try surf.beginScene(vt.z);
+        const is_mlt = rd.header.tile_type == .mlt;
+        while (vt.next()) |t| {
+            const tb = (rd.getTile(a, t.z, t.x, t.y) catch continue) orelse continue;
+            const layers = if (is_mlt)
+                engine.mlt.decode(a, tb) catch continue
+            else
+                engine.mvt.decode(a, tb) catch continue;
+            ps.setOrigin(t.origin_x, t.origin_y);
+            try engine.scene.replayTileSurface(layers, surf);
+        }
+        break :blk try surf.endScene(a);
+    } else blk: {
+        const cells = [_]engine.scene.CellRef{.{ .cell = &cell, .portrayal = streams }};
+        break :blk if (view) |v|
+            try engine.scene.generateViewSurface(a, a, &cells, v.lon, v.lat, v.zoom, false, &ps)
+        else
+            try engine.scene.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
+    };
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
     if (view) |v| {
         std.debug.print("wrote {s}: view {d:.4},{d:.4} z{d:.2}, {d}x{d}px, {d} draw ops, {d} bytes\n", .{ out, v.lon, v.lat, v.zoom, size_w, size_h, ps.ops.items.len, bytes.len });
@@ -821,9 +855,13 @@ fn printUsage() void {
         \\      --colortables FILE). --scheme day|dusk|night; --source-tiles/
         \\      --pmtiles-url pick the source; --sprite/--glyphs enable symbol/text
         \\      layers; --minzoom/--maxzoom.
-        \\  tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette day|dusk|night]
-        \\      Render one tile of a cell to PNG through the native pixel path
-        \\      (fills + strokes; symbols/text pending).
+        \\  tile57 png|pdf <cell.000 | bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette P]
+        \\  tile57 png|pdf <source> --view <lon,lat,zoom> --size WxH -o <out>
+        \\      Render a tile or a view through the native S-52 pixel path:
+        \\      PNG raster or deterministic vector PDF (real text objects).
+        \\      Sources: an S-57 cell (live portrayal) or a baked .pmtiles
+        \\      bundle (tile replay). --dq data-quality overlay; --scale F
+        \\      physical-size multiplier; --palette day|dusk|night.
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
         \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)

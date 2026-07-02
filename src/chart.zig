@@ -20,9 +20,9 @@ const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;
 const gzip = @import("tiles").gzip;
 const s57 = @import("s57");
-const s57_mvt = @import("s57_mvt");
+const scene = @import("scene");
 const portray = @import("portray");
-const bake_enc = @import("s57_mvt").bake_enc;
+const bake_enc = @import("scene").bake_enc;
 const catalogue = @import("s100").catalogue;
 const tile = @import("tiles").tile;
 const render = @import("render");
@@ -825,7 +825,7 @@ pub const Chart = struct {
         const bytes: []u8 = switch (self.backend) {
             .reader => |*r| (r.getTile(gpa, z, x, y) catch return error.TileGen) orelse try gpa.alloc(u8, 0),
             .cell => |*cb| blk_cell: {
-                const one = [_]s57_mvt.CellRef{.{
+                const one = [_]scene.CellRef{.{
                     .cell = &cb.cell,
                     .portrayal = cb.portrayal,
                     .portrayal_plain = cb.portrayal_plain,
@@ -833,7 +833,7 @@ pub const Chart = struct {
                 }};
                 var ar = std.heap.ArenaAllocator.init(gpa);
                 defer ar.deinit();
-                break :blk_cell s57_mvt.generateTileMulti(ar.allocator(), gpa, &one, z, x, y, .mvt, self.pick_attrs) catch return error.TileGen;
+                break :blk_cell scene.generateTileMulti(ar.allocator(), gpa, &one, z, x, y, .mvt, self.pick_attrs) catch return error.TileGen;
             },
             .cells => |*ls| try tileFromCells(ls, z, x, y, self.pick_attrs),
         };
@@ -853,7 +853,6 @@ pub const Chart = struct {
     /// free with freeBytes). Cell-backed sources only; a baked PMTiles source
     /// has no portrayal to render from (bundle-sourced rendering is future work).
     pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, output: render.pixel.Output) ![]u8 {
-        if (self.backend == .reader) return error.Unsupported;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -883,27 +882,46 @@ pub const Chart = struct {
         ps.output = output;
 
         switch (self.backend) {
-            .reader => unreachable,
+            .reader => |*rd| {
+                // Bundle-sourced replay: decode each covering baked tile and
+                // re-emit it as Surface calls. Lossy by design — the bake-time
+                // portrayal context is frozen — but the live-swappable props
+                // (danger depth, sounding composition/unit) re-evaluate here.
+                var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+                const surf = ps.asSurface();
+                try surf.beginScene(vt.z);
+                const is_mlt = rd.header.tile_type == .mlt;
+                while (vt.next()) |t| {
+                    const bytes = (rd.getTile(a, t.z, t.x, t.y) catch continue) orelse continue;
+                    const layers = if (is_mlt)
+                        @import("tiles").mlt.decode(a, bytes) catch continue
+                    else
+                        @import("tiles").mvt.decode(a, bytes) catch continue;
+                    ps.setOrigin(t.origin_x, t.origin_y);
+                    scene.replayTileSurface(layers, surf) catch return error.TileGen;
+                }
+                return surf.endScene(gpa) catch error.TileGen;
+            },
             .cell => |*cb| {
-                const one = [_]s57_mvt.CellRef{.{
+                const one = [_]scene.CellRef{.{
                     .cell = &cb.cell,
                     .portrayal = cb.portrayal,
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
                 }};
-                return s57_mvt.generateViewSurface(a, gpa, &one, lon, lat, zoom, self.pick_attrs, &ps) catch error.TileGen;
+                return scene.generateViewSurface(a, gpa, &one, lon, lat, zoom, self.pick_attrs, &ps) catch error.TileGen;
             },
             .cells => |*ls| {
                 const keep_from = ls.tick + 1;
-                var vt = s57_mvt.ViewTiles.init(lon, lat, zoom, w, h, pt);
+                var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
                 const surf = ps.asSurface();
                 try surf.beginScene(vt.z);
                 while (vt.next()) |t| {
-                    var refs = std.ArrayList(s57_mvt.CellRef).empty;
+                    var refs = std.ArrayList(scene.CellRef).empty;
                     defer refs.deinit(gpa);
                     if (!try tileRefs(ls, t.z, t.x, t.y, &refs)) continue;
                     ps.setOrigin(t.origin_x, t.origin_y);
-                    s57_mvt.appendTileSurface(a, refs.items, t.z, t.x, t.y, self.pick_attrs, surf) catch return error.TileGen;
+                    scene.appendTileSurface(a, refs.items, t.z, t.x, t.y, self.pick_attrs, surf) catch return error.TileGen;
                 }
                 const bytes = surf.endScene(gpa) catch return error.TileGen;
                 lazyEvict(ls, keep_from);
@@ -945,7 +963,7 @@ pub const Chart = struct {
 
 // Collect a parsed cell's distinct SCAMIN denominators into `set`.
 fn collectScaminCell(cell: *const s57.Cell, set: *std.AutoHashMap(u32, void)) void {
-    for (cell.features) |f| if (s57_mvt.featureScamin(f)) |sc| if (sc > 0) set.put(@intCast(sc), {}) catch {};
+    for (cell.features) |f| if (scene.featureScamin(f)) |sc| if (sc > 0) set.put(@intCast(sc), {}) catch {};
 }
 
 // Scan every cell of a lazy/streaming source for SCAMIN. Loaded cells are read
@@ -1029,7 +1047,7 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
 // band-quilted CellRefs (suppression flags computed against the finer-band
 // coverage). Returns false when nothing overlaps. Factored from tileFromCells
 // so renderView can reuse the exact same selection per covering tile.
-fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(s57_mvt.CellRef)) !bool {
+fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.CellRef)) !bool {
     const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
     var any_incl = false;
     var coarsest: ?bake_enc.Band = null;
@@ -1091,12 +1109,12 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(s57_mvt
 
 fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8 {
     const keep_from = ls.tick + 1;
-    var refs = std.ArrayList(s57_mvt.CellRef).empty;
+    var refs = std.ArrayList(scene.CellRef).empty;
     defer refs.deinit(gpa);
     if (!try tileRefs(ls, z, x, y, &refs)) return try gpa.alloc(u8, 0);
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
-    const mvt = s57_mvt.generateTileMulti(ar.allocator(), gpa, refs.items, z, x, y, .mvt, pick_attrs) catch return error.TileGen;
+    const mvt = scene.generateTileMulti(ar.allocator(), gpa, refs.items, z, x, y, .mvt, pick_attrs) catch return error.TileGen;
     lazyEvict(ls, keep_from);
     return mvt;
 }
@@ -1125,7 +1143,7 @@ const BakeWork = struct {
         var portrayal: ?[]const ?[]const u8 = null;
         var portrayal_plain: ?[]const ?[]const u8 = null;
         var portrayal_simplified: ?[]const ?[]const u8 = null;
-        var geo: ?s57_mvt.GeoParts = null;
+        var geo: ?scene.GeoParts = null;
         const pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(gpa);
@@ -1134,7 +1152,7 @@ const BakeWork = struct {
                 portrayal_plain = cp.plain;
                 portrayal_simplified = cp.simplified;
             } else |_| {}
-            if (c.build_geo) geo = s57_mvt.buildGeoCache(p.allocator(), &cell) catch null;
+            if (c.build_geo) geo = scene.buildGeoCache(p.allocator(), &cell) catch null;
         }
         // M_COVR coverage + scale for per-cell quilting (allocate into the cell's own
         // arena before the move, so it outlives with the backend).
@@ -1236,7 +1254,7 @@ pub fn bakeArchive(
             band_arenas.appendAssumeCapacity(pa);
         };
         for (backs.items) |be| for (be.cell.features) |f| {
-            if (s57_mvt.featureScamin(f)) |sc| scamin_set.put(@intCast(sc), {}) catch {};
+            if (scene.featureScamin(f)) |sc| scamin_set.put(@intCast(sc), {}) catch {};
         };
         baker.bakeBand(band, backs.items, null, progress, user) catch {};
         for (backs.items) |*be| be.cell.deinit();
@@ -1257,7 +1275,7 @@ pub fn bakeArchive(
         while (it.next()) |k| try scamin_vals.append(gpa, k.*);
         std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
     }
-    const meta = try s57_mvt.metadataJson(gpa, scamin_vals.items);
+    const meta = try scene.metadataJson(gpa, scamin_vals.items);
     defer gpa.free(meta);
     return try sw.finishBytes(.{
         .metadata_json = meta,

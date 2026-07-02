@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const s57 = @import("s57");
-const s57_mvt = @import("s57_mvt.zig");
+const scene = @import("scene.zig");
 const pmtiles = @import("tiles").pmtiles;
 const tile = @import("tiles").tile;
 
@@ -25,8 +25,8 @@ pub const Backend = struct {
     portrayal: ?[]const ?[]const u8 = null,
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
-    geo: ?s57_mvt.GeoParts = null, // line/area geometry assembled once (buildGeoCache)
-    geo_world: ?s57_mvt.GeoWorld = null, // world coords parallel to geo (cheap reprojection)
+    geo: ?scene.GeoParts = null, // line/area geometry assembled once (buildGeoCache)
+    geo_world: ?scene.GeoWorld = null, // world coords parallel to geo (cheap reprojection)
     feat_bbox: ?[]const ?[4]f64 = null, // per-feature bbox for the per-tile spatial cull
     bounds: [4]f64,
     cscl: i32 = 0, // compilation-scale denominator (1:N); 0 = unknown
@@ -217,7 +217,7 @@ const TileGenCtx = struct {
     results: []?[]u8,
     backends: []Backend,
     gpa: std.mem.Allocator,
-    format: s57_mvt.TileFormat = .mvt,
+    format: scene.TileFormat = .mvt,
     pick_attrs: bool = true, // emit the per-feature pick-report attrs (s57/cell); off = lean tiles
     // Live progress emitted from inside the parallel batch (so a big super-tile
     // shows tiles flowing rather than appearing hung). `done` counts processed
@@ -255,7 +255,7 @@ const TileGenCtx = struct {
 
         // refs + the encoded tile are transient (gzipped right below), so they ride
         // the per-thread scratch arena — reset after this tile, no per-tile mmap.
-        const refs = scratch.alloc(s57_mvt.CellRef, idxs.len) catch return;
+        const refs = scratch.alloc(scene.CellRef, idxs.len) catch return;
         for (idxs, 0..) |idx, j| {
             const be = &c.backends[idx];
             const sc = be.cscl;
@@ -263,7 +263,7 @@ const TileGenCtx = struct {
             const supp_whole = sc > 0 and gf_whole < sc; // a finer cell covers the whole tile
             refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = supp_whole, .suppress_patterns = supp_lines, .suppress_lines = supp_lines, .suppress_points = supp_whole };
         }
-        const mvt_bytes = s57_mvt.generateTileMulti(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
+        const mvt_bytes = scene.generateTileMulti(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
         // collection then only dedups + writes the already-compressed tile. The
         // gzipped result must outlive the scratch reset, so it comes from `c.gpa`.
@@ -302,7 +302,7 @@ pub const Baker = struct {
     sink: TileSink,
     count: usize = 0, // tiles handed to the sink (cumulative across bands)
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
-    format: s57_mvt.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
+    format: scene.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
     pick_attrs: bool = true, // emit per-feature pick-report attrs (s57/cell); off = lean tiles
     // Progress denominator (host §3): the caller sets these PER BAND before baking it
     // so the tiles-stage callback can report `done`/`total` as a per-band tile bar

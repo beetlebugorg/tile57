@@ -16,7 +16,7 @@
 const std = @import("std");
 
 /// The tile-vocabulary version both halves of a bundle are stamped with: the MVT
-/// layer/property set in s57_mvt.zig and the style/colortables that render it.
+/// layer/property set in scene.zig and the style/colortables that render it.
 /// Bump on ANY change to layer names or feature property keys.
 pub const SCHEMA_VERSION = "tile57/1";
 

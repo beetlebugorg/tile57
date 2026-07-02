@@ -23,11 +23,17 @@ pub const PdfCanvas = struct {
     /// Pattern cells used by fillPattern, deduped by pointer; each becomes an
     /// RGB image XObject (+ gray SMask) named /P0, /P1, …
     images: std.ArrayList(*const cv.Pattern) = .empty,
+    /// The raw TrueType to embed for REAL text objects (selectable/searchable).
+    /// null falls back to glyph-outline fills (visually identical, not text).
+    font_data: ?[]const u8 = null,
+    /// gid -> (advance/1000em, representative codepoint) for /W + ToUnicode.
+    used_glyphs: std.AutoHashMapUnmanaged(u16, struct { w1000: u16, cp: u21 }) = .empty,
 
     const vtable = cv.Canvas.VTable{
         .fillPath = fillPathImpl,
         .fillPattern = fillPatternImpl,
         .strokePath = strokePathImpl,
+        .drawGlyphRun = drawGlyphRunImpl,
     };
 
     pub fn init(a: Allocator, w: u32, h: u32) PdfCanvas {
@@ -153,9 +159,55 @@ pub const PdfCanvas = struct {
         try self.content.appendSlice(self.a, "Q\n");
     }
 
+    // Emit one BT..ET text block for the run at rendering mode `tr`.
+    // Identity-H: the string is big-endian 2-byte glyph ids. The text matrix
+    // uses a NEGATIVE vertical scale to counter the page's global y-flip, so
+    // glyphs come out upright with the baseline at the run origin.
+    fn emitTextBlock(self: *PdfCanvas, run: *const cv.GlyphRun, tr: u8) !void {
+        try self.content.appendSlice(self.a, "BT\n/F1 1 Tf\n");
+        try self.content.print(self.a, "{d} Tr\n", .{tr});
+        try self.num(run.size);
+        try self.content.appendSlice(self.a, " 0 0 ");
+        try self.num(-run.size);
+        try self.content.appendSlice(self.a, " ");
+        try self.num(run.origin.x);
+        try self.content.appendSlice(self.a, " ");
+        try self.num(run.origin.y);
+        try self.content.appendSlice(self.a, " Tm\n<");
+        for (run.glyphs) |g| try self.content.print(self.a, "{x:0>4}", .{g.gid});
+        try self.content.appendSlice(self.a, "> Tj\nET\n");
+    }
+
+    fn drawGlyphRunImpl(ctx: *anyopaque, run: *const cv.GlyphRun) anyerror!void {
+        const self = sp(ctx);
+        if (self.font_data == null) {
+            // No font to embed: outline fills (visually identical, not text).
+            if (run.halo) |hc| try strokePathImpl(ctx, run.rings, run.halo_w * 2, null, hc);
+            try fillPathImpl(ctx, run.rings, run.color, .nonzero);
+            return;
+        }
+        for (run.glyphs) |g| {
+            if (!self.used_glyphs.contains(g.gid))
+                try self.used_glyphs.put(self.a, g.gid, .{ .w1000 = g.w1000, .cp = g.cp });
+        }
+        if (run.halo) |hc| {
+            try self.setColor(hc, true);
+            try self.num(run.halo_w * 2);
+            try self.content.appendSlice(self.a, " w\n1 J\n1 j\n[] 0 d\n");
+            try self.emitTextBlock(run, 1); // stroke-only pass = the halo
+        }
+        try self.setColor(run.color, false);
+        try self.emitTextBlock(run, 0); // fill pass
+    }
+
     // ---- document assembly ----------------------------------------------------
 
     /// Assemble the single-page PDF. Caller owns the returned bytes.
+    ///
+    /// Object numbering: 1 Catalog, 2 Pages, 3 Page, 4 Contents, then per
+    /// pattern i {5+2i image, 6+2i SMask}, then (when any text was drawn and a
+    /// font was provided) F = Type0 font, F+1 CIDFontType2, F+2 FontDescriptor,
+    /// F+3 FontFile2 (the raw TTF), F+4 ToUnicode CMap.
     pub fn finish(self: *PdfCanvas, out: Allocator) ![]u8 {
         var doc = std.ArrayList(u8).empty;
         errdefer doc.deinit(out);
@@ -164,9 +216,16 @@ pub const PdfCanvas = struct {
 
         try doc.appendSlice(out, "%PDF-1.4\n");
 
-        // Object numbering: 1 Catalog, 2 Pages, 3 Page, 4 Contents,
-        // then per pattern i: 5+2i = image, 6+2i = its SMask.
         const n_imgs = self.images.items.len;
+        const has_font = self.font_data != null and self.used_glyphs.count() > 0;
+        const font_obj: usize = 5 + 2 * n_imgs;
+
+        // Used glyphs sorted by gid: deterministic /W + ToUnicode.
+        var gids = std.ArrayList(u16).empty;
+        defer gids.deinit(self.a);
+        var git = self.used_glyphs.keyIterator();
+        while (git.next()) |k| try gids.append(self.a, k.*);
+        std.mem.sort(u16, gids.items, {}, std.sort.asc(u16));
 
         // 1: Catalog
         try offsets.append(self.a, doc.items.len);
@@ -178,7 +237,9 @@ pub const PdfCanvas = struct {
         try offsets.append(self.a, doc.items.len);
         try doc.print(out, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {d} {d}] /Contents 4 0 R /Resources << /XObject <<", .{ self.w, self.h });
         for (0..n_imgs) |i| try doc.print(out, " /P{d} {d} 0 R", .{ i, 5 + 2 * i });
-        try doc.appendSlice(out, " >> >> >>\nendobj\n");
+        try doc.appendSlice(out, " >>");
+        if (has_font) try doc.print(out, " /Font << /F1 {d} 0 R >>", .{font_obj});
+        try doc.appendSlice(out, " >> >>\nendobj\n");
         // 4: Contents — the global y-flip, then the recorded ops.
         try offsets.append(self.a, doc.items.len);
         var flip_buf: [64]u8 = undefined;
@@ -198,6 +259,49 @@ pub const PdfCanvas = struct {
             try doc.print(out, "{d} 0 obj\n<< /Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {d} >>\nstream\n", .{ 6 + 2 * i, img.w, img.h, n });
             for (0..n) |p| try doc.append(out, img.rgba[p * 4 + 3]);
             try doc.appendSlice(out, "\nendstream\nendobj\n");
+        }
+
+        if (has_font) {
+            const ttf = self.font_data.?;
+            // F: composite Type0 font, Identity-H (2-byte glyph-id strings).
+            try offsets.append(self.a, doc.items.len);
+            try doc.print(out, "{d} 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /NotoSans /Encoding /Identity-H /DescendantFonts [{d} 0 R] /ToUnicode {d} 0 R >>\nendobj\n", .{ font_obj, font_obj + 1, font_obj + 4 });
+            // F+1: the CIDFontType2 with per-used-glyph widths (CID == GID).
+            try offsets.append(self.a, doc.items.len);
+            try doc.print(out, "{d} 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /BaseFont /NotoSans /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {d} 0 R /DW 600 /CIDToGIDMap /Identity /W [", .{ font_obj + 1, font_obj + 2 });
+            for (gids.items) |gid| {
+                const u = self.used_glyphs.get(gid).?;
+                try doc.print(out, " {d} [{d}]", .{ gid, u.w1000 });
+            }
+            try doc.appendSlice(out, " ] >>\nendobj\n");
+            // F+2: FontDescriptor (metrics approximate; viewers use the font).
+            try offsets.append(self.a, doc.items.len);
+            try doc.print(out, "{d} 0 obj\n<< /Type /FontDescriptor /FontName /NotoSans /Flags 32 /FontBBox [-1000 -500 2500 1500] /ItalicAngle 0 /Ascent 1069 /Descent -293 /CapHeight 714 /StemV 80 /FontFile2 {d} 0 R >>\nendobj\n", .{ font_obj + 2, font_obj + 3 });
+            // F+3: the raw TrueType, whole (no subsetting v1 — deterministic
+            // and simple; ~600 KB, amortized across every label).
+            try offsets.append(self.a, doc.items.len);
+            try doc.print(out, "{d} 0 obj\n<< /Length {d} /Length1 {d} >>\nstream\n", .{ font_obj + 3, ttf.len, ttf.len });
+            try doc.appendSlice(out, ttf);
+            try doc.appendSlice(out, "\nendstream\nendobj\n");
+            // F+4: ToUnicode CMap — glyph id -> UTF-16BE (search/copy works).
+            var cmap = std.ArrayList(u8).empty;
+            defer cmap.deinit(self.a);
+            try cmap.appendSlice(self.a, "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
+            try cmap.print(self.a, "{d} beginbfchar\n", .{gids.items.len});
+            for (gids.items) |gid| {
+                const cp = self.used_glyphs.get(gid).?.cp;
+                if (cp <= 0xFFFF) {
+                    try cmap.print(self.a, "<{x:0>4}> <{x:0>4}>\n", .{ gid, cp });
+                } else {
+                    const v = cp - 0x10000;
+                    try cmap.print(self.a, "<{x:0>4}> <{x:0>4}{x:0>4}>\n", .{ gid, 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF) });
+                }
+            }
+            try cmap.appendSlice(self.a, "endbfchar\nendcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+            try offsets.append(self.a, doc.items.len);
+            try doc.print(out, "{d} 0 obj\n<< /Length {d} >>\nstream\n", .{ font_obj + 4, cmap.items.len });
+            try doc.appendSlice(out, cmap.items);
+            try doc.appendSlice(out, "endstream\nendobj\n");
         }
 
         // xref + trailer

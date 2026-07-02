@@ -405,7 +405,7 @@ fn s65RemapValue(a: std.mem.Allocator, code: u16, v: []const u8) ![]const u8 {
 /// 10 (precisely known) have no S-101 quality-of-horizontal-measurement equivalent and
 /// drop (null, as does the 0 "absent" aggregate). Applied to the featureQuapos
 /// aggregate; the low-accuracy dashed-line switch reads that raw aggregate directly
-/// (s57_mvt), so this remap only shapes the value carried in the adapted feature model.
+/// (scene), so this remap only shapes the value carried in the adapted feature model.
 fn s65RemapQuapos(q: i32) ?i64 {
     return switch (q) {
         3, 4, 6, 7, 8, 9, 11 => 4,
@@ -765,7 +765,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
     // buoys/beacons below; the standalone features are then skipped.
     var topmark_index = try buildTopmarkIndex(a, cell);
     for (cell.features, 0..) |f, i| {
-        // SOUNDG (objl 129) is emitted directly as a multipoint by s57_mvt
+        // SOUNDG (objl 129) is emitted directly as a multipoint by scene
         // (bypassing portrayal), so don't portray it — it would just error on the
         // multipoint primitive the rule path doesn't model.
         if (f.objl == 129) continue;
@@ -994,7 +994,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // S-57 QUAPOS enumerate is not a valid S-101 value — s65RemapQuapos drops
         // 1/2/10 and collapses 3/6/7/8/9/11 to 4). The approximate-position dashed
         // line style is applied separately in the instruction-translation layer,
-        // which reads the raw aggregate directly (s57_mvt cell.featureQuapos), so it
+        // which reads the raw aggregate directly (scene cell.featureQuapos), so it
         // is unaffected by this remap. The per-class permitted list still applies —
         // Quality of Survey allows only 4 (§2.2.3.2), so a doubtful-position 5 drops.
         if (s65RemapQuapos(cell.featureQuapos(f))) |m| {

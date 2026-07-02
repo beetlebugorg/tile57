@@ -34,6 +34,30 @@ pub const FillRule = enum { nonzero, even_odd };
 /// anchored to the canvas origin so adjacent polygons pattern seamlessly.
 pub const Pattern = struct { w: u32, h: u32, rgba: []const u8 };
 
+/// One positioned glyph of a shaped label. `x` is the pen offset from the
+/// run origin in canvas px; `w1000` is the advance in PDF text units
+/// (1000/em) so a text-object canvas can build its widths array; `cp` is
+/// the source codepoint (ToUnicode / searchability).
+pub const Glyph = struct { gid: u16, cp: u21, x: f32, w1000: u16 };
+
+/// A shaped label, carried BOTH ways a canvas may want it: pre-flattened
+/// outline contours in canvas px (raster paints these — identical metrics to
+/// every other path), AND the glyph run + source string (a vector canvas
+/// emits real text objects: embedded font, selectable, searchable).
+pub const GlyphRun = struct {
+    rings: []const []const Point,
+    glyphs: []const Glyph,
+    /// Baseline origin of the run in canvas px.
+    origin: Point,
+    /// Font size in canvas px.
+    size: f32,
+    color: Color,
+    halo: ?Color,
+    halo_w: f32,
+    /// The source UTF-8 string (ToUnicode mapping).
+    text: []const u8,
+};
+
 pub const Canvas = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -48,6 +72,9 @@ pub const Canvas = struct {
         /// `dash` is an [on, off] pixel pattern anchored at each line's start
         /// (null = solid).
         strokePath: *const fn (*anyopaque, lines: []const []const Point, width_px: f32, dash: ?[2]f32, color: Color) anyerror!void,
+        /// Draw one shaped label (see GlyphRun): raster canvases paint the
+        /// outline contours; vector canvases may emit real text objects.
+        drawGlyphRun: *const fn (*anyopaque, run: *const GlyphRun) anyerror!void,
     };
 
     pub fn fillPath(self: Canvas, rings: []const []const Point, color: Color, rule: FillRule) anyerror!void {
@@ -58,6 +85,9 @@ pub const Canvas = struct {
     }
     pub fn strokePath(self: Canvas, lines: []const []const Point, width_px: f32, dash: ?[2]f32, color: Color) anyerror!void {
         return self.vtable.strokePath(self.ptr, lines, width_px, dash, color);
+    }
+    pub fn drawGlyphRun(self: Canvas, run: *const GlyphRun) anyerror!void {
+        return self.vtable.drawGlyphRun(self.ptr, run);
     }
 };
 
