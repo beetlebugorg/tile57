@@ -2,8 +2,9 @@
 
 A minimal browser demo that puts the three pieces together:
 
-1. **`tile57 bake`** turns an S-57 ENC cell into a **PMTiles** vector archive —
-   **MLT** (MapLibre Tile, the demo default) and **MVT**.
+1. **`tile57 bake`** turns an S-57 ENC cell into a chart **bundle** — a PMTiles
+   vector archive plus its sprite/colortables/manifest — in **MLT** (MapLibre
+   Tile, the demo default) and **MVT**.
 2. **MapLibre GL JS** renders it (reading the archive via the `pmtiles://` protocol;
    MLT sources use the `encoding: "mlt"` property, supported since maplibre-gl-js 5.12).
 3. **`@beetlebug/tile57-style-engine`** (the tile57 chartstyle engine compiled to
@@ -11,7 +12,7 @@ A minimal browser demo that puts the three pieces together:
    entirely in the browser. Toggle a setting and the style is regenerated client-side.
 
 ```
-ENC cell ──tile57 bake──▶ chart-mlt/tiles/chart.pmtiles (MLT)  (+ sprite, colortables)
+ENC cell ──tile57 bake──▶ bundle/tiles/chart.pmtiles (MLT)  (+ sprite, colortables, manifest)
 mariner settings ──style-engine (wasm)──▶ style.json ──▶ map.setStyle(...)
                                               ▲ source(+encoding)/sprite/glyphs wired to the served assets
 ```
