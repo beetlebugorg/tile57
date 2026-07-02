@@ -686,6 +686,43 @@ fn lastIndexOfCI(haystack: []const u8, needle: []const u8) ?usize {
 /// designation in quotes cannot be misread as a sounding or a depth — the
 /// chart convention exists for exactly that reason. Unshortened text passes
 /// through borrowed; a quoted designation allocates from `a`.
+// SBDARE nature-of-surface labels arrive from the (pristine, vendored) S-101
+// rule as INT1 abbreviations ("S", "M", "Cy" …, space-joined for multiple
+// surfaces). A screen has no chart-margin legend to decode them against, so
+// expand each known token to its full name ("sand mud"); unknown tokens pass
+// through untouched. SBDARE-only — "S" means something else elsewhere.
+fn expandSeabedText(a: Allocator, class: []const u8, text: []const u8) ![]const u8 {
+    if (!std.mem.eql(u8, class, "SBDARE")) return text;
+    const names = [_][2][]const u8{
+        .{ "M", "mud" },     .{ "Cy", "clay" },   .{ "Si", "silt" },
+        .{ "S", "sand" },    .{ "St", "stone" },  .{ "G", "gravel" },
+        .{ "P", "pebbles" }, .{ "Cb", "cobbles" }, .{ "R", "rock" },
+        .{ "Co", "coral" },  .{ "Sh", "shells" },
+    };
+    var out = std.ArrayList(u8).empty;
+    var it = std.mem.splitScalar(u8, text, ' ');
+    var changed = false;
+    var first = true;
+    while (it.next()) |tok| {
+        if (!first) try out.append(a, ' ');
+        first = false;
+        var expanded: ?[]const u8 = null;
+        for (names) |n| {
+            if (std.mem.eql(u8, tok, n[0])) {
+                expanded = n[1];
+                break;
+            }
+        }
+        try out.appendSlice(a, expanded orelse tok);
+        if (expanded != null) changed = true;
+    }
+    if (!changed) {
+        out.deinit(a);
+        return text;
+    }
+    return out.toOwnedSlice(a);
+}
+
 fn shortenName(a: Allocator, text: []const u8) ![]const u8 {
     // "by " = buoy names, "bn " = beacon names (EncodeString prefixes in the
     // buoy/beacon rules); both reduce to the designation.
@@ -1262,7 +1299,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                     .offset_x = t.offset_x, .offset_y = t.offset_y, .group = t.group,
                 };
                 try surf.beginFeature(&fmeta);
-                try surf.drawText(try shortenName(a, t.text), &style, pt);
+                try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, pt);
                 try surf.endFeature();
             }
         }
@@ -1374,7 +1411,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                         .offset_x = t.offset_x, .offset_y = t.offset_y, .group = t.group,
                     };
                     try surf.beginFeature(&fmeta);
-                    try surf.drawText(try shortenName(a, t.text), &style, cpt);
+                    try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, cpt);
                     try surf.endFeature();
                 }
             }
