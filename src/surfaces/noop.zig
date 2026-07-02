@@ -45,3 +45,27 @@ pub const NoopSurface = struct {
         return out.alloc(u8, 0);
     }
 };
+
+test "noop surface satisfies the full Surface lifecycle" {
+    const a = std.testing.allocator;
+    var ns = NoopSurface.init();
+    const surf = ns.asSurface();
+
+    try surf.beginScene(13);
+    const meta = rs.FeatureMeta{ .draw_prio = 5, .cat = 1 };
+    try surf.beginFeature(&meta);
+    const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 0 }, .{ .x = 10, .y = 10 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+    try surf.fillArea("DEPMS", &rings, .{ .d1 = 0, .d2 = 10 });
+    try surf.fillPattern("DIAMOND1", &rings);
+    try surf.strokeLine("CHBLK", 1.5, .dashed, &rings, 12.0);
+    try surf.drawSymbol("BCNCAR01", .{ .x = 5, .y = 5 }, 0, 1, true, 3.2);
+    try surf.drawSounding(4.7, false, false, .{ .x = 5, .y = 5 });
+    const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .halign = "center", .valign = "middle", .offset_x = 0, .offset_y = 0, .group = 25 };
+    try surf.drawText("12", &style, .{ .x = 5, .y = 5 });
+    try surf.endFeature();
+
+    const out = try surf.endScene(a);
+    defer a.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}

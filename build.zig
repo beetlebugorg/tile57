@@ -546,6 +546,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chartstyle", .module = chartstyle_mod },
     });
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
+    // Noop surface: compile-checks the Surface vtable contract + a lifecycle smoke
+    // test, so the contract can't bit-rot when the vtable evolves (it has no other
+    // consumer yet). See specs/render-engine.md §Non-goals / Verification gates.
+    _ = addPkgTest(b, test_step, "src/surfaces/noop.zig", target, optimize, &.{
+        .{ .name = "render_surface", .module = render_surface_mod },
+    });
     // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
     // rules end-to-end. It rides its own artifact because `portray` links libc + Lua +
     // the rule registry (those settings + C sources propagate from portray_mod), unlike
