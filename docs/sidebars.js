@@ -9,6 +9,7 @@ const sidebars = {
     'zig-api',
     'c-api',
     'architecture',
+    'rendering',
     'tile-schema',
     'limitations',
   ],

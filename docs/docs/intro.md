@@ -110,4 +110,6 @@ stage.
 - [**C API**](./c-api.md) — the `tile57_*` C ABI (`include/tile57.h`).
 - [**Architecture**](./architecture.md) — the pipeline and the Zig packages.
 - [**Tile Schema**](./tile-schema.md) — the vector-tile layer contract.
+- [**The Rendering Engine**](./rendering.md) — the native S-52 pixel path: PNG/PDF
+  renders, the Surface/Canvas architecture, and how to extend it.
 - [**Known Limitations**](./limitations.md) — what does not render yet.

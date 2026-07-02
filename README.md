@@ -47,6 +47,16 @@ entirely with AI assistance. A few specific goals shape its design:
 - **Language-agnostic embedding.** A thin C ABI (`libtile57.a`) bridges the Zig core to any
   language with C FFI. Go bindings ship in the repo; others are straightforward additions.
 
+- **An engine anyone can build on.** The end goal is an easy-to-use S-57/S-100 chart
+  rendering engine that anyone can use to build their marine app ideas — without first
+  becoming an IHO spec expert. Open a chart, get tiles, PNGs, or PDFs; the S-52 rules,
+  portrayal catalogue, and mariner settings are the engine's problem. Ideas it should make
+  easy:
+  - an **anchor alarm** that draws your swing circle over a real chart,
+  - a **Windy plugin** overlaying forecast weather on ENC charts,
+  - a **native cross-platform Qt6 C++ chartplotter** (this repo's `app/qt` is exactly that),
+  - a paper-style **passage-plan PDF printer**, a race-committee display, a tides kiosk…
+
 ---
 
 **tile57** decodes NOAA/IHO **S-57** ENC cells and generates **Mapbox Vector
@@ -79,9 +89,10 @@ S-57 feature + geometry model            src/s57/       (pkg: s57)
    │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/ (pkg: s100)
    ▼
 portrayal instruction stream
-   │  adapt + project + clip + encode    src/{s57_mvt,tile,mvt,pmtiles}/
+   │  scene generation                   src/scene/  (project + clip + draw calls)
    ▼
-Mapbox Vector Tiles  +  MapLibre style.json  +  colortables / linestyles / sprite / patterns
+render Surface ──► MVT / MLT tiles (src/tiles/)  +  MapLibre style.json + assets
+             └───► PNG raster / vector PDF (src/render/ — the native S-52 pixel path)
 ```
 
 The foundational stages are standalone Zig packages — **`iso8211`**, **`s57`**,
