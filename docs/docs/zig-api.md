@@ -6,10 +6,17 @@ sidebar_position: 4
 
 # Zig API
 
-The engine is a real Zig package named **`tile57`** (v0.1.0, requires Zig 0.16).
+The engine is a Zig package named **`tile57`** (v0.1.0, requires Zig 0.16).
 Add it as a dependency and `@import("tile57")` for the curated public surface
 (`src/tile57.zig`). The [C ABI](./c-api.md) is a thin shim over this same
 API.
+
+:::note
+Add it as a **path dependency** on a local clone (submodules initialised) —
+`zig fetch` by URL/hash is currently broken because the package's declared
+`.paths` omit `vendor/` and `include/`. See
+[Installation](./installation.md).
+:::
 
 ## The high-level engine: `Chart`
 
@@ -22,8 +29,8 @@ const tile57 = @import("tile57");
 var chart = try tile57.Chart.openBytes(cell_bytes, .auto, null);
 defer chart.deinit();
 
-if (try chart.tile(z, x, y)) |mvt| {     // decompressed MVT bytes, or null if empty
-    defer tile57.freeBytes(mvt);
+if (try chart.tile(z, x, y)) |bytes| {   // decompressed tile bytes, or null if empty
+    defer tile57.freeBytes(bytes);
     // … hand to your renderer …
 }
 ```
@@ -36,7 +43,11 @@ if (try chart.tile(z, x, y)) |mvt| {     // decompressed MVT bytes, or null if e
 | `openPath(path, rules_dir, pick_attrs)` | open an on-disk ENC_ROOT dir (or a single `.000`) as a streaming chart. |
 | `openCells(cells, rules_dir, pick_attrs)` | open a multi-cell ENC_ROOT from bytes (each cell's `.001…` updates applied). |
 | `openCellsStreaming(metas, reader, user, rules_dir, pick_attrs)` | low-memory ENC_ROOT: read each cell's bytes on demand, free on eviction. |
-| `tile(z, x, y) -> ?[]u8` | the tile's decompressed MVT bytes (null = empty). |
+| `tile(z, x, y) -> ?[]u8` | the tile's decompressed bytes, in the chart's tile encoding (null = empty). |
+| `tileType()` / `setTileFormat(fmt)` | the encoding `tile` returns (MVT/MLT); opt a live cell-backed chart into MLT. |
+| `renderView(lon, lat, zoom, w, h, palette, settings, output)` | render a view through the native S-52 pixel path — PNG or PDF. |
+| `renderAscii(lon, lat, zoom, cols, rows, palette, settings, ansi)` | the same view as a terminal text grid. |
+| `cellsJson()` / `featuresJson(classes)` | per-cell metadata / GeoJSON feature query (the `cells` / `features` CLI). |
 | `bounds() -> ?[4]f64` | geographic extent `[w, s, e, n]`, if known. |
 | `anchor()` | a good initial camera (lat, lon, zoom) on real data. |
 | `bands() -> u32` | bitmask of navigational bands present. |
@@ -94,7 +105,7 @@ The mid-level packages, for callers that compose their own pipeline:
 | `tile57.tile` | web-mercator tiling + clipping |
 | `tile57.pmtiles` | PMTiles read/write |
 | `tile57.bake_enc` | banded multi-cell ENC_ROOT → PMTiles |
-| `tile57.s57_mvt` | S-57 feature → MVT tile |
+| `tile57.scene` | S-57 feature → tile-surface scene generation |
 
 ## Raw formats (advanced)
 
