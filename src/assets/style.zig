@@ -142,6 +142,11 @@ pub const StyleOpts = struct {
     colortables_json: []const u8,
     source_tiles: ?[]const u8 = null, // tiles template; else pmtiles_url
     pmtiles_url: []const u8 = "pmtiles://tiles/chart.pmtiles",
+    // Chart-source tile encoding hint: "mlt" switches maplibre-gl (>=5.12) to its
+    // native MLT decoder via the vector-source `encoding` option. null/"mvt" =
+    // MVT (the MapLibre default; nothing is emitted, keeping MVT styles
+    // byte-identical). No transcode anywhere — the wire format IS the bake format.
+    encoding: ?[]const u8 = null,
     sprite: ?[]const u8 = null, // sprite base; enables symbol/pattern layers
     glyphs: ?[]const u8 = null, // glyphs template; enables text/labels
     minzoom: u32 = 9,
@@ -839,6 +844,12 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     try js.beginObject();
     try js.objectField("type");
     try js.write("vector");
+    // MLT sources carry the encoding hint (maplibre-gl >=5.12 decodes MLT natively);
+    // MVT (the default) emits nothing, keeping existing styles byte-identical.
+    if (opts.encoding) |enc| if (std.mem.eql(u8, enc, "mlt")) {
+        try js.objectField("encoding");
+        try js.write("mlt");
+    };
     if (opts.source_tiles) |t| {
         try js.objectField("tiles");
         try js.beginArray();
@@ -1017,6 +1028,9 @@ pub fn buildFromTemplateScamin(
                     if (c.get("tiles")) |t| {
                         if (t == .array and t.array.items.len > 0 and t.array.items[0] == .string)
                             opts.source_tiles = t.array.items[0].string;
+                    }
+                    if (c.get("encoding")) |e| { // MLT hint rides the rebuild (tile57_build_style / style_diff)
+                        if (e == .string) opts.encoding = e.string;
                     }
                     if (c.get("minzoom")) |z| {
                         if (z == .integer) opts.minzoom = @intCast(z.integer);

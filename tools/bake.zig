@@ -212,19 +212,14 @@ pub fn main(init: std.process.Init) !void {
             const x = try std.fmt.parseInt(u32, args[4], 10);
             const y = try std.fmt.parseInt(u32, args[5], 10);
             if (try r.getTile(arena, z, x, y)) |tile| {
-                if (h.tile_type == .mlt) {
-                    // MLT isn't decodable here (no in-engine MLT decoder); dump the
-                    // decompressed bytes as hex so they can be fed to a reference
-                    // decoder. Cap the hex so a big tile doesn't flood the terminal.
-                    std.debug.print("  tile {d}/{d}/{d}: {d} bytes (MLT)\n", .{ z, x, y, tile.len });
-                    if (tile.len <= 8192) {
-                        std.debug.print("  hex:", .{});
-                        for (tile) |c| std.debug.print("{x:0>2}", .{c});
-                        std.debug.print("\n", .{});
-                    } else std.debug.print("  (>{d} bytes; re-bake a sparser tile for a hex dump)\n", .{@as(usize, 8192)});
-                } else {
-                    const layers = try engine.mvt.decode(arena, tile);
-                    std.debug.print("  tile {d}/{d}/{d}: {d} bytes, {d} layers:\n", .{ z, x, y, tile.len, layers.len });
+                {
+                    // Decode with the codec matching the archive's tile type — both
+                    // return the same DecodedLayer shape, so the dump below is shared.
+                    const layers = if (h.tile_type == .mlt)
+                        try engine.mlt.decode(arena, tile)
+                    else
+                        try engine.mvt.decode(arena, tile);
+                    std.debug.print("  tile {d}/{d}/{d}: {d} bytes ({s}), {d} layers:\n", .{ z, x, y, tile.len, @tagName(h.tile_type), layers.len });
                     // Optional 7th arg names a layer whose features' properties are
                     // dumped (verification aid; does not touch bake output).
                     const want: ?[]const u8 = if (args.len >= 7) args[6] else null;
@@ -371,7 +366,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("  geometry bounds: lon [{d:.4}, {d:.4}]  lat [{d:.4}, {d:.4}]\n", .{ b[0], b[2], b[1], b[3] });
         }
         const named = [_]struct { objl: u16, name: []const u8 }{
-            .{ .objl = 42, .name = "DEPARE" }, .{ .objl = 30, .name = "COALNE" },
+            .{ .objl = 42, .name = "DEPARE" },  .{ .objl = 30, .name = "COALNE" },
             .{ .objl = 129, .name = "SOUNDG" }, .{ .objl = 71, .name = "LNDARE" },
             .{ .objl = 122, .name = "SLCONS" }, .{ .objl = 74, .name = "DEPCNT" },
         };
@@ -631,7 +626,7 @@ fn runBake(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var maxzoom: u8 = DEFAULT_MAXZOOM;
     var lru: usize = DEFAULT_LRU_BUDGET; // lazy-bake tuning: parsed cells held resident
     var super_dz: u8 = DEFAULT_SUPER_DZ; // lazy-bake tuning: spatial super-tile depth
-    var format: engine.scene.TileFormat = .mvt; // tile encoding: mvt (default) or mlt
+    var format: engine.scene.TileFormat = .mlt; // tile encoding: mlt (default) or mvt
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -1281,7 +1276,9 @@ fn printUsage() void {
         \\                          memory for fewer re-parses; default {d})
         \\      --superdz N         spatial super-tile depth below a band's min zoom
         \\                          (lazy-bake tuning; default {d})
-        \\      --format mvt|mlt    tile encoding (default mvt; mlt = MapLibre Tile)
+        \\      --format mlt|mvt    tile encoding (default mlt = MapLibre Tile;
+        \\                          mvt = Mapbox Vector Tile, kept for consumers
+        \\                          without an MLT decoder)
         \\  tile57 assets <portrayal-catalog-dir> -o <out-dir>
         \\      Emit just the portrayal assets (colortables.json today) for a
         \\      catalogue, independent of any cell.

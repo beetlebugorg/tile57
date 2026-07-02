@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const mvt = @import("tiles").mvt;
+const mlt = @import("tiles").mlt;
 
 const fixture = @embedFile("mvt_fixture");
 
@@ -91,5 +92,63 @@ test "re-encode the real tile round-trips (encoder on real shapes)" {
         try std.testing.expectEqual(f1.parts.len, f2.parts.len);
         for (f1.parts, f2.parts) |r1, r2|
             try std.testing.expectEqual(r1.len, r2.len);
+    }
+}
+
+test "MLT re-encode of the real tile matches the MVT decode (cross-codec parity)" {
+    // mlt-default.md acceptance: an MLT bake of the same model must decode to the
+    // SAME layer/feature structure an MVT bake does — the bundle's post-bake
+    // collection (sounding composites + SCAMIN manifest) and the JS renderer both
+    // ride on that equivalence.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const layers = try mvt.decode(a, fixture);
+
+    var enc_layers = std.ArrayList(mvt.Layer).empty;
+    for (layers) |L| {
+        var feats = std.ArrayList(mvt.Feature).empty;
+        for (L.features) |f| {
+            try feats.append(a, .{ .geom_type = f.geom_type, .parts = f.parts, .properties = f.properties });
+        }
+        try enc_layers.append(a, .{ .name = L.name, .extent = L.extent, .features = feats.items });
+    }
+
+    const bytes = try mlt.encode(std.testing.allocator, .{ .layers = enc_layers.items });
+    defer std.testing.allocator.free(bytes);
+
+    const layers2 = try mlt.decode(a, bytes);
+    try std.testing.expectEqual(layers.len, layers2.len);
+    for (layers, layers2) |x, y| {
+        try std.testing.expectEqualStrings(x.name, y.name);
+        try std.testing.expectEqual(x.extent, y.extent);
+        try std.testing.expectEqual(x.features.len, y.features.len);
+        // Geometry parity: every feature keeps its type, part count and vertices.
+        for (x.features, y.features) |f1, f2| {
+            try std.testing.expectEqual(f1.geom_type, f2.geom_type);
+            try std.testing.expectEqual(f1.parts.len, f2.parts.len);
+            for (f1.parts, f2.parts) |r1, r2| {
+                try std.testing.expectEqual(r1.len, r2.len);
+                for (r1, r2) |p1, p2| try std.testing.expectEqual(p1, p2);
+            }
+        }
+    }
+
+    // Property parity on the streams the BakeSink collector depends on: the
+    // scamin/smax denominators (SCAMIN ladder) and the soundings glyph stacks
+    // (sym_s/sym_g composites) must survive the MLT round-trip unchanged.
+    for (layers, layers2) |x, y| {
+        for (x.features, y.features) |f1, f2| {
+            for ([_][]const u8{ "scamin", "smax", "sym_s", "sym_g", "sym_s_ft", "sym_g_ft", "symbol_names", "class", "color_token" }) |key| {
+                const v1 = prop(f1, key) orelse continue;
+                const v2 = prop(f2, key) orelse return error.MissingProp;
+                switch (v1) {
+                    .string => |s| try std.testing.expectEqualStrings(s, v2.string),
+                    .int => |n| try std.testing.expectEqual(n, v2.int),
+                    else => {},
+                }
+            }
+        }
     }
 }

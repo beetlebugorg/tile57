@@ -272,7 +272,7 @@ pub const BakeOpts = struct {
     maxzoom: u8 = 16,
     lru: usize = 64, // lazy-bake tuning: parsed cells held resident
     super_dz: u8 = 3, // lazy-bake tuning: spatial super-tile depth
-    format: engine.scene.TileFormat = .mvt,
+    format: engine.scene.TileFormat = .mlt,
     // Emit per-feature pick-report attrs (s57/cell) in the baked tiles. Defaults ON;
     // a lean bake sets it false to drop the bulky s57 payload.
     pick_attrs: bool = true,
@@ -329,6 +329,9 @@ pub fn bakeBundle(io: std.Io, a: std.mem.Allocator, opts: BakeOpts) !BakeResult 
             const sj = assets.styleJson(a, .{
                 .scheme = sc,
                 .colortables_json = ct,
+                // The bundle style must hint the tiles' encoding so maplibre-gl
+                // (>=5.12) picks its MLT decoder for an MLT bake; MVT emits nothing.
+                .encoding = if (opts.format == .mlt) "mlt" else null,
                 .sprite = if (sprite_ok) "sprite-mln" else null,
                 .minzoom = opts.minzoom,
                 .scamin = rb.scamin,
@@ -610,17 +613,23 @@ const BakeSink = struct {
     a: std.mem.Allocator, // persistent (sound-stack strings; returned to caller)
     gpa: std.mem.Allocator, // scratch backing
     collect_sounds: bool, // bundle wants sprite-mln sounding composites; plain bake doesn't
+    format: engine.scene.TileFormat, // baked tile encoding — selects the decode codec below
 
     // `comp` is the already-gzipped tile (compressed in the gen worker), so the
     // serial path here is just dedup + write — fast. Sounding-stack + SCAMIN-manifest
-    // collection (only for the bundle) gunzips + decodes; plain bake-root skips it.
+    // collection (only for the bundle) gunzips + decodes with the codec matching the
+    // bake format (mlt.decode returns the same DecodedLayer shape as mvt.decode);
+    // plain bake-root skips it.
     fn run(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
         const self: *BakeSink = @ptrCast(@alignCast(ctx.?));
         if (self.collect_sounds) collect: {
             var scratch = std.heap.ArenaAllocator.init(self.gpa);
             defer scratch.deinit();
-            const mvt = engine.gzip.decompress(scratch.allocator(), comp) catch break :collect;
-            const layers = engine.mvt.decode(scratch.allocator(), mvt) catch break :collect;
+            const raw = engine.gzip.decompress(scratch.allocator(), comp) catch break :collect;
+            const layers = switch (self.format) {
+                .mvt => engine.mvt.decode(scratch.allocator(), raw) catch break :collect,
+                .mlt => engine.mlt.decode(scratch.allocator(), raw) catch break :collect,
+            };
             for (layers) |L| {
                 const is_snd = std.mem.eql(u8, L.name, "soundings");
                 for (L.features) |feat| for (feat.properties) |p| {
@@ -790,9 +799,10 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     var sounds = std.StringHashMap(void).init(a);
     var scamin = std.AutoHashMap(u32, void).init(gpa);
     defer scamin.deinit();
-    // Sounding-stack + SCAMIN-manifest collection decodes each tile as MVT, so it only
-    // applies to the MVT output; for MLT the sprite-mln sounding composites are skipped (TODO).
-    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .scamin = &scamin, .a = a, .gpa = gpa, .collect_sounds = collect_sounds and format == .mvt };
+    // Sounding-stack + SCAMIN-manifest collection decodes each tile with the codec
+    // matching the bake format, so MLT bakes get the same sprite-mln sounding
+    // composites + SCAMIN manifest an MVT bake does.
+    var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .scamin = &scamin, .a = a, .gpa = gpa, .collect_sounds = collect_sounds, .format = format };
     var baker = Bands.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
     baker.format = format;
     baker.pick_attrs = pick_attrs;

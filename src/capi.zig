@@ -110,9 +110,18 @@ const CChartInfo = extern struct {
     anchor_lat: f64,
     anchor_lon: f64,
     anchor_zoom: f64,
+    // The encoding tile57_chart_tile returns (TILE57_TILE_TYPE_*): a PMTiles
+    // backend reports its archive's stored type; a cell backend its live
+    // generation format. Appended for ABI-append-safety.
+    tile_type: u8,
 };
 
-/// Fill *out with the chart's fixed metadata (zoom range, bands, bounds, anchor). See tile57.h.
+// tile57_tile_type values (keep in sync with tile57.h).
+const TILE_TYPE_MVT: u8 = 1;
+const TILE_TYPE_MLT: u8 = 2;
+
+/// Fill *out with the chart's fixed metadata (zoom range, bands, bounds, anchor,
+/// tile encoding). See tile57.h.
 export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) void {
     out.* = std.mem.zeroes(CChartInfo);
     const s = src orelse return;
@@ -120,6 +129,10 @@ export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) voi
     out.min_zoom = zr.min;
     out.max_zoom = zr.max;
     out.bands = s.bands();
+    out.tile_type = switch (s.tileType()) {
+        .mlt => TILE_TYPE_MLT,
+        else => TILE_TYPE_MVT,
+    };
     if (s.bounds()) |b| {
         out.has_bounds = true;
         out.west = b[0];
@@ -150,6 +163,10 @@ const CBakeOpts = extern struct {
     omit_pick_attrs: bool,
     progress: BakeProgress,
     progress_user: ?*anyopaque,
+    // Baked tile encoding: 0 = engine default (MLT), TILE57_TILE_TYPE_MVT,
+    // TILE57_TILE_TYPE_MLT. Appended for ABI-append-safety (a zero-initialised
+    // struct bakes the default).
+    format: u8,
 };
 
 // The passed opts or all-defaults (matching NULL opts = every field at its default).
@@ -163,7 +180,13 @@ fn bakeOptsOr(opts: ?*const CBakeOpts) CBakeOpts {
         .omit_pick_attrs = false,
         .progress = null,
         .progress_user = null,
+        .format = 0,
     };
+}
+
+// tile57_bake_opts.format -> engine TileFormat (0 = default = MLT).
+fn bakeFormat(v: u8) @import("scene").TileFormat {
+    return if (v == TILE_TYPE_MVT) .mvt else .mlt;
 }
 
 /// Bake an ENC_ROOT into ONE PMTiles archive. See tile57.h. 1=ok, 0=empty, -1=error.
@@ -178,7 +201,7 @@ export fn tile57_bake_pmtiles(
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return -1;
-    const archive = chart.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, !o.omit_pick_attrs, o.progress, o.progress_user) catch return -1;
+    const archive = chart.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, bakeFormat(o.format), !o.omit_pick_attrs, o.progress, o.progress_user) catch return -1;
     if (archive) |a| {
         out.* = a.ptr;
         out_len.* = a.len;
@@ -225,6 +248,7 @@ export fn tile57_bake_bundle(
         .created = spanOpt(o.created) orelse "",
         .minzoom = o.minzoom,
         .maxzoom = o.maxzoom,
+        .format = bakeFormat(o.format),
         .pick_attrs = !o.omit_pick_attrs,
         .progress = o.progress,
         .progress_user = o.progress_user,
@@ -256,7 +280,9 @@ export fn tile57_chart_scamin(handle: ?*Chart, out: *[*]i32, out_len: *usize) ca
     return 1;
 }
 
-/// Fetch tile (z,x,y) as MVT bytes. 1=OK + out/out_len, 0=empty, -1=error.
+/// Fetch tile (z,x,y) as decompressed vector-tile bytes in the chart's tile
+/// encoding (chart_info.tile_type: stored type for a PMTiles backend, the live
+/// generation format for a cell backend). 1=OK + out/out_len, 0=empty, -1=error.
 export fn tile57_chart_tile(
     handle: ?*Chart,
     z: u8,
@@ -424,6 +450,15 @@ export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {
 /// Drop the in-memory tile cache (bounds memory in long-running hosts).
 export fn tile57_chart_clear_cache(handle: ?*Chart) callconv(.c) void {
     if (handle) |s| s.clearCache();
+}
+
+/// Select the encoding for LIVE-generated tiles on a cell-backed chart
+/// (0 = engine default (MLT), TILE57_TILE_TYPE_MVT, TILE57_TILE_TYPE_MLT).
+/// No-op for a baked PMTiles chart — its stored encoding is fixed. Changing the
+/// format drops the tile cache so served coordinates regenerate. The result is
+/// reported by chart_info.tile_type. See tile57.h.
+export fn tile57_chart_set_tile_format(handle: ?*Chart, fmt: u8) callconv(.c) void {
+    if (handle) |s| s.setTileFormat(bakeFormat(fmt));
 }
 
 // ---- portrayal asset generation (in-memory; mirrors tile57.h) --------------
@@ -712,7 +747,10 @@ export fn tile57_style_diff(
 /// `minzoom` is the chart source's tile floor, emitted VERBATIM — pass the
 /// archive's real minzoom (0 = tiles exist from z0; MapLibre never requests below
 /// a source's minzoom, so an inflated floor blanks every lower zoom). `maxzoom`
-/// of 0 -> engine default. 1=ok + out/out_len (free with tile57_free), 0=error.
+/// of 0 -> engine default. `tile_encoding` is the chart source's tile encoding
+/// (a tile57_tile_type; TILE57_TILE_TYPE_MLT emits `"encoding":"mlt"` on the
+/// source so maplibre-gl >=5.12 decodes MLT natively; 0/MVT emits nothing).
+/// 1=ok + out/out_len (free with tile57_free), 0=error.
 export fn tile57_style_template(
     scheme: c_int,
     source_tiles: ?[*:0]const u8,
@@ -720,6 +758,7 @@ export fn tile57_style_template(
     glyphs_url: ?[*:0]const u8,
     minzoom: u32,
     maxzoom: u32,
+    tile_encoding: u8,
     out: *[*]u8,
     out_len: *usize,
 ) callconv(.c) c_int {
@@ -739,6 +778,7 @@ export fn tile57_style_template(
     if (glyphs_url) |g| opts.glyphs = std.mem.span(g);
     opts.minzoom = minzoom;
     if (maxzoom != 0) opts.maxzoom = maxzoom;
+    if (tile_encoding == TILE_TYPE_MLT) opts.encoding = "mlt";
     const style = assets.styleJson(gpa, opts) catch return 0;
     out.* = style.ptr;
     out_len.* = style.len;

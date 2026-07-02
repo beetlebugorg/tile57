@@ -2,10 +2,11 @@
  *
  * libtile57 is an embeddable nautical-chart tile engine. You open a chart
  * from a path or in-memory bytes (a PMTiles archive or a raw S-57 ENC cell) and it
- * serves decompressed Mapbox Vector Tiles by (z, x, y). The bytes are produced by the
- * Zig tile generator (the engine/ sources) and consumed by any MVT
- * renderer — in this repo, MapLibre Native via the bundled ChartTileSource
- * adapter (app/chart_tile_source.*), but the ABI itself is renderer-agnostic.
+ * serves decompressed vector tiles by (z, x, y) — MapLibre Tiles (MLT, the default
+ * bake format) or Mapbox Vector Tiles (MVT), per tile57_chart_info.tile_type. The
+ * bytes are produced by the Zig tile generator (the engine/ sources) and consumed
+ * by any matching renderer — maplibre-gl >= 5.12 decodes both natively (vector
+ * source `encoding` option) — but the ABI itself is renderer-agnostic.
  *
  * Lifetime: a tile57_chart must OUTLIVE every renderer/adapter still holding it.
  *   In the MapLibre hosts the chart is captured by a long-lived FileSource and
@@ -88,13 +89,23 @@ tile57_chart *tile57_chart_open_bytes(const uint8_t *base, size_t len);
 /* Open a baked PMTiles bundle from a file path. NULL/failure -> NULL. (chart-api.md) */
 tile57_chart *tile57_chart_open_pmtiles(const char *path);
 
+/* Tile encodings served by tile57_chart_tile / produced by the bakes. */
+typedef enum {
+    TILE57_TILE_TYPE_MVT = 1, /* Mapbox Vector Tile */
+    TILE57_TILE_TYPE_MLT = 2, /* MapLibre Tile (the default bake format) */
+} tile57_tile_type;
+
 /* Fixed chart metadata (chart-api.md) — folds zoom_range/bands/bounds/anchor into one
- * getter. Bounds/anchor validity are flagged (false -> those fields are 0). */
+ * getter. Bounds/anchor validity are flagged (false -> those fields are 0).
+ * tile_type is the encoding tile57_chart_tile returns (a tile57_tile_type): a
+ * PMTiles-backed chart reports its archive's stored type; a cell-backed chart
+ * reports its live generation format (see tile57_chart_set_tile_format). */
 typedef struct {
     uint8_t  min_zoom, max_zoom;
     uint32_t bands;                                       /* bitmask of navigational bands present */
     bool     has_bounds; double west, south, east, north;
     bool     has_anchor; double anchor_lat, anchor_lon, anchor_zoom;
+    uint8_t  tile_type;                                   /* tile57_tile_type */
 } tile57_chart_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_chart_info *out);
 
@@ -130,6 +141,11 @@ typedef struct {
     bool omit_pick_attrs;
     tile57_bake_progress progress;
     void *progress_user;        /* NULL = default/none */
+    uint8_t format;             /* baked tile encoding: 0 = default (mlt),
+                                 * TILE57_TILE_TYPE_MVT, TILE57_TILE_TYPE_MLT.
+                                 * Honored by tile57_bake_pmtiles AND
+                                 * tile57_bake_bundle. Appended last, so a
+                                 * zero-initialised struct bakes the default. */
 } tile57_bake_opts;
 
 /* Bake an ENC_ROOT's in-memory cells into ONE PMTiles archive, zoom-banded per cell
@@ -199,10 +215,23 @@ typedef enum {
     TILE57_TILE_ERROR = -1, /* generation / decode failure */
 } tile57_tile_status;
 
-/* Fetch tile (z, x, y) as decompressed MVT bytes. Results are cached per chart,
- * so re-requesting a tile (as renderers do) is cheap and deterministic. */
+/* Fetch tile (z, x, y) as decompressed vector-tile bytes, VERBATIM in the chart's
+ * tile encoding — discoverable via tile57_chart_info.tile_type: a PMTiles-backed
+ * chart returns the stored bytes as baked (MLT by default, MVT for a --format mvt
+ * bake); a cell-backed chart generates in its live format (see
+ * tile57_chart_set_tile_format). There is NO transcode layer — hosts hint the
+ * encoding to the renderer instead (maplibre-gl >= 5.12 decodes MLT natively via
+ * the vector source `encoding` option). Results are cached per chart, so
+ * re-requesting a tile (as renderers do) is cheap and deterministic. */
 tile57_tile_status tile57_chart_tile(tile57_chart *chart, uint8_t z, uint32_t x, uint32_t y,
                            uint8_t **out, size_t *out_len);
+
+/* Select the encoding for LIVE-generated tiles on a cell-backed chart: 0 = engine
+ * default (mlt), TILE57_TILE_TYPE_MVT, TILE57_TILE_TYPE_MLT. Cell-backed charts
+ * OPEN generating MVT (so existing MVT-only embedders are unaffected); a host
+ * whose renderer decodes MLT opts in here. No-op for a baked PMTiles chart (its
+ * stored encoding is fixed). Changing the format drops the tile cache. */
+void tile57_chart_set_tile_format(tile57_chart *chart, uint8_t format);
 
 /* Render a VIEW of the chart — centre + fractional zoom + pixel size — to a
  * PNG through the native S-52 pixel path: the mariner settings evaluate LIVE
@@ -360,7 +389,7 @@ int tile57_style_diff(const char *template_json, size_t template_len,
 /* The S-52 colortables and base style template are baked into the library, so a
  * host can generate a complete style with no on-disk catalogue or template file:
  *   tile57_colortables_default(&ct,&ctn);
- *   tile57_style_template(scheme, "http://host/{z}/{x}/{y}", NULL,NULL,0,0, &t,&tn);
+ *   tile57_style_template(scheme, "http://host/{z}/{x}/{y}", NULL,NULL,0,0,0, &t,&tn);
  *   tile57_build_style(t,tn, &m, ct,ctn, bands,nb, scamin,nsm,lat, &style,&sn);
  * Free each buffer with tile57_free. */
 
@@ -378,10 +407,16 @@ int tile57_colortables_default(uint8_t **out, size_t *out_len);
  *            real minzoom (0 = tiles from z0; MapLibre never requests tiles below
  *            a source's minzoom, so an inflated floor blanks every lower zoom).
  *   maxzoom: 0 -> engine default.
+ *   tile_encoding: the chart source's tile encoding (a tile57_tile_type, from
+ *            chart_info.tile_type / the archive header). TILE57_TILE_TYPE_MLT
+ *            emits "encoding":"mlt" on the source so maplibre-gl >= 5.12 decodes
+ *            MLT natively; 0 / TILE57_TILE_TYPE_MVT emits nothing (the MapLibre
+ *            default). The hint survives tile57_build_style / tile57_style_diff.
  * Returns 1 with out/out_len set (free with tile57_free), 0 on error. */
 int tile57_style_template(tile57_scheme scheme, const char *source_tiles,
                           const char *sprite, const char *glyphs,
                           uint32_t minzoom, uint32_t maxzoom,
+                          uint8_t tile_encoding,
                           uint8_t **out, size_t *out_len);
 
 /* Fill *m with the canonical default mariner settings (so a host needn't hardcode

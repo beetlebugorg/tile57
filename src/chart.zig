@@ -226,13 +226,13 @@ fn bboxOverlap(a_: [4]f64, b_: [4]f64) bool {
 
 // Free the host-malloc'd buffers a streaming reader transferred to us (libc free).
 fn freeCellBytes(cb: *CellBytes) void {
-    if (cb.base_len != 0) std.c.free(@constCast(@ptrCast(cb.base)));
+    if (cb.base_len != 0) std.c.free(@ptrCast(@constCast(cb.base)));
     if (cb.updates) |ups| {
         var k: usize = 0;
-        while (k < cb.update_count) : (k += 1) std.c.free(@constCast(@ptrCast(ups[k])));
-        std.c.free(@constCast(@ptrCast(ups)));
+        while (k < cb.update_count) : (k += 1) std.c.free(@ptrCast(@constCast(ups[k])));
+        std.c.free(@ptrCast(@constCast(ups)));
     }
-    if (cb.update_lens) |ul| std.c.free(@constCast(@ptrCast(ul)));
+    if (cb.update_lens) |ul| std.c.free(@ptrCast(@constCast(ul)));
 }
 
 // ---- path-backed streaming helpers (chart-api.md) --------------------------
@@ -543,6 +543,12 @@ pub const Chart = struct {
     // Defaults ON; the C ABI open can turn it off for lean tiles. (No effect on a
     // PMTiles/reader backend — those tiles are already baked.)
     pick_attrs: bool = true,
+    // Encoding for LIVE-generated tiles (cell backends). Defaults to MVT so
+    // existing chart-handle consumers (MVT-only renderers) are unaffected; a host
+    // whose renderer decodes MLT opts in via setTileFormat. A PMTiles/reader
+    // backend ignores it — stored tiles serve verbatim in their baked encoding
+    // (see tileType).
+    tile_format: scene.TileFormat = .mvt,
 
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
@@ -725,6 +731,33 @@ pub const Chart = struct {
         };
     }
 
+    /// The encoding `tile` returns: a PMTiles backend reports its archive's stored
+    /// tile type (tiles serve verbatim); a cell backend reports its live
+    /// generation format (`tile_format`). Non-vector archive types (png/…) are
+    /// reported as-is.
+    pub fn tileType(self: *Chart) pmtiles.TileType {
+        return switch (self.backend) {
+            .reader => |r| r.header.tile_type,
+            .cell, .cells => switch (self.tile_format) {
+                .mvt => .mvt,
+                .mlt => .mlt,
+            },
+        };
+    }
+
+    /// Select the encoding for LIVE-generated tiles (cell backends; no-op for a
+    /// baked PMTiles backend — its stored encoding is fixed). Drops the tile
+    /// cache so already-served coordinates regenerate in the new format.
+    pub fn setTileFormat(self: *Chart, fmt: scene.TileFormat) void {
+        switch (self.backend) {
+            .reader => return,
+            .cell, .cells => {},
+        }
+        if (self.tile_format == fmt) return;
+        self.tile_format = fmt;
+        self.clearCache();
+    }
+
     /// Min/max zoom served (PMTiles: archive range; cell: 0..18).
     pub fn zoomRange(self: *Chart) struct { min: u8, max: u8 } {
         return switch (self.backend) {
@@ -832,9 +865,12 @@ pub const Chart = struct {
         }
     }
 
-    /// Fetch tile (z,x,y) as decompressed MVT bytes. Returns null for an empty /
-    /// absent tile, else page-allocator-owned bytes (free with `freeBytes`).
-    /// Cached per source, so re-requests are cheap and deterministic.
+    /// Fetch tile (z,x,y) as decompressed vector-tile bytes in the chart's tile
+    /// encoding (`tileType`): a PMTiles backend serves the stored bytes verbatim
+    /// (MVT or MLT, whatever was baked); a cell backend generates in
+    /// `tile_format`. Returns null for an empty / absent tile, else
+    /// page-allocator-owned bytes (free with `freeBytes`). Cached per source, so
+    /// re-requests are cheap and deterministic.
     pub fn tile(self: *Chart, z: u8, x: u32, y: u32) !?[]u8 {
         const key = tileKey(z, x, y);
         if (self.cache.get(key)) |cached| {
@@ -852,9 +888,9 @@ pub const Chart = struct {
                 }};
                 var ar = std.heap.ArenaAllocator.init(gpa);
                 defer ar.deinit();
-                break :blk_cell scene.encodeTile(ar.allocator(), gpa, &one, z, x, y, .mvt, self.pick_attrs) catch return error.TileGen;
+                break :blk_cell scene.encodeTile(ar.allocator(), gpa, &one, z, x, y, self.tile_format, self.pick_attrs) catch return error.TileGen;
             },
-            .cells => |*ls| try tileFromCells(ls, z, x, y, self.pick_attrs),
+            .cells => |*ls| try tileFromCells(ls, z, x, y, self.tile_format, self.pick_attrs),
         };
         if (self.cache.count() >= self.cache_max) {
             var cit = self.cache.valueIterator();
@@ -1475,16 +1511,16 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
     return true;
 }
 
-fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8 {
+fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, fmt: scene.TileFormat, pick_attrs: bool) ![]u8 {
     const keep_from = ls.tick + 1;
     var refs = std.ArrayList(scene.CellRef).empty;
     defer refs.deinit(gpa);
     if (!try tileRefs(ls, z, x, y, &refs)) return try gpa.alloc(u8, 0);
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
-    const mvt = scene.encodeTile(ar.allocator(), gpa, refs.items, z, x, y, .mvt, pick_attrs) catch return error.TileGen;
+    const bytes = scene.encodeTile(ar.allocator(), gpa, refs.items, z, x, y, fmt, pick_attrs) catch return error.TileGen;
     lazyEvict(ls, keep_from);
-    return mvt;
+    return bytes;
 }
 
 // ---- ENC_ROOT bake -------------------------------------------------------
@@ -1545,6 +1581,7 @@ pub fn bakeArchive(
     rules_dir: ?[]const u8,
     minzoom: u8,
     maxzoom: u8,
+    fmt: scene.TileFormat,
     pick_attrs: bool,
     progress: Progress,
     user: ?*anyopaque,
@@ -1566,6 +1603,7 @@ pub fn bakeArchive(
     var sw = pmtiles.StreamWriter.init(gpa);
     defer sw.deinit();
     var baker = bake_enc.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sw, .func = streamSink });
+    baker.format = fmt;
     baker.pick_attrs = pick_attrs;
     defer baker.deinit();
 
@@ -1730,6 +1768,7 @@ pub fn bakeArchive(
         .min_lat_e7 = @intFromFloat(@round(ub[1] * 1e7)),
         .max_lon_e7 = @intFromFloat(@round(ub[2] * 1e7)),
         .max_lat_e7 = @intFromFloat(@round(ub[3] * 1e7)),
+        .tile_type = if (fmt == .mlt) .mlt else .mvt,
     });
 }
 
