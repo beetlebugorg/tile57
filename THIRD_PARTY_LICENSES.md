@@ -115,5 +115,12 @@ used for navigation**.
 
 - **PMTiles** archive format — Protomaps (BSD-3-Clause spec).
 - **Mapbox Vector Tile (MVT)** spec — Mapbox.
-- **MapLibre Tile (MLT)** spec — MapLibre.
+- **MapLibre Tile (MLT)** spec — MapLibre (spec/documentation CC0-1.0). The
+  MLT codec (`src/tiles/mlt.zig`) was written with the reference
+  implementations in github.com/maplibre/maplibre-tile-spec as the wire-format
+  reference (the Java encoder's stream/metadata layout; the Rust `mlt-core`
+  crate as the conformance reference) — that code is dual-licensed
+  **MIT / Apache-2.0**. No reference-implementation code is copied or ported
+  into this repo; if any ever is, it must gain a full attribution entry above
+  with the license text.
 - **IHO S-100 / S-101 / S-57 / S-52** standards — IHO.
