@@ -243,6 +243,8 @@ pub fn build(b: *std.Build) void {
     });
     // The render module's settings-model edge (declared above assets_mod).
     render_mod.addImport("assets", assets_mod);
+    // The scene module's complex-linestyle XML analysis (also declared above).
+    scene_mod.addImport("assets", assets_mod);
 
     // S-101 sprite/pattern atlas builder (nanosvg + stb PNG). libc (the C libs),
     // target-less so it inherits the consumer's target (only the bake tool, which
@@ -376,6 +378,26 @@ pub fn build(b: *std.Build) void {
     // Other hosts (e.g. macOS Mach-O) keep the requested target; the library and
     // unit tests are unaffected (libtile57.a is linked by clang++ in the C++
     // host, and the tests are pure Zig with no libc).
+    // The chart layer (src/chart.zig) as a module for the CLI: streaming
+    // ENC_ROOT open + band-quilted view rendering (`tile57 png|pdf <ENC_ROOT>`).
+    // The lib compiles the same file relatively (capi/tile57 roots); this is a
+    // separate compilation for the separate binary.
+    const chart_mod = b.createModule(.{
+        .root_source_file = b.path("src/chart.zig"),
+        .link_libc = true, // portray (embedded Lua)
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "scene", .module = scene_mod },
+            .{ .name = "render", .module = render_mod },
+            .{ .name = "portray", .module = portray_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+        },
+    });
+    chart_mod.addImport("assets", assets_mod); // linestyle XML analysis
+
     const bake_target = if (target.result.os.tag == .linux and target.result.abi != .musl)
         b.resolveTargetQuery(.{ .cpu_arch = target.result.cpu.arch, .os_tag = .linux, .abi = .musl })
     else
@@ -395,6 +417,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "catalog", .module = catalog_embed },
                 .{ .name = "bundle", .module = bundle_mod },
                 .{ .name = "render", .module = render_mod }, // renderpng pixel path
+                .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
             },
         }),
     });
@@ -495,6 +518,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s100", .module = s100_mod },
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "render", .module = render_mod },
+        .{ .name = "assets", .module = assets_mod },
     });
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
     // The render module: Surface contract + noop lifecycle smoke test (pins

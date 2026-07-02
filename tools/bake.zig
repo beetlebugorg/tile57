@@ -22,6 +22,7 @@ const sprite = @import("sprite");
 const bundle = @import("bundle"); // chart-bundle pipeline (asset emitters etc.) — the lib owns it
 const render = @import("render"); // pixel path: PixelSurface + resolver (renderpng)
 const catalog_embed = @import("catalog"); // embedded portrayal assets (colour profile)
+const chart = @import("chart"); // streaming ENC_ROOT open + quilted view render
 
 const VERSION = "tile57 0.1.0";
 
@@ -702,6 +703,8 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
     var dq = false;
     var size_scale: f64 = 1.0; // physical-size multiplier (S-52 mm -> true mm)
     var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
+    // Mariner settings (defaults match the app: other ON for spot soundings).
+    var m = render.resolve.MarinerSettings{ .display_other = true };
     var f = Flags{ .args = args, .i = if (tile_mode) 5 else 2 };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
@@ -732,10 +735,64 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
         } else if (std.mem.eql(u8, arg, "--scale")) {
             const v = f.next() orelse return usageErr("--scale needs a value");
             size_scale = std.fmt.parseFloat(f64, v) catch return usageErr("bad --scale");
+        } else if (std.mem.eql(u8, arg, "--safety")) {
+            const v = f.next() orelse return usageErr("--safety needs metres");
+            m.safety_contour = std.fmt.parseFloat(f64, v) catch return usageErr("bad --safety");
+        } else if (std.mem.eql(u8, arg, "--safety-depth")) {
+            const v = f.next() orelse return usageErr("--safety-depth needs metres");
+            m.safety_depth = std.fmt.parseFloat(f64, v) catch return usageErr("bad --safety-depth");
+        } else if (std.mem.eql(u8, arg, "--shallow")) {
+            const v = f.next() orelse return usageErr("--shallow needs metres");
+            m.shallow_contour = std.fmt.parseFloat(f64, v) catch return usageErr("bad --shallow");
+        } else if (std.mem.eql(u8, arg, "--deep")) {
+            const v = f.next() orelse return usageErr("--deep needs metres");
+            m.deep_contour = std.fmt.parseFloat(f64, v) catch return usageErr("bad --deep");
+        } else if (std.mem.eql(u8, arg, "--feet")) {
+            m.depth_unit = .feet;
+        } else if (std.mem.eql(u8, arg, "--no-names")) {
+            m.text_names = false;
+        } else if (std.mem.eql(u8, arg, "--no-light-text")) {
+            m.show_light_descriptions = false;
+        } else if (std.mem.eql(u8, arg, "--no-other-text")) {
+            m.text_other = false;
+        } else if (std.mem.eql(u8, arg, "--no-other")) {
+            m.display_other = false;
+        } else if (std.mem.eql(u8, arg, "--plain")) {
+            m.boundary_style = .plain;
+        } else if (std.mem.eql(u8, arg, "--simplified")) {
+            m.simplified_points = true;
+        } else if (std.mem.eql(u8, arg, "--full-sectors")) {
+            m.show_full_sector_lines = true;
         } else return usageErr("unknown flag");
     }
     const out = out_path orelse return usageErr("-o <out.png> is required");
     if (!tile_mode and view == null) return usageErr("--view lon,lat,zoom is required without z x y");
+
+    // A DIRECTORY source is an ENC_ROOT: open it streaming through the chart
+    // layer (band-quilted cell selection per covering view tile) and render.
+    const is_dir = blk: {
+        var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch break :blk false;
+        d.close(io);
+        break :blk true;
+    };
+    if (is_dir) {
+        const v = view orelse return usageErr("an ENC_ROOT source needs --view");
+        engine.portray.setQuiet(true);
+        const c = chart.Chart.openPath(path, rules, false) catch return usageErr("cannot open ENC_ROOT");
+        defer c.deinit();
+        m.scheme = switch (palette) {
+            .day => .day,
+            .dusk => .dusk,
+            .night => .night,
+        };
+        m.data_quality = dq;
+        m.size_scale = size_scale;
+        const bytes = c.renderView(v.lon, v.lat, v.zoom, size_w, size_h, palette, &m, output) catch return usageErr("render failed");
+        defer chart.freeBytes(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
+        std.debug.print("wrote {s}: view {d:.4},{d:.4} z{d:.2}, {d}x{d}px (ENC_ROOT quilt), {d} bytes\n", .{ out, v.lon, v.lat, v.zoom, size_w, size_h, bytes.len });
+        return;
+    }
 
     const from_bundle = std.mem.endsWith(u8, path, ".pmtiles");
     if (from_bundle and view == null) return usageErr("a .pmtiles source needs --view");
@@ -746,14 +803,25 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
     if (!from_bundle) {
         cell = try engine.s57.parseCell(a, data);
         engine.portray.setQuiet(true);
-        streams = try engine.portray.portrayCell(a, &cell, resolveRulesDir(rules));
+        // LIVE portrayal context: the mariner's real safety contour / depth /
+        // contours / styles evaluate INSIDE the rules — the native win over
+        // the tile path's fixed bake context.
+        streams = try engine.portray.portrayCellWith(a, &cell, resolveRulesDir(rules), .{
+            .safety_contour = m.safety_contour,
+            .safety_depth = m.safety_depth,
+            .shallow_contour = m.shallow_contour,
+            .deep_contour = m.deep_contour,
+            .plain_boundaries = m.boundary_style == .plain,
+            .simplified_symbols = m.simplified_points,
+            .full_light_lines = m.show_full_sector_lines,
+        });
     }
     defer if (!from_bundle) cell.deinit();
 
     var colors = try render.resolve.Colors.init(a, catalog_embed.colorprofile[0].bytes);
-    // Display "other" on by default: spot soundings are S-52 category Other,
-    // and this is the recreational verify path (the host enables Other too).
-    const settings = render.resolve.MarinerSettings{ .display_other = true, .data_quality = dq, .size_scale = size_scale };
+    m.data_quality = dq;
+    m.size_scale = size_scale;
+    const settings = m;
 
     const zoom: f64 = if (view) |v| v.zoom else @floatFromInt(z);
     var ps = if (view != null) blk: {
@@ -782,6 +850,11 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
     defer store.deinit();
     ps.store = store.asStore();
     ps.output = output;
+
+    // Complex-linestyle table (idempotent; arena-backed — this run only).
+    const ls_srcs = try a.alloc(assets.LineStyleSrc, catalog_embed.linestyles.len);
+    for (catalog_embed.linestyles, 0..) |e, li| ls_srcs[li] = .{ .id = e.name, .xml = e.bytes };
+    engine.scene.registerLinestylesXml(a, ls_srcs);
 
     const bytes = if (from_bundle) blk: {
         // Bundle-sourced replay: decode each covering baked tile and re-emit

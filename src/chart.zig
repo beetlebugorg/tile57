@@ -874,6 +874,14 @@ pub const Chart = struct {
         const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
         defer store.deinit();
 
+        // Complex-linestyle table (idempotent): without it MARSYS51/cable/
+        // pipeline styles degrade to generic dashed strokes. gpa-backed: the
+        // registry outlives this render (shared with any later bake).
+        var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+        defer ls_srcs.deinit(gpa);
+        for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+        scene.registerLinestylesXml(gpa, ls_srcs.items);
+
         // Continuous scaling between integer zooms; the host applies physical
         // calibration / @2x via settings.size_scale.
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
