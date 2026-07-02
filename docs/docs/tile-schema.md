@@ -21,11 +21,13 @@ Every tile uses an extent of **4096** and a buffer of **64**.
 
 :::note Live path coverage
 Whether the tiles come from a pre-baked PMTiles archive or are generated live from
-a raw S-57 cell, the schema is the same. The live path (`src/s57_mvt/`)
-emits `areas`, `area_patterns`, `lines`, `point_symbols`, `soundings`, and `text`,
-plus the `*_scamin` declutter buckets (features carrying SCAMIN, attr 133) and a
-`draw_prio` property for S-52 fill ordering. DEPCNT lines carry `valdco` (the
-contour value, including the 0 m drying line) for line-centre labels.
+a raw S-57 cell, the schema is the same. The live path (`src/scene/`)
+emits `areas`, `area_patterns`, `lines`, `complex_lines`, `point_symbols`,
+`soundings`, and `text`, plus the `*_scamin` declutter buckets (features carrying
+SCAMIN, attr 133) and a `draw_prio` property for S-52 fill ordering. DEPCNT lines
+carry `valdco` (the contour value, including the 0 m drying line) for line-centre
+labels. The same schema is encoded as MLT or MVT (see
+[architecture](./architecture.md)).
 :::
 
 ## Color is always a name

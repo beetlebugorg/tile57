@@ -16,18 +16,22 @@ navigation.** See [Known limitations](./limitations.md).
 
 :::
 
-**tile57** is a high-performance, low-memory **S-57/S-101 → MVT vector-tile +
+**tile57** is a high-performance, low-memory **S-57/S-101 → vector-tile +
 S-52 style engine**, embeddable from **Zig**, **C**, or **Go**, targeting native
-and WASM. It decodes IHO/NOAA **S-57** ENC cells and generates **Mapbox Vector
-Tiles** by `(z, x, y)`, running the official IHO **S-101 Portrayal Catalogue** in
-embedded Lua to produce S-52 nautical portrayal. Alongside the tiles it emits a
-**MapLibre GL style** and the portrayal **assets** it references — colour tables,
-line styles, and the sprite + area-fill pattern atlases — so a renderer such as
+and WASM. It decodes IHO/NOAA **S-57** ENC cells and generates **vector tiles**
+by `(z, x, y)` — [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec)
+(MLT, the default) or Mapbox Vector Tiles (MVT) — running the official IHO
+**S-101 Portrayal Catalogue** in embedded Lua to produce S-52 nautical
+portrayal. Alongside the tiles it emits a **MapLibre GL style** and the
+portrayal **assets** it references — colour tables, line styles, and the sprite
++ area-fill pattern atlases — so a renderer such as
 [MapLibre](https://github.com/maplibre/maplibre-native) can draw a chart directly
 from tile57's output.
 
-tile57 is the engine only: it produces tiles, a style, and assets. It does not
-draw to a screen — any MVT renderer can consume what it emits.
+tile57 also contains a [native S-52 rendering engine](./rendering.md): the same
+scene that becomes tiles can be drawn straight to **PNG**, deterministic vector
+**PDF**, or a **terminal** (Unicode grid / kitty graphics), with the mariner's
+display settings evaluated live — no browser or GPU involved.
 
 ## Goals
 
@@ -49,9 +53,9 @@ almost entirely with AI assistance. A few specific goals shape its design:
   build systems and first-class WASM targets, making the engine usable in desktop
   apps, servers, and browsers from one codebase.
 
-- **Coupled tile + style.** The engine emits Mapbox Vector Tiles *and* a matching
-  MapLibre GL style together. The same style works for MapLibre Native and
-  MapLibre GL JS, so native and web renderers share one chart look without
+- **Coupled tile + style.** The engine emits vector tiles (MLT or MVT) *and* a
+  matching MapLibre GL style together. The same style works for MapLibre Native
+  and MapLibre GL JS, so native and web renderers share one chart look without
   separate style maintenance.
 
 - **Language-agnostic embedding.** A thin C ABI (`libtile57.a`) bridges the Zig
@@ -62,15 +66,16 @@ almost entirely with AI assistance. A few specific goals shape its design:
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                    src/iso8211/   (pkg: iso8211)
+   │  ISO 8211 decode                    src/s57/iso8211.zig
    ▼
-S-57 feature + geometry model            src/s57/       (pkg: s57)
-   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/ (pkg: s100)
+S-57 feature + geometry model            src/s57/
+   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/
    ▼
 portrayal instruction stream
-   │  adapt + project + clip + encode    src/{s57_mvt,tile,mvt,pmtiles}/
+   │  scene generation                   src/scene/  (project + clip + draw calls)
    ▼
-Mapbox Vector Tiles  +  MapLibre style.json  +  colortables / linestyles / sprite / patterns
+render Surface ──► MVT / MLT tiles + PMTiles (src/tiles/)  +  MapLibre style.json + assets
+             └───► PNG raster / vector PDF / terminal text (src/render/)
 ```
 
 ## Why tile57 is fast and small
@@ -85,9 +90,10 @@ The engine is **high-performance and low-memory by design**:
 - **Band-streamed bakes.** Baking an ENC_ROOT to one PMTiles archive streams
   band-by-band (finest → coarsest, best-band dedup), so peak memory tracks the
   largest single band.
-- **Pure-Zig core.** The foundational format/encode packages (`iso8211`, `s57`,
-  `s100`, `mvt`, `tile`, `pmtiles`) have no libc; only the Lua portrayal + the
-  sprite rasterizer pull in C.
+- **Pure-Zig core.** The foundational format/encode modules (`s57` — including
+  its ISO 8211 decoder — `s100`, `tiles`, `render`, `scene`, `assets`) have no
+  libc; only the Lua portrayal (`portray`) and the sprite rasterizer (`sprite`)
+  pull in C.
 
 ## Portrayal
 
