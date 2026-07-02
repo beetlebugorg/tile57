@@ -672,8 +672,16 @@ fn lastIndexOfCI(haystack: []const u8, needle: []const u8) ?usize {
 /// designation is whatever follows the LAST buoy/beacon type-word; "Light"/"Lt" are
 /// deliberately excluded so a named light keeps its name, and a name with no type-word
 /// keeps its stripped form (e.g. a bare "22").
-fn shortenName(text: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, text, "by ")) return text;
+///
+/// An extracted designation is QUOTED ("78A") like the paper chart: an aid's
+/// designation in quotes cannot be misread as a sounding or a depth — the
+/// chart convention exists for exactly that reason. Unshortened text passes
+/// through borrowed; a quoted designation allocates from `a`.
+fn shortenName(a: Allocator, text: []const u8) ![]const u8 {
+    // "by " = buoy names, "bn " = beacon names (EncodeString prefixes in the
+    // buoy/beacon rules); both reduce to the designation.
+    const tagged = std.mem.startsWith(u8, text, "by ") or std.mem.startsWith(u8, text, "bn ");
+    if (!tagged) return text;
     const name = std.mem.trim(u8, text[3..], " ");
     const keywords = [_][]const u8{ "Daybeacon", "Daymark", "Buoy", "Beacon" };
     var best_end: ?usize = null;
@@ -685,7 +693,7 @@ fn shortenName(text: []const u8) []const u8 {
     }
     if (best_end) |end| {
         const rest = std.mem.trim(u8, name[end..], " ");
-        if (rest.len > 0) return rest;
+        if (rest.len > 0) return std.fmt.allocPrint(a, "\"{s}\"", .{rest});
     }
     return name;
 }
@@ -1240,7 +1248,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                     .offset_x = t.offset_x, .offset_y = t.offset_y, .group = t.group,
                 };
                 try surf.beginFeature(&fmeta);
-                try surf.drawText(shortenName(t.text), &style, pt);
+                try surf.drawText(try shortenName(a, t.text), &style, pt);
                 try surf.endFeature();
             }
         }
@@ -1352,7 +1360,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                         .offset_x = t.offset_x, .offset_y = t.offset_y, .group = t.group,
                     };
                     try surf.beginFeature(&fmeta);
-                    try surf.drawText(shortenName(t.text), &style, cpt);
+                    try surf.drawText(try shortenName(a, t.text), &style, cpt);
                     try surf.endFeature();
                 }
             }
@@ -2434,20 +2442,26 @@ test "appendTextProps: halo (CHWHT/1) gated on font_size >= 10, matching the ora
     }
 }
 
-test "shortenName: buoy/light names reduce to the chart designation" {
-    // Verbose NOAA OBJNAM tagged "by <name>" by the S-101 buoy rules -> just the id.
-    try std.testing.expectEqualStrings("78A", shortenName("by Chesapeake Channel Lighted Buoy 78A"));
-    try std.testing.expectEqualStrings("CR", shortenName("by Chesapeake Channel Lighted Buoy CR"));
-    try std.testing.expectEqualStrings("3", shortenName("by Tangier Sound Daybeacon 3"));
-    try std.testing.expectEqualStrings("2CR", shortenName("by Lighted Whistle Buoy 2CR"));
-    // No type-word -> the stripped name (already short).
-    try std.testing.expectEqualStrings("22", shortenName("by 22"));
+test "shortenName: buoy/light names reduce to the QUOTED chart designation" {
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    const al = arena_s.allocator();
+    // Verbose NOAA OBJNAM tagged "by <name>" by the S-101 buoy rules -> the
+    // designation IN QUOTES (paper-chart convention: not misread as a sounding).
+    try std.testing.expectEqualStrings("\"78A\"", try shortenName(al, "by Chesapeake Channel Lighted Buoy 78A"));
+    try std.testing.expectEqualStrings("\"CR\"", try shortenName(al, "by Chesapeake Channel Lighted Buoy CR"));
+    try std.testing.expectEqualStrings("\"3\"", try shortenName(al, "by Tangier Sound Daybeacon 3"));
+    try std.testing.expectEqualStrings("\"2CR\"", try shortenName(al, "by Lighted Whistle Buoy 2CR"));
+    // No type-word -> the stripped name (already short), unquoted.
+    try std.testing.expectEqualStrings("22", try shortenName(al, "by 22"));
     // No "by " prefix -> passthrough (depth label, light elevation, place name).
-    try std.testing.expectEqualStrings(" 4.6m", shortenName(" 4.6m"));
-    try std.testing.expectEqualStrings("Herring Bay", shortenName("Herring Bay"));
+    try std.testing.expectEqualStrings(" 4.6m", try shortenName(al, " 4.6m"));
+    try std.testing.expectEqualStrings("Herring Bay", try shortenName(al, "Herring Bay"));
     // "Light"/"Lt" are NOT split words -> a named light keeps its name (defensive; such
     // labels don't carry the "by " buoy prefix anyway).
-    try std.testing.expectEqualStrings("Thomas Point Light", shortenName("by Thomas Point Light"));
+    try std.testing.expectEqualStrings("Thomas Point Light", try shortenName(al, "by Thomas Point Light"));
+    // Beacon names ("bn " prefix) reduce the same way.
+    try std.testing.expectEqualStrings("\"2\"", try shortenName(al, "bn Turn Rock Daybeacon 2"));
 }
 
 test "listHasAny splits S-57 comma lists and matches any target" {

@@ -311,10 +311,11 @@ pub const PixelSurface = struct {
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
         const font_px: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);
-        // LocalOffset mm -> px at the label's em size (the tile path's loff
-        // body units are 3.51 mm = 1 em).
-        const ox: f32 = @floatCast(style.offset_x / 3.51);
-        const oy: f32 = @floatCast(style.offset_y / 3.51);
+        // LocalOffset is millimetres, converted inside pushText at the S-52
+        // screen pitch (2.835 px/mm x device scale) — NOT via em units of the
+        // font size, which would overshoot the spec offset for a 12px label.
+        const ox: f32 = @floatCast(style.offset_x);
+        const oy: f32 = @floatCast(style.offset_y);
         // S-52/S-101 text is SOLID (FontBackgroundColor transparent) — the served
         // style deliberately renders no halo; match it. The GlyphRun halo plumbing
         // stays for a future opt-in legibility setting.
@@ -334,11 +335,12 @@ pub const PixelSurface = struct {
 
     /// Shape + buffer one label: glyphs advance left-to-right at `font_px`
     /// (CSS px; device scale applied here), anchored per halign/valign with
-    /// em-unit offsets (ox, oy — S-52 LocalOffset, +y down), optional halo.
-    fn pushText(self: *PixelSurface, text: []const u8, font_px_css: f32, halign: []const u8, valign: []const u8, ox_em: f32, oy_em: f32, color: cv.Color, haloed: bool, anchor: cv.Point) !void {
+    /// MILLIMETRE offsets (S-52 LocalOffset, +y down), optional halo.
+    fn pushText(self: *PixelSurface, text: []const u8, font_px_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, haloed: bool, anchor: cv.Point) !void {
         const f = &(self.fnt orelse return);
         const px = font_px_css * @as(f32, @floatCast(self.devScale()));
         if (px <= 1) return;
+        const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.devScale());
 
         // Shape: glyph ids + pen positions (+ the PDF 1000/em advances).
         var gids = std.ArrayList(cv.Glyph).empty;
@@ -353,10 +355,10 @@ pub const PixelSurface = struct {
         if (gids.items.len == 0) return;
 
         const width = pen;
-        var x0 = anchor.x + ox_em * px;
+        var x0 = anchor.x + ox_mm * mm_px;
         if (std.mem.eql(u8, halign, "center")) x0 -= width / 2;
         if (std.mem.eql(u8, halign, "right")) x0 -= width;
-        var baseline = anchor.y + oy_em * px;
+        var baseline = anchor.y + oy_mm * mm_px;
         if (std.mem.eql(u8, valign, "top")) {
             baseline += f.ascent * px;
         } else if (std.mem.eql(u8, valign, "middle")) {

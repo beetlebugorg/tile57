@@ -466,12 +466,17 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try js.write(FONT);
     try js.objectField("text-size");
     try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 10 }, s.size_scale);
+    // The rule's OWN placement: light descriptions carry halign=left,
+    // valign=middle, loff="2,0" — 7.02 mm (two text bodies) RIGHT of the
+    // light, clear of the flare (LightAllAround.lua LocalOffset:7.02,0). The
+    // old hardcoded top/[0,0.4] dropped the label onto the flare. MapLibre
+    // offsets are ems OF THE TEXT SIZE (12px here), not bodies (10px), so
+    // "2,0" em would overshoot the spec by 20% — emit the mm-exact 1.66em
+    // for the characteristics; a light's NAME keeps the generic map.
     try js.objectField("text-anchor");
-    try js.write("top");
+    try js.write(TEXT_ANCHOR);
     try js.objectField("text-offset");
-    try js.write(.{ 0, 0.4 });
-    try js.objectField("text-justify");
-    try js.write("left");
+    try js.write(.{ "match", .{ "coalesce", .{ "get", "loff" }, "0,0" }, "2,0", .{ "literal", .{ 1.66, 0 } }, TEXT_OFFSET });
     try js.objectField("symbol-sort-key");
     try js.write(.{ "-", 0, .{ "coalesce", .{ "get", "font_size_px" }, 10 } });
     try js.objectField("text-allow-overlap");
