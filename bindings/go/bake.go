@@ -16,7 +16,7 @@ void tile57GoBakeProgress(void *user, uint8_t stage, size_t done, size_t total,
 // console default, and its trampoline no-ops on a NULL user regardless).
 static int tile57_bake_pmtiles_cb(const tile57_cell *cells, size_t count,
                                   const char *rules_dir, uint8_t minz, uint8_t maxz,
-                                  int omit_pick_attrs,
+                                  int omit_pick_attrs, uint8_t format,
                                   void *user, uint8_t **out, size_t *out_len) {
     tile57_bake_opts opts = {
         .rules_dir = rules_dir,
@@ -27,6 +27,7 @@ static int tile57_bake_pmtiles_cb(const tile57_cell *cells, size_t count,
         .omit_pick_attrs = omit_pick_attrs != 0,
         .progress = user ? tile57GoBakeProgress : (tile57_bake_progress)0,
         .progress_user = user,
+        .format = format,
     };
     return tile57_bake_pmtiles(cells, count, &opts, out, out_len);
 }
@@ -35,7 +36,7 @@ static int tile57_bake_pmtiles_cb(const tile57_cell *cells, size_t count,
 static int tile57_bake_bundle_cb(const char *input, const char *out_dir,
                                  const char *rules_dir, const char *catalog_dir,
                                  const char *created, uint8_t minz, uint8_t maxz,
-                                 int omit_pick_attrs,
+                                 int omit_pick_attrs, uint8_t format,
                                  void *user, uint32_t *out_cells, double *out_bbox) {
     tile57_bake_opts opts = {
         .rules_dir = rules_dir,
@@ -46,6 +47,7 @@ static int tile57_bake_bundle_cb(const char *input, const char *out_dir,
         .omit_pick_attrs = omit_pick_attrs != 0,
         .progress = user ? tile57GoBakeProgress : (tile57_bake_progress)0,
         .progress_user = user,
+        .format = format,
     };
     return tile57_bake_bundle(input, out_dir, &opts, out_cells, out_bbox);
 }
@@ -68,7 +70,8 @@ type BakeOpts struct {
 	Created       string // "" = manifest "created" unset (BakeBundle only)
 	MinZoom       uint8  // 0/0 = no band clamp
 	MaxZoom       uint8
-	OmitPickAttrs bool // true = drop the pick-report attrs (class/cell/s57) for a leaner bake
+	OmitPickAttrs bool       // true = drop the pick-report attrs (class/cell/s57) for a leaner bake
+	Format        TileFormat // baked tile encoding; the zero value bakes the engine default (MLT)
 }
 
 // BakePmtiles bakes an ENC_ROOT's in-memory cells into ONE zoom-banded PMTiles
@@ -98,7 +101,7 @@ func BakePmtiles(cells []Cell, opts BakeOpts, progress func(BakeProgress)) ([]by
 	var out *C.uint8_t
 	var outLen C.size_t
 	rc := C.tile57_bake_pmtiles_cb(base, C.size_t(len(cells)), cRules,
-		C.uint8_t(opts.MinZoom), C.uint8_t(opts.MaxZoom), cOmit(opts.OmitPickAttrs), user, &out, &outLen)
+		C.uint8_t(opts.MinZoom), C.uint8_t(opts.MaxZoom), cOmit(opts.OmitPickAttrs), C.uint8_t(opts.Format), user, &out, &outLen)
 	switch rc {
 	case 1:
 		return tileBytes(out, outLen), nil
@@ -153,7 +156,7 @@ func BakeBundle(input, outDir string, opts BakeOpts, progress func(BakeProgress)
 	var cells C.uint32_t
 	var bb [4]C.double
 	rc := C.tile57_bake_bundle_cb(cIn, cOut, cRules, cCat, cCreated,
-		C.uint8_t(opts.MinZoom), C.uint8_t(opts.MaxZoom), cOmit(opts.OmitPickAttrs), user, &cells, &bb[0])
+		C.uint8_t(opts.MinZoom), C.uint8_t(opts.MaxZoom), cOmit(opts.OmitPickAttrs), C.uint8_t(opts.Format), user, &cells, &bb[0])
 	switch rc {
 	case 1:
 		return int(cells), [4]float64{float64(bb[0]), float64(bb[1]), float64(bb[2]), float64(bb[3])}, nil

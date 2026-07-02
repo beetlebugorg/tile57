@@ -33,16 +33,38 @@ import (
 // Version returns the libtile57 version string (e.g. "0.1.0").
 func Version() string { return C.GoString(C.tile57_version()) }
 
+// TileFormat is a tile encoding (tile57_tile_type / tile57_bake_opts.format).
+// The zero value means "the engine default" (MLT) in bake options.
+type TileFormat uint8
+
+const (
+	FormatDefault TileFormat = 0                      // engine default (MLT)
+	FormatMVT     TileFormat = C.TILE57_TILE_TYPE_MVT // Mapbox Vector Tile
+	FormatMLT     TileFormat = C.TILE57_TILE_TYPE_MLT // MapLibre Tile (the default bake format)
+)
+
+// Encoding returns the MapLibre vector-source `encoding` value for the format
+// ("mlt" or "mvt") — the hint a host puts on its style sources / TileJSON so
+// maplibre-gl (>=5.12) picks the matching decoder.
+func (f TileFormat) Encoding() string {
+	if f == FormatMLT {
+		return "mlt"
+	}
+	return "mvt"
+}
+
 // Meta is a chart source's display metadata — the shape a host tile server needs to
 // publish a TileJSON: zoom range, geographic bounds (degrees), whether tile bodies
-// are gzip-compressed (always false here — tile57 serves decompressed MVT), and the
-// distinct SCAMIN denominators present (the live SCAMIN manifest; see [Source.Scamin]).
-// A host with its own metadata type copies these fields across.
+// are gzip-compressed (always false here — tile57 serves decompressed tiles), the
+// distinct SCAMIN denominators present (the live SCAMIN manifest; see [Source.Scamin]),
+// and the tile encoding Tile returns ("mvt" or "mlt" — the TileJSON/style `encoding`
+// hint). A host with its own metadata type copies these fields across.
 type Meta struct {
 	MinZoom, MaxZoom uint8
 	W, S, E, N       float64  // lon/lat bounds (degrees)
 	Gzipped          bool     // tile bodies gzip-compressed (always false for tile57)
 	Scamin           []uint32 // distinct SCAMIN denominators present (ascending)
+	TileType         string   // "mvt" | "mlt" — the encoding Tile returns
 }
 
 // Source is an open libtile57 chart. Construct it with [Open], [OpenChartBytes], or
@@ -112,7 +134,8 @@ func OpenPMTiles(path string) (*Source, error) {
 }
 
 // ChartInfo is a chart's fixed metadata (chart-api.md) — zoom range, bands, bounds,
-// and a good initial camera. HasBounds/HasAnchor guard the respective fields.
+// a good initial camera, and the tile encoding Tile returns. HasBounds/HasAnchor
+// guard the respective fields.
 type ChartInfo struct {
 	MinZoom, MaxZoom                 uint8
 	Bands                            uint32
@@ -120,6 +143,10 @@ type ChartInfo struct {
 	West, South, East, North         float64
 	HasAnchor                        bool
 	AnchorLat, AnchorLon, AnchorZoom float64
+	// TileType is the encoding Tile returns (FormatMVT or FormatMLT): a PMTiles-
+	// backed source reports its archive's stored type; a cell-backed source its
+	// live generation format (see [Source.SetTileFormat]).
+	TileType TileFormat
 }
 
 // Info returns the chart's fixed metadata in one call.
@@ -133,11 +160,26 @@ func (s *Source) Info() ChartInfo {
 		West:      float64(ci.west), South: float64(ci.south), East: float64(ci.east), North: float64(ci.north),
 		HasAnchor: bool(ci.has_anchor),
 		AnchorLat: float64(ci.anchor_lat), AnchorLon: float64(ci.anchor_lon), AnchorZoom: float64(ci.anchor_zoom),
+		TileType: TileFormat(ci.tile_type),
 	}
 }
 
-// Tile fetches tile (z, x, y) as decompressed MVT bytes. (nil, nil) means a blank
-// tile (valid but empty) — the TileSource "no tile here" convention.
+// SetTileFormat selects the encoding for LIVE-generated tiles on a cell-backed
+// source (FormatDefault = the engine default, MLT). Cell-backed sources open
+// generating MVT, so an MLT-capable host opts in here. No-op for a baked PMTiles
+// source (its stored encoding is fixed). Changing the format drops the tile cache.
+func (s *Source) SetTileFormat(f TileFormat) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ptr != nil {
+		C.tile57_chart_set_tile_format(s.ptr, C.uint8_t(f))
+	}
+}
+
+// Tile fetches tile (z, x, y) as decompressed vector-tile bytes in the source's
+// tile encoding (see [ChartInfo.TileType] / [Meta.TileType]; stored bytes verbatim
+// for a PMTiles source, the live generation format for a cell source). (nil, nil)
+// means a blank tile (valid but empty) — the TileSource "no tile here" convention.
 func (s *Source) Tile(z uint8, x, y uint32) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -175,6 +217,7 @@ func (s *Source) Meta() Meta {
 	if bool(ci.has_bounds) {
 		m.W, m.S, m.E, m.N = float64(ci.west), float64(ci.south), float64(ci.east), float64(ci.north)
 	}
+	m.TileType = TileFormat(ci.tile_type).Encoding()
 	m.Scamin = s.scaminLocked()
 	return m
 }

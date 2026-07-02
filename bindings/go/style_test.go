@@ -18,7 +18,7 @@ func TestStyle(t *testing.T) {
 		"http://localhost:8080/tiles/tile57/{z}/{x}/{y}.mvt",
 		"http://localhost:8080/sprite",
 		"http://localhost:8080/glyphs/{fontstack}/{range}.pbf",
-		0, 0, m, nil, nil, 0)
+		0, 0, FormatMVT, m, nil, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestIgnoreScamin(t *testing.T) {
 	build := func(ignore bool) string {
 		m := MarinerDefaults()
 		m.IgnoreScamin = ignore
-		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "", "", 0, 0, m, nil, nil, 0)
+		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "", "", 0, 0, FormatMVT, m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(ignore=%v): %v", ignore, err)
 		}
@@ -68,7 +68,7 @@ func TestViewingGroupsOff(t *testing.T) {
 		m := MarinerDefaults()
 		m.ViewingGroupsOff = off
 		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-			"glyphs/{fontstack}/{range}.pbf", 0, 0, m, nil, nil, 0)
+			"glyphs/{fontstack}/{range}.pbf", 0, 0, FormatMVT, m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(off=%v): %v", off, err)
 		}
@@ -97,7 +97,7 @@ func TestScaminBuckets(t *testing.T) {
 	m := MarinerDefaults()
 	scamin := []int32{89999, 119999, 259999}
 	withManifest, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-		"glyphs/{fontstack}/{range}.pbf", 0, 0, m, nil, scamin, 38.0)
+		"glyphs/{fontstack}/{range}.pbf", 0, 0, FormatMVT, m, nil, scamin, 38.0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,13 +134,52 @@ func itoa(v int32) string {
 	return strconv.Itoa(int(v))
 }
 
+// TestStyleEncodingHint verifies the MLT source-encoding hint through the full C
+// ABI: FormatMLT emits `"encoding":"mlt"` on the chart source (and the hint
+// survives BuildStyle's template rebuild); FormatMVT/FormatDefault emit nothing.
+func TestStyleEncodingHint(t *testing.T) {
+	chartSource := func(b []byte) map[string]any {
+		var doc struct {
+			Sources map[string]map[string]any `json:"sources"`
+		}
+		if err := json.Unmarshal(b, &doc); err != nil {
+			t.Fatalf("style not valid JSON: %v", err)
+		}
+		return doc.Sources["chart"]
+	}
+	build := func(enc TileFormat) []byte {
+		tmpl, err := StyleTemplate(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
+			"glyphs/{fontstack}/{range}.pbf", 0, 0, enc)
+		if err != nil {
+			t.Fatalf("StyleTemplate(enc=%v): %v", enc, err)
+		}
+		if got := chartSource(tmpl)["encoding"]; enc == FormatMLT && got != "mlt" {
+			t.Fatalf("template chart source encoding = %v; want mlt", got)
+		}
+		ct, _ := ColortablesDefault()
+		s, err := BuildStyle(tmpl, MarinerDefaults(), ct, nil, nil, 0)
+		if err != nil {
+			t.Fatalf("BuildStyle(enc=%v): %v", enc, err)
+		}
+		return s
+	}
+	if got := chartSource(build(FormatMLT))["encoding"]; got != "mlt" {
+		t.Fatalf("built style chart source encoding = %v; want mlt (hint must survive the rebuild)", got)
+	}
+	for _, enc := range []TileFormat{FormatMVT, FormatDefault} {
+		if got, ok := chartSource(build(enc))["encoding"]; ok {
+			t.Fatalf("encoding hint for %v should be absent; got %v", enc, got)
+		}
+	}
+}
+
 // TestScaminFilterGate verifies the scamin-layers.md flag through the full C ABI:
 // with a manifest, ScaminFilterGate collapses the per-value #sm bucket layers to one
 // live-filtered layer per render-type — far fewer layers, no #sm, no native minzoom.
 func TestScaminFilterGate(t *testing.T) {
 	ct, _ := ColortablesDefault()
 	tmpl, err := StyleTemplate(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-		"glyphs/{fontstack}/{range}.pbf", 0, 0)
+		"glyphs/{fontstack}/{range}.pbf", 0, 0, FormatMVT)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +227,7 @@ func TestStyleDiff(t *testing.T) {
 		t.Fatal(err)
 	}
 	tmpl, err := StyleTemplate(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-		"glyphs/{fontstack}/{range}.pbf", 0, 0)
+		"glyphs/{fontstack}/{range}.pbf", 0, 0, FormatMVT)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +274,7 @@ func TestSizeScale(t *testing.T) {
 		m := MarinerDefaults()
 		m.SizeScale = scale
 		style, err := Style(SchemeDay, "tile57://{z}/{x}/{y}", "sprite",
-			"glyphs/{fontstack}/{range}.pbf", 0, 0, m, nil, nil, 0)
+			"glyphs/{fontstack}/{range}.pbf", 0, 0, FormatMVT, m, nil, nil, 0)
 		if err != nil {
 			t.Fatalf("Style(scale=%v): %v", scale, err)
 		}

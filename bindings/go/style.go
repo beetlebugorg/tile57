@@ -84,7 +84,12 @@ func MarinerDefaults() Mariner {
 // the symbol/text layers). minZoom is the chart source's tile floor, emitted
 // verbatim — pass the archive's real minzoom (0 = tiles from z0; MapLibre never
 // requests tiles below a source's minzoom). maxZoom of 0 uses the engine default.
-func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32) ([]byte, error) {
+// encoding is the chart source's tile encoding (FormatMLT emits "encoding":"mlt"
+// on the source so maplibre-gl >=5.12 decodes MLT natively; FormatDefault/
+// FormatMVT emit nothing — the MapLibre default). Pass the set's real tile type
+// (e.g. from [Meta.TileType] / the archive header); the hint survives
+// [BuildStyle] and [StyleDiff].
+func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32, encoding TileFormat) ([]byte, error) {
 	cSrc, f1 := cStringOrNil(sourceTiles)
 	defer f1()
 	cSpr, f2 := cStringOrNil(sprite)
@@ -94,10 +99,19 @@ func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, m
 	var out *C.uint8_t
 	var n C.size_t
 	if C.tile57_style_template(C.tile57_scheme(scheme), cSrc, cSpr, cGly,
-		C.uint32_t(minZoom), C.uint32_t(maxZoom), &out, &n) != 1 {
+		C.uint32_t(minZoom), C.uint32_t(maxZoom), C.uint8_t(encoding), &out, &n) != 1 {
 		return nil, fmt.Errorf("tile57: style_template failed")
 	}
 	return tileBytes(out, n), nil
+}
+
+// EncodingFormat maps a TileJSON/style `encoding` string ("mlt"/"mvt"/"") to the
+// TileFormat StyleTemplate takes ("" and "mvt" both mean MVT — no hint emitted).
+func EncodingFormat(encoding string) TileFormat {
+	if encoding == "mlt" {
+		return FormatMLT
+	}
+	return FormatMVT
 }
 
 // BuildStyle patches a style template with the mariner settings + S-52 colortables
@@ -161,15 +175,17 @@ func StyleDiff(template []byte, from, to Mariner, colortables []byte, enabledBan
 // produce a complete MapLibre style JSON from libtile57's baked-in catalogue.
 // minZoom is the chart source's tile floor, emitted verbatim (pass the archive's
 // real minzoom; 0 = tiles from z0). maxZoom of 0 = the engine default, i.e. z16
-// max; a host that overzooms past z16 must pass its own maxZoom. scamin/scaminLat
-// (typically Source.Scamin() + the source center latitude) gate the `_scamin` layers
-// by value; pass nil/0 to leave them ungated.
-func Style(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32, m Mariner, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
+// max; a host that overzooms past z16 must pass its own maxZoom. encoding is the
+// chart source's tile encoding (FormatMLT hints maplibre-gl's native MLT decoder;
+// see StyleTemplate). scamin/scaminLat (typically Source.Scamin() + the source
+// center latitude) gate the `_scamin` layers by value; pass nil/0 to leave them
+// ungated.
+func Style(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32, encoding TileFormat, m Mariner, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
 	ct, err := ColortablesDefault()
 	if err != nil {
 		return nil, err
 	}
-	tmpl, err := StyleTemplate(scheme, sourceTiles, sprite, glyphs, minZoom, maxZoom)
+	tmpl, err := StyleTemplate(scheme, sourceTiles, sprite, glyphs, minZoom, maxZoom, encoding)
 	if err != nil {
 		return nil, err
 	}

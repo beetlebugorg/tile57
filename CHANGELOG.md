@@ -6,6 +6,35 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Changed — MLT is the default tile format
+- **MLT (MapLibre Tiles) is now the DEFAULT bake/storage tile format**;
+  MVT stays available explicitly (`--format mvt`, `tile57_bake_opts.format =
+  TILE57_TILE_TYPE_MVT`). There is NO transcode layer anywhere: the wire format
+  follows the storage format, and maplibre-gl ≥ 5.12 decodes MLT natively via
+  the vector-source `encoding` option.
+- **Bake parity gap closed**: the bundle's post-bake collection (sprite-mln
+  sounding composites + the SCAMIN manifest feeding the client's ladder) now
+  decodes baked tiles with the codec matching the bake format, so an MLT bake
+  produces byte-identical sprite-mln output and the same `scamin` metadata as
+  an MVT bake of the same input.
+- C ABI: `tile57_bake_opts` gained `format` (0 = default = MLT; honored by
+  `tile57_bake_pmtiles` AND `tile57_bake_bundle`); `tile57_chart_info` gained
+  `tile_type` (the encoding `tile57_chart_tile` returns — the stored type for a
+  PMTiles chart, the live generation format for a cell chart); new
+  `tile57_chart_set_tile_format` selects the live-generation encoding on a
+  cell-backed chart (cell charts still OPEN generating MVT so existing MVT-only
+  embedders are unaffected); `tile57_style_template` gained `tile_encoding`
+  (emits `"encoding":"mlt"` on the chart source; the hint survives
+  `tile57_build_style` / `tile57_style_diff`); the stale "decompressed MVT
+  bytes" doc on `tile57_chart_tile` now states tiles serve verbatim in the
+  chart's tile encoding. Bundle styles (`style-{day,dusk,night}.json`) carry
+  `"encoding":"mlt"` on their `pmtiles://` source for MLT bundles.
+- bindings/go: `BakeOpts.Format`, `ChartInfo.TileType` / `Meta.TileType`,
+  `Source.SetTileFormat`, `TileFormat` (+ `Encoding()`/`EncodingFormat`), and an
+  `encoding TileFormat` parameter on `StyleTemplate`/`Style`.
+- `tile57 inspect` now decodes MLT tiles (same layer/feature dump as MVT)
+  instead of hex-dumping them.
+
 ### Fixed — scamin-aware band handoff (the band-floor blank window)
 - **Zooming through a band boundary no longer blanks the chart** while the finer
   band's SCAMIN-gated bulk is still hidden. Each band's floor-zoom tiles now bake
