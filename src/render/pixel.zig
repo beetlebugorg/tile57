@@ -63,10 +63,15 @@ pub const PixelSurface = struct {
     settings: *const resolve.MarinerSettings,
     /// Fractional display zoom the gates evaluate at.
     zoom: f64,
-    /// Output size in pixels and the tile-space extent the incoming geometry
-    /// uses; scale maps one into the other (e.g. 256 / 4096).
-    size_px: u32,
+    /// Output size in pixels; a tile render is square (w == h == px_per_tile),
+    /// a view spans several tiles. `scale` maps tile-extent units into px;
+    /// `origin` is the CURRENT tile's top-left in canvas px (the view driver
+    /// moves it between tiles; 0,0 for single-tile renders).
+    w_px: u32,
+    h_px: u32,
+    px_per_tile: f32,
     scale: f32,
+    origin: cv.Point = .{ .x = 0, .y = 0 },
     /// Catalogue symbol geometry (null = symbols/soundings are skipped —
     /// fills/lines-only render). Wired from the sprite module's nanosvg-backed
     /// store, or a test fake.
@@ -95,16 +100,29 @@ pub const PixelSurface = struct {
     /// from — buffered ops live until endScene, exactly like the tile
     /// surface's feature lists.
     pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.MarinerSettings, zoom: f64, size_px: u32, tile_extent: u32) PixelSurface {
+        return initView(a, colors, palette, settings, zoom, size_px, size_px, @floatFromInt(size_px), tile_extent);
+    }
+
+    /// A multi-tile view scene: w x h output px, each source tile occupying
+    /// px_per_tile px (fractional zoom = a non-power-of-two px_per_tile).
+    pub fn initView(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.MarinerSettings, zoom: f64, w_px: u32, h_px: u32, px_per_tile: f32, tile_extent: u32) PixelSurface {
         return .{
             .a = a,
             .colors = colors,
             .palette = palette,
             .settings = settings,
             .zoom = zoom,
-            .size_px = size_px,
-            .scale = @as(f32, @floatFromInt(size_px)) / @as(f32, @floatFromInt(tile_extent)),
+            .w_px = w_px,
+            .h_px = h_px,
+            .px_per_tile = px_per_tile,
+            .scale = px_per_tile / @as(f32, @floatFromInt(tile_extent)),
             .fnt = fontmod.Font.init(fontmod.notosans) catch null,
         };
+    }
+
+    /// Position the NEXT tile's geometry: its top-left corner in canvas px.
+    pub fn setOrigin(self: *PixelSurface, x: f32, y: f32) void {
+        self.origin = .{ .x = x, .y = y };
     }
 
     pub fn asSurface(self: *PixelSurface) rs.Surface {
@@ -125,8 +143,8 @@ pub const PixelSurface = struct {
         for (parts, 0..) |part, i| {
             const pts = try self.a.alloc(cv.Point, part.len);
             for (part, 0..) |p, j| pts[j] = .{
-                .x = @as(f32, @floatFromInt(p.x)) * self.scale,
-                .y = @as(f32, @floatFromInt(p.y)) * self.scale,
+                .x = self.origin.x + @as(f32, @floatFromInt(p.x)) * self.scale,
+                .y = self.origin.y + @as(f32, @floatFromInt(p.y)) * self.scale,
             };
             out[i] = pts;
         }
@@ -162,7 +180,7 @@ pub const PixelSurface = struct {
     /// icon-size / line-width / text-size so 1 S-52 mm reads as a true mm on
     /// a calibrated display).
     fn devScale(self: *const PixelSurface) f64 {
-        return self.settings.size_scale * @as(f64, @floatFromInt(self.size_px)) / 256.0;
+        return self.settings.size_scale * @as(f64, @floatCast(self.px_per_tile)) / 256.0;
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
@@ -265,8 +283,8 @@ pub const PixelSurface = struct {
         const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
         const cosr = @cos(rad);
         const sinr = @sin(rad);
-        const ax = @as(f32, @floatFromInt(at.x)) * self.scale;
-        const ay = @as(f32, @floatFromInt(at.y)) * self.scale;
+        const ax = self.origin.x + @as(f32, @floatFromInt(at.x)) * self.scale;
+        const ay = self.origin.y + @as(f32, @floatFromInt(at.y)) * self.scale;
         for (s.paths) |p| {
             const rings = try self.a.alloc([]const cv.Point, p.contours.len);
             for (p.contours, 0..) |contour, i| {
@@ -294,8 +312,8 @@ pub const PixelSurface = struct {
         const oy: f32 = @floatCast(style.offset_y / 3.51);
         const haloed = font_px >= 10 and style.halign.len > 0;
         try self.pushText(text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, .{
-            .x = @as(f32, @floatFromInt(at.x)) * self.scale,
-            .y = @as(f32, @floatFromInt(at.y)) * self.scale,
+            .x = self.origin.x + @as(f32, @floatFromInt(at.x)) * self.scale,
+            .y = self.origin.y + @as(f32, @floatFromInt(at.y)) * self.scale,
         });
     }
 
@@ -409,7 +427,7 @@ pub const PixelSurface = struct {
             }
         }
 
-        var rc = try raster.RasterCanvas.init(self.a, self.size_px, self.size_px);
+        var rc = try raster.RasterCanvas.init(self.a, self.w_px, self.h_px);
         defer rc.deinit();
         // NODTA under everything (S-52 no-data); the palette decides its shade.
         rc.clear(self.resolveColor("NODTA"));

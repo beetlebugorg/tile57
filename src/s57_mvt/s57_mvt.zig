@@ -11,7 +11,8 @@ const s57 = @import("s57");
 const tile = @import("tiles").tile;
 const mvt = @import("tiles").mvt;
 const mlt = @import("tiles").mlt;
-const rs = @import("render").surface;
+const render = @import("render");
+const rs = render.surface;
 
 /// The banded multi-cell ENC_ROOT -> PMTiles baker (folded in: it is the
 /// batch driver of this engine). Re-exported for the CLI + lib root.
@@ -2010,16 +2011,14 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
     return surf.endScene(out);
 }
 
-/// Generate a scene for tile (z,x,y) through an arbitrary render Surface —
-/// the pixel-path twin of generateTileMulti (which is this plus the MVT/MLT
-/// surface). The classify() legacy mode (features with NO portrayal) is
-/// tile-schema-only and is skipped here: a pixel render always portrays.
-/// Returns whatever the surface's endScene produces (e.g. PNG bytes).
-pub fn generateTileSurface(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool, surf: rs.Surface) ![]u8 {
-    const a = scratch;
+/// Append one tile's worth of every cell's features into an already-begun
+/// Surface scene — the composable core of the pixel path (a view scene calls
+/// this once per covering tile between beginScene/endScene). The classify()
+/// legacy mode (features with NO portrayal) is tile-schema-only and skipped:
+/// a pixel render always portrays.
+pub fn appendTileSurface(scratch: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool, surf: rs.Surface) !void {
     const tb = tile.tileBoundsLonLat(z, x, y);
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
-    try surf.beginScene(z);
     for (cells) |cr| {
         const opts = CellOpts{
             .band = cr.band,
@@ -2029,7 +2028,53 @@ pub fn generateTileSurface(scratch: Allocator, out: Allocator, cells: []const Ce
             .suppress_points = cr.suppress_points,
             .pick_attrs = pick_attrs,
         };
-        try appendCellFeaturesSurf(a, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeaturesSurf(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+    }
+}
+
+/// Generate a scene for tile (z,x,y) through an arbitrary render Surface —
+/// the pixel-path twin of generateTileMulti (which is this plus the MVT/MLT
+/// surface). Returns whatever the surface's endScene produces (e.g. PNG bytes).
+pub fn generateTileSurface(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool, surf: rs.Surface) ![]u8 {
+    try surf.beginScene(z);
+    try appendTileSurface(scratch, cells, z, x, y, pick_attrs, surf);
+    return surf.endScene(out);
+}
+
+/// Render a VIEW — an arbitrary centre + fractional zoom + pixel size — as
+/// ONE whole scene across every covering tile: labels and declutter run over
+/// the full canvas (no per-tile seams), the native win over tile compositing.
+/// `ps` must have been initView'd with the same output size and a
+/// px_per_tile of 256 * 2^(zoom - round(zoom)) * supersample; this positions
+/// each covering tile via ps.setOrigin and drives the engine per tile.
+pub fn generateViewSurface(scratch: Allocator, out: Allocator, cells: []const CellRef, center_lon: f64, center_lat: f64, zoom: f64, pick_attrs: bool, ps: *render.pixel.PixelSurface) ![]u8 {
+    const zi: u8 = @intFromFloat(std.math.clamp(@round(zoom), 0, 22));
+    const n_tiles: f64 = @floatFromInt(@as(u32, 1) << @intCast(zi));
+    const pt: f64 = @floatCast(ps.px_per_tile);
+    const world = tile.lonLatToWorld(center_lon, center_lat); // [0,1] web-mercator
+    const cx = world[0] * n_tiles * pt;
+    const cy = world[1] * n_tiles * pt;
+    const wf: f64 = @floatFromInt(ps.w_px);
+    const hf: f64 = @floatFromInt(ps.h_px);
+    const left = cx - wf / 2;
+    const top = cy - hf / 2;
+
+    const surf = ps.asSurface();
+    try surf.beginScene(zi);
+    const tx0: i64 = @intFromFloat(@floor(left / pt));
+    const ty0: i64 = @intFromFloat(@floor(top / pt));
+    const tx1: i64 = @intFromFloat(@floor((left + wf - 0.001) / pt));
+    const ty1: i64 = @intFromFloat(@floor((top + hf - 0.001) / pt));
+    const max_t: i64 = @as(i64, 1) << @intCast(zi);
+    var ty = ty0;
+    while (ty <= ty1) : (ty += 1) {
+        if (ty < 0 or ty >= max_t) continue;
+        var tx = tx0;
+        while (tx <= tx1) : (tx += 1) {
+            if (tx < 0 or tx >= max_t) continue;
+            ps.setOrigin(@floatCast(@as(f64, @floatFromInt(tx)) * pt - left), @floatCast(@as(f64, @floatFromInt(ty)) * pt - top));
+            try appendTileSurface(scratch, cells, zi, @intCast(tx), @intCast(ty), pick_attrs, surf);
+        }
     }
     return surf.endScene(out);
 }

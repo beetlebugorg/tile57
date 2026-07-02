@@ -665,34 +665,59 @@ fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     std.debug.print("wrote {s} ({s}, {d} bytes)\n", .{ out_path, scheme, style.len });
 }
 
-// tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette P] [--rules DIR]
+// tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [flags]        (one tile)
+// tile57 renderpng <cell.000> --view <lon,lat,zoom> --size WxH -o out.png (a view)
 // The render-engine pixel path over ONE cell (no band quilting): parse +
 // portray the cell (fixed bake context for now), drive the engine through
-// PixelSurface -> RasterCanvas -> PNG. The in-repo render-to-PNG verify path.
-// P2 scope: area fills + line strokes; symbols/soundings/text land at P3/P4.
+// PixelSurface -> RasterCanvas -> PNG. A view renders ONE whole scene across
+// every covering tile (labels + declutter over the full canvas, no seams).
+// The in-repo render-to-PNG verify path.
 fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
-    if (args.len < 6) {
-        std.debug.print("usage: tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette day|dusk|night] [--rules DIR]\n", .{});
+    if (args.len < 4) {
+        std.debug.print("usage: tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--scale F]\n" ++
+            "       tile57 renderpng <cell.000> --view <lon,lat,zoom> --size WxH -o <out.png> [flags]\n", .{});
         return;
     }
     const path = args[2];
-    const z = std.fmt.parseInt(u8, args[3], 10) catch return usageErr("bad z");
-    const x = std.fmt.parseInt(u32, args[4], 10) catch return usageErr("bad x");
-    const y = std.fmt.parseInt(u32, args[5], 10) catch return usageErr("bad y");
+    const tile_mode = args[3].len > 0 and args[3][0] != '-';
+    var z: u8 = 0;
+    var x: u32 = 0;
+    var y: u32 = 0;
+    if (tile_mode) {
+        if (args.len < 6) return usageErr("tile mode needs z x y");
+        z = std.fmt.parseInt(u8, args[3], 10) catch return usageErr("bad z");
+        x = std.fmt.parseInt(u32, args[4], 10) catch return usageErr("bad x");
+        y = std.fmt.parseInt(u32, args[5], 10) catch return usageErr("bad y");
+    }
 
     var out_path: ?[]const u8 = null;
-    var size: u32 = 256;
+    var size_w: u32 = 256;
+    var size_h: u32 = 256;
     var palette: render.resolve.PaletteId = .day;
     var rules: ?[]const u8 = null;
     var dq = false;
     var size_scale: f64 = 1.0; // physical-size multiplier (S-52 mm -> true mm)
-    var f = Flags{ .args = args, .i = 5 }; // positionals end at args[5]
+    var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
+    var f = Flags{ .args = args, .i = if (tile_mode) 5 else 2 };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
             out_path = f.next() orelse return usageErr("-o needs a path");
         } else if (std.mem.eql(u8, arg, "--size")) {
             const v = f.next() orelse return usageErr("--size needs a value");
-            size = std.fmt.parseInt(u32, v, 10) catch return usageErr("bad --size");
+            if (std.mem.indexOfScalar(u8, v, 'x')) |xi| {
+                size_w = std.fmt.parseInt(u32, v[0..xi], 10) catch return usageErr("bad --size");
+                size_h = std.fmt.parseInt(u32, v[xi + 1 ..], 10) catch return usageErr("bad --size");
+            } else {
+                size_w = std.fmt.parseInt(u32, v, 10) catch return usageErr("bad --size");
+                size_h = size_w;
+            }
+        } else if (std.mem.eql(u8, arg, "--view")) {
+            const v = f.next() orelse return usageErr("--view needs lon,lat,zoom");
+            var it = std.mem.splitScalar(u8, v, ',');
+            const lon = std.fmt.parseFloat(f64, it.next() orelse "") catch return usageErr("bad --view lon");
+            const lat = std.fmt.parseFloat(f64, it.next() orelse "") catch return usageErr("bad --view lat");
+            const zm = std.fmt.parseFloat(f64, it.next() orelse "") catch return usageErr("bad --view zoom");
+            view = .{ .lon = lon, .lat = lat, .zoom = zm };
         } else if (std.mem.eql(u8, arg, "--palette")) {
             const v = f.next() orelse return usageErr("--palette needs a value");
             palette = std.meta.stringToEnum(render.resolve.PaletteId, v) orelse return usageErr("palette must be day|dusk|night");
@@ -706,6 +731,7 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
         } else return usageErr("unknown flag");
     }
     const out = out_path orelse return usageErr("-o <out.png> is required");
+    if (!tile_mode and view == null) return usageErr("--view lon,lat,zoom is required without z x y");
 
     const data = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
     var cell = try engine.s57.parseCell(a, data);
@@ -717,7 +743,15 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     // Display "other" on by default: spot soundings are S-52 category Other,
     // and this is the recreational verify path (the host enables Other too).
     const settings = render.resolve.MarinerSettings{ .display_other = true, .data_quality = dq, .size_scale = size_scale };
-    var ps = render.pixel.PixelSurface.init(a, &colors, palette, &settings, @floatFromInt(z), size, engine.tile.EXTENT);
+
+    const zoom: f64 = if (view) |v| v.zoom else @floatFromInt(z);
+    var ps = if (view != null) blk: {
+        // 512-and-up outputs read as @2x (the CSS baseline is 256/tile).
+        const dpr: f32 = if (@min(size_w, size_h) >= 512) 2 else 1;
+        const zi = @round(zoom);
+        const pt = 256.0 * std.math.pow(f64, 2.0, zoom - zi) * dpr;
+        break :blk render.pixel.PixelSurface.initView(a, &colors, palette, &settings, zoom, size_w, size_h, @floatCast(pt), engine.tile.EXTENT);
+    } else render.pixel.PixelSurface.init(a, &colors, palette, &settings, zoom, size_w, engine.tile.EXTENT);
 
     // Vector symbol store over the embedded catalogue, palette-matched CSS.
     const css_name = switch (palette) {
@@ -738,9 +772,16 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     ps.store = store.asStore();
 
     const cells = [_]engine.s57_mvt.CellRef{.{ .cell = &cell, .portrayal = streams }};
-    const bytes = try engine.s57_mvt.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
+    const bytes = if (view) |v|
+        try engine.s57_mvt.generateViewSurface(a, a, &cells, v.lon, v.lat, v.zoom, false, &ps)
+    else
+        try engine.s57_mvt.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
-    std.debug.print("wrote {s}: tile {d}/{d}/{d}, {d}x{d}px, {d} draw ops, {d} bytes\n", .{ out, z, x, y, size, size, ps.ops.items.len, bytes.len });
+    if (view) |v| {
+        std.debug.print("wrote {s}: view {d:.4},{d:.4} z{d:.2}, {d}x{d}px, {d} draw ops, {d} bytes\n", .{ out, v.lon, v.lat, v.zoom, size_w, size_h, ps.ops.items.len, bytes.len });
+    } else {
+        std.debug.print("wrote {s}: tile {d}/{d}/{d}, {d}x{d}px, {d} draw ops, {d} bytes\n", .{ out, z, x, y, size_w, size_h, ps.ops.items.len, bytes.len });
+    }
 }
 
 fn usageErr(msg: []const u8) void {

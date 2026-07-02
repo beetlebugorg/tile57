@@ -90,11 +90,12 @@ float *tg_svg_parse_paths(char *svg, int *out_n) {
     NSVGimage *img = nsvgParse(svg, "px", 96.0f);
     if (!img) return NULL;
 
-    /* size pass */
+    /* size pass: 12 floats per shape header (marker, fill flag + rgba,
+     * stroke flag + rgba + width), 3 + npts*2 per path */
     size_t n = 1; /* end marker */
     for (NSVGshape *s = img->shapes; s; s = s->next) {
         if (!(s->flags & NSVG_FLAGS_VISIBLE)) continue;
-        n += 11;
+        n += 12;
         for (NSVGpath *p = s->paths; p; p = p->next) n += 3 + (size_t)p->npts * 2;
     }
     float *buf = (float *)malloc(n * sizeof(float));
