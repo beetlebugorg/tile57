@@ -363,7 +363,22 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("colorprofile_registry", colorprofile_registry);
     lib_mod.addImport("catalog", catalog_embed); // chart.renderView symbol/pattern store
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
-    b.installArtifact(lib);
+    if (target.result.os.tag == .macos) {
+        // Apple's ld64 rejects 64-bit mach-o archive members whose offsets aren't
+        // 8-byte aligned, and Zig's archiver doesn't align them — so the raw
+        // `zig build` archive fails to link into the CGO host ("... not 8-byte
+        // aligned"). Re-pack it here, as part of the build, so a plain `zig build`
+        // alone emits an ld64-compatible libtile57.a (no wrapper needed):
+        // scripts/macho-align.sh partial-links every member into one relocatable
+        // object and re-wraps it with Apple's libtool. See the script for why.
+        const repack = b.addSystemCommand(&.{b.pathFromRoot("scripts/macho-align.sh")});
+        repack.setEnvironmentVariable("ZIG", b.graph.zig_exe); // `zig ar` need not be on PATH
+        repack.addFileArg(lib.getEmittedBin());
+        const aligned = repack.addOutputFileArg("libtile57.a");
+        b.getInstallStep().dependOn(&b.addInstallLibFile(aligned, "libtile57.a").step);
+    } else {
+        b.installArtifact(lib);
+    }
 
     // The offline baker / inspector CLI. It runs the embedded-Lua S-101 portrayal
     // so baked tiles get full S-101 styling (not the classify() fallback), so —
