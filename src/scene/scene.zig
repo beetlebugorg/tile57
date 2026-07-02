@@ -333,6 +333,12 @@ pub const CellOpts = struct {
     ///     drawn on top, wins where it has data); no labels lost over a coverage gap.
     suppress_lines: bool = false,
     suppress_points: bool = false,
+    /// Band-handoff carry-down (scamin-aware quilting): this coarser cell rides in a
+    /// tile whose display window opens coarser than the covering finer cell's
+    /// compilation scale, so instead of being suppressed its features are tagged with
+    /// the handoff denominator — the `smax` tile property the style gates on (hide
+    /// once the display is finer than 1:smax). 0 = not carried (no tag emitted).
+    smax: i64 = 0,
     /// Emit the per-feature pick-report attributes (the `s57` blob + `cell` name) for
     /// the S-52 §10.8 cursor pick + dev inspector. Defaults ON (host wants a working
     /// pick report in the local-first deployment); a lean bake can turn it off via the
@@ -407,7 +413,7 @@ pub const TileSurface = struct {
         const s = sp(ctx);
         s.cur = .{
             .prio = meta.draw_prio, .cat = meta.cat, .vg = meta.vg,
-            .scamin = meta.scamin, .class = meta.class, .s57 = meta.s57_json,
+            .scamin = meta.scamin, .smax = meta.smax, .class = meta.class, .s57 = meta.s57_json,
             .cell = meta.cell_name, .band = meta.band,
             .date_start = meta.date_start, .date_end = meta.date_end,
             .bnd = meta.bnd, .pts = meta.pts,
@@ -624,6 +630,9 @@ const Meta = struct {
     cat: i64 = 1, // display-category rank (0 base, 1 standard, 2 other)
     vg: i64 = 0, // raw S-101 viewing-group number of the feature's primary draw (0 = none)
     scamin: ?i64 = null,
+    // Band-handoff carry-down tag: the handoff denominator a carried coarser-band
+    // feature hides beyond (the style's smax gate). 0 = not carried (omitted).
+    smax: i64 = 0,
     class: []const u8 = "", // S-57 object-class acronym (M_QUAL, LIGHTS, …)
     // Cursor-pick report (S-52 §10.8) + dev feature inspector: the feature's full
     // S-57 attribute set as compact acronym->value JSON. "" = omitted (no reportable
@@ -819,6 +828,10 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     if (m.s57.len > 0) try props.append(a, .{ .key = "s57", .value = .{ .string = m.s57 } });
     if (m.cell.len > 0) try props.append(a, .{ .key = "cell", .value = .{ .string = m.cell } });
     if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
+    // Band-handoff carry-down: only a carried coarser-band copy is tagged (see
+    // CellOpts.smax) — untagged features keep their tile footprint unchanged and
+    // pass the style's smax gate via its coalesce-0 fallback.
+    if (m.smax > 0) try props.append(a, .{ .key = "smax", .value = .{ .int = m.smax } });
     // bnd/pts are emitted only for the style-variant passes (0/1); the common case
     // (2) is left off so the client coalesces to 2 (always shown) — keeping every
     // unvarying feature's tile footprint unchanged.
@@ -1206,6 +1219,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
         .draw_prio = p.draw_prio, .cat = p.cat, .vg = p.vg, .scamin = scamin,
+        .smax = opts.smax,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = s57_json, .cell_name = cell_name, .band = opts.band,
         .date_start = p.date_start, .date_end = p.date_end, .bnd = bnd, .pts = pts,
@@ -1861,6 +1875,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const fmeta = rs.FeatureMeta{
         .draw_prio = 6,
         .scamin = featureScamin(f),
+        .smax = opts.smax,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -1916,6 +1931,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const fmeta = rs.FeatureMeta{
         .draw_prio = 12,
         .scamin = featureScamin(f),
+        .smax = opts.smax,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -1964,6 +1980,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
     const fmeta = rs.FeatureMeta{
         .draw_prio = 6,
         .scamin = featureScamin(f),
+        .smax = opts.smax,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -2009,6 +2026,9 @@ pub const CellRef = struct {
     suppress_patterns: bool = false,
     suppress_lines: bool = false,
     suppress_points: bool = false,
+    /// Band-handoff carry-down tag (see CellOpts.smax): the handoff denominator
+    /// stamped on every feature this cell emits into the tile; 0 = not carried.
+    smax: i64 = 0,
 };
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
@@ -2039,6 +2059,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .suppress_patterns = cr.suppress_patterns,
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
+            .smax = cr.smax,
             .pick_attrs = pick_attrs,
         };
         try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
@@ -2062,6 +2083,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .suppress_patterns = cr.suppress_patterns,
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
+            .smax = cr.smax,
             .pick_attrs = pick_attrs,
         };
         try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
@@ -2181,6 +2203,7 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
         .draw_prio = prio,
         .cat = cat,
         .scamin = featureScamin(f),
+        .smax = opts.smax,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -2236,7 +2259,7 @@ fn appendCellFeatures(
                 .draw_prio = 18, .cat = 2, .class = "SOUNDG",
                 .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
                 .cell_name = if (opts.pick_attrs) cell.name else "",
-                .scamin = featureScamin(f), .band = opts.band,
+                .scamin = featureScamin(f), .smax = opts.smax, .band = opts.band,
             };
             try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, surf);
             continue;
@@ -2299,6 +2322,9 @@ fn appendCellFeatures(
             try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
             try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
             try aprops.append(a, .{ .key = "band", .value = .{ .int = opts.band } });
+            // Band-handoff carry-down tag — the classify() schema predates appendMeta
+            // but a carried copy still must hide past its handoff (style smax gate).
+            if (opts.smax > 0) try aprops.append(a, .{ .key = "smax", .value = .{ .int = opts.smax } });
             try appendDepthVals(a, &aprops, f);
             try ms.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
             continue;
@@ -2314,10 +2340,11 @@ fn appendCellFeatures(
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
             for (sub, 0..) |s, i| parts[i] = s;
-            const lprops = try a.alloc(mvt.Prop, 3);
+            const lprops = try a.alloc(mvt.Prop, if (opts.smax > 0) 4 else 3);
             lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
             lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
             lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
+            if (opts.smax > 0) lprops[3] = .{ .key = "smax", .value = .{ .int = opts.smax } };
             try ms.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
         }
     }
@@ -2876,6 +2903,7 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
         .cat = propInt(props, "cat", 1),
         .vg = propInt(props, "vg", 0),
         .scamin = if (propOf(props, "scamin")) |_| propInt(props, "scamin", 0) else null,
+        .smax = propInt(props, "smax", 0),
         .class = propStr(props, "class"),
         .band = @intCast(std.math.clamp(propInt(props, "band", 0), 0, 255)),
         .bnd = propInt(props, "bnd", 2),
