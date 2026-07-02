@@ -11,7 +11,7 @@ const s57 = @import("s57");
 const tile = @import("tile");
 const mvt = @import("mvt");
 const mlt = @import("mlt");
-const rs = @import("render_surface");
+const rs = @import("render").surface;
 
 /// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile (optional).
 pub const TileFormat = enum { mvt, mlt };
@@ -2086,6 +2086,30 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
     return surf.endScene(out);
 }
 
+/// Generate a scene for tile (z,x,y) through an arbitrary render Surface —
+/// the pixel-path twin of generateTileMulti (which is this plus the MVT/MLT
+/// surface). The classify() legacy mode (features with NO portrayal) is
+/// tile-schema-only and is skipped here: a pixel render always portrays.
+/// Returns whatever the surface's endScene produces (e.g. PNG bytes).
+pub fn generateTileSurface(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool, surf: rs.Surface) ![]u8 {
+    const a = scratch;
+    const tb = tile.tileBoundsLonLat(z, x, y);
+    const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
+    try surf.beginScene(z);
+    for (cells) |cr| {
+        const opts = CellOpts{
+            .band = cr.band,
+            .suppress_fills = cr.suppress_fills,
+            .suppress_patterns = cr.suppress_patterns,
+            .suppress_lines = cr.suppress_lines,
+            .suppress_points = cr.suppress_points,
+            .pick_attrs = pick_attrs,
+        };
+        try appendCellFeaturesSurf(a, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+    }
+    return surf.endScene(out);
+}
+
 /// Emit one centred point symbol at the feature's anchor — its node (point), line
 /// middle vertex, or area representative point (see featureAnchor) — routed to the
 /// scamin bucket and carrying the feature's pick meta (class/cell/s57/scamin/band).
@@ -2121,11 +2145,12 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
 /// (SWPARE / NEWOBJ / M_NSYS / INFORM01 / QUESMRK1 / SOUNDG) through their emit*
 /// helpers. The only direct-list writer left is the legacy classify() mode for
 /// features with NO portrayal at all — a tile-only schema that predates the
-/// engine (that's why mvt_surf rides along beside surf).
+/// engine (that's why mvt_surf rides along beside surf — null for non-tile
+/// surfaces, which always portray and never see classify() features).
 fn appendCellFeaturesSurf(
     a: Allocator,
     surf: rs.Surface,
-    mvt_surf: *MvtSurface,
+    mvt_surf: ?*MvtSurface,
     opts: CellOpts,
     cell: *s57.Cell,
     portrayal: ?[]const ?[]const u8,
@@ -2198,6 +2223,9 @@ fn appendCellFeaturesSurf(
             continue;
         }
         if (errored) continue;
+        // classify() legacy mode (no portrayal at all): tile-schema-only —
+        // non-tile surfaces skip it (they always portray).
+        const ms = mvt_surf orelse continue;
         const cls = classify(f.objl);
         if (cls.kind == .skip) continue;
         const geo_parts = featureParts(a, cell.*, geo, fi, f) catch continue;
@@ -2221,7 +2249,7 @@ fn appendCellFeaturesSurf(
             try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
             try aprops.append(a, .{ .key = "band", .value = .{ .int = opts.band } });
             try appendDepthVals(a, &aprops, f);
-            try mvt_surf.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
+            try ms.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
             continue;
         }
 
@@ -2239,7 +2267,7 @@ fn appendCellFeaturesSurf(
             lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
             lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
             lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
-            try mvt_surf.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
+            try ms.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
         }
     }
 }

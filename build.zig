@@ -199,10 +199,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mvt", .module = mvt_mod }},
     });
 
-    // Render engine Surface vtable contract (src/render/surface.zig).
-    // Pure; consumed by s57_mvt (mvt/mlt surface) and the noop surface.
-    const render_surface_mod = b.addModule("render_surface", .{
-        .root_source_file = b.path("src/render/surface.zig"),
+    // Render engine (src/render/): the semantic Surface contract + noop
+    // surface, the resolver (colors at palette, display gates), and the pixel
+    // machinery (Canvas primitive seam, RasterCanvas, PNG encoder). One pure
+    // module; imports mvt (TilePoint alias) + chartstyle (settings model) only
+    // — never s57/s100/portray. NOTE: declared before chartstyle_mod exists,
+    // so the chartstyle edge is attached right after chartstyle_mod below.
+    const render_mod = b.addModule("render", .{
+        .root_source_file = b.path("src/render/render.zig"),
         .imports = &.{.{ .name = "mvt", .module = mvt_mod }},
     });
 
@@ -216,7 +220,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "mvt", .module = mvt_mod },
             .{ .name = "mlt", .module = mlt_mod },
             .{ .name = "tile", .module = tile_mod },
-            .{ .name = "render_surface", .module = render_surface_mod },
+            .{ .name = "render", .module = render_mod },
         },
     });
     const bake_enc_mod = b.addModule("bake_enc", .{
@@ -260,23 +264,13 @@ pub fn build(b: *std.Build) void {
     const chartstyle_mod = b.addModule("chartstyle", .{
         .root_source_file = b.path("src/chartstyle/chartstyle.zig"),
     });
+    // The render module's settings-model edge (declared above chartstyle_mod).
+    render_mod.addImport("chartstyle", chartstyle_mod);
 
     const assets_mod = b.addModule("assets", .{
         .root_source_file = b.path("src/assets/assets.zig"),
         .imports = &.{.{ .name = "chartstyle", .module = chartstyle_mod }},
     });
-
-    // Render-engine resolver (src/render/resolve.zig): color token -> RGB at a
-    // palette + the mariner display gates, for pixel surfaces. Pure; mirrors the
-    // chartstyle expression semantics (imports it for the settings model).
-    const render_resolve_mod = b.addModule("render_resolve", .{
-        .root_source_file = b.path("src/render/resolve.zig"),
-        .imports = &.{
-            .{ .name = "render_surface", .module = render_surface_mod },
-            .{ .name = "chartstyle", .module = chartstyle_mod },
-        },
-    });
-    _ = render_resolve_mod; // consumed by the png/pdf surfaces (P2+)
 
     // S-101 sprite/pattern atlas builder (nanosvg + stb PNG). libc (the C libs),
     // target-less so it inherits the consumer's target (only the bake tool, which
@@ -546,7 +540,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "mvt", .module = mvt_mod },
         .{ .name = "mlt", .module = mlt_mod },
         .{ .name = "tile", .module = tile_mod },
-        .{ .name = "render_surface", .module = render_surface_mod },
+        .{ .name = "render", .module = render_mod },
     });
     _ = addPkgTest(b, test_step, "src/bake_enc/bake_enc.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
@@ -558,15 +552,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chartstyle", .module = chartstyle_mod },
     });
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
-    // Noop surface: compile-checks the Surface contract + a lifecycle smoke
-    // test, so the contract can't bit-rot as it evolves (it has no other
-    // consumer yet).
-    _ = addPkgTest(b, test_step, "src/surfaces/noop.zig", target, optimize, &.{
-        .{ .name = "render_surface", .module = render_surface_mod },
-    });
-    // Render resolver: colors at palette + display gates for pixel surfaces.
-    _ = addPkgTest(b, test_step, "src/render/resolve.zig", target, optimize, &.{
-        .{ .name = "render_surface", .module = render_surface_mod },
+    // The render module: Surface contract + noop lifecycle smoke test (pins
+    // the contract — it has no other consumer yet), resolver gates/colors,
+    // Canvas + RasterCanvas + PNG encoder.
+    _ = addPkgTest(b, test_step, "src/render/render.zig", target, optimize, &.{
+        .{ .name = "mvt", .module = mvt_mod },
         .{ .name = "chartstyle", .module = chartstyle_mod },
     });
     // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
@@ -577,6 +567,16 @@ pub fn build(b: *std.Build) void {
         .{ .name = "portray", .module = portray_mod },
         .{ .name = "s57", .module = s57_mod },
     });
+    // Golden-image test for the pixel path (Gate 2): real Lua rules -> engine ->
+    // PixelSurface -> PNG, sha-asserted. libc for the same reason as above.
+    const pixel_golden = addPkgTest(b, test_step, "src/render/pixel_golden_test.zig", target, optimize, &.{
+        .{ .name = "portray", .module = portray_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s57_mvt", .module = s57_mvt_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "tile", .module = tile_mod },
+    });
+    pixel_golden.addImport("colorprofile_registry", colorprofile_registry);
     // bindings/ shared settings parser (used by the wasm engine + parity oracle).
     _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{
         .{ .name = "chartstyle", .module = chartstyle_mod },
