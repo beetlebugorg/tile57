@@ -46,6 +46,40 @@ pub fn encodePng(out: Allocator, png_bytes: []const u8) ![]u8 {
 /// frames don't accumulate in the terminal's image store.
 pub const delete_all = "\x1b_Ga=d,d=A,q=2\x1b\\";
 
+/// Transmit PNG bytes into the terminal's image store under `id` WITHOUT
+/// displaying (a=t) — the TUI's pan cache: transmit a big region once, then
+/// pan with cheap `place` calls against it.
+pub fn transmitPng(out: Allocator, png_bytes: []const u8, id: u32) ![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const b64 = try out.alloc(u8, enc.calcSize(png_bytes.len));
+    defer out.free(b64);
+    _ = enc.encode(b64, png_bytes);
+    var buf = std.ArrayList(u8).empty;
+    var off: usize = 0;
+    var first = true;
+    while (off < b64.len) {
+        const end = @min(off + CHUNK, b64.len);
+        const more: u8 = if (end < b64.len) '1' else '0';
+        if (first) {
+            try buf.print(out, "\x1b_Ga=t,f=100,i={d},q=2,m={c};", .{ id, more });
+            first = false;
+        } else {
+            try buf.print(out, "\x1b_Gm={c};", .{more});
+        }
+        try buf.appendSlice(out, b64[off..end]);
+        try buf.appendSlice(out, "\x1b\\");
+        off = end;
+    }
+    return buf.toOwnedSlice(out);
+}
+
+/// Display the (x, y, w, h) SOURCE rectangle of stored image `id` at the
+/// cursor, without moving the cursor (C=1). ~40 bytes — this is what makes
+/// panning inside a cached region instant.
+pub fn place(out: Allocator, id: u32, x: u32, y: u32, w: u32, h: u32) ![]u8 {
+    return std.fmt.allocPrint(out, "\x1b_Ga=p,i={d},x={d},y={d},w={d},h={d},C=1,q=2\x1b\\", .{ id, x, y, w, h });
+}
+
 test "kitty encode: chunk structure and payload round-trip" {
     const a = std.testing.allocator;
     // A payload long enough to need 2 chunks once base64-encoded.

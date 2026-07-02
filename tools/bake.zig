@@ -1085,6 +1085,12 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
     var lat = lat0;
     var zoom = zoom0;
     var last: [2]u32 = .{ 0, 0 };
+    // kitty pan cache: per zoom step, a 3x-viewport region image lives in the
+    // terminal's store; panning inside it is a ~40-byte placement escape.
+    // Slots are keyed by round(zoom*2) and evicted round-robin.
+    const Region = struct { zkey: i32 = std.math.minInt(i32), id: u32 = 0, tl_x: f64 = 0, tl_y: f64 = 0, w: u32 = 0, h: u32 = 0 };
+    var regions: [3]Region = .{ .{}, .{}, .{} };
+    var evict: usize = 0;
     while (true) {
         const ts_raw = terminalSize(io);
         const ts = ts_raw orelse .{ 100, 37, 0, 0 };
@@ -1101,13 +1107,59 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
         const view_w: u32 = if (kitty) cols * cp[0] else cols;
         const view_h: u32 = if (kitty) rows * cp[1] else rows * 2; // ascii cell = 1x2 px
         if (kitty) {
-            const png_bytes = c.renderView(lon, lat, zoom, view_w, view_h, palette, m, .png) catch break;
-            const seq = render.kitty.encodePng(a, png_bytes) catch break;
-            chart.freeBytes(png_bytes);
+            // World-pixel geometry at this zoom (256*2^zoom px globe).
+            const world_px = 256.0 * std.math.pow(f64, 2.0, zoom);
+            const vc = worldPxOf(lon, lat, world_px);
+            const zkey: i32 = @intFromFloat(@round(zoom * 2.0));
+            var reg: ?*@TypeOf(regions[0]) = null;
+            for (&regions) |*r| if (r.zkey == zkey) {
+                reg = r;
+            };
+            // A cached region only survives if the whole viewport still fits.
+            var off_x: f64 = 0;
+            var off_y: f64 = 0;
+            if (reg) |r| {
+                if (r.w < view_w or r.h < view_h) {
+                    reg = null; // terminal grew past the cached region
+                } else {
+                    off_x = vc[0] - @as(f64, @floatFromInt(view_w)) / 2.0 - r.tl_x;
+                    off_y = vc[1] - @as(f64, @floatFromInt(view_h)) / 2.0 - r.tl_y;
+                    if (off_x < 0 or off_y < 0 or
+                        off_x > @as(f64, @floatFromInt(r.w - view_w)) or
+                        off_y > @as(f64, @floatFromInt(r.h - view_h))) reg = null;
+                }
+            }
+            if (reg == null) {
+                // (Re)render a 3x-viewport region centred here and transmit it
+                // into an evicted slot. The render is the slow step (~a few
+                // seconds); everything until the region's edge is then free.
+                // Loader note on the status line — the region render blocks
+                // for a few seconds and this is the only sign of life.
+                const note = std.fmt.allocPrint(a, "\x1b[{d};1H\x1b[7m rendering\xe2\x80\xa6 \x1b[0m\x1b[K", .{rows + 1}) catch break;
+                stdout.writeStreamingAll(io, note) catch {};
+                a.free(note);
+                const r = &regions[evict];
+                evict = (evict + 1) % regions.len;
+                r.zkey = zkey;
+                if (r.id == 0) r.id = @intCast(100 + evict);
+                r.w = view_w * 3;
+                r.h = view_h * 3;
+                r.tl_x = vc[0] - @as(f64, @floatFromInt(r.w)) / 2.0;
+                r.tl_y = vc[1] - @as(f64, @floatFromInt(r.h)) / 2.0;
+                const png_bytes = c.renderView(lon, lat, zoom, r.w, r.h, palette, m, .png) catch break;
+                const seq = render.kitty.transmitPng(a, png_bytes, r.id) catch break;
+                chart.freeBytes(png_bytes);
+                stdout.writeStreamingAll(io, seq) catch {};
+                a.free(seq);
+                reg = r;
+                off_x = vc[0] - @as(f64, @floatFromInt(view_w)) / 2.0 - r.tl_x;
+                off_y = vc[1] - @as(f64, @floatFromInt(view_h)) / 2.0 - r.tl_y;
+            }
+            const pl = render.kitty.place(a, reg.?.id, @intFromFloat(@max(0, off_x)), @intFromFloat(@max(0, off_y)), view_w, view_h) catch break;
             stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
             stdout.writeStreamingAll(io, "\x1b[H") catch {};
-            stdout.writeStreamingAll(io, seq) catch {};
-            a.free(seq);
+            stdout.writeStreamingAll(io, pl) catch {};
+            a.free(pl);
         } else {
             const text = c.renderAscii(lon, lat, zoom, cols, rows, palette, m, ansi) catch break;
             stdout.writeStreamingAll(io, "\x1b[H") catch {};
@@ -1151,6 +1203,16 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
             i += 1;
         }
     }
+}
+
+// A lon/lat's Web-Mercator world-pixel position on a `world`-pixel globe.
+fn worldPxOf(lon: f64, lat: f64, world: f64) [2]f64 {
+    const rad = lat * std.math.pi / 180.0;
+    const y = std.math.log(f64, std.math.e, std.math.tan(std.math.pi / 4.0 + rad / 2.0));
+    return .{
+        (lon + 180.0) / 360.0 * world,
+        (1.0 - y / std.math.pi) / 2.0 * world,
+    };
 }
 
 // Shift a latitude by `px` screen pixels (positive = north) on a `world`-pixel
