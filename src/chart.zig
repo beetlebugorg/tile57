@@ -1510,6 +1510,16 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
     const ladders = gpa.alloc([]const u32, idxs.items.len) catch return false;
     defer gpa.free(ladders);
     for (idxs.items, 0..) |i, j| ladders[j] = ls.cells[i].scamins;
+    // Scale-boundary overscale refinement (specs/overscale.md): the finest
+    // compilation scale CONTRIBUTING to this tile — over the quilting's own
+    // participant list, mirroring bake_enc TileGenCtx.gen. A cell hatches its
+    // OVERSC01 coverage only when a strictly-finer cell also rides this tile
+    // (gf_tile < its cscl); whole-view overscale emits no hatch (HUD readout).
+    var gf_tile: i32 = std.math.maxInt(i32);
+    for (idxs.items) |i| {
+        const cs = ls.cells[i].cscl;
+        if (cs > 0 and cs < gf_tile) gf_tile = cs;
+    }
 
     for (idxs.items) |i| {
         const lc = &ls.cells[i];
@@ -1529,6 +1539,7 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 // Overscale tag: compilation scale quantized UP the tile's scamin
                 // ladder (same crossing alignment as the smax handoff).
                 .oscl = if (lc.cscl > 0) bake_enc.quantizeHandoff(ladders, lc.cscl) else 0,
+                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl,
                 // SCAMIN standalone: the overlay below owns prim==1 SCAMIN features.
                 .skip_scamin_points = true,
             }) catch {};
