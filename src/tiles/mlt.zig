@@ -596,3 +596,368 @@ test "encode line + polygon round-trips (verified via reference decoder)" {
     try std.testing.expect(bytes.len > 12);
     try std.testing.expectEqual(@as(u8, 1), bytes[1]); // tag
 }
+
+// ---- decoder ---------------------------------------------------------------
+//
+// The exact inverse of the encoder above, yielding the SAME model mvt.decode
+// yields (mvt.DecodedLayer) so the two formats can be compared semantically —
+// the MLT validation gate (byte-level checks can't see past the encoding) and
+// the substrate for bundle-sourced rendering. Only this encoder's subset is
+// understood; foreign MLT tiles are out of scope.
+
+const DecReader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn varint(r: *DecReader) u64 {
+        var shift: u6 = 0;
+        var v: u64 = 0;
+        while (r.pos < r.buf.len) {
+            const b = r.buf[r.pos];
+            r.pos += 1;
+            v |= @as(u64, b & 0x7F) << shift;
+            if (b & 0x80 == 0) break;
+            shift += 7;
+        }
+        return v;
+    }
+    fn byte(r: *DecReader) u8 {
+        const b = r.buf[r.pos];
+        r.pos += 1;
+        return b;
+    }
+    fn bytes(r: *DecReader, n: usize) []const u8 {
+        const s = r.buf[r.pos .. r.pos + n];
+        r.pos += n;
+        return s;
+    }
+};
+
+fn unzigzag32(v: u64) i32 {
+    const u: u32 = @truncate(v);
+    return @bitCast((u >> 1) ^ (0 -% (u & 1)));
+}
+
+const StreamMeta = struct { phys: u8, sub: u8, num_values: u64, byte_length: u64 };
+
+fn readStreamMeta(r: *DecReader) StreamMeta {
+    const b0 = r.byte();
+    _ = r.byte(); // llt/plt byte — the subset's streams are self-describing by (phys, sub)
+    const nv = r.varint();
+    const bl = r.varint();
+    return .{ .phys = b0 >> 4, .sub = b0 & 0x0F, .num_values = nv, .byte_length = bl };
+}
+
+// ORC byte-RLE (as writePresentStream emits, plus repeat runs for safety):
+// header h >= 128 -> literal run of 256-h bytes; h < 128 -> h+3 repeats of the
+// next byte. Unpacks LSB-first presence bits.
+fn readPresent(a: std.mem.Allocator, r: *DecReader, meta: StreamMeta) ![]bool {
+    const out = try a.alloc(bool, meta.num_values);
+    const end = r.pos + meta.byte_length;
+    var bit: usize = 0;
+    while (r.pos < end and bit < out.len) {
+        const h = r.byte();
+        if (h >= 128) {
+            const n = @as(usize, 256) - h;
+            for (0..n) |_| {
+                const b = r.byte();
+                var i: u4 = 0;
+                while (i < 8 and bit < out.len) : (i += 1) {
+                    out[bit] = (b >> @intCast(i)) & 1 != 0;
+                    bit += 1;
+                }
+            }
+        } else {
+            const n = @as(usize, h) + 3;
+            const b = r.byte();
+            for (0..n) |_| {
+                var i: u4 = 0;
+                while (i < 8 and bit < out.len) : (i += 1) {
+                    out[bit] = (b >> @intCast(i)) & 1 != 0;
+                    bit += 1;
+                }
+            }
+        }
+    }
+    r.pos = end;
+    return out;
+}
+
+const DecCol = struct { kind: PropKind, nullable: bool, key: []const u8 };
+
+/// Decode MLT bytes (this encoder's subset) into the mvt.DecodedLayer model.
+/// All returned memory is allocated from `a`.
+pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
+    var layers = std.ArrayList(mvt.DecodedLayer).empty;
+    var top = DecReader{ .buf = data };
+    while (top.pos < data.len) {
+        const block_len = top.varint();
+        const block = top.bytes(block_len);
+        var r = DecReader{ .buf = block };
+        if (r.varint() != 1) return error.BadTile; // tag
+
+        const name = try a.dupe(u8, r.bytes(r.varint()));
+        const extent: u32 = @intCast(r.varint());
+        const ncols = r.varint();
+        if (ncols == 0 or r.byte() != TYPECODE_GEOMETRY) return error.BadTile;
+        var cols = std.ArrayList(DecCol).empty;
+        for (1..ncols) |_| {
+            const tc = r.byte();
+            if (tc < 10) return error.BadTile;
+            const ord: u8 = (tc - 10) / 2;
+            const kind: PropKind = switch (ord) {
+                ST_STRING => .string,
+                ST_INT32 => .int32,
+                ST_UINT32 => .uint32,
+                ST_DOUBLE => .double,
+                ST_FLOAT => .float,
+                else => return error.BadTile,
+            };
+            const key = try a.dupe(u8, r.bytes(r.varint()));
+            try cols.append(a, .{ .kind = kind, .nullable = (tc - 10) % 2 == 1, .key = key });
+        }
+
+        // ---- geometry column ----------------------------------------------
+        const n_gstreams = r.varint();
+        var gtypes: []u32 = &.{};
+        var geoms: []u64 = &.{};
+        var parts_lens: []u64 = &.{};
+        var rings_lens: []u64 = &.{};
+        var verts: []i32 = &.{};
+        for (0..n_gstreams) |si| {
+            const m = readStreamMeta(&r);
+            const end = r.pos + m.byte_length;
+            if (si == 0) { // GeometryType
+                gtypes = try a.alloc(u32, m.num_values);
+                for (gtypes) |*g| g.* = @intCast(r.varint());
+            } else if (m.phys == PHYS_LENGTH and m.sub == LEN_GEOMETRIES) {
+                geoms = try a.alloc(u64, m.num_values);
+                for (geoms) |*v| v.* = r.varint();
+            } else if (m.phys == PHYS_LENGTH and m.sub == LEN_PARTS) {
+                parts_lens = try a.alloc(u64, m.num_values);
+                for (parts_lens) |*v| v.* = r.varint();
+            } else if (m.phys == PHYS_LENGTH and m.sub == LEN_RINGS) {
+                rings_lens = try a.alloc(u64, m.num_values);
+                for (rings_lens) |*v| v.* = r.varint();
+            } else { // VertexBuffer (componentwise delta + zigzag)
+                verts = try a.alloc(i32, m.num_values);
+                var px: i32 = 0;
+                var py: i32 = 0;
+                var k: usize = 0;
+                while (k + 1 < m.num_values + 1 and k < m.num_values) : (k += 2) {
+                    px +%= unzigzag32(r.varint());
+                    py +%= unzigzag32(r.varint());
+                    verts[k] = px;
+                    if (k + 1 < m.num_values) verts[k + 1] = py;
+                }
+            }
+            r.pos = end;
+        }
+
+        // ---- rebuild features ----------------------------------------------
+        const feats = try a.alloc(mvt.DecodedFeature, gtypes.len);
+        var vi: usize = 0; // vertex cursor (points)
+        var gi: usize = 0; // GEOMETRIES cursor
+        var pi: usize = 0; // PARTS cursor
+        var ri: usize = 0; // RINGS cursor
+        for (gtypes, 0..) |g, fi| {
+            switch (g) {
+                G_POINT, G_MULTIPOINT => {
+                    const n: u64 = if (g == G_POINT) 1 else blk: {
+                        const v = geoms[gi];
+                        gi += 1;
+                        break :blk v;
+                    };
+                    const parts = try a.alloc([]mvt.Point, 1);
+                    const pts = try a.alloc(mvt.Point, n);
+                    for (pts) |*p| {
+                        p.* = .{ .x = verts[vi], .y = verts[vi + 1] };
+                        vi += 2;
+                    }
+                    parts[0] = pts;
+                    feats[fi] = .{ .geom_type = .point, .parts = parts, .properties = &.{} };
+                },
+                G_MULTILINESTRING, G_LINESTRING => {
+                    const nlines: u64 = if (g == G_MULTILINESTRING) blk: {
+                        const v = geoms[gi];
+                        gi += 1;
+                        break :blk v;
+                    } else 1;
+                    const parts = try a.alloc([]mvt.Point, nlines);
+                    for (parts) |*part| {
+                        const len = parts_lens[pi];
+                        pi += 1;
+                        const pts = try a.alloc(mvt.Point, len);
+                        for (pts) |*p| {
+                            p.* = .{ .x = verts[vi], .y = verts[vi + 1] };
+                            vi += 2;
+                        }
+                        part.* = pts;
+                    }
+                    feats[fi] = .{ .geom_type = .linestring, .parts = parts, .properties = &.{} };
+                },
+                G_POLYGON => {
+                    const nrings = parts_lens[pi];
+                    pi += 1;
+                    const parts = try a.alloc([]mvt.Point, nrings);
+                    for (parts) |*ring| {
+                        const len = rings_lens[ri];
+                        ri += 1;
+                        const pts = try a.alloc(mvt.Point, len);
+                        for (pts) |*p| {
+                            p.* = .{ .x = verts[vi], .y = verts[vi + 1] };
+                            vi += 2;
+                        }
+                        ring.* = pts;
+                    }
+                    feats[fi] = .{ .geom_type = .polygon, .parts = parts, .properties = &.{} };
+                },
+                else => return error.BadTile,
+            }
+        }
+
+        // ---- property columns ----------------------------------------------
+        // Collected per feature, in column order.
+        const propbuf = try a.alloc(std.ArrayList(mvt.Prop), feats.len);
+        for (propbuf) |*pb| pb.* = .empty;
+        for (cols.items) |col| {
+            var present: ?[]bool = null;
+            if (col.kind == .string) {
+                var nstreams = r.varint();
+                if (col.nullable) {
+                    const m = readStreamMeta(&r);
+                    present = try readPresent(a, &r, m);
+                    nstreams -= 1;
+                }
+                if (nstreams == 3) { // dictionary
+                    const lm = readStreamMeta(&r);
+                    const dlens = try a.alloc(u64, lm.num_values);
+                    for (dlens) |*v| v.* = r.varint();
+                    const dm = readStreamMeta(&r);
+                    _ = dm;
+                    const dict = try a.alloc([]const u8, dlens.len);
+                    for (dlens, 0..) |dl, i| dict[i] = try a.dupe(u8, r.bytes(dl));
+                    const om = readStreamMeta(&r);
+                    var fi: usize = 0;
+                    for (0..om.num_values) |_| {
+                        const ix = r.varint();
+                        while (present != null and !present.?[fi]) fi += 1;
+                        try propbuf[fi].append(a, .{ .key = col.key, .value = .{ .string = dict[ix] } });
+                        fi += 1;
+                    }
+                } else { // plain: lengths + data
+                    const lm = readStreamMeta(&r);
+                    const lens = try a.alloc(u64, lm.num_values);
+                    for (lens) |*v| v.* = r.varint();
+                    _ = readStreamMeta(&r);
+                    var fi: usize = 0;
+                    for (lens) |sl| {
+                        const s = try a.dupe(u8, r.bytes(sl));
+                        while (present != null and !present.?[fi]) fi += 1;
+                        try propbuf[fi].append(a, .{ .key = col.key, .value = .{ .string = s } });
+                        fi += 1;
+                    }
+                }
+            } else {
+                if (col.nullable) {
+                    const m = readStreamMeta(&r);
+                    present = try readPresent(a, &r, m);
+                }
+                const m = readStreamMeta(&r);
+                var fi: usize = 0;
+                for (0..m.num_values) |_| {
+                    while (present != null and !present.?[fi]) fi += 1;
+                    const v: mvt.Value = switch (col.kind) {
+                        .int32 => .{ .int = unzigzag32(r.varint()) },
+                        .uint32 => .{ .uint = @intCast(r.varint()) },
+                        .double => .{ .double = @bitCast(std.mem.readInt(u64, r.bytes(8)[0..8], .little)) },
+                        .float => .{ .float = @bitCast(std.mem.readInt(u32, r.bytes(4)[0..4], .little)) },
+                        .string => unreachable,
+                    };
+                    try propbuf[fi].append(a, .{ .key = col.key, .value = v });
+                    fi += 1;
+                }
+            }
+        }
+        for (feats, 0..) |*f, i| f.properties = propbuf[i].items;
+
+        try layers.append(a, .{ .name = name, .extent = extent, .features = feats });
+    }
+    return layers.toOwnedSlice(a);
+}
+
+test "decode round-trips the encoder's model (geometry + props, dict + plain + numeric)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ring = [_]mvt.Point{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 80 }, .{ .x = 0, .y = 0 } };
+    const hole = [_]mvt.Point{ .{ .x = 10, .y = 5 }, .{ .x = 20, .y = 5 }, .{ .x = 15, .y = 15 }, .{ .x = 10, .y = 5 } };
+    const poly_parts = [_][]const mvt.Point{ &ring, &hole };
+    const l1 = [_]mvt.Point{ .{ .x = -5, .y = 3 }, .{ .x = 50, .y = 60 } };
+    const l2 = [_]mvt.Point{ .{ .x = 7, .y = 7 }, .{ .x = 8, .y = 9 }, .{ .x = 12, .y = 4 } };
+    const line_parts = [_][]const mvt.Point{ &l1, &l2 };
+    const pt = [_]mvt.Point{.{ .x = 42, .y = 17 }};
+    const pt_parts = [_][]const mvt.Point{&pt};
+
+    const poly_props = [_]mvt.Prop{
+        .{ .key = "color_token", .value = .{ .string = "DEPMS" } },
+        .{ .key = "draw_prio", .value = .{ .int = 3 } },
+        .{ .key = "drval1", .value = .{ .float = 5.5 } },
+    };
+    const line_props = [_]mvt.Prop{
+        .{ .key = "color_token", .value = .{ .string = "CHBLK" } },
+        .{ .key = "draw_prio", .value = .{ .int = 6 } },
+        .{ .key = "width_px", .value = .{ .double = 1.5 } },
+    };
+    const pt_props = [_]mvt.Prop{
+        .{ .key = "color_token", .value = .{ .string = "DEPMS" } }, // repeats -> dict
+        .{ .key = "draw_prio", .value = .{ .int = 9 } },
+        .{ .key = "symbol_name", .value = .{ .string = "BOYLAT13" } }, // nullable col
+    };
+    const feats = [_]mvt.Feature{
+        .{ .geom_type = .polygon, .parts = &poly_parts, .properties = &poly_props },
+        .{ .geom_type = .linestring, .parts = &line_parts, .properties = &line_props },
+        .{ .geom_type = .point, .parts = &pt_parts, .properties = &pt_props },
+    };
+    const layers = [_]mvt.Layer{.{ .name = "areas", .extent = 4096, .features = &feats }};
+    const bytes = try encode(a, .{ .layers = &layers });
+
+    const dec = try decode(a, bytes);
+    try std.testing.expectEqual(@as(usize, 1), dec.len);
+    try std.testing.expectEqualStrings("areas", dec[0].name);
+    try std.testing.expectEqual(@as(u32, 4096), dec[0].extent);
+    try std.testing.expectEqual(@as(usize, 3), dec[0].features.len);
+
+    const poly = dec[0].features[0];
+    try std.testing.expectEqual(mvt.GeomType.polygon, poly.geom_type);
+    try std.testing.expectEqual(@as(usize, 2), poly.parts.len);
+    try std.testing.expectEqual(@as(usize, 4), poly.parts[0].len);
+    try std.testing.expectEqual(mvt.Point{ .x = 100, .y = 80 }, poly.parts[0][2]);
+    try std.testing.expectEqual(mvt.Point{ .x = 15, .y = 15 }, poly.parts[1][2]);
+
+    const line = dec[0].features[1];
+    try std.testing.expectEqual(mvt.GeomType.linestring, line.geom_type);
+    try std.testing.expectEqual(@as(usize, 2), line.parts.len);
+    try std.testing.expectEqual(mvt.Point{ .x = -5, .y = 3 }, line.parts[0][0]);
+    try std.testing.expectEqual(mvt.Point{ .x = 12, .y = 4 }, line.parts[1][2]);
+
+    const p = dec[0].features[2];
+    try std.testing.expectEqual(mvt.GeomType.point, p.geom_type);
+    try std.testing.expectEqual(mvt.Point{ .x = 42, .y = 17 }, p.parts[0][0]);
+
+    // Properties: compare as key->value lookups (column order != source order).
+    const find = struct {
+        fn f(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
+            for (props) |pr| if (std.mem.eql(u8, pr.key, key)) return pr.value;
+            return null;
+        }
+    }.f;
+    try std.testing.expectEqualStrings("DEPMS", find(poly.properties, "color_token").?.string);
+    try std.testing.expectEqual(@as(i64, 3), find(poly.properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(f32, 5.5), find(poly.properties, "drval1").?.float);
+    try std.testing.expectEqual(@as(f64, 1.5), find(line.properties, "width_px").?.double);
+    try std.testing.expectEqualStrings("BOYLAT13", find(p.properties, "symbol_name").?.string);
+    try std.testing.expect(find(poly.properties, "symbol_name") == null); // nullable: absent stays absent
+    try std.testing.expect(find(line.properties, "drval1") == null);
+}
