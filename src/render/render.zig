@@ -28,6 +28,7 @@ pub const raster = @import("raster.zig");
 pub const png = @import("png.zig");
 pub const pixel = @import("pixel.zig");
 pub const ascii = @import("ascii.zig");
+pub const kitty = @import("kitty.zig");
 pub const symbols = @import("symbols.zig");
 pub const sndfrm = @import("sndfrm.zig");
 pub const font = @import("font.zig");

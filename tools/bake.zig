@@ -967,13 +967,13 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
 }
 
 // tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom>
-//     [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--rules DIR]
+//     [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--kitty] [--rules DIR]
 // The chart on stdout as a Unicode text grid — the render-engine EXAMPLE
 // backend (src/render/ascii.zig): the same chart layer + view driver as
 // `tile57 png`, with the AsciiSurface at the end instead of the pixel one.
 fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--kitty] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -984,6 +984,7 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     var rules: ?[]const u8 = null;
     var ansi = false;
     var tui = false;
+    var kitty = false;
     var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
     var f = Flags{ .args = args, .i = 2 };
     while (f.next()) |arg| {
@@ -1009,6 +1010,8 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
             ansi = true;
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui = true;
+        } else if (std.mem.eql(u8, arg, "--kitty")) {
+            kitty = true;
         } else return usageErr("unknown flag");
     }
     const v = view orelse return usageErr("--view lon,lat,zoom is required");
@@ -1038,7 +1041,20 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
         .dusk => .dusk,
         .night => .night,
     };
-    if (tui) return runAsciiTui(io, a, c, v.lon, v.lat, v.zoom, palette, &m, ansi);
+    if (tui) return runAsciiTui(io, a, c, v.lon, v.lat, v.zoom, palette, &m, ansi, kitty);
+
+    if (kitty) {
+        // Real S-52 pixels inline via the kitty graphics protocol (Ghostty,
+        // Kitty, WezTerm, Konsole): the grid's cell count times the
+        // terminal's cell-pixel size (or the 10x20 guess off-TTY).
+        const cp = cellPx(terminalSize(io));
+        const png_bytes = c.renderView(v.lon, v.lat, v.zoom, cols * cp[0], rows * cp[1], palette, &m, .png) catch return usageErr("render failed");
+        defer chart.freeBytes(png_bytes);
+        const seq = render.kitty.encodePng(a, png_bytes) catch return usageErr("encode failed");
+        std.Io.File.stdout().writeStreamingAll(io, seq) catch {};
+        std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+        return;
+    }
 
     const text = c.renderAscii(v.lon, v.lat, v.zoom, cols, rows, palette, &m, ansi) catch return usageErr("render failed");
     defer chart.freeBytes(text);
@@ -1050,7 +1066,7 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
 // ctrl-c) quits. cbreak-style input (no echo/canonical, OPOST kept so \n still
 // carriage-returns), alternate screen + hidden cursor, terminal re-measured
 // every frame so a resize just repaints.
-fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat0: f64, zoom0: f64, palette: render.resolve.PaletteId, m: *render.resolve.MarinerSettings, ansi: bool) !void {
+fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat0: f64, zoom0: f64, palette: render.resolve.PaletteId, m: *render.resolve.MarinerSettings, ansi: bool, kitty: bool) !void {
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
     const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
@@ -1070,17 +1086,34 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
     var zoom = zoom0;
     var last: [2]u32 = .{ 0, 0 };
     while (true) {
-        const ts = terminalSize(io) orelse .{ 100, 37 };
+        const ts_raw = terminalSize(io);
+        const ts = ts_raw orelse .{ 100, 37, 0, 0 };
         const cols = @max(20, ts[0]);
         const rows = @max(10, ts[1]) - 1; // chart rows; the last line is the status bar
         if (cols != last[0] or rows != last[1]) {
             stdout.writeStreamingAll(io, "\x1b[2J") catch {};
             last = .{ cols, rows };
         }
-        const text = c.renderAscii(lon, lat, zoom, cols, rows, palette, m, ansi) catch break;
-        stdout.writeStreamingAll(io, "\x1b[H") catch {};
-        stdout.writeStreamingAll(io, text) catch {};
-        chart.freeBytes(text);
+        // Frame: kitty mode paints the REAL S-52 pixel portrayal (PNG through
+        // the kitty graphics protocol) sized to the chart rows' pixel extent;
+        // ascii mode paints the text grid.
+        const cp = cellPx(ts_raw);
+        const view_w: u32 = if (kitty) cols * cp[0] else cols;
+        const view_h: u32 = if (kitty) rows * cp[1] else rows * 2; // ascii cell = 1x2 px
+        if (kitty) {
+            const png_bytes = c.renderView(lon, lat, zoom, view_w, view_h, palette, m, .png) catch break;
+            const seq = render.kitty.encodePng(a, png_bytes) catch break;
+            chart.freeBytes(png_bytes);
+            stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+            stdout.writeStreamingAll(io, "\x1b[H") catch {};
+            stdout.writeStreamingAll(io, seq) catch {};
+            a.free(seq);
+        } else {
+            const text = c.renderAscii(lon, lat, zoom, cols, rows, palette, m, ansi) catch break;
+            stdout.writeStreamingAll(io, "\x1b[H") catch {};
+            stdout.writeStreamingAll(io, text) catch {};
+            chart.freeBytes(text);
+        }
         const status = std.fmt.allocPrint(a, "\x1b[{d};1H\x1b[7m \xe2\x86\x90\xe2\x86\x91\xe2\x86\x93\xe2\x86\x92 pan  +/- zoom  q quit  {d:.4},{d:.4} z{d:.2} \x1b[0m\x1b[K", .{ rows + 1, lat, lon, zoom }) catch break;
         stdout.writeStreamingAll(io, status) catch {};
 
@@ -1091,11 +1124,11 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
         var b: [64]u8 = undefined;
         const n = std.posix.read(stdin_fd, &b) catch break;
         if (n == 0) break;
-        // Pan steps: an eighth of the view span. The view is `cols` px wide and
-        // `rows*2` px tall (one cell = 1x2 px) on a 256*2^zoom px world.
+        // Pan steps: an eighth of the view span, in the frame's own pixels
+        // (ascii cell = 1x2 px; sixel = real pixels) on a 256*2^zoom px world.
         const world = 256.0 * std.math.pow(f64, 2.0, zoom);
-        const dlon = @as(f64, @floatFromInt(cols)) / 8.0 * 360.0 / world;
-        const dy_px = @as(f64, @floatFromInt(rows * 2)) / 8.0;
+        const dlon = @as(f64, @floatFromInt(view_w)) / 8.0 * 360.0 / world;
+        const dy_px = @as(f64, @floatFromInt(view_h)) / 8.0;
         var i: usize = 0;
         while (i < n) {
             if (b[i] == 0x1b and i + 2 < n and b[i + 1] == '[') {
@@ -1130,10 +1163,12 @@ fn mercShift(lat: f64, px: f64, world: f64) f64 {
     return std.math.clamp(lat2, -85.0, 85.0);
 }
 
-// The controlling terminal's COLSxROWS, or null when stdout isn't a TTY (or
-// the platform gives us no TIOCGWINSZ) — the `ascii` grid's no-wrap default.
+// The controlling terminal's {cols, rows, xpixel, ypixel}, or null when
+// stdout isn't a TTY (or the platform gives us no TIOCGWINSZ) — the `ascii`
+// grid's no-wrap default and the `--sixel` pixel geometry. xpixel/ypixel are
+// 0 when the terminal doesn't report them.
 // The std.Progress terminal-size pattern (Io.operate device_io_control).
-fn terminalSize(io: std.Io) ?[2]u32 {
+fn terminalSize(io: std.Io) ?[4]u32 {
     if (@import("builtin").os.tag == .windows) return null;
     const f = std.Io.File.stdout();
     if ((f.isTty(io) catch return null) == false) return null;
@@ -1145,7 +1180,16 @@ fn terminalSize(io: std.Io) ?[2]u32 {
     } }) catch return null).device_io_control;
     if (err < 0) return null;
     if (ws.col == 0 or ws.row == 0) return null;
-    return .{ ws.col, ws.row };
+    return .{ ws.col, ws.row, ws.xpixel, ws.ypixel };
+}
+
+// The terminal's character-cell size in pixels for sixel geometry: reported
+// xpixel/ypixel over cols/rows when available, else the common 10x20 guess.
+fn cellPx(ts: ?[4]u32) [2]u32 {
+    if (ts) |t| {
+        if (t[2] > 0 and t[3] > 0) return .{ @max(4, t[2] / t[0]), @max(8, t[3] / t[1]) };
+    }
+    return .{ 10, 20 };
 }
 
 fn usageErr(msg: []const u8) void {
@@ -1191,7 +1235,7 @@ fn printUsage() void {
         \\      Sources: an S-57 cell (live portrayal) or a baked .pmtiles
         \\      bundle (tile replay). --dq data-quality overlay; --scale F
         \\      physical-size multiplier; --palette day|dusk|night.
-        \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi]
+        \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi] [--kitty]
         \\      The chart on stdout as a Unicode text grid (the example render
         \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
         \\  tile57 inspect <file.pmtiles> [z x y]
