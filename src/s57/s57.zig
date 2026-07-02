@@ -10,7 +10,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const iso = @import("iso8211");
+/// The ISO/IEC 8211 record parser S-57 rides on (folded into this module —
+/// its only consumer). Re-exported for the CLI inspector + lib root.
+pub const iso8211 = @import("iso8211.zig");
+const iso = iso8211;
 
 // Geographic coordinate stored in S-57's native integer ×1e7 units (lon ±1.8e9,
 // lat ±9e8 both fit i32) — 8 bytes/point vs 16 for an f64 pair, lossless for the
@@ -1868,4 +1871,8 @@ test "pointInRings: inside, outside, and inside a hole" {
     // A lone ring with no hole.
     const just_outer = [_][]const LonLat{outer[0..]};
     try std.testing.expect(pointInRings(&just_outer, 5, 5));
+}
+
+test {
+    _ = iso8211;
 }

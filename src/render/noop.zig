@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const rs = @import("render_surface");
+const rs = @import("surface.zig");
 
 pub const NoopSurface = struct {
     const vtable = rs.Surface.VTable{

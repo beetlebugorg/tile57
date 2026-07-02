@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const gzip = @import("gzip");
+const gzip = @import("gzip.zig");
 
 pub const HEADER_LEN = 127;
 const MAGIC = "PMTiles";
@@ -667,7 +667,7 @@ test "hilbert tile id matches PMTiles reference values" {
 
 test "write then read round-trips a real tile (writer+reader+gzip+mvt)" {
     const gpa = std.testing.allocator;
-    const mvt = @import("mvt");
+    const mvt = @import("mvt.zig");
 
     const tiles = [_]InputTile{.{ .z = 14, .x = 4711, .y = 6262, .mvt = fixture }};
     const archive = try write(gpa, &tiles, .{});

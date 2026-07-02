@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const mvt = @import("mvt");
+const mvt = @import("tiles").mvt;
 
 /// Tile-space integer point (coordinates in [0, extent]).
 /// Aliased from mvt.Point so engine geometry (built by tile helpers that

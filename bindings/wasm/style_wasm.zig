@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const assets = @import("assets");
-const chartstyle = @import("chartstyle");
+const chartstyle = @import("assets").chartstyle;
 const settings = @import("settings");
 
 // Base MapLibre style template + S-52 colortables, embedded at build time.

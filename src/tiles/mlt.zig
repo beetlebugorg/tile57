@@ -17,7 +17,7 @@
 //! and the size-winning encodings (dictionary/RLE) are layered on next.
 
 const std = @import("std");
-const mvt = @import("mvt");
+const mvt = @import("mvt.zig");
 
 // PhysicalStreamType ordinals.
 const PHYS_PRESENT: u8 = 0;

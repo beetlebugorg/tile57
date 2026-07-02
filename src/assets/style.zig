@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const Stringify = std.json.Stringify;
-const chartstyle = @import("chartstyle");
+const chartstyle = @import("chartstyle.zig");
 
 const FALLBACK = "#ff00ff";
 const FONT = .{"Noto Sans Regular"};

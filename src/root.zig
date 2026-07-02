@@ -9,20 +9,20 @@
 
 const std = @import("std");
 
-pub const mvt = @import("mvt");
-pub const gzip = @import("gzip");
-pub const pmtiles = @import("pmtiles");
-pub const tile = @import("tile");
-pub const iso8211 = @import("iso8211");
+pub const mvt = @import("tiles").mvt;
+pub const gzip = @import("tiles").gzip;
+pub const pmtiles = @import("tiles").pmtiles;
+pub const tile = @import("tiles").tile;
+pub const iso8211 = @import("s57").iso8211;
 pub const s57 = @import("s57");
 pub const s57_mvt = @import("s57_mvt");
 pub const s100 = @import("s100");
 pub const s101_instr = s100.s101_instr;
 pub const s101_adapt = s100.s101_adapt;
 pub const catalogue = s100.catalogue;
-pub const bake_enc = @import("bake_enc"); // banded multi-cell ENC_ROOT -> PMTiles
+pub const bake_enc = @import("s57_mvt").bake_enc; // banded multi-cell ENC_ROOT -> PMTiles
 pub const assets = @import("assets"); // chart-bundle asset/manifest generation
-pub const chartstyle = @import("chartstyle"); // mariner-driven MapLibre style patching
+pub const chartstyle = @import("assets").chartstyle; // mariner-driven MapLibre style patching
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {

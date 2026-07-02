@@ -5,7 +5,7 @@
 //! round-trip — validating the encoder on real-world feature shapes.
 
 const std = @import("std");
-const mvt = @import("mvt");
+const mvt = @import("tiles").mvt;
 
 const fixture = @embedFile("mvt_fixture");
 

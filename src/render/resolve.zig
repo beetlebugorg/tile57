@@ -11,8 +11,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const rs = @import("render_surface");
-const chartstyle = @import("chartstyle");
+const rs = @import("surface.zig");
+const chartstyle = @import("assets").chartstyle;
 
 pub const MarinerSettings = chartstyle.MarinerSettings;
 

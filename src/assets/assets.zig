@@ -27,6 +27,10 @@ pub const buildFromTemplate = @import("style.zig").buildFromTemplate;
 pub const buildFromTemplateScamin = @import("style.zig").buildFromTemplateScamin;
 pub const styleDiff = @import("style.zig").styleDiff;
 
+/// The S-52 mariner expression builders (MapLibre style patching) — folded
+/// in: assets is its only sibling and every consumer wants both.
+pub const chartstyle = @import("chartstyle.zig");
+
 // ---- colortables.json ----------------------------------------------------
 
 const Palette = struct { xml_name: []const u8, key: []const u8 };
@@ -532,4 +536,8 @@ test "manifestJson: pins schema_version and couples tiles to portrayal" {
     try std.testing.expectEqualStrings("assets/colortables.json", portrayal.get("colortables").?.string);
     // "styles" is omitted when not provided (emit_null_optional_fields = false)
     try std.testing.expect(portrayal.get("styles") == null);
+}
+
+test {
+    _ = chartstyle;
 }

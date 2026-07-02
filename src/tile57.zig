@@ -52,18 +52,18 @@ pub const style = struct {
 // ---- portrayal asset + style generation ----------------------------------
 pub const assets = @import("assets"); // colortables / linestyles / style / manifest
 pub const sprite = @import("sprite"); // S-101 sprite + area-fill pattern atlases
-pub const chartstyle = @import("chartstyle"); // mariner-driven MapLibre style patching
+pub const chartstyle = @import("assets").chartstyle; // mariner-driven MapLibre style patching
 
 // ---- tiling / encoding ---------------------------------------------------
-pub const mvt = @import("mvt"); // Mapbox Vector Tile encode/decode
-pub const tile = @import("tile"); // web-mercator tiling + clipping
-pub const pmtiles = @import("pmtiles"); // PMTiles read/write
-pub const bake_enc = @import("bake_enc"); // banded multi-cell ENC_ROOT → PMTiles
+pub const mvt = @import("tiles").mvt; // Mapbox Vector Tile encode/decode
+pub const tile = @import("tiles").tile; // web-mercator tiling + clipping
+pub const pmtiles = @import("tiles").pmtiles; // PMTiles read/write
+pub const bake_enc = @import("s57_mvt").bake_enc; // banded multi-cell ENC_ROOT → PMTiles
 pub const s57_mvt = @import("s57_mvt"); // S-57 feature → MVT tile
 
 // ---- raw S-57 / S-100 formats (advanced) ---------------------------------
 pub const formats = struct {
-    pub const iso8211 = @import("iso8211"); // ISO/IEC 8211 records
+    pub const iso8211 = @import("s57").iso8211; // ISO/IEC 8211 records
     pub const s57 = @import("s57"); // S-57 ENC cell parser + geometry
     pub const s100 = @import("s100"); // S-100/S-101 catalogue + adaptation
 };

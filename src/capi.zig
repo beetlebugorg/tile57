@@ -7,7 +7,7 @@
 const std = @import("std");
 const chart = @import("chart.zig");
 const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
-const chartstyle = @import("chartstyle");
+const chartstyle = @import("assets").chartstyle;
 const assets = @import("assets");
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk

@@ -14,7 +14,7 @@ const s57 = @import("s57");
 const portray = @import("portray");
 const s57_mvt = @import("s57_mvt");
 const render = @import("render");
-const tile = @import("tile");
+const tile = @import("tiles").tile;
 
 // The embedded S-101 color profile (same bytes colortables.json is built from).
 const colorprofile_registry = @import("colorprofile_registry");

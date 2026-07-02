@@ -8,10 +8,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const s57 = @import("s57");
-const tile = @import("tile");
-const mvt = @import("mvt");
-const mlt = @import("mlt");
+const tile = @import("tiles").tile;
+const mvt = @import("tiles").mvt;
+const mlt = @import("tiles").mlt;
 const rs = @import("render").surface;
+
+/// The banded multi-cell ENC_ROOT -> PMTiles baker (folded in: it is the
+/// batch driver of this engine). Re-exported for the CLI + lib root.
+pub const bake_enc = @import("bake_enc.zig");
 
 /// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile (optional).
 pub const TileFormat = enum { mvt, mlt };
@@ -2759,4 +2763,8 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
     try processFeatureInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 3), ms.points.items.len);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[2].properties, "sym_deep"));
+}
+
+test {
+    _ = bake_enc;
 }

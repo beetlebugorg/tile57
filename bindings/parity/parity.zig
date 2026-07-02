@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const assets = @import("assets");
-const chartstyle = @import("chartstyle");
+const chartstyle = @import("assets").chartstyle;
 const settings = @import("settings");
 
 const template_json = @embedFile("template_json");

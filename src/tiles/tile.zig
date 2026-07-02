@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const mvt = @import("mvt");
+const mvt = @import("mvt.zig");
 
 pub const EXTENT: i32 = 4096;
 pub const BUFFER: i32 = 64;

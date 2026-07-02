@@ -17,14 +17,14 @@
 //! parallelize internally over cores.
 
 const std = @import("std");
-const pmtiles = @import("pmtiles");
-const gzip = @import("gzip");
+const pmtiles = @import("tiles").pmtiles;
+const gzip = @import("tiles").gzip;
 const s57 = @import("s57");
 const s57_mvt = @import("s57_mvt");
 const portray = @import("portray");
-const bake_enc = @import("bake_enc");
+const bake_enc = @import("s57_mvt").bake_enc;
 const catalogue = @import("s100").catalogue;
-const tile = @import("tile");
+const tile = @import("tiles").tile;
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
 // makes many small, short-lived allocations (tile cache, cell dupes, index
