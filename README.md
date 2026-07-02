@@ -54,7 +54,7 @@ entirely with AI assistance. A few specific goals shape its design:
   easy:
   - an **anchor alarm** that draws your swing circle over a real chart,
   - a **Windy plugin** overlaying forecast weather on ENC charts,
-  - a **native cross-platform Qt6 C++ chartplotter** (this repo's `app/qt` is exactly that),
+  - a **native cross-platform Qt6 C++ chartplotter**,
   - a paper-style **passage-plan PDF printer**, a race-committee display, a tides kiosk…
 
 ---
