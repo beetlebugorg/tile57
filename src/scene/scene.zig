@@ -12,6 +12,7 @@ const tile = @import("tiles").tile;
 const mvt = @import("tiles").mvt;
 const mlt = @import("tiles").mlt;
 const render = @import("render");
+const assets = @import("assets");
 const rs = render.surface;
 
 /// The banded multi-cell ENC_ROOT -> PMTiles baker (folded in: it is the
@@ -1702,6 +1703,40 @@ pub fn registerLinestyle(gpa: Allocator, id: []const u8, info: LsInfo) void {
 pub fn clearLinestyles(gpa: Allocator) void {
     g_linestyles.deinit(gpa);
     g_linestyles = .{};
+}
+
+/// Populate the complex-linestyle table from S-101 LineStyles XML sources
+/// (id = file stem). IDEMPOTENT — a populated table is left untouched, so
+/// every scene entry point (bake, lib renderView, CLI render) can call it
+/// unconditionally; forgetting it silently degrades named linestyles
+/// (MARSYS51, cables, pipelines, …) to generic dashed strokes. Mirrors the
+/// Go lsInfoFromCatalog: mm geometry at the PresLib feature scale, S-52
+/// minimum pen width. `gpa` + `srcs` must outlive all tile generation.
+pub fn registerLinestylesXml(gpa: Allocator, srcs: []const assets.LineStyleSrc) void {
+    if (g_linestyles.count() > 0) return;
+    const px = LINESTYLE_PX_PER_MM;
+    for (srcs) |s| {
+        const parsed = assets.parseLineStyle(gpa, s.xml) catch continue;
+        const period = parsed.interval_length * px;
+        if (period < 0.5) continue; // no interval to tile (pure-symbol style)
+        var runs = std.ArrayList([2]f64).empty;
+        for (parsed.dashes) |d| {
+            const lo = d.start * px;
+            const hi = (d.start + d.length) * px;
+            if (hi - lo > 1e-6) runs.append(gpa, .{ lo, hi }) catch {};
+        }
+        var syms = std.ArrayList(LsSym).empty;
+        for (parsed.symbols) |sym| syms.append(gpa, .{ .name = sym.reference, .offset_px = sym.position * px }) catch {};
+        var width = parsed.pen_width * px;
+        if (width < 0.6) width = 0.9; // S-52 minimum pen
+        registerLinestyle(gpa, s.id, .{
+            .period_px = period,
+            .on_runs = runs.items,
+            .symbols = syms.items,
+            .color_token = parsed.pen_color,
+            .width_px = width,
+        });
+    }
 }
 
 const LsTangent = struct { p: tile.FPoint, dx: f64, dy: f64 };

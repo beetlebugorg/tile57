@@ -315,7 +315,10 @@ pub const PixelSurface = struct {
         // body units are 3.51 mm = 1 em).
         const ox: f32 = @floatCast(style.offset_x / 3.51);
         const oy: f32 = @floatCast(style.offset_y / 3.51);
-        const haloed = font_px >= 10 and style.halign.len > 0;
+        // S-52/S-101 text is SOLID (FontBackgroundColor transparent) — the served
+        // style deliberately renders no halo; match it. The GlyphRun halo plumbing
+        // stays for a future opt-in legibility setting.
+        const haloed = false;
         try self.pushText(text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, .{
             .x = self.origin.x + @as(f32, @floatFromInt(at.x)) * self.scale,
             .y = self.origin.y + @as(f32, @floatFromInt(at.y)) * self.scale,
@@ -659,7 +662,7 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     const t = ps.ops.items[0].kind.text;
     try std.testing.expect(t.run.rings.len >= 6); // R,e,e,f,1,2 (space has none)
     try std.testing.expect(t.run.glyphs.len == 7); // incl. the space glyph
-    try std.testing.expect(t.run.halo != null); // 12px >= 10 -> haloed
+    try std.testing.expect(t.run.halo == null); // S-52: solid text, no halo
     try std.testing.expect(t.bbox[2] > t.bbox[0] and t.bbox[3] > t.bbox[1]);
     try std.testing.expect(t.bbox[0] >= 99); // halign left: extends right of x=100
 

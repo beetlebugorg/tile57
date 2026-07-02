@@ -159,6 +159,14 @@ pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64,
     if (!categoryVisible(meta.cat, meta.class, symbol_name, m)) return false;
     if (!viewingGroupVisible(meta.vg, m.viewing_groups_off)) return false;
     if (!m.ignore_scamin and !scaminVisible(meta.scamin, zoom)) return false;
+    // S-52 display-variant passes (mirrors chartstyle.boundaryFilter /
+    // pointStyleFilter): a feature portrayed twice carries bnd 1/0 (symbolized/
+    // plain boundary) or pts 0/1 (paper/simplified points); show the common
+    // pass (2) + the mariner's active style — otherwise both passes double-draw.
+    const bnd_rank: i64 = if (m.boundary_style == .plain) 0 else 1;
+    if (meta.bnd != 2 and meta.bnd != bnd_rank) return false;
+    const pts_rank: i64 = if (m.simplified_points) 1 else 0;
+    if (meta.pts != 2 and meta.pts != pts_rank) return false;
     return true;
 }
 

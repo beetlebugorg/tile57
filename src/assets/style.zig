@@ -420,7 +420,40 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     var buf: [96]u8 = undefined;
     const sfx = if (std.mem.eql(u8, sl, "text")) "" else "-scamin";
 
-    // light-text<sfx> — always-on LIGHTS characteristics, top-anchored.
+    // text<sfx> — general collidable labels. Emitted BELOW light-text: MapLibre
+    // gives collision precedence to UPPER symbol layers, and S-52 wants the
+    // (high drawing-priority) light characteristics to win placement over
+    // names — the within-layer sort key already ranks tgrp 23 above names,
+    // but that only applies inside one layer.
+    var buf2: [96]u8 = undefined;
+    const tid = try std.fmt.bufPrint(&buf2, "text{s}{s}", .{ sfx, bkt.suffix });
+    try js.beginObject();
+    try layerHead(js, tid, "symbol", sl);
+    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s.common, s.text_group);
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("text-field");
+    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
+    try js.objectField("text-font");
+    try js.write(FONT);
+    try js.objectField("text-size");
+    try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 11 }, s.size_scale);
+    try js.objectField("text-anchor");
+    try js.write(TEXT_ANCHOR);
+    try js.objectField("text-offset");
+    try js.write(TEXT_OFFSET);
+    try js.objectField("symbol-sort-key");
+    try js.write(TEXT_SORT_KEY);
+    try js.objectField("text-allow-overlap");
+    try js.write(false);
+    try js.objectField("text-optional");
+    try js.write(true);
+    try js.endObject();
+    try textPaint(js, s.text_color, s.halo, 0); // S-52: solid black, no halo
+    try js.endObject();
+
+    // light-text<sfx> — LIGHTS characteristics, top-anchored. Above `text`
+    // so light descriptions take collision precedence over names.
     const lid = try std.fmt.bufPrint(&buf, "light-text{s}{s}", .{ sfx, bkt.suffix });
     try js.beginObject();
     try layerHead(js, lid, "symbol", sl);
@@ -441,34 +474,6 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try js.write("left");
     try js.objectField("symbol-sort-key");
     try js.write(.{ "-", 0, .{ "coalesce", .{ "get", "font_size_px" }, 10 } });
-    try js.objectField("text-allow-overlap");
-    try js.write(false);
-    try js.objectField("text-optional");
-    try js.write(true);
-    try js.endObject();
-    try textPaint(js, s.text_color, s.halo, 0); // S-52: solid black, no halo
-    try js.endObject();
-
-    // text<sfx> — general collidable labels.
-    var buf2: [96]u8 = undefined;
-    const tid = try std.fmt.bufPrint(&buf2, "text{s}{s}", .{ sfx, bkt.suffix });
-    try js.beginObject();
-    try layerHead(js, tid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s.common, s.text_group);
-    try js.objectField("layout");
-    try js.beginObject();
-    try js.objectField("text-field");
-    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
-    try js.objectField("text-font");
-    try js.write(FONT);
-    try js.objectField("text-size");
-    try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 11 }, s.size_scale);
-    try js.objectField("text-anchor");
-    try js.write(TEXT_ANCHOR);
-    try js.objectField("text-offset");
-    try js.write(TEXT_OFFSET);
-    try js.objectField("symbol-sort-key");
-    try js.write(TEXT_SORT_KEY);
     try js.objectField("text-allow-overlap");
     try js.write(false);
     try js.objectField("text-optional");
