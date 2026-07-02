@@ -252,7 +252,14 @@ pub const AsciiSurface = struct {
         _ = depth; // the rule already picked the depth-shade token
         const self = sp(ctx);
         if (!self.cur_visible) return;
-        try self.push(.area, .{ .fill = .{ .rings = try self.toGrid(rings), .ch = fillChar(token), .color = self.resolveColor(token) } });
+        // In ANSI mode land reads as a solid background wash, not a wall of
+        // '#'/'@' — the color alone carries it, and marks/labels on land stay
+        // legible. Plain text keeps the glyphs (no color to carry the fill).
+        const ch = if (self.ansi and (std.mem.eql(u8, token, "LANDA") or std.mem.eql(u8, token, "CHBRN")))
+            ' '
+        else
+            fillChar(token);
+        try self.push(.area, .{ .fill = .{ .rings = try self.toGrid(rings), .ch = ch, .color = self.resolveColor(token) } });
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
