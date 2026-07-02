@@ -852,7 +852,7 @@ pub const Chart = struct {
     /// labels + declutter over the whole canvas. Returns PNG bytes (gpa-owned;
     /// free with freeBytes). Cell-backed sources only; a baked PMTiles source
     /// has no portrayal to render from (bundle-sourced rendering is future work).
-    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings) ![]u8 {
+    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, output: render.pixel.Output) ![]u8 {
         if (self.backend == .reader) return error.Unsupported;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
@@ -880,6 +880,7 @@ pub const Chart = struct {
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
         var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, @import("tiles").tile.EXTENT);
         ps.store = store.asStore();
+        ps.output = output;
 
         switch (self.backend) {
             .reader => unreachable,

@@ -219,6 +219,14 @@ int tile57_chart_render_view(tile57_chart *chart, double lon, double lat, double
                              const struct tile57_mariner *m,
                              uint8_t **out, size_t *out_len);
 
+/* tile57_chart_render_view's vector twin: the SAME scene as a deterministic
+ * single-page PDF (1 px = 1 pt, 72 dpi; vector fills + native strokes +
+ * glyph-outline text). Same parameters, returns, and ownership. */
+int tile57_chart_render_pdf(tile57_chart *chart, double lon, double lat, double zoom,
+                            uint32_t width, uint32_t height,
+                            const struct tile57_mariner *m,
+                            uint8_t **out, size_t *out_len);
+
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
  * colortables, atlases, …), passing the same length. The universal free. (chart-api.md) */
 void tile57_free(void *ptr, size_t len);

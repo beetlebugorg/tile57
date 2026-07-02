@@ -770,6 +770,7 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
     defer store.deinit();
     ps.store = store.asStore();
+    if (std.mem.endsWith(u8, out, ".pdf")) ps.output = .pdf;
 
     const cells = [_]engine.s57_mvt.CellRef{.{ .cell = &cell, .portrayal = streams }};
     const bytes = if (view) |v|

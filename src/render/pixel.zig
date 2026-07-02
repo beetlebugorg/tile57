@@ -24,6 +24,7 @@ const png = @import("png.zig");
 const sym = @import("symbols.zig");
 const sndfrm = @import("sndfrm.zig");
 const fontmod = @import("font.zig");
+const pdf = @import("pdf.zig");
 
 /// Unmapped color tokens paint magenta, same as the MapLibre style's fallback —
 /// visible, never silent.
@@ -56,6 +57,8 @@ const Op = struct {
     kind: OpKind,
 };
 
+pub const Output = enum { png, pdf };
+
 pub const PixelSurface = struct {
     a: Allocator,
     colors: *const resolve.Colors,
@@ -76,6 +79,8 @@ pub const PixelSurface = struct {
     /// fills/lines-only render). Wired from the sprite module's nanosvg-backed
     /// store, or a test fake.
     store: ?sym.SymbolStore = null,
+    /// endScene output format: raster PNG (default) or vector PDF.
+    output: Output = .png,
     /// The embedded label face; null only if the embedded TTF fails to parse.
     fnt: ?fontmod.Font = null,
     glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
@@ -387,6 +392,22 @@ pub const PixelSurface = struct {
 
     fn endFeature(_: *anyopaque) anyerror!void {}
 
+    // Paint the sorted, decluttered op list onto any Canvas — the raster and
+    // PDF outputs share this exactly (Gate 3's self-consistency by construction).
+    fn paintOps(self: *PixelSurface, canvas: cv.Canvas, dropped: *const std.AutoHashMapUnmanaged(usize, void)) !void {
+        for (self.ops.items) |op| switch (op.kind) {
+            .fill => |f| try canvas.fillPath(f.rings, f.color, f.rule),
+            .pattern => |p| try canvas.fillPattern(p.rings, p.cell),
+            .stroke => |s| try canvas.strokePath(s.lines, s.width, s.dash, s.color),
+            .text => |t| {
+                if (dropped.contains(op.seq)) continue;
+                // Halo = under-stroke (2x the halo width, centered on the edge).
+                if (t.halo) |hc| try canvas.strokePath(t.rings, t.halo_w * 2, null, hc);
+                try canvas.fillPath(t.rings, t.color, .nonzero);
+            },
+        };
+    }
+
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const self = sp(ctx);
         // Paint order = the tile style's layer stack: class-major (see
@@ -427,23 +448,31 @@ pub const PixelSurface = struct {
             }
         }
 
-        var rc = try raster.RasterCanvas.init(self.a, self.w_px, self.h_px);
-        defer rc.deinit();
-        // NODTA under everything (S-52 no-data); the palette decides its shade.
-        rc.clear(self.resolveColor("NODTA"));
-        const canvas = rc.asCanvas();
-        for (self.ops.items) |op| switch (op.kind) {
-            .fill => |f| try canvas.fillPath(f.rings, f.color, f.rule),
-            .pattern => |p| try canvas.fillPattern(p.rings, p.cell),
-            .stroke => |s| try canvas.strokePath(s.lines, s.width, s.dash, s.color),
-            .text => |t| {
-                if (dropped.contains(op.seq)) continue;
-                // Halo = under-stroke (2x the halo width, centered on the edge).
-                if (t.halo) |hc| try canvas.strokePath(t.rings, t.halo_w * 2, null, hc);
-                try canvas.fillPath(t.rings, t.color, .nonzero);
+        switch (self.output) {
+            .png => {
+                var rc = try raster.RasterCanvas.init(self.a, self.w_px, self.h_px);
+                defer rc.deinit();
+                // NODTA under everything (S-52 no-data); the palette picks the shade.
+                rc.clear(self.resolveColor("NODTA"));
+                try self.paintOps(rc.asCanvas(), &dropped);
+                return png.encodeRgba(out, rc.px, rc.w, rc.h);
             },
-        };
-        return png.encodeRgba(out, rc.px, rc.w, rc.h);
+            .pdf => {
+                var pc = pdf.PdfCanvas.init(self.a, self.w_px, self.h_px);
+                const canvas = pc.asCanvas();
+                // NODTA page background.
+                const bg = [_]cv.Point{
+                    .{ .x = 0, .y = 0 },
+                    .{ .x = @floatFromInt(self.w_px), .y = 0 },
+                    .{ .x = @floatFromInt(self.w_px), .y = @floatFromInt(self.h_px) },
+                    .{ .x = 0, .y = @floatFromInt(self.h_px) },
+                };
+                const bg_rings = [_][]const cv.Point{&bg};
+                try canvas.fillPath(&bg_rings, self.resolveColor("NODTA"), .nonzero);
+                try self.paintOps(canvas, &dropped);
+                return pc.finish(out);
+            },
+        }
     }
 };
 

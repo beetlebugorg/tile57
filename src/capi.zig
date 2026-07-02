@@ -300,7 +300,7 @@ export fn tile57_chart_render_view(
         .dusk => .dusk,
         .night => .night,
     };
-    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings) catch |e| switch (e) {
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .png) catch |e| switch (e) {
         error.Unsupported => return -3,
         else => return -2,
     };
@@ -310,6 +310,37 @@ export fn tile57_chart_render_view(
 }
 
 const RenderPalette = @import("render").resolve.PaletteId;
+
+/// tile57_chart_render_view's vector twin: the SAME scene emitted as a
+/// deterministic single-page PDF (1 px = 1 pt, 72 dpi page; vector fills,
+/// native strokes, glyph-outline text). Same returns/ownership.
+export fn tile57_chart_render_pdf(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
+    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const palette: RenderPalette = switch (settings.scheme) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .pdf) catch |e| switch (e) {
+        error.Unsupported => return -3,
+        else => return -2,
+    };
+    out.* = bytes.ptr;
+    out_len.* = bytes.len;
+    return 0;
+}
 
 /// Free any engine-returned buffer (tiles, style, scamin array, colortables, …). See tile57.h.
 /// (chart-api.md — the universal free.)
