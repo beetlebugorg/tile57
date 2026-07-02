@@ -20,6 +20,8 @@ const engine = @import("engine");
 const assets = @import("assets");
 const sprite = @import("sprite");
 const bundle = @import("bundle"); // chart-bundle pipeline (asset emitters etc.) — the lib owns it
+const render = @import("render"); // pixel path: PixelSurface + resolver (renderpng)
+const catalog_embed = @import("catalog"); // embedded portrayal assets (colour profile)
 
 const VERSION = "tile57 0.1.0";
 
@@ -106,6 +108,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "style")) {
         return runStyle(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "renderpng")) {
+        return runRenderPng(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "inspect")) {
@@ -659,6 +665,56 @@ fn runStyle(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     std.debug.print("wrote {s} ({s}, {d} bytes)\n", .{ out_path, scheme, style.len });
 }
 
+// tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette P] [--rules DIR]
+// The render-engine pixel path over ONE cell (no band quilting): parse +
+// portray the cell (fixed bake context for now), drive the engine through
+// PixelSurface -> RasterCanvas -> PNG. The in-repo render-to-PNG verify path.
+// P2 scope: area fills + line strokes; symbols/soundings/text land at P3/P4.
+fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (args.len < 6) {
+        std.debug.print("usage: tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette day|dusk|night] [--rules DIR]\n", .{});
+        return;
+    }
+    const path = args[2];
+    const z = std.fmt.parseInt(u8, args[3], 10) catch return usageErr("bad z");
+    const x = std.fmt.parseInt(u32, args[4], 10) catch return usageErr("bad x");
+    const y = std.fmt.parseInt(u32, args[5], 10) catch return usageErr("bad y");
+
+    var out_path: ?[]const u8 = null;
+    var size: u32 = 256;
+    var palette: render.resolve.PaletteId = .day;
+    var rules: ?[]const u8 = null;
+    var f = Flags{ .args = args, .i = 5 }; // positionals end at args[5]
+    while (f.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-o")) {
+            out_path = f.next() orelse return usageErr("-o needs a path");
+        } else if (std.mem.eql(u8, arg, "--size")) {
+            const v = f.next() orelse return usageErr("--size needs a value");
+            size = std.fmt.parseInt(u32, v, 10) catch return usageErr("bad --size");
+        } else if (std.mem.eql(u8, arg, "--palette")) {
+            const v = f.next() orelse return usageErr("--palette needs a value");
+            palette = std.meta.stringToEnum(render.resolve.PaletteId, v) orelse return usageErr("palette must be day|dusk|night");
+        } else if (std.mem.eql(u8, arg, "--rules")) {
+            rules = f.next() orelse return usageErr("--rules needs a dir");
+        } else return usageErr("unknown flag");
+    }
+    const out = out_path orelse return usageErr("-o <out.png> is required");
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
+    var cell = try engine.s57.parseCell(a, data);
+    defer cell.deinit();
+    engine.portray.setQuiet(true);
+    const streams = try engine.portray.portrayCell(a, &cell, resolveRulesDir(rules));
+
+    var colors = try render.resolve.Colors.init(a, catalog_embed.colorprofile[0].bytes);
+    const settings = render.resolve.MarinerSettings{};
+    var ps = render.pixel.PixelSurface.init(a, &colors, palette, &settings, @floatFromInt(z), size, engine.tile.EXTENT);
+    const cells = [_]engine.s57_mvt.CellRef{.{ .cell = &cell, .portrayal = streams }};
+    const bytes = try engine.s57_mvt.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
+    std.debug.print("wrote {s}: tile {d}/{d}/{d}, {d}x{d}px, {d} draw ops, {d} bytes\n", .{ out, z, x, y, size, size, ps.ops.items.len, bytes.len });
+}
+
 fn usageErr(msg: []const u8) void {
     std.debug.print("error: {s}\n\n", .{msg});
     printUsage();
@@ -695,6 +751,9 @@ fn printUsage() void {
         \\      --colortables FILE). --scheme day|dusk|night; --source-tiles/
         \\      --pmtiles-url pick the source; --sprite/--glyphs enable symbol/text
         \\      layers; --minzoom/--maxzoom.
+        \\  tile57 renderpng <cell.000> <z> <x> <y> -o <out.png> [--size N] [--palette day|dusk|night]
+        \\      Render one tile of a cell to PNG through the native pixel path
+        \\      (fills + strokes; symbols/text pending).
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
         \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)

@@ -423,6 +423,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "sprite", .module = sprite_mod },
                 .{ .name = "catalog", .module = catalog_embed },
                 .{ .name = "bundle", .module = bundle_mod },
+                .{ .name = "render", .module = render_mod }, // renderpng pixel path
             },
         }),
     });
