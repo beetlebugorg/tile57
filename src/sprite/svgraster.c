@@ -70,4 +70,67 @@ unsigned char *tg_png_encode(const unsigned char *rgba, int w, int h, int *out_l
     return b.data;
 }
 
+// Parse a flattened SVG (viewBox-normalized, like tg_svg_rasterize's input) and
+// serialize its shapes as an f32 stream for the Zig side — the PARSE half of
+// nanosvg, split from rasterization so the render engine can replay symbol
+// geometry as vector paths on its own canvases (raster tile, PDF) instead of
+// blitting pre-rasterized bitmaps. Stream grammar, all f32:
+//
+//   per shape:  1.0,
+//               fill?(0/1),  fr, fg, fb, fa,          (0..255)
+//               stroke?(0/1), sr, sg, sb, sa, stroke_width,
+//     per path: 2.0, npts, closed?(0/1), x0,y0, cp1x,cp1y,cp2x,cp2y,x1,y1, ...
+//   end:        0.0
+//
+// Path points are nanosvg's cubic-bezier runs (npts = 1 + 3n), in the SVG's
+// user units (mm for the S-101 catalogue). Coordinates are untransformed —
+// nanosvg has already applied the document transforms. Returns a malloc'd f32
+// buffer (count in *out_n); free with tg_svg_free. NULL on parse error.
+float *tg_svg_parse_paths(char *svg, int *out_n) {
+    NSVGimage *img = nsvgParse(svg, "px", 96.0f);
+    if (!img) return NULL;
+
+    /* size pass */
+    size_t n = 1; /* end marker */
+    for (NSVGshape *s = img->shapes; s; s = s->next) {
+        if (!(s->flags & NSVG_FLAGS_VISIBLE)) continue;
+        n += 11;
+        for (NSVGpath *p = s->paths; p; p = p->next) n += 3 + (size_t)p->npts * 2;
+    }
+    float *buf = (float *)malloc(n * sizeof(float));
+    if (!buf) { nsvgDelete(img); return NULL; }
+
+    size_t i = 0;
+    for (NSVGshape *s = img->shapes; s; s = s->next) {
+        if (!(s->flags & NSVG_FLAGS_VISIBLE)) continue;
+        buf[i++] = 1.0f;
+        /* nanosvg colors are 0xAABBGGRR; opacity multiplies alpha */
+        unsigned fc = s->fill.color, sc = s->stroke.color;
+        int has_fill = s->fill.type == NSVG_PAINT_COLOR;
+        int has_stroke = s->stroke.type == NSVG_PAINT_COLOR && s->strokeWidth > 0;
+        buf[i++] = has_fill ? 1.0f : 0.0f;
+        buf[i++] = (float)(fc & 0xff);
+        buf[i++] = (float)((fc >> 8) & 0xff);
+        buf[i++] = (float)((fc >> 16) & 0xff);
+        buf[i++] = has_fill ? (float)((fc >> 24) & 0xff) * s->opacity : 0.0f;
+        buf[i++] = has_stroke ? 1.0f : 0.0f;
+        buf[i++] = (float)(sc & 0xff);
+        buf[i++] = (float)((sc >> 8) & 0xff);
+        buf[i++] = (float)((sc >> 16) & 0xff);
+        buf[i++] = has_stroke ? (float)((sc >> 24) & 0xff) * s->opacity : 0.0f;
+        buf[i++] = s->strokeWidth;
+        for (NSVGpath *p = s->paths; p; p = p->next) {
+            buf[i++] = 2.0f;
+            buf[i++] = (float)p->npts;
+            buf[i++] = p->closed ? 1.0f : 0.0f;
+            memcpy(buf + i, p->pts, (size_t)p->npts * 2 * sizeof(float));
+            i += (size_t)p->npts * 2;
+        }
+    }
+    buf[i++] = 0.0f;
+    nsvgDelete(img);
+    *out_n = (int)i;
+    return buf;
+}
+
 void tg_svg_free(void *p) { free(p); }

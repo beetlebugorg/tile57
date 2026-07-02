@@ -27,7 +27,7 @@ const s101_adapt = @import("s100").s101_adapt;
 // style's icon-size = scale / ATLAS_PPU (0.08), so this renders symbols at
 // ~0.354 — matching the reference. The live path previously used 0.08 (icon
 // size 1.0), i.e. ~2.8x too large.
-const SYMBOL_SCALE: f64 = 0.02834627777338028;
+const SYMBOL_SCALE: f64 = @import("render").sndfrm.SYMBOL_SCALE;
 
 // Metres → feet. Soundings are stored + portrayed in metres (S-52/S-101 SNDFRM04 is
 // metres-only); this app additionally bakes a feet glyph variant (sym_s_ft/sym_g_ft)
@@ -36,7 +36,7 @@ const SYMBOL_SCALE: f64 = 0.02834627777338028;
 // through the same SNDFRM04 glyph composition as metres, so it keeps one decimal place
 // for shallow soundings (the depth-contour feet label, chartstyle.contourLabelField,
 // rounds to whole feet — contour valdco values are whole metres).
-const M_TO_FT: f64 = 3.280839895;
+const M_TO_FT: f64 = @import("render").sndfrm.M_TO_FT;
 
 // Worst-case reach of a light's sector legs/arcs (emitAugFigures) as a fraction of a
 // tile — these are drawn at a fixed DISPLAY size (radius/length in mm), so the reach
@@ -96,90 +96,10 @@ fn listHasAny(csv: []const u8, targets: []const i64) bool {
     return false;
 }
 
-/// Port of SNDFRM04's sounding glyph composition: build the comma-joined glyph-name
-/// string for a depth and prefix ("SOUNDS" bold/shallow or "SOUNDG" faint/deep).
-/// Covers the swept (B1) and low-accuracy-ring (C3 shallow / C2 deep) quality
-/// prefixes, the negative-value A-prefix (drying heights), and the full magnitude
-/// range up to 5 digits. Glyph order matches the rule: B1, ring, A-prefix, digits.
-/// `swept`/`low_acc` come from the feature's quality attributes (TECSOU/QUASOU/
-/// STATUS). NOTE: the rule's spatial-QUAPOS fallback for the ring (when the direct
-/// attrs are absent) is not yet wired — soundings whose only low-accuracy signal is
-/// a poor spatial quality-of-position still miss the ring; the direct attrs match.
-fn sndfrmSyms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: bool, always_tenths: bool) ![]const u8 {
-    const d = @abs(depth);
-    // TRUNCATE to tenths (round DOWN), matching SNDFRM04: the rule splits the depth's
-    // decimal string and takes string.sub(fractional, 1, 1) — the FIRST fractional
-    // digit, discarding the rest (SNDFRM04.lua:53,72). So 4.57 m -> "4.5", never "4.6":
-    // a sounding always errs SHALLOW (toward the surface), the safe direction for
-    // navigation. The +1e-6 absorbs binary-FP error so an exact charted tenth stored a
-    // hair low (4.1 as 4.0999…) still truncates to itself, not a notch shallower — while
-    // a genuine sub-tenth value (a unit conversion, e.g. metres->feet) still floors down.
-    // Was @round (nearest), which rounded UP across the half (14.76 ft -> 14.8) — both a
-    // spec divergence AND the unsafe direction.
-    const tenths: i64 = @intFromFloat(@floor(d * 10.0 + 1e-6));
-    const idepth: i64 = @divTrunc(tenths, 10);
-    const frac: u8 = @intCast(@mod(tenths, 10));
-    var dbuf: [12]u8 = undefined;
-    const ds = std.fmt.bufPrint(&dbuf, "{d}", .{idepth}) catch return "";
-    var toks = std.ArrayList([]const u8).empty;
-
-    // Quality prefixes lead the composite (SNDFRM04:37-51). Swept soundings get a B1
-    // ring; low-accuracy ones get a ring sized to the variant — C3 on the shallow
-    // SOUNDS glyph, C2 on the deep SOUNDG glyph (the rule's lowAccuracySymbolRing).
-    if (swept) try toks.append(a, try std.fmt.allocPrint(a, "{s}B1", .{prefix}));
-    if (low_acc) {
-        const ring = if (std.mem.eql(u8, prefix, "SOUNDS")) "C3" else "C2";
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, ring }));
-    }
-
-    // Negative soundings (drying heights / heights above datum) get an A-prefix ring
-    // (SNDFRM04:62-68): A3 if |d|>=10 with a fraction, A2 if |d|>=10 whole, else A1.
-    // (Only SOUNDS* A-glyphs exist — a negative sounding is always <= safety depth so
-    // the style picks the SOUNDS variant; the SOUNDG variant is composed but unused.)
-    if (depth < 0) {
-        if (idepth >= 10 and frac != 0) {
-            try toks.append(a, try std.fmt.allocPrint(a, "{s}A3", .{prefix}));
-        } else if (idepth >= 10) {
-            try toks.append(a, try std.fmt.allocPrint(a, "{s}A2", .{prefix}));
-        } else {
-            try toks.append(a, try std.fmt.allocPrint(a, "{s}A1", .{prefix}));
-        }
-    }
-
-    if (idepth < 10) {
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[0] }));
-        if (frac != 0) try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
-    } else if (idepth < 100 and frac != 0 and (idepth < 31 or always_tenths)) {
-        // Two integer digits + a subscript tenth. SNDFRM04 only does this below 31
-        // (native metres rule); `always_tenths` extends it to 99 for a CONVERTED value
-        // (feet) so a converted sounding never collapses to a whole number — we don't
-        // round conversions. (>= 100 displayed units still drop the tenth: the 3-digit
-        // glyph arrangement has no subscript slot.)
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
-    } else if (idepth < 100) {
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[0] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[1] }));
-    } else if (idepth < 1000) {
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[2] }));
-    } else if (idepth < 10000) {
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[2] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}4{c}", .{ prefix, ds[3] }));
-    } else {
-        // >= 10000 m (deepest oceans ~11 km): 5 digits at codes 3,2,1,0,4.
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}3{c}", .{ prefix, ds[0] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[1] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[2] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}0{c}", .{ prefix, ds[3] }));
-        try toks.append(a, try std.fmt.allocPrint(a, "{s}4{c}", .{ prefix, ds[4] }));
-    }
-    return std.mem.join(a, ",", toks.items);
-}
+// SNDFRM04 glyph composition + the S-52 symbol scale live in the render module
+// (render.sndfrm) so the pixel path composes the SAME glyph lists this engine
+// bakes into sym_s/sym_g. Aliased here; all call sites unchanged.
+const sndfrmSyms = @import("render").sndfrm.syms;
 
 /// SNDFRM04 quality flags for the whole feature: swept (TECSOU∈{4,18}) → B1 ring;
 /// low-accuracy (QUASOU∈{3,4,8,9}, no-bottom, or STATUS∈{18}) → C2/C3 ring.

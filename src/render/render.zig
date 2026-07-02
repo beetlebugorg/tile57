@@ -25,6 +25,8 @@ pub const canvas = @import("canvas.zig");
 pub const raster = @import("raster.zig");
 pub const png = @import("png.zig");
 pub const pixel = @import("pixel.zig");
+pub const symbols = @import("symbols.zig");
+pub const sndfrm = @import("sndfrm.zig");
 
 test {
     _ = surface;
@@ -34,4 +36,6 @@ test {
     _ = raster;
     _ = png;
     _ = pixel;
+    _ = symbols;
+    _ = sndfrm;
 }

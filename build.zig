@@ -242,6 +242,9 @@ pub fn build(b: *std.Build) void {
     const sprite_mod = b.addModule("sprite", .{
         .root_source_file = b.path("src/sprite/sprite.zig"),
         .link_libc = true,
+        // render: the vector-symbol types (symbols.Symbol/SymbolStore) the
+        // CatalogStore produces for the pixel path.
+        .imports = &.{.{ .name = "render", .module = render_mod }},
     });
     addSvgRaster(b, sprite_mod);
 

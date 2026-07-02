@@ -790,3 +790,129 @@ fn atlasJson(a: std.mem.Allocator, cells: *std.StringHashMap(Cell), width: u32, 
     try out.appendSlice(a, "\n}\n");
     return out.toOwnedSlice(a);
 }
+
+// ---- vector symbol store (render-engine pixel path) ------------------------
+//
+// The PARSE half of nanosvg, split from rasterization: symbol SVGs become
+// flattened vector outlines (render.symbols.Symbol) the PixelSurface replays
+// onto a Canvas at scale/rotation — same flatten/CSS pipeline as the atlas
+// above, so the two cannot disagree about what a symbol looks like.
+
+const render = @import("render");
+
+extern fn tg_svg_parse_paths(svg: [*:0]u8, out_n: *c_int) ?[*]f32;
+
+fn streamColor(s: []const f32) render.canvas.Color {
+    return .{
+        .r = @intFromFloat(std.math.clamp(s[0], 0, 255)),
+        .g = @intFromFloat(std.math.clamp(s[1], 0, 255)),
+        .b = @intFromFloat(std.math.clamp(s[2], 0, 255)),
+        .a = @intFromFloat(std.math.clamp(s[3], 0, 255)),
+    };
+}
+
+/// Parse one catalogue symbol SVG into vector geometry: CSS-flatten exactly
+/// like renderSym, nanosvg-parse (tg_svg_parse_paths stream), flatten the
+/// cubic runs. Geometry in SVG user units (mm for S-101), pivot at the S-52
+/// pivot point. Null on parse failure or an empty symbol.
+pub fn parseSymbol(a: std.mem.Allocator, svg: []const u8, css: *std.StringHashMap([]const u8)) ?render.symbols.Symbol {
+    const flat = flatten(a, svg, css) catch return null;
+    var n: c_int = 0;
+    const buf = tg_svg_parse_paths(flat.svg.ptr, &n) orelse return null;
+    defer tg_svg_free(buf);
+    const stream = buf[0..@intCast(n)];
+
+    var paths = std.ArrayList(render.symbols.StyledPath).empty;
+    var i: usize = 0;
+    while (i < stream.len and stream[i] == 1.0) {
+        i += 1;
+        const has_fill = stream[i] != 0;
+        const fill = streamColor(stream[i + 1 .. i + 5]);
+        i += 5;
+        const has_stroke = stream[i] != 0;
+        const stroke = streamColor(stream[i + 1 .. i + 5]);
+        const stroke_w = stream[i + 5];
+        i += 6;
+        var contours = std.ArrayList([]const render.canvas.Point).empty;
+        while (i < stream.len and stream[i] == 2.0) {
+            i += 1;
+            const npts: usize = @intFromFloat(stream[i]);
+            const closed = stream[i + 1] != 0;
+            i += 2;
+            const pts = stream[i .. i + npts * 2];
+            i += npts * 2;
+            const flat_pts = render.symbols.flattenCubics(a, pts, closed) catch return null;
+            if (flat_pts.len >= 2) contours.append(a, flat_pts) catch return null;
+        }
+        if (contours.items.len == 0) continue;
+        paths.append(a, .{
+            .fill = if (has_fill and fill.a > 0) fill else null,
+            .stroke = if (has_stroke and stroke.a > 0) .{ .color = stroke, .width = stroke_w } else null,
+            .contours = contours.items,
+        }) catch return null;
+    }
+    if (paths.items.len == 0) return null;
+    // The S-52 pivot is the pre-normalization user origin, which flatten()'s
+    // translate moved to (-vb[0], -vb[1]) — same as renderSym's pivot math.
+    return .{
+        .paths = paths.items,
+        .pivot = .{ .x = @floatCast(-flat.vb[0]), .y = @floatCast(-flat.vb[1]) },
+    };
+}
+
+/// Parse-on-demand symbol store over the catalogue's id->svg sources + a
+/// palette stylesheet, with a permanent cache (parse once per name; failures
+/// cached too so a bad SVG isn't re-parsed per feature). Implements
+/// render.symbols.SymbolStore. Single-threaded, like a render scene.
+pub const CatalogStore = struct {
+    arena: std.heap.ArenaAllocator,
+    css: std.StringHashMap([]const u8),
+    by_name: std.StringHashMap([]const u8), // id -> svg source bytes
+    cache: std.StringHashMap(?*render.symbols.Symbol),
+
+    const vtable = render.symbols.SymbolStore.VTable{ .get = getImpl };
+
+    /// Self-owning: the store is allocated inside its own arena, so the
+    /// hashmaps' captured allocators point at a STABLE arena (returning an
+    /// ArenaAllocator by value would leave them dangling on the old stack).
+    pub fn init(gpa: std.mem.Allocator, srcs: []const SvgSrc, css_data: []const u8) !*CatalogStore {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const self = try arena.allocator().create(CatalogStore);
+        self.arena = arena; // moved in; allocate via self.arena from here on
+        const a = self.arena.allocator();
+        self.css = try loadCss(a, css_data);
+        self.by_name = std.StringHashMap([]const u8).init(a);
+        self.cache = std.StringHashMap(?*render.symbols.Symbol).init(a);
+        for (srcs) |s| try self.by_name.put(s.id, s.svg);
+        return self;
+    }
+
+    pub fn deinit(self: *CatalogStore) void {
+        var arena = self.arena; // self lives inside it — copy out, then free
+        arena.deinit();
+    }
+
+    pub fn asStore(self: *CatalogStore) render.symbols.SymbolStore {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn getImpl(ctx: *anyopaque, name: []const u8) ?*const render.symbols.Symbol {
+        const self: *CatalogStore = @ptrCast(@alignCast(ctx));
+        if (self.cache.get(name)) |hit| return hit;
+        const a = self.arena.allocator();
+        const key = a.dupe(u8, name) catch return null;
+        const svg = self.by_name.get(name) orelse {
+            self.cache.put(key, null) catch {};
+            return null;
+        };
+        const parsed = parseSymbol(a, svg, &self.css) orelse {
+            self.cache.put(key, null) catch {};
+            return null;
+        };
+        const boxed = a.create(render.symbols.Symbol) catch return null;
+        boxed.* = parsed;
+        self.cache.put(key, boxed) catch {};
+        return boxed;
+    }
+};

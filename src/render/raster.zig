@@ -77,11 +77,11 @@ pub const RasterCanvas = struct {
 
     // ---- Canvas impl --------------------------------------------------------
 
-    fn fillPathImpl(ctx: *anyopaque, rings: []const []const cv.Point, color: cv.Color) anyerror!void {
+    fn fillPathImpl(ctx: *anyopaque, rings: []const []const cv.Point, color: cv.Color, rule: cv.FillRule) anyerror!void {
         const self = sp(ctx);
         self.edges.clearRetainingCapacity();
         for (rings) |ring| try self.addRing(ring);
-        try self.rasterize(color);
+        try self.rasterize(color, rule);
     }
 
     fn strokePathImpl(ctx: *anyopaque, lines: []const []const cv.Point, width_px: f32, dash: ?[2]f32, color: cv.Color) anyerror!void {
@@ -95,7 +95,7 @@ pub const RasterCanvas = struct {
                 try self.strokeRun(line, width_px);
             }
         }
-        try self.rasterize(color);
+        try self.rasterize(color, .nonzero);
     }
 
     // ---- edge building ------------------------------------------------------
@@ -201,7 +201,7 @@ pub const RasterCanvas = struct {
 
     // ---- scanline rasterization ----------------------------------------------
 
-    fn rasterize(self: *RasterCanvas, color: cv.Color) !void {
+    fn rasterize(self: *RasterCanvas, color: cv.Color, rule: cv.FillRule) !void {
         if (self.edges.items.len == 0 or color.a == 0) return;
         const wf: f32 = @floatFromInt(self.w);
         const hf: f32 = @floatFromInt(self.h);
@@ -262,11 +262,21 @@ pub const RasterCanvas = struct {
                 var winding: i32 = 0;
                 var span_start: f32 = 0;
                 for (self.crossings.items) |c| {
-                    const prev = winding;
-                    winding += c.dir;
-                    if (prev == 0 and winding != 0) {
+                    const was_in = switch (rule) {
+                        .nonzero => winding != 0,
+                        .even_odd => @mod(winding, 2) != 0,
+                    };
+                    winding += switch (rule) {
+                        .nonzero => c.dir,
+                        .even_odd => 1, // parity: direction irrelevant
+                    };
+                    const is_in = switch (rule) {
+                        .nonzero => winding != 0,
+                        .even_odd => @mod(winding, 2) != 0,
+                    };
+                    if (!was_in and is_in) {
                         span_start = c.x;
-                    } else if (prev != 0 and winding == 0) {
+                    } else if (was_in and !is_in) {
                         self.addSpan(span_start, c.x, wf);
                     }
                 }
@@ -336,7 +346,7 @@ test "fill: axis-aligned rect covers fully, half-pixel edge blends ~50%" {
     rc.clear(.{ .r = 0, .g = 0, .b = 0 });
     const ring = [_]cv.Point{ .{ .x = 2, .y = 2 }, .{ .x = 10.5, .y = 2 }, .{ .x = 10.5, .y = 10 }, .{ .x = 2, .y = 10 } };
     const rings = [_][]const cv.Point{&ring};
-    try rc.asCanvas().fillPath(&rings, .{ .r = 255, .g = 255, .b = 255 });
+    try rc.asCanvas().fillPath(&rings, .{ .r = 255, .g = 255, .b = 255 }, .nonzero);
     try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, pxAt(&rc, 5, 5)); // interior
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pxAt(&rc, 12, 5)); // outside
     const edge = pxAt(&rc, 10, 5); // x in [10,10.5): half covered
@@ -352,7 +362,7 @@ test "fill: nonzero winding — overlapping same-direction rings fill uniformly"
     const r1 = [_]cv.Point{ .{ .x = 2, .y = 2 }, .{ .x = 10, .y = 2 }, .{ .x = 10, .y = 10 }, .{ .x = 2, .y = 10 } };
     const r2 = [_]cv.Point{ .{ .x = 6, .y = 6 }, .{ .x = 14, .y = 6 }, .{ .x = 14, .y = 14 }, .{ .x = 6, .y = 14 } };
     const rings = [_][]const cv.Point{ &r1, &r2 };
-    try rc.asCanvas().fillPath(&rings, .{ .r = 200, .g = 0, .b = 0, .a = 128 });
+    try rc.asCanvas().fillPath(&rings, .{ .r = 200, .g = 0, .b = 0, .a = 128 }, .nonzero);
     // The overlap zone composites ONCE (winding 2 == winding 1 coverage).
     try std.testing.expectEqual(pxAt(&rc, 4, 4), pxAt(&rc, 8, 8));
 }
@@ -365,7 +375,7 @@ test "fill: counter-oriented inner ring is a hole" {
     const outer = [_]cv.Point{ .{ .x = 2, .y = 2 }, .{ .x = 14, .y = 2 }, .{ .x = 14, .y = 14 }, .{ .x = 2, .y = 14 } };
     const hole = [_]cv.Point{ .{ .x = 6, .y = 6 }, .{ .x = 6, .y = 10 }, .{ .x = 10, .y = 10 }, .{ .x = 10, .y = 6 } }; // reversed
     const rings = [_][]const cv.Point{ &outer, &hole };
-    try rc.asCanvas().fillPath(&rings, .{ .r = 255, .g = 255, .b = 255 });
+    try rc.asCanvas().fillPath(&rings, .{ .r = 255, .g = 255, .b = 255 }, .nonzero);
     try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, pxAt(&rc, 4, 8)); // rim
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pxAt(&rc, 8, 8)); // hole
 }
@@ -415,7 +425,7 @@ test "determinism: identical scene twice -> identical buffers" {
         rc.clear(.{ .r = 10, .g = 20, .b = 30 });
         const tri = [_]cv.Point{ .{ .x = 3.2, .y = 5.1 }, .{ .x = 60.7, .y = 12.9 }, .{ .x = 31.5, .y = 58.4 } };
         const rings = [_][]const cv.Point{&tri};
-        try rc.asCanvas().fillPath(&rings, .{ .r = 120, .g = 40, .b = 200, .a = 180 });
+        try rc.asCanvas().fillPath(&rings, .{ .r = 120, .g = 40, .b = 200, .a = 180 }, .nonzero);
         const line = [_]cv.Point{ .{ .x = 5, .y = 60 }, .{ .x = 55, .y = 30 }, .{ .x = 60, .y = 5 } };
         const lines = [_][]const cv.Point{&line};
         try rc.asCanvas().strokePath(&lines, 3, .{ 4, 3 }, .{ .r = 255, .g = 255, .b = 0, .a = 200 });

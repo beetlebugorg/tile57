@@ -707,8 +707,27 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     const streams = try engine.portray.portrayCell(a, &cell, resolveRulesDir(rules));
 
     var colors = try render.resolve.Colors.init(a, catalog_embed.colorprofile[0].bytes);
-    const settings = render.resolve.MarinerSettings{};
+    // Display "other" on by default: spot soundings are S-52 category Other,
+    // and this is the recreational verify path (the host enables Other too).
+    const settings = render.resolve.MarinerSettings{ .display_other = true };
     var ps = render.pixel.PixelSurface.init(a, &colors, palette, &settings, @floatFromInt(z), size, engine.tile.EXTENT);
+
+    // Vector symbol store over the embedded catalogue, palette-matched CSS.
+    const css_name = switch (palette) {
+        .day => "daySvgStyle",
+        .dusk => "duskSvgStyle",
+        .night => "nightSvgStyle",
+    };
+    var css_data: []const u8 = "";
+    for (catalog_embed.css) |e| {
+        if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
+    }
+    const sym_srcs = try a.alloc(sprite.SvgSrc, catalog_embed.symbols.len);
+    for (catalog_embed.symbols, 0..) |e, si| sym_srcs[si] = .{ .id = e.name, .svg = e.bytes };
+    const store = try sprite.CatalogStore.init(a, sym_srcs, css_data);
+    defer store.deinit();
+    ps.store = store.asStore();
+
     const cells = [_]engine.s57_mvt.CellRef{.{ .cell = &cell, .portrayal = streams }};
     const bytes = try engine.s57_mvt.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
