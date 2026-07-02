@@ -685,6 +685,7 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     var palette: render.resolve.PaletteId = .day;
     var rules: ?[]const u8 = null;
     var dq = false;
+    var size_scale: f64 = 1.0; // physical-size multiplier (S-52 mm -> true mm)
     var f = Flags{ .args = args, .i = 5 }; // positionals end at args[5]
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
@@ -699,6 +700,9 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
             rules = f.next() orelse return usageErr("--rules needs a dir");
         } else if (std.mem.eql(u8, arg, "--dq")) {
             dq = true; // S-52 data-quality overlay (M_QUAL DQUAL* patterns)
+        } else if (std.mem.eql(u8, arg, "--scale")) {
+            const v = f.next() orelse return usageErr("--scale needs a value");
+            size_scale = std.fmt.parseFloat(f64, v) catch return usageErr("bad --scale");
         } else return usageErr("unknown flag");
     }
     const out = out_path orelse return usageErr("-o <out.png> is required");
@@ -712,7 +716,7 @@ fn runRenderPng(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !v
     var colors = try render.resolve.Colors.init(a, catalog_embed.colorprofile[0].bytes);
     // Display "other" on by default: spot soundings are S-52 category Other,
     // and this is the recreational verify path (the host enables Other too).
-    const settings = render.resolve.MarinerSettings{ .display_other = true, .data_quality = dq };
+    const settings = render.resolve.MarinerSettings{ .display_other = true, .data_quality = dq, .size_scale = size_scale };
     var ps = render.pixel.PixelSurface.init(a, &colors, palette, &settings, @floatFromInt(z), size, engine.tile.EXTENT);
 
     // Vector symbol store over the embedded catalogue, palette-matched CSS.

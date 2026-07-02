@@ -141,13 +141,22 @@ pub const PixelSurface = struct {
         try self.push(.{ .fill = .{ .rings = try self.toCanvas(rings), .color = self.resolveColor(token) } });
     }
 
+    /// Device px per CSS px: the supersample factor (a 512px tile is the @2x
+    /// render of the 256 baseline) times the mariner's physical-size
+    /// multiplier (settings.size_scale — the style applies the same factor to
+    /// icon-size / line-width / text-size so 1 S-52 mm reads as a true mm on
+    /// a calibrated display).
+    fn devScale(self: *const PixelSurface) f64 {
+        return self.settings.size_scale * @as(f64, @floatFromInt(self.size_px)) / 256.0;
+    }
+
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
         const self = sp(ctx);
         const store = self.store orelse return;
         if (!self.cur_visible) return;
         // The pattern cell rasterizes at this scene's screen density, so it
         // repeats at the same on-screen period as the MapLibre fill-pattern.
-        const ppm: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * @as(f64, @floatFromInt(self.size_px)) / 256.0);
+        const ppm: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.devScale());
         const cell = store.getPattern(name, ppm) orelse return;
         try self.push(.{ .pattern = .{ .rings = try self.toCanvas(rings), .cell = cell } });
     }
@@ -156,7 +165,7 @@ pub const PixelSurface = struct {
         _ = valdco; // contour labels are text (P4)
         const self = sp(ctx);
         if (!self.cur_visible) return;
-        const w: f32 = @floatCast(width_px);
+        const w: f32 = @floatCast(width_px * self.devScale());
         const d: ?[2]f32 = switch (dash) {
             .solid => null,
             .dashed => .{ DASH_ON * w, DASH_OFF * w },
@@ -202,9 +211,10 @@ pub const PixelSurface = struct {
 
     /// Buffer one symbol's styled paths, transformed into canvas space:
     /// symbol-mm geometry relative to the pivot, scaled by `scale` (screen px
-    /// per 0.01 mm) x the canvas supersample, rotated, anchored at `at`.
+    /// per 0.01 mm) x the device scale (supersample + physical multiplier),
+    /// rotated, anchored at `at`.
     fn pushSymbol(self: *PixelSurface, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64) !void {
-        const k: f32 = @floatCast(scale * 100.0 * @as(f64, @floatFromInt(self.size_px)) / 256.0);
+        const k: f32 = @floatCast(scale * 100.0 * self.devScale());
         const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
         const cosr = @cos(rad);
         const sinr = @sin(rad);
@@ -329,7 +339,10 @@ test "PixelSurface: unknown token falls back magenta, dashed maps to [4w,3w]" {
 
     const op = ps.ops.items[0].kind.stroke;
     try std.testing.expectEqual(FALLBACK, op.color);
-    try std.testing.expectEqual([2]f32{ 8, 6 }, op.dash.?);
+    // Stroke width scales with the device scale (64px canvas = 0.25x the 256
+    // baseline): 2 CSS px -> 0.5 device px; dash [4w, 3w] follows.
+    try std.testing.expectEqual(@as(f32, 0.5), op.width);
+    try std.testing.expectEqual([2]f32{ 2, 1.5 }, op.dash.?);
     // 4096-extent geometry landed in 64px space.
     try std.testing.expectEqual(@as(f32, 32), op.lines[0][1].y);
     try std.testing.expectEqual(@as(f32, 64), op.lines[0][1].x);
