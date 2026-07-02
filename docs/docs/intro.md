@@ -96,11 +96,6 @@ files — in embedded Lua 5.4. The tiles carry S-52 colour **tokens** (never RGB
 and the generated `colortables.json` resolves those tokens to Day / Dusk / Night
 hex, so a renderer can switch palette without regenerating tiles.
 
-The companion Go project,
-[**chartplotter-go**](https://github.com/beetlebugorg/chartplotter), bakes the
-same charts and is the parity oracle; tile57's portrayal mirrors it stage for
-stage.
-
 ## Where to go next
 
 - [**Installation**](./installation.md) — Zig 0.16, submodules, `zig build`.

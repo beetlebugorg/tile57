@@ -34,7 +34,7 @@ Install it from [ziglang.org/download](https://ziglang.org/download/) (pin
 
 ```sh
 zig build         # builds zig-out/bin/tile57 + libtile57.a
-zig build test    # runs the unit + parity tests
+zig build test    # runs the test suite
 ```
 
 `zig build` produces:

@@ -51,12 +51,10 @@ orientation + clearance complex attributes are synthesized. Remaining gaps:
 - **Single-primitive rules vs. non-conformant geometry.** Some S-101 rules handle
   only one primitive (e.g. RecommendedTrack is Curve-only); a cell that encodes the
   feature with another primitive (an area-encoded recommended track) errors in the
-  rule and the feature is suppressed — the Go reference behaves identically.
+  rule and the feature is suppressed.
 
-A pre-baked PMTiles archive from chartplotter-go does not have these gaps; they are
-specific to tile57's own portrayal. The `tile57` CLI baker runs the same full
-S-101 portrayal as the live `Source` path, so a baked archive matches live
-generation.
+The `tile57` CLI baker runs the same full S-101 portrayal as the live chart
+path, so a baked archive matches live generation.
 
 ## ENC_ROOT loading
 

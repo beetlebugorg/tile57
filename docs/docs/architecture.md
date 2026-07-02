@@ -7,9 +7,7 @@ sidebar_position: 6
 # Architecture
 
 This page explains how tile57 turns an S-57 chart cell into vector tiles, how the
-codebase is layered, and the memory design that keeps it small. The Go project at
-[chartplotter-go](https://github.com/beetlebugorg/chartplotter) is the reference
-implementation and parity oracle; the Zig pipeline mirrors it stage for stage.
+codebase is layered, and the memory design that keeps it small.
 
 ## The pipeline
 
