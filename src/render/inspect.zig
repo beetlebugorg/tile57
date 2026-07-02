@@ -6,7 +6,7 @@
 //!   feature X produced: fillArea(DEPVS), drawSymbol(BOYLAT23 @…), drawText(…)
 //!
 //! It is the mirror image of noop.zig (which discards every call) and ascii.zig
-//! (which lowers each call to a character): here the recording IS the output.
+//! (which resolves each call to a character): here the recording IS the output.
 //!
 //! Same rule as every surface (surface.zig): no s57 / s100 / portray imports.
 //! The FeatureMeta the engine hands beginFeature already carries the S-57 class

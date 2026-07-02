@@ -1570,7 +1570,7 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
 //                       rules emit (portray.portrayCell), RAW and PARSED into
 //                       symbols / lines / fills / texts / aug figures
 //                       (s101_instr.parse).
-//   3. Lowered calls  — what the portrayal BECOMES after geometry resolution:
+//   3. Resolved calls — what the portrayal BECOMES after geometry resolution:
 //                       the Surface vtable calls, captured by the recording
 //                       InspectSurface (render/inspect.zig) driven through
 //                       scene.appendTile, matched back to each feature by its
@@ -1599,14 +1599,14 @@ const ExRow = struct {
     attrs: []const ExAttr,
     raw: ?[]const u8, // level 2: raw instruction stream
     parsed: ?engine.s101_instr.Portrayal, // level 2: parsed
-    lowered: ?ExLevel3, // level 3
+    resolved: ?ExLevel3, // level 3
 };
 
 const ExFilters = struct {
     classes: ?[]const u8 = null, // comma-separated acronym allow-list
     obj: ?u64 = null, // match feature index OR rcid OR foid
-    zoom: ?f64 = null, // override the auto fit-zoom for the lowering pass
-    do_lower: bool = true,
+    zoom: ?f64 = null, // override the auto fit-zoom for the resolving pass
+    do_resolve: bool = true,
 };
 
 fn exPrimName(p: u8) []const u8 {
@@ -1674,7 +1674,7 @@ fn exKey(a: std.mem.Allocator, class: []const u8, s57_json: []const u8) []const 
 const ExQueue = struct { idxs: std.ArrayList(usize) = .empty, head: usize = 0 };
 
 // Collect one parsed cell's features into `rows` (levels 1+2 always; level 3 when
-// do_lower and the cell has bounds). Strings a Row keeps are duped into `a`, so
+// do_resolve and the cell has bounds). Strings a Row keeps are duped into `a`, so
 // the caller may deinit the cell afterwards.
 fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8, rules: []const u8, F: ExFilters, rows: *std.ArrayList(ExRow)) !void {
     // Level 2 — S-101 instruction streams, indexed by feature index.
@@ -1684,8 +1684,8 @@ fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8,
     // the recorded passes by fingerprint for per-feature lookup below.
     var recorded: []const render.inspect.RecordedFeature = &.{};
     var qmap = std.StringHashMap(ExQueue).init(a);
-    var lower_view: ?ExLevel3 = null;
-    if (F.do_lower) {
+    var resolve_view: ?ExLevel3 = null;
+    if (F.do_resolve) {
         if (cell.bounds()) |b| {
             const v = if (F.zoom) |zz| exTileAt(b, zz) else exFitTile(b, 19);
             var is = render.inspect.InspectSurface.init(a);
@@ -1701,7 +1701,7 @@ fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8,
                 if (!gop.found_existing) gop.value_ptr.* = .{};
                 try gop.value_ptr.idxs.append(a, ri);
             }
-            lower_view = v;
+            resolve_view = v;
         }
     }
 
@@ -1726,8 +1726,8 @@ fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8,
         const raw: ?[]const u8 = if (portrayal) |p| (if (fi < p.len) p[fi] else null) else null;
         const parsed: ?engine.s101_instr.Portrayal = if (raw) |s| (engine.s101_instr.parse(a, s) catch null) else null;
 
-        var lowered: ?ExLevel3 = null;
-        if (lower_view) |lv| {
+        var resolved: ?ExLevel3 = null;
+        if (resolve_view) |lv| {
             var matched = false;
             var call_items: []const render.inspect.Call = &.{};
             if (class) |cls| {
@@ -1753,7 +1753,7 @@ fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8,
                     call_items = calls.items;
                 };
             }
-            lowered = .{ .calls = call_items, .z = lv.z, .x = lv.x, .y = lv.y, .matched = matched };
+            resolved = .{ .calls = call_items, .z = lv.z, .x = lv.x, .y = lv.y, .matched = matched };
         }
 
         try rows.append(a, .{
@@ -1768,7 +1768,7 @@ fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8,
             .attrs = attrs.items,
             .raw = raw,
             .parsed = parsed,
-            .lowered = lowered,
+            .resolved = resolved,
         });
     }
 }
@@ -1860,9 +1860,9 @@ fn exFormatDetail(a: std.mem.Allocator, row: ExRow) ![]const u8 {
         }
     }
 
-    // Level 3 — lowered Surface calls.
-    try out.appendSlice(a, "  3. Lowered Surface calls:\n");
-    if (row.lowered) |lo| {
+    // Level 3 — resolved Surface calls.
+    try out.appendSlice(a, "  3. Resolved Surface calls:\n");
+    if (row.resolved) |lo| {
         if (!lo.matched) {
             try out.print(a, "     (not in the sampled tile z{d} {d}/{d}/{d}; use --zoom to sample a tile it covers)\n", .{ lo.z, lo.z, lo.x, lo.y });
         } else if (lo.calls.len == 0) {
@@ -1872,7 +1872,7 @@ fn exFormatDetail(a: std.mem.Allocator, row: ExRow) ![]const u8 {
             for (lo.calls) |c| try exAppendCall(a, &out, c);
         }
     } else {
-        try out.appendSlice(a, "     (lowering disabled / cell has no bounds)\n");
+        try out.appendSlice(a, "     (resolving disabled / cell has no bounds)\n");
     }
 
     return out.items;
@@ -1926,14 +1926,14 @@ fn exWriteJson(a: std.mem.Allocator, rows: []const ExRow) ![]const u8 {
             try out.print(a, "],\"lines\":{d},\"patterns\":{d},\"aug_figures\":{d}}}", .{ p.lines.len, p.patterns.len, p.aug_figures.len });
         } else try out.appendSlice(a, ",\"portrayal\":null");
         // Level 3.
-        if (row.lowered) |lo| {
-            try out.print(a, ",\"lowered\":{{\"z\":{d},\"x\":{d},\"y\":{d},\"matched\":{},\"calls\":[", .{ lo.z, lo.x, lo.y, lo.matched });
+        if (row.resolved) |lo| {
+            try out.print(a, ",\"resolved\":{{\"z\":{d},\"x\":{d},\"y\":{d},\"matched\":{},\"calls\":[", .{ lo.z, lo.x, lo.y, lo.matched });
             for (lo.calls, 0..) |c, j| {
                 if (j > 0) try out.append(a, ',');
                 try exJsonStr(a, &out, @tagName(std.meta.activeTag(c)));
             }
             try out.appendSlice(a, "]}");
-        } else try out.appendSlice(a, ",\"lowered\":null");
+        } else try out.appendSlice(a, ",\"resolved\":null");
         try out.appendSlice(a, "}");
     }
     try out.appendSlice(a, "]\n");
@@ -1972,7 +1972,7 @@ fn exLoadCell(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []con
 
 fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--no-lower] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--no-resolve] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -1994,8 +1994,8 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
             json = true;
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui = true;
-        } else if (std.mem.eql(u8, arg, "--no-lower")) {
-            F.do_lower = false;
+        } else if (std.mem.eql(u8, arg, "--no-resolve")) {
+            F.do_resolve = false;
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules_flag = f.val("--rules") orelse return;
         } else return usageErr("unknown flag");
@@ -2359,9 +2359,9 @@ fn printUsage() void {
         \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
         \\  tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]
         \\      Dump, per feature, the RAW S-57 (class + attributes), the S-101
-        \\      portrayal instruction stream (raw + parsed), and the lowered
-        \\      Surface draw calls. --zoom N picks the lowering tile; --json;
-        \\      --no-lower skips the draw-call pass; --tui opens the two-pane
+        \\      portrayal instruction stream (raw + parsed), and the resolved
+        \\      Surface draw calls. --zoom N picks the resolving tile; --json;
+        \\      --no-resolve skips the draw-call pass; --tui opens the two-pane
         \\      explorer (arrows select, / filters by class, q quits).
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>

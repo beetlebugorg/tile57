@@ -6,7 +6,7 @@
 //!
 //!   1. raw S-57      — FeatureMeta.class / .s57_json on the recorded feature
 //!   2. S-101 stream  — portray.portrayCell → s101_instr.parse
-//!   3. lowered calls — the Surface calls the InspectSurface captured
+//!   3. resolved calls — the Surface calls the InspectSurface captured
 //!
 //! End-to-end seam: portray -> instruction parse -> geometry/clip -> Surface
 //! calls -> recorded structure. Own test artifact, like ascii_view_test: `portray`
@@ -123,7 +123,7 @@ test "inspect view: real rules -> InspectSurface records the 3 levels per featur
     const depare_parsed = try @import("s100").s101_instr.parse(a, streams[0].?);
     try std.testing.expect(depare_parsed.fill_token != null);
 
-    // --- COALNE: a line feature lowers to a stroke. ---
+    // --- COALNE: a line feature resolves to a stroke. ---
     const coalne = byClass(&is, "COALNE") orelse return error.NoCoalne;
     var coalne_stroked = false;
     for (coalne.calls.items) |c| switch (c) {
