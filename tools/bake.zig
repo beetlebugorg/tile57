@@ -967,18 +967,19 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
 }
 
 // tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom>
-//     [--size COLSxROWS] [--palette day|dusk|night] [--ansi] [--rules DIR]
+//     [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--rules DIR]
 // The chart on stdout as a Unicode text grid — the render-engine EXAMPLE
 // backend (src/render/ascii.zig): the same chart layer + view driver as
 // `tile57 png`, with the AsciiSurface at the end instead of the pixel one.
 fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS] [--palette day|dusk|night] [--ansi] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
     var cols: u32 = 100;
     var rows: u32 = 36;
+    var size_given = false;
     var palette: render.resolve.PaletteId = .day;
     var rules: ?[]const u8 = null;
     var ansi = false;
@@ -997,6 +998,7 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
             const xi = std.mem.indexOfScalar(u8, v, 'x') orelse return usageErr("bad --size");
             cols = std.fmt.parseInt(u32, v[0..xi], 10) catch return usageErr("bad --size");
             rows = std.fmt.parseInt(u32, v[xi + 1 ..], 10) catch return usageErr("bad --size");
+            size_given = true;
         } else if (std.mem.eql(u8, arg, "--palette")) {
             const v = f.next() orelse return usageErr("--palette needs a value");
             palette = std.meta.stringToEnum(render.resolve.PaletteId, v) orelse return usageErr("palette must be day|dusk|night");
@@ -1007,6 +1009,17 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
         } else return usageErr("unknown flag");
     }
     const v = view orelse return usageErr("--view lon,lat,zoom is required");
+    // No explicit --size: fit the terminal (minus a prompt line) so the
+    // picture never line-wraps; non-TTY output (pipes/files) keeps the fixed
+    // default. ANSI mode additionally brackets its output in DECAWM
+    // autowrap-off (see AsciiSurface), so even an over-wide grid clips at the
+    // right edge instead of wrapping.
+    if (!size_given) {
+        if (terminalSize(io)) |ts| {
+            cols = @max(20, ts[0]);
+            rows = @max(10, ts[1] -| 1);
+        }
+    }
     if (cols == 0 or rows == 0) return usageErr("--size must be positive");
 
     engine.portray.setQuiet(true);
@@ -1025,6 +1038,24 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     const text = c.renderAscii(v.lon, v.lat, v.zoom, cols, rows, palette, &m, ansi) catch return usageErr("render failed");
     defer chart.freeBytes(text);
     std.Io.File.stdout().writeStreamingAll(io, text) catch {};
+}
+
+// The controlling terminal's COLSxROWS, or null when stdout isn't a TTY (or
+// the platform gives us no TIOCGWINSZ) — the `ascii` grid's no-wrap default.
+// The std.Progress terminal-size pattern (Io.operate device_io_control).
+fn terminalSize(io: std.Io) ?[2]u32 {
+    if (@import("builtin").os.tag == .windows) return null;
+    const f = std.Io.File.stdout();
+    if ((f.isTty(io) catch return null) == false) return null;
+    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const err = (io.operate(.{ .device_io_control = .{
+        .file = f,
+        .code = std.posix.T.IOCGWINSZ,
+        .arg = &ws,
+    } }) catch return null).device_io_control;
+    if (err < 0) return null;
+    if (ws.col == 0 or ws.row == 0) return null;
+    return .{ ws.col, ws.row };
 }
 
 fn usageErr(msg: []const u8) void {
@@ -1070,7 +1101,7 @@ fn printUsage() void {
         \\      Sources: an S-57 cell (live portrayal) or a baked .pmtiles
         \\      bundle (tile replay). --dq data-quality overlay; --scale F
         \\      physical-size multiplier; --palette day|dusk|night.
-        \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS] [--ansi]
+        \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi]
         \\      The chart on stdout as a Unicode text grid (the example render
         \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
         \\  tile57 inspect <file.pmtiles> [z x y]

@@ -483,7 +483,11 @@ pub const AsciiSurface = struct {
 
         // Encode: UTF-8 rows; in ANSI mode fore/background escapes are emitted
         // only on change, and every row ends reset so a pager can't bleed.
+        // ANSI output is bracketed in DECAWM autowrap-off/-on (ESC[?7l/?7h) so
+        // a grid wider than the terminal CLIPS at the right edge instead of
+        // wrapping and shearing the picture.
         var buf = std.ArrayList(u8).empty;
+        if (self.ansi) try buf.appendSlice(out, "\x1b[?7l");
         var r: u32 = 0;
         while (r < self.rows) : (r += 1) {
             var fg: ?u8 = null; // rows start at the terminal defaults
@@ -508,6 +512,7 @@ pub const AsciiSurface = struct {
             if (self.ansi and (fg != null or bg != null)) try buf.appendSlice(out, "\x1b[0m");
             try buf.append(out, '\n');
         }
+        if (self.ansi) try buf.appendSlice(out, "\x1b[?7h");
         return buf.toOwnedSlice(out);
     }
 };
