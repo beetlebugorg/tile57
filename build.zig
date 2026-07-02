@@ -266,6 +266,18 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "chartstyle", .module = chartstyle_mod }},
     });
 
+    // Render-engine resolver (src/render/resolve.zig): color token -> RGB at a
+    // palette + the mariner display gates, for pixel surfaces. Pure; mirrors the
+    // chartstyle expression semantics (imports it for the settings model).
+    const render_resolve_mod = b.addModule("render_resolve", .{
+        .root_source_file = b.path("src/render/resolve.zig"),
+        .imports = &.{
+            .{ .name = "render_surface", .module = render_surface_mod },
+            .{ .name = "chartstyle", .module = chartstyle_mod },
+        },
+    });
+    _ = render_resolve_mod; // consumed by the png/pdf surfaces (P2+)
+
     // S-101 sprite/pattern atlas builder (nanosvg + stb PNG). libc (the C libs),
     // target-less so it inherits the consumer's target (only the bake tool, which
     // already links libc for Lua). Not in pure_pkgs — the tests stay libc-free.
@@ -546,11 +558,16 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chartstyle", .module = chartstyle_mod },
     });
     _ = addPkgTest(b, test_step, "src/chartstyle/chartstyle.zig", target, optimize, &.{});
-    // Noop surface: compile-checks the Surface vtable contract + a lifecycle smoke
-    // test, so the contract can't bit-rot when the vtable evolves (it has no other
+    // Noop surface: compile-checks the Surface contract + a lifecycle smoke
+    // test, so the contract can't bit-rot as it evolves (it has no other
     // consumer yet). See specs/render-engine.md §Non-goals / Verification gates.
     _ = addPkgTest(b, test_step, "src/surfaces/noop.zig", target, optimize, &.{
         .{ .name = "render_surface", .module = render_surface_mod },
+    });
+    // Render resolver: colors at palette + display gates (specs/render-engine.md P1).
+    _ = addPkgTest(b, test_step, "src/render/resolve.zig", target, optimize, &.{
+        .{ .name = "render_surface", .module = render_surface_mod },
+        .{ .name = "chartstyle", .module = chartstyle_mod },
     });
     // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
     // rules end-to-end. It rides its own artifact because `portray` links libc + Lua +
