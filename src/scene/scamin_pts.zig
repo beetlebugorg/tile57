@@ -40,6 +40,12 @@ pub const MATCH_EPS_M: f64 = 30.0;
 /// object. Measured NOAA FOID copies are all < 100 m apart.
 pub const FOID_GUARD_M: f64 = 500.0;
 
+/// Live-path gate: skip the per-tile overlay entirely when the tile's display
+/// window opens coarser than any plausible SCAMIN (D(z+1) above this bound —
+/// roughly z <= 4 at mid-latitudes). Nothing could be eligible there, and the
+/// gather would otherwise lazily load every covering cell of the whole root.
+pub const MAX_OVERLAY_DENOM: f64 = 10_000_000;
+
 /// One SCAMIN-carrying point feature's matchable identity (collectRecs) plus
 /// the dedup outputs (dedup fills effective/winner).
 pub const Rec = struct {
@@ -293,6 +299,74 @@ pub fn eligibleAt(effective: i64, smax: i64, floor_denom: f64) bool {
     if (@as(f64, @floatFromInt(effective)) < floor_denom) return false;
     if (smax > 0 and @as(f64, @floatFromInt(smax)) >= floor_denom * 2.0) return false;
     return true;
+}
+
+/// One cell's pre-pass scan: its matchable records plus what the cap
+/// computation needs from OTHER cells at each winner's point (real M_COVR
+/// coverage + the scamin ladder). Everything is allocated in the scan's own
+/// allocator so the parsed cell can be freed right after scanning.
+pub const CellScan = struct {
+    recs: []Rec = &.{},
+    coverage: []const []const []const s57.LonLat = &.{},
+    cov_bounds: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // bbox over the coverage rings
+    ladder: []const u32 = &.{}, // distinct SCAMIN denoms, ascending (collectScamins)
+    cscl: i32 = 0,
+};
+
+/// Scan one parsed cell for the pre-pass (bake drivers run this per cell, in
+/// parallel, then free the cell). Allocates everything in `a`.
+pub fn scanCell(a: Allocator, cell: *const s57.Cell, cell_idx: u32) !CellScan {
+    const cscl = cell.params.cscl;
+    var s = CellScan{
+        .recs = try collectRecs(a, cell, cscl, cell_idx),
+        .coverage = cell.mcovrCoverage(a),
+        .ladder = try bake_enc.collectScamins(a, cell),
+        .cscl = cscl,
+    };
+    for (s.coverage) |rings| for (rings) |ring| for (ring) |p| {
+        s.cov_bounds[0] = @min(s.cov_bounds[0], p.lon());
+        s.cov_bounds[1] = @min(s.cov_bounds[1], p.lat());
+        s.cov_bounds[2] = @max(s.cov_bounds[2], p.lon());
+        s.cov_bounds[3] = @max(s.cov_bounds[3], p.lat());
+    };
+    return s;
+}
+
+/// Dedup the union of all scans' records and derive each winner's MiniEntry:
+/// effective scamin from the group union, smax cap from the finest OTHER chart
+/// really covering the point (capFor; the winner's own cscl IS the group's
+/// finest — winners are elected finest-first). Returns per-cell entry lists
+/// indexed by cell ordinal (`n_cells` slots; empty = no winners). Allocates
+/// results in `a`; `gpa` is transient working memory.
+pub fn resolveWinners(gpa: Allocator, a: Allocator, scans: []const CellScan, n_cells: usize) ![][]MiniEntry {
+    var all = std.ArrayList(Rec).empty;
+    for (scans) |s| try all.appendSlice(a, s.recs);
+    try dedup(gpa, all.items);
+
+    var lists = try a.alloc(std.ArrayList(MiniEntry), n_cells);
+    for (lists) |*l| l.* = std.ArrayList(MiniEntry).empty;
+    var ladders = std.ArrayList([]const u32).empty; // covering ladders, reused per winner
+    for (all.items) |r| {
+        if (!r.winner) continue;
+        // Finest covering compilation scale at the point (real M_COVR only —
+        // the fills/points rule) + the covering cells' ladders for quantizing.
+        var finest: i32 = std.math.maxInt(i32);
+        ladders.clearRetainingCapacity();
+        for (scans) |s| {
+            if (s.cscl <= 0 or s.coverage.len == 0) continue;
+            if (r.lon < s.cov_bounds[0] or r.lon > s.cov_bounds[2] or
+                r.lat < s.cov_bounds[1] or r.lat > s.cov_bounds[3]) continue;
+            if (!s57.coverageContains(s.coverage, r.lon, r.lat)) continue;
+            finest = @min(finest, s.cscl);
+            try ladders.append(a, s.ladder);
+        }
+        const cap = capFor(r.cscl, finest, ladders.items);
+        if (r.cell < n_cells)
+            try lists[r.cell].append(a, .{ .feat = r.feat, .lon = r.lon, .lat = r.lat, .effective = r.effective, .smax = cap });
+    }
+    const out = try a.alloc([]MiniEntry, n_cells);
+    for (lists, 0..) |*l, i| out[i] = l.items;
+    return out;
 }
 
 /// One winner going into a mini cell: the source feature index, its (winner
