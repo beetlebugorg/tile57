@@ -39,7 +39,14 @@ const OpKind = union(enum) {
     stroke: struct { lines: []const []const cv.Point, width: f32, dash: ?[2]f32, color: cv.Color },
 };
 
+/// Paint class, mirroring the tile style's LAYER order (areas ->
+/// area_patterns -> lines -> point_symbols -> soundings -> text): the class
+/// is the major sort key, draw priority orders WITHIN a class — a fill never
+/// paints over a line, whatever its priority, exactly like the layer stack.
+const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4 };
+
 const Op = struct {
+    layer: OpLayer,
     prio: i64,
     seq: usize,
     kind: OpKind,
@@ -118,8 +125,8 @@ pub const PixelSurface = struct {
         return out;
     }
 
-    fn push(self: *PixelSurface, kind: OpKind) !void {
-        try self.ops.append(self.a, .{ .prio = self.cur.draw_prio, .seq = self.ops.items.len, .kind = kind });
+    fn push(self: *PixelSurface, layer: OpLayer, kind: OpKind) !void {
+        try self.ops.append(self.a, .{ .layer = layer, .prio = self.cur.draw_prio, .seq = self.ops.items.len, .kind = kind });
     }
 
     // ---- Surface impl ---------------------------------------------------------
@@ -138,7 +145,7 @@ pub const PixelSurface = struct {
         _ = depth; // the rule resolved the depth token against the real context
         const self = sp(ctx);
         if (!self.cur_visible) return;
-        try self.push(.{ .fill = .{ .rings = try self.toCanvas(rings), .color = self.resolveColor(token) } });
+        try self.push(.area, .{ .fill = .{ .rings = try self.toCanvas(rings), .color = self.resolveColor(token) } });
     }
 
     /// Device px per CSS px: the supersample factor (a 512px tile is the @2x
@@ -158,7 +165,7 @@ pub const PixelSurface = struct {
         // repeats at the same on-screen period as the MapLibre fill-pattern.
         const ppm: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.devScale());
         const cell = store.getPattern(name, ppm) orelse return;
-        try self.push(.{ .pattern = .{ .rings = try self.toCanvas(rings), .cell = cell } });
+        try self.push(.pattern, .{ .pattern = .{ .rings = try self.toCanvas(rings), .cell = cell } });
     }
 
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
@@ -170,7 +177,7 @@ pub const PixelSurface = struct {
             .solid => null,
             .dashed => .{ DASH_ON * w, DASH_OFF * w },
         };
-        try self.push(.{ .stroke = .{ .lines = try self.toCanvas(lines), .width = w, .dash = d, .color = self.resolveColor(token) } });
+        try self.push(.line, .{ .stroke = .{ .lines = try self.toCanvas(lines), .width = w, .dash = d, .color = self.resolveColor(token) } });
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -187,7 +194,7 @@ pub const PixelSurface = struct {
         const s = store.get(eff) orelse return; // unknown glyph: skip (the tile
         // path shows QUESMRK1 for unmapped CLASSES; an unmapped symbol NAME is
         // a catalogue gap and drawing nothing beats a wrong mark)
-        try self.pushSymbol(s, at, rot_deg, scale);
+        try self.pushSymbol(.symbol, s, at, rot_deg, scale);
     }
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
@@ -205,7 +212,7 @@ pub const PixelSurface = struct {
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             // Each digit glyph self-positions by its pivot: draw all at the point.
-            if (store.get(glyph)) |s| try self.pushSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
+            if (store.get(glyph)) |s| try self.pushSymbol(.sounding, s, at, 0, sndfrm.SYMBOL_SCALE);
         }
     }
 
@@ -213,7 +220,7 @@ pub const PixelSurface = struct {
     /// symbol-mm geometry relative to the pivot, scaled by `scale` (screen px
     /// per 0.01 mm) x the device scale (supersample + physical multiplier),
     /// rotated, anchored at `at`.
-    fn pushSymbol(self: *PixelSurface, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64) !void {
+    fn pushSymbol(self: *PixelSurface, layer: OpLayer, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64) !void {
         const k: f32 = @floatCast(scale * 100.0 * self.devScale());
         const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
         const cosr = @cos(rad);
@@ -231,8 +238,8 @@ pub const PixelSurface = struct {
                 }
                 rings[i] = pts;
             }
-            if (p.fill) |color| try self.push(.{ .fill = .{ .rings = rings, .color = color, .rule = .even_odd } });
-            if (p.stroke) |st| try self.push(.{ .stroke = .{ .lines = rings, .width = st.width * k, .dash = null, .color = st.color } });
+            if (p.fill) |color| try self.push(layer, .{ .fill = .{ .rings = rings, .color = color, .rule = .even_odd } });
+            if (p.stroke) |st| try self.push(layer, .{ .stroke = .{ .lines = rings, .width = st.width * k, .dash = null, .color = st.color } });
         }
     }
 
@@ -242,9 +249,11 @@ pub const PixelSurface = struct {
 
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const self = sp(ctx);
-        // S-52 paint order: draw priority, then emission order (stable).
+        // Paint order = the tile style's layer stack: class-major (see
+        // OpLayer), draw priority within a class, emission order for ties.
         std.mem.sort(Op, self.ops.items, {}, struct {
             fn lt(_: void, l: Op, r: Op) bool {
+                if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer);
                 if (l.prio != r.prio) return l.prio < r.prio;
                 return l.seq < r.seq;
             }
