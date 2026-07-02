@@ -569,8 +569,10 @@ export fn tile57_style_diff(
 /// props and takes no source). `scheme` is a tile57_scheme. `source_tiles` is the
 /// {z}/{x}/{y} chart tiles URL (NULL -> a default pmtiles:// source). `sprite` /
 /// `glyphs` are base URLs that enable the symbol / text layers (NULL omits them).
-/// `minzoom` / `maxzoom` of 0 -> engine defaults. 1=ok + out/out_len (free with
-/// tile57_free), 0=error.
+/// `minzoom` is the chart source's tile floor, emitted VERBATIM — pass the
+/// archive's real minzoom (0 = tiles exist from z0; MapLibre never requests below
+/// a source's minzoom, so an inflated floor blanks every lower zoom). `maxzoom`
+/// of 0 -> engine default. 1=ok + out/out_len (free with tile57_free), 0=error.
 export fn tile57_style_template(
     scheme: c_int,
     source_tiles: ?[*:0]const u8,
@@ -595,7 +597,7 @@ export fn tile57_style_template(
     if (source_tiles) |s| opts.source_tiles = std.mem.span(s);
     if (sprite_url) |s| opts.sprite = std.mem.span(s);
     if (glyphs_url) |g| opts.glyphs = std.mem.span(g);
-    if (minzoom != 0) opts.minzoom = minzoom;
+    opts.minzoom = minzoom;
     if (maxzoom != 0) opts.maxzoom = maxzoom;
     const style = assets.styleJson(gpa, opts) catch return 0;
     out.* = style.ptr;

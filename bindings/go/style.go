@@ -81,7 +81,9 @@ func MarinerDefaults() Mariner {
 // StyleTemplate returns the base MapLibre style template (layers + chart sources +
 // sprite/glyph URLs) for a scheme, from the catalogue baked into libtile57.
 // sourceTiles is the chart {z}/{x}/{y} URL; sprite/glyphs are base URLs ("" omits
-// the symbol/text layers); minZoom/maxZoom of 0 use the engine defaults.
+// the symbol/text layers). minZoom is the chart source's tile floor, emitted
+// verbatim — pass the archive's real minzoom (0 = tiles from z0; MapLibre never
+// requests tiles below a source's minzoom). maxZoom of 0 uses the engine default.
 func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32) ([]byte, error) {
 	cSrc, f1 := cStringOrNil(sourceTiles)
 	defer f1()
@@ -157,8 +159,9 @@ func StyleDiff(template []byte, from, to Mariner, colortables []byte, enabledBan
 // Style is a convenience that runs the whole pipeline — default colortables +
 // template (scheme, tiles/sprite/glyph URLs) patched by mariner + band filter — to
 // produce a complete MapLibre style JSON from libtile57's baked-in catalogue.
-// minZoom/maxZoom set the template's zoom span (0 = the engine default, i.e. z16 max);
-// a host that overzooms past z16 must pass its own maxZoom here. scamin/scaminLat
+// minZoom is the chart source's tile floor, emitted verbatim (pass the archive's
+// real minzoom; 0 = tiles from z0). maxZoom of 0 = the engine default, i.e. z16
+// max; a host that overzooms past z16 must pass its own maxZoom. scamin/scaminLat
 // (typically Source.Scamin() + the source center latitude) gate the `_scamin` layers
 // by value; pass nil/0 to leave them ungated.
 func Style(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, maxZoom uint32, m Mariner, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {

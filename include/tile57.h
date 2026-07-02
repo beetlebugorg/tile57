@@ -316,7 +316,10 @@ int tile57_colortables_default(uint8_t **out, size_t *out_len);
  *   scheme:       a tile57_scheme (selects the per-scheme palette).
  *   source_tiles: the chart {z}/{x}/{y} tiles URL (NULL -> a default pmtiles:// source).
  *   sprite,glyphs:base URLs that enable the symbol / text layers (NULL omits them).
- *   minzoom,maxzoom: 0 -> engine defaults.
+ *   minzoom: the chart source's tile floor, emitted verbatim — pass the archive's
+ *            real minzoom (0 = tiles from z0; MapLibre never requests tiles below
+ *            a source's minzoom, so an inflated floor blanks every lower zoom).
+ *   maxzoom: 0 -> engine default.
  * Returns 1 with out/out_len set (free with tile57_free), 0 on error. */
 int tile57_style_template(tile57_scheme scheme, const char *source_tiles,
                           const char *sprite, const char *glyphs,
