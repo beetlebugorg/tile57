@@ -468,20 +468,22 @@ pub const CellOpts = struct {
     /// the handoff denominator — the `smax` tile property the style gates on (hide
     /// once the display is finer than 1:smax). 0 = not carried (no tag emitted).
     smax: i64 = 0,
-    /// The cell's compilation-scale denominator quantized UP the scamin ladder
-    /// (bake_enc.quantizeHandoff over the participating cells' ladders, so the
-    /// client's crossing machinery fires exactly at the emitted value); 0 = unknown.
-    /// Tagged as the `oscl` tile property on area fills + patterns, and emitted as
-    /// the AP(OVERSC01) overscale hatch's gate (S-52 §10.1.10: hatch shows while
-    /// the display is FINER than 1:oscl). See emitOverscaleHatch.
+    /// The overscale gate denominator = cscl / OVERSCALE_FACTOR (X2 per S-52
+    /// PresLib §10.1.10.2: "grossly overscale ... by X2 or more"). A real SCAMIN-
+    /// ladder crossing so the client flip is exact and never fires before 1x;
+    /// 0 = unknown. Tagged as the `oscl` tile property on area fills + patterns,
+    /// and emitted as the AP(OVERSC01) overscale hatch's gate (hatch shows while
+    /// the display denominator is FINER/smaller than oscl). See emitOverscaleHatch.
     oscl: i64 = 0,
-    /// Scale-boundary overscale refinement (specs/overscale.md): emit this cell's
-    /// AP(OVERSC01) coverage hatch into the tile. Set only when a strictly-finer-
-    /// CSCL cell also contributes to the SAME tile (the quilting's finest
-    /// contributing scale undercuts this cell), so the hatch marks scale-boundary
-    /// coarse-only patches beside finer coverage. Whole-view overscale — no finer
-    /// data anywhere in the tile — emits NO hatch; the HUD "overscale ×n" readout
-    /// owns that case.
+    /// Scale-boundary overscale (specs/overscale.md, S-52 §10.1.10.2): emit this
+    /// cell's AP(OVERSC01) coverage hatch into the tile. Set only when BOTH (a) a
+    /// strictly-finer-CSCL cell also contributes to the SAME tile — a scale
+    /// boundary exists (else whole-view overscale, the HUD "overscale ×n" readout's
+    /// job, §10.1.10.1) — AND (b) this cell WINS the pure quilt somewhere in the
+    /// tile (its fills are not suppressed everywhere): the hatch marks only the
+    /// DISPLAYED smaller-scale data at the boundary ("must only be shown on the
+    /// area compiled from the smaller scale ENC"), never a coarse cell occluded
+    /// by finer coverage.
     overscale_hatch: bool = false,
     /// SCAMIN standalone (specs/scamin-standalone.md): this is a REGULAR cell in a
     /// pipeline that emits deduped SCAMIN point objects from a scamin_pts overlay,
@@ -2275,14 +2277,15 @@ fn isCoverageFeature(f: s57.Feature) bool {
     return n == 1;
 }
 
-/// S-52 §10.1.10 overscale indication: emit one AP(OVERSC01) area-pattern feature
-/// over an M_COVR(CATCOV=1) coverage polygon, clipped to the tile, tagged `oscl` =
-/// the cell's compilation scale quantized up the scamin ladder (CellOpts.oscl).
-/// The style shows it only while the display is FINER than 1:oscl and paints it
-/// ABOVE overscaled cells' fills but BELOW at-scale (finer) cells' fills — the
-/// occlusion trick that leaves the hatch only on coarse-only patches
-/// (specs/overscale.md). Rides the cell's carry tag (smax) so a band-handoff copy
-/// hides with the rest of the cell's content past its handoff.
+/// S-52 §10.1.10.2 overscale area at a chart scale boundary: emit one AP(OVERSC01)
+/// area-pattern feature over an M_COVR(CATCOV=1) coverage polygon, clipped to the
+/// tile, tagged `oscl` = the X2 gate denominator (cscl/OVERSCALE_FACTOR,
+/// CellOpts.oscl). The style shows it only while the display is grossly overscale
+/// (denominator FINER/smaller than oscl, i.e. X2+) and paints it ABOVE overscaled
+/// cells' fills but BELOW at-scale (finer) cells' fills — the occlusion trick that
+/// leaves the hatch only on coarse-only patches (specs/overscale.md). Rides the
+/// cell's carry tag (smax) so a band-handoff copy hides with the rest of the
+/// cell's content past its handoff.
 fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
@@ -2341,11 +2344,12 @@ pub const CellRef = struct {
     /// Band-handoff carry-down tag (see CellOpts.smax): the handoff denominator
     /// stamped on every feature this cell emits into the tile; 0 = not carried.
     smax: i64 = 0,
-    /// The cell's quantized compilation scale (see CellOpts.oscl): tags area
+    /// The cell's X2 overscale gate denominator (see CellOpts.oscl): tags area
     /// fills/patterns + gates the AP(OVERSC01) overscale hatch; 0 = unknown.
     oscl: i64 = 0,
     /// Emit this cell's AP(OVERSC01) coverage hatch (see CellOpts.overscale_hatch):
-    /// a strictly-finer-CSCL cell also contributes to this tile (scale boundary).
+    /// a strictly-finer-CSCL cell rides this tile (scale boundary) AND this cell
+    /// wins the pure quilt somewhere (it is the displayed smaller-scale data).
     overscale_hatch: bool = false,
     /// SCAMIN standalone (see the CellOpts twins): regular cells set
     /// skip_scamin_points when a scamin_pts overlay owns their SCAMIN point
@@ -2614,15 +2618,17 @@ fn appendCellFeatures(
         if (!fopts.suppress_points and hasAdditionalInfo(f)) {
             try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, fopts, surf);
         }
-        // S-52 §10.1.10 overscale indication, scale-boundary refinement
+        // S-52 §10.1.10.2 overscale area at a chart scale boundary
         // (specs/overscale.md): a cell's M_COVR (CATCOV=1) coverage polygon rides
-        // the tile as an AP(OVERSC01) hatch gated on `oscl` ONLY when a strictly-
-        // finer-CSCL cell also contributes to this tile (overscale_hatch, set by
-        // the quilting) — the hatch marks coarse-only patches at scale boundaries;
-        // whole-view overscale emits no hatch (the HUD readout's job). Emitted
-        // BESIDE the feature's normal portrayal (the M_COVR boundary lines still
-        // draw). Gated like the cell's fills (the whole-tile suppression rule) so
-        // hatch and fills appear/carry together.
+        // the tile as an AP(OVERSC01) hatch gated on `oscl` (X2) ONLY when
+        // overscale_hatch is set — a strictly-finer-CSCL cell rides the tile (a
+        // scale boundary) AND this cell wins the pure quilt somewhere (it is the
+        // displayed smaller-scale data, "must only be shown on the area compiled
+        // from the smaller scale ENC"). Whole-view overscale emits no hatch (the
+        // HUD readout's job, §10.1.10.1). Emitted BESIDE the feature's normal
+        // portrayal (the M_COVR boundary lines still draw). The extra !suppress_fills
+        // guard is redundant given overscale_hatch (win-somewhere => fills not
+        // suppressed) but kept defensive so hatch and fills always co-vary.
         if (fopts.oscl > 0 and fopts.overscale_hatch and !fopts.suppress_fills and isCoverageFeature(f)) {
             try emitOverscaleHatch(a, cell.*, f, fi, geo, z, x, y, tb, box, fopts, surf);
         }

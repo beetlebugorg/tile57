@@ -70,13 +70,13 @@ pub const FeatureMeta = struct {
     scamin: ?i64 = null, // SCAMIN 1:N denominator (null = no display limit)
     smax: i64 = 0, // band-handoff denominator: a carried coarser-band copy
     // hides once the display is finer than 1:smax (0 = none)
-    oscl: i64 = 0, // the source cell's compilation-scale denominator, quantized
-    // UP the scamin ladder (0 = unknown): tagged on area fills +
+    oscl: i64 = 0, // the source cell's X2 overscale gate denominator
+    // (cscl/OVERSCALE_FACTOR, 0 = unknown): tagged on area fills +
     // patterns so the style can order/gate by overscale state;
     // on the OVERSC01 hatch (overscale=true) it is the show gate
-    overscale: bool = false, // this feature IS the S-52 §10.1.10 overscale hatch
+    overscale: bool = false, // this feature IS the S-52 §10.1.10.2 overscale hatch
     // (AP(OVERSC01) over the cell's M_COVR coverage), shown only
-    // while the display is FINER than 1:oscl (denom < oscl)
+    // while grossly overscale (denom < oscl, i.e. X2+)
     class: []const u8 = "", // S-57 object-class acronym (e.g. "LIGHTS")
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""
     cell_name: []const u8 = "", // source ENC cell name or ""
