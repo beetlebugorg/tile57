@@ -41,9 +41,9 @@ entirely with AI assistance. A few specific goals shape its design:
   were chosen specifically because both have excellent build systems and first-class WASM targets,
   making the engine usable in desktop apps, servers, and browsers from one codebase.
 
-- **Coupled tile + style.** The engine emits Mapbox Vector Tiles *and* a matching MapLibre GL
-  style together. The same style works for MapLibre Native and MapLibre GL JS, so native and
-  web renderers share one chart look without separate style maintenance.
+- **Coupled tile + style.** The engine emits vector tiles (MLT or MVT) *and* a matching
+  MapLibre GL style together. The same style works for MapLibre Native and MapLibre GL JS, so
+  native and web renderers share one chart look without separate style maintenance.
 
 - **Language-agnostic embedding.** A thin C ABI (`libtile57.a`) bridges the Zig core to any
   language with C FFI. Go bindings ship in the repo; others are straightforward additions.
@@ -60,11 +60,13 @@ entirely with AI assistance. A few specific goals shape its design:
 
 ---
 
-**tile57** decodes NOAA/IHO **S-57** ENC cells and generates **Mapbox Vector
-Tiles** by `(z, x, y)`, running the official IHO **S-101 Portrayal Catalogue** in
-embedded Lua to produce S-52 nautical portrayal. Alongside the tiles it emits a
-**MapLibre GL style** and the portrayal **assets** it references — colour tables,
-line styles, and the sprite + area-fill pattern atlases — so a renderer like
+**tile57** decodes NOAA/IHO **S-57** ENC cells and generates **vector tiles** by
+`(z, x, y)` — MapLibre Tiles (MLT, the default bake format; MapLibre GL JS ≥ 5.12
+decodes them natively) or Mapbox Vector Tiles (`--format mvt`) — running the
+official IHO **S-101 Portrayal Catalogue** in embedded Lua to produce S-52
+nautical portrayal. Alongside the tiles it emits a **MapLibre GL style** and the
+portrayal **assets** it references — colour tables, line styles, and the sprite
++ area-fill pattern atlases — so a renderer like
 [MapLibre](https://github.com/maplibre/maplibre-native) can draw a chart directly.
 
 It is **high-performance and low-memory** by design:
@@ -84,20 +86,22 @@ It is **high-performance and low-memory** by design:
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                    src/iso8211/   (pkg: iso8211)
+   │  ISO 8211 decode                    src/s57/iso8211.zig
    ▼
-S-57 feature + geometry model            src/s57/       (pkg: s57)
-   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/ (pkg: s100)
+S-57 feature + geometry model            src/s57/
+   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/
    ▼
 portrayal instruction stream
    │  scene generation                   src/scene/  (project + clip + draw calls)
    ▼
 render Surface ──► MVT / MLT tiles (src/tiles/)  +  MapLibre style.json + assets
-             └───► PNG raster / vector PDF (src/render/ — the native S-52 pixel path)
+             └───► PNG raster / vector PDF / terminal text (src/render/)
 ```
 
-The foundational stages are standalone Zig packages — **`iso8211`**, **`s57`**,
-**`s100`** — so they compose independently and stay libc-free.
+The stages are separate Zig modules — `s57` (including its ISO 8211 decoder),
+`s100`, `tiles`, `render`, `scene`, `assets` — pure Zig with no libc; only the
+Lua portrayal (`portray`) and the sprite rasterizer (`sprite`) pull in C. See
+[the architecture docs](docs/docs/architecture.md).
 
 ## Use it from Zig
 
@@ -146,7 +150,9 @@ zig build                                    # builds zig-out/bin/tile57
 tile57 bake CELL.000 -o out/                 # one cell -> bundle (tiles + style + assets + manifest)
 tile57 bake ENC_ROOT -o out/                 # whole catalogue, band-streamed -> same bundle
 tile57 assets   -o assets/                   # colortables + linestyles + sprite + patterns
-tile57 sprite-mln -o assets/                 # the MapLibre sprite sheet
+tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
+tile57 pdf ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
+tile57 ascii CELL.000 --view -76.48,38.974,13 --ansi --tui    # the chart in your terminal
 ```
 
 ## Build

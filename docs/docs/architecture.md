@@ -15,17 +15,20 @@ A chart cell flows through these stages, all inside the engine:
 
 ```
 S-57 ENC cell (.000)
-   │  decode the binary container     src/iso8211/   (pkg: iso8211)
+   │  decode the binary container     src/s57/iso8211.zig
    ▼
-S-57 feature + geometry model         src/s57/       (pkg: s57)
-   │  apply S-101 portrayal           src/portray/ (pkg) + embedded Lua 5.4
+S-57 feature + geometry model         src/s57/       (module: s57)
+   │  apply S-101 portrayal           src/portray/ + embedded Lua 5.4
    ▼                            (vendor/S-101_Portrayal-Catalogue)
 portrayal instruction stream
-   │  adapt to drawing primitives     src/s100/      (pkg: s100)
+   │  adapt to drawing primitives     src/s100/      (module: s100)
    ▼
-web-mercator project + clip + encode  src/{s57_mvt,mvt,tile,pmtiles}/
+scene generation                      src/scene/  (project + clip + draw calls)
    ▼
-Mapbox Vector Tile bytes  +  MapLibre style.json  +  portrayal assets
+render Surface                        src/render/surface.zig
+   ├─► tile surfaces:  MVT / MLT encode + PMTiles    src/tiles/
+   │        + MapLibre style.json + portrayal assets src/assets/, src/sprite/
+   └─► pixel surfaces: PNG raster · vector PDF · terminal text (src/render/)
 ```
 
 1. **Decode (ISO 8211).** S-57 cells use the ISO 8211 binary container format;
@@ -40,33 +43,73 @@ Mapbox Vector Tile bytes  +  MapLibre style.json  +  portrayal assets
    Lua's macros are easiest from C).
 4. **Adapt the instructions.** The portrayal output is turned into simple drawing
    primitives: filled polygons, stroked lines, symbols, patterns, soundings, text.
-5. **Project, clip, encode.** Each primitive is projected to web-mercator tile
-   coordinates, clipped to the tile (extent 4096, buffer 64), and encoded as MVT.
+5. **Generate the scene.** Each primitive is projected to web-mercator tile
+   coordinates, clipped (extent 4096, buffer 64), and emitted as *draw calls* on a
+   **Surface** — the backend seam described below.
 
-## The Zig packages
+### The Surface contract
 
-Every stage is a **standalone Zig package**, most of them pure (no libc/Lua) and
-target-agnostic:
+Every output format implements one vtable — `Surface`
+(`src/render/surface.zig`). The engine emits *semantic* draw calls (S-52 colour
+tokens, symbol names, raw depths, per-feature display metadata); what happens
+next depends on the listening backend: the **tile surface** serializes the
+semantics into MVT/MLT tiles for a client renderer, the **pixel surface**
+resolves them (tokens → RGB, symbol names → vector outlines) and paints PNG
+raster or deterministic vector PDF, and the **ASCII surface** lowers them to a
+Unicode terminal grid (with optional ANSI colour, or real pixels inline via the
+kitty graphics protocol). One engine, pluggable outputs — see
+[The Rendering Engine](./rendering.md).
 
-| Package | Role |
-|---------|------|
-| `iso8211` | ISO/IEC 8211 record decode |
-| `s57` | S-57 ENC cell parser + geometry model |
+### Tile formats: MLT by default, MVT on request
+
+Bakes encode **MLT** ([MapLibre Tile](https://github.com/maplibre/maplibre-tile-spec))
+by default; MapLibre GL JS ≥ 5.12 decodes it natively via the vector source
+`encoding` option, and the generated styles carry that hint. Pass
+`--format mvt` (CLI) / `tile57_bake_opts.format` (C ABI) to bake Mapbox Vector
+Tiles for consumers without an MLT decoder. Live cell-backed charts open
+generating MVT for compatibility; hosts opt in to MLT with
+`tile57_chart_set_tile_format`.
+
+### Band handoff (`smax`)
+
+Overlapping cells of different compilation scales are resolved per tile to the
+best band. At a band's floor zoom — where a finer band hands over to the
+coarser one — the coarser band's features are *carried down* into the finer
+band's tiles, tagged with an `smax` denominator quantized onto the archive's
+SCAMIN ladder. The style (and the pixel resolver) hides a carried copy the
+moment the display gets finer than `1:smax`, so band boundaries hand off
+without holes or double-draws.
+
+### Overscale indication (`oscl`)
+
+Per S-52 §10.1.10, every contributing cell's coverage polygon is baked as an
+`OVERSC01` vertical-line hatch tagged `oscl` = the cell's compilation-scale
+denominator. The hatch shows only while the display is *finer* than `1:oscl`,
+and the style sandwiches it between the overscaled and at-scale fill passes so
+finer opaque data occludes a coarser cell's hatch. The `show_overscale`
+mariner toggle (default on) drives its visibility.
+
+## The Zig modules
+
+The stages are separate Zig modules (see `build.zig`), most of them pure (no
+libc/Lua) and target-agnostic:
+
+| Module | Role |
+|--------|------|
+| `s57` | S-57 ENC cell parser + geometry model (includes the ISO/IEC 8211 decoder, `src/s57/iso8211.zig`) |
 | `s100` | S-100/S-101 catalogue + portrayal adaptation |
 | `portray` | the embedded-Lua S-101 runner (links libc) |
-| `mvt` | Mapbox Vector Tile encode/decode |
-| `tile` | web-mercator tiling + clipping |
-| `pmtiles` | PMTiles read/write |
-| `s57_mvt` | S-57 feature → MVT tile |
-| `bake_enc` | banded multi-cell ENC_ROOT → PMTiles |
-| `assets` | colortables / linestyles / style / manifest generation |
-| `sprite` | S-101 sprite + area-fill pattern atlases (SVG raster) |
-| `chartstyle` | mariner-driven MapLibre style patching |
+| `tiles` | MVT + MLT encoders, gzip, the PMTiles container, web-mercator tile math |
+| `render` | the Surface contract, the resolver (colours, display gates), and the pixel machinery (Canvas, PNG, PDF, ASCII) |
+| `scene` | S-57 → tile-surface scene generation + the banded ENC_ROOT baker (`bake_enc.zig`) |
+| `assets` | colortables / linestyles / style / manifest generation (includes `chartstyle.zig`, the mariner-driven style builder) |
+| `sprite` | S-101 sprite + area-fill pattern atlases (SVG raster; links libc) |
+| `engine` | the pure packages re-exported as one import (the test root) |
+| `tile57` | the curated public surface (`src/tile57.zig`) |
 
-`portray` is the only package that links libc, and it is never imported by the
-pure test build. The top-level `tile57` module (`src/tile57.zig`) is the
-curated public surface; the C ABI (`src/capi.zig`) is a thin shim over the
-same Zig API.
+`portray` and `sprite` are the only modules that link libc, and neither is
+imported by the pure test build. The C ABI (`src/capi.zig`) is a thin shim over
+the same Zig API as the `tile57` module.
 
 ## The layering: Chart / bake / style
 
@@ -75,11 +118,13 @@ The public surface composes the packages into three high-level entry points:
 - **`Chart`** — open a chart from a path (`openPath`), from bytes (`openBytes`), or
   as a multi-cell ENC_ROOT (`openCells` / `openCellsStreaming`), then `tile(z, x, y)`. This is the live
   tile-generation path. It also reads a pre-baked **PMTiles** archive — the caller
-  can't tell the difference.
-- **`bakeArchive`** (`bake_enc`) — bake a whole ENC_ROOT to one PMTiles archive
-  offline, band-streamed.
-- **`style.build`** (`chartstyle`) + **`assets`** / **`sprite`** — generate the
-  MapLibre style and the portrayal assets it references.
+  can't tell the difference. The same handle renders finished views:
+  `renderView` (PNG), `renderView` with PDF output, and `renderAscii`
+  (`tile57_chart_render_view` / `tile57_chart_render_pdf` in the C ABI).
+- **`bakeArchive`** (`scene/bake_enc.zig`) — bake a whole ENC_ROOT to one PMTiles
+  archive offline, band-streamed.
+- **`style.build`** (`assets/chartstyle.zig`) + **`assets`** / **`sprite`** —
+  generate the MapLibre style and the portrayal assets it references.
 
 The same three are exposed across the C ABI (`tile57_chart_*`,
 `tile57_bake_pmtiles` / `tile57_bake_bundle`, `tile57_build_style`, and
@@ -109,14 +154,17 @@ tile57 is built to hold only its working set:
 
 ## The offline chart bundle
 
-One `bundle` command emits a self-contained, relocatable directory in which the
-tiles and the portrayal that renders them travel together:
+One `bake` command (`tile57 bake <cell.000 | ENC_ROOT> -o out/`) emits a
+self-contained, relocatable directory in which the tiles and the portrayal that
+renders them travel together:
 
 ```
-chart-bundle/
+out/
   manifest.json             pins schema_version, couples the two halves
   tiles/chart.pmtiles       the DATA half — semantic colour tokens, palette-independent
   assets/colortables.json   the PORTRAYAL half — token -> hex per day/dusk/night (the only RGB)
+  assets/linestyles.json    complex line-style metadata
+  assets/sprite-mln*.{json,png}  the symbol + pattern atlases
   assets/style-{day,dusk,night}.json  the MapLibre style layers, colours pre-resolved
 ```
 
