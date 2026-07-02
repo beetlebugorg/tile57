@@ -594,6 +594,10 @@ const CMariner = extern struct {
     // scamin-layers.md: gate SCAMIN with a live client filter instead of per-value
     // bucket layers (one *_scamin layer per render-type). Appended for ABI-append-safety.
     scamin_filter_gate: bool,
+    // S-52 §10.1.10 overscale indication (AP(OVERSC01) over overscaled coverage):
+    // drives the `overscale` layer's visibility. Appended for ABI-append-safety;
+    // tile57_mariner_defaults sets true.
+    show_overscale: bool,
 };
 
 // "YYYYMMDD" or "" from the fixed char[9] field.
@@ -637,6 +641,7 @@ fn marinerFromC(cm: *const CMariner) chartstyle.MarinerSettings {
         .date_view = dateViewSlice(&cm.date_view),
         .ignore_scamin = cm.ignore_scamin,
         .scamin_filter_gate = cm.scamin_filter_gate,
+        .show_overscale = cm.show_overscale,
         .size_scale = cm.size_scale,
         .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
             cm.viewing_groups_off[0..cm.viewing_groups_off_len]
@@ -817,5 +822,6 @@ export fn tile57_mariner_defaults(cm: *CMariner) callconv(.c) void {
         .viewing_groups_off = null, // every viewing group shown
         .viewing_groups_off_len = 0,
         .scamin_filter_gate = d.scamin_filter_gate,
+        .show_overscale = d.show_overscale,
     };
 }

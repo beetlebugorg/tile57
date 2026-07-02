@@ -103,11 +103,17 @@ const ICON_SIZE = .{ "/", .{ "coalesce", .{ "get", "scale" }, 0.08 }, 0.08 };
 
 const VROW = .{ "match", .{ "coalesce", .{ "get", "valign" }, "middle" }, "top", "top", "bottom", "bottom", "center" };
 const TEXT_ANCHOR = .{
-    "match", .{ "concat", VROW, "|", .{ "coalesce", .{ "get", "halign" }, "center" } },
-    "center|left",   "left",       "center|right",  "right",        "center|center", "center",
-    "top|center",    "top",        "bottom|center", "bottom",
-    "top|left",      "top-left",   "top|right",     "top-right",
-    "bottom|left",   "bottom-left", "bottom|right", "bottom-right", "center",
+    "match",         .{ "concat", VROW, "|", .{ "coalesce", .{ "get", "halign" }, "center" } },
+    "center|left",   "left",
+    "center|right",  "right",
+    "center|center", "center",
+    "top|center",    "top",
+    "bottom|center", "bottom",
+    "top|left",      "top-left",
+    "top|right",     "top-right",
+    "bottom|left",   "bottom-left",
+    "bottom|right",  "bottom-right",
+    "center",
 };
 const TEXT_SORT_KEY = .{ "-", .{ "match", .{ "coalesce", .{ "get", "tgrp" }, -1 }, 11, 0, .{ 21, 26, 29 }, 100, 23, 50, 150 }, .{ "coalesce", .{ "get", "font_size_px" }, 10 } };
 
@@ -120,20 +126,20 @@ const TEXT_SORT_KEY = .{ "-", .{ "match", .{ "coalesce", .{ "get", "tgrp" }, -1 
 // the S-52 model places text via alignment AND offset (the oracle's own client drops
 // the offset; we apply it for spec-compliant placement).
 const TEXT_OFFSET = .{
-    "match", .{ "coalesce", .{ "get", "loff" }, "0,0" },
-    "1,1",   .{ "literal", .{ 1, 1 } },
-    "0,1",   .{ "literal", .{ 0, 1 } },
-    "-1,1",  .{ "literal", .{ -1, 1 } },
-    "1,0",   .{ "literal", .{ 1, 0 } },
-    "2,0",   .{ "literal", .{ 2, 0 } },
-    "1,-1",  .{ "literal", .{ 1, -1 } },
-    "0,-1",  .{ "literal", .{ 0, -1 } },
-    "-1,-2", .{ "literal", .{ -1, -2 } },
-    "0,2",   .{ "literal", .{ 0, 2 } },
-    "2,1",   .{ "literal", .{ 2, 1 } },
-    "-2,0",  .{ "literal", .{ -2, 0 } },
-    "-1,2",  .{ "literal", .{ -1, 2 } },
-    "3,-1",  .{ "literal", .{ 3, -1 } },
+    "match",                   .{ "coalesce", .{ "get", "loff" }, "0,0" },
+    "1,1",                     .{ "literal", .{ 1, 1 } },
+    "0,1",                     .{ "literal", .{ 0, 1 } },
+    "-1,1",                    .{ "literal", .{ -1, 1 } },
+    "1,0",                     .{ "literal", .{ 1, 0 } },
+    "2,0",                     .{ "literal", .{ 2, 0 } },
+    "1,-1",                    .{ "literal", .{ 1, -1 } },
+    "0,-1",                    .{ "literal", .{ 0, -1 } },
+    "-1,-2",                   .{ "literal", .{ -1, -2 } },
+    "0,2",                     .{ "literal", .{ 0, 2 } },
+    "2,1",                     .{ "literal", .{ 2, 1 } },
+    "-2,0",                    .{ "literal", .{ -2, 0 } },
+    "-1,2",                    .{ "literal", .{ -1, 2 } },
+    "3,-1",                    .{ "literal", .{ 3, -1 } },
     .{ "literal", .{ 0, 0 } },
 };
 
@@ -210,6 +216,9 @@ const SCtx = struct {
     text_group: ?std.json.Value, // extra filter for text layers (null = template)
     size_scale: f64, // §4 physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
     smax: SmaxGate, // band-handoff gate AND-ed onto every chart layer (see SmaxGate)
+    // The overscale clauses (writeOsclClause) reuse `smax` as their gate value —
+    // same modes, same injected DENOM literal, same show-all placeholder mapping.
+    show_overscale: bool, // S-52 §10.1.10 mariner toggle -> the overscale layer's visibility
 };
 
 // Band-handoff (smax) gate: a coarser-band feature carried down past a finer
@@ -238,6 +247,30 @@ fn writeSmaxClause(js: *Stringify, gate: SmaxGate) !void {
         .off => {},
         .denom => |d| try js.write(.{ "<", .{ "coalesce", .{ "get", "smax" }, 0 }, d }),
         .zoom_k => |k| try js.write(.{ "<", .{ "coalesce", .{ "get", "smax" }, 0 }, .{ "/", k, .{ "^", 2, .{"zoom"} } } }),
+    }
+}
+
+// The overscale (oscl) clause — S-52 §10.1.10 (specs/overscale.md). The
+// filter-gate form is EXACTLY
+//   [">", ["coalesce", ["get","oscl"], 0], DENOM]
+// ("the display is FINER than the cell's quantized compilation scale"), or its
+// ["!", …] negation for the at-scale fill pass drawn ABOVE the hatch. It rides
+// the SAME gate value (and injected DENOM literal) as the smax clause — the live
+// client pattern-matches the inner shape to rewrite DENOM alongside scamin/smax,
+// so keep the three in lockstep (overscale contract). The shared boot/diff
+// placeholder (1e12) reads as hide-the-hatch / all-fills-at-scale — today's
+// rendering — until the client injects the live denominator.
+fn writeOsclClause(js: *Stringify, gate: SmaxGate, negate: bool) !void {
+    switch (gate) {
+        .off => {},
+        .denom => |d| if (negate)
+            try js.write(.{ "!", .{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, d } })
+        else
+            try js.write(.{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, d }),
+        .zoom_k => |k| if (negate)
+            try js.write(.{ "!", .{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, .{ "/", k, .{ "^", 2, .{"zoom"} } } } })
+        else
+            try js.write(.{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, .{ "/", k, .{ "^", 2, .{"zoom"} } } }),
     }
 }
 
@@ -293,6 +326,13 @@ const Bucket = struct {
     cur_denom: f64 = 0, // filter_gate: the current-display-scale denominator literal (client-overwritten)
     minzoom: ?f64 = null,
     suffix: []const u8 = "", // id suffix: "#sm<v>" / "#no" / "" (plain)
+    // Overscale (oscl) clause role (S-52 §10.1.10, specs/overscale.md):
+    //   .none — no oscl clause (every layer outside the overscale sandwich).
+    //   .overscaled — [">", coalesce(oscl,0), DENOM]: this cell's data is displayed
+    //     FINER than its compilation scale (the fills under the hatch + the hatch).
+    //   .at_scale — the ["!", …] negation: at-scale fills, drawn ABOVE the hatch so
+    //     finer opaque data occludes a coarser cell's hatch.
+    oscl: enum { none, overscaled, at_scale } = .none,
 };
 
 // coalesce fallback for a feature with no `scamin`: a denominator larger than any real
@@ -355,10 +395,12 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
 fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *const SCtx, extra: ?std.json.Value) !void {
     const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate or bkt.filter_gate;
     const has_smax = s.smax != .off;
+    const has_oscl = bkt.oscl != .none and s.smax != .off; // oscl rides the smax gate value
     var n: usize = s.common.len;
     if (has_base) n += 1;
     if (has_clause) n += 1;
     if (has_smax) n += 1;
+    if (has_oscl) n += 1;
     if (extra != null) n += 1;
     if (n > 0) {
         try js.objectField("filter");
@@ -370,6 +412,7 @@ fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *c
         if (has_base) try js.write(base);
         if (has_clause) try writeScaminClause(js, bkt);
         if (has_smax) try writeSmaxClause(js, s.smax);
+        if (has_oscl) try writeOsclClause(js, s.smax, bkt.oscl == .at_scale);
         for (s.common) |c| try js.write(c);
         if (extra) |e| try js.write(e);
         if (wrap) try js.endArray();
@@ -597,6 +640,12 @@ fn fillLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void 
     try js.endObject();
 }
 
+// The S-52 §10.1.10 overscale hatch is NOT a generic area pattern: it rides its
+// own sandwiched layer (overscaleLayer) with the oscl gate, so the generic
+// pattern layers must exclude it or it would paint ungated above everything.
+const FILT_OVERSC = .{ "==", .{ "get", "pattern_name" }, "OVERSC01" };
+const FILT_NOT_OVERSC = .{ "!=", .{ "get", "pattern_name" }, "OVERSC01" };
+
 // One area fill-pattern layer (sprite required) for a source-layer + SCAMIN bucket.
 fn patternLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
@@ -607,7 +656,32 @@ fn patternLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !vo
     try js.objectField("fill-pattern");
     try js.write(.{ "concat", "pat:", .{ "coalesce", .{ "get", "pattern_name" }, "" } });
     try js.endObject();
-    try applyBucket(js, .{}, false, bkt, s, null);
+    try applyBucket(js, FILT_NOT_OVERSC, true, bkt, s, null);
+    try js.endObject();
+}
+
+// The AP(OVERSC01) overscale-indication layer (S-52 §10.1.10, specs/overscale.md):
+// every contributing cell's M_COVR coverage polygon (baked into `area_patterns`
+// as pattern OVERSC01, tagged `oscl`), shown only while the display is FINER than
+// the cell's quantized compilation scale (the oscl clause). Sandwiched between
+// the overscaled and at-scale fill passes (styleJson §2), so a finer cell's
+// opaque fills occlude a coarser cell's hatch — the hatch survives only on
+// coarse-only patches. The showOverscale mariner toggle drives layout.visibility
+// alone (layer set unchanged -> a one-op style diff).
+fn overscaleLayer(js: *Stringify, s: *const SCtx) !void {
+    try js.beginObject();
+    try layerHead(js, "overscale", "fill", "area_patterns");
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("visibility");
+    try js.write(if (s.show_overscale) "visible" else "none");
+    try js.endObject();
+    try js.objectField("paint");
+    try js.beginObject();
+    try js.objectField("fill-pattern");
+    try js.write("pat:OVERSC01");
+    try js.endObject();
+    try applyBucket(js, FILT_OVERSC, true, .{ .oscl = .overscaled }, s, null);
     try js.endObject();
 }
 
@@ -824,6 +898,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
             .{ .zoom_k = M_PER_PX_Z0 * @cos(opts.scamin_lat * std.math.pi / 180.0) / (DEFAULT_PX_PITCH_MM / 1000.0) }
         else
             .{ .zoom_k = DENOM_Z0 },
+        .show_overscale = m.show_overscale,
     };
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -883,7 +958,19 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     try js.endObject();
 
     // 2. area fills — base (plain) + one SCAMIN bucket layer per manifest value.
-    try fillLayer(js, &s, "areas", .{});
+    // With scale gating active (and a sprite to draw the hatch) the base fill
+    // layer splits around the AP(OVERSC01) overscale layer: overscaled cells'
+    // fills (fill-areas#oscl) UNDER the hatch, at-scale fills (fill-areas) ABOVE
+    // it — so finer opaque DEPARE/LNDARE occlude a coarser cell's hatch and it
+    // survives only on coarse-only patches (S-52 §10.1.10, specs/overscale.md).
+    // ignore_scamin (gate off) or no sprite keeps the single plain fill layer.
+    if (s.smax != .off and sprite_on) {
+        try fillLayer(js, &s, "areas", .{ .oscl = .overscaled, .suffix = "#oscl" });
+        try overscaleLayer(js, &s);
+        try fillLayer(js, &s, "areas", .{ .oscl = .at_scale });
+    } else {
+        try fillLayer(js, &s, "areas", .{});
+    }
     for (all_buckets) |bkt| try fillLayer(js, &s, "areas_scamin", bkt);
 
     // 3. area fill patterns (sprite required)
@@ -1521,6 +1608,121 @@ test "styleJson: bucket/zoom-gate modes derive the smax denominator from zoom; i
     const out_ign = try styleJson(a, ign);
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "smax") == null);
+}
+
+// ---- overscale (oscl) gate tests (specs/overscale.md) -----------------------
+
+test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const sm = [_]u32{ 45000, 90000 };
+    const gated = try styleJson(a, .{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+        .scamin_filter_gate = true,
+        .scamin_cur_denom = 50000,
+    });
+    defer a.free(gated);
+    // The overscale gate, verbatim — chartplotter-go pattern-matches this shape
+    // (overscale contract) to rewrite DENOM beside the scamin/smax clauses. The
+    // hatch + the under-hatch fill pass carry the positive clause; the at-scale
+    // fill pass carries its ["!", …] negation (occlusion sandwich).
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],50000]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\"!\",[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],50000]]") != null);
+    // Generic pattern layers exclude the hatch (it rides its own gated layer).
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\"!=\",[\"get\",\"pattern_name\"],\"OVERSC01\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\"==\",[\"get\",\"pattern_name\"],\"OVERSC01\"]") != null);
+
+    // The boot/diff PLACEHOLDER (cur_denom 0) maps to 1e12 — hide the hatch and
+    // keep every fill in the at-scale pass (today's rendering) until the client
+    // injects the live denominator (the smax placeholder lesson, cb91c4d).
+    const boot = try styleJson(a, .{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+        .scamin_filter_gate = true,
+        .scamin_cur_denom = 0,
+    });
+    defer a.free(boot);
+    try std.testing.expect(std.mem.indexOf(u8, boot, "[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],1000000000000]") != null);
+
+    // The occlusion sandwich: fill-areas#oscl (overscaled fills) UNDER the
+    // `overscale` hatch layer UNDER fill-areas (at-scale fills) — a finer cell's
+    // opaque fill paints over a coarser cell's hatch, so the hatch survives only
+    // on coarse-only patches. Verify layer order + the hatch layer's shape.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, gated, .{});
+    defer parsed.deinit();
+    var i_oscl: ?usize = null;
+    var i_hatch: ?usize = null;
+    var i_base: ?usize = null;
+    const layers = parsed.value.object.get("layers").?.array.items;
+    for (layers, 0..) |lyr, i| {
+        const id = lyr.object.get("id").?.string;
+        if (std.mem.eql(u8, id, "fill-areas#oscl")) i_oscl = i;
+        if (std.mem.eql(u8, id, "overscale")) i_hatch = i;
+        if (std.mem.eql(u8, id, "fill-areas")) i_base = i;
+    }
+    try std.testing.expect(i_oscl.? < i_hatch.?);
+    try std.testing.expect(i_hatch.? < i_base.?);
+    const hatch = layers[i_hatch.?].object;
+    try std.testing.expectEqualStrings("area_patterns", hatch.get("source-layer").?.string);
+    try std.testing.expectEqualStrings("pat:OVERSC01", hatch.get("paint").?.object.get("fill-pattern").?.string);
+    try std.testing.expectEqualStrings("visible", hatch.get("layout").?.object.get("visibility").?.string);
+}
+
+test "styleJson: showOverscale=false hides the hatch layer; ignore_scamin drops the machinery" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const sm = [_]u32{ 45000, 90000 };
+    const base = StyleOpts{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .scamin = &sm,
+        .scamin_lat = 38.0,
+    };
+    // The mariner toggle flips ONLY the layer's visibility (layer set unchanged,
+    // so a style diff is a single setLayoutProperty op).
+    var off = base;
+    off.mariner = .{ .show_overscale = false };
+    const hidden = try styleJson(a, off);
+    defer a.free(hidden);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "\"id\":\"overscale\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "{\"visibility\":\"none\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "\"oscl\"") != null);
+
+    // Bucket mode derives the oscl DENOM from zoom (same K as the smax clause).
+    const bucketed = try styleJson(a, base);
+    defer a.free(bucketed);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],[\"/\",") != null);
+
+    // ignore_scamin: no oscl clauses, no hatch layer, the single plain fill layer.
+    var ign = base;
+    ign.ignore_scamin = true;
+    const out_ign = try styleJson(a, ign);
+    defer a.free(out_ign);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "\"id\":\"overscale\",") == null);
+
+    // No sprite -> nothing can draw the hatch: single plain fill layer, no sandwich.
+    var nospr = base;
+    nospr.sprite = null;
+    const out_ns = try styleJson(a, nospr);
+    defer a.free(out_ns);
+    try std.testing.expect(std.mem.indexOf(u8, out_ns, "oscl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ns, "\"id\":\"overscale\",") == null);
 }
 
 // ---- styleDiff tests (style-diff.md §5) ------------------------------------

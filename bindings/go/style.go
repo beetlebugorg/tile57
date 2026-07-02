@@ -67,6 +67,7 @@ type Mariner struct {
 	DateView                                                string  // "YYYYMMDD" or "" (today)
 	IgnoreScamin                                            bool    // ?ignoreScamin: drop SCAMIN gating, show all in-band
 	ScaminFilterGate                                        bool    // scamin-layers.md: one live-filtered *_scamin layer per render-type instead of per-value buckets
+	ShowOverscale                                           bool    // S-52 §10.1.10 AP(OVERSC01) overscale indication (default true)
 	SizeScale                                               float64 // physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
 	ViewingGroupsOff                                        []int32 // S-52 §14.5 DENY-LIST: vg ids turned OFF (nil/empty = show all)
 }
@@ -226,6 +227,7 @@ func (m Mariner) toC(arena *cArena) C.tile57_mariner {
 	}
 	c.ignore_scamin = C.bool(m.IgnoreScamin)
 	c.scamin_filter_gate = C.bool(m.ScaminFilterGate)
+	c.show_overscale = C.bool(m.ShowOverscale)
 	c.size_scale = C.double(m.SizeScale)
 	// Viewing-group deny-list: arena-owned C array so no Go pointer crosses into C.
 	vgOffPtr, vgOffN := arena.int32Array(m.ViewingGroupsOff)
@@ -261,6 +263,7 @@ func marinerFromC(c *C.tile57_mariner) Mariner {
 		HighlightDateDependent:     bool(c.highlight_date_dependent),
 		IgnoreScamin:               bool(c.ignore_scamin),
 		ScaminFilterGate:           bool(c.scamin_filter_gate),
+		ShowOverscale:              bool(c.show_overscale),
 		SizeScale:                  float64(c.size_scale),
 	}
 	var dv []byte

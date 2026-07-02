@@ -384,7 +384,11 @@ const TileGenCtx = struct {
         for (idxs, 0..) |idx, j| {
             const be = &c.backends[idx];
             const g = carryGate(be.cscl, gf_centre_d, gf_whole, display_denom, ladders);
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax };
+            // Overscale tag: the cell's compilation scale quantized UP the tile's
+            // scamin ladder (like the smax handoff), so the client's discrete
+            // crossing machinery fires exactly at the emitted value.
+            const oscl: i64 = if (be.cscl > 0) quantizeHandoff(ladders, be.cscl) else 0;
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl };
         }
         const mvt_bytes = scene.encodeTile(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
@@ -746,13 +750,19 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     // was fully suppressed at the shared z9 — the blank-window bug.
     const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }}; // SCAMIN
     const fine_feats = [_]s57.Feature{.{
-        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14,
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &scamin_attr,
     }};
     const coarse_attr = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
     const coarse_feats = [_]s57.Feature{.{
-        .rcnm = 0, .rcid = 1, .prim = 1, .objl = 14,
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &coarse_attr,
     }};
@@ -821,6 +831,105 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     // coarsest-band extension even though nothing coarser was baked).
     const t7 = lonLatToTile(0.35, 0.35, 7);
     try std.testing.expect(sink.tiles.get(tileKey(7, t7[0], t7[1])) != null);
+}
+
+test "overscale: contributing cells emit OVERSC01 coverage hatches tagged quantized oscl" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The band-handoff scenario again (coastal 1:200k + general 1:1.2M over the
+    // same spot), each cell now carrying an M_COVR(CATCOV=1) area feature whose
+    // polygon is supplied via the geo cache. The z9 handoff tile must carry BOTH
+    // cells' AP(OVERSC01) hatches: the fine cell's tagged oscl = quantizeUp(200k)
+    // = 260000 (its own ladder value, untagged smax), the carried coarse cell's
+    // tagged oscl = 1200000 (no ladder value reaches 1.2M -> raw cscl) + the
+    // carry handoff smax — it hides with the rest of the carried copy.
+    const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
+    const catcov_attr = [_]s57.Attr{.{ .code = 18, .value = "1" }}; // CATCOV=1
+    const fine_feats = [_]s57.Feature{
+        .{
+            .rcnm = 0,
+            .rcid = 1,
+            .prim = 1,
+            .objl = 14,
+            .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+            .attrs = &scamin_attr,
+        },
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 302, .attrs = &catcov_attr },
+    };
+    const coarse_attr = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
+    const coarse_feats = [_]s57.Feature{
+        .{
+            .rcnm = 0,
+            .rcid = 1,
+            .prim = 1,
+            .objl = 14,
+            .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+            .attrs = &coarse_attr,
+        },
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 302, .attrs = &catcov_attr },
+    };
+    var fine_cell = try testCell(gpa, 0.35, 0.35, 200_000, &fine_feats);
+    defer fine_cell.deinit();
+    var coarse_cell = try testCell(gpa, 0.35, 0.35, 1_200_000, &coarse_feats);
+    defer coarse_cell.deinit();
+
+    var ring = [_]s57.LonLat{
+        s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2),
+        s57.LonLat.init(3, 3),   s57.LonLat.init(-2, 3),
+        s57.LonLat.init(-2, -2),
+    };
+    const rings = [_][]const s57.LonLat{&ring};
+    const cover = [_][]const []const s57.LonLat{&rings};
+    // Geo cache: the M_COVR feature (index 1) gets the same ring as its polygon.
+    var mparts = [_][]s57.LonLat{&ring};
+    const geo = [_]?[][]s57.LonLat{ null, &mparts };
+    const bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
+    const streams = [_]?[]const u8{ "DrawingPriority:7;PointInstruction:BOYLAT01", null };
+    const fine_scamins = [_]u32{260_000};
+    const coarse_scamins = [_]u32{800_000};
+
+    var fine = Backend{ .cell = fine_cell, .portrayal = &streams, .geo = &geo, .bounds = bounds, .cscl = 200_000, .coverage = &cover, .scamins = &fine_scamins };
+    const coarse = Backend{ .cell = coarse_cell, .portrayal = &streams, .geo = &geo, .bounds = bounds, .cscl = 1_200_000, .coverage = &cover, .scamins = &coarse_scamins };
+
+    var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
+    var baker = Baker.init(gpa, 7, 10, .{ .ctx = &sink, .func = CollectSink.run });
+    defer baker.deinit();
+    try baker.bakeBand(.coastal, (&fine)[0..1], 1, .defer_down, null, null, null);
+    var both = [_]Backend{ coarse, fine };
+    try baker.bakeBand(.general, &both, 1, .extend_min, null, null, null);
+
+    const t9 = lonLatToTile(0.35, 0.35, 9);
+    const bytes = sink.tiles.get(tileKey(9, t9[0], t9[1])) orelse return error.TestUnexpectedResult;
+    const raw = try gzip.decompress(a, bytes);
+    const layers = try mvt.decode(a, raw);
+    var fine_hatch: usize = 0;
+    var coarse_hatch: usize = 0;
+    for (layers) |L| {
+        if (!std.mem.eql(u8, L.name, "area_patterns")) continue;
+        for (L.features) |f| {
+            var is_oversc = false;
+            for (f.properties) |pr| if (std.mem.eql(u8, pr.key, "pattern_name")) {
+                is_oversc = std.mem.eql(u8, pr.value.string, "OVERSC01");
+            };
+            if (!is_oversc) continue;
+            const oscl = findIntProp(f.properties, "oscl") orelse return error.TestUnexpectedResult;
+            const smax = findIntProp(f.properties, "smax");
+            if (oscl == 260_000) {
+                // Fine cell: cscl 200k quantized UP its own ladder; never carried.
+                try std.testing.expectEqual(@as(?i64, null), smax);
+                fine_hatch += 1;
+            } else if (oscl == 1_200_000) {
+                // Carried coarse cell: raw-cscl fallback + the carry handoff smax.
+                try std.testing.expectEqual(@as(?i64, 260_000), smax);
+                coarse_hatch += 1;
+            } else return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), fine_hatch);
+    try std.testing.expectEqual(@as(usize, 1), coarse_hatch);
 }
 
 test "bandOf / bandZooms match the Go reference bands" {

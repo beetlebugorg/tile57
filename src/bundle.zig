@@ -638,7 +638,9 @@ const BakeSink = struct {
                     // handoff denominators join the same ladder: they are quantized
                     // onto real SCAMIN values (usually already present), but a raw-
                     // CSCL fallback still needs its client crossing to hand off at.
-                    if (std.mem.eql(u8, p.key, "scamin") or std.mem.eql(u8, p.key, "smax")) {
+                    // oscl (overscale) tags join it identically: the AP(OVERSC01)
+                    // gate must flip at a client crossing (specs/overscale.md).
+                    if (std.mem.eql(u8, p.key, "scamin") or std.mem.eql(u8, p.key, "smax") or std.mem.eql(u8, p.key, "oscl")) {
                         switch (p.value) {
                             .int => |iv| if (iv > 0) self.scamin.put(@intCast(iv), {}) catch {},
                             else => {},

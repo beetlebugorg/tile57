@@ -139,6 +139,17 @@ pub fn smaxVisible(smax: i64, zoom: f64) bool {
     return zoom < std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(smax)));
 }
 
+/// Overscale gate (S-52 §10.1.10) — the AP(OVERSC01) hatch over a cell's M_COVR
+/// coverage shows only while the display is FINER than the cell's (quantized)
+/// compilation scale: denom(zoom) < oscl, i.e. zoom > log2(DENOM_Z0 / oscl).
+/// Exactly at 1:oscl the display is at compilation scale — no indication (the
+/// style clause is a strict `>`: oscl > DENOM). oscl 0 (unknown) never shows.
+/// Mirrors the style oscl clause (assets/style.zig writeOsclClause).
+pub fn osclVisible(oscl: i64, zoom: f64) bool {
+    if (oscl <= 0) return false;
+    return zoom > std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(oscl)));
+}
+
 /// Viewing-group gate (S-52 §14.5) — the deny-list model of
 /// chartstyle.MarinerSettings.viewing_groups_off (the host's viewingGroupsOff model):
 /// a feature with no viewing group (vg 0) always shows; otherwise it hides iff
@@ -170,6 +181,14 @@ pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64,
     if (!viewingGroupVisible(meta.vg, m.viewing_groups_off)) return false;
     if (!m.ignore_scamin and !scaminVisible(meta.scamin, zoom)) return false;
     if (!m.ignore_scamin and !smaxVisible(meta.smax, zoom)) return false;
+    // The AP(OVERSC01) overscale hatch (S-52 §10.1.10): the mariner toggle, plus
+    // the oscl scale gate. Hidden under ignore_scamin (the debug toggle drops all
+    // scale gating — an always-on hatch would bury the debug view), mirroring the
+    // style builder, which omits the overscale layer entirely there.
+    if (meta.overscale) {
+        if (!m.show_overscale or m.ignore_scamin) return false;
+        if (!osclVisible(meta.oscl, zoom)) return false;
+    }
     // S-52 display-variant passes (mirrors chartstyle.boundaryFilter /
     // pointStyleFilter): a feature portrayed twice carries bnd 1/0 (symbolized/
     // plain boundary) or pts 0/1 (paper/simplified points); show the common
@@ -247,6 +266,34 @@ test "smaxVisible is scaminVisible's mirror: carried copy hides past the handoff
     try std.testing.expect(!smaxVisible(260000, cross));
     try std.testing.expect(scaminVisible(260000, cross));
     try std.testing.expect(smaxVisible(0, 0)); // untagged -> always
+}
+
+test "osclVisible: the overscale hatch shows only past the compilation scale" {
+    // 1:260000 data: the display reads finer than 1:260000 past zoom
+    // log2(279541132/260000) ~= 10.07 — the hatch turns ON there (denom < oscl).
+    const cross = std.math.log2(DENOM_Z0 / 260000.0);
+    try std.testing.expect(!osclVisible(260000, 9.5));
+    try std.testing.expect(osclVisible(260000, 10.5));
+    // Exactly AT compilation scale there is no overscale (strict >, like the
+    // style clause [">", oscl, DENOM]).
+    try std.testing.expect(!osclVisible(260000, cross));
+    // Unknown scale never hatches.
+    try std.testing.expect(!osclVisible(0, 16.0));
+}
+
+test "visible: the overscale hatch honours show_overscale + the oscl gate" {
+    const m = MarinerSettings{};
+    const hatch = rs.FeatureMeta{ .cat = 0, .oscl = 260000, .overscale = true };
+    try std.testing.expect(!visible(&hatch, null, 9.5, &m)); // display coarser: no hatch
+    try std.testing.expect(visible(&hatch, null, 12.0, &m)); // overscaled: hatch shows
+    const off = MarinerSettings{ .show_overscale = false };
+    try std.testing.expect(!visible(&hatch, null, 12.0, &off));
+    const ign = MarinerSettings{ .ignore_scamin = true };
+    try std.testing.expect(!visible(&hatch, null, 12.0, &ign)); // debug view: no hatch
+    // An ordinary fill carrying the oscl TAG (not the hatch) is never oscl-gated.
+    const fill = rs.FeatureMeta{ .cat = 0, .oscl = 260000 };
+    try std.testing.expect(visible(&fill, null, 9.5, &m));
+    try std.testing.expect(visible(&fill, null, 12.0, &m));
 }
 
 test "viewingGroupVisible: deny-list, vg 0 always shows" {

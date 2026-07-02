@@ -58,6 +58,13 @@ pub const MarinerSettings = struct {
     show_meta_bounds: bool = false,
     show_isolated_dangers_shallow: bool = false,
 
+    // -- overscale indication (S-52 §10.1.10, ON by default) --
+    // AP(OVERSC01) vertical-line hatch over regions whose best displayed data is
+    // enlarged past its compilation scale (the baked `oscl` gate). Toggling only
+    // flips the `overscale` layer's visibility — the layer set is unchanged, so
+    // the style-diff path emits one setLayoutProperty op.
+    show_overscale: bool = true,
+
     // -- symbolization style --
     boundary_style: BoundaryStyle = .symbolized,
     simplified_points: bool = false,
@@ -212,17 +219,23 @@ pub fn seabedTokenExpr(b: B, m: *const MarinerSettings) !Value {
     if (!m.four_shade_water) {
         return b.arr(&.{
             b.s("case"),
-            try band(b, d1, d2, m.safety_contour), b.s("DEPDW"),
-            try band(b, d1, d2, 0.0),              b.s("DEPVS"),
+            try band(b, d1, d2, m.safety_contour),
+            b.s("DEPDW"),
+            try band(b, d1, d2, 0.0),
+            b.s("DEPVS"),
             b.s("DEPIT"),
         });
     }
     return b.arr(&.{
         b.s("case"),
-        try band(b, d1, d2, m.deep_contour),    b.s("DEPDW"),
-        try band(b, d1, d2, m.safety_contour),  b.s("DEPMD"),
-        try band(b, d1, d2, m.shallow_contour), b.s("DEPMS"),
-        try band(b, d1, d2, 0.0),               b.s("DEPVS"),
+        try band(b, d1, d2, m.deep_contour),
+        b.s("DEPDW"),
+        try band(b, d1, d2, m.safety_contour),
+        b.s("DEPMD"),
+        try band(b, d1, d2, m.shallow_contour),
+        b.s("DEPMS"),
+        try band(b, d1, d2, 0.0),
+        b.s("DEPVS"),
         b.s("DEPIT"),
     });
 }
@@ -412,16 +425,22 @@ pub fn dateFilter(b: B, today_str: []const u8) !Value {
     });
     const body = try b.arr(&.{
         b.s("case"),
-        try b.arr(&.{ b.s("all"), hasS, hasE }), inRange,
-        hasS, geTS,
-        hasE, leTE,
+        try b.arr(&.{ b.s("all"), hasS, hasE }),
+        inRange,
+        hasS,
+        geTS,
+        hasE,
+        leTE,
         b.boolean(true),
     });
     const letExpr = try b.arr(&.{
         b.s("let"),
-        b.s("T"), T,
-        b.s("S"), try b.coalesce(try b.get("date_start"), b.s("")),
-        b.s("E"), try b.coalesce(try b.get("date_end"), b.s("")),
+        b.s("T"),
+        T,
+        b.s("S"),
+        try b.coalesce(try b.get("date_start"), b.s("")),
+        b.s("E"),
+        try b.coalesce(try b.get("date_end"), b.s("")),
         body,
     });
     return b.arr(&.{

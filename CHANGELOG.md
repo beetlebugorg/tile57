@@ -6,6 +6,39 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Added — S-52 overscale indication (AP(OVERSC01), specs/overscale.md)
+- **Baked overscale hatch geometry**: every cell contributing to a tile
+  (including band-handoff carried cells) now emits its M_COVR (CATCOV=1)
+  data-coverage polygon, clipped per tile, into the `area_patterns` source
+  layer as pattern `OVERSC01`, tagged with a new int prop `oscl` = the cell's
+  compilation scale quantized UP the scamin ladder (same crossing alignment as
+  the `smax` handoff). Area fills carry the same `oscl` tag.
+- **The occlusion sandwich** (style builder): the base `areas` fill layer
+  splits into `fill-areas#oscl` (fills of overscaled cells) UNDER the new
+  `overscale` layer (fill-pattern `pat:OVERSC01`, source-layer
+  `area_patterns`) UNDER `fill-areas` (at-scale fills) — a finer cell's opaque
+  DEPARE/LNDARE occlude a coarser cell's hatch, so the hatch survives only on
+  coarse-only patches, with zero polygon boolean ops. The generic pattern
+  layers exclude `OVERSC01`.
+- **The oscl gate clause** (client-injected, exact shape pinned by test):
+  `[">", ["coalesce",["get","oscl"], 0], DENOM]` on the hatch + under-hatch
+  fills, and its `["!", …]` negation on the at-scale fills. DENOM is the SAME
+  injected literal as the scamin/smax clauses (filter-gate mode), a
+  zoom-derived denominator in bucket/fallback modes, and the 1e12 show-all
+  placeholder at boot (hatch hidden, all fills at-scale, until the client
+  injects the live denom).
+- **`show_overscale` mariner toggle** (default true; S-52 §10.1.10): drives the
+  `overscale` layer's `layout.visibility` only, so a toggle is a single
+  `setLayoutProperty` style-diff op. C ABI: `tile57_mariner.show_overscale`
+  (appended; `tile57_mariner_defaults` sets true); bindings/go:
+  `Mariner.ShowOverscale`.
+- **Pixel/ascii surfaces**: `resolve.osclVisible` mirrors the style gate, so
+  render_view/pdf/ascii draw the hatch consistently (via the normal AP path);
+  hidden under `ignore_scamin` and when `show_overscale` is off.
+- **Manifest ladder**: emitted `oscl` values join the archive/live `scamin`
+  ladder (bundle prop scan + per-cell quantized-cscl fold), so the client's
+  discrete crossing machinery fires exactly at every emitted gate value.
+
 ### Changed — MLT is the default tile format
 - **MLT (MapLibre Tiles) is now the DEFAULT bake/storage tile format**;
   MVT stays available explicitly (`--format mvt`, `tile57_bake_opts.format =
