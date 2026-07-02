@@ -33,19 +33,32 @@ pub const SymbolName = []const u8;
 /// Line dash pattern.
 pub const Dash = enum { solid, dashed };
 
+/// How a symbol was placed by the engine.
+/// `.point`: at a feature anchor (node / centroid); rotation is the rule's.
+/// `.line`: tessellated along a complex-linestyle curve; rotation follows the
+/// line tangent and is inherently chart-relative (rot_north is always true).
+/// Surfaces may treat the two differently (collision/declutter, serialization).
+pub const SymbolPlacement = enum { point, line };
+
 /// Depth range (metres) for fillArea on DEPARE / DRGARE features.
 /// Null when the area is not a depth area.
 pub const DepthRange = struct { d1: f32, d2: f32 };
 
 /// Text-label style carried by drawText.
+///
+/// An empty `halign` marks a MINIMAL label: no alignment/offset/halo/group was
+/// specified by the producing rule (native fallback labels like the SWPARE
+/// "swept to N" note). Surfaces emit/draw only what is specified — the mvt
+/// surface serializes just text/color/size for a minimal label; a pixel
+/// surface uses its defaults.
 pub const TextStyle = struct {
     color: ColorToken,
     font_size: f64,
-    halign: []const u8, // "left" | "center" | "right"
-    valign: []const u8, // "top" | "middle" | "bottom"
-    offset_x: f64,      // S-52 LocalOffset in mm (+x right / +y down)
-    offset_y: f64,
-    group: i64,         // S-101 text group (§14.5)
+    halign: []const u8 = "", // "left" | "center" | "right" ("" = minimal label)
+    valign: []const u8 = "", // "top" | "middle" | "bottom"
+    offset_x: f64 = 0,       // S-52 LocalOffset in mm (+x right / +y down)
+    offset_y: f64 = 0,
+    group: i64 = 0,          // S-101 text group (§14.5)
 };
 
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
@@ -91,9 +104,11 @@ pub const Surface = struct {
         fillPattern: *const fn (*anyopaque, name: SymbolName, rings: []const []const TilePoint) anyerror!void,
         /// Stroke a line. `valdco` carries the depth-contour value for DEPCNT labels.
         strokeLine: *const fn (*anyopaque, token: ColorToken, width_px: f64, dash: Dash, lines: []const []const TilePoint, valdco: ?f64) anyerror!void,
-        /// Draw a point symbol. `danger_depth` is non-null for DANGER01/02 on
-        /// wreck/obstruction/rock classes (live-mariner depth swap).
-        drawSymbol: *const fn (*anyopaque, name: SymbolName, at: TilePoint, rot_deg: f64, scale: f64, rot_north: bool, danger_depth: ?f64) anyerror!void,
+        /// Draw a point symbol. `placement` distinguishes anchor-placed symbols
+        /// from linestyle-tessellated ones (see SymbolPlacement). `danger_depth`
+        /// is non-null for DANGER01/02 on wreck/obstruction/rock classes
+        /// (live-mariner depth swap); point placement only.
+        drawSymbol: *const fn (*anyopaque, name: SymbolName, at: TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: SymbolPlacement, danger_depth: ?f64) anyerror!void,
         /// Draw a depth sounding (the engine has recognized it as a sounding glyph).
         drawSounding: *const fn (*anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: TilePoint) anyerror!void,
         /// Draw a text label.
@@ -119,8 +134,8 @@ pub const Surface = struct {
     pub fn strokeLine(self: Surface, token: ColorToken, width_px: f64, dash: Dash, lines: []const []const TilePoint, valdco: ?f64) anyerror!void {
         return self.vtable.strokeLine(self.ptr, token, width_px, dash, lines, valdco);
     }
-    pub fn drawSymbol(self: Surface, name: SymbolName, at: TilePoint, rot_deg: f64, scale: f64, rot_north: bool, danger_depth: ?f64) anyerror!void {
-        return self.vtable.drawSymbol(self.ptr, name, at, rot_deg, scale, rot_north, danger_depth);
+    pub fn drawSymbol(self: Surface, name: SymbolName, at: TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: SymbolPlacement, danger_depth: ?f64) anyerror!void {
+        return self.vtable.drawSymbol(self.ptr, name, at, rot_deg, scale, rot_north, placement, danger_depth);
     }
     pub fn drawSounding(self: Surface, depth_m: f64, swept: bool, low_acc: bool, at: TilePoint) anyerror!void {
         return self.vtable.drawSounding(self.ptr, depth_m, swept, low_acc, at);

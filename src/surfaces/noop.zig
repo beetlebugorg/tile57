@@ -37,7 +37,7 @@ pub const NoopSurface = struct {
     fn fillArea(_: *anyopaque, _: rs.ColorToken, _: []const []const rs.TilePoint, _: ?rs.DepthRange) anyerror!void {}
     fn fillPattern(_: *anyopaque, _: rs.SymbolName, _: []const []const rs.TilePoint) anyerror!void {}
     fn strokeLine(_: *anyopaque, _: rs.ColorToken, _: f64, _: rs.Dash, _: []const []const rs.TilePoint, _: ?f64) anyerror!void {}
-    fn drawSymbol(_: *anyopaque, _: rs.SymbolName, _: rs.TilePoint, _: f64, _: f64, _: bool, _: ?f64) anyerror!void {}
+    fn drawSymbol(_: *anyopaque, _: rs.SymbolName, _: rs.TilePoint, _: f64, _: f64, _: bool, _: rs.SymbolPlacement, _: ?f64) anyerror!void {}
     fn drawSounding(_: *anyopaque, _: f64, _: bool, _: bool, _: rs.TilePoint) anyerror!void {}
     fn drawText(_: *anyopaque, _: []const u8, _: *const rs.TextStyle, _: rs.TilePoint) anyerror!void {}
     fn endFeature(_: *anyopaque) anyerror!void {}
@@ -59,7 +59,7 @@ test "noop surface satisfies the full Surface lifecycle" {
     try surf.fillArea("DEPMS", &rings, .{ .d1 = 0, .d2 = 10 });
     try surf.fillPattern("DIAMOND1", &rings);
     try surf.strokeLine("CHBLK", 1.5, .dashed, &rings, 12.0);
-    try surf.drawSymbol("BCNCAR01", .{ .x = 5, .y = 5 }, 0, 1, true, 3.2);
+    try surf.drawSymbol("BCNCAR01", .{ .x = 5, .y = 5 }, 0, 1, true, .point, 3.2);
     try surf.drawSounding(4.7, false, false, .{ .x = 5, .y = 5 });
     const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .halign = "center", .valign = "middle", .offset_x = 0, .offset_y = 0, .group = 25 };
     try surf.drawText("12", &style, .{ .x = 5, .y = 5 });

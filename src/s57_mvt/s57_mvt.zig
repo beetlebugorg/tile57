@@ -226,89 +226,22 @@ fn isSoundingName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "SOUNDS") or std.mem.startsWith(u8, name, "SOUNDG");
 }
 
-/// Emit a feature's point-symbol instructions at the anchor geometry `parts`.
-/// Regular symbols go to `points_l`. SNDFRM04 sounding digit-glyphs (a wreck /
-/// obstruction / rock depth the rule drew via SNDFRM04) are instead coalesced into
-/// ONE `soundings`-layer feature built from the feature's VALSOU — so the depth lands
-/// in the soundings layer like the oracle (bake.go:797), honouring the safety-depth
-/// split and the mariner depth unit (sym_s_ft/sym_g_ft) just like a SOUNDG sounding,
-/// rather than leaking into point_symbols as fixed-metres glyphs. If the feature has
-/// no usable VALSOU the glyphs are left in point_symbols unchanged (no depth to recompose).
-fn emitFeaturePoints(a: Allocator, syms: []const s101.Point, parts: []const []const mvt.Point, f: s57.Feature, meta: Meta, points_l: *std.ArrayList(mvt.Feature), L: Layers) !void {
-    // Coalesce the rule's sounding glyphs into the soundings layer when the feature
-    // carries a depth to recompose from (VALSOU); else they stay in point_symbols.
-    var routed_sounding = false;
-    if (f.attrFloat(s57.ATTR_VALSOU)) |valsou| {
-        var has = false;
-        for (syms) |sym| {
-            if (isSoundingName(sym.symbol)) {
-                has = true;
-                break;
-            }
-        }
-        if (has) {
-            const q = soundingQualityFlags(f);
-            var props = std.ArrayList(mvt.Prop).empty;
-            if (try appendSoundingProps(a, &props, valsou, q.swept, q.low_acc)) {
-                try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-                try appendMeta(a, &props, meta); // class/draw_prio/cat/scamin from the feature's portrayal
-                try L.soundings.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-                routed_sounding = true;
-            }
-        }
-    }
-    for (syms) |sym| {
-        if (routed_sounding and isSoundingName(sym.symbol)) continue; // moved to the soundings layer
-        var props = std.ArrayList(mvt.Prop).empty;
-        // OBSTRN07/WRECKS05 pick DANGER01 (shallow) vs DANGER02 (deep) against the
-        // BAKE-TIME safety depth, but that split is a live mariner setting. Normalize
-        // the baked symbol to DANGER01 and tag danger_depth + sym_deep so the style's
-        // coalesce swaps to DANGER02 when the danger lies deeper than the LIVE safety
-        // contour (chartstyle.pointSymbolImage; port of the oracle's applyDangerDepth
-        // post-tag). Keyed to the danger classes with a usable VALSOU, like the oracle.
-        const is_danger01_02 = std.mem.eql(u8, sym.symbol, "DANGER01") or std.mem.eql(u8, sym.symbol, "DANGER02");
-        const danger_class = f.objl == 86 or f.objl == 153 or f.objl == 159; // OBSTRN / UWTROC / WRECKS
-        if (is_danger01_02 and danger_class) {
-            if (f.attrFloat(s57.ATTR_VALSOU)) |valsou| {
-                try props.append(a, .{ .key = "symbol_name", .value = .{ .string = "DANGER01" } });
-                try props.append(a, .{ .key = "danger_depth", .value = .{ .double = valsou } });
-                try props.append(a, .{ .key = "sym_deep", .value = .{ .string = "DANGER02" } });
-            } else {
-                try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
-            }
-        } else {
-            try props.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.symbol } });
-        }
-        try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = sym.rotation } });
-        if (sym.rot_north) try props.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } });
-        try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-        try appendMeta(a, &props, meta);
-        try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-    }
-}
-
 /// Emit a SOUNDG feature's multipoint soundings into the `soundings` layer, one
 /// point per sounding, with the SNDFRM glyph variants (see appendSoundingProps) so
 /// the style renders the depth digits and the mariner safety-depth + unit switches.
-fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, meta: Meta, z: u8, x: u32, y: u32, tb: [4]f64, out: *std.ArrayList(mvt.Feature)) !void {
+fn emitSoundings(a: Allocator, cell: s57.Cell, f: s57.Feature, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, tb: [4]f64, surf: rs.Surface) !void {
     const snds = cell.soundingsFor(a, f) catch return;
     const q = soundingQualityFlags(f);
+    // One feature bracket for the whole SOUNDG multipoint; the meta (draw priority /
+    // display category / band / SCAMIN / class) rides every sounding so they honour
+    // the client's category + SCAMIN gating — oracle routeSoundingGroup (bake.go:894).
+    try surf.beginFeature(&fmeta);
     for (snds) |s| {
         if (s.lon() < tb[0] or s.lon() > tb[2] or s.lat() < tb[1] or s.lat() > tb[3]) continue;
-        var props = std.ArrayList(mvt.Prop).empty;
-        if (!try appendSoundingProps(a, &props, s.depth, q.swept, q.low_acc)) continue;
-        try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-        // Shared S-52 mariner-filter metadata (draw priority / display category /
-        // band / SCAMIN / class) so soundings honour the client's category + SCAMIN
-        // gating like every other feature — oracle routeSoundingGroup (bake.go:894).
-        try appendMeta(a, &props, meta);
         const pt = tile.project(s.lon(), s.lat(), z, x, y, tile.EXTENT);
-        const parts = try a.alloc([]const mvt.Point, 1);
-        const single = try a.alloc(mvt.Point, 1);
-        single[0] = pt;
-        parts[0] = single;
-        try out.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+        try surf.drawSounding(s.depth, q.swept, q.low_acc, pt);
     }
+    try surf.endFeature();
 }
 
 fn overlaps(b0: [4]f64, b1: [4]f64) bool {
@@ -447,78 +380,49 @@ fn geomBounds(g: []const s57.LonLat) [4]f64 {
     return b;
 }
 
-/// Emit a feature styled by its S-101 instruction stream. Surfaces with a
-/// ColorFill become `areas` polygons (color_token already depth-resolved by the
-/// rule); curves with LineInstructions become `lines`. (Patterns / points /
-/// text grow here next.)
-const Layers = struct {
-    areas: *std.ArrayList(mvt.Feature),
-    area_patterns: *std.ArrayList(mvt.Feature),
-    lines: *std.ArrayList(mvt.Feature),
-    points: *std.ArrayList(mvt.Feature),
-    texts: *std.ArrayList(mvt.Feature),
-    // SCAMIN buckets: a feature carrying SCAMIN (s57 attr 133) routes here instead
-    // of the base list, and carries a `scamin` property so the style gates its
-    // display below the feature's 1:N scale (see s57_mvt.ATTR_SCAMIN / assets/style.zig).
-    areas_scamin: *std.ArrayList(mvt.Feature),
-    area_patterns_scamin: *std.ArrayList(mvt.Feature),
-    lines_scamin: *std.ArrayList(mvt.Feature),
-    points_scamin: *std.ArrayList(mvt.Feature),
-    texts_scamin: *std.ArrayList(mvt.Feature),
-    // The `soundings` layer (one list, no SCAMIN bucket — gated by the `scamin`
-    // property in the style). SOUNDG multipoints and wreck/obstruction/rock depth
-    // glyphs (coalesced from the portrayal, see emitFeaturePoints) both land here.
-    soundings: *std.ArrayList(mvt.Feature),
-    // NOAA navigational band of the cell being appended (0=berthing/finest …
-    // 5=overview/coarsest). Emitted as the MVT `band` property so the style's
-    // fill-sort-key draws finer-band area fills over coarser ones at band overlaps
-    // (the live multi-cell path overlays all bands into one tile).
-    band: u8 = 0,
-    // Best-band coverage suppression (live multi-cell path): this cell is a COARSER
-    // band overzoomed past its native range where a finer band's M_COVR coverage is
-    // present, so its AREA fills (suppress_fills) and/or patterns (suppress_patterns)
-    // are dropped — the finer cell carries the real data. Fills are suppressed only
-    // where a finer band covers the WHOLE tile (no seam gap; the finer fill occludes
-    // via the band sort-key); patterns, which draw above all fills, are suppressed by
-    // the tile centre so they can't lap over finer land.
-    suppress_fills: bool = false,
-    suppress_patterns: bool = false,
-    // Best-band suppression for the remaining geometry of an overzoomed coarser cell:
-    //   suppress_lines  — drop boundary/line STROKES where a finer band covers the tile
-    //     centre. Lines double-draw beside the finer copy (no opaque fill hides them),
-    //     so this matches the Go line rule (coverageScaleAt at the tile centre).
-    //   suppress_points — drop point symbols + text where a finer band covers the WHOLE
-    //     tile. Conservative per-tile approximation of Go's per-point position test:
-    //     a partly-covered seam tile keeps the coarse points/labels (the finer cell,
-    //     drawn on top, wins where it has data); no labels lost over a coverage gap.
-    suppress_lines: bool = false,
-    suppress_points: bool = false,
-    // Emit the per-feature pick-report attributes (the `s57` blob + `cell` name) for
-    // the S-52 §10.8 cursor pick + dev inspector. Defaults ON (host wants a working
-    // pick report in the local-first deployment); a lean bake can turn it off via the
-    // C ABI to drop the bulky `s57` payload. See encodeS57Attrs / pickS57.
-    pick_attrs: bool = true,
-};
-
-/// Per-cell generation options — the CellRef suppression/band/pick flags extracted
-/// so they can be threaded through the Surface-based engine path without Layers.
+/// Per-cell generation options: the CellRef band / coverage-suppression / pick
+/// flags, threaded through the engine path beside the Surface.
 pub const CellOpts = struct {
+    /// NOAA navigational band of the cell being appended (0=berthing/finest …
+    /// 5=overview/coarsest). Emitted as the `band` property so the style's
+    /// fill-sort-key draws finer-band area fills over coarser ones at band overlaps
+    /// (the live multi-cell path overlays all bands into one tile).
     band: u8 = 0,
+    /// Best-band coverage suppression (live multi-cell path): this cell is a COARSER
+    /// band overzoomed past its native range where a finer band's M_COVR coverage is
+    /// present, so its AREA fills (suppress_fills) and/or patterns (suppress_patterns)
+    /// are dropped — the finer cell carries the real data. Fills are suppressed only
+    /// where a finer band covers the WHOLE tile (no seam gap; the finer fill occludes
+    /// via the band sort-key); patterns, which draw above all fills, are suppressed by
+    /// the tile centre so they can't lap over finer land.
     suppress_fills: bool = false,
     suppress_patterns: bool = false,
+    /// Best-band suppression for the remaining geometry of an overzoomed coarser cell:
+    ///   suppress_lines  — drop boundary/line STROKES where a finer band covers the tile
+    ///     centre. Lines double-draw beside the finer copy (no opaque fill hides them),
+    ///     so this matches the Go line rule (coverageScaleAt at the tile centre).
+    ///   suppress_points — drop point symbols + text where a finer band covers the WHOLE
+    ///     tile. Conservative per-tile approximation of Go's per-point position test:
+    ///     a partly-covered seam tile keeps the coarse points/labels (the finer cell,
+    ///     drawn on top, wins where it has data); no labels lost over a coverage gap.
     suppress_lines: bool = false,
     suppress_points: bool = false,
+    /// Emit the per-feature pick-report attributes (the `s57` blob + `cell` name) for
+    /// the S-52 §10.8 cursor pick + dev inspector. Defaults ON (host wants a working
+    /// pick report in the local-first deployment); a lean bake can turn it off via the
+    /// C ABI to drop the bulky `s57` payload. See encodeS57Attrs.
     pick_attrs: bool = true,
 };
 
-/// MVT/MLT surface: owns the 11 tile layer lists and implements the rs.Surface vtable.
-/// The engine calls vtable methods (fillArea/strokeLine/…); this surface builds the
-/// mvt.Feature props in the exact order the existing code used, so bakes are
-/// byte-identical before and after the P0 seam is cut.
+/// MVT/MLT surface: owns the 11 tile layer lists and implements the rs.Surface
+/// interface. The engine calls Surface methods (fillArea/strokeLine/…); this
+/// surface builds the mvt.Feature props in the exact order the pre-seam code
+/// used, so bakes are byte-identical before and after the split.
 ///
-/// emitAugFigures and emitComplexLine are NOT routed through the vtable (their
-/// embedded-symbol prop order differs from drawSymbol); they access lists directly
-/// via asMvtSurf() downcasts in processFeatureParsed.
+/// The only draw path that does NOT come through the Surface interface is the
+/// legacy classify() mode (features with NO portrayal at all): its prop schema
+/// ({class, color_token, band}) predates the S-101 engine and is a tile-only
+/// serialization detail, so appendCellFeaturesSurf writes those lists directly.
 pub const MvtSurface = struct {
     a: Allocator,
     format: TileFormat,
@@ -527,26 +431,32 @@ pub const MvtSurface = struct {
     lines: std.ArrayList(mvt.Feature) = .empty,
     points: std.ArrayList(mvt.Feature) = .empty,
     texts: std.ArrayList(mvt.Feature) = .empty,
+    // SCAMIN buckets: a feature carrying SCAMIN (s57 attr 133) routes here instead
+    // of the base list, and carries a `scamin` property so the style gates its
+    // display below the feature's 1:N scale (see ATTR_SCAMIN / assets/style.zig).
     areas_scamin: std.ArrayList(mvt.Feature) = .empty,
     area_patterns_scamin: std.ArrayList(mvt.Feature) = .empty,
     lines_scamin: std.ArrayList(mvt.Feature) = .empty,
     points_scamin: std.ArrayList(mvt.Feature) = .empty,
     texts_scamin: std.ArrayList(mvt.Feature) = .empty,
+    // The `soundings` layer (one list, no SCAMIN bucket — gated by the `scamin`
+    // property in the style). SOUNDG multipoints and wreck/obstruction/rock depth
+    // glyphs (coalesced from the portrayal via drawSounding) both land here.
     soundings: std.ArrayList(mvt.Feature) = .empty,
-    /// Current feature meta, set by beginFeature; vtable methods read it.
+    /// Current feature meta, set by beginFeature; the draw methods read it.
     cur: Meta = .{ .prio = 0 },
 
     const mvt_vtable = rs.Surface.VTable{
-        .beginScene = vtableBeginScene,
-        .beginFeature = vtableBeginFeature,
-        .fillArea = vtableFillArea,
-        .fillPattern = vtableFillPattern,
-        .strokeLine = vtableStrokeLine,
-        .drawSymbol = vtableDrawSymbol,
-        .drawSounding = vtableDrawSounding,
-        .drawText = vtableDrawText,
-        .endFeature = vtableEndFeature,
-        .endScene = vtableEndScene,
+        .beginScene = beginScene,
+        .beginFeature = beginFeature,
+        .fillArea = fillArea,
+        .fillPattern = fillPattern,
+        .strokeLine = strokeLine,
+        .drawSymbol = drawSymbol,
+        .drawSounding = drawSounding,
+        .drawText = drawText,
+        .endFeature = endFeature,
+        .endScene = endScene,
     };
 
     pub fn init(a: Allocator, format: TileFormat) MvtSurface {
@@ -557,23 +467,6 @@ pub const MvtSurface = struct {
         return .{ .ptr = self, .vtable = &mvt_vtable };
     }
 
-    /// Build a Layers view whose pointer fields point into this surface's lists.
-    /// Used by native fallbacks and the classify() path that still append directly.
-    pub fn asLayers(self: *MvtSurface, opts: CellOpts) Layers {
-        return .{
-            .areas = &self.areas,               .area_patterns = &self.area_patterns,
-            .lines = &self.lines,               .points = &self.points,
-            .texts = &self.texts,               .areas_scamin = &self.areas_scamin,
-            .area_patterns_scamin = &self.area_patterns_scamin,
-            .lines_scamin = &self.lines_scamin, .points_scamin = &self.points_scamin,
-            .texts_scamin = &self.texts_scamin, .soundings = &self.soundings,
-            .band = opts.band,
-            .suppress_fills = opts.suppress_fills, .suppress_patterns = opts.suppress_patterns,
-            .suppress_lines = opts.suppress_lines, .suppress_points = opts.suppress_points,
-            .pick_attrs = opts.pick_attrs,
-        };
-    }
-
     fn sp(ctx: *anyopaque) *MvtSurface { return @ptrCast(@alignCast(ctx)); }
 
     fn areasL(s: *MvtSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.areas_scamin else &s.areas; }
@@ -582,9 +475,9 @@ pub const MvtSurface = struct {
     fn pointsL(s: *MvtSurface) *std.ArrayList(mvt.Feature)       { return if (s.cur.scamin != null) &s.points_scamin else &s.points; }
     fn textsL(s: *MvtSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.texts_scamin else &s.texts; }
 
-    fn vtableBeginScene(_: *anyopaque, _: u8) anyerror!void {}
+    fn beginScene(_: *anyopaque, _: u8) anyerror!void {}
 
-    fn vtableBeginFeature(ctx: *anyopaque, meta: *const rs.FeatureMeta) anyerror!void {
+    fn beginFeature(ctx: *anyopaque, meta: *const rs.FeatureMeta) anyerror!void {
         const s = sp(ctx);
         s.cur = .{
             .prio = meta.draw_prio, .cat = meta.cat, .vg = meta.vg,
@@ -595,7 +488,7 @@ pub const MvtSurface = struct {
         };
     }
 
-    fn vtableFillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
+    fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try props.append(s.a, .{ .key = "color_token", .value = .{ .string = token } });
@@ -607,7 +500,7 @@ pub const MvtSurface = struct {
         try s.areasL().append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
     }
 
-    fn vtableFillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
+    fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try props.append(s.a, .{ .key = "pattern_name", .value = .{ .string = name } });
@@ -615,7 +508,7 @@ pub const MvtSurface = struct {
         try s.apatL().append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
     }
 
-    fn vtableStrokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
+    fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try props.append(s.a, .{ .key = "color_token", .value = .{ .string = token } });
@@ -627,10 +520,13 @@ pub const MvtSurface = struct {
         try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = lines, .properties = props.items });
     }
 
-    fn vtableDrawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, danger_depth: ?f64) anyerror!void {
+    fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         if (danger_depth) |depth| {
+            // OBSTRN07/WRECKS05 picked DANGER01 (shallow) vs 02 (deep) against the
+            // BAKE-TIME safety depth; normalize to DANGER01 + danger_depth/sym_deep
+            // so the style swaps live against the mariner's safety contour.
             try props.append(s.a, .{ .key = "symbol_name", .value = .{ .string = "DANGER01" } });
             try props.append(s.a, .{ .key = "danger_depth", .value = .{ .double = depth } });
             try props.append(s.a, .{ .key = "sym_deep", .value = .{ .string = "DANGER02" } });
@@ -638,8 +534,16 @@ pub const MvtSurface = struct {
             try props.append(s.a, .{ .key = "symbol_name", .value = .{ .string = name } });
         }
         try props.append(s.a, .{ .key = "rotation_deg", .value = .{ .double = rot_deg } });
-        if (rot_north) try props.append(s.a, .{ .key = "rot_north", .value = .{ .int = 1 } });
+        switch (placement) {
+            // Anchor-placed: rot_north only when the rule asked for chart-relative
+            // rotation, and it precedes scale (the historical tile prop order).
+            .point => if (rot_north) try props.append(s.a, .{ .key = "rot_north", .value = .{ .int = 1 } }),
+            .line => {},
+        }
         try props.append(s.a, .{ .key = "scale", .value = .{ .double = scale } });
+        // Linestyle-embedded: tangent rotation turns with the chart, so rot_north is
+        // inherent — and historically serialized AFTER scale. Keep that order.
+        if (placement == .line) try props.append(s.a, .{ .key = "rot_north", .value = .{ .int = 1 } });
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
         const single = try s.a.alloc(mvt.Point, 1);
@@ -648,7 +552,7 @@ pub const MvtSurface = struct {
         try s.pointsL().append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 
-    fn vtableDrawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
+    fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         if (!try appendSoundingProps(s.a, &props, depth_m, swept, low_acc)) return;
@@ -661,27 +565,10 @@ pub const MvtSurface = struct {
         try s.soundings.append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 
-    fn vtableDrawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
+    fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
-        // Prop order must match appendTextProps exactly.
-        const font_px: f64 = if (style.font_size > 0) style.font_size else 12;
-        try props.append(s.a, .{ .key = "text", .value = .{ .string = text } }); // already shortened by engine
-        try props.append(s.a, .{ .key = "color_token", .value = .{ .string = style.color } });
-        try props.append(s.a, .{ .key = "font_size_px", .value = .{ .double = font_px } });
-        try props.append(s.a, .{ .key = "halign", .value = .{ .string = style.halign } });
-        try props.append(s.a, .{ .key = "valign", .value = .{ .string = style.valign } });
-        {
-            const TEXT_BODY_MM = 3.51;
-            const ux: i64 = @intFromFloat(@round(style.offset_x / TEXT_BODY_MM));
-            const uy: i64 = @intFromFloat(@round(style.offset_y / TEXT_BODY_MM));
-            if (ux != 0 or uy != 0)
-                try props.append(s.a, .{ .key = "loff", .value = .{ .string = try std.fmt.allocPrint(s.a, "{d},{d}", .{ ux, uy }) } });
-        }
-        const haloed = font_px >= 10;
-        try props.append(s.a, .{ .key = "halo_color_token", .value = .{ .string = if (haloed) "CHWHT" else "" } });
-        try props.append(s.a, .{ .key = "halo_width", .value = .{ .double = if (haloed) 1 else 0 } });
-        try props.append(s.a, .{ .key = "tgrp", .value = .{ .int = style.group } });
+        try appendTextProps(s.a, &props, text, style); // text already shortened by engine
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
         const single = try s.a.alloc(mvt.Point, 1);
@@ -690,9 +577,9 @@ pub const MvtSurface = struct {
         try s.textsL().append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 
-    fn vtableEndFeature(_: *anyopaque) anyerror!void {}
+    fn endFeature(_: *anyopaque) anyerror!void {}
 
-    fn vtableEndScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
+    fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const s = sp(ctx);
         var layers = std.ArrayList(mvt.Layer).empty;
         if (s.areas.items.len > 0)               try layers.append(s.a, .{ .name = "areas",                   .features = s.areas.items });
@@ -713,14 +600,6 @@ pub const MvtSurface = struct {
         };
     }
 };
-
-/// Downcast a Surface known to wrap MvtSurface (safe within s57_mvt.zig where all
-/// Surface values come from MvtSurface.asSurface()). Used by processFeatureParsed to
-/// hand direct list pointers to emitAugFigures / emitComplexLine, which bypass the
-/// vtable because their embedded-symbol prop order differs from drawSymbol's.
-fn asMvtSurf(surf: rs.Surface) *MvtSurface {
-    return @ptrCast(@alignCast(surf.ptr));
-}
 
 /// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
 pub fn featureScamin(f: s57.Feature) ?i64 {
@@ -885,15 +764,19 @@ fn shortenName(text: []const u8) []const u8 {
     return name;
 }
 
-fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) !void {
+/// Serialize a text label's props in the tile schema order. `text` arrives already
+/// shortened/resolved by the engine. A minimal label (empty halign — see
+/// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
+fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, style: *const rs.TextStyle) !void {
     // Resolved body size: the FontSize modifier px, or 12 (oracle default). Drives
     // both the emitted font_size_px and the halo gate below.
-    const font_px: f64 = if (t.font_size > 0) t.font_size else 12;
-    try props.append(a, .{ .key = "text", .value = .{ .string = shortenName(t.text) } });
-    try props.append(a, .{ .key = "color_token", .value = .{ .string = t.color } });
+    const font_px: f64 = if (style.font_size > 0) style.font_size else 12;
+    try props.append(a, .{ .key = "text", .value = .{ .string = text } });
+    try props.append(a, .{ .key = "color_token", .value = .{ .string = style.color } });
     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = font_px } });
-    try props.append(a, .{ .key = "halign", .value = .{ .string = t.halign } });
-    try props.append(a, .{ .key = "valign", .value = .{ .string = t.valign } });
+    if (style.halign.len == 0) return; // minimal label: no alignment/halo/group spec
+    try props.append(a, .{ .key = "halign", .value = .{ .string = style.halign } });
+    try props.append(a, .{ .key = "valign", .value = .{ .string = style.valign } });
     // S-101 LocalOffset -> label-offset key in text-body units (3.51 mm = one text
     // body height = 1 em): the style's text-offset match keys on "ux,uy" to shift a
     // name clear of its symbol (PortrayFeatureName emits 0,-3.51 = one body up).
@@ -901,8 +784,8 @@ fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) 
     // right / +y down, which matches MapLibre's text-offset.
     {
         const TEXT_BODY_MM = 3.51;
-        const ux: i64 = @intFromFloat(@round(t.offset_x / TEXT_BODY_MM));
-        const uy: i64 = @intFromFloat(@round(t.offset_y / TEXT_BODY_MM));
+        const ux: i64 = @intFromFloat(@round(style.offset_x / TEXT_BODY_MM));
+        const uy: i64 = @intFromFloat(@round(style.offset_y / TEXT_BODY_MM));
         if (ux != 0 or uy != 0)
             try props.append(a, .{ .key = "loff", .value = .{ .string = try std.fmt.allocPrint(a, "{d},{d}", .{ ux, uy }) } });
     }
@@ -915,7 +798,7 @@ fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), t: s101.Text) 
     const haloed = font_px >= 10;
     try props.append(a, .{ .key = "halo_color_token", .value = .{ .string = if (haloed) "CHWHT" else "" } });
     try props.append(a, .{ .key = "halo_width", .value = .{ .double = if (haloed) 1 else 0 } });
-    try props.append(a, .{ .key = "tgrp", .value = .{ .int = t.group } });
+    try props.append(a, .{ .key = "tgrp", .value = .{ .int = style.group } });
 }
 
 /// JSON-escape `s` (surrounding quotes included) into `buf`: escapes ", \, and the
@@ -960,17 +843,6 @@ fn encodeS57Attrs(a: Allocator, f: s57.Feature) ![]const u8 {
     if (n == 0) return "";
     try buf.append(a, '}');
     return buf.items;
-}
-
-/// The `s57` pick-report blob for `f`, or "" when pick attributes are disabled
-/// (host opt-out flag) — so a lean bake stays free of the bulky attribute payload.
-fn pickS57(a: Allocator, L: Layers, f: s57.Feature) ![]const u8 {
-    return if (L.pick_attrs) encodeS57Attrs(a, f) else "";
-}
-
-/// The source-cell name for the pick report, or "" when pick attributes are disabled.
-fn pickCell(L: Layers, cell_name: []const u8) []const u8 {
-    return if (L.pick_attrs) cell_name else "";
 }
 
 test "encodeS57Attrs: acronym->value JSON; skips blank + unknown; escapes" {
@@ -1139,7 +1011,7 @@ pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, stre
 /// per-tile cull reuses them instead of recomputing geomBounds for every tile a
 /// feature spans (that recompute was ~10% of the bake). worldToTile is linear and
 /// monotonic, so projecting the world bbox corners yields the part's exact
-/// tile-coord bbox — letting emitParsed skip a part that misses the clip box
+/// tile-coord bbox — letting processFeatureParsed skip a part that misses the clip box
 /// without projecting its points (byte-identical to clipping it to empty).
 pub const WPart = struct { pts: [][2]f64, bbox: [4]f64, wbbox: [4]f64 };
 
@@ -1276,44 +1148,10 @@ fn variantDiffers(base: []const u8, variant: ?[]const u8) bool {
     return !std.mem.eql(u8, base, v);
 }
 
-/// Emit one feature, tagging its primitives with the boundary/point-style variant
-/// it varies under. Replicates the Go portrayer's Passes semantics (§8.6.1/§11.2.2):
-///   - AREA features whose boundary changes under PlainBoundaries get two passes —
-///     the default (symbolized, bnd=1) and the plain stream (bnd=0);
-///   - (non-SOUNDG) POINT features whose symbol changes under SimplifiedSymbols get
-///     two passes — the default (paper, pts=0) and the simplified stream (pts=1);
-///   - everything else (including features whose variant stream is identical) stays
-///     a single common pass (bnd=pts=2, tags omitted).
-/// SOUNDG bypasses this path (emitted as a multipoint earlier), so it never doubles.
-fn emitFromInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
-    const base = try s101.parse(a, instr);
-
-    // Point-symbol style (pts): a point feature whose simplified-symbol stream
-    // differs is emitted twice (paper pts=0 + simplified pts=1); else common.
-    if (f.prim == 1) {
-        if (variantDiffers(instr, simplified)) {
-            try emitParsed(a, cell, f, fi, geo, geo_world, base, 2, 0, z, x, y, tb, box, L);
-            const sp = try s101.parse(a, simplified.?);
-            try emitParsed(a, cell, f, fi, geo, geo_world, sp, 2, 1, z, x, y, tb, box, L);
-        } else {
-            try emitParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, L);
-        }
-        return;
-    }
-    // Boundary symbolization (bnd): an area feature whose plain-boundary stream
-    // differs is emitted twice (symbolized bnd=1 + plain bnd=0); else common.
-    if (f.prim == 3 and variantDiffers(instr, plain)) {
-        try emitParsed(a, cell, f, fi, geo, geo_world, base, 1, 2, z, x, y, tb, box, L);
-        const pl = try s101.parse(a, plain.?);
-        try emitParsed(a, cell, f, fi, geo, geo_world, pl, 0, 2, z, x, y, tb, box, L);
-        return;
-    }
-    // Lines, and any feature whose variant is absent/identical: one common pass.
-    try emitParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, L);
-}
-
-/// Surface-based variant of emitFromInstr: drives processFeatureParsed instead of
-/// emitParsed. Same pass-splitting logic; callers use CellOpts instead of Layers.
+/// Drive one feature's S-101 instruction stream (plus its optional plain/simplified
+/// display variants) through the Surface: parse each pass and hand it to
+/// processFeatureParsed, splitting into two passes only when a variant differs
+/// (S-52 boundary §8.6.1 / point-symbol §11.2.2 axes -> the bnd/pts tags).
 fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const base = try s101.parse(a, instr);
     if (f.prim == 1) {
@@ -1353,7 +1191,7 @@ fn bearingToScreen(deg: f64) [2]f64 {
 /// radius over the sweep (a 0 sweep = a full ring). Built in normalised-world coords
 /// (anchor + screen-offset/worldPx) and projected with worldToTile — identical to
 /// Go's per-zoom sunproject + reproject. Each figure carries its own stroke + vg.
-fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat, meta: Meta, z: u8, x: u32, y: u32, box: tile.Box, lines_l: *std.ArrayList(mvt.Feature)) !void {
+fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, box: tile.Box, surf: rs.Surface) !void {
     if (figs.len == 0) return;
     const world_px = 256.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
     const pxmm = s101.PX_PER_MM;
@@ -1396,14 +1234,11 @@ fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat
         for (sub) |run| if (run.len >= 2) try kept.append(a, run);
         if (kept.items.len == 0) continue;
 
-        var fmeta = meta;
-        fmeta.vg = if (fig.vg != 0) fig.vg else meta.vg; // sector arcs filter on their own VG
-        var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(a, .{ .key = "color_token", .value = .{ .string = fig.color } });
-        try props.append(a, .{ .key = "width_px", .value = .{ .double = fig.width_mm * pxmm } });
-        try props.append(a, .{ .key = "dash", .value = .{ .string = if (fig.dashed) "dashed" else "solid" } });
-        try appendMeta(a, &props, fmeta);
-        try lines_l.append(a, .{ .geom_type = .linestring, .parts = kept.items, .properties = props.items });
+        var fig_meta = fmeta;
+        fig_meta.vg = if (fig.vg != 0) fig.vg else fmeta.vg; // sector arcs filter on their own VG
+        try surf.beginFeature(&fig_meta);
+        try surf.strokeLine(fig.color, fig.width_mm * pxmm, if (fig.dashed) .dashed else .solid, kept.items, null);
+        try surf.endFeature();
     }
 }
 
@@ -1427,260 +1262,10 @@ fn appendDepthVals(a: Allocator, props: *std.ArrayList(mvt.Prop), f: s57.Feature
     }
 }
 
-/// Emit one parsed portrayal pass `p`, stamping every primitive with the pass's
-/// boundary (`bnd`) and point-style (`pts`) variant tags.
-fn emitParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
-    // Route each feature into its base layer or the *_scamin bucket depending on
-    // whether it carries a SCAMIN (1:N) display limit. Same geometry/properties
-    // either way; the bucket lets the style gate the feature below its scale.
-    const scamin = featureScamin(f);
-    const meta = Meta{
-        .prio = p.draw_prio,
-        .cat = p.cat,
-        .vg = p.vg,
-        .scamin = scamin,
-        .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57 = try pickS57(a, L, f),
-        .cell = pickCell(L, cell.name),
-        .band = L.band,
-        .date_start = p.date_start,
-        .date_end = p.date_end,
-        .bnd = bnd,
-        .pts = pts,
-    };
-    const areas_l = if (scamin != null) L.areas_scamin else L.areas;
-    const apat_l = if (scamin != null) L.area_patterns_scamin else L.area_patterns;
-    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const points_l = if (scamin != null) L.points_scamin else L.points;
-    const texts_l = if (scamin != null) L.texts_scamin else L.texts;
-
-    // Point features (buoys/beacons/lights/landmarks/soundings): symbols + text
-    // placed at the feature's node.
-    if (f.prim == 1) {
-        const pg = cell.pointGeometry(f) orelse return;
-        // Sector legs/arcs (LightSectored) are stroked around the light's node and
-        // clipped to the tile box, so they render even when the node sits in the
-        // buffer zone just off-tile. Emitted before the point's in-bounds gate below.
-        try emitAugFigures(a, p.aug_figures, pg, meta, z, x, y, box, lines_l);
-        if (pg.lon() < tb[0] or pg.lon() > tb[2] or pg.lat() < tb[1] or pg.lat() > tb[3]) return;
-        const pt = tile.project(pg.lon(), pg.lat(), z, x, y, tile.EXTENT);
-        const parts = try a.alloc([]const mvt.Point, 1);
-        const single = try a.alloc(mvt.Point, 1);
-        single[0] = pt;
-        parts[0] = single;
-        // Best-band suppression: a finer band covers this whole tile, so drop this
-        // coarse cell's point symbols + text (the finer cell carries them). A wreck/
-        // obstruction/rock depth the rule drew via SNDFRM04 is routed to the soundings
-        // layer (emitFeaturePoints) so it honours the depth unit + safety split.
-        if (!L.suppress_points) try emitFeaturePoints(a, p.points, parts, f, meta, points_l, L);
-        if (!L.suppress_points) for (p.texts) |t| {
-            var props = std.ArrayList(mvt.Prop).empty;
-            try appendTextProps(a, &props, t);
-            try appendMeta(a, &props, meta);
-            try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-        };
-        return;
-    }
-
-    // Line/area features: assemble into connected parts (rings / chains) so
-    // disjoint geometry isn't joined by a spurious straight jump across the cell.
-    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
-    if (geo_parts.len == 0) return;
-
-    // Project each usable part; quick-reject if none overlap the tile. Reproject
-    // from the cell's precomputed world coords (cheap; no per-point tan/log) when
-    // the baker supplied them, else project lon/lat directly (the live path).
-    const wparts: ?[]const WPart = if (geo_world) |gw| (if (fi < gw.len) gw[fi] else null) else null;
-    var projected = std.ArrayList([]mvt.Point).empty;
-    var any_overlap = false;
-    for (geo_parts, 0..) |gp, pi| {
-        if (gp.len < 2) continue;
-        const wp: ?WPart = if (wparts) |wps| (if (pi < wps.len and wps[pi].pts.len == gp.len) wps[pi] else null) else null;
-        if (wp) |w| {
-            // any_overlap keys on the RAW tile bbox (no buffer), exactly as before —
-            // a feature touching only the buffer zone is still dropped.
-            if (overlaps(w.bbox, tb)) any_overlap = true;
-            // Exact tile-coord cull: worldToTile is linear+monotonic, so projecting
-            // the part's world bbox corners gives its exact projected bbox. If that
-            // misses the clip box the part clips to nothing — skip projecting its
-            // points (byte-identical, just no wasted work). Big win on multi-part
-            // features (coastlines, land/depth areas) that span a super-tile but
-            // touch each leaf tile with only a few of their parts.
-            const lo = tile.worldToTile(.{ w.wbbox[0], w.wbbox[1] }, z, x, y, tile.EXTENT);
-            const hi = tile.worldToTile(.{ w.wbbox[2], w.wbbox[3] }, z, x, y, tile.EXTENT);
-            if (hi.x < box.min or lo.x > box.max or hi.y < box.min or lo.y > box.max) continue;
-            const proj = try a.alloc(mvt.Point, gp.len);
-            for (w.pts, 0..) |ww, i| proj[i] = tile.worldToTile(ww, z, x, y, tile.EXTENT);
-            try projected.append(a, proj);
-        } else {
-            // Live path (single-tile): bbox-cull in lon/lat, project every part.
-            if (overlaps(geomBounds(gp), tb)) any_overlap = true;
-            const proj = try a.alloc(mvt.Point, gp.len);
-            for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-            try projected.append(a, proj);
-        }
-    }
-    if (!any_overlap or projected.items.len == 0) return;
-
-    if (f.prim == 3) {
-        // Clip each ring, then assemble ONE multipolygon per feature with the
-        // rings wound exterior-vs-hole (orientAreaRings) so interior holes (e.g.
-        // an island inside a sea/depth area) are subtracted, not filled — and
-        // disjoint area parts still render. (Was: one polygon per ring, which
-        // filled holes with the area's own colour.)
-        var rings = std.ArrayList([]const mvt.Point).empty;
-        for (projected.items) |proj| {
-            const ring = try clipSimplifyPoly(a, proj, box);
-            if (ring.len >= 3) try rings.append(a, ring);
-        }
-        // Best-band suppression: drop a coarser band's fill (where a finer band
-        // covers the whole tile) and/or its pattern (where a finer band covers the
-        // tile centre) so coarse water/shallow-pattern can't lap over finer land.
-        if (rings.items.len > 0) {
-            const parts = try orientAreaRings(a, rings.items);
-            if (!L.suppress_fills) if (p.fill_token) |token| {
-                var props = std.ArrayList(mvt.Prop).empty;
-                try props.append(a, .{ .key = "color_token", .value = .{ .string = token } });
-                try appendDepthVals(a, &props, f); // DEPARE/DRGARE -> drval1/drval2 (SEABED01)
-                try appendMeta(a, &props, meta);
-                try areas_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
-            };
-            // AreaFillReference -> a tiled fill pattern (DRGARE/FOUL/quality fills).
-            if (!L.suppress_patterns) for (p.patterns) |pat| {
-                var props = std.ArrayList(mvt.Prop).empty;
-                try props.append(a, .{ .key = "pattern_name", .value = .{ .string = pat } });
-                try appendMeta(a, &props, meta);
-                try apat_l.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = props.items });
-            };
-        }
-    }
-    // DEPCNT depth-contour value (metres), incl. the 0 m drying/chart-datum line:
-    // baked whenever VALDCO is explicitly present (even 0) so the style can label
-    // it; a missing VALDCO is unknown, not zero, so it's left off. Mirrors the Go
-    // contourValdco fix (no `> 0` drop).
-    const valdco: ?f64 = if (f.objl == 43) f.attrFloat(s57.ATTR_VALDCO) else null;
-
-    // S-52 §8.6.2: masked (MASK==1) / data-limit (USAG==3) boundary edges must NOT be
-    // drawn. The FILL above keeps full rings and labels use the full geometry, but the
-    // STROKE uses the drawable subset — for BOTH simple solid strokes AND complex
-    // (symbolized) linestyles, since the oracle masks the line geometry before
-    // portrayal so a symbolized boundary skips masked/coast-coincident edges too.
-    // `stroke_geo` is the lon/lat geometry the strokes draw along (the drawable subset
-    // when masking applies, else the full geometry); `stroke_proj` is its projection
-    // for the simple path. Fast path: with no mask/usag info the drawn geometry equals
-    // the full geometry, so reuse `geo_parts`/`projected` (and its precomputed cull).
-    var stroke_geo: []const []s57.LonLat = geo_parts;
-    var stroke_proj: []const []mvt.Point = projected.items;
-    if (!L.suppress_lines and p.lines.len > 0 and cell.needsDrawableBoundary(f)) {
-        var stroke_storage = std.ArrayList([]mvt.Point).empty;
-        const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
-        stroke_geo = dparts;
-        for (dparts) |dp| {
-            if (dp.len < 2) continue;
-            if (!overlaps(geomBounds(dp), tb)) continue;
-            const proj = try a.alloc(mvt.Point, dp.len);
-            for (dp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-            try stroke_storage.append(a, proj);
-        }
-        stroke_proj = stroke_storage.items;
-    }
-
-    // Low-accuracy geometry (QUAPOS not surveyed / precise / calculated) draws DASHED —
-    // the S-52 approximate-position line style (s101build.go:435: DEPCNT03 dashes a
-    // low-accuracy depth contour; the same for coastline, rivers, tracks…). The S-101
-    // rules read this from a per-edge spatial-quality association we don't model, so
-    // apply it from the parsed per-feature QUAPOS aggregate (cell.featureQuapos): switch
-    // SOLID simple strokes to dashed. Man-made structures (quaposSolidClass) and complex
-    // linestyles keep their look. Computed once per feature, outside the stroke loop.
-    const force_dash = !quaposSolidClass(f.objl) and s57.isLowAccuracyQuapos(cell.featureQuapos(f));
-
-    // Best-band suppression: a finer band covers the tile centre, so drop this coarse
-    // cell's line strokes (they'd double-draw beside the finer copy).
-    if (!L.suppress_lines) for (p.lines) |ln| {
-        // A named (complex) linestyle in the registered table is tessellated along the
-        // geometry (dash runs + embedded symbols on the tangent); see emitComplexLine.
-        if (!std.mem.eql(u8, ln.style, "solid")) {
-            if (g_linestyles.get(ln.style)) |info| {
-                // Draw the symbolized linestyle along the DRAWABLE subset (stroke_geo),
-                // not the full ring — so a complex boundary skips masked / data-limit /
-                // coast-coincident edges like the simple stroke does (S-52 §8.6.2).
-                // e187d80 hoisted stroke_geo but left this call on geo_parts, so complex
-                // linestyles still drew along the entire coastline; feed it stroke_geo.
-                try emitComplexLine(a, stroke_geo, info, ln.color, !L.suppress_points, z, x, y, box, meta, lines_l, points_l);
-                continue;
-            }
-        }
-        // _simple_ -> solid (dashed when the feature's QUAPOS is low-accuracy, above);
-        // an UNregistered named style (or no table, e.g. the live host path) is
-        // approximated as a dashed stroke rather than a bold solid one.
-        const dash: []const u8 = if (std.mem.eql(u8, ln.style, "solid"))
-            (if (force_dash) "dashed" else "solid")
-        else
-            "dashed";
-        for (stroke_proj) |proj| {
-            const sub = try clipSimplifyLine(a, proj, box);
-            if (sub.len == 0) continue;
-            const parts = try a.alloc([]const mvt.Point, sub.len);
-            for (sub, 0..) |s, i| parts[i] = s;
-            var props = std.ArrayList(mvt.Prop).empty;
-            try props.append(a, .{ .key = "color_token", .value = .{ .string = ln.color } });
-            try props.append(a, .{ .key = "width_px", .value = .{ .double = ln.width } });
-            try props.append(a, .{ .key = "dash", .value = .{ .string = dash } });
-            if (valdco) |v| try props.append(a, .{ .key = "valdco", .value = .{ .double = v } });
-            try appendMeta(a, &props, meta);
-            try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
-        }
-    };
-
-    // Area / line labels (TextInstruction): placed at the feature's text anchor —
-    // an area's representative point (centre of gravity; see areaRepresentativePoint),
-    // a line's middle vertex (see featureAnchor). Without this only point-feature
-    // labels show, so area/channel/place names were missing.
-    // (suppress_points: a finer band covers the whole tile — drop coarse labels.)
-    if (!L.suppress_points and p.texts.len > 0) {
-        if (featureAnchor(a, cell, f, fi, geo_parts)) |rp| {
-            if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
-                const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
-                const parts = try a.alloc([]const mvt.Point, 1);
-                const single = try a.alloc(mvt.Point, 1);
-                single[0] = cpt;
-                parts[0] = single;
-                for (p.texts) |t| {
-                    var props = std.ArrayList(mvt.Prop).empty;
-                    try appendTextProps(a, &props, t);
-                    try appendMeta(a, &props, meta);
-                    try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
-                }
-            }
-        }
-    }
-
-    // Point symbols on a LINE/AREA feature (PointInstruction). Go emits these at the
-    // feature's anchor (CentreOnArea → area rep point; a line → its middle vertex);
-    // place them there so centred-area marks (anchorage, restricted-area/entry, marine
-    // farm, TSS arrows) aren't dropped — previously p.points was only emitted for
-    // prim==1. (suppress_points: a finer band covers the whole tile — drop coarse symbols.)
-    if (!L.suppress_points and p.points.len > 0) {
-        if (featureAnchor(a, cell, f, fi, geo_parts)) |rp| {
-            if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
-                const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
-                const parts = try a.alloc([]const mvt.Point, 1);
-                const single = try a.alloc(mvt.Point, 1);
-                single[0] = cpt;
-                parts[0] = single;
-                // Same split as the point path: an area OBSTRN's SNDFRM04 depth glyphs
-                // route to the soundings layer; other centred symbols to point_symbols.
-                try emitFeaturePoints(a, p.points, parts, f, meta, points_l, L);
-            }
-        }
-    }
-}
-
-/// Surface-based variant of emitParsed: drives the rs.Surface vtable instead of
-/// appending to Layers directly. Mirrors emitParsed logic exactly so bakes are
-/// byte-identical. emitAugFigures and emitComplexLine are still called directly
-/// (via asMvtSurf downcast) because their embedded-symbol prop order differs from
-/// the generic drawSymbol vtable method.
+/// Emit one parsed portrayal pass `p` through the Surface interface, stamping
+/// every primitive with the pass's meta (draw_prio/cat/vg/scamin/bnd/pts + pick
+/// attrs). The engine work happens here — geometry assembly, projection, tile
+/// clipping/simplification, anchoring — so surfaces only ever see draw calls.
 fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const scamin = featureScamin(f);
     const s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "";
@@ -1691,21 +1276,12 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         .s57_json = s57_json, .cell_name = cell_name, .band = opts.band,
         .date_start = p.date_start, .date_end = p.date_end, .bnd = bnd, .pts = pts,
     };
-    // Meta for emitAugFigures / emitComplexLine (bypass vtable — direct list helpers).
-    const meta = Meta{
-        .prio = p.draw_prio, .cat = p.cat, .vg = p.vg, .scamin = scamin,
-        .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57 = s57_json, .cell = cell_name, .band = opts.band,
-        .date_start = p.date_start, .date_end = p.date_end, .bnd = bnd, .pts = pts,
-    };
 
     // ── Point features ──────────────────────────────────────────────────────────
     if (f.prim == 1) {
         const pg = cell.pointGeometry(f) orelse return;
-        // Sector legs/arcs: downcast to get lines list for emitAugFigures directly.
-        const ms = asMvtSurf(surf);
-        const aug_ll = if (scamin != null) &ms.lines_scamin else &ms.lines;
-        try emitAugFigures(a, p.aug_figures, pg, meta, z, x, y, box, aug_ll);
+        // Sector legs / arcs draw before the light's own symbols (S-52 stacking).
+        try emitAugFigures(a, p.aug_figures, pg, fmeta, z, x, y, box, surf);
         if (pg.lon() < tb[0] or pg.lon() > tb[2] or pg.lat() < tb[1] or pg.lat() > tb[3]) return;
         const pt = tile.project(pg.lon(), pg.lat(), z, x, y, tile.EXTENT);
         if (!opts.suppress_points) {
@@ -1728,7 +1304,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 const danger_class = f.objl == 86 or f.objl == 153 or f.objl == 159;
                 const danger_depth: ?f64 = if (is_d12 and danger_class) f.attrFloat(s57.ATTR_VALSOU) else null;
                 try surf.beginFeature(&fmeta);
-                try surf.drawSymbol(sym.symbol, pt, sym.rotation, SYMBOL_SCALE, sym.rot_north, danger_depth);
+                try surf.drawSymbol(sym.symbol, pt, sym.rotation, SYMBOL_SCALE, sym.rot_north, .point, danger_depth);
                 try surf.endFeature();
             }
             for (p.texts) |t| {
@@ -1818,11 +1394,8 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     if (!opts.suppress_lines) for (p.lines) |ln| {
         if (!std.mem.eql(u8, ln.style, "solid")) {
             if (g_linestyles.get(ln.style)) |info| {
-                // Complex linestyle: bypass vtable (embedded-symbol prop order differs).
-                const ms2 = asMvtSurf(surf);
-                const ll = if (scamin != null) &ms2.lines_scamin else &ms2.lines;
-                const pl = if (scamin != null) &ms2.points_scamin else &ms2.points;
-                try emitComplexLine(a, stroke_geo, info, ln.color, !opts.suppress_points, z, x, y, box, meta, ll, pl);
+                // Complex linestyle: tessellated dash runs + tangent-rotated symbols.
+                try emitComplexLine(a, stroke_geo, info, ln.color, !opts.suppress_points, z, x, y, box, &fmeta, surf);
                 continue;
             }
         }
@@ -1882,7 +1455,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                     const danger_class = f.objl == 86 or f.objl == 153 or f.objl == 159;
                     const danger_depth: ?f64 = if (is_d12 and danger_class) f.attrFloat(s57.ATTR_VALSOU) else null;
                     try surf.beginFeature(&fmeta);
-                    try surf.drawSymbol(sym.symbol, cpt, sym.rotation, SYMBOL_SCALE, sym.rot_north, danger_depth);
+                    try surf.drawSymbol(sym.symbol, cpt, sym.rotation, SYMBOL_SCALE, sym.rot_north, .point, danger_depth);
                     try surf.endFeature();
                 }
             }
@@ -2107,7 +1680,7 @@ fn syminsText(a: Allocator, f: s57.Feature, op: []const u8, params: []const u8) 
 
 /// Build an S-101 Portrayal from a NEWOBJ's SYMINS attribute, or null when there is
 /// no usable SYMINS (caller then falls back to the default new-object symbology).
-/// Geometry/anchoring/clipping is handled by emitParsed exactly like a rule stream.
+/// Geometry/anchoring/clipping is handled by processFeatureParsed exactly like a rule stream.
 fn buildSyminsPortrayal(a: Allocator, f: s57.Feature) !?s101.Portrayal {
     const raw0 = f.attr(SYMINS_ATTR) orelse return null;
     const raw = std.mem.trim(u8, raw0, " ");
@@ -2248,11 +1821,12 @@ fn lsSubPathByArc(a: Allocator, rp: []const tile.FPoint, rarc: []const f64, d0_i
 
 /// Tessellate a complex linestyle along a feature's geometry parts into this tile.
 /// `emit_symbols` is false when best-band suppression drops the coarse cell's points.
-fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, meta: Meta, lines_l: *std.ArrayList(mvt.Feature), points_l: *std.ArrayList(mvt.Feature)) !void {
+fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, fmeta: *const rs.FeatureMeta, surf: rs.Surface) !void {
     const ext: f64 = @floatFromInt(tile.EXTENT);
     const px_scale = ext / 256.0; // figures are laid out in 256-px-per-tile space
     const period = info.period_px * px_scale;
     if (period < 1e-6) return;
+    try surf.beginFeature(fmeta);
     for (parts) |part| {
         if (part.len < 2) continue;
         const fpts = try a.alloc(tile.FPoint, part.len);
@@ -2278,15 +1852,10 @@ fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, colo
                     const sub = try lsSubPathByArc(a, rp, rarc, lo - g0, hi - g0);
                     if (sub.len < 2) continue;
                     const seg = try a.alloc(mvt.Point, sub.len);
-                    for (sub, 0..) |sp, i| seg[i] = tile.quantizeF(sp);
+                    for (sub, 0..) |spt, i| seg[i] = tile.quantizeF(spt);
                     const segparts = try a.alloc([]const mvt.Point, 1);
                     segparts[0] = seg;
-                    var props = std.ArrayList(mvt.Prop).empty;
-                    try props.append(a, .{ .key = "color_token", .value = .{ .string = color } });
-                    try props.append(a, .{ .key = "width_px", .value = .{ .double = info.width_px } });
-                    try props.append(a, .{ .key = "dash", .value = .{ .string = "solid" } });
-                    try appendMeta(a, &props, meta);
-                    try lines_l.append(a, .{ .geom_type = .linestring, .parts = segparts, .properties = props.items });
+                    try surf.strokeLine(color, info.width_px, .solid, segparts, null);
                 }
                 if (!emit_symbols) continue;
                 for (info.symbols) |sym| { // embedded symbols -> tangent-rotated points
@@ -2304,21 +1873,12 @@ fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, colo
                     // the seam belongs to exactly one side (no gap, no double).
                     if (qp.x < 0 or qp.x >= tile.EXTENT or qp.y < 0 or qp.y >= tile.EXTENT) continue;
                     const rot = std.math.atan2(tp.dy, tp.dx) * 180.0 / std.math.pi;
-                    const single = try a.alloc(mvt.Point, 1);
-                    single[0] = qp;
-                    const sparts = try a.alloc([]const mvt.Point, 1);
-                    sparts[0] = single;
-                    var sprops = std.ArrayList(mvt.Prop).empty;
-                    try sprops.append(a, .{ .key = "symbol_name", .value = .{ .string = sym.name } });
-                    try sprops.append(a, .{ .key = "rotation_deg", .value = .{ .double = rot } });
-                    try sprops.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-                    try sprops.append(a, .{ .key = "rot_north", .value = .{ .int = 1 } }); // turns with the chart
-                    try appendMeta(a, &sprops, meta);
-                    try points_l.append(a, .{ .geom_type = .point, .parts = sparts, .properties = sprops.items });
+                    try surf.drawSymbol(sym.name, qp, rot, SYMBOL_SCALE, true, .line, null);
                 }
             }
         }
     }
+    try surf.endFeature();
 }
 
 /// Native S-52 fallback for SweptArea (SWPARE, objl 134). The S-101 Portrayal
@@ -2326,19 +1886,23 @@ fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, colo
 /// nothing for it. Mirror the Go reference's sweptAreaBuild: a dashed CHGRD
 /// boundary on every ring, the SWPARE51 swept-depth bracket at the area's
 /// representative point, and a "swept to <DRVAL1>" label there. DrawingPriority 6.
-fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
-    const scamin = featureScamin(f);
-    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const points_l = if (scamin != null) L.points_scamin else L.points;
-    const texts_l = if (scamin != null) L.texts_scamin else L.texts;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .cell = pickCell(L, cell.name), .band = L.band };
+    const fmeta = rs.FeatureMeta{
+        .draw_prio = 6,
+        .scamin = featureScamin(f),
+        .class = catalogue.acronymByObjl(f.objl) orelse "",
+        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .cell_name = if (opts.pick_attrs) cell.name else "",
+        .band = opts.band,
+    };
+    try surf.beginFeature(&fmeta);
 
     // Dashed CHGRD boundary on each ring (clipped to the tile). Best-band: drop the
     // stroke where a finer band covers the tile centre (suppress_lines).
-    if (!L.suppress_lines) for (geo_parts) |gp| {
+    if (!opts.suppress_lines) for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
@@ -2347,41 +1911,24 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
-        var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHGRD" } });
-        try props.append(a, .{ .key = "width_px", .value = .{ .double = 1 } });
-        try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
-        try appendMeta(a, &props, meta);
-        try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
+        try surf.strokeLine("CHGRD", 1, .dashed, parts, null);
     };
 
     // SWPARE51 bracket + "swept to <DRVAL1>" label at the representative point. Drop
     // both where a finer band covers the whole tile (suppress_points).
-    if (L.suppress_points) return;
-    const rp = labelPoint(a, cell, fi, geo_parts) orelse return;
-    if (rp.lon() < tb[0] or rp.lon() > tb[2] or rp.lat() < tb[1] or rp.lat() > tb[3]) return;
-    const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
-    const parts = try a.alloc([]const mvt.Point, 1);
-    const single = try a.alloc(mvt.Point, 1);
-    single[0] = cpt;
-    parts[0] = single;
+    if (!opts.suppress_points) blk: {
+        const rp = labelPoint(a, cell, fi, geo_parts) orelse break :blk;
+        if (rp.lon() < tb[0] or rp.lon() > tb[2] or rp.lat() < tb[1] or rp.lat() > tb[3]) break :blk;
+        const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
+        try surf.drawSymbol("SWPARE51", cpt, 0, SYMBOL_SCALE, false, .point, null);
 
-    var sprops = std.ArrayList(mvt.Prop).empty;
-    try sprops.append(a, .{ .key = "symbol_name", .value = .{ .string = "SWPARE51" } });
-    try sprops.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
-    try sprops.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-    try appendMeta(a, &sprops, meta);
-    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = sprops.items });
-
-    if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| {
-        const label = try std.fmt.allocPrint(a, "swept to {d}", .{d1});
-        var tprops = std.ArrayList(mvt.Prop).empty;
-        try tprops.append(a, .{ .key = "text", .value = .{ .string = label } });
-        try tprops.append(a, .{ .key = "color_token", .value = .{ .string = "CHBLK" } });
-        try tprops.append(a, .{ .key = "font_size_px", .value = .{ .double = 11 } });
-        try appendMeta(a, &tprops, meta);
-        try texts_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = tprops.items });
+        if (f.attrFloat(s57.ATTR_DRVAL1)) |d1| {
+            const label = try std.fmt.allocPrint(a, "swept to {d}", .{d1});
+            // Minimal label (empty halign): no alignment/halo/group spec — see rs.TextStyle.
+            try surf.drawText(label, &.{ .color = "CHBLK", .font_size = 11 }, cpt);
+        }
     }
+    try surf.endFeature();
 }
 
 /// Native S-52 fallback for M_NSYS (objl 306) — the Go reference's navSystemBuild.
@@ -2393,15 +1940,19 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// the boundary draws nothing. DrawingPriority 12. NOTE: the ORIENT-only DIRBOY
 /// direction-of-buoyage arrow (DIRBOY01/A1/B1, CentreOnArea) is not yet ported —
 /// absent on the reference data; the A/B boundary line is the visible feature.
-fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
-    if (L.suppress_lines) return;
+fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+    if (opts.suppress_lines) return;
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
-    const scamin = featureScamin(f);
-    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const points_l = if (scamin != null) L.points_scamin else L.points;
-    const meta = Meta{ .prio = 12, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .cell = pickCell(L, cell.name), .band = L.band };
+    const fmeta = rs.FeatureMeta{
+        .draw_prio = 12,
+        .scamin = featureScamin(f),
+        .class = catalogue.acronymByObjl(f.objl) orelse "",
+        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .cell_name = if (opts.pick_attrs) cell.name else "",
+        .band = opts.band,
+    };
 
     // ORIENT present -> direction-of-buoyage boundary (NAVARE51); else the plain
     // IALA A/B system boundary (MARSYS51). Both stroke in CHGRD.
@@ -2409,10 +1960,11 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 
     // Tessellate the registered complex linestyle (dashes + the A/B letter symbols).
     if (g_linestyles.get(boundary)) |info| {
-        try emitComplexLine(a, geo_parts, info, "CHGRD", !L.suppress_points, z, x, y, box, meta, lines_l, points_l);
+        try emitComplexLine(a, geo_parts, info, "CHGRD", !opts.suppress_points, z, x, y, box, &fmeta, surf);
         return;
     }
     // No registered linestyle (live/host path, no table): a plain dashed CHGRD ring.
+    try surf.beginFeature(&fmeta);
     for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
@@ -2422,13 +1974,9 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
-        var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(a, .{ .key = "color_token", .value = .{ .string = "CHGRD" } });
-        try props.append(a, .{ .key = "width_px", .value = .{ .double = 1 } });
-        try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
-        try appendMeta(a, &props, meta);
-        try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
+        try surf.strokeLine("CHGRD", 1, .dashed, parts, null);
     }
+    try surf.endFeature();
 }
 
 /// Native S-52 fallback for NEWOBJ (objl 163). NEWOBJ features map to S-101 classes
@@ -2439,15 +1987,21 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// Stroke a feature's line/area geometry as a dashed boundary in `color` — the
 /// shared shape of several native S-52 fallbacks (NEWOBJ box; an area-encoded
 /// RecommendedTrack whose Curve-only S-101 rule errors). DrawingPriority 6.
-fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, color: []const u8, width: f64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, L: Layers) !void {
+fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, color: []const u8, width: f64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     if (f.prim != 2 and f.prim != 3) return;
-    if (L.suppress_lines) return; // coarse band over finer M_COVR (centre): drop the stroke
+    if (opts.suppress_lines) return; // coarse band over finer M_COVR (centre): drop the stroke
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
-    const scamin = featureScamin(f);
-    const lines_l = if (scamin != null) L.lines_scamin else L.lines;
-    const meta = Meta{ .prio = 6, .scamin = scamin, .class = catalogue.acronymByObjl(f.objl) orelse "", .s57 = try pickS57(a, L, f), .cell = pickCell(L, cell.name), .band = L.band };
+    const fmeta = rs.FeatureMeta{
+        .draw_prio = 6,
+        .scamin = featureScamin(f),
+        .class = catalogue.acronymByObjl(f.objl) orelse "",
+        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .cell_name = if (opts.pick_attrs) cell.name else "",
+        .band = opts.band,
+    };
+    try surf.beginFeature(&fmeta);
     for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
@@ -2457,13 +2011,9 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
-        var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(a, .{ .key = "color_token", .value = .{ .string = color } });
-        try props.append(a, .{ .key = "width_px", .value = .{ .double = width } });
-        try props.append(a, .{ .key = "dash", .value = .{ .string = "dashed" } });
-        try appendMeta(a, &props, meta);
-        try lines_l.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
+        try surf.strokeLine(color, width, .dashed, parts, null);
     }
+    try surf.endFeature();
 }
 
 /// One cell plus its optional per-feature S-101 instruction streams. `portrayal`
@@ -2486,7 +2036,7 @@ pub const CellRef = struct {
     band: u8 = 0,
     /// Drop this coarser band cell's AREA fills / patterns / line strokes / point
     /// symbols+text where a finer band's M_COVR data-coverage is present. See the
-    /// Layers.suppress_* fields for the per-geometry whole-tile vs centre rules.
+    /// CellOpts.suppress_* fields for the per-geometry whole-tile vs centre rules.
     suppress_fills: bool = false,
     suppress_patterns: bool = false,
     suppress_lines: bool = false,
@@ -2542,7 +2092,7 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
 /// Shared by the §10.6.1.1 INFORM01 "info available" marker and the §10.1.1
 /// QUESMRK1 unknown-object mark, which differ only in symbol/priority/category.
 /// No-op when the anchor doesn't resolve or falls outside the raw tile bounds.
-fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, symbol: []const u8, prio: i64, cat: i64, z: u8, x: u32, y: u32, tb: [4]f64, L: Layers) !void {
+fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, symbol: []const u8, prio: i64, cat: i64, z: u8, x: u32, y: u32, tb: [4]f64, opts: CellOpts, surf: rs.Surface) !void {
     const rp: ?s57.LonLat = if (f.prim == 1)
         cell.pointGeometry(f)
     else rpblk: {
@@ -2551,216 +2101,27 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
     };
     const p = rp orelse return;
     if (p.lon() < tb[0] or p.lon() > tb[2] or p.lat() < tb[1] or p.lat() > tb[3]) return;
-    const scamin = featureScamin(f);
-    const points_l = if (scamin != null) L.points_scamin else L.points;
     const pt = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-    const parts = try a.alloc([]const mvt.Point, 1);
-    const single = try a.alloc(mvt.Point, 1);
-    single[0] = pt;
-    parts[0] = single;
-    var props = std.ArrayList(mvt.Prop).empty;
-    try props.append(a, .{ .key = "symbol_name", .value = .{ .string = symbol } });
-    try props.append(a, .{ .key = "rotation_deg", .value = .{ .double = 0 } });
-    try props.append(a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
-    try appendMeta(a, &props, .{
-        .prio = prio,
+    const fmeta = rs.FeatureMeta{
+        .draw_prio = prio,
         .cat = cat,
-        .scamin = scamin,
+        .scamin = featureScamin(f),
         .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57 = try pickS57(a, L, f),
-        .cell = pickCell(L, cell.name),
-        .band = L.band,
-    });
-    try points_l.append(a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .cell_name = if (opts.pick_attrs) cell.name else "",
+        .band = opts.band,
+    };
+    try surf.beginFeature(&fmeta);
+    try surf.drawSymbol(symbol, pt, 0, SYMBOL_SCALE, false, .point, null);
+    try surf.endFeature();
 }
 
-/// Append one cell's features for tile (z,x,y) into the shared layer lists.
-fn appendCellFeatures(
-    a: Allocator,
-    L: Layers,
-    cell: *s57.Cell,
-    portrayal: ?[]const ?[]const u8,
-    portrayal_plain: ?[]const ?[]const u8,
-    portrayal_simplified: ?[]const ?[]const u8,
-    geo: ?GeoParts,
-    geo_world: ?GeoWorld,
-    feat_bbox: ?[]const ?[4]f64,
-    z: u8,
-    x: u32,
-    y: u32,
-    tb: [4]f64,
-    box: tile.Box,
-) !void {
-    // Tile bbox expanded by the buffer zone, for the spatial cull (a feature whose
-    // bbox misses this would clip to nothing, so skipping it is output-preserving).
-    const mlon = (tb[2] - tb[0]) * @as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT));
-    const mlat = (tb[3] - tb[1]) * @as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT));
-    for (cell.features, 0..) |f, fi| {
-        // Spatial cull: skip features whose precomputed bbox doesn't overlap the tile.
-        // LIGHTS (objl 75) carry sector legs/arcs (emitAugFigures) that radiate a fixed
-        // DISPLAY distance from the node — a near-constant tile fraction at any zoom,
-        // well beyond the node-only point bbox. Widen the cull margin for them so the
-        // feature is processed (and its arcs clipped in) on every tile the arcs cross,
-        // instead of being dropped one tile out -> sector lights cut off at seams.
-        var ml = mlon;
-        var mt = mlat;
-        if (f.objl == 75) {
-            ml = @max(ml, (tb[2] - tb[0]) * LIGHT_AUG_REACH_TILES);
-            mt = @max(mt, (tb[3] - tb[1]) * LIGHT_AUG_REACH_TILES);
-        }
-        if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
-            if (b[2] < tb[0] - ml or b[0] > tb[2] + ml or b[3] < tb[1] - mt or b[1] > tb[3] + mt) continue;
-        };
-        // S-52 §10.6.1.1 additional-information indicator: a SY(INFORM01) "info
-        // available" marker at the feature's representative point whenever it carries
-        // a non-blank INFORM/NINFOM/TXTDSC/NTXTDS/PICREP. Always draw priority 8,
-        // category Other (overriding the feature's own category) so it clears Standard
-        // display and only shows when the mariner enables Other — matching the oracle's
-        // addInformSymbol + the bake's per-symbol category override (build.go:267 /
-        // bake.go:854). Emitted here, before the dispatch below, so EVERY feature gets
-        // it (Go wraps every buildFeature) regardless of which body path draws the
-        // feature — even an unportrayed/suppressed one. (suppress_points: a finer band
-        // covers the whole tile → drop this coarse cell's marker, like its symbols.)
-        if (!L.suppress_points and hasAdditionalInfo(f)) {
-            try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, L);
-        }
-        // SOUNDG (objl 129) is multipoint: emit its SG3D soundings directly into
-        // the `soundings` layer (the flat S-101 instruction stream can't carry
-        // per-sounding geometry). Bypasses the portrayal/classify dispatch.
-        if (f.objl == 129) {
-            // SOUNDG bypasses the portrayal dispatch (multipoint geometry can't ride
-            // the flat instruction stream), so its feature-level Meta is built here.
-            // SNDFRM04 portrayal is deterministic for the class: DrawingPriority 18,
-            // display category Other (cat=2) — verified against the oracle's
-            // routeSoundingGroup (fb.DisplayPriority / catRank(fb.DisplayCategory)).
-            const smeta = Meta{
-                .prio = 18,
-                .cat = 2,
-                .class = "SOUNDG",
-                .s57 = try pickS57(a, L, f),
-                .cell = pickCell(L, cell.name),
-                .scamin = featureScamin(f),
-                .band = L.band,
-            };
-            try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, L.soundings);
-            continue;
-        }
-        // NEWOBJ with a producer SYMINS attribute: portray the explicit S-52 symbol
-        // instruction (SYMINS02) instead of the S-101 V-AIS alias the engine emitted.
-        // Dispatched FIRST, exactly like Go buildFeatureBody (s101build.go:298-302).
-        if (f.objl == 163) {
-            if (try buildSyminsPortrayal(a, f)) |sp| {
-                try emitParsed(a, cell.*, f, fi, geo, geo_world, sp, 2, 2, z, x, y, tb, box, L);
-                continue;
-            }
-        }
-        // S-101 portrayal stream for this feature: null = unmapped/unportrayed; an
-        // "ERROR:" marker = the rule raised. A usable stream styles the feature;
-        // otherwise fall through to the native S-52 fallbacks / classify().
-        const stream: ?[]const u8 = if (portrayal) |pp| (if (fi < pp.len) pp[fi] else null) else null;
-        const errored = stream != null and std.mem.startsWith(u8, stream.?, "ERROR:");
-        if (stream) |s| {
-            if (!errored) {
-                // The boundary-style (area) / point-style (point) display variants
-                // for this feature, if portrayed — emitFromInstr splits the feature
-                // into two passes only when the variant actually differs.
-                const plain: ?[]const u8 = if (portrayal_plain) |pp| (if (fi < pp.len) pp[fi] else null) else null;
-                const simplified: ?[]const u8 = if (portrayal_simplified) |pp| (if (fi < pp.len) pp[fi] else null) else null;
-                try emitFromInstr(a, cell.*, f, fi, geo, geo_world, s, plain, simplified, z, x, y, tb, box, L);
-                continue;
-            }
-        }
-        // No usable portrayal. Native S-52 fallbacks for classes the catalogue can't
-        // portray (mirrors Go's buildFeatureBody); any other class that errored is
-        // suppressed (drawn as nothing, as the Go reference does).
-        if (f.objl == 134) { // SWPARE — the catalogue ships no SweptArea rule (IHO gap)
-            try emitSweptAreaFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
-            continue;
-        }
-        if (f.objl == 163) { // NEWOBJ — new-object box placeholder (dashed magenta)
-            try emitDashedBoundary(a, cell.*, f, fi, geo, "CHMGF", 1.5, z, x, y, tb, box, L);
-            continue;
-        }
-        // RECTRC area: the RecommendedTrack rule is Curve-only, so a surface
-        // (prim 3) RECTRC errors. The oracle's error branch (s101build.go:341-355)
-        // handles ONLY NEWOBJ and SWPARE — every other errored class, RECTRC
-        // included, returns a suppressed empty build. So draw nothing: an errored
-        // RECTRC falls through to `if (errored) continue` below (it's a mapped
-        // class → resolveClass != null → no QUESMRK1), matching the oracle.
-        if (f.objl == 306 and f.prim == 3) { // M_NSYS — navSystemBuild (IALA A/B boundary linestyle)
-            try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
-            continue;
-        }
-        // Genuinely-unknown object class (no S-101 alias) → the S-52 §10.1.1 QUESMRK1
-        // "unknown object" mark at the feature's representative point (== Go
-        // unknownObjectBuild, dispatched on the engine's "UNMAPPED:" marker). Checked
-        // AFTER the class-specific fallbacks above (NEWOBJ/M_NSYS resolve to null
-        // or error but have their own symbology). A MAPPED class that merely errored or
-        // emitted nothing is NOT marked — it falls through to classify()/suppress below,
-        // matching the oracle (which marks only resolveCode failures, not rule errors).
-        // TOPMAR (folded into its parent buoy/beacon) and SOUNDG (handled above) are
-        // pre-filtered out of the engine batch like the oracle, so they get an empty
-        // stream → suppressed, NOT the unknown mark.
-        if (f.objl != s57.OBJL_TOPMAR and s101_adapt.resolveClass(f) == null) {
-            if (!L.suppress_points) try emitCentredSymbol(a, cell.*, f, fi, geo, "QUESMRK1", 6, 1, z, x, y, tb, L);
-            continue;
-        }
-        if (errored) continue; // genuine rule error on a normal class → suppress
-        const cls = classify(f.objl);
-        if (cls.kind == .skip) continue;
-        const geo_parts = featureParts(a, cell.*, geo, fi, f) catch continue;
-        if (geo_parts.len == 0) continue;
-
-        if (cls.kind == .area) {
-            if (L.suppress_fills) continue; // coarse band over finer M_COVR (whole tile): drop the fill
-            // Collect the feature's clipped rings, then emit ONE multipolygon with
-            // holes subtracted (see orientAreaRings) — same fix as the portrayal
-            // path so a sea/depth hole over an island isn't filled.
-            var rings = std.ArrayList([]const mvt.Point).empty;
-            for (geo_parts) |gp| {
-                if (gp.len < 2) continue;
-                if (!overlaps(geomBounds(gp), tb)) continue;
-                const proj = try a.alloc(mvt.Point, gp.len);
-                for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-                const ring = try clipSimplifyPoly(a, proj, box);
-                if (ring.len >= 3) try rings.append(a, ring);
-            }
-            if (rings.items.len == 0) continue;
-            const parts = try orientAreaRings(a, rings.items);
-            // Depth areas carry DRVAL1/DRVAL2 so the style's SEABED01 shading
-            // applies (areasFillColor keys on `drval1`).
-            var aprops = std.ArrayList(mvt.Prop).empty;
-            try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
-            try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
-            try aprops.append(a, .{ .key = "band", .value = .{ .int = L.band } });
-            try appendDepthVals(a, &aprops, f); // f32 + DRVAL2->DRVAL1 fallback (== oracle depthVals)
-            try L.areas.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = aprops.items });
-            continue;
-        }
-
-        // Line classes: drop the stroke where a finer band covers the tile centre.
-        if (L.suppress_lines) continue;
-        for (geo_parts) |gp| {
-            if (gp.len < 2) continue;
-            if (!overlaps(geomBounds(gp), tb)) continue;
-            const proj = try a.alloc(mvt.Point, gp.len);
-            for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-            const sub = try clipSimplifyLine(a, proj, box);
-            if (sub.len == 0) continue;
-            const parts = try a.alloc([]const mvt.Point, sub.len);
-            for (sub, 0..) |s, i| parts[i] = s;
-            const lprops = try a.alloc(mvt.Prop, 3);
-            lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
-            lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
-            lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
-            try L.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
-        }
-    }
-}
-
-/// Surface-based variant of appendCellFeatures: routes the S-101 portrayal path
-/// through processFeatureInstr (→ Surface vtable). Native fallbacks and the legacy
-/// classify() path still use Layers directly via mvt_surf.asLayers(opts).
+/// Append one cell's features for tile (z,x,y), driving the Surface interface:
+/// the S-101 portrayal path through processFeatureInstr, native S-52 fallbacks
+/// (SWPARE / NEWOBJ / M_NSYS / INFORM01 / QUESMRK1 / SOUNDG) through their emit*
+/// helpers. The only direct-list writer left is the legacy classify() mode for
+/// features with NO portrayal at all — a tile-only schema that predates the
+/// engine (that's why mvt_surf rides along beside surf).
 fn appendCellFeaturesSurf(
     a: Allocator,
     surf: rs.Surface,
@@ -2779,8 +2140,6 @@ fn appendCellFeaturesSurf(
     tb: [4]f64,
     box: tile.Box,
 ) !void {
-    // Build a Layers view (pointing into mvt_surf) for fallbacks and classify().
-    const L = mvt_surf.asLayers(opts);
     const mlon = (tb[2] - tb[0]) * @as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT));
     const mlat = (tb[3] - tb[1]) * @as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT));
     for (cell.features, 0..) |f, fi| {
@@ -2794,16 +2153,16 @@ fn appendCellFeaturesSurf(
             if (b[2] < tb[0] - ml or b[0] > tb[2] + ml or b[3] < tb[1] - mt or b[1] > tb[3] + mt) continue;
         };
         if (!opts.suppress_points and hasAdditionalInfo(f)) {
-            try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, L);
+            try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, opts, surf);
         }
         if (f.objl == 129) {
-            const smeta = Meta{
-                .prio = 18, .cat = 2, .class = "SOUNDG",
-                .s57 = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
-                .cell = if (opts.pick_attrs) cell.name else "",
+            const smeta = rs.FeatureMeta{
+                .draw_prio = 18, .cat = 2, .class = "SOUNDG",
+                .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+                .cell_name = if (opts.pick_attrs) cell.name else "",
                 .scamin = featureScamin(f), .band = opts.band,
             };
-            try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, &mvt_surf.soundings);
+            try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, surf);
             continue;
         }
         if (f.objl == 163) {
@@ -2823,19 +2182,19 @@ fn appendCellFeaturesSurf(
             }
         }
         if (f.objl == 134) {
-            try emitSweptAreaFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
+            try emitSweptAreaFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, opts, surf);
             continue;
         }
         if (f.objl == 163) {
-            try emitDashedBoundary(a, cell.*, f, fi, geo, "CHMGF", 1.5, z, x, y, tb, box, L);
+            try emitDashedBoundary(a, cell.*, f, fi, geo, "CHMGF", 1.5, z, x, y, tb, box, opts, surf);
             continue;
         }
         if (f.objl == 306 and f.prim == 3) {
-            try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, L);
+            try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, opts, surf);
             continue;
         }
         if (f.objl != s57.OBJL_TOPMAR and s101_adapt.resolveClass(f) == null) {
-            if (!opts.suppress_points) try emitCentredSymbol(a, cell.*, f, fi, geo, "QUESMRK1", 6, 1, z, x, y, tb, L);
+            if (!opts.suppress_points) try emitCentredSymbol(a, cell.*, f, fi, geo, "QUESMRK1", 6, 1, z, x, y, tb, opts, surf);
             continue;
         }
         if (errored) continue;
@@ -2955,7 +2314,7 @@ test "appendTextProps: LocalOffset (mm) -> loff key in text-body units (round mm
     };
     for (cases) |c| {
         var props = std.ArrayList(mvt.Prop).empty;
-        try appendTextProps(a, &props, .{ .text = "x", .color = "CHBLK", .offset_x = c.ox, .offset_y = c.oy });
+        try appendTextProps(a, &props, "x", &.{ .color = "CHBLK", .font_size = 0, .halign = "left", .valign = "bottom", .offset_x = c.ox, .offset_y = c.oy });
         var loff: ?[]const u8 = null;
         for (props.items) |p| {
             if (std.mem.eql(u8, p.key, "loff")) loff = p.value.string;
@@ -2983,7 +2342,7 @@ test "appendTextProps: halo (CHWHT/1) gated on font_size >= 10, matching the ora
     };
     for (cases) |c| {
         var props = std.ArrayList(mvt.Prop).empty;
-        try appendTextProps(a, &props, .{ .text = "x", .color = "CHBLK", .font_size = c.fs });
+        try appendTextProps(a, &props, "x", &.{ .color = "CHBLK", .font_size = c.fs, .halign = "left", .valign = "bottom" });
         var color: []const u8 = "<none>";
         var width: f64 = -1;
         for (props.items) |p| {
@@ -3086,7 +2445,7 @@ test "featureScamin reads s57 attr 133" {
     try std.testing.expectEqual(@as(?i64, null), featureScamin(without));
 }
 
-test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin" {
+test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/scamin" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -3104,24 +2463,8 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
     defer cell.deinit();
     try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
-    var areas = std.ArrayList(mvt.Feature).empty;
-    var area_patterns = std.ArrayList(mvt.Feature).empty;
-    var lines = std.ArrayList(mvt.Feature).empty;
-    var points = std.ArrayList(mvt.Feature).empty;
-    var texts = std.ArrayList(mvt.Feature).empty;
-    var areas_s = std.ArrayList(mvt.Feature).empty;
-    var apat_s = std.ArrayList(mvt.Feature).empty;
-    var lines_s = std.ArrayList(mvt.Feature).empty;
-    var points_s = std.ArrayList(mvt.Feature).empty;
-    var texts_s = std.ArrayList(mvt.Feature).empty;
-    var soundings_l = std.ArrayList(mvt.Feature).empty;
-    const L = Layers{
-        .areas = &areas,         .area_patterns = &area_patterns,        .lines = &lines,
-        .points = &points,       .texts = &texts,
-        .areas_scamin = &areas_s, .area_patterns_scamin = &apat_s,       .lines_scamin = &lines_s,
-        .points_scamin = &points_s, .texts_scamin = &texts_s,
-        .soundings = &soundings_l,
-    };
+    var ms = MvtSurface.init(a, .mvt);
+    const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
@@ -3131,23 +2474,23 @@ test "emitFromInstr routes SCAMIN point to the bucket + carries draw_prio/scamin
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
     };
-    try emitFromInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
-    try std.testing.expectEqual(@as(usize, 0), points.items.len);
-    try std.testing.expectEqual(@as(usize, 1), points_s.items.len);
-    try std.testing.expectEqual(@as(i64, 7), findProp(points_s.items[0].properties, "draw_prio").?.int);
-    try std.testing.expectEqual(@as(i64, 22000), findProp(points_s.items[0].properties, "scamin").?.int);
+    try processFeatureInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try std.testing.expectEqual(@as(usize, 0), ms.points.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ms.points_scamin.items.len);
+    try std.testing.expectEqual(@as(i64, 7), findProp(ms.points_scamin.items[0].properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(i64, 22000), findProp(ms.points_scamin.items[0].properties, "scamin").?.int);
 
     // No SCAMIN -> base point_symbols layer, draw_prio default 0, no scamin.
     const f_base = s57.Feature{
         .rcnm = 0, .rcid = 2, .prim = 1, .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try emitFromInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, L);
-    try std.testing.expectEqual(@as(usize, 1), points.items.len);
-    try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "draw_prio").?.int);
-    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "scamin"));
+    try processFeatureInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try std.testing.expectEqual(@as(usize, 1), ms.points.items.len);
+    try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "scamin"));
     // No point-style variant -> common pass: no `pts` tag (client coalesces to 2).
-    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "pts"));
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "pts"));
 }
 
 test "variantDiffers: absent/errored/identical = common, real change = split" {
@@ -3157,7 +2500,7 @@ test "variantDiffers: absent/errored/identical = common, real change = split" {
     try std.testing.expect(variantDiffers("PointInstruction:BOYLAT01", "PointInstruction:BOYLAT11"));
 }
 
-test "emitFromInstr tags pts 0/1 when a point's simplified symbol differs" {
+test "processFeatureInstr tags pts 0/1 when a point's simplified symbol differs" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -3175,24 +2518,8 @@ test "emitFromInstr tags pts 0/1 when a point's simplified symbol differs" {
     defer cell.deinit();
     try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
-    var areas = std.ArrayList(mvt.Feature).empty;
-    var area_patterns = std.ArrayList(mvt.Feature).empty;
-    var lines = std.ArrayList(mvt.Feature).empty;
-    var points = std.ArrayList(mvt.Feature).empty;
-    var texts = std.ArrayList(mvt.Feature).empty;
-    var areas_s = std.ArrayList(mvt.Feature).empty;
-    var apat_s = std.ArrayList(mvt.Feature).empty;
-    var lines_s = std.ArrayList(mvt.Feature).empty;
-    var points_s = std.ArrayList(mvt.Feature).empty;
-    var texts_s = std.ArrayList(mvt.Feature).empty;
-    var soundings_l = std.ArrayList(mvt.Feature).empty;
-    const L = Layers{
-        .areas = &areas,            .area_patterns = &area_patterns,    .lines = &lines,
-        .points = &points,          .texts = &texts,
-        .areas_scamin = &areas_s,   .area_patterns_scamin = &apat_s,    .lines_scamin = &lines_s,
-        .points_scamin = &points_s, .texts_scamin = &texts_s,
-        .soundings = &soundings_l,
-    };
+    var ms = MvtSurface.init(a, .mvt);
+    const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
@@ -3201,17 +2528,17 @@ test "emitFromInstr tags pts 0/1 when a point's simplified symbol differs" {
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
     // Paper -> BOYLAT01; simplified -> BOYLAT11. Two passes: pts=0 then pts=1.
-    try emitFromInstr(a, cell, f, 0, null, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", 0, 0, 0, tb, box, L);
-    try std.testing.expectEqual(@as(usize, 2), points.items.len);
-    try std.testing.expectEqual(@as(i64, 0), findProp(points.items[0].properties, "pts").?.int);
-    try std.testing.expectEqualStrings("BOYLAT01", findProp(points.items[0].properties, "symbol_name").?.string);
-    try std.testing.expectEqual(@as(i64, 1), findProp(points.items[1].properties, "pts").?.int);
-    try std.testing.expectEqualStrings("BOYLAT11", findProp(points.items[1].properties, "symbol_name").?.string);
+    try processFeatureInstr(a, cell, f, 0, null, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", 0, 0, 0, tb, box, .{}, surf);
+    try std.testing.expectEqual(@as(usize, 2), ms.points.items.len);
+    try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "pts").?.int);
+    try std.testing.expectEqualStrings("BOYLAT01", findProp(ms.points.items[0].properties, "symbol_name").?.string);
+    try std.testing.expectEqual(@as(i64, 1), findProp(ms.points.items[1].properties, "pts").?.int);
+    try std.testing.expectEqualStrings("BOYLAT11", findProp(ms.points.items[1].properties, "symbol_name").?.string);
     // Boundary axis untouched on a point: no `bnd` tag.
-    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[0].properties, "bnd"));
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "bnd"));
 }
 
-test "emitFromInstr tags bnd 1/0 when an area's plain boundary differs" {
+test "processFeatureInstr tags bnd 1/0 when an area's plain boundary differs" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -3227,31 +2554,15 @@ test "emitFromInstr tags bnd 1/0 when an area's plain boundary differs" {
         .arena = std.heap.ArenaAllocator.init(gpa),
     };
     defer cell.deinit();
-    // A square ring, pre-assembled below so emitFromInstr skips edge resolution.
+    // A square ring, pre-assembled below so processFeatureInstr skips edge resolution.
     const ring = [_]s57.LonLat{
         s57.LonLat.init(-0.5, -0.5), s57.LonLat.init(0.5, -0.5),
         s57.LonLat.init(0.5, 0.5),   s57.LonLat.init(-0.5, 0.5),
         s57.LonLat.init(-0.5, -0.5),
     };
 
-    var areas = std.ArrayList(mvt.Feature).empty;
-    var area_patterns = std.ArrayList(mvt.Feature).empty;
-    var lines = std.ArrayList(mvt.Feature).empty;
-    var points = std.ArrayList(mvt.Feature).empty;
-    var texts = std.ArrayList(mvt.Feature).empty;
-    var areas_s = std.ArrayList(mvt.Feature).empty;
-    var apat_s = std.ArrayList(mvt.Feature).empty;
-    var lines_s = std.ArrayList(mvt.Feature).empty;
-    var points_s = std.ArrayList(mvt.Feature).empty;
-    var texts_s = std.ArrayList(mvt.Feature).empty;
-    var soundings_l = std.ArrayList(mvt.Feature).empty;
-    const L = Layers{
-        .areas = &areas,            .area_patterns = &area_patterns,    .lines = &lines,
-        .points = &points,          .texts = &texts,
-        .areas_scamin = &areas_s,   .area_patterns_scamin = &apat_s,    .lines_scamin = &lines_s,
-        .points_scamin = &points_s, .texts_scamin = &texts_s,
-        .soundings = &soundings_l,
-    };
+    var ms = MvtSurface.init(a, .mvt);
+    const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
@@ -3266,15 +2577,15 @@ test "emitFromInstr tags bnd 1/0 when an area's plain boundary differs" {
     // Symbolized boundary draws a complex line; plain draws a simple stroke.
     const symbolized = "ColorFill:DEPMS;LineStyle:CTNARE51,,1,CHMGD;LineInstruction:CTNARE51";
     const plain = "ColorFill:DEPMS;LineStyle:_simple_,,1,CHMGD;LineInstruction:_simple_";
-    try emitFromInstr(a, cell, f, 0, geo_one, null, symbolized, plain, null, 0, 0, 0, tb, box, L);
+    try processFeatureInstr(a, cell, f, 0, geo_one, null, symbolized, plain, null, 0, 0, 0, tb, box, .{}, surf);
     // Both passes emit the fill: one tagged bnd=1 (symbolized), one bnd=0 (plain).
-    try std.testing.expectEqual(@as(usize, 2), areas.items.len);
-    try std.testing.expectEqual(@as(i64, 1), findProp(areas.items[0].properties, "bnd").?.int);
-    try std.testing.expectEqual(@as(i64, 0), findProp(areas.items[1].properties, "bnd").?.int);
+    try std.testing.expectEqual(@as(usize, 2), ms.areas.items.len);
+    try std.testing.expectEqual(@as(i64, 1), findProp(ms.areas.items[0].properties, "bnd").?.int);
+    try std.testing.expectEqual(@as(i64, 0), findProp(ms.areas.items[1].properties, "bnd").?.int);
     // Symbolized + plain boundary line, each tagged with its pass's bnd.
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expectEqual(@as(i64, 1), findProp(lines.items[0].properties, "bnd").?.int);
-    try std.testing.expectEqual(@as(i64, 0), findProp(lines.items[1].properties, "bnd").?.int);
+    try std.testing.expectEqual(@as(usize, 2), ms.lines.items.len);
+    try std.testing.expectEqual(@as(i64, 1), findProp(ms.lines.items[0].properties, "bnd").?.int);
+    try std.testing.expectEqual(@as(i64, 0), findProp(ms.lines.items[1].properties, "bnd").?.int);
 }
 
 test "generate a tile from a cell is well-formed MVT" {
@@ -3383,24 +2694,8 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
     defer cell.deinit();
     try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
-    var areas = std.ArrayList(mvt.Feature).empty;
-    var area_patterns = std.ArrayList(mvt.Feature).empty;
-    var lines = std.ArrayList(mvt.Feature).empty;
-    var points = std.ArrayList(mvt.Feature).empty;
-    var texts = std.ArrayList(mvt.Feature).empty;
-    var areas_s = std.ArrayList(mvt.Feature).empty;
-    var apat_s = std.ArrayList(mvt.Feature).empty;
-    var lines_s = std.ArrayList(mvt.Feature).empty;
-    var points_s = std.ArrayList(mvt.Feature).empty;
-    var texts_s = std.ArrayList(mvt.Feature).empty;
-    var soundings_l = std.ArrayList(mvt.Feature).empty;
-    const L = Layers{
-        .areas = &areas,         .area_patterns = &area_patterns,        .lines = &lines,
-        .points = &points,       .texts = &texts,
-        .areas_scamin = &areas_s, .area_patterns_scamin = &apat_s,       .lines_scamin = &lines_s,
-        .points_scamin = &points_s, .texts_scamin = &texts_s,
-        .soundings = &soundings_l,
-    };
+    var ms = MvtSurface.init(a, .mvt);
+    const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
@@ -3411,21 +2706,21 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "15.1" }},
     };
-    try emitFromInstr(a, cell, f_wreck, 0, null, null, "DrawingPriority:12;PointInstruction:DANGER02", null, null, 0, 0, 0, tb, box, L);
-    try std.testing.expectEqual(@as(usize, 1), points.items.len);
-    try std.testing.expectEqualStrings("DANGER01", findProp(points.items[0].properties, "symbol_name").?.string);
-    try std.testing.expectEqual(@as(f64, 15.1), findProp(points.items[0].properties, "danger_depth").?.double);
-    try std.testing.expectEqualStrings("DANGER02", findProp(points.items[0].properties, "sym_deep").?.string);
+    try processFeatureInstr(a, cell, f_wreck, 0, null, null, "DrawingPriority:12;PointInstruction:DANGER02", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try std.testing.expectEqual(@as(usize, 1), ms.points.items.len);
+    try std.testing.expectEqualStrings("DANGER01", findProp(ms.points.items[0].properties, "symbol_name").?.string);
+    try std.testing.expectEqual(@as(f64, 15.1), findProp(ms.points.items[0].properties, "danger_depth").?.double);
+    try std.testing.expectEqualStrings("DANGER02", findProp(ms.points.items[0].properties, "sym_deep").?.string);
 
     // No VALSOU -> the baked symbol passes through untagged (nothing to swap on).
     const f_nodep = s57.Feature{
         .rcnm = 0, .rcid = 2, .prim = 1, .objl = 159,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try emitFromInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, L);
-    try std.testing.expectEqual(@as(usize, 2), points.items.len);
-    try std.testing.expectEqualStrings("DANGER01", findProp(points.items[1].properties, "symbol_name").?.string);
-    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[1].properties, "danger_depth"));
+    try processFeatureInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try std.testing.expectEqual(@as(usize, 2), ms.points.items.len);
+    try std.testing.expectEqualStrings("DANGER01", findProp(ms.points.items[1].properties, "symbol_name").?.string);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[1].properties, "danger_depth"));
 
     // A non-danger class (BOYLAT) never gets tagged even with VALSOU present.
     const f_buoy = s57.Feature{
@@ -3433,7 +2728,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "4" }},
     };
-    try emitFromInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, L);
-    try std.testing.expectEqual(@as(usize, 3), points.items.len);
-    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(points.items[2].properties, "sym_deep"));
+    try processFeatureInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try std.testing.expectEqual(@as(usize, 3), ms.points.items.len);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[2].properties, "sym_deep"));
 }
