@@ -132,6 +132,15 @@ const LazyCell = struct {
     // (scamin_pts.collectRecs; cell.arena, Rec.cell stamped at gather time) —
     // the live per-tile dedup's inputs. null until loaded.
     recs: ?[]const scene.scamin_pts.Rec = null,
+    // Sector-figure reach (scene.collectLightReach), computed on first load from
+    // the portrayal streams and KEPT after eviction (plain values, no arena) so
+    // tileRefs' reach candidacy doesn't have to reload the cell to test it.
+    // Until the first load (light_known == false) the cell is provisionally a
+    // candidate within a one-tile ring of its bbox — loading it then resolves
+    // the exact reach.
+    light_known: bool = false,
+    light_bbox: ?[4]f64 = null,
+    light_range_m: f64 = 0,
     // Streaming: when the source has a reader, `base`/`updates` are empty until the
     // cell is first needed (read on demand into gpa, freed on eviction), so only
     // the LRU working set's bytes are held. `index` is passed to the reader.
@@ -383,6 +392,12 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
     // SCAMIN standalone: the cell's matchable point records for the live
     // per-tile dedup (Rec.cell is stamped when gathered — 0 here).
     lc.recs = scamin_pts.collectRecs(cell.arena.allocator(), &cell, lc.cscl, 0) catch null;
+    // Sector-figure reach from the portrayal streams — plain values kept across
+    // unload so reach candidacy never needs a reload just to test it.
+    const lr = scene.collectLightReach(&cell, lc.portrayal);
+    lc.light_bbox = lr.bbox;
+    lc.light_range_m = lr.range_m;
+    lc.light_known = true;
     lc.cell = cell;
     ls.loaded += 1;
 }
@@ -1453,6 +1468,34 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
     }
 }
 
+// The fallback band for a tile whose zoom sits outside every overlapping
+// cell's native window: bake_enc.fallbackBand (finest above all windows,
+// coarsest below / in gaps).
+const fallbackBand = bake_enc.fallbackBand;
+
+// Whether cell `i`'s light sector figures can reach into tile bounds `tb` at
+// zoom z: its light bbox expanded by the per-zoom figure reach
+// (scene.lightReachTiles — one tile for display-mm legs/arcs, the honest span
+// for ground-length directional legs) overlaps the tile. A never-loaded cell
+// (reach unknown) within the one-tile `ring` is loaded once to resolve it; the
+// result persists across LRU eviction, so this never reloads. Caveat: an
+// unloaded cell whose ground legs reach FURTHER than one tile only resolves
+// after its first load — any view near the cell triggers that.
+fn lightReachOverlap(ls: *LazySource, i: u32, tb: [4]f64, z: u8, ring: *const [4]f64) bool {
+    const lc = &ls.cells[i];
+    if (!lc.light_known) {
+        if (!bboxOverlap(lc.bbox, ring.*)) return false; // provisional one-tile ring
+        lazyEnsureLoaded(ls, lc);
+        if (!lc.light_known) return false; // unreadable cell
+    }
+    const lb = lc.light_bbox orelse return false;
+    const reach = scene.lightReachTiles(lc.light_range_m, z, (tb[1] + tb[3]) * 0.5);
+    const pad_lon = (tb[2] - tb[0]) * reach;
+    const pad_lat = (tb[3] - tb[1]) * reach;
+    return lb[0] <= tb[2] + pad_lon and lb[2] >= tb[0] - pad_lon and
+        lb[1] <= tb[3] + pad_lat and lb[3] >= tb[1] - pad_lat;
+}
+
 // Multi-cell tile generation: collect overlapping cells, lazily load them, apply
 // per-scale M_COVR quilting + the scamin-aware band handoff, and overlay
 // coarse→fine.
@@ -1464,31 +1507,57 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
 // SCAMIN-standalone overlay mini cells are built into it.
 fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.CellRef), scratch: std.mem.Allocator) !bool {
     const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
+    // One-tile ring around the tile: the provisional reach-candidacy margin for
+    // cells whose sector-figure reach isn't known yet (never loaded).
+    const ring = [4]f64{
+        tb[0] - (tb[2] - tb[0]), tb[1] - (tb[3] - tb[1]),
+        tb[2] + (tb[2] - tb[0]), tb[3] + (tb[3] - tb[1]),
+    };
     var any_incl = false;
     var coarsest: ?bake_enc.Band = null;
+    var finest: ?bake_enc.Band = null;
     for (ls.cells) |lc| {
         if (!bboxOverlap(lc.bbox, tb)) continue;
         const zr = bake_enc.bandZooms(lc.band);
         if (z >= zr.min and z <= zr.max) any_incl = true;
         if (coarsest == null or @intFromEnum(lc.band) > @intFromEnum(coarsest.?)) coarsest = lc.band;
+        if (finest == null or @intFromEnum(lc.band) < @intFromEnum(finest.?)) finest = lc.band;
     }
-    const cband = coarsest orelse return false;
 
+    // In-tile cells join by band window exactly as before (out-of-window zooms
+    // fall back per fallbackBand); cells NEAR the tile join reach-only when
+    // their light sector figures can cross into it (lightReachOverlap) — those
+    // ride the tile for their figures alone, excluded from the tile-level
+    // quilting ladder / overscale scan below (mirrors bake_enc REACH_FLAG).
     var idxs = std.ArrayList(u32).empty;
     defer idxs.deinit(gpa);
+    var ridxs = std.ArrayList(u32).empty;
+    defer ridxs.deinit(gpa);
     for (ls.cells, 0..) |lc, i| {
-        if (!bboxOverlap(lc.bbox, tb)) continue;
         const zr = bake_enc.bandZooms(lc.band);
-        const use = if (any_incl) (z >= zr.min and z <= zr.max) else (lc.band == cband);
-        if (use) idxs.append(gpa, @intCast(i)) catch {};
+        const in_window = z >= zr.min and z <= zr.max;
+        const use = if (any_incl or coarsest == null)
+            in_window
+        else
+            lc.band == fallbackBand(finest.?, coarsest.?, z);
+        if (!use) continue;
+        if (bboxOverlap(lc.bbox, tb)) {
+            idxs.append(gpa, @intCast(i)) catch {};
+        } else if (lightReachOverlap(ls, @intCast(i), tb, z, &ring)) {
+            ridxs.append(gpa, @intCast(i)) catch {};
+        }
     }
-    std.mem.sort(u32, idxs.items, ls, struct {
+    if (idxs.items.len == 0 and ridxs.items.len == 0) return false;
+    const sortByBand = struct {
         fn lt(l: *LazySource, a: u32, b: u32) bool {
             return @intFromEnum(l.cells[a].band) > @intFromEnum(l.cells[b].band);
         }
-    }.lt);
+    }.lt;
+    std.mem.sort(u32, idxs.items, ls, sortByBand);
+    std.mem.sort(u32, ridxs.items, ls, sortByBand);
 
     for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
+    for (ridxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
 
     // Per-scale quilting + scamin-aware band handoff, the same rules as the baker
     // (bake_enc TileGenCtx.gen): the finest covering cscl gates lines/patterns at
@@ -1542,6 +1611,34 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl,
                 // SCAMIN standalone: the overlay below owns prim==1 SCAMIN features.
                 .skip_scamin_points = true,
+                .light_range_m = lc.light_range_m,
+            }) catch {};
+        }
+    }
+    // Reach-only cells: their raw bbox misses the tile, only their light sector
+    // figures cross into it. Same gates as the in-tile cells (the gf_* samples
+    // lie inside the tile, which their coverage can't contain — no suppression
+    // they wouldn't get at home), but never an overscale hatch and never a
+    // ladder contribution (they were excluded from `ladders`/`gf_tile` above).
+    for (ridxs.items) |i| {
+        const lc = &ls.cells[i];
+        if (lc.cell) |*c| {
+            const g = bake_enc.carryGate(lc.cscl, gf_centre, gf_whole, display_denom, ladders);
+            refs.append(gpa, .{
+                .cell = c,
+                .portrayal = lc.portrayal,
+                .portrayal_plain = lc.portrayal_plain,
+                .portrayal_simplified = lc.portrayal_simplified,
+                .band = @intFromEnum(lc.band),
+                .suppress_fills = g.suppress_whole,
+                .suppress_patterns = g.suppress_centre,
+                .suppress_lines = g.suppress_centre,
+                .suppress_points = g.suppress_whole,
+                .smax = g.smax,
+                .oscl = if (lc.cscl > 0) bake_enc.quantizeHandoff(ladders, lc.cscl) else 0,
+                .overscale_hatch = false,
+                .skip_scamin_points = true,
+                .light_range_m = lc.light_range_m,
             }) catch {};
         }
     }
@@ -1575,11 +1672,14 @@ fn appendLiveOverlay(ls: *LazySource, z: u8, tb: [4]f64, clat: f64, refs: *std.A
 
     // Candidate cells: EVERY cell overlapping the gather bounds, loaded on
     // demand regardless of band — the standalone model needs the fine cells'
-    // copies (winner geometry/attrs) in coarse tiles and vice versa.
+    // copies (winner geometry/attrs) in coarse tiles and vice versa. A cell
+    // whose light sector figures reach FURTHER than the shared margin (ground-
+    // length directional legs) also joins via its known reach ring.
     var cand = std.ArrayList(u32).empty;
     defer cand.deinit(gpa);
     for (ls.cells, 0..) |lc, i| {
-        if (bboxOverlap(lc.bbox, gtb)) cand.append(gpa, @intCast(i)) catch {};
+        if (bboxOverlap(lc.bbox, gtb) or lightReachOverlap(ls, @intCast(i), tb, z, &gtb))
+            cand.append(gpa, @intCast(i)) catch {};
     }
     if (cand.items.len == 0) return;
     for (cand.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
@@ -1590,8 +1690,18 @@ fn appendLiveOverlay(ls: *LazySource, z: u8, tb: [4]f64, clat: f64, refs: *std.A
     for (cand.items) |i| {
         const lc = &ls.cells[i];
         const cell_recs = lc.recs orelse continue;
+        // Per-cell gather bounds: the shared margin, widened to the cell's own
+        // sector-figure reach so a far directional light's record still gathers.
+        var cg = gtb;
+        if (lc.light_known and lc.light_range_m > 0) {
+            const reach = scene.lightReachTiles(lc.light_range_m, z, clat);
+            cg[0] = @min(cg[0], tb[0] - (tb[2] - tb[0]) * reach);
+            cg[1] = @min(cg[1], tb[1] - (tb[3] - tb[1]) * reach);
+            cg[2] = @max(cg[2], tb[2] + (tb[2] - tb[0]) * reach);
+            cg[3] = @max(cg[3], tb[3] + (tb[3] - tb[1]) * reach);
+        }
         for (cell_recs) |r0| {
-            if (r0.lon < gtb[0] or r0.lon > gtb[2] or r0.lat < gtb[1] or r0.lat > gtb[3]) continue;
+            if (r0.lon < cg[0] or r0.lon > cg[2] or r0.lat < cg[1] or r0.lat > cg[3]) continue;
             var r = r0;
             r.cell = i;
             recs.append(gpa, r) catch return;
@@ -1603,10 +1713,9 @@ fn appendLiveOverlay(ls: *LazySource, z: u8, tb: [4]f64, clat: f64, refs: *std.A
     // Winners: eligibility-clamp against this tile's window, cap against the
     // finest covering chart (real M_COVR only — the same rule as the bake's
     // resolveWinners), and bucket per source cell for the mini build. Emission
-    // bounds = tile + one-tile pad (sector-figure reach; the per-feature cull
-    // inside appendCellFeatures owns the fine filtering).
-    const pad_lon = tb[2] - tb[0];
-    const pad_lat = tb[3] - tb[1];
+    // bounds = tile + the source cell's sector-figure reach pad (one tile for
+    // display-mm figures, the honest span for ground-length directional legs;
+    // the per-feature cull inside appendCellFeatures owns the fine filtering).
     var per_cell = std.AutoHashMap(u32, std.ArrayList(scamin_pts.MiniEntry)).init(gpa);
     defer {
         var vit = per_cell.valueIterator();
@@ -1617,6 +1726,9 @@ fn appendLiveOverlay(ls: *LazySource, z: u8, tb: [4]f64, clat: f64, refs: *std.A
     defer ladders.deinit(gpa);
     for (recs.items) |r| {
         if (!r.winner) continue;
+        const reach = scene.lightReachTiles(ls.cells[r.cell].light_range_m, z, clat);
+        const pad_lon = (tb[2] - tb[0]) * reach;
+        const pad_lat = (tb[3] - tb[1]) * reach;
         if (r.lon < tb[0] - pad_lon or r.lon > tb[2] + pad_lon or
             r.lat < tb[1] - pad_lat or r.lat > tb[3] + pad_lat) continue;
         var finest: i32 = std.math.maxInt(i32);
@@ -1652,6 +1764,7 @@ fn appendLiveOverlay(ls: *LazySource, z: u8, tb: [4]f64, clat: f64, refs: *std.A
             .feat_smax = mini.feat_smax,
             .scamin_floor = floor_denom,
             .band = @intFromEnum(lc.band),
+            .light_range_m = lc.light_range_m,
         });
     }
 }
@@ -1800,6 +1913,10 @@ fn buildBakeOverlay(sources: []const BakeSource, rules_dir: []const u8) BakeOver
     for (minis, mini_arenas) |m, pa| {
         const mini = m orelse continue;
         if (pa == null) continue;
+        // Deduped LIGHTS winners keep their sector-figure reach (see
+        // bundle.buildRootOverlay): the overlay tile pad widens to the
+        // ground-leg span so a directional light's leg isn't chopped.
+        const lr = scene.collectLightReach(&mini.cell, mini.portrayal);
         backends.append(gpa, .{
             .cell = mini.cell,
             .portrayal = mini.portrayal,
@@ -1808,6 +1925,8 @@ fn buildBakeOverlay(sources: []const BakeSource, rules_dir: []const u8) BakeOver
             .feat_smax = mini.feat_smax,
             .bounds = mini.bounds,
             .cscl = mini.cell.params.cscl,
+            .light_bbox = lr.bbox,
+            .light_range_m = lr.range_m,
         }) catch break;
     }
     return .{ .backends = backends.toOwnedSlice(gpa) catch &.{}, .arenas = mini_arenas };
@@ -1849,7 +1968,10 @@ const BakeWork = struct {
         const coverage = cell.mcovrCoverage(cell.arena.allocator());
         const scamins = bake_enc.collectScamins(cell.arena.allocator(), &cell) catch &.{};
         const cscl = cell.params.cscl;
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins };
+        // Sector-figure reach (exact, from the portrayal streams): buildTileMap
+        // addresses the neighbouring tiles the cell's light legs/arcs cross.
+        const lr = scene.collectLightReach(&cell, portrayal);
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
         c.arenas[i] = pa;
     }
 };
