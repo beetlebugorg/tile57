@@ -938,6 +938,71 @@ pub const Chart = struct {
         }
     }
 
+    /// Render a VIEW as ASCII art — renderView's shape on the text surface:
+    /// one Unicode character per terminal cell (cols x rows), optional
+    /// ANSI-256 color. Returns UTF-8 bytes, one '\n'-terminated row per grid
+    /// row (gpa-owned; free with freeBytes). Same backends as renderView.
+    pub fn renderAscii(self: *Chart, lon: f64, lat: f64, zoom: f64, cols: u32, rows: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, ansi: bool) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // ANSI mode resolves tokens through the same embedded colour profile
+        // the pixel path uses; plain mode never consults it. No symbol store
+        // and no complex-linestyle table: the ASCII surface lowers symbol
+        // NAMES to glyphs itself, and complex linestyles degrading to the
+        // generic dashed stroke is exactly the fidelity a text grid carries.
+        var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var as = render.ascii.AsciiSurface.initView(a, &colors, palette, settings, zoom, cols, rows, pt, @import("tiles").tile.EXTENT);
+        as.ansi = ansi;
+
+        switch (self.backend) {
+            .reader => |*rd| {
+                // Bundle-sourced replay, exactly like renderView.
+                var vt = scene.ViewTiles.init(lon, lat, zoom, as.w_px, as.h_px, as.px_per_tile);
+                const surf = as.asSurface();
+                try surf.beginScene(vt.z);
+                const is_mlt = rd.header.tile_type == .mlt;
+                while (vt.next()) |t| {
+                    const bytes = (rd.getTile(a, t.z, t.x, t.y) catch continue) orelse continue;
+                    const layers = if (is_mlt)
+                        @import("tiles").mlt.decode(a, bytes) catch continue
+                    else
+                        @import("tiles").mvt.decode(a, bytes) catch continue;
+                    as.setOrigin(t.origin_x, t.origin_y);
+                    scene.replayTile(surf, layers) catch return error.TileGen;
+                }
+                return surf.endScene(gpa) catch error.TileGen;
+            },
+            .cell => |*cb| {
+                const one = [_]scene.CellRef{.{
+                    .cell = &cb.cell,
+                    .portrayal = cb.portrayal,
+                    .portrayal_plain = cb.portrayal_plain,
+                    .portrayal_simplified = cb.portrayal_simplified,
+                }};
+                return scene.generateView(&as, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
+            },
+            .cells => |*ls| {
+                const keep_from = ls.tick + 1;
+                var vt = scene.ViewTiles.init(lon, lat, zoom, as.w_px, as.h_px, as.px_per_tile);
+                const surf = as.asSurface();
+                try surf.beginScene(vt.z);
+                while (vt.next()) |t| {
+                    var refs = std.ArrayList(scene.CellRef).empty;
+                    defer refs.deinit(gpa);
+                    if (!try tileRefs(ls, t.z, t.x, t.y, &refs)) continue;
+                    as.setOrigin(t.origin_x, t.origin_y);
+                    scene.appendTile(surf, a, refs.items, t.z, t.x, t.y, self.pick_attrs) catch return error.TileGen;
+                }
+                const bytes = surf.endScene(gpa) catch return error.TileGen;
+                lazyEvict(ls, keep_from);
+                return bytes;
+            },
+        }
+    }
+
     /// The chart's per-cell metadata as a JSON array:
     /// [{"name","scale","edition","update","issueDate","agency","bbox"?}, …].
     /// DSID fields reflect the applied update chain; bbox is the cell's

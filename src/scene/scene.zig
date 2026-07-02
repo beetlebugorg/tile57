@@ -2081,10 +2081,12 @@ pub fn generateTile(surf: rs.Surface, scratch: Allocator, out: Allocator, cells:
 /// Render a VIEW — an arbitrary centre + fractional zoom + pixel size — as
 /// ONE whole scene across every covering tile: labels and declutter run over
 /// the full canvas (no per-tile seams), the native win over tile compositing.
-/// `ps` must have been initView'd with the same output size and a
-/// px_per_tile of 256 * 2^(zoom - round(zoom)) * supersample; this positions
-/// each covering tile via ps.setOrigin and drives the engine per tile.
-pub fn generateView(ps: *render.pixel.PixelSurface, scratch: Allocator, out: Allocator, cells: []const CellRef, center_lon: f64, center_lat: f64, zoom: f64, pick_attrs: bool) ![]u8 {
+/// `ps` is any view-shaped surface (*render.pixel.PixelSurface,
+/// *render.ascii.AsciiSurface): it carries w_px/h_px/px_per_tile and is
+/// repositioned per covering tile via setOrigin. It must have been initView'd
+/// with the same output size and a px_per_tile of
+/// 256 * 2^(zoom - round(zoom)) * supersample.
+pub fn generateView(ps: anytype, scratch: Allocator, out: Allocator, cells: []const CellRef, center_lon: f64, center_lat: f64, zoom: f64, pick_attrs: bool) ![]u8 {
     var vt = ViewTiles.init(center_lon, center_lat, zoom, ps.w_px, ps.h_px, ps.px_per_tile);
     const surf = ps.asSurface();
     try surf.beginScene(vt.z);
