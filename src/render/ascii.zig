@@ -227,7 +227,25 @@ pub const AsciiSurface = struct {
         self.cur = meta.*;
         // Category / viewing-group / SCAMIN gates apply per feature, exactly
         // like the pixel surface.
-        self.cur_visible = resolve.visible(meta, null, self.zoom, self.settings);
+        self.cur_visible = resolve.visible(meta, null, self.zoom, self.settings) and
+            !droppedClass(meta.class);
+    }
+
+    // Classes dropped wholesale at character resolution: long dashed linework
+    // that reads as clutter in a text grid. Depth CONTOURS go because the
+    // depth-area shade ramp already carries the bathymetry; cables/pipelines
+    // and navigation (leading/clearing/transit) lines go because a screenful
+    // of `- - -` swallows the marks that matter here (soundings, buoys,
+    // coastline).
+    fn droppedClass(class: []const u8) bool {
+        const dropped = [_][]const u8{
+            "DEPCNT", // depth contour
+            "CBLSUB", "CBLOHD", "CBLARE", // cables (submarine / overhead / area)
+            "PIPSOL", "PIPOHD", "PIPARE", // pipelines (submarine-on-land / overhead / area)
+            "NAVLNE", // navigation line (leading / clearing / transit)
+        };
+        for (dropped) |d| if (std.mem.eql(u8, class, d)) return true;
+        return false;
     }
 
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
