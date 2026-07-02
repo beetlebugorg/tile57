@@ -967,13 +967,13 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
 }
 
 // tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom>
-//     [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--rules DIR]
+//     [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--rules DIR]
 // The chart on stdout as a Unicode text grid — the render-engine EXAMPLE
 // backend (src/render/ascii.zig): the same chart layer + view driver as
 // `tile57 png`, with the AsciiSurface at the end instead of the pixel one.
 fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -983,6 +983,7 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
     var palette: render.resolve.PaletteId = .day;
     var rules: ?[]const u8 = null;
     var ansi = false;
+    var tui = false;
     var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
     var f = Flags{ .args = args, .i = 2 };
     while (f.next()) |arg| {
@@ -1006,6 +1007,8 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
             rules = f.next() orelse return usageErr("--rules needs a dir");
         } else if (std.mem.eql(u8, arg, "--ansi")) {
             ansi = true;
+        } else if (std.mem.eql(u8, arg, "--tui")) {
+            tui = true;
         } else return usageErr("unknown flag");
     }
     const v = view orelse return usageErr("--view lon,lat,zoom is required");
@@ -1035,9 +1038,96 @@ fn runAscii(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void 
         .dusk => .dusk,
         .night => .night,
     };
+    if (tui) return runAsciiTui(io, a, c, v.lon, v.lat, v.zoom, palette, &m, ansi);
+
     const text = c.renderAscii(v.lon, v.lat, v.zoom, cols, rows, palette, &m, ansi) catch return usageErr("render failed");
     defer chart.freeBytes(text);
     std.Io.File.stdout().writeStreamingAll(io, text) catch {};
+}
+
+// `tile57 ascii --tui`: an interactive pan/zoom loop around the ascii surface.
+// Arrow keys pan by an eighth of the view, +/- zoom by half a level, q (or
+// ctrl-c) quits. cbreak-style input (no echo/canonical, OPOST kept so \n still
+// carriage-returns), alternate screen + hidden cursor, terminal re-measured
+// every frame so a resize just repaints.
+fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat0: f64, zoom0: f64, palette: render.resolve.PaletteId, m: *render.resolve.MarinerSettings, ansi: bool) !void {
+    const stdout = std.Io.File.stdout();
+    const stdin_fd = std.Io.File.stdin().handle;
+    const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
+    var raw = old;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.ISIG = false; // ctrl-c arrives as 0x03 → clean quit through the defers
+    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    std.posix.tcsetattr(stdin_fd, .NOW, raw) catch return usageErr("--tui needs a terminal");
+    defer std.posix.tcsetattr(stdin_fd, .NOW, old) catch {};
+    stdout.writeStreamingAll(io, "\x1b[?1049h\x1b[?25l") catch {}; // alt screen, hide cursor
+    defer stdout.writeStreamingAll(io, "\x1b[?25h\x1b[?1049l") catch {};
+
+    var lon = lon0;
+    var lat = lat0;
+    var zoom = zoom0;
+    var last: [2]u32 = .{ 0, 0 };
+    while (true) {
+        const ts = terminalSize(io) orelse .{ 100, 37 };
+        const cols = @max(20, ts[0]);
+        const rows = @max(10, ts[1]) - 1; // chart rows; the last line is the status bar
+        if (cols != last[0] or rows != last[1]) {
+            stdout.writeStreamingAll(io, "\x1b[2J") catch {};
+            last = .{ cols, rows };
+        }
+        const text = c.renderAscii(lon, lat, zoom, cols, rows, palette, m, ansi) catch break;
+        stdout.writeStreamingAll(io, "\x1b[H") catch {};
+        stdout.writeStreamingAll(io, text) catch {};
+        chart.freeBytes(text);
+        const status = std.fmt.allocPrint(a, "\x1b[{d};1H\x1b[7m \xe2\x86\x90\xe2\x86\x91\xe2\x86\x93\xe2\x86\x92 pan  +/- zoom  q quit  {d:.4},{d:.4} z{d:.2} \x1b[0m\x1b[K", .{ rows + 1, lat, lon, zoom }) catch break;
+        stdout.writeStreamingAll(io, status) catch {};
+
+        // Drain a whole read of input before re-rendering: key-repeat (a held
+        // arrow) coalesces several ESC [ A/B/C/D sequences into one read, so
+        // parse the buffer as a stream and apply every key — one repaint per
+        // batch keeps a held arrow smooth instead of frames-behind.
+        var b: [64]u8 = undefined;
+        const n = std.posix.read(stdin_fd, &b) catch break;
+        if (n == 0) break;
+        // Pan steps: an eighth of the view span. The view is `cols` px wide and
+        // `rows*2` px tall (one cell = 1x2 px) on a 256*2^zoom px world.
+        const world = 256.0 * std.math.pow(f64, 2.0, zoom);
+        const dlon = @as(f64, @floatFromInt(cols)) / 8.0 * 360.0 / world;
+        const dy_px = @as(f64, @floatFromInt(rows * 2)) / 8.0;
+        var i: usize = 0;
+        while (i < n) {
+            if (b[i] == 0x1b and i + 2 < n and b[i + 1] == '[') {
+                switch (b[i + 2]) {
+                    'A' => lat = mercShift(lat, dy_px, world),
+                    'B' => lat = mercShift(lat, -dy_px, world),
+                    'C' => lon = @min(180, lon + dlon),
+                    'D' => lon = @max(-180, lon - dlon),
+                    else => {},
+                }
+                i += 3;
+                continue;
+            }
+            switch (b[i]) {
+                '+', '=' => zoom = @min(18.0, zoom + 0.5),
+                '-', '_' => zoom = @max(3.0, zoom - 0.5),
+                'q', 'Q', 0x03 => return,
+                else => {},
+            }
+            i += 1;
+        }
+    }
+}
+
+// Shift a latitude by `px` screen pixels (positive = north) on a `world`-pixel
+// Web-Mercator globe — exact Mercator, so panning doesn't drift at high lat.
+fn mercShift(lat: f64, px: f64, world: f64) f64 {
+    const rad = lat * std.math.pi / 180.0;
+    const y = std.math.log(f64, std.math.e, std.math.tan(std.math.pi / 4.0 + rad / 2.0));
+    const y2 = y + px * 2.0 * std.math.pi / world;
+    const lat2 = (2.0 * std.math.atan(std.math.exp(y2)) - std.math.pi / 2.0) * 180.0 / std.math.pi;
+    return std.math.clamp(lat2, -85.0, 85.0);
 }
 
 // The controlling terminal's COLSxROWS, or null when stdout isn't a TTY (or
