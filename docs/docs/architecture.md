@@ -119,7 +119,7 @@ The public surface composes the packages into three high-level entry points:
   as a multi-cell ENC_ROOT (`openCells` / `openCellsStreaming`), then `tile(z, x, y)`. This is the live
   tile-generation path. It also reads a pre-baked **PMTiles** archive — the caller
   can't tell the difference. The same handle renders finished views:
-  `renderView` (PNG), `renderView` with PDF output, and `renderAscii`
+  `renderView` (PNG or PDF, per its output parameter) and `renderAscii`
   (`tile57_chart_render_view` / `tile57_chart_render_pdf` in the C ABI).
 - **`bakeArchive`** (`scene/bake_enc.zig`) — bake a whole ENC_ROOT to one PMTiles
   archive offline, band-streamed.
