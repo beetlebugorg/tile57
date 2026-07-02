@@ -29,7 +29,7 @@ print. One engine, pluggable outputs.
                                  │  drawSymbol · drawSounding · drawText
               ┌──────────────────┼─────────────────────┐
               ▼                  ▼                     ▼
-        MvtSurface          NoopSurface           PixelSurface (src/render/pixel.zig)
+        TileSurface         NoopSurface           PixelSurface (src/render/pixel.zig)
         serialize the       discard (bench)       resolve + layout + declutter
         semantics                                      │
               │                                        │  the Canvas interface
@@ -141,9 +141,9 @@ millimetre on your display) and doubles as the @2x knob. Every field of
 ### From Zig
 
 Both interfaces are directly available: build a `PixelSurface`, drive it with
-`scene.generateTileSurface` / `generateViewSurface`, or replay a decoded
-tile with `scene.replayTileSurface`. See `tools/bake.zig`'s `runRender` for
-a complete worked example.
+`scene.generateTile` / `scene.generateView`, or replay a decoded tile with
+`scene.replayTile`. See `tools/bake.zig`'s `runRender` for a complete worked
+example.
 
 ## Extending it
 
@@ -155,7 +155,7 @@ feature, symbol, and label arrives already resolved and positioned.
 
 **A new tile/serialization format = one Surface implementation.** Implement
 the ten Surface methods and you receive the full semantic stream — this is
-how MVT and MLT are done (`MvtSurface` in `src/scene/scene.zig`), and how a
+how MVT and MLT are done (`TileSurface` in `src/scene/scene.zig`), and how a
 GeoJSON debug dump or a GPU display list would be done.
 
 **From the C ABI:** not currently supported. Surface and Canvas are Zig

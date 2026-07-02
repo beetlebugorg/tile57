@@ -348,8 +348,8 @@ pub const CellOpts = struct {
 /// The only draw path that does NOT come through the Surface interface is the
 /// legacy classify() mode (features with NO portrayal at all): its prop schema
 /// ({class, color_token, band}) predates the S-101 engine and is a tile-only
-/// serialization detail, so appendCellFeaturesSurf writes those lists directly.
-pub const MvtSurface = struct {
+/// serialization detail, so appendCellFeatures writes those lists directly.
+pub const TileSurface = struct {
     a: Allocator,
     format: TileFormat,
     areas: std.ArrayList(mvt.Feature) = .empty,
@@ -385,21 +385,21 @@ pub const MvtSurface = struct {
         .endScene = endScene,
     };
 
-    pub fn init(a: Allocator, format: TileFormat) MvtSurface {
+    pub fn init(a: Allocator, format: TileFormat) TileSurface {
         return .{ .a = a, .format = format };
     }
 
-    pub fn asSurface(self: *MvtSurface) rs.Surface {
+    pub fn asSurface(self: *TileSurface) rs.Surface {
         return .{ .ptr = self, .vtable = &mvt_vtable };
     }
 
-    fn sp(ctx: *anyopaque) *MvtSurface { return @ptrCast(@alignCast(ctx)); }
+    fn sp(ctx: *anyopaque) *TileSurface { return @ptrCast(@alignCast(ctx)); }
 
-    fn areasL(s: *MvtSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.areas_scamin else &s.areas; }
-    fn apatL(s: *MvtSurface) *std.ArrayList(mvt.Feature)         { return if (s.cur.scamin != null) &s.area_patterns_scamin else &s.area_patterns; }
-    fn linesL(s: *MvtSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.lines_scamin else &s.lines; }
-    fn pointsL(s: *MvtSurface) *std.ArrayList(mvt.Feature)       { return if (s.cur.scamin != null) &s.points_scamin else &s.points; }
-    fn textsL(s: *MvtSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.texts_scamin else &s.texts; }
+    fn areasL(s: *TileSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.areas_scamin else &s.areas; }
+    fn apatL(s: *TileSurface) *std.ArrayList(mvt.Feature)         { return if (s.cur.scamin != null) &s.area_patterns_scamin else &s.area_patterns; }
+    fn linesL(s: *TileSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.lines_scamin else &s.lines; }
+    fn pointsL(s: *TileSurface) *std.ArrayList(mvt.Feature)       { return if (s.cur.scamin != null) &s.points_scamin else &s.points; }
+    fn textsL(s: *TileSurface) *std.ArrayList(mvt.Feature)        { return if (s.cur.scamin != null) &s.texts_scamin else &s.texts; }
 
     fn beginScene(_: *anyopaque, _: u8) anyerror!void {}
 
@@ -1697,7 +1697,7 @@ pub const LsInfo = struct {
 };
 
 // Set once by the baker before tile generation; read-only during the parallel bake
-// (generateTileMulti only reads), so it needs no lock. Absent => named lines fall
+// (encodeTile only reads), so it needs no lock. Absent => named lines fall
 // back to the generic dashed stroke (live/host path, no regression).
 var g_linestyles: std.StringHashMapUnmanaged(LsInfo) = .{};
 
@@ -2015,13 +2015,6 @@ pub const CellRef = struct {
 /// `portrayal`, if given, is indexed by feature index and holds each feature's
 /// S-101 instruction stream (from the Lua engine); features with an instruction
 /// stream are styled by it, the rest fall back to classify().
-pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, portrayal: ?[]const ?[]const u8) ![]u8 {
-    const one = [_]CellRef{.{ .cell = cell, .portrayal = portrayal }};
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    return generateTileMulti(arena.allocator(), gpa, &one, z, x, y, .mvt, true);
-}
-
 /// Generate encoded tile bytes (uncompressed) for tile (z,x,y) overlaying one or
 /// more cells (an ENC_ROOT). Each cell's features are appended into the shared
 /// layers, so a tile spanning several cells carries all of them.
@@ -2030,12 +2023,12 @@ pub fn generateTile(gpa: Allocator, cell: *s57.Cell, z: u8, x: u32, y: u32, port
 /// the per-layer feature lists). A batch baker passes a per-thread arena reset
 /// between tiles; `out` owns only the returned encoded bytes (pass `scratch` too
 /// when the result is consumed before the next reset, e.g. gzipped immediately).
-pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, format: TileFormat, pick_attrs: bool) ![]u8 {
+pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, format: TileFormat, pick_attrs: bool) ![]u8 {
     const a = scratch;
     const tb = tile.tileBoundsLonLat(z, x, y);
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
-    var mvt_surf = MvtSurface.init(a, format);
+    var mvt_surf = TileSurface.init(a, format);
     const surf = mvt_surf.asSurface();
     try surf.beginScene(z);
 
@@ -2048,7 +2041,7 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
             .suppress_points = cr.suppress_points,
             .pick_attrs = pick_attrs,
         };
-        try appendCellFeaturesSurf(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 
     return surf.endScene(out);
@@ -2059,7 +2052,7 @@ pub fn generateTileMulti(scratch: Allocator, out: Allocator, cells: []const Cell
 /// this once per covering tile between beginScene/endScene). The classify()
 /// legacy mode (features with NO portrayal) is tile-schema-only and skipped:
 /// a pixel render always portrays.
-pub fn appendTileSurface(scratch: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool, surf: rs.Surface) !void {
+pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool) !void {
     const tb = tile.tileBoundsLonLat(z, x, y);
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
     for (cells) |cr| {
@@ -2071,16 +2064,17 @@ pub fn appendTileSurface(scratch: Allocator, cells: []const CellRef, z: u8, x: u
             .suppress_points = cr.suppress_points,
             .pick_attrs = pick_attrs,
         };
-        try appendCellFeaturesSurf(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 }
 
-/// Generate a scene for tile (z,x,y) through an arbitrary render Surface —
-/// the pixel-path twin of generateTileMulti (which is this plus the MVT/MLT
-/// surface). Returns whatever the surface's endScene produces (e.g. PNG bytes).
-pub fn generateTileSurface(scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool, surf: rs.Surface) ![]u8 {
+/// Generate the chart scene for tile (z,x,y) onto an arbitrary render
+/// Surface — the backend decides what a scene becomes (a PixelSurface makes
+/// PNG/PDF; encodeTile is this plus the tile-serializing surface). Returns
+/// whatever the surface's endScene produces.
+pub fn generateTile(surf: rs.Surface, scratch: Allocator, out: Allocator, cells: []const CellRef, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8 {
     try surf.beginScene(z);
-    try appendTileSurface(scratch, cells, z, x, y, pick_attrs, surf);
+    try appendTile(surf, scratch, cells, z, x, y, pick_attrs);
     return surf.endScene(out);
 }
 
@@ -2090,19 +2084,19 @@ pub fn generateTileSurface(scratch: Allocator, out: Allocator, cells: []const Ce
 /// `ps` must have been initView'd with the same output size and a
 /// px_per_tile of 256 * 2^(zoom - round(zoom)) * supersample; this positions
 /// each covering tile via ps.setOrigin and drives the engine per tile.
-pub fn generateViewSurface(scratch: Allocator, out: Allocator, cells: []const CellRef, center_lon: f64, center_lat: f64, zoom: f64, pick_attrs: bool, ps: *render.pixel.PixelSurface) ![]u8 {
+pub fn generateView(ps: *render.pixel.PixelSurface, scratch: Allocator, out: Allocator, cells: []const CellRef, center_lon: f64, center_lat: f64, zoom: f64, pick_attrs: bool) ![]u8 {
     var vt = ViewTiles.init(center_lon, center_lat, zoom, ps.w_px, ps.h_px, ps.px_per_tile);
     const surf = ps.asSurface();
     try surf.beginScene(vt.z);
     while (vt.next()) |t| {
         ps.setOrigin(t.origin_x, t.origin_y);
-        try appendTileSurface(scratch, cells, t.z, t.x, t.y, pick_attrs, surf);
+        try appendTile(surf, scratch, cells, t.z, t.x, t.y, pick_attrs);
     }
     return surf.endScene(out);
 }
 
 /// The tiles covering a view (centre + fractional zoom + output px), with each
-/// tile's canvas origin — shared by generateViewSurface and the lib's
+/// tile's canvas origin — shared by generateView and the lib's
 /// chart-level renderView (which re-selects cells per tile).
 pub const ViewTiles = struct {
     z: u8,
@@ -2202,10 +2196,10 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
 /// features with NO portrayal at all — a tile-only schema that predates the
 /// engine (that's why mvt_surf rides along beside surf — null for non-tile
 /// surfaces, which always portray and never see classify() features).
-fn appendCellFeaturesSurf(
+fn appendCellFeatures(
     a: Allocator,
     surf: rs.Surface,
-    mvt_surf: ?*MvtSurface,
+    mvt_surf: ?*TileSurface,
     opts: CellOpts,
     cell: *s57.Cell,
     portrayal: ?[]const ?[]const u8,
@@ -2552,7 +2546,7 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
     defer cell.deinit();
     try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
-    var ms = MvtSurface.init(a, .mvt);
+    var ms = TileSurface.init(a, .mvt);
     const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
@@ -2607,7 +2601,7 @@ test "processFeatureInstr tags pts 0/1 when a point's simplified symbol differs"
     defer cell.deinit();
     try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
-    var ms = MvtSurface.init(a, .mvt);
+    var ms = TileSurface.init(a, .mvt);
     const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
@@ -2650,7 +2644,7 @@ test "processFeatureInstr tags bnd 1/0 when an area's plain boundary differs" {
         s57.LonLat.init(-0.5, -0.5),
     };
 
-    var ms = MvtSurface.init(a, .mvt);
+    var ms = TileSurface.init(a, .mvt);
     const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
@@ -2690,7 +2684,10 @@ test "generate a tile from a cell is well-formed MVT" {
         .arena = std.heap.ArenaAllocator.init(gpa),
     };
     defer cell.deinit();
-    const out = try generateTile(gpa, &cell, 14, 4711, 6262, null);
+    const one = [_]CellRef{.{ .cell = &cell, .portrayal = null }};
+    var tile_arena = std.heap.ArenaAllocator.init(gpa);
+    defer tile_arena.deinit();
+    const out = try encodeTile(tile_arena.allocator(), gpa, &one, 14, 4711, 6262, .mvt, true);
     defer gpa.free(out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
 }
@@ -2783,7 +2780,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
     defer cell.deinit();
     try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(0, 0));
 
-    var ms = MvtSurface.init(a, .mvt);
+    var ms = TileSurface.init(a, .mvt);
     const surf = ms.asSurface();
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
@@ -2887,8 +2884,8 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
 }
 
 /// Replay one decoded tile's layers as Surface calls (between the caller's
-/// begin/endScene). Layer names route exactly as MvtSurface emitted them.
-pub fn replayTileSurface(layers: []const mvt.DecodedLayer, surf: rs.Surface) !void {
+/// begin/endScene). Layer names route exactly as TileSurface emitted them.
+pub fn replayTile(surf: rs.Surface, layers: []const mvt.DecodedLayer) !void {
     for (layers) |layer| {
         const is_areas = std.mem.startsWith(u8, layer.name, "areas");
         const is_patterns = std.mem.startsWith(u8, layer.name, "area_patterns");

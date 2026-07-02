@@ -944,15 +944,15 @@ fn runRender(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, outpu
             else
                 engine.mvt.decode(a, tb) catch continue;
             ps.setOrigin(t.origin_x, t.origin_y);
-            try engine.scene.replayTileSurface(layers, surf);
+            try engine.scene.replayTile(surf, layers);
         }
         break :blk try surf.endScene(a);
     } else blk: {
         const cells = [_]engine.scene.CellRef{.{ .cell = &cell, .portrayal = streams }};
         break :blk if (view) |v|
-            try engine.scene.generateViewSurface(a, a, &cells, v.lon, v.lat, v.zoom, false, &ps)
+            try engine.scene.generateView(&ps, a, a, &cells, v.lon, v.lat, v.zoom, false)
         else
-            try engine.scene.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
+            try engine.scene.generateTile(ps.asSurface(), a, a, &cells, z, x, y, false);
     };
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
     if (view) |v| {

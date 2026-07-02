@@ -1,6 +1,6 @@
 //! Golden-image test for the pixel path (Gate 2): drive the REAL embedded
 //! S-101 Lua rules over a tiny in-memory fixture cell, run the render engine
-//! through generateTileSurface with a PixelSurface, and hash the PNG bytes.
+//! through scene.generateTile with a PixelSurface, and hash the PNG bytes.
 //!
 //! End-to-end seam: portray -> instruction parse -> geometry/clip -> Surface
 //! calls -> resolver (embedded colorProfile) -> op sort -> RasterCanvas -> PNG.
@@ -82,7 +82,7 @@ test "golden PNG: depth-area fill + coastline stroke through the pixel path" {
     var ps = render.pixel.PixelSurface.init(a, &colors, .day, &settings, @floatFromInt(z), 256, tile.EXTENT);
 
     const cells = [_]scene.CellRef{.{ .cell = &cell, .portrayal = streams, .geo = geo }};
-    const bytes = try scene.generateTileSurface(a, a, &cells, z, x, y, false, ps.asSurface());
+    const bytes = try scene.generateTile(ps.asSurface(), a, a, &cells, z, x, y, false);
 
     // Always drop the image for eyeballing / re-blessing.
     {

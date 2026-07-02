@@ -833,7 +833,7 @@ pub const Chart = struct {
                 }};
                 var ar = std.heap.ArenaAllocator.init(gpa);
                 defer ar.deinit();
-                break :blk_cell scene.generateTileMulti(ar.allocator(), gpa, &one, z, x, y, .mvt, self.pick_attrs) catch return error.TileGen;
+                break :blk_cell scene.encodeTile(ar.allocator(), gpa, &one, z, x, y, .mvt, self.pick_attrs) catch return error.TileGen;
             },
             .cells => |*ls| try tileFromCells(ls, z, x, y, self.pick_attrs),
         };
@@ -906,7 +906,7 @@ pub const Chart = struct {
                     else
                         @import("tiles").mvt.decode(a, bytes) catch continue;
                     ps.setOrigin(t.origin_x, t.origin_y);
-                    scene.replayTileSurface(layers, surf) catch return error.TileGen;
+                    scene.replayTile(surf, layers) catch return error.TileGen;
                 }
                 return surf.endScene(gpa) catch error.TileGen;
             },
@@ -917,7 +917,7 @@ pub const Chart = struct {
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
                 }};
-                return scene.generateViewSurface(a, gpa, &one, lon, lat, zoom, self.pick_attrs, &ps) catch error.TileGen;
+                return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
             },
             .cells => |*ls| {
                 const keep_from = ls.tick + 1;
@@ -929,7 +929,7 @@ pub const Chart = struct {
                     defer refs.deinit(gpa);
                     if (!try tileRefs(ls, t.z, t.x, t.y, &refs)) continue;
                     ps.setOrigin(t.origin_x, t.origin_y);
-                    scene.appendTileSurface(a, refs.items, t.z, t.x, t.y, self.pick_attrs, surf) catch return error.TileGen;
+                    scene.appendTile(surf, a, refs.items, t.z, t.x, t.y, self.pick_attrs) catch return error.TileGen;
                 }
                 const bytes = surf.endScene(gpa) catch return error.TileGen;
                 lazyEvict(ls, keep_from);
@@ -1387,7 +1387,7 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, pick_attrs: bool) ![]u8
     if (!try tileRefs(ls, z, x, y, &refs)) return try gpa.alloc(u8, 0);
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
-    const mvt = scene.generateTileMulti(ar.allocator(), gpa, refs.items, z, x, y, .mvt, pick_attrs) catch return error.TileGen;
+    const mvt = scene.encodeTile(ar.allocator(), gpa, refs.items, z, x, y, .mvt, pick_attrs) catch return error.TileGen;
     lazyEvict(ls, keep_from);
     return mvt;
 }

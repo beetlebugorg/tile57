@@ -8,7 +8,7 @@
 //!
 //! Pure engine code (no Lua): the caller parses + portrays one band's cells, calls
 //! Baker.bakeBand, then frees them before the next band — so peak memory tracks the
-//! single largest band, not the whole catalogue. generateTileMulti encodes each
+//! single largest band, not the whole catalogue. encodeTile encodes each
 //! tile immediately, so the accumulated tiles never reference cell memory.
 
 const std = @import("std");
@@ -210,7 +210,7 @@ pub fn parallelFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *co
 }
 
 // Worker context for parallel per-tile MVT generation. Each index is an
-// independent tile; generateTileMulti only reads the cells, so this is race-free.
+// independent tile; encodeTile only reads the cells, so this is race-free.
 const TileGenCtx = struct {
     keys: []const u64,
     idx_lists: []const []const u32,
@@ -263,7 +263,7 @@ const TileGenCtx = struct {
             const supp_whole = sc > 0 and gf_whole < sc; // a finer cell covers the whole tile
             refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = supp_whole, .suppress_patterns = supp_lines, .suppress_lines = supp_lines, .suppress_points = supp_whole };
         }
-        const mvt_bytes = scene.generateTileMulti(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
+        const mvt_bytes = scene.encodeTile(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
         // collection then only dedups + writes the already-compressed tile. The
         // gzipped result must outlive the scratch reset, so it comes from `c.gpa`.
@@ -281,7 +281,7 @@ const TileGenCtx = struct {
 /// Accumulates the baked tiles across bands and writes the final PMTiles archive.
 ///
 /// `gpa` MUST be a real freeing allocator (e.g. page_allocator), NOT an arena:
-/// generateTileMulti creates and frees a child arena per tile, which an arena
+/// encodeTile creates and frees a child arena per tile, which an arena
 /// backing would turn into a leak of every tile's working set.
 /// Receives each baked tile as it is produced. The Baker frees `mvt` right after
 /// the call, so the sink must consume/copy what it keeps. This keeps the bake
