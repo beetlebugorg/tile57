@@ -40,6 +40,15 @@ pub const MATCH_EPS_M: f64 = 30.0;
 /// object. Measured NOAA FOID copies are all < 100 m apart.
 pub const FOID_GUARD_M: f64 = 500.0;
 
+/// Tight epsilon for records that BOTH carry a FOID but different ones: NOAA
+/// maintains the FOID across scales for aids to navigation, but NOT for many
+/// hazard/area-point classes (wrecks, dumping grounds, landmark points), whose
+/// per-scale copies re-issue FIDN at the IDENTICAL position. Essentially
+/// co-located (< 5 m) same-class same-key records are the same charted object;
+/// two genuinely distinct objects under 5 m apart would be indistinguishable
+/// on screen anyway.
+pub const MATCH_EPS_TIGHT_M: f64 = 5.0;
+
 /// Live-path gate: skip the per-tile overlay entirely when the tile's display
 /// window opens coarser than any plausible SCAMIN (D(z+1) above this bound —
 /// roughly z <= 4 at mid-latitudes). Nothing could be eligible there, and the
@@ -65,10 +74,16 @@ pub const Rec = struct {
 };
 
 // Attributes that discriminate DISTINCT objects sharing a class + position:
-// COLOUR separates gate pairs; the light character/sector/range set separates
-// stacked sector/range lights at one structure. Absent attrs hash as "".
+// COLOUR separates gate pairs, BCNSHP/BOYSHP/CATLAM/TOPSHP separate co-located
+// seasonal variants (a summer lighted buoy vs its winter ice can), and the
+// light character/sector/range set separates stacked sector/range lights at
+// one structure. Absent attrs hash as "".
 const MKEY_ATTRS = [_]u16{
     s57.ATTR_COLOUR,
+    2, // BCNSHP
+    4, // BOYSHP
+    36, // CATLAM
+    s57.ATTR_TOPSHP,
     s57.ATTR_LITCHR, s57.ATTR_SIGGRP, s57.ATTR_SIGPER,
     s57.ATTR_SECTR1, s57.ATTR_SECTR2, s57.ATTR_VALNMR,
     86, // HEIGHT
@@ -194,16 +209,12 @@ pub fn dedup(gpa: Allocator, recs: []Rec) !void {
         }
     }
 
-    // Fallback pass for FOID-less records: spatial grid, match by class +
-    // discriminator key + epsilon against ALL records.
-    var any_no_foid = false;
-    for (recs) |r| {
-        if (r.foid == 0) {
-            any_no_foid = true;
-            break;
-        }
-    }
-    if (any_no_foid) {
+    // Positional fallback pass: a spatial grid over ALL records. FOID-less
+    // records match by class + discriminator key within MATCH_EPS_M; records
+    // whose FOIDs simply DIFFER (NOAA re-issues FIDN across scales for many
+    // hazard classes) still merge when essentially co-located
+    // (MATCH_EPS_TIGHT_M) with the same class + key.
+    {
         // Grid cell ~ MATCH_EPS_M at the records' latitude span; neighbours checked 3x3.
         const cell_deg = MATCH_EPS_M / 111_320.0 * 2.0;
         var grid = std.AutoHashMap(u64, u32).init(gpa); // grid key -> first idx
@@ -229,7 +240,6 @@ pub fn dedup(gpa: Allocator, recs: []Rec) !void {
         }
         for (recs, 0..) |r, ri| {
             const i: u32 = @intCast(ri);
-            if (r.foid != 0) continue; // fallback matching only for FOID-less records
             var dxi: i64 = -1;
             while (dxi <= 1) : (dxi += 1) {
                 var dyi: i64 = -1;
@@ -241,9 +251,14 @@ pub fn dedup(gpa: Allocator, recs: []Rec) !void {
                     );
                     var j = grid.get(k) orelse continue;
                     while (true) {
-                        if (j != i and recs[j].objl == r.objl and recs[j].mkey == r.mkey and
-                            distM(r.lon, r.lat, recs[j].lon, recs[j].lat) <= MATCH_EPS_M)
-                            ufUnion(parent, i, j);
+                        if (j != i and recs[j].objl == r.objl and recs[j].mkey == r.mkey) {
+                            // Same-FOID pairs are already unioned above; a pair with
+                            // any FOID-less member uses the measured copy epsilon,
+                            // a differing-FOID pair only the co-location epsilon.
+                            const eps: f64 = if (r.foid != 0 and recs[j].foid != 0) MATCH_EPS_TIGHT_M else MATCH_EPS_M;
+                            if (distM(r.lon, r.lat, recs[j].lon, recs[j].lat) <= eps)
+                                ufUnion(parent, i, j);
+                        }
                         if (gchain[j] == std.math.maxInt(u32)) break;
                         j = gchain[j];
                     }
@@ -499,6 +514,23 @@ test "dedup: different FOIDs at distance keep their own scamin" {
     try testing.expectEqual(@as(u32, 29_999), recs[0].effective);
     try testing.expectEqual(@as(u32, 39_999), recs[1].effective);
     try testing.expect(recs[0].winner and recs[1].winner);
+}
+
+test "dedup: differing FOIDs merge only when essentially co-located" {
+    // NOAA re-issues FIDN across scales for wrecks/dump grounds: identical
+    // position + class + key with DIFFERENT FOIDs is the same object (merge);
+    // the same shape 20 m apart is two objects (keep).
+    var recs = [_]Rec{
+        rec(-75.39745, 36.81623, 999_999, 159, 0xAAA1, 7, 0, 0, 350_000), // WRECKS, US3
+        rec(-75.39745, 36.81623, 4_999_999, 159, 0xBBB2, 7, 1, 0, 1_200_000), // same spot, US2, different FOID
+        rec(-75.39765, 36.81623, 999_999, 159, 0xCCC3, 7, 2, 1, 350_000), // ~18 m away: distinct wreck
+    };
+    try dedup(testing.allocator, &recs);
+    try testing.expectEqual(@as(u32, 4_999_999), recs[0].effective); // merged with the US2 copy
+    try testing.expectEqual(@as(u32, 4_999_999), recs[1].effective);
+    try testing.expect(recs[0].winner and !recs[1].winner);
+    try testing.expectEqual(@as(u32, 999_999), recs[2].effective); // beyond the tight epsilon
+    try testing.expect(recs[2].winner);
 }
 
 test "dedup: FOID guard refuses a far-apart identity" {
