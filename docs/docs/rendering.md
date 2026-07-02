@@ -43,7 +43,7 @@ print. One engine, pluggable outputs.
 
 Two interfaces do all the work:
 
-- **Surface** (`src/render/surface.zig`) — the *semantic* seam. Calls carry
+- **Surface** (`src/render/surface.zig`) — the *semantic* interface. Calls carry
   S-52 meaning: color **tokens** like `DEPVS`, symbol **names** like
   `BOYLAT13`, raw sounding depths, S-52 metadata (drawing priority, display
   category, SCAMIN). Nothing is resolved yet. This is what lets the tile
@@ -51,7 +51,7 @@ Two interfaces do all the work:
   palettes or the safety contour without re-baking, because the tiles still
   contain the names, not the pixels.
 
-- **Canvas** (`src/render/canvas.zig`) — the *primitive* seam. By the time a
+- **Canvas** (`src/render/canvas.zig`) — the *drawing* interface. By the time a
   call reaches a Canvas, everything is resolved: RGB colors, flattened
   polygon outlines, positioned glyphs. A Canvas knows nothing about charts.
   This is deliberately the same shape as a classic 2-D drawing API, so a new
@@ -140,7 +140,7 @@ millimetre on your display) and doubles as the @2x knob. Every field of
 
 ### From Zig
 
-The full seams are available: build a `PixelSurface`, drive it with
+Both interfaces are directly available: build a `PixelSurface`, drive it with
 `scene.generateTileSurface` / `generateViewSurface`, or replay a decoded
 tile with `scene.replayTileSurface`. See `tools/bake.zig`'s `runRender` for
 a complete worked example.
@@ -158,12 +158,12 @@ the ten Surface methods and you receive the full semantic stream — this is
 how MVT and MLT are done (`MvtSurface` in `src/scene/scene.zig`), and how a
 GeoJSON debug dump or a GPU display list would be done.
 
-**From the C ABI?** Not today — honestly. The Surface and Canvas seams are
-Zig interfaces; the C ABI exposes the *products* (tiles, PNG, PDF, styles,
-assets) and the *inputs* (charts, mariner settings), not the seams
+**From the C ABI?** Not today — honestly. Surface and Canvas are Zig
+interfaces; the C ABI exposes the *products* (tiles, PNG, PDF, styles,
+assets) and the *inputs* (charts, mariner settings), not the interfaces
 themselves. A C-callback Canvas (your C function pointers receiving resolved
-paths and glyph runs) is a feasible future addition — the seam was designed
-so that would be mechanical — but it does not exist yet. If you need a
+paths and glyph runs) is a feasible future addition — the boundary was
+designed so that would be mechanical — but it does not exist yet. If you need a
 custom output, today the answer is a small Zig file in `src/render/`; the
 build wires it in one place.
 
