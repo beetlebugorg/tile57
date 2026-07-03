@@ -97,6 +97,32 @@ fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64
     return best;
 }
 
+/// A read-only coverage participant from ANOTHER pack (bake --existing): its real
+/// M_COVR coverage + compilation scale, folded into the finest-cscl suppression
+/// scan so THIS pack's coarser cells defer to the peer pack where it is finer
+/// (cross-pack best-available). The peer emits nothing here and never rides the
+/// tilemap — it only prevents this pack's overview from painting over the peer's
+/// finer data (e.g. clipping its light sectors). M_COVR only (no derived bbox),
+/// the conservative fills/points rule.
+pub const ContextCell = struct {
+    coverage: []const []const []const s57.LonLat = &.{},
+    bounds: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // bbox over the coverage rings
+    cscl: i32 = 0,
+};
+
+/// Lower `best` to a peer ContextCell's cscl where one strictly finer covers
+/// (lon,lat) — the cross-pack extension of finestCsclAt. `best` is the finest
+/// cscl from this pack's own cells; the result folds the peer packs in.
+fn finestCsclCtx(context: []const ContextCell, lon: f64, lat: f64, best_in: i32) i32 {
+    var best = best_in;
+    for (context) |*c| {
+        if (c.cscl <= 0 or c.cscl >= best) continue;
+        if (lon < c.bounds[0] or lon > c.bounds[2] or lat < c.bounds[1] or lat > c.bounds[3]) continue;
+        if (c.coverage.len > 0 and s57.coverageContains(c.coverage, lon, lat)) best = c.cscl;
+    }
+    return best;
+}
+
 /// A parsed cell's distinct SCAMIN denominators, sorted ascending — its slice of
 /// the archive's scamin ladder, kept per Backend/cell so the band-handoff can
 /// quantize `smax` onto values that really exist (see quantizeHandoff). Allocated
@@ -423,6 +449,10 @@ const TileGenCtx = struct {
     // eligibility, and the flag that makes regular cells skip their own copies.
     overlay: []const Backend = &.{},
     standalone: bool = false,
+    // Cross-pack best-available (Baker.context): peer packs' coverage folded into
+    // the finest-scale suppression scan so this pack's coarser cells defer where a
+    // peer is finer. Read-only; emits nothing.
+    context: []const ContextCell = &.{},
     // Live progress emitted from inside the parallel batch (so a big super-tile
     // shows tiles flowing rather than appearing hung). `done` counts processed
     // tiles; `base` is the emitted count before this batch.
@@ -466,10 +496,15 @@ const TileGenCtx = struct {
         const tbll = tile.tileBoundsLonLat(z, x, y); // [minlon, minlat, maxlon, maxlat]
         const clon = (tbll[0] + tbll[2]) * 0.5;
         const clat = (tbll[1] + tbll[3]) * 0.5;
-        const gf_centre_d = finestCsclAt(c.backends, idxs, clon, clat, true);
-        var gf_whole: i32 = finestCsclAt(c.backends, idxs, clon, clat, false);
+        // Fold peer-pack coverage (bake --existing) into the finest-scale scan so
+        // this pack's coarser cells defer to a finer peer where it covers — the
+        // cross-pack extension of the finest-cell suppression (finestCsclCtx). The
+        // overscale hatch below (gf_tile) stays own-cells-only: the peer renders its
+        // own hatch, so folding it here would double it.
+        const gf_centre_d = finestCsclCtx(c.context, clon, clat, finestCsclAt(c.backends, idxs, clon, clat, true));
+        var gf_whole: i32 = finestCsclCtx(c.context, clon, clat, finestCsclAt(c.backends, idxs, clon, clat, false));
         const corners = [4][2]f64{ .{ tbll[0], tbll[1] }, .{ tbll[2], tbll[1] }, .{ tbll[0], tbll[3] }, .{ tbll[2], tbll[3] } };
-        for (corners) |cn| gf_whole = @max(gf_whole, finestCsclAt(c.backends, idxs, cn[0], cn[1], false));
+        for (corners) |cn| gf_whole = @max(gf_whole, finestCsclCtx(c.context, cn[0], cn[1], finestCsclAt(c.backends, idxs, cn[0], cn[1], false)));
         // The display window's shallow end for a tile at zoom z: D(z, φ_tile). The
         // participating cells' SCAMIN ladders quantize the handoff (quantizeHandoff).
         const display_denom = assets.displayDenomZ(z, clat);
@@ -583,6 +618,11 @@ pub const Baker = struct {
     // drivers set it whenever they built an overlay (even an empty one).
     overlay: []const Backend = &.{},
     scamin_standalone: bool = false,
+    // Cross-pack best-available (bake --existing / tile57_bake_pmtiles context cells):
+    // peer packs' M_COVR coverage + cscl, set ONCE by the driver. Folded into the
+    // per-tile finest-scale suppression so this pack's overview defers where a peer
+    // pack is finer (stops it painting over the peer's sectors). Emits nothing.
+    context: []const ContextCell = &.{},
     // Progress denominator (host §3): the caller sets these PER BAND before baking it
     // so the tiles-stage callback can report `done`/`total` as a per-band tile bar
     // (done = self.count - band_base; total = band_total, a planned estimate from
@@ -797,7 +837,7 @@ pub const Baker = struct {
         // NUL-terminated — @tagName is a comptime string literal, safe across the ABI).
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .context = self.context, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
@@ -878,7 +918,7 @@ pub const Baker = struct {
 
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .context = self.context, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
