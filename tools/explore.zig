@@ -743,9 +743,48 @@ fn exStreamCell(
     }
 }
 
+// A parsed camera for --view: the "lon,lat,zoom" the explorer bounds its cell set
+// to. Accepts the bare triple ("-75.39724,37.876816,12.34") or a share URL whose
+// hash carries it ("http://host:8080/#v=-75.39724,37.876816,12.34" — the web app's
+// parseViewHash format). Extra hash fields (bearing,pitch) are ignored.
+const View = struct { lon: f64, lat: f64, zoom: f64 };
+fn parseViewArg(s: []const u8) ?View {
+    var v = s;
+    if (std.mem.indexOf(u8, v, "#v=")) |i| {
+        v = v[i + 3 ..];
+        if (std.mem.indexOfScalar(u8, v, '&')) |j| v = v[0..j];
+    }
+    var it = std.mem.splitScalar(u8, v, ',');
+    const lon = std.fmt.parseFloat(f64, std.mem.trim(u8, it.next() orelse return null, " \t")) catch return null;
+    const lat = std.fmt.parseFloat(f64, std.mem.trim(u8, it.next() orelse return null, " \t")) catch return null;
+    const zoom = std.fmt.parseFloat(f64, std.mem.trim(u8, it.next() orelse return null, " \t")) catch return null;
+    return .{ .lon = lon, .lat = lat, .zoom = zoom };
+}
+
+// Web-Mercator latitude at world-pixel y (inverse of the projection below).
+fn latOfY(y_px: f64, world: f64) f64 {
+    const n = std.math.pi * (1.0 - 2.0 * y_px / world);
+    return std.math.atan(std.math.sinh(n)) * 180.0 / std.math.pi;
+}
+
+// The [west, south, east, north] geographic bounds of a `w_px`×`h_px` screen
+// centred on (lon,lat) at web-Mercator `zoom` — the same projection the client
+// uses, so "cells in this viewport" matches what the app would load at that view.
+fn viewportBbox(lon: f64, lat: f64, zoom: f64, w_px: f64, h_px: f64) [4]f64 {
+    const world = 256.0 * std.math.pow(f64, 2.0, zoom);
+    const cx = (lon + 180.0) / 360.0 * world;
+    const sphi = @sin(lat * std.math.pi / 180.0);
+    const cy = (0.5 - @log((1.0 + sphi) / (1.0 - sphi)) / (4.0 * std.math.pi)) * world;
+    const west = (cx - w_px / 2.0) / world * 360.0 - 180.0;
+    const east = (cx + w_px / 2.0) / world * 360.0 - 180.0;
+    const north = latOfY(cy - h_px / 2.0, world); // smaller y = higher lat
+    const south = latOfY(cy + h_px / 2.0, world);
+    return .{ west, south, east, north };
+}
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 explore <cell.000> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--kitty] [--no-resolve] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--view LON,LAT,ZOOM|URL] [--viewport WxH] [--json] [--tui] [--kitty] [--no-resolve] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -754,9 +793,20 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var tui = false;
     var kitty = false;
     var rules_flag: ?[]const u8 = null;
+    var view: ?View = null;
+    var viewport_w: f64 = 1280; // the screen the viewport filter assumes (CSS px)
+    var viewport_h: f64 = 800;
     var f = Flags{ .args = args, .i = 2 };
     while (f.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--class")) {
+        if (std.mem.eql(u8, arg, "--view")) {
+            const v = f.val("--view") orelse return;
+            view = parseViewArg(v) orelse return usageErr("--view must be LON,LAT,ZOOM or a URL with #v=LON,LAT,ZOOM");
+        } else if (std.mem.eql(u8, arg, "--viewport")) {
+            const v = f.val("--viewport") orelse return;
+            const xi = std.mem.indexOfScalar(u8, v, 'x') orelse return usageErr("--viewport must be WxH");
+            viewport_w = std.fmt.parseFloat(f64, v[0..xi]) catch return usageErr("bad --viewport W");
+            viewport_h = std.fmt.parseFloat(f64, v[xi + 1 ..]) catch return usageErr("bad --viewport H");
+        } else if (std.mem.eql(u8, arg, "--class")) {
             F.classes = f.val("--class") orelse return;
         } else if (std.mem.eql(u8, arg, "--object")) {
             const v = f.val("--object") orelse return;
@@ -791,22 +841,59 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var m = render.resolve.MarinerSettings{ .display_other = true };
     m.scheme = .day;
 
-    // SINGLE CELL ONLY. explore is a per-cell inspector / live cell map; an
-    // ENC_ROOT with hundreds of cells overwhelms the tree + the map framing, so a
-    // directory is rejected outright (nonzero exit) rather than quietly walked.
-    // A single .000 auto-discovers its .001+ updates (exParseCellFrom).
-    if (!std.mem.endsWith(u8, path, ".000")) {
-        std.debug.print("error: explore takes a single .000 cell; an ENC_ROOT with many cells overwhelms the explorer — pass one cell\n", .{});
-        std.process.exit(2);
-    }
-    // The one source cell. `dir` stays open for the whole run (the TUI re-reads
-    // the cell lazily to rebuild level 3 + the map render).
+    // explore inspects one or more source cells. `dir` stays open for the whole run
+    // (the TUI re-reads cells lazily to rebuild level 3 + the map render).
+    //   • a single .000 auto-discovers its .001+ updates (exParseCellFrom); OR
+    //   • an ENC_ROOT (directory) with --view: the viewport BOUNDS the cell set to
+    //     the handful under that screen, so the tree + map stay tractable (an
+    //     unfiltered ENC_ROOT with hundreds of cells would not).
     var dir: std.Io.Dir = undefined;
     var cell_paths = std.ArrayList([]const u8).empty;
-    {
+    if (std.mem.endsWith(u8, path, ".000")) {
         const dirp = std.fs.path.dirname(path) orelse ".";
         dir = std.Io.Dir.cwd().openDir(io, dirp, .{}) catch return usageErr("cannot open cell directory");
         try cell_paths.append(a, try a.dupe(u8, std.fs.path.basename(path)));
+    } else {
+        const v = view orelse {
+            std.debug.print("error: explore takes a single .000 cell, or an ENC_ROOT with --view LON,LAT,ZOOM (or a #v= URL) to pull the cells under that viewport\n", .{});
+            std.process.exit(2);
+        };
+        dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return usageErr("cannot open ENC_ROOT directory");
+        const vb = viewportBbox(v.lon, v.lat, v.zoom, viewport_w, viewport_h);
+        // Cheap bbox scan: peekMeta (M_COVR/header only, no full parse) per .000,
+        // keep those whose coverage intersects the viewport. One cell's bytes resident
+        // at a time (scan arena reset per file).
+        const Match = struct { path: []const u8, cscl: i32 };
+        var matches = std.ArrayList(Match).empty;
+        var scan_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scan_arena.deinit();
+        var scanned: usize = 0;
+        var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
+            _ = scan_arena.reset(.retain_capacity);
+            const sa = scan_arena.allocator();
+            const bytes = dir.readFileAlloc(io, entry.path, sa, .unlimited) catch continue;
+            scanned += 1;
+            const meta = engine.s57.peekMeta(sa, bytes) orelse continue;
+            const bb = meta.bounds orelse continue; // [west, south, east, north]
+            if (bb[0] <= vb[2] and bb[2] >= vb[0] and bb[1] <= vb[3] and bb[3] >= vb[1])
+                try matches.append(a, .{ .path = try a.dupe(u8, entry.path), .cscl = meta.cscl });
+        }
+        if (matches.items.len == 0) {
+            std.debug.print("no cells intersect the viewport ({d} .000 scanned; view {d:.5},{d:.5} z{d:.2}, {d:.0}x{d:.0}px)\n", .{ scanned, v.lon, v.lat, v.zoom, viewport_w, viewport_h });
+            return;
+        }
+        // Coarsest-first (largest compilation scale = overview) so the tree reads
+        // overview -> harbour, like the chart stack.
+        std.mem.sort(Match, matches.items, {}, struct {
+            fn lt(_: void, x: Match, y: Match) bool {
+                return x.cscl > y.cscl;
+            }
+        }.lt);
+        for (matches.items) |mt| try cell_paths.append(a, mt.path);
+        std.debug.print("viewport {d:.5},{d:.5} z{d:.2}: {d} of {d} cell(s)\n", .{ v.lon, v.lat, v.zoom, cell_paths.items.len, scanned });
     }
     defer dir.close(io);
 
@@ -878,25 +965,28 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     }
 
-    // Console. The header ("N feature(s)") needs the grand total up front: the
-    // single cell yields it from its own filter pass (one parse), then a second
-    // pass streams each feature's dump.
+    // Console. The header ("N feature(s)") needs the grand total up front, so scan
+    // every cell for its count first, then a second pass streams each cell's dump
+    // (one cell resident at a time; `first` carries separator state across cells).
     var first = true;
-    _ = cell_arena.reset(.free_all);
-    var cell = exParseCellFrom(io, cell_arena.allocator(), dir, cell_paths.items[0], false) orelse {
-        std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
-        return;
-    };
     var total: usize = 0;
-    for (cell.features, 0..) |fe, fi| {
-        if (exPasses(F, engine.catalogue.acronymByObjl(fe.objl), fe, fi)) total += 1;
+    for (cell_paths.items) |base_rel| {
+        _ = cell_arena.reset(.free_all);
+        const cell = exParseCellFrom(io, cell_arena.allocator(), dir, base_rel, true) orelse continue;
+        for (cell.features, 0..) |fe, fi| {
+            if (exPasses(F, engine.catalogue.acronymByObjl(fe.objl), fe, fi)) total += 1;
+        }
     }
     if (total == 0) {
         std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
         return;
     }
     outbuf.write(std.fmt.allocPrint(a, "{d} feature(s)\n", .{total}) catch "");
-    exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(cell_paths.items[0]), rules, F, .console, &outbuf, &first, palette, &m) catch {};
+    for (cell_paths.items) |base_rel| {
+        _ = cell_arena.reset(.free_all);
+        var cell = exParseCellFrom(io, cell_arena.allocator(), dir, base_rel, false) orelse continue;
+        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .console, &outbuf, &first, palette, &m) catch {};
+    }
 }
 
 // Console `--kitty`: after a row's text dump, append a one-line caption + the
