@@ -1632,6 +1632,8 @@ const ExIndexRow = struct {
     det12: []const []const u8, // pre-formatted levels 1+2 detail lines
     cell_id: usize,
     index: usize,
+    prim: u8, // S-57 primitive (1 point / 2 line / 3 area) — geometry glyph in the tree
+    objl: u16, // object-class code — the group header's S-101 human name
 };
 
 const ExFilters = struct {
@@ -2281,6 +2283,8 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
                     .det12 = splitLines(a, d.items) catch continue,
                     .cell_id = cid,
                     .index = row.index,
+                    .prim = row.prim,
+                    .objl = row.objl,
                 }) catch {};
             }
         }
@@ -2291,7 +2295,7 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
         }
         var cells = std.ArrayList(ExCellSrc).empty;
         for (cell_paths.items) |bp| try cells.append(a, .{ .base_rel = bp });
-        return exploreTui(io, a, index.items, cells.items, dir, rules, F, kitty, chart_h, palette, &m);
+        return exploreTui(io, a, index.items, cells.items, dir, rules, F, kitty, chart_h, palette, &m, path);
     }
 
     // --- Non-TUI: stream each cell's features straight to a buffered stdout, one
@@ -2379,15 +2383,331 @@ fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), c: ?*chart.Chart
     try out.append(a, '\n');
 }
 
-// `tile57 explore --tui`: a two-pane feature explorer. Left = the scrollable,
-// class-filterable feature list; right = the selected feature's three-level
-// detail. Arrow/j/k move the selection, PgUp/PgDn page, / filters by class,
-// q (or ctrl-c) quits. Same termios raw-mode + alt-screen scaffolding as
-// `tile57 ascii --tui`; dependency-free. With `--kitty` the selected feature's
-// RESOLVED render is placed as a kitty-graphics thumbnail in the top-right of the
-// detail pane (transmit-once-per-selection + place, deleted each frame — the same
+// ---- explore --tui: colour + layout vocabulary -----------------------------
+// Standard 8/16-colour ANSI only (+ bold/dim/reverse) so it degrades on plain
+// terminals; no 256-colour assumptions. Colours are zero display-width, applied
+// AFTER any width clipping, so column maths stays exact.
+const EXC_RESET = "\x1b[0m";
+const EXC_BOLD = "\x1b[1m";
+const EXC_DIM = "\x1b[2m";
+const EXC_REV = "\x1b[7m";
+const EXC_RED = "\x1b[31m";
+const EXC_GREEN = "\x1b[32m";
+const EXC_YELLOW = "\x1b[33m";
+const EXC_BLUE = "\x1b[34m";
+const EXC_MAGENTA = "\x1b[35m";
+const EXC_CYAN = "\x1b[36m";
+const EXC_BCYAN = "\x1b[1;36m"; // class acronym (group header + feature title)
+const EXC_H1 = "\x1b[1;33m"; // detail section "1. S-57 attributes"
+const EXC_H2 = "\x1b[1;35m"; // detail section "2. S-101 portrayal instructions"
+const EXC_H3 = "\x1b[1;32m"; // detail section "3. Resolved Surface calls"
+const EXC_SPACES = " " ** 80;
+
+// Per-primitive geometry glyph + colour for the class tree (point ● / line ─ /
+// area ▬). All are single display columns but multi-byte UTF-8 — see dispWidth.
+fn exGeomGlyph(prim: u8) []const u8 {
+    return switch (prim) {
+        1 => "\u{25CF}", // ● point
+        2 => "\u{2500}", // ─ line
+        3 => "\u{25AC}", // ▬ area
+        else => "\u{00B7}", // · unknown
+    };
+}
+fn exGeomColor(prim: u8) []const u8 {
+    return switch (prim) {
+        1 => EXC_CYAN,
+        2 => EXC_GREEN,
+        3 => EXC_BLUE,
+        else => EXC_DIM,
+    };
+}
+fn exGeomName(prim: u8) []const u8 {
+    return switch (prim) {
+        1 => "point",
+        2 => "line",
+        3 => "area",
+        else => "other",
+    };
+}
+fn exPrimSlot(prim: u8) usize {
+    return switch (prim) {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        else => 3,
+    };
+}
+
+// A class group in the tree: the member feature rows (indices into the resident
+// index), a per-primitive tally for the header glyph + summary, the S-101 human
+// name, and a collapse flag. Built once (the index is fixed for the session).
+const ExGroup = struct {
+    class: []const u8,
+    members: []const usize, // indices into the resident `rows` (ExIndexRow) list
+    counts: [4]usize, // [point, line, area, other]
+    dominant: u8, // S-57 primitive of the header glyph (most common in the class)
+    s101: []const u8, // S-101 feature-class name for the header, or ""
+    expanded: bool,
+};
+
+// One flattened, on-screen row: a group HEADER, or a FEATURE under an expanded
+// group. `row` indexes the resident index (only meaningful when !is_header).
+const ExVisRow = struct { is_header: bool, group: usize, row: usize };
+
+fn exLtClass(_: void, x: []const u8, y: []const u8) bool {
+    return std.mem.lessThan(u8, x, y);
+}
+
+// Group the resident index by S-57 class, sorted alphabetically by acronym. All
+// allocations land in `a` (tiny — just index lists + group headers), so this is
+// memory-negligible next to the level-3/thumbnail arenas.
+fn exBuildGroups(a: std.mem.Allocator, rows: []const ExIndexRow) ![]ExGroup {
+    var map = std.StringHashMap(std.ArrayList(usize)).init(a);
+    for (rows, 0..) |row, i| {
+        const gop = try map.getOrPut(row.class);
+        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(usize).empty;
+        try gop.value_ptr.append(a, i);
+    }
+    var classes = std.ArrayList([]const u8).empty;
+    var kit = map.keyIterator();
+    while (kit.next()) |k| try classes.append(a, k.*);
+    std.mem.sort([]const u8, classes.items, {}, exLtClass);
+
+    var groups = std.ArrayList(ExGroup).empty;
+    for (classes.items) |cls| {
+        const members = map.get(cls).?.items;
+        var counts = [_]usize{ 0, 0, 0, 0 };
+        for (members) |ri| counts[exPrimSlot(rows[ri].prim)] += 1;
+        var dom: u8 = 1;
+        var best: usize = 0;
+        for ([_]u8{ 1, 2, 3, 255 }) |p| {
+            const c = counts[exPrimSlot(p)];
+            if (c > best) {
+                best = c;
+                dom = p;
+            }
+        }
+        try groups.append(a, .{
+            .class = cls,
+            .members = members,
+            .counts = counts,
+            .dominant = dom,
+            .s101 = engine.catalogue.resolveFeatureByObjl(rows[members[0]].objl) orelse "",
+            .expanded = false,
+        });
+    }
+    // A single-group source opens expanded — no point hiding the only class.
+    if (groups.items.len == 1) groups.items[0].expanded = true;
+    return groups.items;
+}
+
+// The feature-row label with its redundant leading class stripped (the class is
+// already the group header): "LIGHTS Thomas Point" -> "Thomas Point".
+fn exSubLabel(row: ExIndexRow) []const u8 {
+    if (std.mem.startsWith(u8, row.label, row.class) and
+        row.label.len > row.class.len and row.label[row.class.len] == ' ')
+        return row.label[row.class.len + 1 ..];
+    return row.label;
+}
+
+// The header-summary detail shown when a GROUP header is selected (cheap — no
+// cell re-parse). Lines land in `a` (a per-detail arena, reset per selection).
+fn exGroupDetail(a: std.mem.Allocator, g: ExGroup, rows: []const ExIndexRow) ![]const []const u8 {
+    _ = rows;
+    var lines = std.ArrayList([]const u8).empty;
+    if (g.s101.len > 0)
+        try lines.append(a, try std.fmt.allocPrint(a, "{s}  ({s})", .{ g.class, g.s101 }))
+    else
+        try lines.append(a, try a.dupe(u8, g.class));
+    try lines.append(a, "");
+    try lines.append(a, try std.fmt.allocPrint(a, "  {d} feature(s) in this class", .{g.members.len}));
+    var gb = std.ArrayList(u8).empty;
+    try gb.appendSlice(a, "  geometry: ");
+    var first = true;
+    for ([_]u8{ 1, 2, 3, 255 }) |p| {
+        const c = g.counts[exPrimSlot(p)];
+        if (c == 0) continue;
+        if (!first) try gb.appendSlice(a, "  ");
+        first = false;
+        try gb.print(a, "{d} {s}", .{ c, exGeomName(p) });
+    }
+    try lines.append(a, gb.items);
+    try lines.append(a, try std.fmt.allocPrint(a, "  status: {s}", .{if (g.expanded) "expanded" else "collapsed"}));
+    try lines.append(a, "");
+    if (g.expanded)
+        try lines.append(a, "  <-/Enter/Space  collapse this class")
+    else
+        try lines.append(a, "  ->/Enter/Space  expand this class");
+    try lines.append(a, "  then select a feature to inspect its");
+    try lines.append(a, "  S-57 attributes + portrayal + resolved render");
+    return lines.items;
+}
+
+// Display width in terminal columns: count UTF-8 scalars (lead bytes), each as a
+// single column. Correct for the ASCII + box-drawing glyphs the tree uses; the
+// honest caveat is East-Asian "ambiguous width" glyphs (● ▬ ·) render as 2 cols
+// in CJK-wide terminals, which this counts as 1 (assumes a Western-width font).
+fn dispWidth(s: []const u8) usize {
+    var w: usize = 0;
+    for (s) |b| {
+        if ((b & 0xC0) != 0x80) w += 1;
+    }
+    return w;
+}
+
+// Clip `s` to at most `cols` display columns on a UTF-8 scalar boundary.
+fn clipCols(s: []const u8, cols: usize) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const lead = (s[i] & 0xC0) != 0x80;
+        if (lead and w >= cols) break;
+        if (lead) w += 1;
+        i += 1;
+    }
+    return s[0..i];
+}
+
+// A full-width reverse-video status bar (title / footer). `text` must be plain
+// (no escapes) so the width maths is exact; the whole bar is reverse (+ optional
+// bold), then padded with spaces to `cols`.
+fn exEmitBar(fa: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8, cols: usize, bold: bool) !void {
+    try buf.appendSlice(fa, EXC_REV);
+    if (bold) try buf.appendSlice(fa, EXC_BOLD);
+    const c = clipCols(text, cols);
+    try buf.appendSlice(fa, c);
+    var w = dispWidth(c);
+    while (w < cols) : (w += 1) try buf.append(fa, ' ');
+    try buf.appendSlice(fa, EXC_RESET);
+}
+
+// One coloured segment of a left-pane row (text + its known display width +
+// optional SGR colour). Assembling from known-width parts lets exEmitLeft clip
+// and pad by columns without measuring around the embedded escapes.
+const ExSeg = struct { t: []const u8, w: usize, c: []const u8 };
+
+// Emit one left-pane cell of exactly `width` columns from coloured segments,
+// clipping the overflowing segment on a scalar boundary and padding the rest. A
+// selected row is drawn as a plain reverse-video bar (segment colours dropped so
+// fg-on-reverse never muddies the highlight).
+fn exEmitLeft(fa: std.mem.Allocator, buf: *std.ArrayList(u8), segs: []const ExSeg, width: usize, selected: bool) !void {
+    if (selected) try buf.appendSlice(fa, EXC_REV);
+    var used: usize = 0;
+    for (segs) |sg| {
+        if (used >= width) break;
+        const avail = width - used;
+        const colour = !selected and sg.c.len > 0;
+        if (sg.w <= avail) {
+            if (colour) try buf.appendSlice(fa, sg.c);
+            try buf.appendSlice(fa, sg.t);
+            if (colour) try buf.appendSlice(fa, EXC_RESET);
+            used += sg.w;
+        } else {
+            const clipped = clipCols(sg.t, avail);
+            if (colour) try buf.appendSlice(fa, sg.c);
+            try buf.appendSlice(fa, clipped);
+            if (colour) try buf.appendSlice(fa, EXC_RESET);
+            used += dispWidth(clipped);
+            break;
+        }
+    }
+    while (used < width) : (used += 1) try buf.append(fa, ' ');
+    if (selected) try buf.appendSlice(fa, EXC_RESET);
+}
+
+fn exTokenColor(op: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, op, "SY")) return EXC_MAGENTA; // symbol name
+    if (std.mem.eql(u8, op, "AC")) return EXC_CYAN; // area colour token
+    if (std.mem.eql(u8, op, "AP")) return EXC_CYAN; // area pattern
+    if (std.mem.eql(u8, op, "LS")) return EXC_CYAN; // line style
+    if (std.mem.eql(u8, op, "TX")) return EXC_GREEN; // text
+    return null;
+}
+
+// Colourise S-52 shorthand opcodes (SY/AC/AP/LS/TX) in a detail line: dim the
+// "XX(" opener, colour the parenthesised token by opcode. Leaves everything else
+// untouched (best-effort — a ')' inside a TX string ends the run early).
+fn exColorTokens(fa: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (i + 3 <= s.len and s[i + 2] == '(' and
+            s[i] >= 'A' and s[i] <= 'Z' and s[i + 1] >= 'A' and s[i + 1] <= 'Z')
+        {
+            if (exTokenColor(s[i .. i + 2])) |col| {
+                var j = i + 3;
+                while (j < s.len and s[j] != ')') j += 1;
+                try buf.appendSlice(fa, EXC_DIM);
+                try buf.appendSlice(fa, s[i .. i + 3]);
+                try buf.appendSlice(fa, EXC_RESET);
+                try buf.appendSlice(fa, col);
+                try buf.appendSlice(fa, s[i + 3 .. j]);
+                try buf.appendSlice(fa, EXC_RESET);
+                if (j < s.len) {
+                    try buf.append(fa, ')');
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        try buf.append(fa, s[i]);
+        i += 1;
+    }
+}
+
+// Emit one detail-pane line, clipped to `budget` columns, with colour applied by
+// line type: the group-summary title, the numbered S-57/S-101/resolved section
+// headers, the feature title, attribute acronyms, and S-52 opcode tokens. The
+// underlying text is the SAME bytes the console path prints — colour lives only
+// here, so `--json`/console stay byte-identical.
+fn exEmitDetail(fa: std.mem.Allocator, buf: *std.ArrayList(u8), line: []const u8, budget: usize, first_header: bool) !void {
+    const s = clipCols(line, budget);
+    if (first_header) {
+        try buf.appendSlice(fa, EXC_BCYAN);
+        try buf.appendSlice(fa, s);
+        try buf.appendSlice(fa, EXC_RESET);
+        return;
+    }
+    if (std.mem.startsWith(u8, s, "  1. ")) return exSection(fa, buf, s, EXC_H1);
+    if (std.mem.startsWith(u8, s, "  2. ")) return exSection(fa, buf, s, EXC_H2);
+    if (std.mem.startsWith(u8, s, "  3. ")) return exSection(fa, buf, s, EXC_H3);
+    if (s.len > 0 and s[0] == '[') {
+        try buf.appendSlice(fa, EXC_BOLD);
+        try buf.appendSlice(fa, s);
+        try buf.appendSlice(fa, EXC_RESET);
+        return;
+    }
+    // Attribute line: five leading spaces, an uppercase acronym, then " = ".
+    if (std.mem.startsWith(u8, s, "     ") and s.len > 6 and s[5] >= 'A' and s[5] <= 'Z') {
+        if (std.mem.indexOf(u8, s, " = ")) |eq| {
+            try buf.appendSlice(fa, s[0..5]);
+            try buf.appendSlice(fa, EXC_YELLOW);
+            try buf.appendSlice(fa, s[5..eq]);
+            try buf.appendSlice(fa, EXC_RESET);
+            try buf.appendSlice(fa, s[eq..]);
+            return;
+        }
+    }
+    try exColorTokens(fa, buf, s);
+}
+
+fn exSection(fa: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8, color: []const u8) !void {
+    try buf.appendSlice(fa, color);
+    try buf.appendSlice(fa, s);
+    try buf.appendSlice(fa, EXC_RESET);
+}
+
+// `tile57 explore --tui`: a two-pane feature explorer. Left = a COLLAPSIBLE class
+// tree (group headers + indented features under expanded groups); right = the
+// selected feature's three-level detail (or a group summary on a header). j/k or
+// arrows move; ->/Enter/Space expand, <- collapse, E/C expand/collapse all;
+// PgUp/PgDn page; g/G home/end; [/] scroll detail; / filters by class; q quits.
+// Same termios raw-mode + alt-screen scaffolding as `tile57 ascii --tui`;
+// dependency-free. With `--kitty` the selected feature's RESOLVED render is
+// placed as a kitty-graphics thumbnail in the top-right of the detail pane
+// (transmit-once-per-selection + place, deleted each frame — the same
 // cached-region pattern as the ascii kitty TUI, so it never scrolls the layout).
-fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, chart_h: ?*chart.Chart, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
+fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, chart_h: ?*chart.Chart, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, source: []const u8) !void {
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
     const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
@@ -2410,48 +2730,104 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
     // detail lines. Level 3 (resolved calls) + the kitty thumbnail are computed
     // LAZILY per selection below — never held for every feature.
 
+    // The class tree: group the index by S-57 class once (it is fixed for the
+    // session); `expanded` toggles per header. Memory-negligible next to the arenas.
+    const groups = try exBuildGroups(a, rows);
+    const src_base = std.fs.path.basename(source);
+
     // Lazy level-3/thumbnail state. `sel_arena` caches ONE cell's re-parse +
     // recording + folded resolved calls (rebuilt only when the selection crosses to
     // another cell). `det_arena` holds just the currently-shown feature's level-3
-    // text + line list (rebuilt when the selection moves). Both page-backed so their
-    // resets return memory to the OS. This is what keeps a 3000+-feature cell viable.
+    // (or a group header summary). Both page-backed so their resets return memory to
+    // the OS. This is what keeps a 3000+-feature cell viable.
     var sel_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer sel_arena.deinit();
     var det_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer det_arena.deinit();
+    // Per-FRAME scratch (bounded to one redraw) for the output buffer + tiny format
+    // temporaries, reset each frame so the process arena never grows with redraws.
+    var frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer frame_arena.deinit();
     const need_cell = F.do_resolve or do_kitty; // no re-parse needed if neither
     var cached_cell: ?usize = null;
     var resolved_by_fi: []?ExLevel3 = &.{}; // current cell, indexed by feature index
     var thumb_by_fi: []?ExThumb = &.{};
     var cur_det: []const []const u8 = &.{}; // detail lines for the current selection
-    var det_gi: ?usize = null; // rows[] index cur_det was built for
+    var det_is_header = false; // cur_det is a group summary (colour its title line)
+    // What cur_det was built for: kind 0=none 1=feature 2=header, id = rows[] index
+    // (feature) or group index (header). det_kind = 3 forces a rebuild after a tree
+    // mutation (expand/collapse changes the header summary or the feature set).
+    var det_kind: u8 = 3;
+    var det_id: usize = 0;
 
     var filt_buf: [64]u8 = undefined;
     var filt_len: usize = 0;
     var filtering = false; // typing into the class filter
-    var sel: usize = 0; // index into the FILTERED view
+    var sel: usize = 0; // index into the flattened visible-row list
     var top: usize = 0; // first visible list row
     var det_top: usize = 0; // detail scroll offset
+    // After a tree mutation the flattened list shifts; relocate the selection onto
+    // this stable (group, header?/row) identity rather than onto a stale index.
+    var sel_target: ?ExVisRow = null;
 
-    // The filtered view: indices into rows whose class contains the filter.
-    var view = std.ArrayList(usize).empty;
+    // The flattened visible rows: a header per matching group, plus its features
+    // when expanded. Rebuilt each frame into a reused buffer (no per-frame growth).
+    var vis = std.ArrayList(ExVisRow).empty;
     while (true) {
         const filt = filt_buf[0..filt_len];
-        view.clearRetainingCapacity();
-        for (rows, 0..) |row, i| {
-            if (filt.len == 0 or indexOfIgnoreCase(row.class, filt) != null) try view.append(a, i);
+        vis.clearRetainingCapacity();
+        var nvis_groups: usize = 0;
+        for (groups, 0..) |g, gidx| {
+            if (filt.len > 0 and indexOfIgnoreCase(g.class, filt) == null) continue;
+            nvis_groups += 1;
+            try vis.append(a, .{ .is_header = true, .group = gidx, .row = 0 });
+            if (g.expanded) for (g.members) |ri|
+                try vis.append(a, .{ .is_header = false, .group = gidx, .row = ri });
         }
-        if (view.items.len == 0) {
-            sel = 0;
-        } else if (sel >= view.items.len) sel = view.items.len - 1;
+        // Relocate the selection after a tree mutation, then clamp it in range.
+        if (sel_target) |t| {
+            sel_target = null;
+            for (vis.items, 0..) |v, k| {
+                if (v.group == t.group and v.is_header == t.is_header and (v.is_header or v.row == t.row)) {
+                    sel = k;
+                    break;
+                }
+            }
+        }
+        if (vis.items.len == 0) sel = 0 else if (sel >= vis.items.len) sel = vis.items.len - 1;
 
-        // Rebuild the selected feature's detail (levels 1+2 resident + level 3 lazy)
-        // whenever the selection moves. On a cell crossing this re-parses + re-records
-        // that cell once (cached for intra-cell navigation).
-        const gi: ?usize = if (view.items.len > 0) view.items[sel] else null;
-        if (det_gi == null or gi == null or det_gi.? != gi.?) {
-            det_gi = gi;
-            if (gi) |g| {
+        const cur: ?ExVisRow = if (vis.items.len > 0) vis.items[sel] else null;
+        // `gi`: the resident-index row of the selected FEATURE (null on a header /
+        // empty view) — the key for the lazy level-3 + thumbnail. Model unchanged.
+        const gi: ?usize = if (cur) |c| (if (c.is_header) null else c.row) else null;
+
+        // Rebuild the detail only when the selected item's identity changes (or a
+        // tree mutation forced det_kind = 3). A FEATURE re-parses + re-records its
+        // cell once on a cell crossing (cached); a HEADER shows a cheap summary.
+        var want_kind: u8 = 0;
+        var want_id: usize = 0;
+        if (cur) |c| {
+            if (c.is_header) {
+                want_kind = 2;
+                want_id = c.group;
+            } else {
+                want_kind = 1;
+                want_id = c.row;
+            }
+        }
+        if (want_kind != det_kind or want_id != det_id) {
+            det_kind = want_kind;
+            det_id = want_id;
+            det_top = 0;
+            det_is_header = want_kind == 2;
+            if (want_kind == 0) {
+                cur_det = &[_][]const u8{"(no classes match the filter)"};
+            } else if (want_kind == 2) {
+                _ = det_arena.reset(.retain_capacity);
+                cur_det = exGroupDetail(det_arena.allocator(), groups[want_id], rows) catch
+                    &[_][]const u8{groups[want_id].class};
+            } else {
+                const g = want_id;
                 const row = rows[g];
                 if (need_cell and (cached_cell == null or cached_cell.? != row.cell_id) and row.cell_id < cells.len) {
                     _ = sel_arena.reset(.free_all);
@@ -2502,8 +2878,6 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
                 for (rows[g].det12) |ln| lines.append(da, ln) catch {};
                 for (l3_lines) |ln| lines.append(da, ln) catch {};
                 cur_det = lines.items;
-            } else {
-                cur_det = &[_][]const u8{"(no features match the filter)"};
             }
         }
 
@@ -2511,7 +2885,7 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
         const ts = ts_raw orelse .{ 100, 37, 0, 0 };
         const cols: usize = @max(40, ts[0]);
         const term_rows: usize = @max(8, ts[1]);
-        const body_h = term_rows - 2; // one title row, one status row
+        const body_h = term_rows - 2; // one title row, one footer row
         const left_w = @min(@as(usize, 40), cols / 2);
         const right_w = cols - left_w - 3; // " │ " separator
 
@@ -2519,54 +2893,90 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
         if (sel < top) top = sel;
         if (sel >= top + body_h) top = sel + 1 - body_h;
 
+        _ = frame_arena.reset(.retain_capacity);
+        const fa = frame_arena.allocator();
         var buf = std.ArrayList(u8).empty;
-        try buf.appendSlice(a, "\x1b[H");
-        // Title row.
-        try buf.print(a, "\x1b[7m tile57 explore — {d}/{d} feature(s) ", .{ view.items.len, rows.len });
-        try padTo(a, &buf, 24, cols);
-        try buf.appendSlice(a, "\x1b[0m\x1b[K\n");
+        try buf.appendSlice(fa, "\x1b[H");
 
-        const det = cur_det;
+        // Title bar: source + totals (+ the matching-class count while filtering).
+        var hdr = std.ArrayList(u8).empty;
+        try hdr.print(fa, " tile57 explore   {s}   {d} features \u{00B7} {d} classes", .{ src_base, rows.len, groups.len });
+        if (filt.len > 0) try hdr.print(fa, "   filter \"{s}\" \u{2192} {d}", .{ filt, nvis_groups });
+        try exEmitBar(fa, &buf, hdr.items, cols, true);
+        try buf.appendSlice(fa, "\x1b[K\n");
+
         var r: usize = 0;
         while (r < body_h) : (r += 1) {
-            // Left: the feature list, windowed around `top`.
-            var lw: usize = 0;
+            // Left: the collapsible class tree, windowed around `top`.
             const li = top + r;
-            if (li < view.items.len) {
+            if (li < vis.items.len) {
+                const v = vis.items[li];
                 const selected = li == sel;
-                if (selected) try buf.appendSlice(a, "\x1b[7m");
-                const label = clip(rows[view.items[li]].label, left_w);
-                try buf.appendSlice(a, label);
-                lw = label.len;
-                if (selected) {
-                    while (lw < left_w) : (lw += 1) try buf.append(a, ' ');
-                    try buf.appendSlice(a, "\x1b[0m");
+                var segs: [8]ExSeg = undefined;
+                var ns: usize = 0;
+                if (v.is_header) {
+                    const g = groups[v.group];
+                    segs[ns] = .{ .t = if (g.expanded) "\u{25BE} " else "\u{25B8} ", .w = 2, .c = EXC_DIM };
+                    ns += 1;
+                    segs[ns] = .{ .t = g.class, .w = g.class.len, .c = EXC_BCYAN };
+                    ns += 1;
+                    const cnt: []const u8 = std.fmt.allocPrint(fa, "{d}", .{g.members.len}) catch "?";
+                    const leftw = 2 + g.class.len;
+                    const rightw = cnt.len + 2; // count + space + glyph
+                    const spw = if (left_w > leftw + rightw) left_w - leftw - rightw else 1;
+                    const spwc = @min(spw, EXC_SPACES.len);
+                    segs[ns] = .{ .t = EXC_SPACES[0..spwc], .w = spwc, .c = "" };
+                    ns += 1;
+                    segs[ns] = .{ .t = cnt, .w = cnt.len, .c = EXC_DIM };
+                    ns += 1;
+                    segs[ns] = .{ .t = " ", .w = 1, .c = "" };
+                    ns += 1;
+                    segs[ns] = .{ .t = exGeomGlyph(g.dominant), .w = 1, .c = exGeomColor(g.dominant) };
+                    ns += 1;
+                } else {
+                    const row = rows[v.row];
+                    const sub = exSubLabel(row);
+                    const dim = std.mem.startsWith(u8, sub, "foid:") or (sub.len > 0 and sub[0] == '#');
+                    segs[ns] = .{ .t = "  ", .w = 2, .c = "" };
+                    ns += 1;
+                    segs[ns] = .{ .t = exGeomGlyph(row.prim), .w = 1, .c = exGeomColor(row.prim) };
+                    ns += 1;
+                    segs[ns] = .{ .t = " ", .w = 1, .c = "" };
+                    ns += 1;
+                    segs[ns] = .{ .t = sub, .w = dispWidth(sub), .c = if (dim) EXC_DIM else "" };
+                    ns += 1;
                 }
+                try exEmitLeft(fa, &buf, segs[0..ns], left_w, selected);
+            } else {
+                var k: usize = 0;
+                while (k < left_w) : (k += 1) try buf.append(fa, ' ');
             }
-            while (lw < left_w) : (lw += 1) try buf.append(a, ' ');
-            try buf.appendSlice(a, " │ ");
-            // Right: the detail pane, windowed around `det_top`.
+            // Separator.
+            try buf.appendSlice(fa, " ");
+            try buf.appendSlice(fa, EXC_DIM);
+            try buf.appendSlice(fa, "\u{2502}"); // │
+            try buf.appendSlice(fa, EXC_RESET);
+            try buf.appendSlice(fa, " ");
+            // Right: the detail pane, windowed around `det_top`, colourised per line.
             const di = det_top + r;
-            if (di < det.len) try buf.appendSlice(a, clip(det[di], right_w));
-            try buf.appendSlice(a, "\x1b[K\n");
+            if (di < cur_det.len) try exEmitDetail(fa, &buf, cur_det[di], right_w, det_is_header and di == 0);
+            try buf.appendSlice(fa, "\x1b[K\n");
         }
 
-        // Status / filter row.
-        try buf.appendSlice(a, "\x1b[7m");
+        // Footer keybar.
         if (filtering) {
-            try buf.print(a, " filter class: {s}_  (enter=apply esc=clear) ", .{filt});
+            const t: []const u8 = std.fmt.allocPrint(fa, " filter class: {s}_    enter=apply   esc=clear", .{filt}) catch " filter";
+            try exEmitBar(fa, &buf, t, cols, false);
         } else {
-            try buf.print(a, " ↑↓/jk select  PgUp/PgDn page  /=filter  q=quit ", .{});
-            if (filt.len > 0) try buf.print(a, " [class~{s}] ", .{filt});
+            try exEmitBar(fa, &buf, " j/k move  \u{2192}/enter expand  \u{2190} collapse  E/C all  / filter  [ ] scroll  q quit", cols, false);
         }
-        try padTo(a, &buf, 8, cols);
-        try buf.appendSlice(a, "\x1b[0m\x1b[K");
-        try buf.appendSlice(a, "\x1b[J"); // clear anything below
+        try buf.appendSlice(fa, "\x1b[J"); // clear anything below
         stdout.writeStreamingAll(io, buf.items) catch {};
 
-        // --kitty: the selected feature's resolved render, placed over the
+        // --kitty: the selected FEATURE's resolved render, placed over the
         // top-right of the detail pane (deleted-then-placed after the text so it
-        // floats above the cells without disturbing the layout).
+        // floats above the cells without disturbing the layout). A header
+        // selection (gi == null) clears any prior image.
         if (do_kitty) {
             if (gi) |g| {
                 const tv: ?ExThumb = if (rows[g].index < thumb_by_fi.len) thumb_by_fi[rows[g].index] else null;
@@ -2582,7 +2992,6 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
         const n = std.posix.read(stdin_fd, &b) catch break;
         if (n == 0) break;
         var i: usize = 0;
-        var moved = false;
         while (i < n) {
             const c = b[i];
             if (filtering) {
@@ -2601,49 +3010,56 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
                 i += 1;
                 continue;
             }
-            // Nav mode. Arrow escape sequences first.
+            // Nav mode. Cursor escape sequences first (arrows + PgUp/PgDn).
             if (c == 0x1b and i + 2 < n and b[i + 1] == '[') {
                 switch (b[i + 2]) {
-                    'A' => {
-                        sel -|= 1;
-                        moved = true;
+                    'A' => sel -|= 1, // up
+                    'B' => sel += 1, // down
+                    'C' => { // right: expand the selected header
+                        if (cur) |cc| if (cc.is_header) {
+                            groups[cc.group].expanded = true;
+                            det_kind = 3;
+                            sel_target = .{ .is_header = true, .group = cc.group, .row = 0 };
+                        };
                     },
-                    'B' => {
-                        sel += 1;
-                        moved = true;
+                    'D' => { // left: collapse the selected header (or a feature's parent)
+                        if (cur) |cc| {
+                            groups[cc.group].expanded = false;
+                            det_kind = 3;
+                            sel_target = .{ .is_header = true, .group = cc.group, .row = 0 };
+                        }
                     },
-                    '5' => {
-                        sel -|= body_h;
-                        moved = true;
-                    }, // PgUp (ESC[5~)
-                    '6' => {
-                        sel += body_h;
-                        moved = true;
-                    }, // PgDn (ESC[6~)
+                    '5' => sel -|= body_h, // PgUp (ESC[5~)
+                    '6' => sel += body_h, // PgDn (ESC[6~)
                     else => {},
                 }
                 i += 3;
                 continue;
             }
             switch (c) {
-                'k' => {
-                    sel -|= 1;
-                    moved = true;
-                },
-                'j' => {
-                    sel += 1;
-                    moved = true;
-                },
-                'g' => {
-                    sel = 0;
-                    moved = true;
-                },
-                'G' => {
-                    sel = if (view.items.len > 0) view.items.len - 1 else 0;
-                    moved = true;
-                },
+                'k' => sel -|= 1,
+                'j' => sel += 1,
+                'g' => sel = 0,
+                'G' => sel = if (vis.items.len > 0) vis.items.len - 1 else 0,
                 '[' => det_top -|= 1, // scroll detail up
                 ']' => det_top += 1, // scroll detail down
+                ' ', 0x0d, 0x0a => { // space / enter: toggle the selected header
+                    if (cur) |cc| if (cc.is_header) {
+                        groups[cc.group].expanded = !groups[cc.group].expanded;
+                        det_kind = 3;
+                        sel_target = .{ .is_header = true, .group = cc.group, .row = 0 };
+                    };
+                },
+                'E' => { // expand all classes
+                    for (groups) |*g| g.expanded = true;
+                    det_kind = 3;
+                    if (cur) |cc| sel_target = cc;
+                },
+                'C' => { // collapse all classes
+                    for (groups) |*g| g.expanded = false;
+                    det_kind = 3;
+                    if (cur) |cc| sel_target = .{ .is_header = true, .group = cc.group, .row = 0 };
+                },
                 '/' => {
                     filtering = true;
                     filt_len = 0;
@@ -2653,8 +3069,8 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
             }
             i += 1;
         }
-        if (view.items.len > 0 and sel >= view.items.len) sel = view.items.len - 1;
-        if (moved) det_top = 0; // reset detail scroll when the selection changes
+        if (vis.items.len > 0 and sel >= vis.items.len) sel = vis.items.len - 1;
+        if (cur_det.len > 0) det_top = @min(det_top, cur_det.len - 1) else det_top = 0;
     }
 }
 
