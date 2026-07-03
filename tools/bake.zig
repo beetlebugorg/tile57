@@ -30,11 +30,14 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var lru: usize = DEFAULT_LRU_BUDGET; // lazy-bake tuning: parsed cells held resident
     var super_dz: u8 = DEFAULT_SUPER_DZ; // lazy-bake tuning: spatial super-tile depth
     var format: engine.scene.TileFormat = .mlt; // tile encoding: mlt (default) or mvt
+    var existing: []const u8 = ""; // cross-pack best-available: a peer pack's ENC_ROOT
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             out = f.val(arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--existing")) {
+            existing = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--catalog")) {
@@ -82,6 +85,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         .lru = lru,
         .super_dz = super_dz,
         .format = format,
+        .existing_input = existing,
     }) catch |err| {
         std.debug.print("error: cannot bake {s} ({s})\n", .{ base_path, @errorName(err) });
         return;

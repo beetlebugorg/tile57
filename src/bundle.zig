@@ -273,6 +273,10 @@ pub const BakeOpts = struct {
     lru: usize = 64, // lazy-bake tuning: parsed cells held resident
     super_dz: u8 = 3, // lazy-bake tuning: spatial super-tile depth
     format: engine.scene.TileFormat = .mlt,
+    // Cross-pack best-available: a peer pack's ENC_ROOT (same provider) read for
+    // M_COVR coverage only, so THIS pack's coarser cells defer where the peer is
+    // finer — stops an overview pack painting over the peer's sectors. "" = none.
+    existing_input: []const u8 = "",
     // Emit per-feature pick-report attrs (s57/cell) in the baked tiles. Defaults ON;
     // a lean bake sets it false to drop the bulky s57 payload.
     pick_attrs: bool = true,
@@ -296,7 +300,7 @@ pub fn bakeBundle(io: std.Io, a: std.mem.Allocator, opts: BakeOpts) !BakeResult 
     const tiles_dir = try std.fs.path.join(a, &.{ opts.out_dir, "tiles" });
     try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
     const tiles_path = try std.fs.path.join(a, &.{ tiles_dir, "chart.pmtiles" });
-    const rb = try bakeRoot(io, a, opts.input, tiles_path, opts.rules_dir, opts.minzoom, opts.maxzoom, opts.lru, opts.super_dz, true, opts.format, opts.pick_attrs, opts.progress, opts.progress_user);
+    const rb = try bakeRoot(io, a, opts.input, tiles_path, opts.rules_dir, opts.minzoom, opts.maxzoom, opts.lru, opts.super_dz, true, opts.format, opts.pick_attrs, opts.existing_input, opts.progress, opts.progress_user);
     const bounds = rb.bounds;
     const cells = rb.cells;
     const snd_stacks = rb.sounds; // sounding glyph stacks for sprite-mln
@@ -458,6 +462,35 @@ fn readParseCell(io: std.Io, dir: std.Io.Dir, bpath: []const u8) ?engine.s57.Cel
         };
     }
     return engine.s57.parseCellWithUpdates(gpa, base, ups.items) catch null;
+}
+
+/// Cross-pack best-available (BakeOpts.existing_input / bake --existing): peer packs'
+/// M_COVR coverage + cscl, read from a sibling ENC_ROOT for suppression context only
+/// (never emitted). One cell resident at a time; coverage is copied into `a` so each
+/// cell frees right after. "" / a missing dir yields no context (a plain bake).
+fn loadContextCoverage(io: std.Io, a: std.mem.Allocator, path: []const u8) []engine.bake_enc.ContextCell {
+    if (path.len == 0) return &.{};
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+    var walker = dir.walk(a) catch return &.{};
+    defer walker.deinit();
+    var out = std.ArrayList(engine.bake_enc.ContextCell).empty;
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
+        var cell = readParseCell(io, dir, entry.path) orelse continue;
+        defer cell.deinit();
+        const cov = cell.mcovrCoverage(a); // copied into `a`; survives cell.deinit()
+        if (cov.len == 0) continue;
+        var b = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+        for (cov) |rings| for (rings) |ring| for (ring) |p| {
+            b[0] = @min(b[0], p.lon());
+            b[1] = @min(b[1], p.lat());
+            b[2] = @max(b[2], p.lon());
+            b[3] = @max(b[3], p.lat());
+        };
+        out.append(a, .{ .coverage = cov, .bounds = b, .cscl = cell.params.cscl }) catch {};
+    }
+    return out.toOwnedSlice(a) catch &.{};
 }
 
 const OverlayScanWork = struct {
@@ -871,7 +904,7 @@ const BakeSink = struct {
 // StreamWriter — only the compressed data + small directory are held, not the raw
 // tiles). Returns the union bounds + cell stems + sounding stacks + SCAMIN denoms.
 // error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.scene.TileFormat, pick_attrs: bool, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.scene.TileFormat, pick_attrs: bool, existing_path: []const u8, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
     // Progress sink: the caller's callback, else the built-in console writer (the CLI
     // path, byte-identical to before). Both only touch stderr — never the tile bytes.
     const prog: engine.bake_enc.Progress = progress orelse cliProgress;
@@ -1027,6 +1060,12 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     }
     baker.overlay = overlay.backends;
     baker.scamin_standalone = true;
+    // Cross-pack best-available: a peer pack's coverage (bake --existing) suppresses
+    // this pack's coarser cells where the peer is finer — stops an overview pack
+    // painting over the peer's sectors. Empty (no --existing) = a plain bake.
+    baker.context = loadContextCoverage(io, a, existing_path);
+    if (baker.context.len > 0)
+        std.debug.print("  cross-pack context: {d} peer coverage cell(s) from {s}\n", .{ baker.context.len, existing_path });
     var overlay_pts: usize = 0;
     for (overlay.backends) |be| {
         overlay_pts += be.cell.features.len;
