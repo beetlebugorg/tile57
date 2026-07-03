@@ -1587,6 +1587,16 @@ const ExLevel3 = struct {
     matched: bool, // this feature was found in the sampled tile (else out of view)
 };
 
+// Where to point renderView for a feature's `--kitty` thumbnail: the anchor
+// lon/lat + a per-feature zoom (a point sits at its node and renders at the
+// cell's native band zoom; a line/area is centred on its bbox at a zoom that
+// frames it). `framed` distinguishes the two for the caption.
+const ExThumb = struct { lon: f64, lat: f64, zoom: f64, framed: bool };
+
+// Thumbnail crop size (device px). Small on purpose — a glanceable proof of what
+// the portrayal actually draws, inline beside the text dump.
+const THUMB_PX: u32 = 200;
+
 const ExRow = struct {
     cell_name: []const u8,
     index: usize, // feature index within its cell
@@ -1600,6 +1610,7 @@ const ExRow = struct {
     raw: ?[]const u8, // level 2: raw instruction stream
     parsed: ?engine.s101_instr.Portrayal, // level 2: parsed
     resolved: ?ExLevel3, // level 3
+    thumb: ?ExThumb, // --kitty: where to render this feature's thumbnail (null = no geometry)
 };
 
 const ExFilters = struct {
@@ -1607,6 +1618,7 @@ const ExFilters = struct {
     obj: ?u64 = null, // match feature index OR rcid OR foid
     zoom: ?f64 = null, // override the auto fit-zoom for the resolving pass
     do_resolve: bool = true,
+    kitty: bool = false, // compute each row's per-feature thumbnail view (--kitty)
 };
 
 fn exPrimName(p: u8) []const u8 {
@@ -1653,6 +1665,48 @@ fn exTileAt(bounds: [4]f64, zoom: f64) ExLevel3 {
     const c = engine.tile.lonLatToWorld((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0);
     const n = @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
     return .{ .calls = &.{}, .z = z, .x = @intFromFloat(@floor(c[0] * n)), .y = @intFromFloat(@floor(c[1] * n)), .matched = false };
+}
+
+// Pick the renderView point + zoom for a feature's `--kitty` thumbnail. A POINT
+// feature sits at its node, rendered at the cell's native band zoom (the finest
+// zoom the cell is compiled for, so SCAMIN never gates the symbol out). A LINE or
+// AREA is centred on its geometry bbox at the zoom that frames the larger span to
+// ~80% of the crop. Returns null when the feature has no resolvable geometry.
+fn exThumbView(a: std.mem.Allocator, cell: *engine.s57.Cell, f: engine.s57.Feature) ?ExThumb {
+    const band = engine.bake_enc.bandOf(cell.params.cscl);
+    const zr = engine.bake_enc.bandZooms(band);
+    if (f.prim == 1) {
+        const p = cell.pointGeometry(f) orelse return null;
+        return .{ .lon = p.lon(), .lat = p.lat(), .zoom = @floatFromInt(zr.max), .framed = false };
+    }
+    // Line/area: bbox of the assembled geometry parts.
+    const parts = cell.geometryParts(a, f) catch return null;
+    var min_lon: f64 = 1e9;
+    var min_lat: f64 = 1e9;
+    var max_lon: f64 = -1e9;
+    var max_lat: f64 = -1e9;
+    var any = false;
+    for (parts) |part| for (part) |pt| {
+        any = true;
+        min_lon = @min(min_lon, pt.lon());
+        min_lat = @min(min_lat, pt.lat());
+        max_lon = @max(max_lon, pt.lon());
+        max_lat = @max(max_lat, pt.lat());
+    };
+    if (!any) return null;
+    const clon = (min_lon + max_lon) / 2.0;
+    const clat = (min_lat + max_lat) / 2.0;
+    // Frame the bbox: the larger normalized-globe span * 256*2^z should fill ~80%
+    // of the crop. Fall back to the band zoom for a degenerate (zero-span) bbox.
+    const nw = worldPxOf(min_lon, max_lat, 1.0);
+    const se = worldPxOf(max_lon, min_lat, 1.0);
+    const frac = @max(@abs(se[0] - nw[0]), @abs(se[1] - nw[1]));
+    var zoom: f64 = @floatFromInt(zr.max);
+    if (frac > 1e-12) {
+        const target = @as(f64, @floatFromInt(THUMB_PX)) * 0.8;
+        zoom = std.math.clamp(std.math.log2(target / (256.0 * frac)), 2.0, 19.0);
+    }
+    return .{ .lon = clon, .lat = clat, .zoom = zoom, .framed = true };
 }
 
 fn exClassMatches(list: []const u8, acr: []const u8) bool {
@@ -1756,6 +1810,8 @@ fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8,
             resolved = .{ .calls = call_items, .z = lv.z, .x = lv.x, .y = lv.y, .matched = matched };
         }
 
+        const thumb: ?ExThumb = if (F.kitty) exThumbView(a, cell, f) else null;
+
         try rows.append(a, .{
             .cell_name = cell_name,
             .index = fi,
@@ -1769,6 +1825,7 @@ fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8,
             .raw = raw,
             .parsed = parsed,
             .resolved = resolved,
+            .thumb = thumb,
         });
     }
 }
@@ -1972,13 +2029,14 @@ fn exLoadCell(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []con
 
 fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--no-resolve] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--kitty] [--no-resolve] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
     var F = ExFilters{};
     var json = false;
     var tui = false;
+    var kitty = false;
     var rules_flag: ?[]const u8 = null;
     var f = Flags{ .args = args, .i = 2 };
     while (f.next()) |arg| {
@@ -1994,6 +2052,9 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
             json = true;
         } else if (std.mem.eql(u8, arg, "--tui")) {
             tui = true;
+        } else if (std.mem.eql(u8, arg, "--kitty")) {
+            kitty = true;
+            F.kitty = true;
         } else if (std.mem.eql(u8, arg, "--no-resolve")) {
             F.do_resolve = false;
         } else if (std.mem.eql(u8, arg, "--rules")) {
@@ -2004,6 +2065,19 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
     engine.portray.setQuiet(true);
     engine.catalogue.warmUp();
     const rules = resolveRulesDir(rules_flag);
+
+    // --kitty: a Chart handle over the SAME source (single cell or quilted
+    // ENC_ROOT) drives renderView for the per-feature thumbnails. Opened once;
+    // a failure just downgrades to the text-only dump (graceful degradation).
+    var chart_h: ?*chart.Chart = null;
+    defer if (chart_h) |cc| cc.deinit();
+    const palette: render.resolve.PaletteId = .day;
+    var m = render.resolve.MarinerSettings{ .display_other = true };
+    m.scheme = .day;
+    if (kitty) {
+        chart_h = chart.Chart.openPath(path, rules, false) catch null;
+        if (chart_h == null) std.debug.print("note: --kitty could not open {s} for rendering; showing text only\n", .{path});
+    }
 
     var rows = std.ArrayList(ExRow).empty;
     if (std.mem.endsWith(u8, path, ".000")) {
@@ -2028,7 +2102,7 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
         return;
     }
 
-    if (tui) return exploreTui(io, a, rows.items);
+    if (tui) return exploreTui(io, a, rows.items, kitty, chart_h, palette, &m);
 
     var stdout = std.Io.File.stdout();
     if (json) {
@@ -2042,16 +2116,46 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
     for (rows.items) |row| {
         try out.appendSlice(a, "\n────────────────────────────────────────────────────────────────\n");
         try out.appendSlice(a, try exFormatDetail(a, row));
+        if (kitty) try exAppendThumb(a, &out, chart_h, row, palette, &m);
     }
     stdout.writeStreamingAll(io, out.items) catch {};
+}
+
+// Console `--kitty`: after a row's text dump, append a one-line caption + the
+// feature's RESOLVED render as an inline kitty-graphics PNG. Any failure prints a
+// short note instead of an image (graceful degradation), never an error.
+fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), c: ?*chart.Chart, row: ExRow, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
+    const cc = c orelse {
+        try out.appendSlice(a, "  resolved render: (chart unavailable)\n");
+        return;
+    };
+    const tv = row.thumb orelse {
+        try out.appendSlice(a, "  resolved render: (no renderable geometry)\n");
+        return;
+    };
+    const png = cc.renderView(tv.lon, tv.lat, tv.zoom, THUMB_PX, THUMB_PX, palette, m, .png) catch {
+        try out.appendSlice(a, "  resolved render: (renderView failed for this feature)\n");
+        return;
+    };
+    defer chart.freeBytes(png);
+    const seq = render.kitty.encodePng(a, png) catch {
+        try out.appendSlice(a, "  resolved render: (kitty encode failed)\n");
+        return;
+    };
+    try out.print(a, "  resolved render — {d}x{d}px {s} @ z{d:.1} ({d:.4},{d:.4}):\n", .{ THUMB_PX, THUMB_PX, if (tv.framed) "bbox" else "anchor", tv.zoom, tv.lon, tv.lat });
+    try out.appendSlice(a, seq);
+    try out.append(a, '\n');
 }
 
 // `tile57 explore --tui`: a two-pane feature explorer. Left = the scrollable,
 // class-filterable feature list; right = the selected feature's three-level
 // detail. Arrow/j/k move the selection, PgUp/PgDn page, / filters by class,
 // q (or ctrl-c) quits. Same termios raw-mode + alt-screen scaffolding as
-// `tile57 ascii --tui`; dependency-free.
-fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow) !void {
+// `tile57 ascii --tui`; dependency-free. With `--kitty` the selected feature's
+// RESOLVED render is placed as a kitty-graphics thumbnail in the top-right of the
+// detail pane (transmit-once-per-selection + place, deleted each frame — the same
+// cached-region pattern as the ascii kitty TUI, so it never scrolls the layout).
+fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool, chart_h: ?*chart.Chart, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
     const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
@@ -2065,6 +2169,10 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow) !void {
     defer std.posix.tcsetattr(stdin_fd, .NOW, old) catch {};
     stdout.writeStreamingAll(io, "\x1b[?1049h\x1b[?25l") catch {}; // alt screen, hide cursor
     defer stdout.writeStreamingAll(io, "\x1b[?25h\x1b[?1049l") catch {};
+    const do_kitty = kitty and chart_h != null;
+    defer if (do_kitty) stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+    const thumb_id: u32 = 1;
+    var thumb_sel: ?usize = null; // rows[] index currently transmitted into the store
 
     // Pre-format each feature's label + detail-lines once (rows are immutable).
     const labels = try a.alloc([]const u8, rows.len);
@@ -2093,7 +2201,8 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow) !void {
             sel = 0;
         } else if (sel >= view.items.len) sel = view.items.len - 1;
 
-        const ts = terminalSize(io) orelse .{ 100, 37, 0, 0 };
+        const ts_raw = terminalSize(io);
+        const ts = ts_raw orelse .{ 100, 37, 0, 0 };
         const cols: usize = @max(40, ts[0]);
         const term_rows: usize = @max(8, ts[1]);
         const body_h = term_rows - 2; // one title row, one status row
@@ -2148,6 +2257,18 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow) !void {
         try buf.appendSlice(a, "\x1b[0m\x1b[K");
         try buf.appendSlice(a, "\x1b[J"); // clear anything below
         stdout.writeStreamingAll(io, buf.items) catch {};
+
+        // --kitty: the selected feature's resolved render, placed over the
+        // top-right of the detail pane (deleted-then-placed after the text so it
+        // floats above the cells without disturbing the layout).
+        if (do_kitty) {
+            if (view.items.len > 0)
+                exTuiThumb(io, a, stdout, chart_h.?, rows[view.items[sel]], view.items[sel], &thumb_sel, thumb_id, palette, m, cols, left_w, term_rows, ts_raw)
+            else {
+                stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+                thumb_sel = null;
+            }
+        }
 
         // Input.
         var b: [64]u8 = undefined;
@@ -2228,6 +2349,54 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow) !void {
         if (view.items.len > 0 and sel >= view.items.len) sel = view.items.len - 1;
         if (moved) det_top = 0; // reset detail scroll when the selection changes
     }
+}
+
+// Place the selected feature's `--kitty` thumbnail in the detail pane's top-right
+// corner. Transmit-once-per-selection (a cheap ~40-byte `place` on every other
+// frame), delete_all each frame so replaced/scrolled-away images don't linger —
+// the same store-and-place pattern as the ascii kitty TUI. Any failure clears the
+// image and leaves the text pane intact (graceful degradation).
+fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, c: *chart.Chart, row: ExRow, row_index: usize, thumb_sel: *?usize, id: u32, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, cols: usize, left_w: usize, term_rows: usize, ts_raw: ?[4]u32) void {
+    const tv = row.thumb orelse {
+        stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+        thumb_sel.* = null;
+        return;
+    };
+    // The crop occupies ceil(THUMB/cell) terminal cells; hug the pane's right edge
+    // below the title row. Bail (clearing any prior image) if the pane can't hold it.
+    const cp = cellPx(ts_raw);
+    const cols_span: usize = (THUMB_PX + cp[0] - 1) / cp[0];
+    const rows_span: usize = (THUMB_PX + cp[1] - 1) / cp[1];
+    if (term_rows < rows_span + 2 or cols < left_w + cols_span + 4) {
+        stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+        thumb_sel.* = null;
+        return;
+    }
+    // (Re)render + transmit into the store only when the selection changed.
+    if (thumb_sel.* == null or thumb_sel.*.? != row_index) {
+        const png = c.renderView(tv.lon, tv.lat, tv.zoom, THUMB_PX, THUMB_PX, palette, m, .png) catch {
+            stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+            thumb_sel.* = null;
+            return;
+        };
+        defer chart.freeBytes(png);
+        const seq = render.kitty.transmitPng(a, png, id) catch {
+            thumb_sel.* = null;
+            return;
+        };
+        defer a.free(seq);
+        stdout.writeStreamingAll(io, seq) catch {};
+        thumb_sel.* = row_index;
+    }
+    // Clear the previous placement, then place the whole stored image at the corner.
+    const col1: usize = cols - cols_span; // 1-based column of the image's left edge
+    const move = std.fmt.allocPrint(a, "\x1b[{d};{d}H", .{ 2, col1 }) catch return;
+    defer a.free(move);
+    const pl = render.kitty.place(a, id, 0, 0, THUMB_PX, THUMB_PX) catch return;
+    defer a.free(pl);
+    stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+    stdout.writeStreamingAll(io, move) catch {};
+    stdout.writeStreamingAll(io, pl) catch {};
 }
 
 // Split text into lines (no trailing empty line for a final '\n'). Arena-owned.
@@ -2362,7 +2531,9 @@ fn printUsage() void {
         \\      portrayal instruction stream (raw + parsed), and the resolved
         \\      Surface draw calls. --zoom N picks the resolving tile; --json;
         \\      --no-resolve skips the draw-call pass; --tui opens the two-pane
-        \\      explorer (arrows select, / filters by class, q quits).
+        \\      explorer (arrows select, / filters by class, q quits); --kitty
+        \\      adds a live thumbnail of each feature's resolved render (inline in
+        \\      console mode, in the TUI detail pane) for graphics terminals.
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
         \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)
