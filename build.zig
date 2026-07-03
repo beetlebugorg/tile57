@@ -421,7 +421,7 @@ pub fn build(b: *std.Build) void {
     const bake = b.addExecutable(.{
         .name = "tile57",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/bake.zig"),
+            .root_source_file = b.path("tools/main.zig"),
             .target = bake_target,
             .optimize = optimize,
             .link_libc = true,
