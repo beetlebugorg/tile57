@@ -1594,8 +1594,22 @@ const ExLevel3 = struct {
 // let the TUI RE-FRAME for its much larger dynamic canvas (the console keeps the
 // THUMB_PX-square `zoom`): `frac` is the bbox's larger normalized-globe span
 // (world=1.0), `band_max` the cell's native band-max zoom. `frac <= 0` = point /
-// degenerate bbox — render at `band_max`.
-const ExThumb = struct { lon: f64, lat: f64, zoom: f64, framed: bool, frac: f64 = 0, band_max: f64 = 0 };
+// degenerate bbox — render at `band_max`. `has_bbox` + min/max lon/lat carry a
+// line/area's real extent so the TUI live map can BOX the selected feature (a
+// point leaves has_bbox false).
+const ExThumb = struct {
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    framed: bool,
+    frac: f64 = 0,
+    band_max: f64 = 0,
+    has_bbox: bool = false,
+    min_lon: f64 = 0,
+    min_lat: f64 = 0,
+    max_lon: f64 = 0,
+    max_lat: f64 = 0,
+};
 
 // The TUI live-cell-map's cross-frame state. `seq` is the cached a=T
 // (transmit-AND-display) kitty sequence for the currently-framed view,
@@ -1605,6 +1619,8 @@ const ExThumb = struct { lon: f64, lat: f64, zoom: f64, framed: bool, frac: f64 
 // either invalidates the cache. `arena` owns `seq` and is reset when the view
 // changes — the render (the slow step) runs once per view, matching the old
 // transmit-once-per-selection model. `zoom < 0` means "no cached view yet".
+// `hl_*` mirror the current view's highlight so a change in the highlighted
+// feature (even at an identical view) re-renders too.
 const ThumbState = struct {
     lon: f64 = 0,
     lat: f64 = 0,
@@ -1612,6 +1628,9 @@ const ThumbState = struct {
     seq: ?[]const u8 = null,
     w: u32 = 0,
     h: u32 = 0,
+    hl_on: bool = false,
+    hl_lon: f64 = 0,
+    hl_lat: f64 = 0,
     arena: *std.heap.ArenaAllocator,
 };
 
@@ -1764,7 +1783,19 @@ fn exThumbView(a: std.mem.Allocator, cell: *engine.s57.Cell, f: engine.s57.Featu
         const target = @as(f64, @floatFromInt(THUMB_PX)) * 0.8;
         zoom = std.math.clamp(std.math.log2(target / (256.0 * frac)), 2.0, 19.0);
     }
-    return .{ .lon = clon, .lat = clat, .zoom = zoom, .framed = true, .frac = frac, .band_max = band_max };
+    return .{
+        .lon = clon,
+        .lat = clat,
+        .zoom = zoom,
+        .framed = true,
+        .frac = frac,
+        .band_max = band_max,
+        .has_bbox = true,
+        .min_lon = min_lon,
+        .min_lat = min_lat,
+        .max_lon = max_lon,
+        .max_lat = max_lat,
+    };
 }
 
 // The framing zoom that fills ~`fill` of a `target_px`-min-dimension canvas with
@@ -1776,16 +1807,24 @@ fn exThumbView(a: std.mem.Allocator, cell: *engine.s57.Cell, f: engine.s57.Featu
 fn exThumbZoom(t: ExThumb, target_px: f64, fill: f64) f64 {
     if (!t.framed or t.frac <= 1e-12) return t.band_max;
     const target = target_px * fill;
-    return std.math.clamp(std.math.log2(target / (256.0 * t.frac)), 2.0, 24.0);
+    return std.math.clamp(std.math.log2(target / (256.0 * t.frac)), 2.0, MAP_FEATURE_ZOOM_MAX);
 }
 
 // How much of the live-cell-map canvas the framed geometry fills. The whole-cell
 // overview packs the cell bbox into ~92% of the canvas (a thin margin so the
-// coastline isn't flush to the edge); a feature frame leaves the feature at ~50%
-// so its neighbours / depths stay visible around it (the "zoom into the thing,
-// keep the context" feel).
+// coastline isn't flush to the edge); a feature frame packs the SELECTED feature
+// into ~82% so it clearly dominates the render (with a thin context margin — the
+// highlight reticle then pins exactly which one it is).
 const MAP_CELL_FILL: f64 = 0.92;
-const MAP_FEATURE_FILL: f64 = 0.5;
+const MAP_FEATURE_FILL: f64 = 0.82;
+
+// A point has no extent to fit, so its feature frame zooms this many levels PAST
+// the cell's native band-max (each level halves the framed ground span) — tight
+// enough that the symbol + its immediate surroundings fill the pane. Capped at
+// MAP_FEATURE_ZOOM_MAX so a berthing-band point (or a near-degenerate line/area)
+// can't blow up past a sane scale.
+const MAP_POINT_ZOOM_IN: f64 = 3.0;
+const MAP_FEATURE_ZOOM_MAX: f64 = 21.0;
 
 // The whole-cell overview view: centre on the cell bbox, zoom so its larger span
 // reaches `fill` of the canvas. `bounds` = [west, south, east, north]. A
@@ -1814,15 +1853,31 @@ fn exFitCellView(bounds: [4]f64, w: u32, h: u32, fill: f64) MapView {
     return .{ .lon = clon, .lat = clat, .zoom = std.math.clamp(if (got) zoom else 12, 1.0, 19.0) };
 }
 
-// The zoomed-in feature view: centre on the feature, at the zoom that leaves it
-// at ~MAP_FEATURE_FILL of the canvas (so the surrounding chart shows around it).
-// A point / degenerate bbox renders at the cell's native band-max zoom (real
-// chart detail around the node). This is a real map crop of the cell — the same
-// scene as the header overview, just framed tighter — so the selected feature
-// appears in its true neighbourhood.
+// The zoomed-in feature view: centre on the feature, framed TIGHT so it dominates
+// the render. A line/area fits its bbox to ~MAP_FEATURE_FILL of the canvas (a tiny
+// feature still scales up close rather than sitting as a speck); a point (or a
+// degenerate bbox) zooms MAP_POINT_ZOOM_IN levels past the cell's band-max so the
+// symbol + its immediate surroundings fill the pane. This is a real map crop of
+// the cell — the same scene as the header overview, just framed much tighter — so
+// the selected feature appears in its true neighbourhood.
 fn exFeatureView(tv: ExThumb, w: u32, h: u32) MapView {
     const min_dim: f64 = @floatFromInt(@min(w, h));
-    return .{ .lon = tv.lon, .lat = tv.lat, .zoom = exThumbZoom(tv, min_dim, MAP_FEATURE_FILL) };
+    const zoom = if (tv.framed and tv.frac > 1e-12)
+        exThumbZoom(tv, min_dim, MAP_FEATURE_FILL)
+    else
+        std.math.clamp(tv.band_max + MAP_POINT_ZOOM_IN, tv.band_max, MAP_FEATURE_ZOOM_MAX);
+    return .{ .lon = tv.lon, .lat = tv.lat, .zoom = zoom };
+}
+
+// The highlight marker for a framed feature: its anchor node (the ExThumb centre
+// — a point's node, or a line/area's bbox centre) plus, for a line/area, its
+// real bbox so the render can box the extent. A point carries no bbox.
+fn exFeatureHighlight(tv: ExThumb) chart.Highlight {
+    return .{
+        .lon = tv.lon,
+        .lat = tv.lat,
+        .bbox = if (tv.has_bbox) .{ tv.min_lon, tv.min_lat, tv.max_lon, tv.max_lat } else null,
+    };
 }
 
 fn exClassMatches(list: []const u8, acr: []const u8) bool {
@@ -3074,16 +3129,22 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
             var rendered = false;
             if (exMapGeom(right_w, left_w, term_rows, text_rows, map_full, ts_raw)) |gm| {
                 if (sel_cell) |cp| {
-                    // A FEATURE frames the cell zoomed IN around it; a HEADER frames
-                    // the whole cell bbox. Either yields a real chart crop (context).
-                    const view: ?MapView = if (gi) |g| fb: {
+                    // A FEATURE frames the cell zoomed IN around it AND highlights
+                    // it; a HEADER frames the whole cell bbox (no single feature →
+                    // no highlight). Either yields a real chart crop (context).
+                    var view: ?MapView = null;
+                    var hl: ?chart.Highlight = null;
+                    if (gi) |g| {
                         const tv: ?ExThumb = if (rows[g].index < thumb_by_fi.len) thumb_by_fi[rows[g].index] else null;
-                        break :fb if (tv) |t| exFeatureView(t, gm.w, gm.h) else null;
-                    } else if (cur != null and cur.?.is_header) hb: {
-                        break :hb if (cp.bounds()) |bnd| exFitCellView(bnd, gm.w, gm.h, MAP_CELL_FILL) else null;
-                    } else null;
+                        if (tv) |t| {
+                            view = exFeatureView(t, gm.w, gm.h);
+                            hl = exFeatureHighlight(t);
+                        }
+                    } else if (cur != null and cur.?.is_header) {
+                        if (cp.bounds()) |bnd| view = exFitCellView(bnd, gm.w, gm.h, MAP_CELL_FILL);
+                    }
                     if (view) |v| {
-                        exTuiMap(io, stdout, &thumb, cp, sel_portrayal, v, palette, m, gm);
+                        exTuiMap(io, stdout, &thumb, cp, sel_portrayal, v, hl, palette, m, gm);
                         rendered = true;
                     }
                 }
@@ -3232,7 +3293,7 @@ fn exMapGeom(right_w: usize, left_w: usize, term_rows: usize, text_rows: usize, 
 // cursor) is the SAME escape shape as the console `--kitty` path. The image stays
 // strictly within the body rows (footer clear) so its cursor-advance can't scroll
 // the text away. Any failure clears the image and leaves the text intact.
-fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, view: MapView, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, geom: MapGeom) void {
+fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, view: MapView, highlight: ?chart.Highlight, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, geom: MapGeom) void {
     const clear = struct {
         fn f(io_: std.Io, out: std.Io.File, s: *ThumbState) void {
             out.writeStreamingAll(io_, render.kitty.delete_all) catch {};
@@ -3242,14 +3303,18 @@ fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.
     }.f;
     const w = geom.w;
     const h = geom.h;
+    const hl_on = highlight != null;
+    const hl_lon = if (highlight) |hh| hh.lon else 0;
+    const hl_lat = if (highlight) |hh| hh.lat else 0;
 
-    // (Re)render + rebuild the a=T sequence only when the VIEW or pixel size
-    // changed. Keyed on the exact view so a new selection (reframe) or a terminal
-    // resize invalidates, but re-selecting the same item re-emits the cache.
-    if (st.seq == null or st.lon != view.lon or st.lat != view.lat or st.zoom != view.zoom or st.w != w or st.h != h) {
+    // (Re)render + rebuild the a=T sequence only when the VIEW, pixel size, or
+    // HIGHLIGHTED feature changed. Keyed on the exact view + highlight so a new
+    // selection (reframe) or a terminal resize invalidates, but re-selecting the
+    // same item re-emits the cache.
+    if (st.seq == null or st.lon != view.lon or st.lat != view.lat or st.zoom != view.zoom or st.w != w or st.h != h or st.hl_on != hl_on or st.hl_lon != hl_lon or st.hl_lat != hl_lat) {
         _ = st.arena.reset(.retain_capacity);
         const ta = st.arena.allocator();
-        const png = chart.renderCellView(cell, portrayal, view.lon, view.lat, view.zoom, w, h, palette, m, .png) catch {
+        const png = chart.renderCellView(cell, portrayal, view.lon, view.lat, view.zoom, w, h, palette, m, .png, highlight) catch {
             clear(io, stdout, st);
             return;
         };
@@ -3264,6 +3329,9 @@ fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.
         st.zoom = view.zoom;
         st.w = w;
         st.h = h;
+        st.hl_on = hl_on;
+        st.hl_lon = hl_lon;
+        st.hl_lat = hl_lat;
     }
     // Each frame: clear the previous frame's image, move the (hidden) cursor to the
     // map's top-left cell, then transmit+display the cached image.
