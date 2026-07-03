@@ -1593,9 +1593,26 @@ const ExLevel3 = struct {
 // frames it). `framed` distinguishes the two for the caption.
 const ExThumb = struct { lon: f64, lat: f64, zoom: f64, framed: bool };
 
+// The TUI kitty thumbnail's cross-frame state. `seq` is the cached a=T
+// (transmit-AND-display) kitty sequence for the currently-rendered feature,
+// re-emitted every frame (after the text) so the text redraw can't leave it
+// stale; `sel` is the feature index it was built for. `arena` owns `seq` and is
+// reset when the selection changes — the render (the slow step) runs once per
+// selection, matching the old transmit-once model.
+const ThumbState = struct {
+    sel: ?usize = null,
+    seq: ?[]const u8 = null,
+    arena: *std.heap.ArenaAllocator,
+};
+
 // Thumbnail crop size (device px). Small on purpose — a glanceable proof of what
 // the portrayal actually draws, inline beside the text dump.
 const THUMB_PX: u32 = 200;
+
+// Background colour token the isolated feature thumbnail clears to: DEPMS, the
+// S-52 light shallow-water shade — a solid "mini scene" sea the single feature's
+// black/coloured marks read clearly against.
+const THUMB_BG: []const u8 = "DEPMS";
 
 const ExRow = struct {
     cell_name: []const u8,
@@ -2140,7 +2157,6 @@ fn exStreamCell(
     mode: ExOut,
     out: *OutBuf,
     first: *bool,
-    chart_h: ?*chart.Chart,
     palette: render.resolve.PaletteId,
     m: *const render.resolve.MarinerSettings,
 ) !void {
@@ -2164,7 +2180,7 @@ fn exStreamCell(
                 try chunk.appendSlice(fa, EX_SEP);
                 try exFormatDetail12(fa, &chunk, row);
                 try exFormatLevel3(fa, &chunk, row.resolved);
-                if (F.kitty) try exAppendThumb(fa, &chunk, chart_h, row, palette, m);
+                if (F.kitty) try exAppendThumb(fa, &chunk, cell, portrayal, fi, row, palette, m);
             },
             .json => {
                 if (!first.*) try chunk.appendSlice(fa, ",\n");
@@ -2215,18 +2231,13 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
     engine.catalogue.warmUp();
     const rules = resolveRulesDir(rules_flag);
 
-    // --kitty: a Chart handle over the SAME source (single cell or quilted
-    // ENC_ROOT) drives renderView for the per-feature thumbnails. Opened once;
-    // a failure just downgrades to the text-only dump (graceful degradation).
-    var chart_h: ?*chart.Chart = null;
-    defer if (chart_h) |cc| cc.deinit();
+    // --kitty: each feature's thumbnail is an ISOLATED render of that one feature's
+    // resolved portrayal on a solid background (chart.renderFeature) — built from the
+    // same re-parsed cell + portrayal streams the text dump uses, so no separate Chart
+    // handle is opened.
     const palette: render.resolve.PaletteId = .day;
     var m = render.resolve.MarinerSettings{ .display_other = true };
     m.scheme = .day;
-    if (kitty) {
-        chart_h = chart.Chart.openPath(path, rules, false) catch null;
-        if (chart_h == null) std.debug.print("note: --kitty could not open {s} for rendering; showing text only\n", .{path});
-    }
 
     // Collect the source cell list (one .000, or every *.000 under an ENC_ROOT).
     // `dir` stays open for the whole run (the TUI re-reads cells on demand).
@@ -2295,7 +2306,7 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
         }
         var cells = std.ArrayList(ExCellSrc).empty;
         for (cell_paths.items) |bp| try cells.append(a, .{ .base_rel = bp });
-        return exploreTui(io, a, index.items, cells.items, dir, rules, F, kitty, chart_h, palette, &m, path);
+        return exploreTui(io, a, index.items, cells.items, dir, rules, F, kitty, palette, &m, path);
     }
 
     // --- Non-TUI: stream each cell's features straight to a buffered stdout, one
@@ -2310,7 +2321,7 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
         for (cell_paths.items) |base_rel| {
             _ = cell_arena.reset(.free_all);
             var cell = exParseCellFrom(io, cell_arena.allocator(), dir, base_rel, false) orelse continue;
-            exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .json, &outbuf, &first, chart_h, palette, &m) catch {};
+            exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .json, &outbuf, &first, palette, &m) catch {};
         }
         outbuf.write("]\n");
         return;
@@ -2336,7 +2347,7 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
             return;
         }
         outbuf.write(std.fmt.allocPrint(a, "{d} feature(s)\n", .{total}) catch "");
-        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(cell_paths.items[0]), rules, F, .console, &outbuf, &first, chart_h, palette, &m) catch {};
+        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(cell_paths.items[0]), rules, F, .console, &outbuf, &first, palette, &m) catch {};
         return;
     }
 
@@ -2353,24 +2364,22 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
     for (cell_paths.items) |base_rel| {
         _ = cell_arena.reset(.free_all);
         var cell = exParseCellFrom(io, cell_arena.allocator(), dir, base_rel, false) orelse continue;
-        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .console, &outbuf, &first, chart_h, palette, &m) catch {};
+        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .console, &outbuf, &first, palette, &m) catch {};
     }
 }
 
 // Console `--kitty`: after a row's text dump, append a one-line caption + the
-// feature's RESOLVED render as an inline kitty-graphics PNG. Any failure prints a
-// short note instead of an image (graceful degradation), never an error.
-fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), c: ?*chart.Chart, row: ExRow, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
-    const cc = c orelse {
-        try out.appendSlice(a, "  resolved render: (chart unavailable)\n");
-        return;
-    };
+// feature's RESOLVED render as an inline kitty-graphics PNG. The render is
+// ISOLATED — only this feature's portrayal (chart.renderFeature, only_fi = fi)
+// on a solid background, NOT a map crop of the surrounding scene. Any failure
+// prints a short note instead of an image (graceful degradation), never an error.
+fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, row: ExRow, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
     const tv = row.thumb orelse {
         try out.appendSlice(a, "  resolved render: (no renderable geometry)\n");
         return;
     };
-    const png = cc.renderView(tv.lon, tv.lat, tv.zoom, THUMB_PX, THUMB_PX, palette, m, .png) catch {
-        try out.appendSlice(a, "  resolved render: (renderView failed for this feature)\n");
+    const png = chart.renderFeature(cell, portrayal, fi, tv.lon, tv.lat, tv.zoom, THUMB_PX, THUMB_PX, palette, m, THUMB_BG, .png) catch {
+        try out.appendSlice(a, "  resolved render: (renderFeature failed for this feature)\n");
         return;
     };
     defer chart.freeBytes(png);
@@ -2378,7 +2387,7 @@ fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), c: ?*chart.Chart
         try out.appendSlice(a, "  resolved render: (kitty encode failed)\n");
         return;
     };
-    try out.print(a, "  resolved render — {d}x{d}px {s} @ z{d:.1} ({d:.4},{d:.4}):\n", .{ THUMB_PX, THUMB_PX, if (tv.framed) "bbox" else "anchor", tv.zoom, tv.lon, tv.lat });
+    try out.print(a, "  resolved render (isolated) — {d}x{d}px {s} @ z{d:.1} ({d:.4},{d:.4}):\n", .{ THUMB_PX, THUMB_PX, if (tv.framed) "bbox" else "anchor", tv.zoom, tv.lon, tv.lat });
     try out.appendSlice(a, seq);
     try out.append(a, '\n');
 }
@@ -2707,7 +2716,7 @@ fn exSection(fa: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8, colo
 // placed as a kitty-graphics thumbnail in the top-right of the detail pane
 // (transmit-once-per-selection + place, deleted each frame — the same
 // cached-region pattern as the ascii kitty TUI, so it never scrolls the layout).
-fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, chart_h: ?*chart.Chart, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, source: []const u8) !void {
+fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, source: []const u8) !void {
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
     const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
@@ -2721,10 +2730,17 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
     defer std.posix.tcsetattr(stdin_fd, .NOW, old) catch {};
     stdout.writeStreamingAll(io, "\x1b[?1049h\x1b[?25l") catch {}; // alt screen, hide cursor
     defer stdout.writeStreamingAll(io, "\x1b[?25h\x1b[?1049l") catch {};
-    const do_kitty = kitty and chart_h != null;
+    const do_kitty = kitty;
     defer if (do_kitty) stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-    const thumb_id: u32 = 1;
-    var thumb_sel: ?usize = null; // rows[] index currently transmitted into the store
+    // The kitty thumbnail's cross-frame state + its dedicated arena (owns the cached
+    // a=T sequence; reset per selection). `sel_cell`/`sel_portrayal` persist the
+    // re-parsed cell + portrayal the isolated render draws from (sel_arena-owned;
+    // valid while `cached_cell` matches).
+    var thumb_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer thumb_arena.deinit();
+    var thumb = ThumbState{ .arena = &thumb_arena };
+    var sel_cell: ?*engine.s57.Cell = null;
+    var sel_portrayal: ?[]const ?[]const u8 = null;
 
     // The resident index (rows) already carries each feature's label + LEVELS 1+2
     // detail lines. Level 3 (resolved calls) + the kitty thumbnail are computed
@@ -2842,38 +2858,47 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
                     cached_cell = null;
                     resolved_by_fi = &.{};
                     thumb_by_fi = &.{};
+                    sel_cell = null;
+                    sel_portrayal = null;
+                    thumb.sel = null; // the cached thumbnail belonged to the old cell
                     const sa = sel_arena.allocator();
                     if (exParseCellFrom(io, sa, dir, cells[row.cell_id].base_rel, true)) |cell_val| {
-                        var cell = cell_val;
-                        const portrayal = engine.portray.portrayCell(sa, &cell, rules) catch null;
-                        var ctx_storage = exSetupResolve(sa, &cell, portrayal, F);
-                        const ctx: ?*ExResolveCtx = if (ctx_storage) |*cc| cc else null;
-                        var rbf: []?ExLevel3 = &.{};
-                        if (sa.alloc(?ExLevel3, cell.features.len)) |buf| {
-                            rbf = buf;
-                            @memset(rbf, null);
-                        } else |_| {}
-                        var tbf: []?ExThumb = &.{};
-                        if (do_kitty) {
-                            if (sa.alloc(?ExThumb, cell.features.len)) |buf| {
-                                tbf = buf;
-                                @memset(tbf, null);
+                        // Persist the parsed Cell in sel_arena so the isolated thumbnail
+                        // render can reach it across frames (a stack local would dangle).
+                        if (sa.create(engine.s57.Cell)) |cell| {
+                            cell.* = cell_val;
+                            const portrayal = engine.portray.portrayCell(sa, cell, rules) catch null;
+                            var ctx_storage = exSetupResolve(sa, cell, portrayal, F);
+                            const ctx: ?*ExResolveCtx = if (ctx_storage) |*cc| cc else null;
+                            var rbf: []?ExLevel3 = &.{};
+                            if (sa.alloc(?ExLevel3, cell.features.len)) |buf| {
+                                rbf = buf;
+                                @memset(rbf, null);
                             } else |_| {}
-                        }
-                        // Fold every kept feature IN ORDER (the queue consumes in feature
-                        // order, exactly as the console path does), so a random-access
-                        // lookup by feature index is byte-identical to the eager dump.
-                        for (cell.features, 0..) |fe, cfi| {
-                            const class = engine.catalogue.acronymByObjl(fe.objl);
-                            if (!exPasses(F, class, fe, cfi)) continue;
-                            if (ctx) |c2| {
-                                if (cfi < rbf.len) rbf[cfi] = exFoldResolved(sa, fe, class, c2) catch null;
+                            var tbf: []?ExThumb = &.{};
+                            if (do_kitty) {
+                                if (sa.alloc(?ExThumb, cell.features.len)) |buf| {
+                                    tbf = buf;
+                                    @memset(tbf, null);
+                                } else |_| {}
                             }
-                            if (do_kitty and cfi < tbf.len) tbf[cfi] = exThumbView(sa, &cell, fe);
-                        }
-                        resolved_by_fi = rbf;
-                        thumb_by_fi = tbf;
-                        cached_cell = row.cell_id;
+                            // Fold every kept feature IN ORDER (the queue consumes in feature
+                            // order, exactly as the console path does), so a random-access
+                            // lookup by feature index is byte-identical to the eager dump.
+                            for (cell.features, 0..) |fe, cfi| {
+                                const class = engine.catalogue.acronymByObjl(fe.objl);
+                                if (!exPasses(F, class, fe, cfi)) continue;
+                                if (ctx) |c2| {
+                                    if (cfi < rbf.len) rbf[cfi] = exFoldResolved(sa, fe, class, c2) catch null;
+                                }
+                                if (do_kitty and cfi < tbf.len) tbf[cfi] = exThumbView(sa, cell, fe);
+                            }
+                            resolved_by_fi = rbf;
+                            thumb_by_fi = tbf;
+                            sel_cell = cell;
+                            sel_portrayal = portrayal;
+                            cached_cell = row.cell_id;
+                        } else |_| {}
                     }
                 }
                 _ = det_arena.reset(.retain_capacity);
@@ -2981,17 +3006,21 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
         try buf.appendSlice(fa, "\x1b[J"); // clear anything below
         stdout.writeStreamingAll(io, buf.items) catch {};
 
-        // --kitty: the selected FEATURE's resolved render, placed over the
-        // top-right of the detail pane (deleted-then-placed after the text so it
-        // floats above the cells without disturbing the layout). A header
-        // selection (gi == null) clears any prior image.
+        // --kitty: the selected FEATURE's ISOLATED render (only that feature's
+        // portrayal on a solid background), transmit-and-displayed over the
+        // top-right of the detail pane AFTER the text so it floats above the cells
+        // without disturbing the layout. A header selection (gi == null) or an
+        // unavailable cell clears any prior image.
         if (do_kitty) {
-            if (gi) |g| {
+            const rendered = if (gi) |g| blk: {
+                const cp = sel_cell orelse break :blk false;
                 const tv: ?ExThumb = if (rows[g].index < thumb_by_fi.len) thumb_by_fi[rows[g].index] else null;
-                exTuiThumb(io, a, stdout, chart_h.?, tv, g, &thumb_sel, thumb_id, palette, m, cols, left_w, term_rows, ts_raw);
-            } else {
+                exTuiThumb(io, a, stdout, &thumb, cp, sel_portrayal, rows[g].index, tv, palette, m, cols, left_w, term_rows, ts_raw);
+                break :blk true;
+            } else false;
+            if (!rendered) {
                 stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-                thumb_sel = null;
+                thumb.sel = null;
             }
         }
 
@@ -3083,51 +3112,63 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
 }
 
 // Place the selected feature's `--kitty` thumbnail in the detail pane's top-right
-// corner. Transmit-once-per-selection (a cheap ~40-byte `place` on every other
-// frame), delete_all each frame so replaced/scrolled-away images don't linger —
-// the same store-and-place pattern as the ascii kitty TUI. Any failure clears the
-// image and leaves the text pane intact (graceful degradation).
-fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, c: *chart.Chart, tv_in: ?ExThumb, row_index: usize, thumb_sel: *?usize, id: u32, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, cols: usize, left_w: usize, term_rows: usize, ts_raw: ?[4]u32) void {
+// corner as an ISOLATED render (only feature `fi`'s portrayal on a solid
+// background — chart.renderFeature). The render + kitty encode run ONCE per
+// selection (cached in `st`); every frame re-emits the cached a=T sequence AFTER
+// the text so the redraw can't leave it stale. a=T (transmit-AND-display at the
+// cursor) is the SAME escape shape as the confirmed-working console `--kitty`
+// path (render.kitty.encodePng) — NOT the a=t store + a=p place that never
+// rendered (delete_all's d=A freed the stored image before the place referenced
+// it). The bail below guarantees the pane has room under row 2, so the image's
+// cursor-advance can't scroll the text away. Any failure clears the image and
+// leaves the text pane intact (graceful degradation).
+fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, tv_in: ?ExThumb, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, cols: usize, left_w: usize, term_rows: usize, ts_raw: ?[4]u32) void {
     const tv = tv_in orelse {
         stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-        thumb_sel.* = null;
+        st.sel = null;
+        st.seq = null;
         return;
     };
-    // The crop occupies ceil(THUMB/cell) terminal cells; hug the pane's right edge
+    // The image occupies ceil(THUMB/cell) terminal cells; hug the pane's right edge
     // below the title row. Bail (clearing any prior image) if the pane can't hold it.
     const cp = cellPx(ts_raw);
     const cols_span: usize = (THUMB_PX + cp[0] - 1) / cp[0];
     const rows_span: usize = (THUMB_PX + cp[1] - 1) / cp[1];
     if (term_rows < rows_span + 2 or cols < left_w + cols_span + 4) {
         stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-        thumb_sel.* = null;
+        st.sel = null;
+        st.seq = null;
         return;
     }
-    // (Re)render + transmit into the store only when the selection changed.
-    if (thumb_sel.* == null or thumb_sel.*.? != row_index) {
-        const png = c.renderView(tv.lon, tv.lat, tv.zoom, THUMB_PX, THUMB_PX, palette, m, .png) catch {
+    // (Re)render the isolated feature + build its a=T sequence only when the
+    // selection changed (render is the slow step; the cached bytes are cheap to re-emit).
+    if (st.sel == null or st.sel.? != fi or st.seq == null) {
+        _ = st.arena.reset(.retain_capacity);
+        const ta = st.arena.allocator();
+        const png = chart.renderFeature(cell, portrayal, fi, tv.lon, tv.lat, tv.zoom, THUMB_PX, THUMB_PX, palette, m, THUMB_BG, .png) catch {
             stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-            thumb_sel.* = null;
+            st.sel = null;
+            st.seq = null;
             return;
         };
         defer chart.freeBytes(png);
-        const seq = render.kitty.transmitPng(a, png, id) catch {
-            thumb_sel.* = null;
+        const seq = render.kitty.encodePng(ta, png) catch {
+            stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
+            st.sel = null;
+            st.seq = null;
             return;
         };
-        defer a.free(seq);
-        stdout.writeStreamingAll(io, seq) catch {};
-        thumb_sel.* = row_index;
+        st.seq = seq;
+        st.sel = fi;
     }
-    // Clear the previous placement, then place the whole stored image at the corner.
+    // Each frame: clear the previous frame's image, move the (hidden) cursor to the
+    // pane's top-right corner, then transmit+display the cached image there.
     const col1: usize = cols - cols_span; // 1-based column of the image's left edge
     const move = std.fmt.allocPrint(a, "\x1b[{d};{d}H", .{ 2, col1 }) catch return;
     defer a.free(move);
-    const pl = render.kitty.place(a, id, 0, 0, THUMB_PX, THUMB_PX) catch return;
-    defer a.free(pl);
     stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
     stdout.writeStreamingAll(io, move) catch {};
-    stdout.writeStreamingAll(io, pl) catch {};
+    stdout.writeStreamingAll(io, st.seq.?) catch {};
 }
 
 // Split text into lines (no trailing empty line for a final '\n'). Arena-owned.

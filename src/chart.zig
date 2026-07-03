@@ -1260,6 +1260,71 @@ pub const Chart = struct {
     }
 };
 
+/// Render ONE feature's resolved portrayal onto a solid background — the
+/// `explore --kitty` thumbnail's isolated "mini scene". Only feature `fi` of
+/// `cell` is portrayed (via its per-feature S-101 instruction stream in
+/// `portrayal`, `only_fi` skipping the rest of the cell); the canvas is cleared
+/// to the `bg` colour token (e.g. "DEPMS", the S-52 shallow-water shade) and the
+/// feature framed by the caller's centre + zoom (a point sits at its node at
+/// native size; a line/area is centred on its bbox). SCAMIN is ignored so the
+/// feature always shows at the framing zoom. No Chart handle needed: the sprite
+/// store + colour profile are built from the embedded catalogue exactly as
+/// Chart.renderView does. Returns PNG/PDF bytes (gpa-owned; free with freeBytes).
+pub fn renderFeature(
+    cell: *s57.Cell,
+    portrayal: ?[]const ?[]const u8,
+    fi: usize,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    w: u32,
+    h: u32,
+    palette: render.resolve.PaletteId,
+    settings: *const render.resolve.MarinerSettings,
+    bg: []const u8,
+    output: render.pixel.Output,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const css_name = switch (palette) {
+        .day => "daySvgStyle",
+        .dusk => "duskSvgStyle",
+        .night => "nightSvgStyle",
+    };
+    var css_data: []const u8 = "";
+    for (embedded_assets.css) |e| {
+        if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
+    }
+    const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+    for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+    const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+    for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+    const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+    defer store.deinit();
+
+    // Complex-linestyle table (idempotent), same as renderView.
+    var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+    defer ls_srcs.deinit(gpa);
+    for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+    scene.registerLinestylesXml(gpa, ls_srcs.items);
+
+    // Always show the previewed feature regardless of its SCAMIN at the framing zoom.
+    var s = settings.*;
+    s.ignore_scamin = true;
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var ps = render.pixel.PixelSurface.initView(a, &colors, palette, &s, zoom, w, h, pt, tile.EXTENT);
+    ps.store = store.asStore();
+    ps.output = output;
+    ps.bg_token = bg;
+
+    const one = [_]scene.CellRef{.{ .cell = cell, .portrayal = portrayal, .only_fi = fi }};
+    return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, false) catch error.TileGen;
+}
+
 fn appendJsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(a, '"');
     for (s) |c| switch (c) {

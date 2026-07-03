@@ -81,6 +81,11 @@ pub const PixelSurface = struct {
     store: ?sym.SymbolStore = null,
     /// endScene output format: raster PNG (default) or vector PDF.
     output: Output = .png,
+    /// Background colour token the scene clears to (null = "NODTA", the S-52
+    /// no-data shade, as every whole-scene render does). Overridden only by the
+    /// isolated single-feature thumbnail, which frames one feature on a solid
+    /// sea/neutral fill.
+    bg_token: ?[]const u8 = null,
     /// The embedded label face; null only if the embedded TTF fails to parse.
     fnt: ?fontmod.Font = null,
     glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
@@ -462,7 +467,8 @@ pub const PixelSurface = struct {
                 var rc = try raster.RasterCanvas.init(self.a, self.w_px, self.h_px);
                 defer rc.deinit();
                 // NODTA under everything (S-52 no-data); the palette picks the shade.
-                rc.clear(self.resolveColor("NODTA"));
+                // The isolated-feature thumbnail overrides this via bg_token.
+                rc.clear(self.resolveColor(self.bg_token orelse "NODTA"));
                 try self.paintOps(rc.asCanvas(), &dropped);
                 return png.encodeRgba(out, rc.px, rc.w, rc.h);
             },
@@ -478,7 +484,7 @@ pub const PixelSurface = struct {
                     .{ .x = 0, .y = @floatFromInt(self.h_px) },
                 };
                 const bg_rings = [_][]const cv.Point{&bg};
-                try canvas.fillPath(&bg_rings, self.resolveColor("NODTA"), .nonzero);
+                try canvas.fillPath(&bg_rings, self.resolveColor(self.bg_token orelse "NODTA"), .nonzero);
                 try self.paintOps(canvas, &dropped);
                 return pc.finish(out);
             },

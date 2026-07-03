@@ -510,6 +510,10 @@ pub const CellOpts = struct {
     /// per-zoom reach (lightReachTiles) so a directional light's full-nominal-range
     /// leg isn't culled on the tiles it crosses. 0 = display-mm figures only.
     light_range_m: f64 = 0,
+    /// Isolated single-feature render (the `explore --kitty` thumbnail): portray
+    /// ONLY the feature at this index, skipping every other feature in the cell.
+    /// null = the normal whole-cell pass. See CellRef.only_fi.
+    only_fi: ?usize = null,
 };
 
 /// MVT/MLT surface: owns the 11 tile layer lists and implements the rs.Surface
@@ -2361,6 +2365,9 @@ pub const CellRef = struct {
     /// Max ground-distance sector-leg length (metres) among the cell's lights
     /// (see CellOpts.light_range_m) — the honest LIGHTS cull margin.
     light_range_m: f64 = 0,
+    /// Isolated single-feature render (see CellOpts.only_fi): portray ONLY the
+    /// feature at this index. null = the normal whole-cell pass.
+    only_fi: ?usize = null,
 };
 
 /// Generate MVT bytes (uncompressed) for tile (z,x,y) from a single `cell`.
@@ -2399,6 +2406,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .feat_smax = cr.feat_smax,
             .pick_attrs = pick_attrs,
             .light_range_m = cr.light_range_m,
+            .only_fi = cr.only_fi,
         };
         try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
@@ -2429,6 +2437,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .feat_smax = cr.feat_smax,
             .pick_attrs = pick_attrs,
             .light_range_m = cr.light_range_m,
+            .only_fi = cr.only_fi,
         };
         try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
@@ -2589,6 +2598,9 @@ fn appendCellFeatures(
     // ground-length legs (directional lights) reach their honest per-zoom span.
     const light_reach = lightReachTiles(opts.light_range_m, z, (tb[1] + tb[3]) * 0.5);
     for (cell.features, 0..) |f, fi| {
+        // Isolated single-feature render (explore --kitty thumbnail): draw only
+        // the requested feature, skip the rest of the cell.
+        if (opts.only_fi) |only| if (fi != only) continue;
         var ml = mlon;
         var mt = mlat;
         if (f.objl == 75) {
