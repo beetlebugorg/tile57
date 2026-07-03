@@ -189,12 +189,14 @@ pub fn printUsage() void {
         \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi] [--kitty]
         \\      The chart on stdout as a Unicode text grid (the example render
         \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
-        \\  tile57 explore <cell.000> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]
+        \\  tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]
         \\      Dump, per feature, the RAW S-57 (class + attributes), the S-101
         \\      portrayal instruction stream (raw + parsed), and the resolved
         \\      Surface draw calls. Takes a SINGLE .000 cell (auto-applying its
-        \\      .001+ updates); an ENC_ROOT is rejected. --zoom N picks the
-        \\      resolving tile; --json; --no-resolve skips the draw-call pass;
+        \\      .001+ updates), or an ENC_ROOT with --view LON,LAT,ZOOM (or a
+        \\      "…/#v=LON,LAT,ZOOM" share URL) to pull just the cells under that
+        \\      viewport (--viewport WxH overrides the assumed 1280x800 screen).
+        \\      --zoom N picks the resolving tile; --json; --no-resolve skips the draw-call pass;
         \\      --tui opens the two-pane explorer (arrows select, / filters, q
         \\      quits); --kitty adds, in console mode, an isolated thumbnail of
         \\      each feature's resolved render, and in the TUI a LIVE CELL MAP that
