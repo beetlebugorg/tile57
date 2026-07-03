@@ -1325,6 +1325,64 @@ pub fn renderFeature(
     return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, false) catch error.TileGen;
 }
 
+/// Render a FULL-CONTEXT view of an already-parsed cell + its portrayal — the
+/// real quilted chart (ALL features, honouring SCAMIN, on the normal chart
+/// background), centred on `lon`/`lat` at `zoom`. The `explore --tui --kitty`
+/// live cell map draws with this: a whole-cell overview when a class header is
+/// selected, or the cell zoomed IN to frame a feature (with its neighbours /
+/// depths around it) when a feature is selected. Unlike `renderFeature` there is
+/// no single-feature isolation and no forced background — it is `renderView`'s
+/// `.cell` path, but driven from a caller-held cell so the TUI needn't open a
+/// Chart handle (it already holds the parsed cell + portrayal). Returns PNG/PDF
+/// bytes (gpa-owned; free with freeBytes).
+pub fn renderCellView(
+    cell: *s57.Cell,
+    portrayal: ?[]const ?[]const u8,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    w: u32,
+    h: u32,
+    palette: render.resolve.PaletteId,
+    settings: *const render.resolve.MarinerSettings,
+    output: render.pixel.Output,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const css_name = switch (palette) {
+        .day => "daySvgStyle",
+        .dusk => "duskSvgStyle",
+        .night => "nightSvgStyle",
+    };
+    var css_data: []const u8 = "";
+    for (embedded_assets.css) |e| {
+        if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
+    }
+    const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+    for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+    const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+    for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+    const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+    defer store.deinit();
+
+    // Complex-linestyle table (idempotent), same as renderView / renderFeature.
+    var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+    defer ls_srcs.deinit(gpa);
+    for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+    scene.registerLinestylesXml(gpa, ls_srcs.items);
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, tile.EXTENT);
+    ps.store = store.asStore();
+    ps.output = output;
+
+    const one = [_]scene.CellRef{.{ .cell = cell, .portrayal = portrayal }};
+    return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, false) catch error.TileGen;
+}
+
 fn appendJsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     try out.append(a, '"');
     for (s) |c| switch (c) {

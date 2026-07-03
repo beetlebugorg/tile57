@@ -1597,21 +1597,28 @@ const ExLevel3 = struct {
 // degenerate bbox — render at `band_max`.
 const ExThumb = struct { lon: f64, lat: f64, zoom: f64, framed: bool, frac: f64 = 0, band_max: f64 = 0 };
 
-// The TUI kitty thumbnail's cross-frame state. `seq` is the cached a=T
-// (transmit-AND-display) kitty sequence for the currently-rendered feature,
+// The TUI live-cell-map's cross-frame state. `seq` is the cached a=T
+// (transmit-AND-display) kitty sequence for the currently-framed view,
 // re-emitted every frame (after the text) so the text redraw can't leave it
-// stale; `sel` is the feature index it was built for; `w`/`h` are the pixel size
-// it was rendered at (a terminal resize changes the target size, so the cache is
-// invalidated when they differ). `arena` owns `seq` and is reset when the
-// selection changes — the render (the slow step) runs once per selection,
-// matching the old transmit-once model.
+// stale. The cache is keyed on the VIEW (lon/lat/zoom) + pixel size (w/h): a new
+// selection reframes to a new view, a terminal resize changes the size, and
+// either invalidates the cache. `arena` owns `seq` and is reset when the view
+// changes — the render (the slow step) runs once per view, matching the old
+// transmit-once-per-selection model. `zoom < 0` means "no cached view yet".
 const ThumbState = struct {
-    sel: ?usize = null,
+    lon: f64 = 0,
+    lat: f64 = 0,
+    zoom: f64 = -1,
     seq: ?[]const u8 = null,
     w: u32 = 0,
     h: u32 = 0,
     arena: *std.heap.ArenaAllocator,
 };
+
+// The map view the live cell map renders: a centre + web-mercator zoom. A class
+// header frames the WHOLE cell (exFitCellView); a feature frames the cell zoomed
+// IN around it with surrounding context (exFeatureView).
+const MapView = struct { lon: f64, lat: f64, zoom: f64 };
 
 // Console thumbnail crop size (device px). Small on purpose — a glanceable proof
 // of what the portrayal actually draws, inline beside the text dump. The TUI sizes
@@ -1770,6 +1777,52 @@ fn exThumbZoom(t: ExThumb, target_px: f64, fill: f64) f64 {
     if (!t.framed or t.frac <= 1e-12) return t.band_max;
     const target = target_px * fill;
     return std.math.clamp(std.math.log2(target / (256.0 * t.frac)), 2.0, 24.0);
+}
+
+// How much of the live-cell-map canvas the framed geometry fills. The whole-cell
+// overview packs the cell bbox into ~92% of the canvas (a thin margin so the
+// coastline isn't flush to the edge); a feature frame leaves the feature at ~50%
+// so its neighbours / depths stay visible around it (the "zoom into the thing,
+// keep the context" feel).
+const MAP_CELL_FILL: f64 = 0.92;
+const MAP_FEATURE_FILL: f64 = 0.5;
+
+// The whole-cell overview view: centre on the cell bbox, zoom so its larger span
+// reaches `fill` of the canvas. `bounds` = [west, south, east, north]. A
+// degenerate (zero-span) bbox falls back to a mid zoom. Used when a class HEADER
+// is selected — the "you are here" over the real quilted chart.
+fn exFitCellView(bounds: [4]f64, w: u32, h: u32, fill: f64) MapView {
+    const clon = (bounds[0] + bounds[2]) / 2.0;
+    const clat = (bounds[1] + bounds[3]) / 2.0;
+    const nw = worldPxOf(bounds[0], bounds[3], 1.0); // west,north  -> (x_min, y_min)
+    const se = worldPxOf(bounds[2], bounds[1], 1.0); // east,south  -> (x_max, y_max)
+    const span_x = @abs(se[0] - nw[0]);
+    const span_y = @abs(se[1] - nw[1]);
+    const wf = @as(f64, @floatFromInt(w)) * fill;
+    const hf = @as(f64, @floatFromInt(h)) * fill;
+    var zoom: f64 = 12;
+    var got = false;
+    if (span_x > 1e-12) {
+        zoom = std.math.log2(wf / (256.0 * span_x));
+        got = true;
+    }
+    if (span_y > 1e-12) {
+        const zy = std.math.log2(hf / (256.0 * span_y));
+        zoom = if (got) @min(zoom, zy) else zy;
+        got = true;
+    }
+    return .{ .lon = clon, .lat = clat, .zoom = std.math.clamp(if (got) zoom else 12, 1.0, 19.0) };
+}
+
+// The zoomed-in feature view: centre on the feature, at the zoom that leaves it
+// at ~MAP_FEATURE_FILL of the canvas (so the surrounding chart shows around it).
+// A point / degenerate bbox renders at the cell's native band-max zoom (real
+// chart detail around the node). This is a real map crop of the cell — the same
+// scene as the header overview, just framed tighter — so the selected feature
+// appears in its true neighbourhood.
+fn exFeatureView(tv: ExThumb, w: u32, h: u32) MapView {
+    const min_dim: f64 = @floatFromInt(@min(w, h));
+    return .{ .lon = tv.lon, .lat = tv.lat, .zoom = exThumbZoom(tv, min_dim, MAP_FEATURE_FILL) };
 }
 
 fn exClassMatches(list: []const u8, acr: []const u8) bool {
@@ -2120,19 +2173,6 @@ fn exParseCellFrom(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: 
     };
 }
 
-// The count pre-pass for the multi-cell console header ("N feature(s)"): parse the
-// cell into `a` and count features passing the filters, WITHOUT portrayal or the
-// recording surface. Cheap + memory-bounded (the caller resets `a` after).
-fn exCountCell(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []const u8, F: ExFilters) usize {
-    // quiet: a broken cell is reported once, by the heavy streaming pass that follows.
-    const cell = exParseCellFrom(io, a, dir, base_rel, true) orelse return 0;
-    var n: usize = 0;
-    for (cell.features, 0..) |f, fi| {
-        if (exPasses(F, engine.catalogue.acronymByObjl(f.objl), f, fi)) n += 1;
-    }
-    return n;
-}
-
 // A small buffered sink over stdout: append into a reusable buffer and flush in
 // ~64 KiB chunks (and at teardown), so the explore dump streams out instead of
 // materialising the whole thing in one giant ArrayList. The buffer backing lives
@@ -2217,7 +2257,7 @@ fn exStreamCell(
 
 fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--kitty] [--no-resolve] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 explore <cell.000> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--json] [--tui] [--kitty] [--no-resolve] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -2254,31 +2294,31 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
     engine.catalogue.warmUp();
     const rules = resolveRulesDir(rules_flag);
 
-    // --kitty: each feature's thumbnail is an ISOLATED render of that one feature's
-    // resolved portrayal on a solid background (chart.renderFeature) — built from the
-    // same re-parsed cell + portrayal streams the text dump uses, so no separate Chart
-    // handle is opened.
+    // --kitty renders from the same re-parsed cell + portrayal streams the text
+    // dump uses, so no separate Chart handle is opened. In the CONSOLE dump each
+    // feature gets an ISOLATED render of just its portrayal on a solid background
+    // (chart.renderFeature); the --tui LIVE CELL MAP instead frames the selection
+    // over the real chart (chart.renderCellView — see exTuiMap).
     const palette: render.resolve.PaletteId = .day;
     var m = render.resolve.MarinerSettings{ .display_other = true };
     m.scheme = .day;
 
-    // Collect the source cell list (one .000, or every *.000 under an ENC_ROOT).
-    // `dir` stays open for the whole run (the TUI re-reads cells on demand).
+    // SINGLE CELL ONLY. explore is a per-cell inspector / live cell map; an
+    // ENC_ROOT with hundreds of cells overwhelms the tree + the map framing, so a
+    // directory is rejected outright (nonzero exit) rather than quietly walked.
+    // A single .000 auto-discovers its .001+ updates (exParseCellFrom).
+    if (!std.mem.endsWith(u8, path, ".000")) {
+        std.debug.print("error: explore takes a single .000 cell; an ENC_ROOT with many cells overwhelms the explorer — pass one cell\n", .{});
+        std.process.exit(2);
+    }
+    // The one source cell. `dir` stays open for the whole run (the TUI re-reads
+    // the cell lazily to rebuild level 3 + the map render).
     var dir: std.Io.Dir = undefined;
     var cell_paths = std.ArrayList([]const u8).empty;
-    if (std.mem.endsWith(u8, path, ".000")) {
+    {
         const dirp = std.fs.path.dirname(path) orelse ".";
         dir = std.Io.Dir.cwd().openDir(io, dirp, .{}) catch return usageErr("cannot open cell directory");
         try cell_paths.append(a, try a.dupe(u8, std.fs.path.basename(path)));
-    } else {
-        dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return usageErr("source must be a .000 file or an ENC_ROOT directory");
-        var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
-        defer walker.deinit();
-        while (walker.next(io) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
-            try cell_paths.append(a, try a.dupe(u8, entry.path));
-        }
     }
     defer dir.close(io);
 
@@ -2350,45 +2390,25 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
         return;
     }
 
-    // Console. The header ("N feature(s)") needs the grand total up front: a single
-    // cell yields it from its own filter pass (one parse); an ENC_ROOT gets it from a
-    // cheap parse-only count pre-pass — byte-identical output, at the cost of parsing
-    // each cell twice (the heavy portrayal + recording still run only once).
+    // Console. The header ("N feature(s)") needs the grand total up front: the
+    // single cell yields it from its own filter pass (one parse), then a second
+    // pass streams each feature's dump.
     var first = true;
-    if (cell_paths.items.len == 1) {
-        _ = cell_arena.reset(.free_all);
-        var cell = exParseCellFrom(io, cell_arena.allocator(), dir, cell_paths.items[0], false) orelse {
-            std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
-            return;
-        };
-        var total: usize = 0;
-        for (cell.features, 0..) |fe, fi| {
-            if (exPasses(F, engine.catalogue.acronymByObjl(fe.objl), fe, fi)) total += 1;
-        }
-        if (total == 0) {
-            std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
-            return;
-        }
-        outbuf.write(std.fmt.allocPrint(a, "{d} feature(s)\n", .{total}) catch "");
-        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(cell_paths.items[0]), rules, F, .console, &outbuf, &first, palette, &m) catch {};
+    _ = cell_arena.reset(.free_all);
+    var cell = exParseCellFrom(io, cell_arena.allocator(), dir, cell_paths.items[0], false) orelse {
+        std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
         return;
-    }
-
+    };
     var total: usize = 0;
-    for (cell_paths.items) |base_rel| {
-        _ = cell_arena.reset(.free_all);
-        total += exCountCell(io, cell_arena.allocator(), dir, base_rel, F);
+    for (cell.features, 0..) |fe, fi| {
+        if (exPasses(F, engine.catalogue.acronymByObjl(fe.objl), fe, fi)) total += 1;
     }
     if (total == 0) {
         std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
         return;
     }
     outbuf.write(std.fmt.allocPrint(a, "{d} feature(s)\n", .{total}) catch "");
-    for (cell_paths.items) |base_rel| {
-        _ = cell_arena.reset(.free_all);
-        var cell = exParseCellFrom(io, cell_arena.allocator(), dir, base_rel, false) orelse continue;
-        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .console, &outbuf, &first, palette, &m) catch {};
-    }
+    exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(cell_paths.items[0]), rules, F, .console, &outbuf, &first, palette, &m) catch {};
 }
 
 // Console `--kitty`: after a row's text dump, append a one-line caption + the
@@ -2729,16 +2749,72 @@ fn exSection(fa: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8, colo
     try buf.appendSlice(fa, EXC_RESET);
 }
 
-// `tile57 explore --tui`: a two-pane feature explorer. Left = a COLLAPSIBLE class
-// tree (group headers + indented features under expanded groups); right = the
-// selected feature's three-level detail (or a group summary on a header). j/k or
-// arrows move; ->/Enter/Space expand, <- collapse, E/C expand/collapse all;
-// PgUp/PgDn page; g/G home/end; [/] scroll detail; / filters by class; q quits.
-// Same termios raw-mode + alt-screen scaffolding as `tile57 ascii --tui`;
-// dependency-free. With `--kitty` the selected feature's RESOLVED render is
-// placed as a kitty-graphics thumbnail in the top-right of the detail pane
-// (transmit-once-per-selection + place, deleted each frame — the same
-// cached-region pattern as the ascii kitty TUI, so it never scrolls the layout).
+// Parse + portray the single explored cell into `sa` and fold every kept
+// feature's level 3 (resolved calls) + `--kitty` map framing, IN feature order
+// (the resolve queue consumes in that order — the same single ascending sweep the
+// console dump uses), so a random-access lookup by feature index matches the dump.
+// Everything is `sa`-owned and resident for the run (explore is single-cell). On
+// any failure the out-params keep their empty defaults (the TUI degrades to the
+// text-only levels 1+2). Mirrors the console path's per-cell processing.
+fn exLoadCell(
+    io: std.Io,
+    sa: std.mem.Allocator,
+    dir: std.Io.Dir,
+    base_rel: []const u8,
+    rules: []const u8,
+    F: ExFilters,
+    do_kitty: bool,
+    out_cell: *?*engine.s57.Cell,
+    out_portrayal: *?[]const ?[]const u8,
+    out_resolved: *[]?ExLevel3,
+    out_thumb: *[]?ExThumb,
+) void {
+    const cell_val = exParseCellFrom(io, sa, dir, base_rel, true) orelse return;
+    // Persist the parsed Cell in `sa` so the map render + level 3 can reach it
+    // across frames (a stack local would dangle once this function returns).
+    const cell = sa.create(engine.s57.Cell) catch return;
+    cell.* = cell_val;
+    const portrayal = engine.portray.portrayCell(sa, cell, rules) catch null;
+    var ctx_storage = exSetupResolve(sa, cell, portrayal, F);
+    const ctx: ?*ExResolveCtx = if (ctx_storage) |*cc| cc else null;
+    var rbf: []?ExLevel3 = &.{};
+    if (sa.alloc(?ExLevel3, cell.features.len)) |buf| {
+        rbf = buf;
+        @memset(rbf, null);
+    } else |_| {}
+    var tbf: []?ExThumb = &.{};
+    if (do_kitty) {
+        if (sa.alloc(?ExThumb, cell.features.len)) |buf| {
+            tbf = buf;
+            @memset(tbf, null);
+        } else |_| {}
+    }
+    for (cell.features, 0..) |fe, cfi| {
+        const class = engine.catalogue.acronymByObjl(fe.objl);
+        if (!exPasses(F, class, fe, cfi)) continue;
+        if (ctx) |c2| {
+            if (cfi < rbf.len) rbf[cfi] = exFoldResolved(sa, fe, class, c2) catch null;
+        }
+        if (do_kitty and cfi < tbf.len) tbf[cfi] = exThumbView(sa, cell, fe);
+    }
+    out_resolved.* = rbf;
+    out_thumb.* = tbf;
+    out_cell.* = cell;
+    out_portrayal.* = portrayal;
+}
+
+// `tile57 explore --tui`: a two-pane feature explorer that doubles as a LIVE
+// CELL MAP. Left = a COLLAPSIBLE class tree (group headers + indented features);
+// right = the selected item's text detail with, under `--kitty`, a live map
+// render that FRAMES the selection: a class HEADER shows the whole cell (the
+// real quilted chart — "you are here"); a FEATURE zooms the map IN around it
+// with its neighbours / depths still visible. Scrolling the list down visually
+// zooms the map into the thing. j/k or arrows move; ->/Enter/Space expand, <-
+// collapse, E/C expand/collapse all; PgUp/PgDn page; g/G home/end; [/] scroll
+// detail; m toggles map-only; / filters by class; q quits. Same termios raw-mode
+// + alt-screen scaffolding as `tile57 ascii --tui`; dependency-free. The map is
+// transmit-once-per-view + place, deleted each frame — the same cached-region
+// pattern as the ascii kitty TUI, so it never scrolls the layout.
 fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, source: []const u8) !void {
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
@@ -2755,30 +2831,29 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
     defer stdout.writeStreamingAll(io, "\x1b[?25h\x1b[?1049l") catch {};
     const do_kitty = kitty;
     defer if (do_kitty) stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-    // The kitty thumbnail's cross-frame state + its dedicated arena (owns the cached
-    // a=T sequence; reset per selection). `sel_cell`/`sel_portrayal` persist the
-    // re-parsed cell + portrayal the isolated render draws from (sel_arena-owned;
-    // valid while `cached_cell` matches).
+    // The live map's cross-frame state + its dedicated arena (owns the cached a=T
+    // sequence; reset per view). `sel_cell`/`sel_portrayal` are the parsed cell +
+    // portrayal the map + level-3 draw from (sel_arena-owned, resident for the run
+    // — explore is single-cell, so one cell is the whole working set).
     var thumb_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer thumb_arena.deinit();
     var thumb = ThumbState{ .arena = &thumb_arena };
     var sel_cell: ?*engine.s57.Cell = null;
     var sel_portrayal: ?[]const ?[]const u8 = null;
+    var map_full = false; // 'm': map fills the whole detail pane (hide the text)
 
     // The resident index (rows) already carries each feature's label + LEVELS 1+2
-    // detail lines. Level 3 (resolved calls) + the kitty thumbnail are computed
-    // LAZILY per selection below — never held for every feature.
+    // detail lines. Level 3 (resolved calls) is read from `resolved_by_fi` below.
 
     // The class tree: group the index by S-57 class once (it is fixed for the
     // session); `expanded` toggles per header. Memory-negligible next to the arenas.
     const groups = try exBuildGroups(a, rows);
     const src_base = std.fs.path.basename(source);
 
-    // Lazy level-3/thumbnail state. `sel_arena` caches ONE cell's re-parse +
-    // recording + folded resolved calls (rebuilt only when the selection crosses to
-    // another cell). `det_arena` holds just the currently-shown feature's level-3
-    // (or a group header summary). Both page-backed so their resets return memory to
-    // the OS. This is what keeps a 3000+-feature cell viable.
+    // Level-3 / map state. `sel_arena` holds the single cell's parse + recording +
+    // folded resolved calls + per-feature map framings, resident for the run.
+    // `det_arena` holds just the currently-shown feature's level-3 (or a group
+    // header summary). Both page-backed so their resets return memory to the OS.
     var sel_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer sel_arena.deinit();
     var det_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -2787,10 +2862,14 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
     // temporaries, reset each frame so the process arena never grows with redraws.
     var frame_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer frame_arena.deinit();
-    const need_cell = F.do_resolve or do_kitty; // no re-parse needed if neither
-    var cached_cell: ?usize = null;
-    var resolved_by_fi: []?ExLevel3 = &.{}; // current cell, indexed by feature index
+    const need_cell = F.do_resolve or do_kitty; // no parse needed if neither
+    var resolved_by_fi: []?ExLevel3 = &.{}; // the cell, indexed by feature index
     var thumb_by_fi: []?ExThumb = &.{};
+    // Load the single cell up front (parse + portray + fold level 3 + per-feature
+    // map framings) — resident for the whole session. explore is single-cell now,
+    // so there is no lazy per-selection cell crossing to manage.
+    if (need_cell and cells.len > 0)
+        exLoadCell(io, sel_arena.allocator(), dir, cells[0].base_rel, rules, F, do_kitty, &sel_cell, &sel_portrayal, &resolved_by_fi, &thumb_by_fi);
     var cur_det: []const []const u8 = &.{}; // detail lines for the current selection
     var det_is_header = false; // cur_det is a group summary (colour its title line)
     // What cur_det was built for: kind 0=none 1=feature 2=header, id = rows[] index
@@ -2845,12 +2924,13 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
 
         const cur: ?ExVisRow = if (vis.items.len > 0) vis.items[sel] else null;
         // `gi`: the resident-index row of the selected FEATURE (null on a header /
-        // empty view) — the key for the lazy level-3 + thumbnail. Model unchanged.
+        // empty view) — the key for the level-3 detail + feature map framing.
         const gi: ?usize = if (cur) |c| (if (c.is_header) null else c.row) else null;
 
         // Rebuild the detail only when the selected item's identity changes (or a
-        // tree mutation forced det_kind = 3). A FEATURE re-parses + re-records its
-        // cell once on a cell crossing (cached); a HEADER shows a cheap summary.
+        // tree mutation forced det_kind = 3). Level 3 + the map framings were folded
+        // once up front (exLoadCell); a FEATURE reads its resolved calls, a HEADER
+        // shows a cheap summary.
         var want_kind: u8 = 0;
         var want_id: usize = 0;
         if (cur) |c| {
@@ -2875,58 +2955,9 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
                     &[_][]const u8{groups[want_id].class};
             } else {
                 const g = want_id;
-                const row = rows[g];
-                if (need_cell and (cached_cell == null or cached_cell.? != row.cell_id) and row.cell_id < cells.len) {
-                    _ = sel_arena.reset(.free_all);
-                    cached_cell = null;
-                    resolved_by_fi = &.{};
-                    thumb_by_fi = &.{};
-                    sel_cell = null;
-                    sel_portrayal = null;
-                    thumb.sel = null; // the cached thumbnail belonged to the old cell
-                    const sa = sel_arena.allocator();
-                    if (exParseCellFrom(io, sa, dir, cells[row.cell_id].base_rel, true)) |cell_val| {
-                        // Persist the parsed Cell in sel_arena so the isolated thumbnail
-                        // render can reach it across frames (a stack local would dangle).
-                        if (sa.create(engine.s57.Cell)) |cell| {
-                            cell.* = cell_val;
-                            const portrayal = engine.portray.portrayCell(sa, cell, rules) catch null;
-                            var ctx_storage = exSetupResolve(sa, cell, portrayal, F);
-                            const ctx: ?*ExResolveCtx = if (ctx_storage) |*cc| cc else null;
-                            var rbf: []?ExLevel3 = &.{};
-                            if (sa.alloc(?ExLevel3, cell.features.len)) |buf| {
-                                rbf = buf;
-                                @memset(rbf, null);
-                            } else |_| {}
-                            var tbf: []?ExThumb = &.{};
-                            if (do_kitty) {
-                                if (sa.alloc(?ExThumb, cell.features.len)) |buf| {
-                                    tbf = buf;
-                                    @memset(tbf, null);
-                                } else |_| {}
-                            }
-                            // Fold every kept feature IN ORDER (the queue consumes in feature
-                            // order, exactly as the console path does), so a random-access
-                            // lookup by feature index is byte-identical to the eager dump.
-                            for (cell.features, 0..) |fe, cfi| {
-                                const class = engine.catalogue.acronymByObjl(fe.objl);
-                                if (!exPasses(F, class, fe, cfi)) continue;
-                                if (ctx) |c2| {
-                                    if (cfi < rbf.len) rbf[cfi] = exFoldResolved(sa, fe, class, c2) catch null;
-                                }
-                                if (do_kitty and cfi < tbf.len) tbf[cfi] = exThumbView(sa, cell, fe);
-                            }
-                            resolved_by_fi = rbf;
-                            thumb_by_fi = tbf;
-                            sel_cell = cell;
-                            sel_portrayal = portrayal;
-                            cached_cell = row.cell_id;
-                        } else |_| {}
-                    }
-                }
                 _ = det_arena.reset(.retain_capacity);
                 const da = det_arena.allocator();
-                const resolved: ?ExLevel3 = if (row.index < resolved_by_fi.len) resolved_by_fi[row.index] else null;
+                const resolved: ?ExLevel3 = if (rows[g].index < resolved_by_fi.len) resolved_by_fi[rows[g].index] else null;
                 var l3 = std.ArrayList(u8).empty;
                 exFormatLevel3(da, &l3, resolved) catch {};
                 const l3_lines = splitLines(da, l3.items) catch &[_][]const u8{};
@@ -3023,30 +3054,43 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
         if (filtering) {
             const t: []const u8 = std.fmt.allocPrint(fa, " filter class: {s}_    enter=apply   esc=clear", .{filt}) catch " filter";
             try exEmitBar(fa, &buf, t, cols, false);
+        } else if (do_kitty) {
+            try exEmitBar(fa, &buf, " j/k move  \u{2192}/enter expand  \u{2190} collapse  E/C all  / filter  [ ] scroll  m map  q quit", cols, false);
         } else {
             try exEmitBar(fa, &buf, " j/k move  \u{2192}/enter expand  \u{2190} collapse  E/C all  / filter  [ ] scroll  q quit", cols, false);
         }
         try buf.appendSlice(fa, "\x1b[J"); // clear anything below
         stdout.writeStreamingAll(io, buf.items) catch {};
 
-        // --kitty: the selected FEATURE's ISOLATED render (only that feature's
-        // portrayal on a solid background), transmit-and-displayed in the LOWER
-        // part of the detail pane, BELOW the text, AFTER the text so it never
-        // scrolls the layout. A header selection (gi == null) or an unavailable
-        // cell clears any prior image.
+        // --kitty: the LIVE CELL MAP, framed to the selection — a HEADER frames the
+        // whole cell (the real quilted chart), a FEATURE frames the cell zoomed IN
+        // around it. Transmit-and-displayed in the LOWER part of the detail pane
+        // (BELOW the text, unless map-only), AFTER the text so it never scrolls the
+        // layout. No cell / no framing clears any prior image.
         if (do_kitty) {
-            const rendered = if (gi) |g| blk: {
-                const cp = sel_cell orelse break :blk false;
-                const tv: ?ExThumb = if (rows[g].index < thumb_by_fi.len) thumb_by_fi[rows[g].index] else null;
-                // Text lines currently visible in the detail pane (the image tucks
-                // in just below them, pinned to the pane's lower rows).
-                const text_rows: usize = if (cur_det.len > det_top) @min(cur_det.len - det_top, body_h) else 0;
-                exTuiThumb(io, a, stdout, &thumb, cp, sel_portrayal, rows[g].index, tv, palette, m, right_w, left_w, term_rows, text_rows, ts_raw);
-                break :blk true;
-            } else false;
+            // The image's pixel geometry (also the framing target — the feature
+            // zoom depends on the canvas min dimension). Null = pane too small.
+            const text_rows: usize = if (map_full) 0 else if (cur_det.len > det_top) @min(cur_det.len - det_top, body_h) else 0;
+            var rendered = false;
+            if (exMapGeom(right_w, left_w, term_rows, text_rows, map_full, ts_raw)) |gm| {
+                if (sel_cell) |cp| {
+                    // A FEATURE frames the cell zoomed IN around it; a HEADER frames
+                    // the whole cell bbox. Either yields a real chart crop (context).
+                    const view: ?MapView = if (gi) |g| fb: {
+                        const tv: ?ExThumb = if (rows[g].index < thumb_by_fi.len) thumb_by_fi[rows[g].index] else null;
+                        break :fb if (tv) |t| exFeatureView(t, gm.w, gm.h) else null;
+                    } else if (cur != null and cur.?.is_header) hb: {
+                        break :hb if (cp.bounds()) |bnd| exFitCellView(bnd, gm.w, gm.h, MAP_CELL_FILL) else null;
+                    } else null;
+                    if (view) |v| {
+                        exTuiMap(io, stdout, &thumb, cp, sel_portrayal, v, palette, m, gm);
+                        rendered = true;
+                    }
+                }
+            }
             if (!rendered) {
                 stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-                thumb.sel = null;
+                thumb.zoom = -1; // invalidate the cached view
             }
         }
 
@@ -3106,6 +3150,10 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
                 'G' => sel = if (vis.items.len > 0) vis.items.len - 1 else 0,
                 '[' => det_top -|= 1, // scroll detail up
                 ']' => det_top += 1, // scroll detail down
+                'm', 'M' => if (do_kitty) {
+                    map_full = !map_full; // toggle map-only (hide the text under the map)
+                    thumb.zoom = -1; // the canvas size changed → re-render the view
+                },
                 ' ', 0x0d, 0x0a => { // space / enter: toggle the selected header
                     if (cur) |cc| if (cc.is_header) {
                         groups[cc.group].expanded = !groups[cc.group].expanded;
@@ -3137,40 +3185,19 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
     }
 }
 
-// Draw the selected feature's `--kitty` thumbnail as a LARGE isolated render
-// (only feature `fi`'s portrayal on a solid background — chart.renderFeature),
-// filling the detail pane's width and its lower rows, positioned BELOW the text.
-// Sizing: the image fills `right_w` cells wide and ~60% of the body's rows tall
-// (clamped to a sane pixel max), its top pinned just under the visible text lines
-// so the pane's upper rows always keep the class/attribute header; long text
-// simply scrolls behind the image. The framing zoom is recomputed for this bigger
-// canvas (a line/area frames its bbox to ~80% of the min canvas dimension; a point
-// renders at the cell band-max zoom, and its fixed-device-px symbol is scaled up
-// via size_scale so it doesn't look lost on the large canvas).
-//
-// The render + kitty encode run ONCE per selection (cached in `st`, re-run only if
-// the target pixel size changes, e.g. a terminal resize); every frame re-emits the
-// cached a=T sequence AFTER the text so the redraw can't leave it stale. a=T
-// (transmit-AND-display at the cursor) is the SAME escape shape as the console
-// `--kitty` path. The image is drawn strictly within the pane's body rows (footer
-// stays clear) so its cursor-advance can't scroll the text away. Any failure — or
-// a pane too small to hold a useful image — clears the image and leaves the text
-// pane intact (graceful degradation).
-fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, tv_in: ?ExThumb, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, right_w: usize, left_w: usize, term_rows: usize, text_rows: usize, ts_raw: ?[4]u32) void {
-    const clear = struct {
-        fn f(io_: std.Io, out: std.Io.File, s: *ThumbState) void {
-            out.writeStreamingAll(io_, render.kitty.delete_all) catch {};
-            s.sel = null;
-            s.seq = null;
-        }
-    }.f;
-    const tv = tv_in orelse {
-        clear(io, stdout, st);
-        return;
-    };
+// The live cell map's on-screen geometry: its pixel size (`w`x`h`) and its 1-based
+// top-left cell (`row`,`col`) in the detail pane. `w`/`h` are also the framing
+// target (the feature zoom depends on the canvas min dimension), so the caller
+// computes the geometry BEFORE the view.
+const MapGeom = struct { w: u32, h: u32, row: usize, col: usize };
 
-    // Pane budget. The body owns rows 2..term_rows-1 (title row 1, footer last);
-    // reserve its lower part for the image, keeping >= min_text_rows of text above.
+// Size + place the live cell map inside the detail pane. The body owns rows
+// 2..term_rows-1 (title row 1, footer last). Normally the map fills the pane
+// width and ~72% of the body height, pinned to the bottom with a few text rows
+// kept above; map-only (`map_full`) gives it the whole body. Each axis is clamped
+// to a sane pixel max so a huge terminal doesn't transmit an enormous PNG.
+// Returns null when the pane is too small to hold a useful image.
+fn exMapGeom(right_w: usize, left_w: usize, term_rows: usize, text_rows: usize, map_full: bool, ts_raw: ?[4]u32) ?MapGeom {
     const cp = cellPx(ts_raw);
     const cpw: usize = cp[0];
     const cph: usize = cp[1];
@@ -3178,38 +3205,51 @@ fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, st: *ThumbS
     const min_img_rows: usize = 6;
     const min_text_rows: usize = 3;
     const min_img_cols: usize = 16;
-    if (body_h < min_img_rows + min_text_rows or right_w < min_img_cols) {
-        clear(io, stdout, st);
-        return;
-    }
+    const need_rows = if (map_full) min_img_rows else min_img_rows + min_text_rows;
+    if (body_h < need_rows or right_w < min_img_cols) return null;
 
-    // Image size in cells: fill the detail-pane width, ~60% of the body's height,
-    // each clamped to a sane pixel maximum so a huge terminal doesn't transmit an
-    // enormous PNG. Then position it below the text (pinned to the pane's bottom).
     const max_px: usize = 1600;
     var img_cols: usize = right_w;
     if (img_cols * cpw > max_px) img_cols = @max(min_img_cols, max_px / cpw);
-    var img_rows: usize = (body_h * 3) / 5;
-    img_rows = std.math.clamp(img_rows, min_img_rows, body_h - min_text_rows);
+    var img_rows: usize = if (map_full) body_h else std.math.clamp((body_h * 18) / 25, min_img_rows, body_h - min_text_rows);
     if (img_rows * cph > max_px) img_rows = @max(min_img_rows, max_px / cph);
-    const w: u32 = @intCast(img_cols * cpw);
-    const h: u32 = @intCast(img_rows * cph);
-    const top_offset: usize = @min(text_rows, body_h - img_rows); // text rows kept above the image
-    const img_top_row: usize = 2 + top_offset; // 1-based; +img_rows-1 <= term_rows-1
-    const col1: usize = left_w + 4; // 1-based left edge of the detail pane's content
+    const top_offset: usize = if (map_full) 0 else @min(text_rows, body_h - img_rows);
+    return .{
+        .w = @intCast(img_cols * cpw),
+        .h = @intCast(img_rows * cph),
+        .row = 2 + top_offset, // 1-based; + img_rows-1 <= term_rows-1
+        .col = left_w + 4, // 1-based left edge of the detail pane's content
+    };
+}
 
-    // (Re)render the isolated feature + build its a=T sequence only when the
-    // selection OR the target pixel size changed (the render is the slow step; the
-    // cached bytes are cheap to re-emit). The framing zoom is recomputed for this
-    // canvas, and point symbols are enlarged (size_scale) so they read at this size.
-    if (st.sel == null or st.sel.? != fi or st.seq == null or st.w != w or st.h != h) {
+// Draw the LIVE CELL MAP for the current view (a full-context chart crop —
+// chart.renderCellView, ALL features) into the detail pane at `geom`, positioned
+// BELOW the visible text (or over the whole pane in map-only mode). The render +
+// kitty encode run ONCE per VIEW (cached in `st` keyed on lon/lat/zoom + pixel
+// size, re-run on a reframe or resize — the render is the slow step, the cached
+// bytes are cheap to re-emit); every frame re-emits the cached a=T sequence AFTER
+// the text so the redraw can't leave it stale. a=T (transmit-AND-display at the
+// cursor) is the SAME escape shape as the console `--kitty` path. The image stays
+// strictly within the body rows (footer clear) so its cursor-advance can't scroll
+// the text away. Any failure clears the image and leaves the text intact.
+fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, view: MapView, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, geom: MapGeom) void {
+    const clear = struct {
+        fn f(io_: std.Io, out: std.Io.File, s: *ThumbState) void {
+            out.writeStreamingAll(io_, render.kitty.delete_all) catch {};
+            s.zoom = -1;
+            s.seq = null;
+        }
+    }.f;
+    const w = geom.w;
+    const h = geom.h;
+
+    // (Re)render + rebuild the a=T sequence only when the VIEW or pixel size
+    // changed. Keyed on the exact view so a new selection (reframe) or a terminal
+    // resize invalidates, but re-selecting the same item re-emits the cache.
+    if (st.seq == null or st.lon != view.lon or st.lat != view.lat or st.zoom != view.zoom or st.w != w or st.h != h) {
         _ = st.arena.reset(.retain_capacity);
         const ta = st.arena.allocator();
-        const min_dim: f64 = @floatFromInt(@min(w, h));
-        const zoom = exThumbZoom(tv, min_dim, 0.8);
-        var s = m.*;
-        s.size_scale *= std.math.clamp(min_dim / @as(f64, @floatFromInt(THUMB_PX)), 1.0, 3.0);
-        const png = chart.renderFeature(cell, portrayal, fi, tv.lon, tv.lat, zoom, w, h, palette, &s, THUMB_BG, .png) catch {
+        const png = chart.renderCellView(cell, portrayal, view.lon, view.lat, view.zoom, w, h, palette, m, .png) catch {
             clear(io, stdout, st);
             return;
         };
@@ -3219,14 +3259,16 @@ fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, st: *ThumbS
             return;
         };
         st.seq = seq;
-        st.sel = fi;
+        st.lon = view.lon;
+        st.lat = view.lat;
+        st.zoom = view.zoom;
         st.w = w;
         st.h = h;
     }
     // Each frame: clear the previous frame's image, move the (hidden) cursor to the
-    // image's top-left cell below the text, then transmit+display the cached image.
-    const move = std.fmt.allocPrint(a, "\x1b[{d};{d}H", .{ img_top_row, col1 }) catch return;
-    defer a.free(move);
+    // map's top-left cell, then transmit+display the cached image.
+    var mv: [40]u8 = undefined;
+    const move = std.fmt.bufPrint(&mv, "\x1b[{d};{d}H", .{ geom.row, geom.col }) catch return;
     stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
     stdout.writeStreamingAll(io, move) catch {};
     stdout.writeStreamingAll(io, st.seq.?) catch {};
@@ -3359,14 +3401,17 @@ fn printUsage() void {
         \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi] [--kitty]
         \\      The chart on stdout as a Unicode text grid (the example render
         \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
-        \\  tile57 explore <cell.000 | ENC_ROOT> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]
+        \\  tile57 explore <cell.000> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]
         \\      Dump, per feature, the RAW S-57 (class + attributes), the S-101
         \\      portrayal instruction stream (raw + parsed), and the resolved
-        \\      Surface draw calls. --zoom N picks the resolving tile; --json;
-        \\      --no-resolve skips the draw-call pass; --tui opens the two-pane
-        \\      explorer (arrows select, / filters by class, q quits); --kitty
-        \\      adds a live thumbnail of each feature's resolved render (inline in
-        \\      console mode, in the TUI detail pane) for graphics terminals.
+        \\      Surface draw calls. Takes a SINGLE .000 cell (auto-applying its
+        \\      .001+ updates); an ENC_ROOT is rejected. --zoom N picks the
+        \\      resolving tile; --json; --no-resolve skips the draw-call pass;
+        \\      --tui opens the two-pane explorer (arrows select, / filters, q
+        \\      quits); --kitty adds, in console mode, an isolated thumbnail of
+        \\      each feature's resolved render, and in the TUI a LIVE CELL MAP that
+        \\      frames the selection (whole cell on a class header, zoomed in to
+        \\      frame a feature; m toggles map-only) — for graphics terminals.
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
         \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)
