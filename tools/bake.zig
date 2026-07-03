@@ -1590,23 +1590,33 @@ const ExLevel3 = struct {
 // Where to point renderView for a feature's `--kitty` thumbnail: the anchor
 // lon/lat + a per-feature zoom (a point sits at its node and renders at the
 // cell's native band zoom; a line/area is centred on its bbox at a zoom that
-// frames it). `framed` distinguishes the two for the caption.
-const ExThumb = struct { lon: f64, lat: f64, zoom: f64, framed: bool };
+// frames it). `framed` distinguishes the two for the caption. `frac`/`band_max`
+// let the TUI RE-FRAME for its much larger dynamic canvas (the console keeps the
+// THUMB_PX-square `zoom`): `frac` is the bbox's larger normalized-globe span
+// (world=1.0), `band_max` the cell's native band-max zoom. `frac <= 0` = point /
+// degenerate bbox — render at `band_max`.
+const ExThumb = struct { lon: f64, lat: f64, zoom: f64, framed: bool, frac: f64 = 0, band_max: f64 = 0 };
 
 // The TUI kitty thumbnail's cross-frame state. `seq` is the cached a=T
 // (transmit-AND-display) kitty sequence for the currently-rendered feature,
 // re-emitted every frame (after the text) so the text redraw can't leave it
-// stale; `sel` is the feature index it was built for. `arena` owns `seq` and is
-// reset when the selection changes — the render (the slow step) runs once per
-// selection, matching the old transmit-once model.
+// stale; `sel` is the feature index it was built for; `w`/`h` are the pixel size
+// it was rendered at (a terminal resize changes the target size, so the cache is
+// invalidated when they differ). `arena` owns `seq` and is reset when the
+// selection changes — the render (the slow step) runs once per selection,
+// matching the old transmit-once model.
 const ThumbState = struct {
     sel: ?usize = null,
     seq: ?[]const u8 = null,
+    w: u32 = 0,
+    h: u32 = 0,
     arena: *std.heap.ArenaAllocator,
 };
 
-// Thumbnail crop size (device px). Small on purpose — a glanceable proof of what
-// the portrayal actually draws, inline beside the text dump.
+// Console thumbnail crop size (device px). Small on purpose — a glanceable proof
+// of what the portrayal actually draws, inline beside the text dump. The TUI sizes
+// its own thumbnail dynamically (fills the detail pane); THUMB_PX is the baseline
+// the TUI scales symbols against so a fixed-device-px point mark still reads big.
 const THUMB_PX: u32 = 200;
 
 // Background colour token the isolated feature thumbnail clears to: DEPMS, the
@@ -1715,9 +1725,10 @@ fn exTileAt(bounds: [4]f64, zoom: f64) ExLevel3 {
 fn exThumbView(a: std.mem.Allocator, cell: *engine.s57.Cell, f: engine.s57.Feature) ?ExThumb {
     const band = engine.bake_enc.bandOf(cell.params.cscl);
     const zr = engine.bake_enc.bandZooms(band);
+    const band_max: f64 = @floatFromInt(zr.max);
     if (f.prim == 1) {
         const p = cell.pointGeometry(f) orelse return null;
-        return .{ .lon = p.lon(), .lat = p.lat(), .zoom = @floatFromInt(zr.max), .framed = false };
+        return .{ .lon = p.lon(), .lat = p.lat(), .zoom = band_max, .framed = false, .frac = 0, .band_max = band_max };
     }
     // Line/area: bbox of the assembled geometry parts.
     const parts = cell.geometryParts(a, f) catch return null;
@@ -1741,12 +1752,24 @@ fn exThumbView(a: std.mem.Allocator, cell: *engine.s57.Cell, f: engine.s57.Featu
     const nw = worldPxOf(min_lon, max_lat, 1.0);
     const se = worldPxOf(max_lon, min_lat, 1.0);
     const frac = @max(@abs(se[0] - nw[0]), @abs(se[1] - nw[1]));
-    var zoom: f64 = @floatFromInt(zr.max);
+    var zoom: f64 = band_max;
     if (frac > 1e-12) {
         const target = @as(f64, @floatFromInt(THUMB_PX)) * 0.8;
         zoom = std.math.clamp(std.math.log2(target / (256.0 * frac)), 2.0, 19.0);
     }
-    return .{ .lon = clon, .lat = clat, .zoom = zoom, .framed = true };
+    return .{ .lon = clon, .lat = clat, .zoom = zoom, .framed = true, .frac = frac, .band_max = band_max };
+}
+
+// The framing zoom that fills ~`fill` of a `target_px`-min-dimension canvas with
+// this feature's geometry. A POINT (or a degenerate bbox) renders at the cell's
+// native band-max zoom. Used by the TUI to reframe for its larger dynamic canvas
+// (the console keeps the fixed THUMB_PX-square `ExThumb.zoom`). The upper zoom
+// clamp is deliberately high (24, past any real band) so a tiny line/area still
+// scales up to fill the big canvas instead of sitting as a speck on empty sea.
+fn exThumbZoom(t: ExThumb, target_px: f64, fill: f64) f64 {
+    if (!t.framed or t.frac <= 1e-12) return t.band_max;
+    const target = target_px * fill;
+    return std.math.clamp(std.math.log2(target / (256.0 * t.frac)), 2.0, 24.0);
 }
 
 fn exClassMatches(list: []const u8, acr: []const u8) bool {
@@ -3007,15 +3030,18 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
         stdout.writeStreamingAll(io, buf.items) catch {};
 
         // --kitty: the selected FEATURE's ISOLATED render (only that feature's
-        // portrayal on a solid background), transmit-and-displayed over the
-        // top-right of the detail pane AFTER the text so it floats above the cells
-        // without disturbing the layout. A header selection (gi == null) or an
-        // unavailable cell clears any prior image.
+        // portrayal on a solid background), transmit-and-displayed in the LOWER
+        // part of the detail pane, BELOW the text, AFTER the text so it never
+        // scrolls the layout. A header selection (gi == null) or an unavailable
+        // cell clears any prior image.
         if (do_kitty) {
             const rendered = if (gi) |g| blk: {
                 const cp = sel_cell orelse break :blk false;
                 const tv: ?ExThumb = if (rows[g].index < thumb_by_fi.len) thumb_by_fi[rows[g].index] else null;
-                exTuiThumb(io, a, stdout, &thumb, cp, sel_portrayal, rows[g].index, tv, palette, m, cols, left_w, term_rows, ts_raw);
+                // Text lines currently visible in the detail pane (the image tucks
+                // in just below them, pinned to the pane's lower rows).
+                const text_rows: usize = if (cur_det.len > det_top) @min(cur_det.len - det_top, body_h) else 0;
+                exTuiThumb(io, a, stdout, &thumb, cp, sel_portrayal, rows[g].index, tv, palette, m, right_w, left_w, term_rows, text_rows, ts_raw);
                 break :blk true;
             } else false;
             if (!rendered) {
@@ -3111,60 +3137,95 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
     }
 }
 
-// Place the selected feature's `--kitty` thumbnail in the detail pane's top-right
-// corner as an ISOLATED render (only feature `fi`'s portrayal on a solid
-// background — chart.renderFeature). The render + kitty encode run ONCE per
-// selection (cached in `st`); every frame re-emits the cached a=T sequence AFTER
-// the text so the redraw can't leave it stale. a=T (transmit-AND-display at the
-// cursor) is the SAME escape shape as the confirmed-working console `--kitty`
-// path (render.kitty.encodePng) — NOT the a=t store + a=p place that never
-// rendered (delete_all's d=A freed the stored image before the place referenced
-// it). The bail below guarantees the pane has room under row 2, so the image's
-// cursor-advance can't scroll the text away. Any failure clears the image and
-// leaves the text pane intact (graceful degradation).
-fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, tv_in: ?ExThumb, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, cols: usize, left_w: usize, term_rows: usize, ts_raw: ?[4]u32) void {
+// Draw the selected feature's `--kitty` thumbnail as a LARGE isolated render
+// (only feature `fi`'s portrayal on a solid background — chart.renderFeature),
+// filling the detail pane's width and its lower rows, positioned BELOW the text.
+// Sizing: the image fills `right_w` cells wide and ~60% of the body's rows tall
+// (clamped to a sane pixel max), its top pinned just under the visible text lines
+// so the pane's upper rows always keep the class/attribute header; long text
+// simply scrolls behind the image. The framing zoom is recomputed for this bigger
+// canvas (a line/area frames its bbox to ~80% of the min canvas dimension; a point
+// renders at the cell band-max zoom, and its fixed-device-px symbol is scaled up
+// via size_scale so it doesn't look lost on the large canvas).
+//
+// The render + kitty encode run ONCE per selection (cached in `st`, re-run only if
+// the target pixel size changes, e.g. a terminal resize); every frame re-emits the
+// cached a=T sequence AFTER the text so the redraw can't leave it stale. a=T
+// (transmit-AND-display at the cursor) is the SAME escape shape as the console
+// `--kitty` path. The image is drawn strictly within the pane's body rows (footer
+// stays clear) so its cursor-advance can't scroll the text away. Any failure — or
+// a pane too small to hold a useful image — clears the image and leaves the text
+// pane intact (graceful degradation).
+fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, tv_in: ?ExThumb, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, right_w: usize, left_w: usize, term_rows: usize, text_rows: usize, ts_raw: ?[4]u32) void {
+    const clear = struct {
+        fn f(io_: std.Io, out: std.Io.File, s: *ThumbState) void {
+            out.writeStreamingAll(io_, render.kitty.delete_all) catch {};
+            s.sel = null;
+            s.seq = null;
+        }
+    }.f;
     const tv = tv_in orelse {
-        stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-        st.sel = null;
-        st.seq = null;
+        clear(io, stdout, st);
         return;
     };
-    // The image occupies ceil(THUMB/cell) terminal cells; hug the pane's right edge
-    // below the title row. Bail (clearing any prior image) if the pane can't hold it.
+
+    // Pane budget. The body owns rows 2..term_rows-1 (title row 1, footer last);
+    // reserve its lower part for the image, keeping >= min_text_rows of text above.
     const cp = cellPx(ts_raw);
-    const cols_span: usize = (THUMB_PX + cp[0] - 1) / cp[0];
-    const rows_span: usize = (THUMB_PX + cp[1] - 1) / cp[1];
-    if (term_rows < rows_span + 2 or cols < left_w + cols_span + 4) {
-        stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-        st.sel = null;
-        st.seq = null;
+    const cpw: usize = cp[0];
+    const cph: usize = cp[1];
+    const body_h: usize = term_rows - 2;
+    const min_img_rows: usize = 6;
+    const min_text_rows: usize = 3;
+    const min_img_cols: usize = 16;
+    if (body_h < min_img_rows + min_text_rows or right_w < min_img_cols) {
+        clear(io, stdout, st);
         return;
     }
+
+    // Image size in cells: fill the detail-pane width, ~60% of the body's height,
+    // each clamped to a sane pixel maximum so a huge terminal doesn't transmit an
+    // enormous PNG. Then position it below the text (pinned to the pane's bottom).
+    const max_px: usize = 1600;
+    var img_cols: usize = right_w;
+    if (img_cols * cpw > max_px) img_cols = @max(min_img_cols, max_px / cpw);
+    var img_rows: usize = (body_h * 3) / 5;
+    img_rows = std.math.clamp(img_rows, min_img_rows, body_h - min_text_rows);
+    if (img_rows * cph > max_px) img_rows = @max(min_img_rows, max_px / cph);
+    const w: u32 = @intCast(img_cols * cpw);
+    const h: u32 = @intCast(img_rows * cph);
+    const top_offset: usize = @min(text_rows, body_h - img_rows); // text rows kept above the image
+    const img_top_row: usize = 2 + top_offset; // 1-based; +img_rows-1 <= term_rows-1
+    const col1: usize = left_w + 4; // 1-based left edge of the detail pane's content
+
     // (Re)render the isolated feature + build its a=T sequence only when the
-    // selection changed (render is the slow step; the cached bytes are cheap to re-emit).
-    if (st.sel == null or st.sel.? != fi or st.seq == null) {
+    // selection OR the target pixel size changed (the render is the slow step; the
+    // cached bytes are cheap to re-emit). The framing zoom is recomputed for this
+    // canvas, and point symbols are enlarged (size_scale) so they read at this size.
+    if (st.sel == null or st.sel.? != fi or st.seq == null or st.w != w or st.h != h) {
         _ = st.arena.reset(.retain_capacity);
         const ta = st.arena.allocator();
-        const png = chart.renderFeature(cell, portrayal, fi, tv.lon, tv.lat, tv.zoom, THUMB_PX, THUMB_PX, palette, m, THUMB_BG, .png) catch {
-            stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-            st.sel = null;
-            st.seq = null;
+        const min_dim: f64 = @floatFromInt(@min(w, h));
+        const zoom = exThumbZoom(tv, min_dim, 0.8);
+        var s = m.*;
+        s.size_scale *= std.math.clamp(min_dim / @as(f64, @floatFromInt(THUMB_PX)), 1.0, 3.0);
+        const png = chart.renderFeature(cell, portrayal, fi, tv.lon, tv.lat, zoom, w, h, palette, &s, THUMB_BG, .png) catch {
+            clear(io, stdout, st);
             return;
         };
         defer chart.freeBytes(png);
         const seq = render.kitty.encodePng(ta, png) catch {
-            stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
-            st.sel = null;
-            st.seq = null;
+            clear(io, stdout, st);
             return;
         };
         st.seq = seq;
         st.sel = fi;
+        st.w = w;
+        st.h = h;
     }
     // Each frame: clear the previous frame's image, move the (hidden) cursor to the
-    // pane's top-right corner, then transmit+display the cached image there.
-    const col1: usize = cols - cols_span; // 1-based column of the image's left edge
-    const move = std.fmt.allocPrint(a, "\x1b[{d};{d}H", .{ 2, col1 }) catch return;
+    // image's top-left cell below the text, then transmit+display the cached image.
+    const move = std.fmt.allocPrint(a, "\x1b[{d};{d}H", .{ img_top_row, col1 }) catch return;
     defer a.free(move);
     stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
     stdout.writeStreamingAll(io, move) catch {};
