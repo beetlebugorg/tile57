@@ -2764,6 +2764,14 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells:
     var filt_len: usize = 0;
     var filtering = false; // typing into the class filter
     var sel: usize = 0; // index into the flattened visible-row list
+    // With --kitty the point of the tool is the render, so don't open on a class
+    // HEADER (which has no thumbnail) — expand the first group and land on its
+    // first feature so a render is visible immediately. Without --kitty, groups
+    // open collapsed (a tidy class list to navigate).
+    if (do_kitty and groups.len > 0) {
+        groups[0].expanded = true;
+        sel = 1; // vis row 0 is the first header; row 1 is its first feature
+    }
     var top: usize = 0; // first visible list row
     var det_top: usize = 0; // detail scroll offset
     // After a tree mutation the flattened list shifts; relocate the selection onto
