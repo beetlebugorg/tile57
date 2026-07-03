@@ -1325,6 +1325,18 @@ pub fn renderFeature(
     return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, false) catch error.TileGen;
 }
 
+/// A feature to HIGHLIGHT over a `renderCellView` — the `explore --tui` live cell
+/// map pins the SELECTED feature so it stands out from every other charted
+/// feature. `lon`/`lat` is the anchor (point node, or a line/area's bbox centre);
+/// `bbox` = [west, south, east, north] additionally draws a box around a
+/// line/area's extent (null for a point). Passing null to `renderCellView`
+/// renders exactly as before.
+pub const Highlight = struct {
+    lon: f64,
+    lat: f64,
+    bbox: ?[4]f64 = null,
+};
+
 /// Render a FULL-CONTEXT view of an already-parsed cell + its portrayal — the
 /// real quilted chart (ALL features, honouring SCAMIN, on the normal chart
 /// background), centred on `lon`/`lat` at `zoom`. The `explore --tui --kitty`
@@ -1334,7 +1346,8 @@ pub fn renderFeature(
 /// no single-feature isolation and no forced background — it is `renderView`'s
 /// `.cell` path, but driven from a caller-held cell so the TUI needn't open a
 /// Chart handle (it already holds the parsed cell + portrayal). Returns PNG/PDF
-/// bytes (gpa-owned; free with freeBytes).
+/// bytes (gpa-owned; free with freeBytes). `highlight` (null for every other
+/// caller) pins one feature over the finished chart — see `Highlight`.
 pub fn renderCellView(
     cell: *s57.Cell,
     portrayal: ?[]const ?[]const u8,
@@ -1346,6 +1359,7 @@ pub fn renderCellView(
     palette: render.resolve.PaletteId,
     settings: *const render.resolve.MarinerSettings,
     output: render.pixel.Output,
+    highlight: ?Highlight,
 ) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1378,6 +1392,31 @@ pub fn renderCellView(
     var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, tile.EXTENT);
     ps.store = store.asStore();
     ps.output = output;
+
+    // Project the highlight's lon/lat (and bbox) into this view's canvas px so
+    // the surface can pin the selected feature over the finished chart. The view
+    // frame is standard web-mercator: `world` px span a normalised globe unit,
+    // the centre lon/lat maps to the canvas centre.
+    if (highlight) |hl| {
+        const world = 256.0 * std.math.pow(f64, 2.0, zoom);
+        const c = tile.lonLatToWorld(lon, lat);
+        const cw = @as(f64, @floatFromInt(w)) / 2.0;
+        const ch = @as(f64, @floatFromInt(h)) / 2.0;
+        const toPx = struct {
+            fn f(plon: f64, plat: f64, cc: [2]f64, wpx: f64, hw: f64, hh: f64) [2]f32 {
+                const p = tile.lonLatToWorld(plon, plat);
+                return .{ @floatCast((p[0] - cc[0]) * wpx + hw), @floatCast((p[1] - cc[1]) * wpx + hh) };
+            }
+        }.f;
+        const anchor = toPx(hl.lon, hl.lat, c, world, cw, ch);
+        var sh = render.pixel.ScreenHighlight{ .cx = anchor[0], .cy = anchor[1] };
+        if (hl.bbox) |b| {
+            const nw = toPx(b[0], b[3], c, world, cw, ch); // west,  north
+            const se = toPx(b[2], b[1], c, world, cw, ch); // east,  south
+            sh.bbox = .{ @min(nw[0], se[0]), @min(nw[1], se[1]), @max(nw[0], se[0]), @max(nw[1], se[1]) };
+        }
+        ps.highlight = sh;
+    }
 
     const one = [_]scene.CellRef{.{ .cell = cell, .portrayal = portrayal }};
     return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, false) catch error.TileGen;

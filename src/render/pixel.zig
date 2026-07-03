@@ -59,6 +59,28 @@ const Op = struct {
 
 pub const Output = enum { png, pdf };
 
+/// A selection HIGHLIGHT overlay painted ON TOP of the finished chart raster —
+/// the `explore --tui` live cell map sets it so the SELECTED feature stands out
+/// from every other charted feature. Coordinates are canvas px: the caller
+/// (`chart.renderCellView`) has already projected the feature's anchor lon/lat
+/// (and, for a line/area, its bbox) into this scene's pixel frame. Null (the
+/// default) leaves every other render — tiles, `renderView`, `renderFeature` —
+/// byte-for-byte unchanged.
+pub const ScreenHighlight = struct {
+    /// Feature anchor in canvas px: the ring + reticle centre (any geometry).
+    cx: f32,
+    cy: f32,
+    /// Line/area extent in canvas px [x0, y0, x1, y1] — a dashed box drawn
+    /// around the feature; null for a point (reticle only).
+    bbox: ?[4]f32 = null,
+};
+
+/// Highlight reticle colours: a hi-vis amber core over a near-black halo — a
+/// pairing that pops against the whole S-52 palette (blue sea, tan land, white
+/// safe water) and reads as a UI overlay, not chart content.
+const HL_CORE = cv.Color{ .r = 255, .g = 221, .b = 0 };
+const HL_HALO = cv.Color{ .r = 0, .g = 0, .b = 0, .a = 235 };
+
 pub const PixelSurface = struct {
     a: Allocator,
     colors: *const resolve.Colors,
@@ -86,6 +108,9 @@ pub const PixelSurface = struct {
     /// isolated single-feature thumbnail, which frames one feature on a solid
     /// sea/neutral fill.
     bg_token: ?[]const u8 = null,
+    /// Optional selection highlight painted over the finished raster (see
+    /// ScreenHighlight); null for every normal render.
+    highlight: ?ScreenHighlight = null,
     /// The embedded label face; null only if the embedded TTF fails to parse.
     fnt: ?fontmod.Font = null,
     glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
@@ -422,6 +447,54 @@ pub const PixelSurface = struct {
         };
     }
 
+    // Paint the selection HIGHLIGHT (if any) over the finished chart: a ring +
+    // crosshair reticle at the feature's anchor and, for a line/area, a dashed
+    // box around its extent. A hi-vis amber core over a near-black halo so it
+    // reads against any S-52 shade. Canvas-space; a no-op when unset, so every
+    // ordinary render is untouched.
+    fn drawHighlight(self: *PixelSurface, canvas: cv.Canvas) !void {
+        const hl = self.highlight orelse return;
+        const md: f32 = @floatFromInt(@min(self.w_px, self.h_px));
+        const r = std.math.clamp(md * 0.055, 12.0, 64.0); // ring radius
+        const gap = r * 0.42; // crosshair centre gap (the feature stays visible)
+        const arm = r * 1.85; // crosshair half-length
+        const core_w = std.math.clamp(md * 0.006, 1.5, 4.0);
+        const halo_w = core_w + std.math.clamp(md * 0.005, 1.5, 3.5);
+
+        // Reticle: a closed ring + four radial ticks (N/S/E/W).
+        const N = 48;
+        var ring: [N + 1]cv.Point = undefined;
+        for (0..N + 1) |i| {
+            const t = @as(f32, @floatFromInt(i)) * (2.0 * std.math.pi / @as(f32, N));
+            ring[i] = .{ .x = hl.cx + r * @cos(t), .y = hl.cy + r * @sin(t) };
+        }
+        const up = [_]cv.Point{ .{ .x = hl.cx, .y = hl.cy - gap }, .{ .x = hl.cx, .y = hl.cy - arm } };
+        const dn = [_]cv.Point{ .{ .x = hl.cx, .y = hl.cy + gap }, .{ .x = hl.cx, .y = hl.cy + arm } };
+        const lf = [_]cv.Point{ .{ .x = hl.cx - gap, .y = hl.cy }, .{ .x = hl.cx - arm, .y = hl.cy } };
+        const rt = [_]cv.Point{ .{ .x = hl.cx + gap, .y = hl.cy }, .{ .x = hl.cx + arm, .y = hl.cy } };
+        const reticle = [_][]const cv.Point{ &ring, &up, &dn, &lf, &rt };
+
+        // Halo (wide, dark) first, bright core last so the core sits inside it.
+        try canvas.strokePath(&reticle, halo_w, null, HL_HALO);
+
+        // Line/area extent box (dashed), padded a hair outside the geometry.
+        if (hl.bbox) |b| {
+            const pad = r * 0.25;
+            const box = [_]cv.Point{
+                .{ .x = b[0] - pad, .y = b[1] - pad },
+                .{ .x = b[2] + pad, .y = b[1] - pad },
+                .{ .x = b[2] + pad, .y = b[3] + pad },
+                .{ .x = b[0] - pad, .y = b[3] + pad },
+                .{ .x = b[0] - pad, .y = b[1] - pad },
+            };
+            const boxlines = [_][]const cv.Point{&box};
+            const dash = [2]f32{ 9.0 * core_w, 6.0 * core_w };
+            try canvas.strokePath(&boxlines, halo_w, dash, HL_HALO);
+            try canvas.strokePath(&boxlines, core_w, dash, HL_CORE);
+        }
+        try canvas.strokePath(&reticle, core_w, null, HL_CORE);
+    }
+
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const self = sp(ctx);
         // Paint order = the tile style's layer stack: class-major (see
@@ -470,6 +543,7 @@ pub const PixelSurface = struct {
                 // The isolated-feature thumbnail overrides this via bg_token.
                 rc.clear(self.resolveColor(self.bg_token orelse "NODTA"));
                 try self.paintOps(rc.asCanvas(), &dropped);
+                try self.drawHighlight(rc.asCanvas());
                 return png.encodeRgba(out, rc.px, rc.w, rc.h);
             },
             .pdf => {
@@ -486,6 +560,7 @@ pub const PixelSurface = struct {
                 const bg_rings = [_][]const cv.Point{&bg};
                 try canvas.fillPath(&bg_rings, self.resolveColor(self.bg_token orelse "NODTA"), .nonzero);
                 try self.paintOps(canvas, &dropped);
+                try self.drawHighlight(canvas);
                 return pc.finish(out);
             },
         }
@@ -694,4 +769,65 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     // painting: the collision set is internal, so assert via op count + the
     // deterministic sha of a scene where the drop changes pixels.)
     try std.testing.expectEqual(@as(usize, 2), ps.ops.items.len);
+}
+
+test "drawHighlight: reticle straddles the anchor, bbox adds a dashed box, hi-vis colours" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A recording Canvas: each strokePath call's colour, dash flag, and the
+    // bounding box of every point it drew.
+    const Rec = struct { color: cv.Color, dashed: bool, minx: f32, miny: f32, maxx: f32, maxy: f32 };
+    const Fake = struct {
+        recs: std.ArrayList(Rec),
+        alloc: Allocator,
+        const vt = cv.Canvas.VTable{ .fillPath = fillPath, .fillPattern = fillPattern, .strokePath = strokePath, .drawGlyphRun = drawGlyphRun };
+        fn fillPath(_: *anyopaque, _: []const []const cv.Point, _: cv.Color, _: cv.FillRule) anyerror!void {}
+        fn fillPattern(_: *anyopaque, _: []const []const cv.Point, _: *const cv.Pattern) anyerror!void {}
+        fn drawGlyphRun(_: *anyopaque, _: *const cv.GlyphRun) anyerror!void {}
+        fn strokePath(ctx: *anyopaque, lines: []const []const cv.Point, _: f32, dash: ?[2]f32, color: cv.Color) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            var r = Rec{ .color = color, .dashed = dash != null, .minx = 1e9, .miny = 1e9, .maxx = -1e9, .maxy = -1e9 };
+            for (lines) |ln| for (ln) |p| {
+                r.minx = @min(r.minx, p.x);
+                r.miny = @min(r.miny, p.y);
+                r.maxx = @max(r.maxx, p.x);
+                r.maxy = @max(r.maxy, p.y);
+            };
+            self.recs.append(self.alloc, r) catch {};
+        }
+    };
+
+    var colors = try resolve.Colors.init(a, test_profile);
+    const settings = resolve.MarinerSettings{};
+    var ps = PixelSurface.init(a, &colors, .day, &settings, 14.0, 400, 400);
+
+    // POINT: reticle only (no dashed box). Both halo + core passes straddle the
+    // anchor at (200,200).
+    var fake = Fake{ .recs = .empty, .alloc = a };
+    ps.highlight = .{ .cx = 200, .cy = 200 };
+    try ps.drawHighlight(.{ .ptr = &fake, .vtable = &Fake.vt });
+    var saw_core = false;
+    var saw_halo = false;
+    var saw_dash = false;
+    try std.testing.expect(fake.recs.items.len >= 2);
+    for (fake.recs.items) |r| {
+        if (std.meta.eql(r.color, HL_CORE)) saw_core = true;
+        if (std.meta.eql(r.color, HL_HALO)) saw_halo = true;
+        if (r.dashed) saw_dash = true;
+        try std.testing.expect(r.minx < 200 and r.maxx > 200 and r.miny < 200 and r.maxy > 200);
+    }
+    try std.testing.expect(saw_core and saw_halo and !saw_dash);
+
+    // LINE/AREA: the bbox adds a dashed extent box in the core colour.
+    var fake2 = Fake{ .recs = .empty, .alloc = a };
+    ps.highlight = .{ .cx = 200, .cy = 200, .bbox = .{ 120, 140, 280, 260 } };
+    try ps.drawHighlight(.{ .ptr = &fake2, .vtable = &Fake.vt });
+    var dashed_box = false;
+    for (fake2.recs.items) |r| {
+        if (r.dashed and std.meta.eql(r.color, HL_CORE)) dashed_box = true;
+    }
+    try std.testing.expect(dashed_box);
 }
