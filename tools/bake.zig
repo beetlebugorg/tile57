@@ -1599,6 +1599,7 @@ const THUMB_PX: u32 = 200;
 
 const ExRow = struct {
     cell_name: []const u8,
+    cell_id: usize = 0, // index into the source cell list (TUI lazy re-load); 0 for streaming
     index: usize, // feature index within its cell
     rcid: u32,
     foid: u64,
@@ -1611,6 +1612,26 @@ const ExRow = struct {
     parsed: ?engine.s101_instr.Portrayal, // level 2: parsed
     resolved: ?ExLevel3, // level 3
     thumb: ?ExThumb, // --kitty: where to render this feature's thumbnail (null = no geometry)
+};
+
+// One source cell in an explore run: the path (relative to the run's `dir`) to
+// re-read + re-parse on demand. The TUI holds one of these per cell so it can
+// lazily rebuild a selected feature's level-3 + thumbnail without keeping every
+// cell's heavy recorded-render pass resident.
+const ExCellSrc = struct { base_rel: []const u8 };
+
+// The TUI's per-feature INDEX entry: just enough to navigate + show levels 1+2.
+// It deliberately does NOT keep the structured attrs/raw/parsed portrayal or the
+// full portrayal stream (those are formatted into `det12` once and dropped), nor
+// any level-3 calls — level 3 + the kitty thumbnail are rebuilt lazily from the
+// re-parsed cell on selection. `index` is the feature's position within its cell,
+// `cell_id` indexes the cell source list.
+const ExIndexRow = struct {
+    class: []const u8, // filter key (S-57 acronym or "?<objl>")
+    label: []const u8, // left-pane list label
+    det12: []const []const u8, // pre-formatted levels 1+2 detail lines
+    cell_id: usize,
+    index: usize,
 };
 
 const ExFilters = struct {
@@ -1727,106 +1748,136 @@ fn exKey(a: std.mem.Allocator, class: []const u8, s57_json: []const u8) []const 
 
 const ExQueue = struct { idxs: std.ArrayList(usize) = .empty, head: usize = 0 };
 
-// Collect one parsed cell's features into `rows` (levels 1+2 always; level 3 when
-// do_resolve and the cell has bounds). Strings a Row keeps are duped into `a`, so
-// the caller may deinit the cell afterwards.
-fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8, rules: []const u8, F: ExFilters, rows: *std.ArrayList(ExRow)) !void {
-    // Level 2 — S-101 instruction streams, indexed by feature index.
-    const portrayal: ?[]const ?[]const u8 = engine.portray.portrayCell(a, cell, rules) catch null;
+// The whole-cell recording pass, indexed for per-feature level-3 lookup. Built
+// once per cell by exSetupResolve; the queue heads advance as kept features are
+// folded IN FEATURE ORDER (exFoldResolved), so the same cell must be folded in a
+// single ascending sweep (exProcessCell / exStreamCell / the TUI cell cache all do).
+const ExResolveCtx = struct {
+    recorded: []const render.inspect.RecordedFeature,
+    qmap: std.StringHashMap(ExQueue),
+    view: ExLevel3, // z/x/y of the sampled tile (calls empty; per-feature calls fold in)
+};
 
-    // Level 3 — drive the recording surface once over the whole cell, then index
-    // the recorded passes by fingerprint for per-feature lookup below.
-    var recorded: []const render.inspect.RecordedFeature = &.{};
+// Drive the recording surface once over the whole cell and index the recorded
+// passes by feature fingerprint. Returns null when resolving is disabled or the
+// cell has no bounds (level 3 unavailable). Everything is allocated into `a`
+// (the recorded `Call` lists carry the geometry — the memory-heavy part — so `a`
+// should be a per-cell arena that is reset before the next cell).
+fn exSetupResolve(a: std.mem.Allocator, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, F: ExFilters) ?ExResolveCtx {
+    if (!F.do_resolve) return null;
+    const b = cell.bounds() orelse return null;
+    const v = if (F.zoom) |zz| exTileAt(b, zz) else exFitTile(b, 19);
+    var is = render.inspect.InspectSurface.init(a);
+    const surf = is.asSurface();
+    surf.beginScene(v.z) catch {};
+    const one = [_]engine.scene.CellRef{.{ .cell = cell, .portrayal = portrayal }};
+    engine.scene.appendTile(surf, a, &one, v.z, v.x, v.y, true) catch {};
+    _ = surf.endScene(a) catch {};
     var qmap = std.StringHashMap(ExQueue).init(a);
-    var resolve_view: ?ExLevel3 = null;
-    if (F.do_resolve) {
-        if (cell.bounds()) |b| {
-            const v = if (F.zoom) |zz| exTileAt(b, zz) else exFitTile(b, 19);
-            var is = render.inspect.InspectSurface.init(a);
-            const surf = is.asSurface();
-            surf.beginScene(v.z) catch {};
-            const one = [_]engine.scene.CellRef{.{ .cell = cell, .portrayal = portrayal }};
-            engine.scene.appendTile(surf, a, &one, v.z, v.x, v.y, true) catch {};
-            _ = surf.endScene(a) catch {};
-            recorded = is.features.items;
-            for (recorded, 0..) |rf, ri| {
-                const key = exKey(a, rf.meta.class, rf.meta.s57_json);
-                const gop = try qmap.getOrPut(key);
-                if (!gop.found_existing) gop.value_ptr.* = .{};
-                try gop.value_ptr.idxs.append(a, ri);
+    const recorded = is.features.items;
+    for (recorded, 0..) |rf, ri| {
+        const key = exKey(a, rf.meta.class, rf.meta.s57_json);
+        const gop = qmap.getOrPut(key) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.idxs.append(a, ri) catch {};
+    }
+    return .{ .recorded = recorded, .qmap = qmap, .view = v };
+}
+
+// Level 3 for one feature: fold its consecutive recorded passes (boundary/point
+// variant passes + constructed sector figures are emitted adjacently) into one
+// call list, CONSUMING the fingerprint queue. Must be called in feature order for
+// the cell's kept features. Caveat: two neighbouring features that share a class
+// AND identical attributes (mostly attribute-less areas like LNDARE) can merge —
+// attributed features (the tool's focus) are distinct, so this is exact for them.
+fn exFoldResolved(a: std.mem.Allocator, f: engine.s57.Feature, class: ?[]const u8, ctx: *ExResolveCtx) !ExLevel3 {
+    var matched = false;
+    var call_items: []const render.inspect.Call = &.{};
+    if (class) |cls| {
+        const s57_json = engine.scene.encodeS57Attrs(a, f) catch "";
+        const key = exKey(a, cls, s57_json);
+        if (ctx.qmap.getPtr(key)) |q| if (q.head < q.idxs.items.len) {
+            var calls = std.ArrayList(render.inspect.Call).empty;
+            var idx = q.idxs.items[q.head];
+            q.head += 1;
+            try calls.appendSlice(a, ctx.recorded[idx].calls.items);
+            while (q.head < q.idxs.items.len and q.idxs.items[q.head] == idx + 1) {
+                idx = q.idxs.items[q.head];
+                q.head += 1;
+                try calls.appendSlice(a, ctx.recorded[idx].calls.items);
             }
-            resolve_view = v;
-        }
+            matched = true;
+            call_items = calls.items;
+        };
+    }
+    return .{ .calls = call_items, .z = ctx.view.z, .x = ctx.view.x, .y = ctx.view.y, .matched = matched };
+}
+
+// Whether a feature passes the class/object filters (the shared gate used by the
+// count pre-pass, the streaming emit and the TUI index/cache — kept identical so
+// output byte-for-byte matches across paths).
+fn exPasses(F: ExFilters, class: ?[]const u8, f: engine.s57.Feature, fi: usize) bool {
+    if (F.classes) |cl| {
+        if (class == null or !exClassMatches(cl, class.?)) return false;
+    }
+    if (F.obj) |want| {
+        if (fi != want and f.rcid != want and f.foid != want) return false;
+    }
+    return true;
+}
+
+// Build one feature's ExRow (all three levels) into `a`. Strings are duped into
+// `a`, so the cell may be freed afterwards. `ctx` (when non-null) is consumed in
+// feature order — the caller must invoke this for kept features in ascending index
+// order. Assumes the feature already passed the filters (exPasses).
+fn exBuildRow(a: std.mem.Allocator, cell: *engine.s57.Cell, cell_name: []const u8, cell_id: usize, fi: usize, f: engine.s57.Feature, class: ?[]const u8, portrayal: ?[]const ?[]const u8, ctx: ?*ExResolveCtx, F: ExFilters) !ExRow {
+    var attrs = std.ArrayList(ExAttr).empty;
+    for (f.attrs) |at| {
+        const acr = engine.catalogue.attrAcronym(at.code) orelse
+            std.fmt.allocPrint(a, "?{d}", .{at.code}) catch "?";
+        try attrs.append(a, .{ .acr = acr, .code = at.code, .value = try a.dupe(u8, std.mem.trim(u8, at.value, " ")) });
     }
 
+    const raw: ?[]const u8 = if (portrayal) |p| (if (fi < p.len) p[fi] else null) else null;
+    const parsed: ?engine.s101_instr.Portrayal = if (raw) |s| (engine.s101_instr.parse(a, s) catch null) else null;
+
+    const resolved: ?ExLevel3 = if (ctx) |c| try exFoldResolved(a, f, class, c) else null;
+    const thumb: ?ExThumb = if (F.kitty) exThumbView(a, cell, f) else null;
+
+    return .{
+        .cell_name = cell_name,
+        .cell_id = cell_id,
+        .index = fi,
+        .rcid = f.rcid,
+        .foid = f.foid,
+        .prim = f.prim,
+        .objl = f.objl,
+        .class = class orelse (std.fmt.allocPrint(a, "?{d}", .{f.objl}) catch "?"),
+        .s101 = engine.catalogue.resolveFeatureByObjl(f.objl) orelse "",
+        .attrs = attrs.items,
+        .raw = raw,
+        .parsed = parsed,
+        .resolved = resolved,
+        .thumb = thumb,
+    };
+}
+
+// Collect one parsed cell's features into `rows` (levels 1+2 always; level 3 when
+// do_resolve and the cell has bounds). Strings a Row keeps are duped into `a`, so
+// the caller may deinit the cell afterwards. Used to build the TUI's lightweight
+// feature index (with F.do_resolve = false, F.kitty = false — level 3 + thumbs are
+// computed lazily on selection); console/JSON stream per feature via exStreamCell.
+fn exProcessCell(a: std.mem.Allocator, cell: *engine.s57.Cell, name: []const u8, rules: []const u8, F: ExFilters, cell_id: usize, rows: *std.ArrayList(ExRow)) !void {
+    const portrayal: ?[]const ?[]const u8 = engine.portray.portrayCell(a, cell, rules) catch null;
+    var ctx_storage = exSetupResolve(a, cell, portrayal, F);
+    const ctx: ?*ExResolveCtx = if (ctx_storage) |*c| c else null;
     const cell_name = try a.dupe(u8, if (name.len > 0) name else cell.name);
 
     for (cell.features, 0..) |f, fi| {
         const class = engine.catalogue.acronymByObjl(f.objl);
-        if (F.classes) |cl| {
-            if (class == null or !exClassMatches(cl, class.?)) continue;
-        }
-        if (F.obj) |want| {
-            if (fi != want and f.rcid != want and f.foid != want) continue;
-        }
-
-        var attrs = std.ArrayList(ExAttr).empty;
-        for (f.attrs) |at| {
-            const acr = engine.catalogue.attrAcronym(at.code) orelse
-                std.fmt.allocPrint(a, "?{d}", .{at.code}) catch "?";
-            try attrs.append(a, .{ .acr = acr, .code = at.code, .value = try a.dupe(u8, std.mem.trim(u8, at.value, " ")) });
-        }
-
-        const raw: ?[]const u8 = if (portrayal) |p| (if (fi < p.len) p[fi] else null) else null;
-        const parsed: ?engine.s101_instr.Portrayal = if (raw) |s| (engine.s101_instr.parse(a, s) catch null) else null;
-
-        var resolved: ?ExLevel3 = null;
-        if (resolve_view) |lv| {
-            var matched = false;
-            var call_items: []const render.inspect.Call = &.{};
-            if (class) |cls| {
-                const s57_json = engine.scene.encodeS57Attrs(a, f) catch "";
-                const key = exKey(a, cls, s57_json);
-                if (qmap.getPtr(key)) |q| if (q.head < q.idxs.items.len) {
-                    // Fold this feature's consecutive recorded passes (boundary/point
-                    // variant passes + constructed sector figures are emitted adjacently)
-                    // into one call list. Caveat: two neighbouring features that share a
-                    // class AND identical attributes (mostly attribute-less areas like
-                    // LNDARE) can merge — attributed features (the tool's focus) are
-                    // distinct, so this is exact for them.
-                    var calls = std.ArrayList(render.inspect.Call).empty;
-                    var idx = q.idxs.items[q.head];
-                    q.head += 1;
-                    try calls.appendSlice(a, recorded[idx].calls.items);
-                    while (q.head < q.idxs.items.len and q.idxs.items[q.head] == idx + 1) {
-                        idx = q.idxs.items[q.head];
-                        q.head += 1;
-                        try calls.appendSlice(a, recorded[idx].calls.items);
-                    }
-                    matched = true;
-                    call_items = calls.items;
-                };
-            }
-            resolved = .{ .calls = call_items, .z = lv.z, .x = lv.x, .y = lv.y, .matched = matched };
-        }
-
-        const thumb: ?ExThumb = if (F.kitty) exThumbView(a, cell, f) else null;
-
-        try rows.append(a, .{
-            .cell_name = cell_name,
-            .index = fi,
-            .rcid = f.rcid,
-            .foid = f.foid,
-            .prim = f.prim,
-            .objl = f.objl,
-            .class = class orelse (std.fmt.allocPrint(a, "?{d}", .{f.objl}) catch "?"),
-            .s101 = engine.catalogue.resolveFeatureByObjl(f.objl) orelse "",
-            .attrs = attrs.items,
-            .raw = raw,
-            .parsed = parsed,
-            .resolved = resolved,
-            .thumb = thumb,
-        });
+        if (!exPasses(F, class, f, fi)) continue;
+        const row = try exBuildRow(a, cell, cell_name, cell_id, fi, f, class, portrayal, ctx, F);
+        try rows.append(a, row);
     }
 }
 
@@ -1870,11 +1921,14 @@ fn exAppendCall(a: std.mem.Allocator, out: *std.ArrayList(u8), call: render.insp
     }
 }
 
-// The full three-level detail for one feature as plain text (shared by the
-// console dump and the TUI right pane).
-fn exFormatDetail(a: std.mem.Allocator, row: ExRow) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
+// The per-feature detail is emitted in two parts so the TUI can keep only levels
+// 1+2 resident and format level 3 lazily on selection; the console streamer calls
+// both back-to-back for the classic full dump.
 
+// Levels 1+2 (header + S-57 attributes + S-101 portrayal) — cheap, and the only
+// part the TUI keeps resident per feature. Level 3 (exFormatLevel3) is appended
+// lazily on selection.
+fn exFormatDetail12(a: std.mem.Allocator, out: *std.ArrayList(u8), row: ExRow) !void {
     try out.print(a, "[{s} #{d}] {s}", .{ row.cell_name, row.index, row.class });
     if (row.s101.len > 0) try out.print(a, " ({s})", .{row.s101});
     try out.print(a, "  prim={s} objl={d} rcid={d}", .{ exPrimName(row.prim), row.objl, row.rcid });
@@ -1916,23 +1970,24 @@ fn exFormatDetail(a: std.mem.Allocator, row: ExRow) ![]const u8 {
             try out.print(a, "       augmented: {d} ray(s), {d} arc(s) (light sector figure)\n", .{ rays, arcs });
         }
     }
+}
 
-    // Level 3 — resolved Surface calls.
+// Level 3 — resolved Surface calls (from an already-folded ExLevel3, or null when
+// resolving is disabled / the cell has no bounds).
+fn exFormatLevel3(a: std.mem.Allocator, out: *std.ArrayList(u8), resolved: ?ExLevel3) !void {
     try out.appendSlice(a, "  3. Resolved Surface calls:\n");
-    if (row.resolved) |lo| {
+    if (resolved) |lo| {
         if (!lo.matched) {
             try out.print(a, "     (not in the sampled tile z{d} {d}/{d}/{d}; use --zoom to sample a tile it covers)\n", .{ lo.z, lo.z, lo.x, lo.y });
         } else if (lo.calls.len == 0) {
             try out.print(a, "     (no draw calls at z{d} tile {d}/{d}/{d} — gated or geometry clipped)\n", .{ lo.z, lo.z, lo.x, lo.y });
         } else {
             try out.print(a, "     (z{d} tile {d}/{d}/{d})\n", .{ lo.z, lo.z, lo.x, lo.y });
-            for (lo.calls) |c| try exAppendCall(a, &out, c);
+            for (lo.calls) |c| try exAppendCall(a, out, c);
         }
     } else {
         try out.appendSlice(a, "     (resolving disabled / cell has no bounds)\n");
     }
-
-    return out.items;
 }
 
 fn exJsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
@@ -1946,55 +2001,50 @@ fn exJsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void
     try out.append(a, '"');
 }
 
-fn exWriteJson(a: std.mem.Allocator, rows: []const ExRow) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    try out.appendSlice(a, "[");
-    for (rows, 0..) |row, i| {
-        if (i > 0) try out.appendSlice(a, ",\n");
-        try out.print(a, "{{\"cell\":\"{s}\",\"index\":{d},\"rcid\":{d},\"foid\":\"{x}\",\"prim\":\"{s}\",\"objl\":{d},\"class\":", .{ row.cell_name, row.index, row.rcid, row.foid, exPrimName(row.prim), row.objl });
-        try exJsonStr(a, &out, row.class);
-        try out.appendSlice(a, ",\"s101\":");
-        try exJsonStr(a, &out, row.s101);
-        // Level 1.
-        try out.appendSlice(a, ",\"attrs\":{");
-        for (row.attrs, 0..) |at, j| {
-            if (j > 0) try out.append(a, ',');
-            try exJsonStr(a, &out, at.acr);
-            try out.append(a, ':');
-            try exJsonStr(a, &out, at.value);
-        }
-        try out.appendSlice(a, "}");
-        // Level 2.
-        try out.appendSlice(a, ",\"portrayal_raw\":");
-        if (row.raw) |raw| try exJsonStr(a, &out, raw) else try out.appendSlice(a, "null");
-        if (row.parsed) |p| {
-            try out.print(a, ",\"portrayal\":{{\"prio\":{d},\"cat\":\"{s}\",\"vg\":{d},\"fill\":", .{ p.draw_prio, exCatName(p.cat), p.vg });
-            if (p.fill_token) |t| try exJsonStr(a, &out, t) else try out.appendSlice(a, "null");
-            try out.appendSlice(a, ",\"symbols\":[");
-            for (p.points, 0..) |pt, j| {
-                if (j > 0) try out.append(a, ',');
-                try exJsonStr(a, &out, pt.symbol);
-            }
-            try out.appendSlice(a, "],\"texts\":[");
-            for (p.texts, 0..) |tx, j| {
-                if (j > 0) try out.append(a, ',');
-                try exJsonStr(a, &out, tx.text);
-            }
-            try out.print(a, "],\"lines\":{d},\"patterns\":{d},\"aug_figures\":{d}}}", .{ p.lines.len, p.patterns.len, p.aug_figures.len });
-        } else try out.appendSlice(a, ",\"portrayal\":null");
-        // Level 3.
-        if (row.resolved) |lo| {
-            try out.print(a, ",\"resolved\":{{\"z\":{d},\"x\":{d},\"y\":{d},\"matched\":{},\"calls\":[", .{ lo.z, lo.x, lo.y, lo.matched });
-            for (lo.calls, 0..) |c, j| {
-                if (j > 0) try out.append(a, ',');
-                try exJsonStr(a, &out, @tagName(std.meta.activeTag(c)));
-            }
-            try out.appendSlice(a, "]}");
-        } else try out.appendSlice(a, ",\"resolved\":null");
-        try out.appendSlice(a, "}");
+// One feature as a JSON object (no surrounding array / comma — the streaming
+// caller writes `[`, the `,\n` separators and the closing `]\n`).
+fn exWriteJsonRow(a: std.mem.Allocator, out: *std.ArrayList(u8), row: ExRow) !void {
+    try out.print(a, "{{\"cell\":\"{s}\",\"index\":{d},\"rcid\":{d},\"foid\":\"{x}\",\"prim\":\"{s}\",\"objl\":{d},\"class\":", .{ row.cell_name, row.index, row.rcid, row.foid, exPrimName(row.prim), row.objl });
+    try exJsonStr(a, out, row.class);
+    try out.appendSlice(a, ",\"s101\":");
+    try exJsonStr(a, out, row.s101);
+    // Level 1.
+    try out.appendSlice(a, ",\"attrs\":{");
+    for (row.attrs, 0..) |at, j| {
+        if (j > 0) try out.append(a, ',');
+        try exJsonStr(a, out, at.acr);
+        try out.append(a, ':');
+        try exJsonStr(a, out, at.value);
     }
-    try out.appendSlice(a, "]\n");
-    return out.items;
+    try out.appendSlice(a, "}");
+    // Level 2.
+    try out.appendSlice(a, ",\"portrayal_raw\":");
+    if (row.raw) |raw| try exJsonStr(a, out, raw) else try out.appendSlice(a, "null");
+    if (row.parsed) |p| {
+        try out.print(a, ",\"portrayal\":{{\"prio\":{d},\"cat\":\"{s}\",\"vg\":{d},\"fill\":", .{ p.draw_prio, exCatName(p.cat), p.vg });
+        if (p.fill_token) |t| try exJsonStr(a, out, t) else try out.appendSlice(a, "null");
+        try out.appendSlice(a, ",\"symbols\":[");
+        for (p.points, 0..) |pt, j| {
+            if (j > 0) try out.append(a, ',');
+            try exJsonStr(a, out, pt.symbol);
+        }
+        try out.appendSlice(a, "],\"texts\":[");
+        for (p.texts, 0..) |tx, j| {
+            if (j > 0) try out.append(a, ',');
+            try exJsonStr(a, out, tx.text);
+        }
+        try out.print(a, "],\"lines\":{d},\"patterns\":{d},\"aug_figures\":{d}}}", .{ p.lines.len, p.patterns.len, p.aug_figures.len });
+    } else try out.appendSlice(a, ",\"portrayal\":null");
+    // Level 3.
+    if (row.resolved) |lo| {
+        try out.print(a, ",\"resolved\":{{\"z\":{d},\"x\":{d},\"y\":{d},\"matched\":{},\"calls\":[", .{ lo.z, lo.x, lo.y, lo.matched });
+        for (lo.calls, 0..) |c, j| {
+            if (j > 0) try out.append(a, ',');
+            try exJsonStr(a, out, @tagName(std.meta.activeTag(c)));
+        }
+        try out.appendSlice(a, "]}");
+    } else try out.appendSlice(a, ",\"resolved\":null");
+    try out.appendSlice(a, "}");
 }
 
 // Read a base cell's sequential .001.. update files from `dir` (auto-discovery,
@@ -2012,19 +2062,116 @@ fn exReadUpdates(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []
     return list.items;
 }
 
-// Parse `base_rel` from `dir` (with its updates) and collect its features.
-fn exLoadCell(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []const u8, rules: []const u8, F: ExFilters, rows: *std.ArrayList(ExRow)) void {
+// Parse `base_rel` from `dir` (with its updates) into `a`. All cell allocations
+// (bytes, updates, the parsed Cell + its child arena/maps) live in `a`, so the
+// caller reclaims them by resetting `a` — no cell.deinit() needed. `quiet`
+// suppresses the read/parse diagnostics for the throwaway count pre-pass.
+fn exParseCellFrom(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []const u8, quiet: bool) ?engine.s57.Cell {
     const base = dir.readFileAlloc(io, base_rel, a, .unlimited) catch {
-        std.debug.print("cannot read {s}\n", .{base_rel});
-        return;
+        if (!quiet) std.debug.print("cannot read {s}\n", .{base_rel});
+        return null;
     };
     const updates = exReadUpdates(io, a, dir, base_rel);
-    var cell = engine.s57.parseCellWithUpdates(a, base, updates) catch {
-        std.debug.print("cannot parse {s}\n", .{base_rel});
-        return;
+    return engine.s57.parseCellWithUpdates(a, base, updates) catch {
+        if (!quiet) std.debug.print("cannot parse {s}\n", .{base_rel});
+        return null;
     };
-    defer cell.deinit();
-    exProcessCell(a, &cell, std.fs.path.basename(base_rel), rules, F, rows) catch {};
+}
+
+// The count pre-pass for the multi-cell console header ("N feature(s)"): parse the
+// cell into `a` and count features passing the filters, WITHOUT portrayal or the
+// recording surface. Cheap + memory-bounded (the caller resets `a` after).
+fn exCountCell(io: std.Io, a: std.mem.Allocator, dir: std.Io.Dir, base_rel: []const u8, F: ExFilters) usize {
+    // quiet: a broken cell is reported once, by the heavy streaming pass that follows.
+    const cell = exParseCellFrom(io, a, dir, base_rel, true) orelse return 0;
+    var n: usize = 0;
+    for (cell.features, 0..) |f, fi| {
+        if (exPasses(F, engine.catalogue.acronymByObjl(f.objl), f, fi)) n += 1;
+    }
+    return n;
+}
+
+// A small buffered sink over stdout: append into a reusable buffer and flush in
+// ~64 KiB chunks (and at teardown), so the explore dump streams out instead of
+// materialising the whole thing in one giant ArrayList. The buffer backing lives
+// in a long-lived allocator (the process arena); clearRetainingCapacity reuses it.
+const OutBuf = struct {
+    io: std.Io,
+    f: std.Io.File,
+    a: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+
+    const FLUSH_AT: usize = 1 << 16;
+
+    fn write(self: *OutBuf, bytes: []const u8) void {
+        self.buf.appendSlice(self.a, bytes) catch {
+            // On OOM growing the buffer, flush what we have and write directly.
+            self.flush();
+            self.f.writeStreamingAll(self.io, bytes) catch {};
+            return;
+        };
+        if (self.buf.items.len >= FLUSH_AT) self.flush();
+    }
+    fn flush(self: *OutBuf) void {
+        if (self.buf.items.len == 0) return;
+        self.f.writeStreamingAll(self.io, self.buf.items) catch {};
+        self.buf.clearRetainingCapacity();
+    }
+};
+
+const ExOut = enum { console, json };
+
+const EX_SEP = "\n────────────────────────────────────────────────────────────────\n";
+
+// Stream one cell's matching features to `out` (console detail or JSON objects),
+// building each feature's ExRow in `fa_arena` (reset per feature) and the whole-
+// cell portrayal + recording pass in `ca_arena` (the caller resets it before the
+// next cell). Peak memory = ONE cell, never the whole source. The JSON `first`
+// flag carries comma state across cells.
+fn exStreamCell(
+    ca_arena: *std.heap.ArenaAllocator,
+    fa_arena: *std.heap.ArenaAllocator,
+    cell: *engine.s57.Cell,
+    name: []const u8,
+    rules: []const u8,
+    F: ExFilters,
+    mode: ExOut,
+    out: *OutBuf,
+    first: *bool,
+    chart_h: ?*chart.Chart,
+    palette: render.resolve.PaletteId,
+    m: *const render.resolve.MarinerSettings,
+) !void {
+    const ca = ca_arena.allocator();
+    const portrayal: ?[]const ?[]const u8 = engine.portray.portrayCell(ca, cell, rules) catch null;
+    var ctx_storage = exSetupResolve(ca, cell, portrayal, F);
+    const ctx: ?*ExResolveCtx = if (ctx_storage) |*c| c else null;
+    const cell_name = try ca.dupe(u8, if (name.len > 0) name else cell.name);
+
+    for (cell.features, 0..) |f, fi| {
+        const class = engine.catalogue.acronymByObjl(f.objl);
+        if (!exPasses(F, class, f, fi)) continue;
+
+        _ = fa_arena.reset(.retain_capacity);
+        const fa = fa_arena.allocator();
+        const row = try exBuildRow(fa, cell, cell_name, 0, fi, f, class, portrayal, ctx, F);
+
+        var chunk = std.ArrayList(u8).empty;
+        switch (mode) {
+            .console => {
+                try chunk.appendSlice(fa, EX_SEP);
+                try exFormatDetail12(fa, &chunk, row);
+                try exFormatLevel3(fa, &chunk, row.resolved);
+                if (F.kitty) try exAppendThumb(fa, &chunk, chart_h, row, palette, m);
+            },
+            .json => {
+                if (!first.*) try chunk.appendSlice(fa, ",\n");
+                try exWriteJsonRow(fa, &chunk, row);
+                first.* = false;
+            },
+        }
+        out.write(chunk.items);
+    }
 }
 
 fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -2079,46 +2226,131 @@ fn runExplore(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !voi
         if (chart_h == null) std.debug.print("note: --kitty could not open {s} for rendering; showing text only\n", .{path});
     }
 
-    var rows = std.ArrayList(ExRow).empty;
+    // Collect the source cell list (one .000, or every *.000 under an ENC_ROOT).
+    // `dir` stays open for the whole run (the TUI re-reads cells on demand).
+    var dir: std.Io.Dir = undefined;
+    var cell_paths = std.ArrayList([]const u8).empty;
     if (std.mem.endsWith(u8, path, ".000")) {
         const dirp = std.fs.path.dirname(path) orelse ".";
-        var dir = std.Io.Dir.cwd().openDir(io, dirp, .{}) catch return usageErr("cannot open cell directory");
-        defer dir.close(io);
-        exLoadCell(io, a, dir, std.fs.path.basename(path), rules, F, &rows);
+        dir = std.Io.Dir.cwd().openDir(io, dirp, .{}) catch return usageErr("cannot open cell directory");
+        try cell_paths.append(a, try a.dupe(u8, std.fs.path.basename(path)));
     } else {
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return usageErr("source must be a .000 file or an ENC_ROOT directory");
-        defer dir.close(io);
+        dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return usageErr("source must be a .000 file or an ENC_ROOT directory");
         var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
         defer walker.deinit();
         while (walker.next(io) catch null) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
-            exLoadCell(io, a, dir, entry.path, rules, F, &rows);
+            try cell_paths.append(a, try a.dupe(u8, entry.path));
         }
     }
+    defer dir.close(io);
 
-    if (rows.items.len == 0) {
+    // Per-cell scratch (heavy: parse + portrayal + recording surface) reset before
+    // every cell, and a per-feature scratch reset before every feature — both backed
+    // by the page allocator so freed pages return to the OS. Peak stays at ONE cell
+    // regardless of how big the ENC_ROOT is.
+    var cell_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer cell_arena.deinit();
+    var feat_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer feat_arena.deinit();
+
+    // --- TUI: build only the lightweight feature INDEX (levels 1+2) resident; the
+    //     level-3 resolve + kitty thumbnail are computed lazily per selection. ---
+    if (tui) {
+        var index_F = F;
+        index_F.do_resolve = false; // level 3 is lazy (per selection)
+        index_F.kitty = false; // thumbnails are lazy (per selection)
+        // Build the lightweight index: parse + portray each cell in the per-cell
+        // scratch (freed after), keeping only the formatted levels-1+2 lines + label
+        // on the process arena. Peak during the build stays at one cell; the resident
+        // index scales with feature COUNT (text), not with geometry.
+        var index = std.ArrayList(ExIndexRow).empty;
+        for (cell_paths.items, 0..) |base_rel, cid| {
+            _ = cell_arena.reset(.free_all);
+            const ca = cell_arena.allocator();
+            var cell = exParseCellFrom(io, ca, dir, base_rel, false) orelse continue;
+            var rows = std.ArrayList(ExRow).empty; // transient (scratch)
+            exProcessCell(ca, &cell, std.fs.path.basename(base_rel), rules, index_F, cid, &rows) catch {};
+            for (rows.items) |row| {
+                var d = std.ArrayList(u8).empty;
+                exFormatDetail12(a, &d, row) catch continue;
+                index.append(a, .{
+                    .class = a.dupe(u8, row.class) catch continue,
+                    .label = a.dupe(u8, exLabel(ca, row)) catch continue,
+                    .det12 = splitLines(a, d.items) catch continue,
+                    .cell_id = cid,
+                    .index = row.index,
+                }) catch {};
+            }
+        }
+        _ = cell_arena.reset(.free_all);
+        if (index.items.len == 0) {
+            std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
+            return;
+        }
+        var cells = std.ArrayList(ExCellSrc).empty;
+        for (cell_paths.items) |bp| try cells.append(a, .{ .base_rel = bp });
+        return exploreTui(io, a, index.items, cells.items, dir, rules, F, kitty, chart_h, palette, &m);
+    }
+
+    // --- Non-TUI: stream each cell's features straight to a buffered stdout, one
+    //     cell resident at a time. ---
+    var outbuf = OutBuf{ .io = io, .f = std.Io.File.stdout(), .a = a };
+    defer outbuf.flush();
+    outbuf.buf.ensureTotalCapacity(a, OutBuf.FLUSH_AT) catch {};
+
+    if (json) {
+        outbuf.write("[");
+        var first = true;
+        for (cell_paths.items) |base_rel| {
+            _ = cell_arena.reset(.free_all);
+            var cell = exParseCellFrom(io, cell_arena.allocator(), dir, base_rel, false) orelse continue;
+            exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .json, &outbuf, &first, chart_h, palette, &m) catch {};
+        }
+        outbuf.write("]\n");
+        return;
+    }
+
+    // Console. The header ("N feature(s)") needs the grand total up front: a single
+    // cell yields it from its own filter pass (one parse); an ENC_ROOT gets it from a
+    // cheap parse-only count pre-pass — byte-identical output, at the cost of parsing
+    // each cell twice (the heavy portrayal + recording still run only once).
+    var first = true;
+    if (cell_paths.items.len == 1) {
+        _ = cell_arena.reset(.free_all);
+        var cell = exParseCellFrom(io, cell_arena.allocator(), dir, cell_paths.items[0], false) orelse {
+            std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
+            return;
+        };
+        var total: usize = 0;
+        for (cell.features, 0..) |fe, fi| {
+            if (exPasses(F, engine.catalogue.acronymByObjl(fe.objl), fe, fi)) total += 1;
+        }
+        if (total == 0) {
+            std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
+            return;
+        }
+        outbuf.write(std.fmt.allocPrint(a, "{d} feature(s)\n", .{total}) catch "");
+        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(cell_paths.items[0]), rules, F, .console, &outbuf, &first, chart_h, palette, &m) catch {};
+        return;
+    }
+
+    var total: usize = 0;
+    for (cell_paths.items) |base_rel| {
+        _ = cell_arena.reset(.free_all);
+        total += exCountCell(io, cell_arena.allocator(), dir, base_rel, F);
+    }
+    if (total == 0) {
         std.debug.print("no matching features (source opened, but nothing passed the filters)\n", .{});
         return;
     }
-
-    if (tui) return exploreTui(io, a, rows.items, kitty, chart_h, palette, &m);
-
-    var stdout = std.Io.File.stdout();
-    if (json) {
-        const j = try exWriteJson(a, rows.items);
-        stdout.writeStreamingAll(io, j) catch {};
-        return;
+    outbuf.write(std.fmt.allocPrint(a, "{d} feature(s)\n", .{total}) catch "");
+    for (cell_paths.items) |base_rel| {
+        _ = cell_arena.reset(.free_all);
+        var cell = exParseCellFrom(io, cell_arena.allocator(), dir, base_rel, false) orelse continue;
+        exStreamCell(&cell_arena, &feat_arena, &cell, std.fs.path.basename(base_rel), rules, F, .console, &outbuf, &first, chart_h, palette, &m) catch {};
     }
-
-    var out = std.ArrayList(u8).empty;
-    try out.print(a, "{d} feature(s)\n", .{rows.items.len});
-    for (rows.items) |row| {
-        try out.appendSlice(a, "\n────────────────────────────────────────────────────────────────\n");
-        try out.appendSlice(a, try exFormatDetail(a, row));
-        if (kitty) try exAppendThumb(a, &out, chart_h, row, palette, &m);
-    }
-    stdout.writeStreamingAll(io, out.items) catch {};
 }
 
 // Console `--kitty`: after a row's text dump, append a one-line caption + the
@@ -2155,7 +2387,7 @@ fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), c: ?*chart.Chart
 // RESOLVED render is placed as a kitty-graphics thumbnail in the top-right of the
 // detail pane (transmit-once-per-selection + place, deleted each frame — the same
 // cached-region pattern as the ascii kitty TUI, so it never scrolls the layout).
-fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool, chart_h: ?*chart.Chart, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
+fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, chart_h: ?*chart.Chart, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
     const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
@@ -2174,13 +2406,25 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool
     const thumb_id: u32 = 1;
     var thumb_sel: ?usize = null; // rows[] index currently transmitted into the store
 
-    // Pre-format each feature's label + detail-lines once (rows are immutable).
-    const labels = try a.alloc([]const u8, rows.len);
-    const details = try a.alloc([]const []const u8, rows.len);
-    for (rows, 0..) |row, i| {
-        labels[i] = exLabel(a, row);
-        details[i] = try splitLines(a, try exFormatDetail(a, row));
-    }
+    // The resident index (rows) already carries each feature's label + LEVELS 1+2
+    // detail lines. Level 3 (resolved calls) + the kitty thumbnail are computed
+    // LAZILY per selection below — never held for every feature.
+
+    // Lazy level-3/thumbnail state. `sel_arena` caches ONE cell's re-parse +
+    // recording + folded resolved calls (rebuilt only when the selection crosses to
+    // another cell). `det_arena` holds just the currently-shown feature's level-3
+    // text + line list (rebuilt when the selection moves). Both page-backed so their
+    // resets return memory to the OS. This is what keeps a 3000+-feature cell viable.
+    var sel_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer sel_arena.deinit();
+    var det_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer det_arena.deinit();
+    const need_cell = F.do_resolve or do_kitty; // no re-parse needed if neither
+    var cached_cell: ?usize = null;
+    var resolved_by_fi: []?ExLevel3 = &.{}; // current cell, indexed by feature index
+    var thumb_by_fi: []?ExThumb = &.{};
+    var cur_det: []const []const u8 = &.{}; // detail lines for the current selection
+    var det_gi: ?usize = null; // rows[] index cur_det was built for
 
     var filt_buf: [64]u8 = undefined;
     var filt_len: usize = 0;
@@ -2201,6 +2445,68 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool
             sel = 0;
         } else if (sel >= view.items.len) sel = view.items.len - 1;
 
+        // Rebuild the selected feature's detail (levels 1+2 resident + level 3 lazy)
+        // whenever the selection moves. On a cell crossing this re-parses + re-records
+        // that cell once (cached for intra-cell navigation).
+        const gi: ?usize = if (view.items.len > 0) view.items[sel] else null;
+        if (det_gi == null or gi == null or det_gi.? != gi.?) {
+            det_gi = gi;
+            if (gi) |g| {
+                const row = rows[g];
+                if (need_cell and (cached_cell == null or cached_cell.? != row.cell_id) and row.cell_id < cells.len) {
+                    _ = sel_arena.reset(.free_all);
+                    cached_cell = null;
+                    resolved_by_fi = &.{};
+                    thumb_by_fi = &.{};
+                    const sa = sel_arena.allocator();
+                    if (exParseCellFrom(io, sa, dir, cells[row.cell_id].base_rel, true)) |cell_val| {
+                        var cell = cell_val;
+                        const portrayal = engine.portray.portrayCell(sa, &cell, rules) catch null;
+                        var ctx_storage = exSetupResolve(sa, &cell, portrayal, F);
+                        const ctx: ?*ExResolveCtx = if (ctx_storage) |*cc| cc else null;
+                        var rbf: []?ExLevel3 = &.{};
+                        if (sa.alloc(?ExLevel3, cell.features.len)) |buf| {
+                            rbf = buf;
+                            @memset(rbf, null);
+                        } else |_| {}
+                        var tbf: []?ExThumb = &.{};
+                        if (do_kitty) {
+                            if (sa.alloc(?ExThumb, cell.features.len)) |buf| {
+                                tbf = buf;
+                                @memset(tbf, null);
+                            } else |_| {}
+                        }
+                        // Fold every kept feature IN ORDER (the queue consumes in feature
+                        // order, exactly as the console path does), so a random-access
+                        // lookup by feature index is byte-identical to the eager dump.
+                        for (cell.features, 0..) |fe, cfi| {
+                            const class = engine.catalogue.acronymByObjl(fe.objl);
+                            if (!exPasses(F, class, fe, cfi)) continue;
+                            if (ctx) |c2| {
+                                if (cfi < rbf.len) rbf[cfi] = exFoldResolved(sa, fe, class, c2) catch null;
+                            }
+                            if (do_kitty and cfi < tbf.len) tbf[cfi] = exThumbView(sa, &cell, fe);
+                        }
+                        resolved_by_fi = rbf;
+                        thumb_by_fi = tbf;
+                        cached_cell = row.cell_id;
+                    }
+                }
+                _ = det_arena.reset(.retain_capacity);
+                const da = det_arena.allocator();
+                const resolved: ?ExLevel3 = if (row.index < resolved_by_fi.len) resolved_by_fi[row.index] else null;
+                var l3 = std.ArrayList(u8).empty;
+                exFormatLevel3(da, &l3, resolved) catch {};
+                const l3_lines = splitLines(da, l3.items) catch &[_][]const u8{};
+                var lines = std.ArrayList([]const u8).empty;
+                for (rows[g].det12) |ln| lines.append(da, ln) catch {};
+                for (l3_lines) |ln| lines.append(da, ln) catch {};
+                cur_det = lines.items;
+            } else {
+                cur_det = &[_][]const u8{"(no features match the filter)"};
+            }
+        }
+
         const ts_raw = terminalSize(io);
         const ts = ts_raw orelse .{ 100, 37, 0, 0 };
         const cols: usize = @max(40, ts[0]);
@@ -2220,7 +2526,7 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool
         try padTo(a, &buf, 24, cols);
         try buf.appendSlice(a, "\x1b[0m\x1b[K\n");
 
-        const det = if (view.items.len > 0) details[view.items[sel]] else &[_][]const u8{"(no features match the filter)"};
+        const det = cur_det;
         var r: usize = 0;
         while (r < body_h) : (r += 1) {
             // Left: the feature list, windowed around `top`.
@@ -2229,7 +2535,7 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool
             if (li < view.items.len) {
                 const selected = li == sel;
                 if (selected) try buf.appendSlice(a, "\x1b[7m");
-                const label = clip(labels[view.items[li]], left_w);
+                const label = clip(rows[view.items[li]].label, left_w);
                 try buf.appendSlice(a, label);
                 lw = label.len;
                 if (selected) {
@@ -2262,9 +2568,10 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool
         // top-right of the detail pane (deleted-then-placed after the text so it
         // floats above the cells without disturbing the layout).
         if (do_kitty) {
-            if (view.items.len > 0)
-                exTuiThumb(io, a, stdout, chart_h.?, rows[view.items[sel]], view.items[sel], &thumb_sel, thumb_id, palette, m, cols, left_w, term_rows, ts_raw)
-            else {
+            if (gi) |g| {
+                const tv: ?ExThumb = if (rows[g].index < thumb_by_fi.len) thumb_by_fi[rows[g].index] else null;
+                exTuiThumb(io, a, stdout, chart_h.?, tv, g, &thumb_sel, thumb_id, palette, m, cols, left_w, term_rows, ts_raw);
+            } else {
                 stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
                 thumb_sel = null;
             }
@@ -2356,8 +2663,8 @@ fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExRow, kitty: bool
 // frame), delete_all each frame so replaced/scrolled-away images don't linger —
 // the same store-and-place pattern as the ascii kitty TUI. Any failure clears the
 // image and leaves the text pane intact (graceful degradation).
-fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, c: *chart.Chart, row: ExRow, row_index: usize, thumb_sel: *?usize, id: u32, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, cols: usize, left_w: usize, term_rows: usize, ts_raw: ?[4]u32) void {
-    const tv = row.thumb orelse {
+fn exTuiThumb(io: std.Io, a: std.mem.Allocator, stdout: std.Io.File, c: *chart.Chart, tv_in: ?ExThumb, row_index: usize, thumb_sel: *?usize, id: u32, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, cols: usize, left_w: usize, term_rows: usize, ts_raw: ?[4]u32) void {
+    const tv = tv_in orelse {
         stdout.writeStreamingAll(io, render.kitty.delete_all) catch {};
         thumb_sel.* = null;
         return;
