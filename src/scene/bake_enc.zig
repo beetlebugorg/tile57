@@ -77,6 +77,14 @@ pub const CellSpan = struct {
 /// so a reach-only neighbour can't perturb tiles it has no real coverage in.
 pub const REACH_FLAG: u32 = 1 << 31;
 
+/// Tag bit on a buildTileMap contributor index: this carry (finer-band) cell rode
+/// a coarser band's BELOW-window extend tile (.extend_min pass) as a cross-band
+/// HOLE-FILL candidate. Its bbox reaches the tile, but it must only actually
+/// contribute where the in-window band leaves an M_COVR hole — TileGenCtx.gen
+/// keeps it iff a sampled tile point is uncovered by the non-hole-fill cells,
+/// else drops it (the tile then bakes byte-identically to the pre-hole-fill baker).
+pub const HOLEFILL_FLAG: u32 = 1 << 30;
+
 /// The finest (smallest 1:N) compilation scale among `backends[idxs]` whose coverage
 /// contains (lon,lat); `maxInt` when none — so `finestCsclAt(...) < my_cscl` means "a
 /// strictly finer cell covers this point" (a cell never undercuts itself: its own
@@ -95,6 +103,25 @@ fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64
         if (covered) best = be.cscl;
     }
     return best;
+}
+
+/// Whether ANY cell in `idxs` covers (lon,lat): real M_COVR containment, or the
+/// cell's bbox when it has no M_COVR. Unlike finestCsclAt this also counts
+/// cscl<=0 cells — a coverage-hole test must treat any present data as coverage
+/// (an unknown-scale cell still fills the ground). Used by the cross-band
+/// hole-fill admission: a coarser in-window band leaves a HOLE at a sampled point
+/// none of its cells cover, and a finer out-of-window cell that DOES cover there
+/// is admitted to fill it (see TileGenCtx.gen / chart.zig tileRefs).
+fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) bool {
+    for (idxs) |i| {
+        const be = &backends[i];
+        const covered = if (be.coverage.len > 0)
+            s57.coverageContains(be.coverage, lon, lat)
+        else
+            (lon >= be.bounds[0] and lon <= be.bounds[2] and lat >= be.bounds[1] and lat <= be.bounds[3]);
+        if (covered) return true;
+    }
+    return false;
 }
 
 /// A read-only coverage participant from ANOTHER pack (bake --existing): its real
@@ -162,7 +189,18 @@ pub fn quantizeHandoff(ladders: []const []const u32, cscl_fine: i32) i64 {
             }
         }
     }
-    return if (best == std.math.maxInt(i64)) cscl_fine else best;
+    // Snap onto a NEARBY ladder rung (keeps the handoff aligned to a real client
+    // crossing) — but reject a rung that overshoots cscl_fine by more than ~30%.
+    // Snapping across a wide ladder gap (observed: 2.16M -> 2.999M) pushes the
+    // handoff far above the covering cell's own activation scale, so carryGate's
+    // escape `display_denom > handoff` never fires for displays in
+    // (cscl_fine, rung) and the coarse cell is plainly suppressed there —
+    // re-opening the band-floor blank the carry exists to prevent. Beyond the
+    // cap, fall back to the raw crossing (a supported handoff; BakeSink folds it
+    // into the manifest, so the client still gets a crossing there).
+    const want_i: i64 = want;
+    if (best != std.math.maxInt(i64) and best * 10 <= want_i * 13) return best;
+    return want_i;
 }
 
 /// S-52 overscale factor at/above which AP(OVERSC01) marks a scale boundary.
@@ -215,6 +253,14 @@ pub const CellGate = struct {
 /// finer than the handoff. The carry is skipped (plain suppression) when even the
 /// quantized handoff can't display inside this tile's window (display_denom <=
 /// smax) — the copy would be dead weight in the tile.
+// Diagnostic (compile-time): flip to `true` + rebuild to log every coarse (general/
+// overview) cell whose FILLS end up SUPPRESSED by best-available — i.e. where land /
+// depth-areas get CUT because the carry-down didn't fire. Prints cscl / gf_whole /
+// display / handoff so the cause is visible (handoff >> gf_whole = a SCAMIN-ladder gap
+// overshooting the band handoff). Off (dead-stripped) by default. Covers bake + live.
+const carry_dbg = false; // TEMP diagnostic hook: flip to true to log land-cut suppressions
+var carry_dbg_n = std.atomic.Value(usize).init(0);
+
 pub fn carryGate(cscl: i32, gf_centre: i32, gf_whole: i32, display_denom: f64, ladders: []const []const u32) CellGate {
     var g = CellGate{
         .suppress_centre = cscl > 0 and gf_centre < cscl, // a finer cell covers the centre
@@ -235,6 +281,16 @@ pub fn carryGate(cscl: i32, gf_centre: i32, gf_whole: i32, display_denom: f64, l
             g.suppress_centre = false;
             if (g.smax == 0) g.smax = h;
         }
+    }
+    if (carry_dbg) {
+        // Self-verifying: the first ~60 calls print UNCONDITIONALLY (proof the flag is
+        // compiled + carryGate is on the bake path), then only suppressions (the land-cut
+        // cases) up to a cap. If you see NO lines at all → the running binary predates
+        // this edit. If you see "carryGate#.." but never sw=true → carryGate isn't the
+        // suppressor and the cut is elsewhere.
+        const nn = carry_dbg_n.fetchAdd(1, .monotonic);
+        if (nn < 60 or ((g.suppress_whole or g.suppress_centre) and nn < 5000))
+            std.debug.print("carryGate#{d} cscl={d} gf_whole={d} gf_centre={d} display={d:.0} handoff={d} sw={} sc={}\n", .{ nn, cscl, gf_whole, gf_centre, display_denom, quantizeHandoff(ladders, gf_whole), g.suppress_whole, g.suppress_centre });
     }
     return g;
 }
@@ -477,11 +533,13 @@ const TileGenCtx = struct {
         // draw across the boundary) but stays out of the tile-level decisions
         // below (scamin ladders, the overscale finest-contributor scan).
         const raw_idxs = c.idx_lists[i];
-        const idxs = scratch.alloc(u32, raw_idxs.len) catch return;
-        const reach_only = scratch.alloc(bool, raw_idxs.len) catch return;
+        var idxs = scratch.alloc(u32, raw_idxs.len) catch return;
+        var reach_only = scratch.alloc(bool, raw_idxs.len) catch return;
+        var holefill = scratch.alloc(bool, raw_idxs.len) catch return;
         for (raw_idxs, 0..) |v, j| {
-            idxs[j] = v & ~REACH_FLAG;
+            idxs[j] = v & ~(REACH_FLAG | HOLEFILL_FLAG);
             reach_only[j] = (v & REACH_FLAG) != 0;
+            holefill[j] = (v & HOLEFILL_FLAG) != 0;
         }
         // Per-scale cell quilting: where a strictly-finer-CSCL cell's M_COVR coverage
         // contains a location, the coarser cell is suppressed there (so two cells of
@@ -496,6 +554,57 @@ const TileGenCtx = struct {
         const tbll = tile.tileBoundsLonLat(z, x, y); // [minlon, minlat, maxlon, maxlat]
         const clon = (tbll[0] + tbll[2]) * 0.5;
         const clat = (tbll[1] + tbll[3]) * 0.5;
+        // Cross-band hole-fill (buildTileMap HOLEFILL_FLAG, .extend_min pass): a
+        // finer carry cell rode this below-window tile as a hole-fill candidate.
+        // Keep it ONLY where the in-window band leaves an M_COVR hole at a sampled
+        // point (centre + 4 corners); else drop it so the tile bakes exactly as it
+        // did before hole-fill existed (byte-identical off the hole path).
+        {
+            var any_hf = false;
+            for (holefill) |hf| if (hf) {
+                any_hf = true;
+                break;
+            };
+            if (any_hf) {
+                // In-window coverage = admitted cells that are neither hole-fillers
+                // nor reach-only riders (neither actually covers the tile ground).
+                const own = scratch.alloc(u32, idxs.len) catch return;
+                var own_n: usize = 0;
+                for (idxs, 0..) |ix, j| {
+                    if (!holefill[j] and !reach_only[j]) {
+                        own[own_n] = ix;
+                        own_n += 1;
+                    }
+                }
+                const samples = [_][2]f64{
+                    .{ clon, clat },
+                    .{ tbll[0], tbll[1] }, .{ tbll[2], tbll[1] },
+                    .{ tbll[0], tbll[3] }, .{ tbll[2], tbll[3] },
+                };
+                var hole = false;
+                for (samples) |p| {
+                    if (!coversAny(c.backends, own[0..own_n], p[0], p[1])) {
+                        hole = true;
+                        break;
+                    }
+                }
+                if (!hole) {
+                    // No hole here: compact the hole-fillers out; the rest of gen
+                    // runs over the in-window set, byte-identical to before.
+                    var n: usize = 0;
+                    for (idxs, 0..) |ix, j| {
+                        if (holefill[j]) continue;
+                        idxs[n] = ix;
+                        reach_only[n] = reach_only[j];
+                        holefill[n] = holefill[j];
+                        n += 1;
+                    }
+                    idxs = idxs[0..n];
+                    reach_only = reach_only[0..n];
+                    holefill = holefill[0..n];
+                }
+            }
+        }
         // Fold peer-pack coverage (bake --existing) into the finest-scale scan so
         // this pack's coarser cells defer to a finer peer where it covers — the
         // cross-pack extension of the finest-cell suppression (finestCsclCtx). The
@@ -516,10 +625,13 @@ const TileGenCtx = struct {
         // not point-sampled coverage. A cell hatches its OVERSC01 coverage only
         // when a strictly-finer cell also rides this tile (gf_tile < its cscl);
         // whole-view overscale (no finer data anywhere in the tile) emits no
-        // hatch — the HUD readout's job.
+        // hatch — the HUD readout's job. Hole-fill riders are excluded too: they
+        // are finer than the in-window (coarsest-band) cell but supplement it in
+        // its coverage holes at overview zoom, where it is NOT overscale — counting
+        // them would stamp a spurious OVERSC01 over the overview's own areas.
         var gf_tile: i32 = std.math.maxInt(i32);
         for (idxs, 0..) |idx, j| {
-            if (reach_only[j]) continue;
+            if (reach_only[j] or holefill[j]) continue;
             const cs = c.backends[idx].cscl;
             if (cs > 0 and cs < gf_tile) gf_tile = cs;
         }
@@ -558,7 +670,7 @@ const TileGenCtx = struct {
             //                      flip, so a coarse overview occluded by finer fills
             //                      (even when carried) contributes NO hatch.
             const wins_somewhere = gf_whole >= be.cscl; // == !pure_suppress_whole (cscl>0)
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .overscale_hatch = !reach_only[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
         }
         if (n_ov > 0) {
             const floor_denom = assets.displayDenomZ(z + 1, clat);
@@ -697,11 +809,26 @@ pub const Baker = struct {
             const b = sp.bounds;
             var z = zlo;
             var zend = zhi;
+            // Carry (finer-band) cells normally contribute only at the deferred
+            // floor (carry_z = this band's max). In the coarsest (.extend_min) pass
+            // they ALSO ride the below-window extend zooms [zlo..carry_z-1] as
+            // cross-band HOLE-FILL candidates (tagged HOLEFILL_FLAG; gen keeps them
+            // only where the in-window band leaves an M_COVR hole). Other passes
+            // keep the floor-only behaviour.
+            var holefill_top: ?u8 = null;
             if (i >= own_len) {
-                z = carry_z orelse continue;
-                zend = z;
+                const cz = carry_z orelse continue;
+                zend = cz;
+                if (floor == .extend_min) {
+                    z = zlo;
+                    holefill_top = cz;
+                } else {
+                    z = cz;
+                }
             } else if (zlo > zhi) continue;
             while (z <= zend) : (z += 1) {
+                const holefill_z = if (holefill_top) |top| z < top else false;
+                const tag: u32 = if (holefill_z) HOLEFILL_FLAG else 0;
                 const nw = lonLatToTile(b[0], b[3], z);
                 const se = lonLatToTile(b[2], b[1], z);
                 // Clamp the cell's tile span to the super-tile's tile range at z
@@ -725,13 +852,16 @@ pub const Baker = struct {
                         if (self.emitted.contains(key)) continue; // a finer band has it
                         const gop = try tilemap.getOrPut(key);
                         if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
-                        try gop.value_ptr.append(self.gpa, @intCast(i));
+                        try gop.value_ptr.append(self.gpa, @as(u32, @intCast(i)) | tag);
                     }
                 }
                 // Sector-figure reach ring: the tiles within ceil(reach) of the
                 // cell's light bbox that the raw span above did NOT address. The
                 // cell rides them tagged REACH_FLAG (figures only) so its legs/
-                // arcs continue across the bbox tile boundary.
+                // arcs continue across the bbox tile boundary. Skipped for a
+                // below-window hole-fill rider (it contributes fills only where
+                // there's a coverage hole, not stray light figures at overview zoom).
+                if (holefill_z) continue;
                 const lb = sp.light_bbox orelse continue;
                 const reach = scene.lightReachTiles(sp.light_range_m, z, (lb[1] + lb[3]) * 0.5);
                 const m: u32 = @intFromFloat(@ceil(reach));
@@ -1015,12 +1145,15 @@ test "quantizeHandoff: smallest ladder value >= cscl, raw-cscl fallback" {
     const fine = [_]u32{ 90_000, 260_000, 350_000 };
     const coarse = [_]u32{ 700_000, 1_000_000 };
     const ladders = [_][]const u32{ &fine, &coarse };
-    // 200k quantizes up onto the fine cell's 260k (the crossing where its bulk activates).
+    // 200k quantizes up onto the fine cell's 260k (the crossing where its bulk
+    // activates) — a +30% snap, within the nearby-rung cap.
     try std.testing.expectEqual(@as(i64, 260_000), quantizeHandoff(&ladders, 200_000));
     // An exact ladder member maps to itself.
     try std.testing.expectEqual(@as(i64, 260_000), quantizeHandoff(&ladders, 260_000));
-    // Above every fine value: the coarse ladder supplies the crossing.
-    try std.testing.expectEqual(@as(i64, 700_000), quantizeHandoff(&ladders, 400_000));
+    // Above every fine value the only rung (700k) overshoots 400k by 75% — beyond
+    // the ~30% cap, so it is rejected in favour of the raw crossing (400k), keeping
+    // the band-floor carry window open instead of collapsing it up a ladder gap.
+    try std.testing.expectEqual(@as(i64, 400_000), quantizeHandoff(&ladders, 400_000));
     // No ladder value reaches it -> raw cscl (BakeSink folds it into the manifest).
     try std.testing.expectEqual(@as(i64, 2_000_000), quantizeHandoff(&ladders, 2_000_000));
     try std.testing.expectEqual(@as(i64, 200_000), quantizeHandoff(&.{}, 200_000));

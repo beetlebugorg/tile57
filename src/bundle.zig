@@ -899,12 +899,30 @@ const BakeSink = struct {
     }
 };
 
+// Parse the named environment variable as a usize, returning `dflt` when it is
+// unset or unparseable — the bake-tuning host toggle (TILE57_SUPER_DZ /
+// TILE57_LRU_BUDGET). Reads the process environment the host launched with; no
+// ABI/flag surface needed. The engine is linked into the host, so this sees the
+// host's env.
+fn envUsizeOr(name: [:0]const u8, dflt: usize) usize {
+    const v = std.c.getenv(name.ptr) orelse return dflt;
+    const s = std.mem.sliceTo(v, 0);
+    return std.fmt.parseInt(usize, std.mem.trim(u8, s, " \t\r\n"), 10) catch dflt;
+}
+
 // Bake an ENC_ROOT directory (or a single cell.000) into one band-streamed PMTiles
 // archive written straight to `out_path` (the data section streams through a
 // StreamWriter — only the compressed data + small directory are held, not the raw
 // tiles). Returns the union bounds + cell stems + sounding stacks + SCAMIN denoms.
 // error.NoGeometry if no cell parses.
-fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget: usize, super_dz: u8, collect_sounds: bool, format: engine.scene.TileFormat, pick_attrs: bool, existing_path: []const u8, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
+fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: []const u8, rules_dir: []const u8, minzoom: u8, maxzoom: u8, lru_budget_arg: usize, super_dz_arg: u8, collect_sounds: bool, format: engine.scene.TileFormat, pick_attrs: bool, existing_path: []const u8, progress: engine.bake_enc.Progress, progress_user: ?*anyopaque) !RootBake {
+    // Bake-tuning env overrides (host toggle, no ABI/flag change): TILE57_SUPER_DZ /
+    // TILE57_LRU_BUDGET replace the caller's defaults for the lazy super-tile bake —
+    // super_dz = how coarse a "super-tile" the band is loaded/generated in (bigger =
+    // fewer, larger super-tiles = more cells resident at once), lru_budget = the cap
+    // on parsed+portrayed cells kept between super-tiles. Read once per bake.
+    const lru_budget = envUsizeOr("TILE57_LRU_BUDGET", lru_budget_arg);
+    const super_dz: u8 = @intCast(@min(envUsizeOr("TILE57_SUPER_DZ", super_dz_arg), @as(usize, 16)));
     // Progress sink: the caller's callback, else the built-in console writer (the CLI
     // path, byte-identical to before). Both only touch stderr — never the tile bytes.
     const prog: engine.bake_enc.Progress = progress orelse cliProgress;
@@ -983,16 +1001,26 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     };
 
     if (!single_file and !via_catalog) {
+        // De-dup by cell stem: the recursive walk can find the SAME cell under two
+        // subfolders (a provider ENC_ROOT holds one district subfolder per download, and
+        // adjacent NOAA districts share boundary cells). Baking a stem twice double-draws
+        // its features into the overlapping tiles, so the first occurrence wins (a shared
+        // boundary cell is the same edition across districts).
+        var seen = std.StringHashMap(void).init(a);
+        defer seen.deinit();
         var walker = try dir.walk(a);
         defer walker.deinit();
         while (try walker.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
+            if (seen.contains(std.fs.path.stem(std.fs.path.basename(entry.path)))) continue;
             const path = try a.dupe(u8, entry.path);
+            const stem = try a.dupe(u8, std.fs.path.stem(std.fs.path.basename(path)));
+            try seen.put(stem, {});
             const bytes = dir.readFileAlloc(io, path, gpa, .unlimited) catch continue;
             const meta = engine.s57.peekMeta(gpa, bytes);
             gpa.free(bytes);
-            try cell_names.append(a, try a.dupe(u8, std.fs.path.stem(std.fs.path.basename(path))));
+            try cell_names.append(a, stem);
             total_cells += 1;
             // A cell with no peek-bbox has no geometry to bake — skip it (it would
             // produce no tiles). The peek bbox is a superset of the parsed bounds,

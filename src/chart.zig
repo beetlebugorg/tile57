@@ -233,6 +233,24 @@ fn finestCsclAtLive(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64, incl
     return best;
 }
 
+// Whether ANY indexed cell in `idxs` covers (lon,lat): real M_COVR containment,
+// or its bbox when it has no M_COVR. The live twin of bake_enc.coversAny — counts
+// cscl<=0 cells too (a coverage-hole test treats any present data as coverage).
+// Cells must already be lazy-loaded (their coverage is read). Used by tileRefs'
+// cross-band hole-fill admission.
+fn coversAnyLive(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64) bool {
+    for (idxs) |i| {
+        const lc = &ls.cells[i];
+        const cov = lazyCellCoverage(lc);
+        const covered = if (cov.len > 0)
+            coverageContains(cov, lon, lat)
+        else
+            (lon >= lc.bbox[0] and lon <= lc.bbox[2] and lat >= lc.bbox[1] and lat <= lc.bbox[3]);
+        if (covered) return true;
+    }
+    return false;
+}
+
 fn bboxOverlap(a_: [4]f64, b_: [4]f64) bool {
     return a_[0] <= b_[2] and a_[2] >= b_[0] and a_[1] <= b_[3] and a_[3] >= b_[1];
 }
@@ -1684,7 +1702,14 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
     var any_incl = false;
     var coarsest: ?bake_enc.Band = null;
     var finest: ?bake_enc.Band = null;
+    // Globally coarsest band present in the whole source (NOT bbox-filtered): the
+    // baker's .extend_min band. The cross-band hole-fill band is the one adjacent-
+    // finer to it (the carry band the baker defers into that pass), computed in the
+    // hole block below so live hole-fill matches the bake regardless of which cells
+    // happen to overlap a given tile.
+    var global_coarsest: ?bake_enc.Band = null;
     for (ls.cells) |lc| {
+        if (global_coarsest == null or @intFromEnum(lc.band) > @intFromEnum(global_coarsest.?)) global_coarsest = lc.band;
         if (!bboxOverlap(lc.bbox, tb)) continue;
         const zr = bake_enc.bandZooms(lc.band);
         if (z >= zr.min and z <= zr.max) any_incl = true;
@@ -1727,6 +1752,58 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
     for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
     for (ridxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
 
+    // Cross-band hole-fill — the live twin of the baker's HOLEFILL_FLAG path
+    // (bake_enc buildTileMap/TileGenCtx.gen). Where the in-window band leaves an
+    // M_COVR hole at a sampled tile point (centre + 4 corners), admit the COARSEST
+    // out-of-window band that bbox-overlaps the tile (the next-finer band that
+    // supplements the coarse band in its coverage gaps — general filling an
+    // overview cell's gap at Cape Hatteras z5/z6). Only when in-window selection
+    // was used (any_incl); the fallbackBand branch already fills pure-hole tiles.
+    // The finest-covering quilt below then lets the filler win in the hole; it is
+    // marked so it can't stamp a spurious overscale hatch on the coarse band.
+    var holefill_set = std.AutoHashMap(u32, void).init(gpa);
+    defer holefill_set.deinit();
+    if (any_incl) {
+        const samples = [_][2]f64{
+            .{ (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2 },
+            .{ tb[0], tb[1] }, .{ tb[2], tb[1] }, .{ tb[0], tb[3] }, .{ tb[2], tb[3] },
+        };
+        var hole = false;
+        for (samples) |p| {
+            if (!coversAnyLive(ls, idxs.items, p[0], p[1])) {
+                hole = true;
+                break;
+            }
+        }
+        if (hole) {
+            // The baker fills the GLOBALLY-coarsest (.extend_min) band's coverage
+            // holes with its adjacent-finer carry band, only at zooms where that
+            // band is out-of-window. Mirror it exactly: fill_band = the coarsest
+            // band in the whole source strictly finer than global_coarsest (NOT
+            // per-tile — an offshore tile the overview cell misses must still use
+            // general, not pull coastal 2 bands up as it did before). Admitted only
+            // where fill_band is out-of-window at z (in-window it is already
+            // selected) and its cells overlap the tile.
+            var fill_band: ?bake_enc.Band = null;
+            if (global_coarsest) |gc| for (ls.cells) |lc| {
+                if (@intFromEnum(lc.band) >= @intFromEnum(gc)) continue; // must be finer than the global coarsest
+                if (fill_band == null or @intFromEnum(lc.band) > @intFromEnum(fill_band.?)) fill_band = lc.band;
+            };
+            if (fill_band) |fb| {
+                const zr = bake_enc.bandZooms(fb);
+                if (z < zr.min or z > zr.max) { // only where the filler band is out-of-window
+                    for (ls.cells, 0..) |lc, i| {
+                        if (lc.band != fb or !bboxOverlap(lc.bbox, tb)) continue;
+                        idxs.append(gpa, @intCast(i)) catch {};
+                        holefill_set.put(@intCast(i), {}) catch {};
+                    }
+                    std.mem.sort(u32, idxs.items, ls, sortByBand); // keep coarsest-first draw order
+                    for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
+                }
+            }
+        }
+    }
+
     // Per-scale quilting + scamin-aware band handoff, the same rules as the baker
     // (bake_enc TileGenCtx.gen): the finest covering cscl gates lines/patterns at
     // the tile centre (derived extents count) and fills/points over the whole tile
@@ -1752,8 +1829,12 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
     // participant list, mirroring bake_enc TileGenCtx.gen. A cell hatches its
     // OVERSC01 coverage only when a strictly-finer cell also rides this tile
     // (gf_tile < its cscl); whole-view overscale emits no hatch (HUD readout).
+    // Hole-fill riders are excluded: they are finer than the in-window coarse band
+    // but merely supplement it in its coverage gaps at overview zoom (not overscale
+    // there) — counting them would stamp a spurious OVERSC01 on the coarse band.
     var gf_tile: i32 = std.math.maxInt(i32);
     for (idxs.items) |i| {
+        if (holefill_set.contains(i)) continue;
         const cs = ls.cells[i].cscl;
         if (cs > 0 and cs < gf_tile) gf_tile = cs;
     }
@@ -1781,7 +1862,7 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 // boundary: a finer cell rides the tile (gf_tile < cscl) AND this
                 // cell wins the pure quilt somewhere (gf_whole >= cscl, pre-carry) —
                 // an occluded coarse overview contributes no hatch (specs/overscale.md v3).
-                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl and gf_whole >= lc.cscl,
+                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl and gf_whole >= lc.cscl and !holefill_set.contains(i),
                 // SCAMIN standalone: the overlay below owns prim==1 SCAMIN features.
                 .skip_scamin_points = true,
                 .light_range_m = lc.light_range_m,
