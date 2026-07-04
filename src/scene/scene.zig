@@ -1381,6 +1381,14 @@ fn bearingToScreen(deg: f64) [2]f64 {
 /// radius over the sweep (a 0 sweep = a full ring). Built in normalised-world coords
 /// (anchor + screen-offset/worldPx) and projected with worldToTile — identical to
 /// Go's per-zoom sunproject + reproject. Each figure carries its own stroke + vg.
+/// Zoom below which a full-circle range ring (LightAllAround majorLight) is NOT
+/// emitted. The ring is a fixed ~26 mm decoration drawn as baked geometry, so at
+/// small scales it reads as a huge circle covering a wide ground area — and every
+/// major light (VALNMR ≥ 10 M) has one, so overview fills with overlapping circles.
+/// Real ECDIS shows the ring when zoomed in; gate to approach scale and finer
+/// (bake_enc.bandZooms(.approach).min = 11). Partial sector arcs are unaffected.
+const RING_MIN_ZOOM: u8 = 11;
+
 fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, box: tile.Box, surf: rs.Surface) !void {
     if (figs.len == 0) return;
     const world_px = 256.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
@@ -1406,6 +1414,10 @@ fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat
             if (radius_px <= 0) continue;
             var sweep = fig.sweep_deg;
             if (sweep == 0) sweep = 360; // a zero sweep is a full all-round ring
+            // Suppress the major-light range ring (full circle) below approach scale
+            // (see RING_MIN_ZOOM) — it would balloon into overlapping circles at
+            // overview. Partial sector arcs (|sweep| < 360) keep drawing.
+            if (@abs(sweep) >= 360 and z < RING_MIN_ZOOM) continue;
             const n: usize = @max(@as(usize, @intFromFloat(@ceil(@abs(sweep) / 3.0))), 8);
             var i: usize = 0;
             while (i <= n) : (i += 1) {
