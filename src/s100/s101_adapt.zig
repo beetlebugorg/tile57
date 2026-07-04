@@ -972,6 +972,16 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         if (f.objl == 75) {
             try buildLightSectors(a, &children, f);
             try buildRhythmOfLight(a, &children, f);
+            // majorLight: LightAllAround draws the range ring (ArcByRadius 0,0,26,0,360 —
+            // a full circle stroked black + the light colour) ONLY when feature.majorLight
+            // is set. It has no S-57 source; the FC calls it a compiler cartographic hint
+            // ("a cartographic attribute to aid the compiler ... not ... a formal
+            // classification method for lights"), so the S-57->S-101 conversion derives it:
+            // a light of nominal range >= 10 M is a major light (the paper-chart cutoff).
+            // LightAllAround itself re-excludes aero (CATLIT 5) and Morse (LITCHR 12) lights
+            // (notAeroLight / notMorseCodeLight), so only the range test is supplied here.
+            const valnmr = std.fmt.parseFloat(f64, attrTrim(f, s57.ATTR_VALNMR)) catch -1.0;
+            if (valnmr >= 10.0) try attrs.append(a, .{ .name = "majorLight", .value = "true" });
         }
 
         // Derived depth attributes for under/awash dangers (S-52 DEPVAL): supply
@@ -1472,6 +1482,57 @@ test "BRIDGE re-models: line -> Bridge (openingBridge from CATBRG), point -> Lan
     try std.testing.expectEqual(@as(?[]const u8, null), adapted[1].root.resolve("").?.simpleValue("openingBridge"));
     // Point bridge -> Landmark (Bridge.lua has no Point branch; S-65 §4.8.15).
     try std.testing.expectEqualStrings("Landmark", adapted[2].code);
+}
+
+test "LIGHTS: majorLight synthesized from VALNMR >= 10 M (drives the LightAllAround range ring)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const node_ref = [_]s57.SpatialRef{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }};
+    // white all-around light, nominal range 15 M (>= 10) -> majorLight
+    const major = [_]s57.Attr{
+        .{ .code = s57.ATTR_COLOUR, .value = "1" },
+        .{ .code = s57.ATTR_LITCHR, .value = "2" },
+        .{ .code = s57.ATTR_VALNMR, .value = "15" },
+    };
+    // same but range 5 M (< 10) -> no majorLight
+    const minor = [_]s57.Attr{
+        .{ .code = s57.ATTR_COLOUR, .value = "1" },
+        .{ .code = s57.ATTR_LITCHR, .value = "2" },
+        .{ .code = s57.ATTR_VALNMR, .value = "5" },
+    };
+    // absent VALNMR -> no majorLight (e.g. a co-located reduced-intensity standby)
+    const norange = [_]s57.Attr{
+        .{ .code = s57.ATTR_COLOUR, .value = "1" },
+        .{ .code = s57.ATTR_LITCHR, .value = "2" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 75, .attrs = &major, .refs = &node_ref },
+        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 75, .attrs = &minor, .refs = &node_ref },
+        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 75, .attrs = &norange, .refs = &node_ref },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-74.0, 40.5));
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 3), adapted.len);
+    // VALNMR 15 -> LightAllAround carrying majorLight=true (the yellow range ring)
+    try std.testing.expectEqualStrings("LightAllAround", adapted[0].code);
+    try std.testing.expectEqualStrings("true", adapted[0].root.resolve("").?.simpleValue("majorLight").?);
+    // VALNMR 5 -> below the cutoff, no majorLight
+    try std.testing.expectEqual(@as(?[]const u8, null), adapted[1].root.resolve("").?.simpleValue("majorLight"));
+    // no VALNMR -> no majorLight
+    try std.testing.expectEqual(@as(?[]const u8, null), adapted[2].root.resolve("").?.simpleValue("majorLight"));
 }
 
 test "s65RemapValue: TECSOU/QUASOU S-65 value conversion" {
