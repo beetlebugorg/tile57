@@ -655,6 +655,29 @@ fn buildRhythmOfLight(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry)
     try appendChild(a, children, "rhythmOfLight", rol.build());
 }
 
+/// Build the S-101 `information` complex (alias INFORM) that ProcessNauticalInformation
+/// reads for the "information available" (VG 90020) / "file available" (VG 90021)
+/// indicators — and that pick reports surface. One instance per present source: INFORM
+/// -> {language, text}; TXTDSC -> {language, fileReference} (the external text file).
+/// `language` is mandatory on the complex (FC multiplicity [1,1]); NOAA text is English.
+/// National NINFOM/NTXTDS are deferred. Runs for every feature (any class can carry it).
+fn buildInformation(a: std.mem.Allocator, children: *std.ArrayList(ChildEntry), f: s57.Feature) !void {
+    const inform = attrTrim(f, s57.ATTR_INFORM);
+    if (inform.len > 0) {
+        const subs = try a.alloc(NameVal, 2);
+        subs[0] = .{ .name = "language", .value = "eng" };
+        subs[1] = .{ .name = "text", .value = inform };
+        try appendChild(a, children, "information", .{ .simple = subs });
+    }
+    const txtdsc = attrTrim(f, s57.ATTR_TXTDSC);
+    if (txtdsc.len > 0) {
+        const subs = try a.alloc(NameVal, 2);
+        subs[0] = .{ .name = "language", .value = "eng" };
+        subs[1] = .{ .name = "fileReference", .value = txtdsc };
+        try appendChild(a, children, "information", .{ .simple = subs });
+    }
+}
+
 /// Position/depth accuracy a ZOC category asserts, per the ZOC table (S-57 App. A
 /// Ch. 2, as amended by Supplement 3): ±(fixed + factor·depth) metres. D (5) and
 /// U (6) are unquantified ("worse than ZOC C" / "unassessed") — no row, so no
@@ -808,6 +831,13 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
                 s57.ATTR_SURSTA, s57.ATTR_SUREND => continue,
                 else => {},
             };
+            // INFORM/TXTDSC feed the `information` COMPLEX (buildInformation below);
+            // forwarding them flat would mis-model a complex as a simple attr the
+            // framework then ignores (isComplex("information")).
+            switch (at.code) {
+                s57.ATTR_INFORM, s57.ATTR_TXTDSC => continue,
+                else => {},
+            }
             if (catalogue.resolveAttrByCode(at.code)) |aname| {
                 // S-65 Annex B §E: some attributes "will not convert" for this S-57
                 // object (S-101 prohibits them for the class) — drop the whole
@@ -969,6 +999,9 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         // rhythmOfLight for every light's characteristic text. Synthesized from the
         // S-57 LIGHTS simple attributes (port of complex.go buildLightSectors /
         // buildRhythmOfLight). Gated on the S-57 LIGHTS object class (OBJL 75).
+        // information complex (INFORM/TXTDSC) — nautical-info indicators + pick text.
+        try buildInformation(a, &children, f);
+
         if (f.objl == 75) {
             try buildLightSectors(a, &children, f);
             try buildRhythmOfLight(a, &children, f);
