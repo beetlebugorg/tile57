@@ -25,6 +25,8 @@ extern void tgp_emit(size_t i, const char *instr, size_t len);
 extern size_t tgp_points_count(size_t i);
 extern void tgp_point(size_t i, size_t j, double *x, double *y, double *z);
 extern size_t tgp_colocated(size_t i, size_t *out, size_t max);
+extern size_t tgp_assoc_features(size_t i, const char *role, size_t role_len,
+                                 size_t *out, size_t max);
 
 /* Catalogue accessors implemented in Zig (catalogue.zig). */
 extern size_t tgc_feature_count(void);
@@ -701,6 +703,27 @@ static int lp_spatial_assoc_features(lua_State *L) {
     }
     return 1;
 }
+/* HostFeatureGetAssociatedFeatureIDs(id, assocCode, roleCode): the feature IDs this
+ * feature's S-57 FFPT pointers reference, filtered by role (RIND-derived). assocCode
+ * is required by the framework but not used to filter here — S-57 FFPT carries no
+ * association code, so the RIND->role mapping (roleCode, nil = any) selects the
+ * pointers. Backs StructureEquipment (DistanceMark, PortrayalModel text placement)
+ * and the aids-to-navigation aggregations. IDs are the decimal adapted indices. */
+static int lp_feature_assoc_features(lua_State *L) {
+    size_t i = (size_t)atol(luaL_checkstring(L, 1));
+    size_t rlen = 0;
+    const char *role = lua_isnoneornil(L, 3) ? "" : luaL_checklstring(L, 3, &rlen);
+    lua_newtable(L);
+    size_t buf[64];
+    size_t n = tgp_assoc_features(i, role, rlen, buf, sizeof buf / sizeof buf[0]);
+    for (size_t k = 0; k < n; k++) {
+        char id[24];
+        snprintf(id, sizeof id, "%zu", buf[k]);
+        lua_pushstring(L, id);
+        lua_rawseti(L, -2, (lua_Integer)(k + 1));
+    }
+    return 1;
+}
 static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value(s)} */
     size_t i = (size_t)atol(luaL_checkstring(L, 1));
     const char *path = lua_tostring(L, 2); /* the framework attributePath; "" = the feature root */
@@ -817,7 +840,10 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
     lua_register(L, "HostGetRoleTypeCodes", lp_role_codes);
     lua_register(L, "HostGetInformationAssociationTypeCodes", lp_info_assoc_codes);
     lua_register(L, "HostGetFeatureAssociationTypeCodes", lp_feature_assoc_codes);
-    lua_register(L, "HostFeatureGetAssociatedFeatureIDs", l_empty_table);
+    lua_register(L, "HostFeatureGetAssociatedFeatureIDs", lp_feature_assoc_features);
+    /* feature->information: S-57 has no such record pointer (info rides on
+     * attributes / the synthesized `information` complex), so there are no IDs to
+     * surface — left empty. */
     lua_register(L, "HostFeatureGetAssociatedInformationIDs", l_empty_table);
     lua_register(L, "HostSpatialGetAssociatedFeatureIDs", lp_spatial_assoc_features);
     lua_register(L, "HostSpatialGetAssociatedInformationIDs", l_empty_table);
