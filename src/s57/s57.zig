@@ -457,6 +457,17 @@ pub const SpatialRef = struct {
     mask: u8 = 0, // MASK: 1=mask (edge not drawn), 2=show, 255=null
 };
 
+/// One FFPT pointer — a feature-to-feature object reference (S-57 App. B.1, the
+/// feature-record analogue of FSPT). `lnam` is the referenced feature's LNAM =
+/// AGEN(2)+FIDN(4)+FIDS(2), packed identically to `Feature.foid` (via foidKey) so
+/// it joins straight against the cell's FOID index (Cell.featureIndexByFoid). RIND
+/// is the relationship indicator: 1=master, 2=slave, 3=peer.
+pub const FeatureRef = struct {
+    lnam: u64, // referenced feature's FOID composite key (foidKey packing)
+    rind: u8, // 1=master, 2=slave, 3=peer
+    comt: []const u8 = "", // FFPT COMT free-text comment
+};
+
 /// One VRPT pointer. The full list is retained so a VRPC-controlled partial modify
 /// (.001+ update) is an indexed insert/delete/modify, not a wholesale replace.
 pub const VPtr = struct { rcid: u32, topi: u8 }; // TOPI 1=begin, 2=end, 3=left, 4=right
@@ -561,6 +572,7 @@ pub const Feature = struct {
     foid: u64 = 0,
     refs: []const SpatialRef = &.{}, // FSPT spatial pointers
     attrs: []const Attr = &.{}, // ATTF attributes
+    frefs: []const FeatureRef = &.{}, // FFPT feature-to-feature object pointers
 
     pub fn attr(self: Feature, code: u16) ?[]const u8 {
         for (self.attrs) |x| if (x.code == code) return x.value;
@@ -592,6 +604,12 @@ pub const Cell = struct {
     /// S-57 App. B.1 Annex A §17 scn 2. Arena-backed (freed with the cell); empty for
     /// cells with no coast.
     coast_edges: std.AutoHashMapUnmanaged(u32, void) = .{},
+    /// FOID (LNAM composite key) -> index into `features`, built once from the
+    /// flattened features. Resolves an FFPT feature-to-feature pointer's LNAM to the
+    /// feature it references (Cell.featureIndexByFoid). Arena-backed (freed with the
+    /// cell); empty for cells whose features carry no FOID. Last-wins on duplicate FOID,
+    /// matching the update-merge index.
+    foid_index: std.AutoHashMapUnmanaged(u64, usize) = .{},
     /// Per-feature area representative (label) point, indexed by feature index; built
     /// once per cell by the baker (scene.buildLabelCache) so the per-tile emit reuses
     /// it instead of re-running the pole-of-inaccessibility (polylabel) search for every
@@ -606,6 +624,14 @@ pub const Cell = struct {
         self.edges.deinit();
         self.sounding_vecs.deinit();
         self.arena.deinit();
+    }
+
+    /// Index into `features` of the feature identified by FFPT LNAM / FOID composite
+    /// key `foid`, or null when the cell carries no such feature. Backs feature-to-
+    /// feature association resolution (portray HostFeatureGetAssociatedFeatureIDs).
+    pub fn featureIndexByFoid(self: *const Cell, foid: u64) ?usize {
+        if (foid == 0) return null;
+        return self.foid_index.get(foid);
     }
 
     /// All soundings (lon/lat/depth) carried by a multipoint feature's
@@ -1069,6 +1095,26 @@ fn parseFSPT(a: Allocator, data: []const u8) ![]SpatialRef {
     return refs;
 }
 
+/// FFPT (feature-to-feature pointer): repeated entries of LNAM(8 = the referenced
+/// feature's AGEN+FIDN+FIDS) + RIND(1) + COMT(ASCII, UT-terminated). The fixed 9-byte
+/// binary prefix is followed by the variable comment, exactly like parseATTF's UT scan
+/// but with a binary head. LNAM packs through foidKey (identical to FOID) so it resolves
+/// against Cell.featureIndexByFoid. Values are copied into `a`.
+fn parseFFPT(a: Allocator, data: []const u8) ![]FeatureRef {
+    var list = std.ArrayList(FeatureRef).empty;
+    var off: usize = 0;
+    while (off + 9 <= data.len) {
+        const lnam = foidKey(data[off .. off + 8]);
+        const rind = data[off + 8];
+        off += 9;
+        var end = off;
+        while (end < data.len and data[end] != iso.UT) end += 1;
+        try list.append(a, .{ .lnam = lnam, .rind = rind, .comt = try a.dupe(u8, data[off..end]) });
+        off = end + 1; // skip UT
+    }
+    return list.items;
+}
+
 fn parseSG3D(a: Allocator, data: []const u8, comf: f64, somf: f64) ![]Sounding {
     const n = data.len / 12;
     const out = try a.alloc(Sounding, n);
@@ -1501,6 +1547,7 @@ fn mergeFile(
                 continue;
             }
             if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
+            if (rec.field("FFPT")) |ff| f.frefs = try parseFFPT(a, ff);
             if (rec.field("ATTF")) |at| f.attrs = try parseATTF(a, at);
             if (rec.field("NATF")) |nt| f.attrs = try mergeNatf(a, f.attrs, nt);
 
@@ -1513,6 +1560,15 @@ fn mergeFile(
                         ex.refs = try applyControl(a, SpatialRef, ex.refs, f.refs, fspc.?);
                     } else if (rec.field("FSPT") != null) {
                         ex.refs = f.refs;
+                    }
+                    // FFPC = indexed insert/delete/modify of the FFPT list (§8.4.2.2,
+                    // identical structure to FSPC); a bare FFPT with no FFPC is a full
+                    // replace of the feature-to-feature pointers.
+                    const ffpc = rec.field("FFPC");
+                    if (ffpc != null and ffpc.?.len >= 5) {
+                        ex.frefs = try applyControl(a, FeatureRef, ex.frefs, f.frefs, ffpc.?);
+                    } else if (rec.field("FFPT") != null) {
+                        ex.frefs = f.frefs;
                     }
                     // Gate on the PARSED attribute count, not ATTF field presence: the
                     // oracle (updates.go:228) replaces attributes only when the update
@@ -1633,7 +1689,14 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
         for (f.refs) |ref| if (ref.name.rcnm == RCNM_VE) try coast_edges.put(a, ref.name.rcid, {});
     }
 
-    return .{ .params = params, .dsid = dsid, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .arena = arena };
+    // FOID -> flat feature index, so FFPT feature-to-feature pointers resolve to the
+    // features they reference (post-flatten indices differ from the merge-time fidx).
+    var foid_index: std.AutoHashMapUnmanaged(u64, usize) = .{};
+    for (features.items, 0..) |f, i| {
+        if (f.foid != 0) try foid_index.put(a, f.foid, i);
+    }
+
+    return .{ .params = params, .dsid = dsid, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .foid_index = foid_index, .arena = arena };
 }
 
 // ---- tests --------------------------------------------------------------
@@ -1656,6 +1719,31 @@ test "parse DSPM coordinate factors" {
     const pn = parseDSPM(&data);
     try std.testing.expectEqual(@as(i32, 10_000_000), pn.comf);
     try std.testing.expectEqual(@as(i32, 10), pn.somf);
+}
+
+test "parseFFPT decodes LNAM + RIND + COMT feature-to-feature pointers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf = std.ArrayList(u8).empty;
+    // entry 1: AGEN=2, FIDN=0x11223344, FIDS=5, RIND=2 (slave), COMT="hi"
+    try buf.appendSlice(a, &[_]u8{ 2, 0, 0x44, 0x33, 0x22, 0x11, 5, 0 });
+    try buf.append(a, 2);
+    try buf.appendSlice(a, "hi");
+    try buf.append(a, iso.UT);
+    // entry 2: AGEN=7, FIDN=9, FIDS=0, RIND=1 (master), empty COMT
+    try buf.appendSlice(a, &[_]u8{ 7, 0, 9, 0, 0, 0, 0, 0 });
+    try buf.append(a, 1);
+    try buf.append(a, iso.UT);
+
+    const refs = try parseFFPT(a, buf.items);
+    try std.testing.expectEqual(@as(usize, 2), refs.len);
+    try std.testing.expectEqual(foidKey(&[_]u8{ 2, 0, 0x44, 0x33, 0x22, 0x11, 5, 0 }), refs[0].lnam);
+    try std.testing.expectEqual(@as(u8, 2), refs[0].rind);
+    try std.testing.expectEqualStrings("hi", refs[0].comt);
+    try std.testing.expectEqual(foidKey(&[_]u8{ 7, 0, 9, 0, 0, 0, 0, 0 }), refs[1].lnam);
+    try std.testing.expectEqual(@as(u8, 1), refs[1].rind);
+    try std.testing.expectEqualStrings("", refs[1].comt);
 }
 
 test "VRPC partial VRPT modify preserves the unmodified endpoint" {
