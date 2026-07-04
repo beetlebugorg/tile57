@@ -181,6 +181,11 @@ fn winnerBetter(a_: Rec, b: Rec) bool {
 /// pre-pass) or one tile's gather (live). O(n·bucket) — buckets are tiny.
 pub fn dedup(gpa: Allocator, recs: []Rec) !void {
     if (recs.len == 0) return;
+    // Diagnostic (compile-time): flip to `true` + rebuild to log same-class near-neighbours
+    // that did NOT merge (the cross-cell copies), with FOID / mkey / distance / scamin — so a
+    // bake reveals whether the miss is the epsilon, differing FOIDs, or an mkey mismatch. Off
+    // (dead-stripped) by default; this std has no runtime env-var lookup on the musl target.
+    const dbg = false;
     const n: u32 = @intCast(recs.len);
     const parent = try gpa.alloc(u32, n);
     defer gpa.free(parent);
@@ -265,6 +270,36 @@ pub fn dedup(gpa: Allocator, recs: []Rec) !void {
                         }
                         if (gchain[j] == std.math.maxInt(u32)) break;
                         j = gchain[j];
+                    }
+                }
+            }
+        }
+        // DEBUG pass: after all unions, report same-class near-neighbours (<=120 m) that
+        // ended up in DIFFERENT groups — i.e. the dedup FAILED to merge them.
+        if (dbg) {
+            var shown: usize = 0;
+            for (recs, 0..) |r, ri| {
+                if (shown >= 400) break;
+                const i: u32 = @intCast(ri);
+                var dxi: i64 = -1;
+                while (dxi <= 1) : (dxi += 1) {
+                    var dyi: i64 = -1;
+                    while (dyi <= 1) : (dyi += 1) {
+                        const k = keyOf(r.lon + @as(f64, @floatFromInt(dxi)) * cell_deg, r.lat + @as(f64, @floatFromInt(dyi)) * cell_deg, cell_deg);
+                        var j = grid.get(k) orelse continue;
+                        while (true) {
+                            if (j > i and recs[j].objl == r.objl and shown < 400 and
+                                ufFind(parent, i) != ufFind(parent, j))
+                            {
+                                const dd = distM(r.lon, r.lat, recs[j].lon, recs[j].lat);
+                                if (dd <= 120) {
+                                    shown += 1;
+                                    std.debug.print("dedup-miss objl={d} dist={d:.1}m foidA={d} foidB={d} mkeyEq={} scA={d} scB={d} @ {d:.5},{d:.5}\n", .{ r.objl, dd, r.foid, recs[j].foid, r.mkey == recs[j].mkey, r.scamin, recs[j].scamin, r.lon, r.lat });
+                                }
+                            }
+                            if (gchain[j] == std.math.maxInt(u32)) break;
+                            j = gchain[j];
+                        }
                     }
                 }
             }

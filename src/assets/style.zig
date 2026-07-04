@@ -392,9 +392,17 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
 // layers). All optional; a single part is written bare (no "all" wrapper) so a
 // template layer is byte-identical to the pre-mariner output. `has_base=false` for
 // layers with no base predicate (fills/patterns/complex/soundings).
-fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *const SCtx, extra: ?std.json.Value) !void {
+fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *const SCtx, drop_smax: bool, extra: ?std.json.Value) !void {
     const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate or bkt.filter_gate;
-    const has_smax = s.smax != .off;
+    // scamin-standalone.md §0/§3: the SCAMIN POINT/TEXT/LINE layers (point_symbols_scamin,
+    // text-scamin, the scamin line variants) are band-INDEPENDENT — their whole display
+    // lifecycle is the scamin gate, so the band-handoff `smax` carry-down clause does NOT
+    // apply (a SCAMIN feature "should just exist regardless of band"). `drop_smax` is true
+    // only from those layer functions; it takes effect solely on the _scamin variant (the
+    // one carrying a scamin clause). smax STAYS on areas/patterns (§46 "area/line only" —
+    // fills need scale-appropriate generalization + occlusion), on SOUNDINGS ("stay
+    // as-is"), and on the carried plain (non-scamin) points/lines (has_clause=false).
+    const has_smax = s.smax != .off and !(has_clause and drop_smax);
     const has_oscl = bkt.oscl != .none and s.smax != .off; // oscl rides the smax gate value
     var n: usize = s.common.len;
     if (has_base) n += 1;
@@ -428,7 +436,7 @@ fn lineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, name: []const u8, f
     const id = try std.fmt.bufPrint(&buf, "{s}-{s}{s}", .{ sl, name, bkt.suffix });
     try js.beginObject();
     try layerHead(js, id, "line", sl);
-    try applyBucket(js, filt, true, bkt, s, null);
+    try applyBucket(js, filt, true, bkt, s, true, null); // line: scamin line variants band-independent
     try js.objectField("paint");
     try linePaint(js, s.line_color, dash, s.size_scale);
     try js.endObject();
@@ -495,9 +503,9 @@ fn applyPointBucket(js: *Stringify, s: *const SCtx, bkt: Bucket, comptime rot_no
     const in_danger = .{ "in", .{ "get", "class" }, .{ "literal", DANGER_CLASSES } };
     switch (mode) {
         // base = not a light AND not a danger (those ride their own over-soundings passes).
-        .base => try applyBucket(js, .{ "all", rot, .{ "!=", .{ "get", "class" }, "LIGHTS" }, .{ "!", in_danger } }, true, bkt, s, null),
-        .dangers_only => try applyBucket(js, .{ "all", rot, in_danger }, true, bkt, s, null),
-        .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s, null),
+        .base => try applyBucket(js, .{ "all", rot, .{ "!=", .{ "get", "class" }, "LIGHTS" }, .{ "!", in_danger } }, true, bkt, s, true, null),
+        .dangers_only => try applyBucket(js, .{ "all", rot, in_danger }, true, bkt, s, true, null),
+        .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s, true, null),
     }
 }
 
@@ -541,7 +549,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     const tid = try std.fmt.bufPrint(&buf2, "text{s}{s}", .{ sfx, bkt.suffix });
     try js.beginObject();
     try layerHead(js, tid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, s.text_group);
+    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // text-scamin band-independent
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -569,7 +577,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     const lid = try std.fmt.bufPrint(&buf, "light-text{s}{s}", .{ sfx, bkt.suffix });
     try js.beginObject();
     try layerHead(js, lid, "symbol", sl);
-    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, s.text_group);
+    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // light-text-scamin band-independent
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -636,7 +644,7 @@ fn fillLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void 
     try js.objectField("fill-antialias");
     try js.write(true);
     try js.endObject();
-    try applyBucket(js, .{}, false, bkt, s, null);
+    try applyBucket(js, .{}, false, bkt, s, false, null); // area fills stay band-quilted (keep smax)
     try js.endObject();
 }
 
@@ -656,7 +664,7 @@ fn patternLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !vo
     try js.objectField("fill-pattern");
     try js.write(.{ "concat", "pat:", .{ "coalesce", .{ "get", "pattern_name" }, "" } });
     try js.endObject();
-    try applyBucket(js, FILT_NOT_OVERSC, true, bkt, s, null);
+    try applyBucket(js, FILT_NOT_OVERSC, true, bkt, s, false, null); // area patterns stay band-quilted
     try js.endObject();
 }
 
@@ -681,7 +689,7 @@ fn overscaleLayer(js: *Stringify, s: *const SCtx) !void {
     try js.objectField("fill-pattern");
     try js.write("pat:OVERSC01");
     try js.endObject();
-    try applyBucket(js, FILT_OVERSC, true, .{ .oscl = .overscaled }, s, null);
+    try applyBucket(js, FILT_OVERSC, true, .{ .oscl = .overscaled }, s, false, null); // overscale hatch rides the smax/oscl gate
     try js.endObject();
 }
 
@@ -692,7 +700,7 @@ fn complexLineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket)
     try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}{s}", .{ sl, bkt.suffix }), "line", sl);
     try js.objectField("paint");
     try linePaint(js, s.line_color, null, s.size_scale);
-    try applyBucket(js, .{}, false, bkt, s, null);
+    try applyBucket(js, .{}, false, bkt, s, true, null); // complex (symbolised) scamin lines band-independent
     try js.endObject();
 }
 
@@ -701,7 +709,7 @@ fn contourLabelLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}{s}", .{ sl, bkt.suffix }), "symbol", sl);
-    try applyBucket(js, .{ "has", "valdco" }, true, bkt, s, null);
+    try applyBucket(js, .{ "has", "valdco" }, true, bkt, s, true, null); // contour value labels (scamin text) band-independent
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("symbol-placement");
@@ -750,7 +758,7 @@ fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, FILT_SPOT_SND, true, bkt, s, null);
+    try applyBucket(js, FILT_SPOT_SND, true, bkt, s, false, null); // soundings stay as-is (band-quilted, keep smax)
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("icon-image");
@@ -769,7 +777,7 @@ fn dangerSoundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "danger_soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, FILT_DANGER_SND, true, bkt, s, null);
+    try applyBucket(js, FILT_DANGER_SND, true, bkt, s, false, null); // danger soundings stay as-is (band-quilted)
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("icon-image");
