@@ -69,48 +69,6 @@ test "golden Part-9 stream: opening vs fixed Bridge, DepthArea (BRIDGE->Bridge +
     try std.testing.expect(!has(streams[2], "BRIDGE01"));
 }
 
-test "golden Part-9 stream: FFPT StructureEquipment suppresses DistanceMark's standalone symbol" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Three point features: a free-standing DISMAR (no association), a DISMAR bound
-    // via FFPT to a LNDMRK "structure", and the LNDMRK itself. DistanceMark.lua calls
-    // GetFeatureAssociations('StructureEquipment'): when it returns nothing the rule
-    // draws a standalone DISMAR06/07 symbol; when the association resolves it suppresses
-    // the symbol (the structure already carries one). This exercises the full path:
-    // FFPT parse -> Cell.foid_index -> HostFeatureGetAssociatedFeatureIDs -> the rule.
-    const struct_foid: u64 = 0xABCDEF;
-    const eq_ref = [_]s57.FeatureRef{.{ .lnam = struct_foid, .rind = 2 }}; // slave -> the structure
-    const feats = [_]s57.Feature{
-        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 44 }, // DISMAR, free-standing
-        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 44, .frefs = &eq_ref }, // DISMAR bound to a structure
-        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 74, .foid = struct_foid }, // LNDMRK -> Landmark
-    };
-    var foid_index: std.AutoHashMapUnmanaged(u64, usize) = .{};
-    try foid_index.put(a, struct_foid, 2);
-    var cell = s57.Cell{
-        .params = .{},
-        .vectors = &.{},
-        .features = &feats,
-        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
-        .edges = std.AutoHashMap(u32, usize).init(a),
-        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
-        .foid_index = foid_index,
-        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-    };
-    defer cell.arena.deinit();
-
-    portray.setQuiet(true);
-    const streams = try portray.portrayCell(a, &cell, "");
-    try std.testing.expectEqual(@as(usize, 3), streams.len);
-
-    // [0] no association -> DistanceMark draws its standalone symbol.
-    try std.testing.expect(has(streams[0], "PointInstruction:DISMAR"));
-    // [1] StructureEquipment association resolved -> symbol suppressed.
-    try std.testing.expect(!has(streams[1], "PointInstruction:DISMAR"));
-}
-
 test "golden Part-9 stream: M_QUAL quality fills (DQUAL from CATZOC, NODATA03 when absent)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -21,8 +21,6 @@ const Ctx = struct {
     adapted: []adapt.Adapted,
     results: [][]const u8, // per adapted index -> instruction stream (arena-owned)
     arena: std.mem.Allocator,
-    cell: *const s57.Cell, // for FFPT feature-to-feature association resolution
-    feat_to_adapted: []const ?usize, // cell.features index -> this pass's adapted index
 };
 
 // One in-flight portrayal per thread. The tgp_* accessors below run on the same
@@ -153,59 +151,6 @@ export fn tgp_colocated(i: usize, out: [*]usize, max: usize) callconv(.c) usize 
     return n;
 }
 
-fn eqlAny(role: []const u8, names: []const []const u8) bool {
-    for (names) |n| if (std.mem.eql(u8, role, n)) return true;
-    return false;
-}
-
-/// True when an FFPT pointer with relationship indicator `rind` (1=master,
-/// 2=slave, 3=peer) satisfies an S-101 association `roleCode`. S-57 FFPT carries
-/// only the RIND, not the S-101 role, so the role of the REFERENCED feature is
-/// derived from it: a master pointer means the referenced object is the
-/// collection/whole/structure, a slave pointer means it is the component/part/
-/// equipment. In practice NOAA encodes aids-to-navigation as the structure (beacon/
-/// buoy) carrying a SLAVE pointer to its equipment (LIGHTS/DAYMAR/TOPMAR), so
-/// `theEquipment`/`theComponent` map to RIND=2. An empty role (the framework's nil)
-/// matches any pointer; an unrecognised role is permissive (matches any) rather than
-/// silently dropping an association the caller only existence-checks.
-fn roleMatchesRind(role: []const u8, rind: u8) bool {
-    if (role.len == 0) return true;
-    if (eqlAny(role, &.{ "theStructure", "theCollection", "thePrimaryFeature", "theRoofedStructure", "theUpdate" })) return rind == 1;
-    if (eqlAny(role, &.{ "theEquipment", "theComponent", "theSupport", "theAuxiliaryFeature", "theUpdatedObject", "theCartographicText", "thePositionProvider" })) return rind == 2;
-    return true;
-}
-
-/// This-pass adapted indices of the features that feature `i`'s FFPT pointers
-/// reference, filtered by `role` (RIND-derived; see roleMatchesRind). Backs
-/// HostFeatureGetAssociatedFeatureIDs so the reference framework's feature-feature
-/// associations resolve — StructureEquipment (DistanceMark, PortrayalModel text
-/// placement) and the aids-to-navigation aggregations. The returned indices are the
-/// same opaque IDs lp_feature_ids/featureCache use. Writes up to `max` into `out`.
-/// O(frefs) per call and only non-empty for the few features carrying FFPT; the
-/// S-101 association code (arg 2 in the shim) is not used to filter — S-57 FFPT has
-/// no association-code concept, so the RIND->role filter alone selects the pointers.
-export fn tgp_assoc_features(i: usize, role_ptr: [*]const u8, role_len: usize, out: [*]usize, max: usize) callconv(.c) usize {
-    const c = g_ctx orelse return 0;
-    if (i >= c.adapted.len) return 0;
-    const fi = c.adapted[i].feature_index;
-    if (fi >= c.cell.features.len) return 0;
-    const frefs = c.cell.features[fi].frefs;
-    if (frefs.len == 0) return 0;
-    const role = role_ptr[0..role_len];
-    var n: usize = 0;
-    for (frefs) |fr| {
-        if (!roleMatchesRind(role, fr.rind)) continue;
-        const tfi = c.cell.featureIndexByFoid(fr.lnam) orelse continue;
-        if (tfi >= c.feat_to_adapted.len) continue;
-        const aj = c.feat_to_adapted[tfi] orelse continue;
-        if (aj == i) continue; // a feature never associates with itself
-        if (n >= max) break;
-        out[n] = aj;
-        n += 1;
-    }
-    return n;
-}
-
 /// C calls this with each feature's joined instruction stream.
 export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(.c) void {
     const c = g_ctx orelse return;
@@ -257,22 +202,11 @@ pub const Context = struct {
 /// Run the S-101 rules over `adapted` with `ov`, returning a stream array indexed
 /// by cell.features index (null where the adapted subset doesn't cover a feature,
 /// or it emitted nothing). `features_len` is cell.features.len.
-fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapt.Adapted, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
+fn runAdapted(arena: std.mem.Allocator, adapted: []adapt.Adapted, features_len: usize, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
     const results = try arena.alloc([]const u8, adapted.len);
     for (results) |*r| r.* = "";
 
-    // Reverse index cell.features index -> this pass's adapted index, so an FFPT
-    // pointer (resolved to a feature index via Cell.featureIndexByFoid) maps back to
-    // the opaque Lua feature ID (the adapted index) that HostFeatureGetCode/featureCache
-    // use. Only features present in THIS pass are mapped, so a subset (variant) pass
-    // resolves associations among its own features.
-    const feat_to_adapted = try arena.alloc(?usize, cell.features.len);
-    for (feat_to_adapted) |*x| x.* = null;
-    for (adapted, 0..) |ad, i| {
-        if (ad.feature_index < feat_to_adapted.len) feat_to_adapted[ad.feature_index] = i;
-    }
-
-    var ctx = Ctx{ .adapted = adapted, .results = results, .arena = arena, .cell = cell, .feat_to_adapted = feat_to_adapted };
+    var ctx = Ctx{ .adapted = adapted, .results = results, .arena = arena };
     g_ctx = &ctx;
     defer g_ctx = null;
 
@@ -280,7 +214,7 @@ fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapt.
     _ = tg_portray_run(rules_dir.ptr, rules_dir.len, &cctx);
 
     // Re-key adapted-index results to cell feature index.
-    const by_feature = try arena.alloc(?[]const u8, cell.features.len);
+    const by_feature = try arena.alloc(?[]const u8, features_len);
     for (by_feature) |*b| b.* = null;
     for (adapted, 0..) |ad, i| {
         if (results[i].len > 0) by_feature[ad.feature_index] = results[i];
@@ -293,7 +227,7 @@ fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapt.
 /// emitted nothing). Allocates into `arena` (must outlive tile generation).
 pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) ![]?[]const u8 {
     const adapted = try adapt.adaptCell(arena, cell);
-    return runAdapted(arena, cell, adapted, rules_dir, .{});
+    return runAdapted(arena, adapted, cell.features.len, rules_dir, .{});
 }
 
 /// Portray a cell with an explicit S-101 context — the native-render entry
@@ -302,7 +236,7 @@ pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: [
 /// of the tile path's live-swap props. One pass, one context.
 pub fn portrayCellWith(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8, ctx: Context) ![]?[]const u8 {
     const adapted = try adapt.adaptCell(arena, cell);
-    return runAdapted(arena, cell, adapted, rules_dir, ctx);
+    return runAdapted(arena, adapted, cell.features.len, rules_dir, ctx);
 }
 
 /// A cell's default portrayal plus its display-variant passes. `plain` is the
@@ -334,9 +268,9 @@ pub fn portrayCellSubset(arena: std.mem.Allocator, cell: *const s57.Cell, rules_
         try subset.append(arena, ad);
         if (std.mem.eql(u8, ad.primitive, "Point")) try points.append(arena, ad);
     }
-    var cp = CellPortrayal{ .base = try runAdapted(arena, cell, subset.items, rules_dir, .{}) };
+    var cp = CellPortrayal{ .base = try runAdapted(arena, subset.items, cell.features.len, rules_dir, .{}) };
     if (points.items.len > 0)
-        cp.simplified = runAdapted(arena, cell, points.items, rules_dir, .{ .simplified_symbols = true }) catch null;
+        cp.simplified = runAdapted(arena, points.items, cell.features.len, rules_dir, .{ .simplified_symbols = true }) catch null;
     return cp;
 }
 
@@ -348,7 +282,7 @@ pub fn portrayCellSubset(arena: std.mem.Allocator, cell: *const s57.Cell, rules_
 /// override — so the extra rule evaluation is bounded to the relevant features.
 pub fn portrayCellVariants(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) !CellPortrayal {
     const adapted = try adapt.adaptCell(arena, cell);
-    const base = try runAdapted(arena, cell, adapted, rules_dir, .{});
+    const base = try runAdapted(arena, adapted, cell.features.len, rules_dir, .{});
 
     // Partition the adapted features by the variant they can contribute. "Surface"
     // → the plain-boundary variant; "Point" → the simplified-symbol variant
@@ -365,8 +299,8 @@ pub fn portrayCellVariants(arena: std.mem.Allocator, cell: *const s57.Cell, rule
 
     var cp = CellPortrayal{ .base = base };
     if (areas.items.len > 0)
-        cp.plain = runAdapted(arena, cell, areas.items, rules_dir, .{ .plain_boundaries = true }) catch null;
+        cp.plain = runAdapted(arena, areas.items, cell.features.len, rules_dir, .{ .plain_boundaries = true }) catch null;
     if (points.items.len > 0)
-        cp.simplified = runAdapted(arena, cell, points.items, rules_dir, .{ .simplified_symbols = true }) catch null;
+        cp.simplified = runAdapted(arena, points.items, cell.features.len, rules_dir, .{ .simplified_symbols = true }) catch null;
     return cp;
 }
