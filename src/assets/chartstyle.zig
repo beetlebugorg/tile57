@@ -175,6 +175,39 @@ pub fn colorMatch(b: B, tokenExpr: Value, palette: *const ObjectMap, fallback: [
     return .{ .array = list };
 }
 
+// Fill colour for a colour token that may carry a ",<alpha>" suffix — S-101 ColorFill
+// emits "TOKEN,alpha" (e.g. TRFCF,0.75 traffic-separation zones; CHGRF,0.5; NODTA,0.5).
+// Match the palette on the BASE token (else "TRFCF,0.75" != "TRFCF" -> opaque fallback)
+// and fold the alpha into an rgba fill-colour (fill-opacity isn't data-driven in
+// MapLibre; fill-color is). A token with no comma is matched whole (no regression).
+// Mirrors the web colorTokenFill (s52-style.mjs).
+pub fn colorTokenFill(b: B, prop: []const u8, palette: *const ObjectMap) !Value {
+    const ct = try b.coalesce(try b.get(prop), b.s(""));
+    const var_ct = try b.arr(&.{ b.s("var"), b.s("ct") });
+    const var_ci = try b.arr(&.{ b.s("var"), b.s("ci") });
+    const var_c = try b.arr(&.{ b.s("var"), b.s("c") });
+    const ci_expr = try b.arr(&.{ b.s("index-of"), b.s(","), var_ct });
+    // no comma -> match the whole token (to-color unifies the case branch types)
+    const no_alpha = try b.arr(&.{ b.s("to-color"), try colorMatch(b, var_ct, palette, FALLBACK) });
+    // comma -> match the base token, fold the numeric suffix into rgba alpha
+    const base = try b.arr(&.{ b.s("slice"), var_ct, b.int(0), var_ci });
+    const c_color = try b.arr(&.{ b.s("to-color"), try colorMatch(b, base, palette, FALLBACK) });
+    const r = try b.arr(&.{ b.s("at"), b.int(0), try b.arr(&.{ b.s("to-rgba"), var_c }) });
+    const g = try b.arr(&.{ b.s("at"), b.int(1), try b.arr(&.{ b.s("to-rgba"), var_c }) });
+    const bl = try b.arr(&.{ b.s("at"), b.int(2), try b.arr(&.{ b.s("to-rgba"), var_c }) });
+    const ci1 = try b.arr(&.{ b.s("+"), var_ci, b.int(1) });
+    const alpha = try b.arr(&.{ b.s("to-number"), try b.arr(&.{ b.s("slice"), var_ct, ci1 }) });
+    const rgba = try b.arr(&.{ b.s("rgba"), r, g, bl, alpha });
+    const alpha_branch = try b.arr(&.{ b.s("let"), b.s("c"), c_color, rgba });
+    const lt0 = try b.arr(&.{ b.s("<"), var_ci, b.int(0) });
+    const case_expr = try b.arr(&.{ b.s("case"), lt0, no_alpha, alpha_branch });
+    // NEST the lets: the inner "ci" binding references var "ct" from the OUTER let's
+    // scope. MapLibre forbids a binding from referencing a SIBLING binding — a flat
+    // ["let","ct",..,"ci",<uses var ct>,..] fails at runtime with "Unknown variable ct".
+    const inner = try b.arr(&.{ b.s("let"), b.s("ci"), ci_expr, case_expr });
+    return b.arr(&.{ b.s("let"), b.s("ct"), ct, inner });
+}
+
 // A single resolved colour token for the scheme (concrete value).
 pub fn token(palette: *const ObjectMap, name: []const u8, fallback: []const u8) []const u8 {
     if (palette.get(name)) |v| if (v == .string) return v.string;
@@ -247,7 +280,7 @@ pub fn areasFillColor(b: B, palette: *const ObjectMap, m: *const MarinerSettings
         b.s("case"),
         try b.arr(&.{ b.s("has"), b.s("drval1") }),
         try colorMatch(b, try seabedTokenExpr(b, m), palette, FALLBACK),
-        try colorMatch(b, try b.coalesce(try b.get("color_token"), b.s("")), palette, FALLBACK),
+        try colorTokenFill(b, "color_token", palette),
     });
 }
 
