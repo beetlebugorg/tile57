@@ -123,6 +123,34 @@ export fn tgp_point(i: usize, j: usize, x: *f64, y: *f64, z: *f64) callconv(.c) 
     z.* = p[j][2];
 }
 
+/// Feature indices co-located with point feature `i` (same lon/lat within ~1 cm),
+/// excluding `i`. Backs HostSpatialGetAssociatedFeatureIDs for `#P` spatials so
+/// LightFlareAndDescription's co-located-light rule (the 45° flare — an S-101
+/// portrayal DEFAULT; S-65 does NOT derive flareBearing for this) can run. Writes up
+/// to `max` indices into `out`, returns the count; 0 for a non-point feature. O(n)
+/// per call, invoked only for the few white/yellow/orange all-round lights whose rule
+/// reads AssociatedFeatures. NOAA co-located aids share the exact S-57 node, so a
+/// tight position epsilon reconstructs the S-101 shared-spatial association.
+export fn tgp_colocated(i: usize, out: [*]usize, max: usize) callconv(.c) usize {
+    const c = g_ctx orelse return 0;
+    if (i >= c.adapted.len) return 0;
+    const pi = c.adapted[i].points;
+    if (pi.len == 0) return 0;
+    const lon = pi[0][0];
+    const lat = pi[0][1];
+    const eps: f64 = 1e-7;
+    var n: usize = 0;
+    for (c.adapted, 0..) |aj, j| {
+        if (j == i or aj.points.len == 0) continue;
+        if (@abs(aj.points[0][0] - lon) <= eps and @abs(aj.points[0][1] - lat) <= eps) {
+            if (n >= max) break;
+            out[n] = j;
+            n += 1;
+        }
+    }
+    return n;
+}
+
 /// C calls this with each feature's joined instruction stream.
 export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(.c) void {
     const c = g_ctx orelse return;

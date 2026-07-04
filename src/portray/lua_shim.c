@@ -24,6 +24,7 @@ extern size_t tgp_complex_count(size_t i, const char *path, size_t plen,
 extern void tgp_emit(size_t i, const char *instr, size_t len);
 extern size_t tgp_points_count(size_t i);
 extern void tgp_point(size_t i, size_t j, double *x, double *y, double *z);
+extern size_t tgp_colocated(size_t i, size_t *out, size_t max);
 
 /* Catalogue accessors implemented in Zig (catalogue.zig). */
 extern size_t tgc_feature_count(void);
@@ -635,6 +636,28 @@ static int lp_feature_points(lua_State *L) {
     }
     return 1;
 }
+/* HostSpatialGetAssociatedFeatureIDs(spatialID): for a POINT spatial ("<fid>#P"),
+ * return the feature IDs co-located with <fid> so LightFlareAndDescription's
+ * co-located-light rule (the 45-degree flare — an S-101 portrayal DEFAULT; S-65
+ * does not derive flareBearing for this) can run. Line/area spatials (#S/#M/#exterior)
+ * return an empty list, so the curve/area rules that also read AssociatedFeatures are
+ * unaffected. IDs are the decimal feature indices lp_feature_ids/featureCache use. */
+static int lp_spatial_assoc_features(lua_State *L) {
+    size_t slen = 0;
+    const char *sid = luaL_checklstring(L, 1, &slen);
+    lua_newtable(L);
+    if (slen < 3 || sid[slen - 2] != '#' || sid[slen - 1] != 'P') return 1; /* points only */
+    size_t i = (size_t)atol(sid); /* the "<fid>" prefix */
+    size_t buf[64];
+    size_t n = tgp_colocated(i, buf, sizeof buf / sizeof buf[0]);
+    for (size_t k = 0; k < n; k++) {
+        char id[24];
+        snprintf(id, sizeof id, "%zu", buf[k]);
+        lua_pushstring(L, id);
+        lua_rawseti(L, -2, (lua_Integer)(k + 1));
+    }
+    return 1;
+}
 static int lp_feature_simple_attr(lua_State *L) { /* (id, path, code) -> {value(s)} */
     size_t i = (size_t)atol(luaL_checkstring(L, 1));
     const char *path = lua_tostring(L, 2); /* the framework attributePath; "" = the feature root */
@@ -753,7 +776,7 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
     lua_register(L, "HostGetFeatureAssociationTypeCodes", l_empty_table);
     lua_register(L, "HostFeatureGetAssociatedFeatureIDs", l_empty_table);
     lua_register(L, "HostFeatureGetAssociatedInformationIDs", l_empty_table);
-    lua_register(L, "HostSpatialGetAssociatedFeatureIDs", l_empty_table);
+    lua_register(L, "HostSpatialGetAssociatedFeatureIDs", lp_spatial_assoc_features);
     lua_register(L, "HostSpatialGetAssociatedInformationIDs", l_empty_table);
     lua_register(L, "HostInformationTypeGetCode", l_empty_string);
     lua_register(L, "HostInformationTypeGetSimpleAttribute", l_empty_table);
