@@ -25,6 +25,12 @@ const Catalogue = struct {
     simple_codes: [][]const u8,
     complex_codes: [][]const u8,
     info_codes: [][]const u8,
+    // Association/role metadata (FeatureCatalogue S100_FC_Roles / *Associations).
+    // Only the code lists are consumed — S100Scripting.lua GetTypeInfo builds the
+    // Role/FeatureAssociation/InformationAssociation Infos inline from these codes.
+    role_codes: [][]const u8,
+    feature_assoc_codes: [][]const u8,
+    info_assoc_codes: [][]const u8,
     feature_bindings: std.StringHashMap([]Binding),
     complex_bindings: std.StringHashMap([]Binding),
     info_bindings: std.StringHashMap([]Binding),
@@ -96,6 +102,9 @@ fn ensureLoaded() void {
         .simple_codes = &.{},
         .complex_codes = &.{},
         .info_codes = &.{},
+        .role_codes = &.{},
+        .feature_assoc_codes = &.{},
+        .info_assoc_codes = &.{},
         .feature_bindings = std.StringHashMap([]Binding).init(a),
         .complex_bindings = std.StringHashMap([]Binding).init(a),
         .info_bindings = std.StringHashMap([]Binding).init(a),
@@ -161,6 +170,19 @@ fn ensureLoaded() void {
         }
         cat.info_codes = codes.items;
     };
+    // roles / feature-associations / information-associations: only the code KEYS
+    // are served (to S100Scripting.lua GetTypeInfo), so just collect the keys.
+    for ([_]struct { key: []const u8, dst: *[][]const u8 }{
+        .{ .key = "roles", .dst = &cat.role_codes },
+        .{ .key = "featureAssociations", .dst = &cat.feature_assoc_codes },
+        .{ .key = "informationAssociations", .dst = &cat.info_assoc_codes },
+    }) |kv| {
+        if (root.get(kv.key)) |v| if (v == .object) {
+            var codes = std.ArrayList([]const u8).empty;
+            for (v.object.keys()) |code| codes.append(a, code) catch {};
+            kv.dst.* = codes.items;
+        };
+    }
 
     // S-57 numeric code -> acronym tables.
     if (std.json.parseFromSlice(std.json.Value, a, s57codes_bytes, .{})) |cp| {
@@ -348,6 +370,34 @@ export fn tgc_info_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
     return s.ptr;
 }
 
+export fn tgc_role_count() callconv(.c) usize {
+    ensureLoaded();
+    return if (g_cat) |c| c.role_codes.len else 0;
+}
+export fn tgc_role_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const s = g_cat.?.role_codes[i];
+    out_len.* = s.len;
+    return s.ptr;
+}
+export fn tgc_feature_assoc_count() callconv(.c) usize {
+    ensureLoaded();
+    return if (g_cat) |c| c.feature_assoc_codes.len else 0;
+}
+export fn tgc_feature_assoc_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const s = g_cat.?.feature_assoc_codes[i];
+    out_len.* = s.len;
+    return s.ptr;
+}
+export fn tgc_info_assoc_count() callconv(.c) usize {
+    ensureLoaded();
+    return if (g_cat) |c| c.info_assoc_codes.len else 0;
+}
+export fn tgc_info_assoc_code(i: usize, out_len: *usize) callconv(.c) [*]const u8 {
+    const s = g_cat.?.info_assoc_codes[i];
+    out_len.* = s.len;
+    return s.ptr;
+}
+
 fn bindingsOf(map: *std.StringHashMap([]Binding), code: []const u8) []Binding {
     return map.get(code) orelse &.{};
 }
@@ -403,6 +453,23 @@ test "catalogue loads + resolves aliases + bindings" {
     const c = &g_cat.?;
     for (c.feature_bindings.get("DepthArea").?) |b| {
         if (std.mem.eql(u8, b.ref, "depthRangeMinimumValue")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "role + association code lists load from the catalogue" {
+    try std.testing.expect(tgc_loaded());
+    // 14 roles, 18 feature-associations, 3 information-associations (FeatureCatalogue.xml).
+    try std.testing.expectEqual(@as(usize, 14), tgc_role_count());
+    try std.testing.expectEqual(@as(usize, 18), tgc_feature_assoc_count());
+    try std.testing.expectEqual(@as(usize, 3), tgc_info_assoc_count());
+    // StructureEquipment (DistanceMark) is present among the feature associations.
+    var found = false;
+    var i: usize = 0;
+    while (i < tgc_feature_assoc_count()) : (i += 1) {
+        var len: usize = 0;
+        const c = tgc_feature_assoc_code(i, &len);
+        if (std.mem.eql(u8, c[0..len], "StructureEquipment")) found = true;
     }
     try std.testing.expect(found);
 }

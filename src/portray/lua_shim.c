@@ -35,6 +35,12 @@ extern size_t tgc_complex_count(void);
 extern const char *tgc_complex_code(size_t i, size_t *len);
 extern size_t tgc_info_count(void);
 extern const char *tgc_info_code(size_t i, size_t *len);
+extern size_t tgc_role_count(void);
+extern const char *tgc_role_code(size_t i, size_t *len);
+extern size_t tgc_feature_assoc_count(void);
+extern const char *tgc_feature_assoc_code(size_t i, size_t *len);
+extern size_t tgc_info_assoc_count(void);
+extern const char *tgc_info_assoc_code(size_t i, size_t *len);
 extern size_t tgc_feature_binding_count(const char *code, size_t code_len);
 extern size_t tgc_complex_binding_count(const char *code, size_t code_len);
 extern size_t tgc_info_binding_count(const char *code, size_t code_len);
@@ -545,6 +551,43 @@ static int lp_info_codes(lua_State *L) { /* HostGetInformationTypeCodes() */
     }
     return 1;
 }
+/* HostGetRoleTypeCodes / HostGetFeatureAssociationTypeCodes /
+ * HostGetInformationAssociationTypeCodes: 1-based arrays of the catalogue code
+ * strings. S100Scripting.lua GetTypeInfo() builds the Role/FeatureAssociation/
+ * InformationAssociation Infos inline from these (no per-code Info callback). */
+static int lp_role_codes(lua_State *L) {
+    size_t n = tgc_role_count();
+    lua_newtable(L);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *c = tgc_role_code(i, &len);
+        lua_pushlstring(L, c, len);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    return 1;
+}
+static int lp_feature_assoc_codes(lua_State *L) {
+    size_t n = tgc_feature_assoc_count();
+    lua_newtable(L);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *c = tgc_feature_assoc_code(i, &len);
+        lua_pushlstring(L, c, len);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    return 1;
+}
+static int lp_info_assoc_codes(lua_State *L) {
+    size_t n = tgc_info_assoc_count();
+    lua_newtable(L);
+    for (size_t i = 0; i < n; i++) {
+        size_t len = 0;
+        const char *c = tgc_info_assoc_code(i, &len);
+        lua_pushlstring(L, c, len);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    return 1;
+}
 static int lp_info_info(lua_State *L) { /* HostGetInformationTypeInfo(code) */
     size_t clen = 0;
     const char *code = luaL_checklstring(L, 1, &clen);
@@ -770,10 +813,10 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
      * spatial-quality association functions themselves are Lua glue below. */
     lua_register(L, "HostGetInformationTypeCodes", lp_info_codes);
     lua_register(L, "HostGetInformationTypeInfo", lp_info_info);
-    /* empty catalogue tables */
-    lua_register(L, "HostGetRoleTypeCodes", l_empty_table);
-    lua_register(L, "HostGetInformationAssociationTypeCodes", l_empty_table);
-    lua_register(L, "HostGetFeatureAssociationTypeCodes", l_empty_table);
+    /* role / association type-code lists (from the embedded Feature Catalogue) */
+    lua_register(L, "HostGetRoleTypeCodes", lp_role_codes);
+    lua_register(L, "HostGetInformationAssociationTypeCodes", lp_info_assoc_codes);
+    lua_register(L, "HostGetFeatureAssociationTypeCodes", lp_feature_assoc_codes);
     lua_register(L, "HostFeatureGetAssociatedFeatureIDs", l_empty_table);
     lua_register(L, "HostFeatureGetAssociatedInformationIDs", l_empty_table);
     lua_register(L, "HostSpatialGetAssociatedFeatureIDs", lp_spatial_assoc_features);
