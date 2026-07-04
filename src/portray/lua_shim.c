@@ -867,39 +867,20 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
         "cp('DeepContour','real', DEEP_CONTOUR); cp('SafetyHeight','real', SAFETY_HEIGHT)\n"
         "cp('PreferredLanguage','text','eng')\n"
         "PortrayalInitializeContextParameters(cps)\n"
-        "local ctx=portrayalContext.ContextParameters\n"
-        "local nok,nerr,nskip,ntext,errs=0,0,0,0,{}\n"
-        "for _,item in ipairs(portrayalContext.FeaturePortrayalItems) do\n"
-        "  local feature=item.Feature\n"
-        "  local fp=item:NewFeaturePortrayal()\n"
-        // After the class rule runs, fall back to PortrayFeatureName when the rule
-        // didn't self-label (fp.GetFeatureNameCalled) — this is how place/area/region
-        // names etc. get their centred black label (mirrors Go engine.go:374-376 /
-        // main.lua). vg is the rule's returned viewing group.
-        "  local ok,err=pcall(function()\n"
-        "    require(feature.Code)\n"
-        "    local vg=_G[feature.Code](feature,fp,ctx)\n"
-        "    if not fp.GetFeatureNameCalled then PortrayFeatureName(feature,fp,ctx,32,24,vg,nil,'TextAlignHorizontal:Center;TextAlignVertical:Top;LocalOffset:0,-3.51;FontColor:CHBLK') end\n"
-        "  end)\n"
-        "  local instr\n"
-        "  if ok then nok=nok+1; instr=table.concat(fp.DrawingInstructions, ';')\n"
-        // A feature whose own class has no rule file is NOT an error: the catalogue
-        // simply doesn't portray it (e.g. SweptArea/SWPARE — an IHO gap). Leave
-        // instr nil so it falls back to classify(), and tally it apart from real
-        // rule errors. Matches the Go reference, which suppresses these silently.
-        // The match is on feature.Code so a *different* missing require inside a
-        // rule (a real bug) still counts as an error.
-        "  elseif tostring(err):find(\"module '\"..feature.Code..\"' not found\", 1, true) then nskip=nskip+1\n"
-        "  else nerr=nerr+1; instr='ERROR:'..tostring(err)\n"
-        // PrimitiveType is a PortrayalAPI enum *table*; print its .Name (Point/
-        // Curve/Surface) rather than the useless "table: 0x..." address.
-        "    errs[feature.Code]=(errs[feature.Code] or (tostring(err)..' [prim='..(feature.PrimitiveType and feature.PrimitiveType.Name or '?')..']')) end\n"
-        "  if instr and instr:find('TextInstruction') then ntext=ntext+1 end\n"
-        "  tg_store(tonumber(feature.ID), instr)\nend\n"
-        "if not QUIET then\n"
-        "  io.stderr:write('[s101] portrayed '..nok..' ok, '..nerr..' errors, '..nskip..' unportrayed, '..ntext..' with text\\n')\n"
-        "  for code,e in pairs(errs) do io.stderr:write('  '..code..': '..e..'\\n') end\n"
-        "end\n";
+        // Drive portrayal through the reference S-100 Part 9a entry point exactly as
+        // the catalogue intends. HostPortrayalEmit is the framework's per-feature
+        // emit callback (9A-14.2.1): route each feature's joined instructions into our
+        // tgp_emit sink, keyed by FeatureReference (== feature.ID == our feature index),
+        // and return true to continue. PortrayalMain() then runs the full
+        // ProcessFeaturePortrayalItem wrapper per feature — ProcessFixedAndPeriodicDates,
+        // ScaleMinimum/ScaleMaximum, the rule, PortrayFeatureName fallback,
+        // ProcessNauticalInformation (info/picture-available indicators),
+        // AddDateDependentSymbol, deferred TextPlacement, and Default()-on-error — that
+        // our old hand-rolled loop skipped.
+        "function HostPortrayalEmit(ref, instr, observed)\n"
+        "  tg_store(tonumber(ref), instr or '')\n"
+        "  return true\nend\n"
+        "PortrayalMain()\n";
     lua_pushboolean(L, g_portray_quiet);
     lua_setglobal(L, "QUIET");
     /* The pass's S-101 context parameters, read by the driver's cp() lines.
