@@ -987,18 +987,15 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         for (all_buckets) |bkt| try patternLayer(js, &s, "area_patterns_scamin", bkt);
     }
 
-    // 4. lines: solid/dashed/dotted over base + _scamin buckets
+    // 4. lines: solid/dashed/dotted over base + _scamin buckets. Complex
+    // (symbolised) lines fold into `lines` and light sector figures route through
+    // `lines` too (scene.zig endScene), so there are NO complex_lines /
+    // complex_lines_scamin / sector_lines source-layers to draw — the old style
+    // layers over them were dead (baked nothing) and were removed.
     try lineLayers(js, &s, "lines", .{});
     for (all_buckets) |bkt| try lineLayers(js, &s, "lines_scamin", bkt);
 
-    // 5. complex (symbolised) lines
-    try complexLineLayer(js, &s, "complex_lines", .{});
-    for (all_buckets) |bkt| try complexLineLayer(js, &s, "complex_lines_scamin", bkt);
-
-    // 6. light sector limit lines (no SCAMIN bucketing)
-    try lineLayers(js, &s, "sector_lines", .{});
-
-    // 7. point symbols + soundings (sprite required), stacked by z-order:
+    // 5. point symbols + soundings (sprite required), stacked by z-order:
     //   base symbols (buoys/beacons/landmarks…) UNDER soundings (S-52 priority),
     //   then soundings, then the DANGER markers (obstruction/wreck/rock) OVER soundings
     //   so the hazard stays visible on top of its own depth number, then LIGHTS on top.
