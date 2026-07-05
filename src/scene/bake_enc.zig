@@ -147,6 +147,9 @@ const BackendCov = struct {
     pub inline fn name(self: BackendCov, i: u32) []const u8 {
         return self.backends[i].cell.name;
     }
+    pub inline fn date(self: BackendCov, i: u32) []const u8 {
+        return self.backends[i].cell.dsid.isdt;
+    }
 };
 
 fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
@@ -155,6 +158,17 @@ fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64
 
 fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) bool {
     return coversAnyCtx(BackendCov{ .backends = backends }, idxs, lon, lat);
+}
+
+// Whether cell `a` orders strictly before cell `b` in the equal-scale clip
+// order: newer DSID issue/update date first (YYYYMMDD compares lexically; a
+// dated cell orders before an undated one), then cell name ascending - total
+// and deterministic for distinct cells, so bake output is byte-stable.
+fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
+    const da = ctx.date(a_idx);
+    const db = ctx.date(b_idx);
+    if (!std.mem.eql(u8, da, db)) return std.mem.lessThan(u8, db, da); // newer first
+    return std.mem.lessThan(u8, ctx.name(a_idx), ctx.name(b_idx));
 }
 
 /// The finer-scale coverage to subtract from cell `cscl_self`'s fills in tile
@@ -177,10 +191,12 @@ pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, r
         const cscl = ctx.cscl(idx);
         if (cscl <= 0 or cscl > cscl_self) continue; // coarser never clips finer
         // Strictly finer coverage always clips. EQUAL-scale neighbours clip by a
-        // deterministic total order (cell name), so two adjacent same-band cells
-        // that both chart a seam object emit exactly one copy — spec §2.3:
-        // F(cell c) = union of M_COVR of all cells ordered strictly before c.
-        if (cscl == cscl_self and !std.mem.lessThan(u8, ctx.name(idx), ctx.name(self_idx))) continue;
+        // deterministic total order — NEWER compilation first (DSID issue date,
+        // refreshed by each applied update), cell name as the final tie — so two
+        // adjacent same-band cells that both chart a seam object emit exactly one
+        // copy AND the newer survey wins the double-owned strip (spec §2.1/Q4:
+        // F(cell c) = union of M_COVR of all cells ordered strictly before c).
+        if (cscl == cscl_self and !ordersBefore(ctx, idx, self_idx)) continue;
         for (ctx.coverage(idx)) |rings| {
             var poly = std.ArrayList([]const geometry.boolean.Pt).empty;
             for (rings) |ring| {
@@ -1698,4 +1714,26 @@ test "bandOf / bandZooms match the Go reference bands" {
     try std.testing.expectEqual(Band.approach, bandOf(80_000)); // [11,13]
     try std.testing.expectEqual(Band.approach, bandOf(0)); // CSCL 0 -> 50k -> approach
     try std.testing.expectEqual(Band.coastal, bandOf(200_000)); // [9,11]
+}
+
+test "ordersBefore: newer DSID date first, name breaks ties, dated beats undated" {
+    const Ctx = struct {
+        dates: []const []const u8,
+        names: []const []const u8,
+        pub fn date(self: @This(), i: u32) []const u8 {
+            return self.dates[i];
+        }
+        pub fn name(self: @This(), i: u32) []const u8 {
+            return self.names[i];
+        }
+    };
+    const ctx = Ctx{
+        .dates = &.{ "20240101", "20250601", "20250601", "" },
+        .names = &.{ "US5AAAAA", "US5BBBBB", "US5CCCCC", "US5DDDDD" },
+    };
+    try std.testing.expect(ordersBefore(ctx, 1, 0)); // newer date wins
+    try std.testing.expect(!ordersBefore(ctx, 0, 1));
+    try std.testing.expect(ordersBefore(ctx, 1, 2)); // same date -> name asc
+    try std.testing.expect(!ordersBefore(ctx, 2, 1));
+    try std.testing.expect(ordersBefore(ctx, 0, 3)); // dated beats undated
 }
