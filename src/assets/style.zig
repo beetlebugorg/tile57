@@ -457,6 +457,13 @@ fn lineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, name: []const u8, f
     try js.beginObject();
     try layerHead(js, id, "line", sl);
     try applyBucket(js, filt, true, bkt, s, true, null); // line: scamin line variants band-independent
+    try js.objectField("layout");
+    try js.beginObject();
+    // draw_prio as the sole intra-layer z-order axis (mirrors fill-/symbol-sort-key),
+    // so a higher-priority line paints over a lower one within a dash class.
+    try js.objectField("line-sort-key");
+    try js.write(.{ "coalesce", .{ "get", "draw_prio" }, 0 });
+    try js.endObject();
     try js.objectField("paint");
     try linePaint(js, s.line_color, dash, s.size_scale);
     try js.endObject();
@@ -481,15 +488,15 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
     try js.write(true);
     try js.objectField("icon-ignore-placement");
     try js.write(true);
-    // Draw point symbols in S-101 DrawingPriority order (the `draw_prio` tile property,
-    // higher = on top), not raw tile/source order — so e.g. a light (DrawingPriority 24)
-    // draws over an obstruction (12). symbol-sort-key sorts ascending (lower drawn first
-    // = underneath), so the key IS draw_prio. z-order "auto" makes the sort-key take
-    // effect (was "source", which ignored it). Mirrors fill-sort-key on the fill layers.
-    // NOTE: this orders WITHIN one layer only; LIGHTS get their own top layer set (see
-    // styleJson) so they beat same-priority bridges that sit in a different scamin bucket.
+    // Draw point symbols in S-101 DrawingPriority order (SYMBOL_SORT: effective
+    // draw_prio, higher = on top), not raw tile/source order — so e.g. a light
+    // (DrawingPriority 24) draws over an obstruction (12). Sorts ascending (lower drawn
+    // first = underneath). draw_prio is the SOLE axis; the danger-over-sounding
+    // deviation is a sort VALUE (effective 19), not a class tier. z-order "auto" makes
+    // the sort-key take effect. Mirrors fill-sort-key on the fill layers. NOTE: this
+    // orders WITHIN one layer only; LIGHTS get their own top layer set (see styleJson).
     try js.objectField("symbol-sort-key");
-    try js.write(.{ "coalesce", .{ "get", "draw_prio" }, 0 });
+    try js.write(SYMBOL_SORT);
     try js.objectField("symbol-z-order");
     try js.write("auto");
     try js.objectField("icon-rotation-alignment");
@@ -504,12 +511,32 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
 // book the sounding would cover them).
 const DANGER_CLASSES = .{ "OBSTRN", "WRECKS", "UWTROC" };
 
-// Which classes a point-symbol layer carries, so the style can stack three passes in
-// the right z-order: `base` (everything else) UNDER soundings; `dangers_only` (the
-// hazard markers) OVER soundings; `lights_only` (the paramount navaid) over all. LIGHTS
-// and dangers need their own passes because a light/danger and a same-or-higher-priority
-// neighbour usually sit in different SCAMIN buckets (separate MapLibre layers painted in
-// emit order), so an in-layer sort-key can't reorder across them.
+// The soundings DrawingPriority — the z-order boundary the point family partitions on.
+const SOUNDINGS_PRIO = 18;
+
+// `class in DANGER_CLASSES` — the danger-over-sounding deviation (see DANGER_CLASSES).
+const IN_DANGER = .{ "in", .{ "get", "class" }, .{ "literal", DANGER_CLASSES } };
+
+// Effective DrawingPriority = draw_prio (the honest catalogue 0..30 tile property,
+// NEVER bucketed) offset by the display plane (plane*64 most-significant; +1 OverRadar
+// / -1 UnderRadar, inert today -> coalesce 0). This is the SOLE point z-order axis:
+// no base/danger/light class TIERS. Used both as the partition threshold and, via
+// SYMBOL_SORT, as the intra-layer sort key.
+const EFF_PRIO = .{ "+", .{ "*", .{ "coalesce", .{ "get", "plane" }, 0 }, 64 }, .{ "coalesce", .{ "get", "draw_prio" }, 0 } };
+
+// symbol-sort-key: draw_prio is the sole axis, EXCEPT the S-52 danger deviation is
+// expressed here as a sort VALUE — a danger (OBSTRN/WRECKS/UWTROC) sorts at an
+// effective 19 so it draws just above soundings (18) WITHOUT baking a fake draw_prio
+// into the tile (the tile keeps the honest 12, so pick/spec stay correct). A base at
+// draw_prio 30 still sorts above the danger's 19; a base at 5 stays under soundings.
+const SYMBOL_SORT = .{ "case", IN_DANGER, 19, EFF_PRIO };
+
+// Which slice of the point family a layer carries. z-order is draw_prio ALONE: `base`
+// = effective-prio under soundings (< 18), `dangers_only` = effective-prio at/over
+// soundings (>= 18) PLUS the danger deviation, `lights_only` = the paramount navaid on
+// top. Dangers ride the over-soundings pass via the class-membership OR (their honest
+// draw_prio 12 is < 18); LIGHTS keep their own top pass so the marker<digit<light
+// legibility order survives across SCAMIN buckets (separate layers painted in emit order).
 const PointMode = enum { base, dangers_only, lights_only };
 
 // AND the per-alignment rot_north test with the mode's class clause, then emit the
@@ -520,11 +547,14 @@ fn applyPointBucket(js: *Stringify, s: *const SCtx, bkt: Bucket, comptime rot_no
         .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }
     else
         .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 };
-    const in_danger = .{ "in", .{ "get", "class" }, .{ "literal", DANGER_CLASSES } };
+    const not_light = .{ "!=", .{ "get", "class" }, "LIGHTS" };
     switch (mode) {
-        // base = not a light AND not a danger (those ride their own over-soundings passes).
-        .base => try applyBucket(js, .{ "all", rot, .{ "!=", .{ "get", "class" }, "LIGHTS" }, .{ "!", in_danger } }, true, bkt, s, true, null),
-        .dangers_only => try applyBucket(js, .{ "all", rot, in_danger }, true, bkt, s, true, null),
+        // UNDER soundings: effective-prio < 18, and neither a danger (rides the over
+        // pass via its class) nor a light (its own top pass).
+        .base => try applyBucket(js, .{ "all", rot, .{ "<", EFF_PRIO, SOUNDINGS_PRIO }, not_light, .{ "!", IN_DANGER } }, true, bkt, s, true, null),
+        // OVER soundings: effective-prio >= 18 OR a danger class (the deviation), not a light.
+        .dangers_only => try applyBucket(js, .{ "all", rot, .{ "any", .{ ">=", EFF_PRIO, SOUNDINGS_PRIO }, IN_DANGER }, not_light }, true, bkt, s, true, null),
+        // LIGHTS on top (kept a dedicated pass for legibility order).
         .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s, true, null),
     }
 }
@@ -1020,15 +1050,18 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     try lineLayers(js, &s, "lines", .{});
     for (all_buckets) |bkt| try lineLayers(js, &s, "lines_scamin", bkt);
 
-    // 5. point symbols + soundings (sprite required), stacked by z-order:
-    //   base symbols (buoys/beacons/landmarks…) UNDER soundings (S-52 priority),
-    //   then soundings, then the DANGER markers (obstruction/wreck/rock) OVER soundings
-    //   so the hazard stays visible on top of its own depth number, then LIGHTS on top.
+    // 5. point symbols + soundings (sprite required), stacked by z-order — draw_prio
+    // is the SOLE axis, partitioned at the soundings boundary (18):
+    //   under-soundings symbols (effective-prio < 18) UNDER soundings,
+    //   then soundings, then over-soundings symbols (effective-prio >= 18, plus the
+    //   DANGER markers at effective 19 so a hazard stays on top of its own depth
+    //   number), then LIGHTS on top. A base at draw_prio 30 lands in the over pass and
+    //   sorts above a danger's 19; a base at 5 stays under soundings.
     if (sprite_on) {
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .base);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .base);
         for (snd_buckets) |bkt| try soundingsLayer(js, &s, bkt);
-        // Danger markers over the spot soundings (hazard visibility — see DANGER_CLASSES).
+        // Over-soundings pass: high-priority symbols + the danger deviation (see PointMode).
         try pointSymbolLayers(js, &s, "point_symbols", .{}, .dangers_only);
         for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .dangers_only);
         // Danger depths ABOVE the danger markers: DANGER01/02 have an OPAQUE
@@ -1393,6 +1426,51 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     defer a.free(out_nm_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "#sm") == null);
+}
+
+fn layerIndexById(layers: []std.json.Value, id: []const u8) ?usize {
+    for (layers, 0..) |l, i| if (std.mem.eql(u8, l.object.get("id").?.string, id)) return i;
+    return null;
+}
+
+test "styleJson: point z-order = draw_prio alone (threshold partition + danger sort-value)" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    const out = try styleJson(a, .{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .source_tiles = "tile57://{z}/{x}/{y}",
+    });
+    defer a.free(out);
+
+    // symbol-sort-key = draw_prio (via plane*64 + draw_prio), with dangers mapped to an
+    // effective 19 as a sort VALUE — NOT a baked tile draw_prio, NOT a class tier.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"symbol-sort-key\":[\"case\",[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]],19,[\"+\",[\"*\",[\"coalesce\",[\"get\",\"plane\"],0],64],[\"coalesce\",[\"get\",\"draw_prio\"],0]]]") != null);
+    // The under-soundings pass filters on effective-prio < 18 (the threshold), not class.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"<\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"plane\"],0],64],[\"coalesce\",[\"get\",\"draw_prio\"],0]],18]") != null);
+    // The over-soundings pass = effective-prio >= 18 OR a danger class.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"any\",[\">=\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"plane\"],0],64],[\"coalesce\",[\"get\",\"draw_prio\"],0]],18],[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]]]") != null);
+    // Lines gained a draw_prio sort key.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"line-sort-key\":[\"coalesce\",[\"get\",\"draw_prio\"],0]") != null);
+
+    // z-order (emit order): under-symbols < soundings < over-symbols < lights. So a
+    // base at draw_prio 30 (over pass, sorts 30) draws above a danger (over pass, sorts
+    // 19) above soundings (18) above a base at 5 (under pass). Layer array position +
+    // sort key together realise draw_prio as the sole axis.
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    const layers = parsed.value.object.get("layers").?.array.items;
+    const i_under = layerIndexById(layers, "point_symbols").?;
+    const i_snd = layerIndexById(layers, "soundings").?;
+    const i_over = layerIndexById(layers, "point_symbols-dgr").?;
+    const i_lt = layerIndexById(layers, "point_symbols-lt").?;
+    try std.testing.expect(i_under < i_snd);
+    try std.testing.expect(i_snd < i_over);
+    try std.testing.expect(i_over < i_lt);
 }
 
 test "styleJson: size_scale wraps icon/line/text sizes in a multiplier" {
