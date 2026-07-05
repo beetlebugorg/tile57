@@ -182,8 +182,13 @@ fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
 /// covers this tile (the cell is finest here → draw everything). Allocated in `a`
 /// (the per-tile scratch), so it lives exactly as long as the tile.
 pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, reach_only: ?[]const bool, self_idx: u32, z: u8, x: u32, y: u32, box: tile.Box) ?[]const []const mvt.Point {
-    const cscl_self = ctx.cscl(self_idx);
-    if (cscl_self <= 0) return null;
+    // No-M_COVR / unknown-scale cells (cscl <= 0) follow the asymmetric rule
+    // (spec §2.1/Q1): they render their own content but ARE clipped by finer
+    // real coverage — at bandOf's default scale, the same one their band floor
+    // uses — while never clipping others (the `cscl <= 0` skip below: a derived
+    // bbox must not cut coarser cells across its empty corners).
+    const raw_self = ctx.cscl(self_idx);
+    const cscl_self: i32 = if (raw_self > 0) raw_self else 50_000;
     var covers = std.ArrayList(geometry.boolean.Polygon).empty;
     for (idxs, 0..) |idx, j| {
         if (reach_only) |ro| if (ro[j]) continue;
@@ -325,7 +330,9 @@ pub fn overscaleGateDenom(cscl: i32) i64 {
 /// nothing else can show there. Tiles below the floor don't exist, so lifting a
 /// smaller scamin up to the floor denominator changes nothing below it.
 pub fn effScaminFloor(cscl: i32) i64 {
-    if (cscl <= 0) return 0;
+    // cscl <= 0 (no M_COVR / unknown scale) uses bandOf's same 1:50k default —
+    // such a cell is now clipped by finer coverage (asymmetric rule, Q1), so
+    // the band-floor visibility clamp applies to it identically.
     const floor_z = bandZooms(bandOf(cscl)).min;
     // The coarsest band has no coarser copy to hand off from, so no blank
     // window can open — leave its SCAMINs raw (a z0 clamp would disable
