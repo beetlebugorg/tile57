@@ -1831,9 +1831,15 @@ pub fn bakeArchive(
     });
 }
 
-// Tile sink: feed each streamed tile into the StreamWriter (the Baker frees the
-// buffer after this returns; StreamWriter gzips+copies what it keeps).
-fn streamSink(ctx: ?*anyopaque, z: u8, x: u32, y: u32, mvt: []const u8) anyerror!void {
+// Tile sink: feed each streamed tile into the StreamWriter. The Baker already
+// gzipped the tile in its parallel gen worker (bake_enc gzipTile), so `comp` is
+// ALREADY compressed — use addCompressed (verbatim), NOT add (which would gzip a
+// second time, double-gzipping every tile). MVT survives that (maplibre auto-
+// inflates a gzip-magic body) but an MLT tile does not: the client strips one
+// gzip layer and hands the MLT decoder still-gzipped bytes ("Unable to parse the
+// tile"). The bundle.zig sink already does this correctly; this path had drifted.
+// The Baker frees the buffer after this returns, so addCompressed copies it.
+fn streamSink(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
     const sw: *pmtiles.StreamWriter = @ptrCast(@alignCast(ctx.?));
-    try sw.add(z, x, y, mvt);
+    try sw.addCompressed(z, x, y, comp);
 }
