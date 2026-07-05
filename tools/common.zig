@@ -183,10 +183,10 @@ pub fn printUsage() void {
         \\  tile57 png|pdf <source> --view <lon,lat,zoom> --size WxH -o <out>
         \\      Render a tile or a view through the native S-52 pixel path:
         \\      PNG raster or deterministic vector PDF (real text objects).
-        \\      Sources: an S-57 cell (live portrayal) or a baked .pmtiles
+        \\      Sources: an S-57 cell (single-cell portrayal) or a baked .pmtiles
         \\      bundle (tile replay). --dq data-quality overlay; --scale F
         \\      physical-size multiplier; --palette day|dusk|night.
-        \\  tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi] [--kitty]
+        \\  tile57 ascii <cell.000 | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi] [--kitty]
         \\      The chart on stdout as a Unicode text grid (the example render
         \\      backend). --ansi adds xterm-256 color; --palette day|dusk|night.
         \\  tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]

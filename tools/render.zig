@@ -108,29 +108,16 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     const out = out_path orelse return usageErr("-o <out.png> is required");
     if (!tile_mode and view == null) return usageErr("--view lon,lat,zoom is required without z x y");
 
-    // A DIRECTORY source is an ENC_ROOT: open it streaming through the chart
-    // layer (band-quilted cell selection per covering view tile) and render.
+    // Baked tiles are the only multi-cell path: an ENC_ROOT is baked first,
+    // then the bundle's .pmtiles is rendered (tile replay) — the live quilted
+    // view renderer is gone with the rest of the live tile path.
     const is_dir = blk: {
         var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch break :blk false;
         d.close(io);
         break :blk true;
     };
     if (is_dir) {
-        const v = view orelse return usageErr("an ENC_ROOT source needs --view");
-        engine.portray.setQuiet(true);
-        const c = chart.Chart.openPath(path, rules, false) catch return usageErr("cannot open ENC_ROOT");
-        defer c.deinit();
-        m.scheme = switch (palette) {
-            .day => .day,
-            .dusk => .dusk,
-            .night => .night,
-        };
-        m.data_quality = dq;
-        m.size_scale = size_scale;
-        const bytes = c.renderView(v.lon, v.lat, v.zoom, size_w, size_h, palette, &m, output) catch return usageErr("render failed");
-        defer chart.freeBytes(bytes);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
-        std.debug.print("wrote {s}: view {d:.4},{d:.4} z{d:.2}, {d}x{d}px (ENC_ROOT quilt), {d} bytes\n", .{ out, v.lon, v.lat, v.zoom, size_w, size_h, bytes.len });
+        std.debug.print("ENC_ROOT live rendering removed — bake first:\n  tile57 bake {s} -o <out>\n  tile57 {s} <out>/tiles/chart.pmtiles --view ... -o {s}\n", .{ path, @tagName(output), out });
         return;
     }
 

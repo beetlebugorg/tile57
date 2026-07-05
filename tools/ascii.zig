@@ -10,14 +10,14 @@ const mercShift = common.mercShift;
 const terminalSize = common.terminalSize;
 const cellPx = common.cellPx;
 
-// tile57 ascii <cell.000 | ENC_ROOT | bundle.pmtiles> --view <lon,lat,zoom>
+// tile57 ascii <cell.000 | bundle.pmtiles> --view <lon,lat,zoom>
 //     [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--kitty] [--rules DIR]
 // The chart on stdout as a Unicode text grid — the render-engine EXAMPLE
 // backend (src/render/ascii.zig): the same chart layer + view driver as
 // `tile57 png`, with the AsciiSurface at the end instead of the pixel one.
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 ascii <cell.000|ENC_ROOT|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--kitty] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 ascii <cell.000|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--kitty] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -73,6 +73,17 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (cols == 0 or rows == 0) return usageErr("--size must be positive");
 
     engine.portray.setQuiet(true);
+    // Baked tiles are the only multi-cell path: an ENC_ROOT is baked first,
+    // then the bundle's .pmtiles is rendered (tile replay).
+    const is_dir = blk: {
+        var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch break :blk false;
+        d.close(io);
+        break :blk true;
+    };
+    if (is_dir) {
+        std.debug.print("ENC_ROOT live rendering removed — bake first:\n  tile57 bake {s} -o <out>\n  tile57 ascii <out>/tiles/chart.pmtiles --view ...\n", .{path});
+        return;
+    }
     const c = if (std.mem.endsWith(u8, path, ".pmtiles")) blk: {
         const data = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
         break :blk chart.Chart.openBytes(data, .pmtiles, rules) catch return usageErr("cannot open bundle");

@@ -38,7 +38,6 @@ const inspect = @import("inspect.zig");
 const zoomsizes = @import("zoomsizes.zig");
 const audit_holes = @import("audit_holes.zig");
 const audit_pairs = @import("audit_pairs.zig");
-const livetile = @import("livetile.zig");
 const objlcount = @import("objlcount.zig");
 const cell = @import("cell.zig");
 
@@ -115,10 +114,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "audit-pairs")) {
         return audit_pairs.run(io, arena, args);
-    }
-
-    if (std.mem.eql(u8, sub, "livetile")) {
-        return livetile.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "objlcount")) {

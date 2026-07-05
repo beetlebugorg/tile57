@@ -183,57 +183,6 @@ const Backend = union(enum) {
     cells: LazySource, // ENC_ROOT: lazy spatial index, parsed/portrayed on demand
 };
 
-// The cell's M_COVR (OBJL 302, CATCOV=1) data-coverage polygons, assembled +
-// cached on first use. Each polygon is a list of lon/lat rings (exterior + holes).
-fn lazyCellCoverage(lc: *LazyCell) []const []const []const s57.LonLat {
-    if (lc.coverage) |c| return c;
-    if (lc.cell) |*cell| {
-        const a = cell.arena.allocator();
-        var polys = std.ArrayList([]const []const s57.LonLat).empty;
-        for (cell.features) |f| {
-            if (f.objl != 302) continue; // M_COVR
-            const cv = f.attr(18) orelse continue; // CATCOV (S-57 attr 18)
-            const n = std.fmt.parseInt(i64, std.mem.trim(u8, cv, " "), 10) catch continue;
-            if (n != 1) continue; // 1 = coverage available (2 = no coverage)
-            const rings = cell.lineGeometryParts(a, f) catch continue;
-            if (rings.len > 0) polys.append(a, rings) catch {};
-        }
-        lc.coverage = polys.items;
-        return polys.items;
-    }
-    return &.{};
-}
-
-// The live oracle's per-cell accessor for the shared cross-band coverage oracle
-// (bake_enc.finestCsclAtCtx / coversAnyCtx). `coverage(i)` lazy-loads + caches the
-// cell's M_COVR on first touch. This is what makes the live path quilt + band-
-// hand-off byte-identically to the baker: one implementation, two accessors —
-// retiring the old `finestCsclAtLive`/`coversAnyLive` re-code and its private
-// `coverageContains` duplicate of s57.coverageContains.
-const LazyCov = struct {
-    ls: *LazySource,
-    pub inline fn cscl(self: LazyCov, i: u32) i32 {
-        return self.ls.cells[i].cscl;
-    }
-    pub inline fn coverage(self: LazyCov, i: u32) []const []const []const s57.LonLat {
-        return lazyCellCoverage(&self.ls.cells[i]);
-    }
-    pub inline fn bounds(self: LazyCov, i: u32) [4]f64 {
-        return self.ls.cells[i].bbox;
-    }
-    pub inline fn name(self: LazyCov, i: u32) []const u8 {
-        return self.ls.cells[i].name;
-    }
-};
-
-fn finestCsclAtLive(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
-    return bake_enc.finestCsclAtCtx(LazyCov{ .ls = ls }, idxs, lon, lat, include_derived);
-}
-
-fn coversAnyLive(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64) bool {
-    return bake_enc.coversAnyCtx(LazyCov{ .ls = ls }, idxs, lon, lat);
-}
-
 fn bboxOverlap(a_: [4]f64, b_: [4]f64) bool {
     return a_[0] <= b_[2] and a_[2] >= b_[0] and a_[1] <= b_[3] and a_[3] >= b_[1];
 }
@@ -897,20 +846,13 @@ pub const Chart = struct {
             if (cached.len == 0) return null;
             return try gpa.dupe(u8, cached);
         }
+        // Baked tiles are the ONLY tile path: cell-backed charts exist for
+        // metadata/inspection (cellsJson/featuresJson/scamin/renderView on a
+        // single cell), never on-demand tile generation — bake first, serve
+        // the archive.
         const bytes: []u8 = switch (self.backend) {
             .reader => |*r| (r.getTile(gpa, z, x, y) catch return error.TileGen) orelse try gpa.alloc(u8, 0),
-            .cell => |*cb| blk_cell: {
-                const one = [_]scene.CellRef{.{
-                    .cell = &cb.cell,
-                    .portrayal = cb.portrayal,
-                    .portrayal_plain = cb.portrayal_plain,
-                    .portrayal_simplified = cb.portrayal_simplified,
-                }};
-                var ar = std.heap.ArenaAllocator.init(gpa);
-                defer ar.deinit();
-                break :blk_cell scene.encodeTile(ar.allocator(), gpa, &one, z, x, y, self.tile_format, self.pick_attrs) catch return error.TileGen;
-            },
-            .cells => |*ls| try tileFromCells(ls, z, x, y, self.tile_format, self.pick_attrs),
+            .cell, .cells => return error.TileGen,
         };
         if (self.cache.count() >= self.cache_max) {
             var cit = self.cache.valueIterator();
@@ -994,22 +936,9 @@ pub const Chart = struct {
                 }};
                 return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
             },
-            .cells => |*ls| {
-                const keep_from = ls.tick + 1;
-                var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
-                const surf = ps.asSurface();
-                try surf.beginScene(vt.z);
-                while (vt.next()) |t| {
-                    var refs = std.ArrayList(scene.CellRef).empty;
-                    defer refs.deinit(gpa);
-                    if (!try tileRefs(ls, t.z, t.x, t.y, &refs, a)) continue;
-                    ps.setOrigin(t.origin_x, t.origin_y);
-                    scene.appendTile(surf, a, refs.items, t.z, t.x, t.y, self.pick_attrs) catch return error.TileGen;
-                }
-                const bytes = surf.endScene(gpa) catch return error.TileGen;
-                lazyEvict(ls, keep_from);
-                return bytes;
-            },
+            // Baked tiles only: a multi-cell live view render would re-implement
+            // the baker's composition — bake, then render the archive.
+            .cells => return error.TileGen,
         }
     }
 
@@ -1059,22 +988,9 @@ pub const Chart = struct {
                 }};
                 return scene.generateView(&as, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
             },
-            .cells => |*ls| {
-                const keep_from = ls.tick + 1;
-                var vt = scene.ViewTiles.init(lon, lat, zoom, as.w_px, as.h_px, as.px_per_tile);
-                const surf = as.asSurface();
-                try surf.beginScene(vt.z);
-                while (vt.next()) |t| {
-                    var refs = std.ArrayList(scene.CellRef).empty;
-                    defer refs.deinit(gpa);
-                    if (!try tileRefs(ls, t.z, t.x, t.y, &refs, a)) continue;
-                    as.setOrigin(t.origin_x, t.origin_y);
-                    scene.appendTile(surf, a, refs.items, t.z, t.x, t.y, self.pick_attrs) catch return error.TileGen;
-                }
-                const bytes = surf.endScene(gpa) catch return error.TileGen;
-                lazyEvict(ls, keep_from);
-                return bytes;
-            },
+            // Baked tiles only: a multi-cell live view render would re-implement
+            // the baker's composition — bake, then render the archive.
+            .cells => return error.TileGen,
         }
     }
 
@@ -1623,253 +1539,6 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
         while (i < json.len and json[i] >= '0' and json[i] <= '9') : (i += 1) v = v *% 10 +% (json[i] - '0');
         if (v > 0) set.put(v, {}) catch {};
     }
-}
-
-// The fallback band for a tile whose zoom sits outside every overlapping
-// cell's native window: bake_enc.fallbackBand (finest above all windows,
-// coarsest below / in gaps).
-const fallbackBand = bake_enc.fallbackBand;
-
-// Whether cell `i`'s light sector figures can reach into tile bounds `tb` at
-// zoom z: its light bbox expanded by the per-zoom figure reach
-// (scene.lightReachTiles — one tile for display-mm legs/arcs, the honest span
-// for ground-length directional legs) overlaps the tile. A never-loaded cell
-// (reach unknown) within the one-tile `ring` is loaded once to resolve it; the
-// result persists across LRU eviction, so this never reloads. Caveat: an
-// unloaded cell whose ground legs reach FURTHER than one tile only resolves
-// after its first load — any view near the cell triggers that.
-fn lightReachOverlap(ls: *LazySource, i: u32, tb: [4]f64, z: u8, ring: *const [4]f64) bool {
-    const lc = &ls.cells[i];
-    if (!lc.light_known) {
-        if (!bboxOverlap(lc.bbox, ring.*)) return false; // provisional one-tile ring
-        lazyEnsureLoaded(ls, lc);
-        if (!lc.light_known) return false; // unreadable cell
-    }
-    const lb = lc.light_bbox orelse return false;
-    const reach = scene.lightReachTiles(lc.light_range_m, z, (tb[1] + tb[3]) * 0.5);
-    const pad_lon = (tb[2] - tb[0]) * reach;
-    const pad_lat = (tb[3] - tb[1]) * reach;
-    return lb[0] <= tb[2] + pad_lon and lb[2] >= tb[0] - pad_lon and
-        lb[1] <= tb[3] + pad_lat and lb[3] >= tb[1] - pad_lat;
-}
-
-// Multi-cell tile generation: collect overlapping cells, lazily load them, apply
-// per-scale M_COVR quilting + the scamin-aware band handoff, and overlay
-// coarse→fine.
-// Select + load the cells contributing to tile (z,x,y) and append their
-// quilted CellRefs (suppression/carry computed against the finest covering
-// compilation scale). Returns false when nothing overlaps.
-// Factored from tileFromCells so renderView reuses the exact same selection.
-// `scratch` must outlive the tile's encode/append (the per-tile arena): the
-// SCAMIN-standalone overlay mini cells are built into it.
-fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.CellRef), scratch: std.mem.Allocator) !bool {
-    const tb = tile.tileBoundsLonLat(z, x, y); // [w,s,e,n]
-    // One-tile ring around the tile: the provisional reach-candidacy margin for
-    // cells whose sector-figure reach isn't known yet (never loaded).
-    const ring = [4]f64{
-        tb[0] - (tb[2] - tb[0]), tb[1] - (tb[3] - tb[1]),
-        tb[2] + (tb[2] - tb[0]), tb[3] + (tb[3] - tb[1]),
-    };
-    var any_incl = false;
-    var coarsest: ?bake_enc.Band = null;
-    var finest: ?bake_enc.Band = null;
-    // Globally coarsest band present in the whole source (NOT bbox-filtered): the
-    // baker's .extend_min band. The cross-band hole-fill band is the one adjacent-
-    // finer to it (the carry band the baker defers into that pass), computed in the
-    // hole block below so live hole-fill matches the bake regardless of which cells
-    // happen to overlap a given tile.
-    var global_coarsest: ?bake_enc.Band = null;
-    for (ls.cells) |lc| {
-        if (global_coarsest == null or @intFromEnum(lc.band) > @intFromEnum(global_coarsest.?)) global_coarsest = lc.band;
-        if (!bboxOverlap(lc.bbox, tb)) continue;
-        const zr = bake_enc.bandZooms(lc.band);
-        if (z >= zr.min and z <= zr.max) any_incl = true;
-        if (coarsest == null or @intFromEnum(lc.band) > @intFromEnum(coarsest.?)) coarsest = lc.band;
-        if (finest == null or @intFromEnum(lc.band) < @intFromEnum(finest.?)) finest = lc.band;
-    }
-
-    // In-tile cells join by band window exactly as before (out-of-window zooms
-    // fall back per fallbackBand); cells NEAR the tile join reach-only when
-    // their light sector figures can cross into it (lightReachOverlap) — those
-    // ride the tile for their figures alone, excluded from the tile-level
-    // quilting ladder / overscale scan below (mirrors bake_enc REACH_FLAG).
-    var idxs = std.ArrayList(u32).empty;
-    defer idxs.deinit(gpa);
-    var ridxs = std.ArrayList(u32).empty;
-    defer ridxs.deinit(gpa);
-    for (ls.cells, 0..) |lc, i| {
-        const zr = bake_enc.bandZooms(lc.band);
-        const in_window = z >= zr.min and z <= zr.max;
-        const use = if (any_incl or coarsest == null)
-            in_window
-        else
-            lc.band == fallbackBand(finest.?, coarsest.?, z);
-        if (!use) continue;
-        if (bboxOverlap(lc.bbox, tb)) {
-            idxs.append(gpa, @intCast(i)) catch {};
-        } else if (lightReachOverlap(ls, @intCast(i), tb, z, &ring)) {
-            ridxs.append(gpa, @intCast(i)) catch {};
-        }
-    }
-    if (idxs.items.len == 0 and ridxs.items.len == 0) return false;
-    const sortByBand = struct {
-        fn lt(l: *LazySource, a: u32, b: u32) bool {
-            return @intFromEnum(l.cells[a].band) > @intFromEnum(l.cells[b].band);
-        }
-    }.lt;
-    std.mem.sort(u32, idxs.items, ls, sortByBand);
-    std.mem.sort(u32, ridxs.items, ls, sortByBand);
-
-    for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
-    for (ridxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
-
-    // Cross-band hole-fill — the live twin of the baker's HOLEFILL_FLAG path
-    // (bake_enc buildTileMap/TileGenCtx.gen). Where the in-window band leaves an
-    // M_COVR hole at a sampled tile point (centre + 4 corners), admit the COARSEST
-    // out-of-window band that bbox-overlaps the tile (the next-finer band that
-    // supplements the coarse band in its coverage gaps — general filling an
-    // overview cell's gap at Cape Hatteras z5/z6). Only when in-window selection
-    // was used (any_incl); the fallbackBand branch already fills pure-hole tiles.
-    // The finest-covering quilt below then lets the filler win in the hole; it is
-    // marked so it can't stamp a spurious overscale hatch on the coarse band.
-    var holefill_set = std.AutoHashMap(u32, void).init(gpa);
-    defer holefill_set.deinit();
-    if (any_incl) {
-        const samples = [_][2]f64{
-            .{ (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2 },
-            .{ tb[0], tb[1] },
-            .{ tb[2], tb[1] },
-            .{ tb[0], tb[3] },
-            .{ tb[2], tb[3] },
-        };
-        var hole = false;
-        for (samples) |p| {
-            if (!coversAnyLive(ls, idxs.items, p[0], p[1])) {
-                hole = true;
-                break;
-            }
-        }
-        if (hole) {
-            // The baker fills the GLOBALLY-coarsest (.extend_min) band's coverage
-            // holes with its adjacent-finer carry band, only at zooms where that
-            // band is out-of-window. Mirror it exactly: fill_band = the coarsest
-            // band in the whole source strictly finer than global_coarsest (NOT
-            // per-tile — an offshore tile the overview cell misses must still use
-            // general, not pull coastal 2 bands up as it did before). Admitted only
-            // where fill_band is out-of-window at z (in-window it is already
-            // selected) and its cells overlap the tile.
-            var fill_band: ?bake_enc.Band = null;
-            if (global_coarsest) |gc| for (ls.cells) |lc| {
-                if (@intFromEnum(lc.band) >= @intFromEnum(gc)) continue; // must be finer than the global coarsest
-                if (fill_band == null or @intFromEnum(lc.band) > @intFromEnum(fill_band.?)) fill_band = lc.band;
-            };
-            if (fill_band) |fb| {
-                const zr = bake_enc.bandZooms(fb);
-                if (z < zr.min or z > zr.max) { // only where the filler band is out-of-window
-                    for (ls.cells, 0..) |lc, i| {
-                        if (lc.band != fb or !bboxOverlap(lc.bbox, tb)) continue;
-                        idxs.append(gpa, @intCast(i)) catch {};
-                        holefill_set.put(@intCast(i), {}) catch {};
-                    }
-                    std.mem.sort(u32, idxs.items, ls, sortByBand); // keep coarsest-first draw order
-                    for (idxs.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
-                }
-            }
-        }
-    }
-
-    // The point-sampled cross-band quilting (finestCsclAtLive over centre+corners →
-    // carryGate → suppress) is GONE — the coverage-clipped composite
-    // (bake_enc.coverClipForCell + scene.subtractCoverage/coveredByFiner) does it
-    // exactly per-feature, identically to the baker. Only the overscale scale-
-    // boundary scan (gf_tile) remains.
-    // Scale-boundary overscale refinement (specs/overscale.md): the finest
-    // compilation scale CONTRIBUTING to this tile — over the quilting's own
-    // participant list, mirroring bake_enc TileGenCtx.gen. A cell hatches its
-    // OVERSC01 coverage only when a strictly-finer cell also rides this tile
-    // (gf_tile < its cscl); whole-view overscale emits no hatch (HUD readout).
-    // Hole-fill riders are excluded: they are finer than the in-window coarse band
-    // but merely supplement it in its coverage gaps at overview zoom (not overscale
-    // there) — counting them would stamp a spurious OVERSC01 on the coarse band.
-    var gf_tile: i32 = std.math.maxInt(i32);
-    for (idxs.items) |i| {
-        if (holefill_set.contains(i)) continue;
-        const cs = ls.cells[i].cscl;
-        if (cs > 0 and cs < gf_tile) gf_tile = cs;
-    }
-
-    const clip_box = tile.Box.default(tile.EXTENT, tile.BUFFER);
-    for (idxs.items) |i| {
-        const lc = &ls.cells[i];
-        if (lc.cell) |*c| {
-            // The exact best-available composite (same shared geometry as the baker,
-            // so live == bake): subtract the finer cells' M_COVR from this cell's
-            // fills/patterns and drop its points/strokes where a finer cell owns the
-            // ground. cover_clip is the ONE cross-band mechanism.
-            const cover_clip = bake_enc.coverClipForCell(scratch, LazyCov{ .ls = ls }, idxs.items, null, i, z, x, y, clip_box);
-            const wins_somewhere = cover_clip == null or !bake_enc.tileFullyCovered(scratch, cover_clip.?, clip_box);
-            refs.append(gpa, .{
-                .cell = c,
-                .portrayal = lc.portrayal,
-                .portrayal_plain = lc.portrayal_plain,
-                .portrayal_simplified = lc.portrayal_simplified,
-                .band = @intFromEnum(lc.band),
-                .suppress_fills = false,
-                .suppress_patterns = false,
-                .cover_clip = cover_clip,
-                .suppress_lines = false,
-                .suppress_points = false,
-                // Overscale (S-52 §10.1.10.2): X2 gate denominator; hatch only where a
-                // finer cell rides the tile (gf_tile < cscl) AND this cell still owns
-                // some of it (its fills aren't fully clipped away).
-                .oscl = bake_enc.overscaleGateDenom(lc.cscl),
-                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl and wins_somewhere and !holefill_set.contains(i),
-                .eff_scamin_floor = bake_enc.effScaminFloor(lc.cscl),
-                .light_range_m = lc.light_range_m,
-            }) catch {};
-        }
-    }
-    // Reach-only cells: their raw bbox misses the tile, only their light sector
-    // figures cross into it. Same gates as the in-tile cells (the gf_* samples
-    // lie inside the tile, which their coverage can't contain — no suppression
-    // they wouldn't get at home), but never an overscale hatch and never a
-    // ladder contribution (they were excluded from `ladders`/`gf_tile` above).
-    for (ridxs.items) |i| {
-        const lc = &ls.cells[i];
-        if (lc.cell) |*c| {
-            // Reach-only: only this cell's light sector figures cross in; its own
-            // ground isn't in the tile, so nothing clips it and it clips nothing.
-            refs.append(gpa, .{
-                .cell = c,
-                .portrayal = lc.portrayal,
-                .portrayal_plain = lc.portrayal_plain,
-                .portrayal_simplified = lc.portrayal_simplified,
-                .band = @intFromEnum(lc.band),
-                .suppress_fills = false,
-                .suppress_patterns = false,
-                .suppress_lines = false,
-                .suppress_points = false,
-                .oscl = bake_enc.overscaleGateDenom(lc.cscl),
-                .overscale_hatch = false,
-                .eff_scamin_floor = bake_enc.effScaminFloor(lc.cscl),
-                .light_range_m = lc.light_range_m,
-            }) catch {};
-        }
-    }
-
-    return true;
-}
-
-fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, fmt: scene.TileFormat, pick_attrs: bool) ![]u8 {
-    const keep_from = ls.tick + 1;
-    var refs = std.ArrayList(scene.CellRef).empty;
-    defer refs.deinit(gpa);
-    var ar = std.heap.ArenaAllocator.init(gpa);
-    defer ar.deinit();
-    if (!try tileRefs(ls, z, x, y, &refs, ar.allocator())) return try gpa.alloc(u8, 0);
-    const bytes = scene.encodeTile(ar.allocator(), gpa, refs.items, z, x, y, fmt, pick_attrs) catch return error.TileGen;
-    lazyEvict(ls, keep_from);
-    return bytes;
 }
 
 // ---- ENC_ROOT bake -------------------------------------------------------
