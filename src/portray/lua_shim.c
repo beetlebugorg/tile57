@@ -25,7 +25,8 @@ extern void tgp_emit(size_t i, const char *instr, size_t len);
 extern size_t tgp_points_count(size_t i);
 extern void tgp_point(size_t i, size_t j, double *x, double *y, double *z);
 extern size_t tgp_colocated(size_t i, size_t *out, size_t max);
-extern size_t tgp_assoc_features(size_t i, const char *role, size_t role_len,
+extern size_t tgp_assoc_features(size_t i, const char *assoc, size_t assoc_len,
+                                 const char *role, size_t role_len,
                                  size_t *out, size_t max);
 
 /* Catalogue accessors implemented in Zig (catalogue.zig). */
@@ -141,6 +142,22 @@ static int l_empty_table(lua_State *L) {
 }
 static int l_noop(lua_State *L) {
     (void)L;
+    return 0;
+}
+/* HostDebuggerEntry(kind, message, ...): surface the framework's Debug channel so a rule
+ * error is never a silent QUESMRK1 "?". S100Scripting overrides the global error() to call
+ * Debug.FirstChanceError on EVERY raised error, so 'first_chance_error' carries the cause of
+ * every "?" — always print it (a conformant catalogue raises none). 'trace' also carries
+ * benign warnings (the Lua-version note, an empty-instruction TextPlacement, ...), so gate it
+ * on !quiet to keep parallel bakes clean. Performance and 'break' entries are ignored. */
+static int l_debug_entry(lua_State *L) {
+    const char *kind = lua_tostring(L, 1);
+    if (!kind) return 0;
+    int is_err = strcmp(kind, "first_chance_error") == 0;
+    if (is_err || (!g_portray_quiet && strcmp(kind, "trace") == 0)) {
+        const char *msg = lua_tostring(L, 2);
+        fprintf(stderr, "[s101:%s] %s\n", is_err ? "error" : "trace", msg ? msg : "");
+    }
     return 0;
 }
 
@@ -390,7 +407,7 @@ int tile57_diag_portray_demo(const char *dir) {
     lua_register(L, "HostFeatureGetSimpleAttribute", l_feature_simple_attr);
     lua_register(L, "HostFeatureGetComplexAttributeCount", l_zero);
     lua_register(L, "HostPortrayalEmit", l_true);
-    lua_register(L, "HostDebuggerEntry", l_noop);
+    lua_register(L, "HostDebuggerEntry", l_debug_entry);
     /* empty catalogue tables */
     lua_register(L, "HostGetInformationTypeCodes", l_empty_table);
     lua_register(L, "HostGetComplexAttributeTypeCodes", l_empty_table);
@@ -704,18 +721,22 @@ static int lp_spatial_assoc_features(lua_State *L) {
     return 1;
 }
 /* HostFeatureGetAssociatedFeatureIDs(id, assocCode, roleCode): the feature IDs this
- * feature's S-57 FFPT pointers reference, filtered by role (RIND-derived). assocCode
- * is required by the framework but not used to filter here — S-57 FFPT carries no
- * association code, so the RIND->role mapping (roleCode, nil = any) selects the
- * pointers. Backs StructureEquipment (DistanceMark, PortrayalModel text placement)
- * and the aids-to-navigation aggregations. IDs are the decimal adapted indices. */
+ * feature's S-57 FFPT pointers reference for association `assocCode`, filtered by role
+ * (RIND-derived). S-57 FFPT only models the structure<->equipment relationship and carries
+ * no association code, so tgp_assoc_features answers StructureEquipment only and returns
+ * empty for any other code — notably 'TextAssociation', which S-57 can't represent.
+ * (Answering every code from FFPT returned wrong-class features; the framework then read
+ * the TextPlacement-only attribute textType on a beacon -> "Invalid attribute code" ->
+ * QUESMRK1.) roleCode (nil = any) selects the pointer direction. IDs are decimal adapted
+ * indices. */
 static int lp_feature_assoc_features(lua_State *L) {
     size_t i = (size_t)atol(luaL_checkstring(L, 1));
-    size_t rlen = 0;
+    size_t alen = 0, rlen = 0;
+    const char *assoc = lua_isnoneornil(L, 2) ? "" : luaL_checklstring(L, 2, &alen);
     const char *role = lua_isnoneornil(L, 3) ? "" : luaL_checklstring(L, 3, &rlen);
     lua_newtable(L);
     size_t buf[64];
-    size_t n = tgp_assoc_features(i, role, rlen, buf, sizeof buf / sizeof buf[0]);
+    size_t n = tgp_assoc_features(i, assoc, alen, role, rlen, buf, sizeof buf / sizeof buf[0]);
     for (size_t k = 0; k < n; k++) {
         char id[24];
         snprintf(id, sizeof id, "%zu", buf[k]);
@@ -828,7 +849,7 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
     lua_register(L, "HostFeatureGetSimpleAttribute", lp_feature_simple_attr);
     lua_register(L, "HostFeatureGetComplexAttributeCount", lp_feature_complex_count);
     lua_register(L, "HostPortrayalEmit", l_true);
-    lua_register(L, "HostDebuggerEntry", l_noop);
+    lua_register(L, "HostDebuggerEntry", l_debug_entry);
     lua_register(L, "tg_store", lp_store);
     lua_register(L, "HostGetComplexAttributeTypeCodes", lp_complex_codes);
     lua_register(L, "HostGetComplexAttributeTypeInfo", lp_complex_info);

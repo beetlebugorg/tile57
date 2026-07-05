@@ -176,16 +176,23 @@ fn roleMatchesRind(role: []const u8, rind: u8) bool {
 }
 
 /// This-pass adapted indices of the features that feature `i`'s FFPT pointers
-/// reference, filtered by `role` (RIND-derived; see roleMatchesRind). Backs
-/// HostFeatureGetAssociatedFeatureIDs so the reference framework's feature-feature
-/// associations resolve — StructureEquipment (DistanceMark, PortrayalModel text
-/// placement) and the aids-to-navigation aggregations. The returned indices are the
-/// same opaque IDs lp_feature_ids/featureCache use. Writes up to `max` into `out`.
-/// O(frefs) per call and only non-empty for the few features carrying FFPT; the
-/// S-101 association code (arg 2 in the shim) is not used to filter — S-57 FFPT has
-/// no association-code concept, so the RIND->role filter alone selects the pointers.
-export fn tgp_assoc_features(i: usize, role_ptr: [*]const u8, role_len: usize, out: [*]usize, max: usize) callconv(.c) usize {
+/// reference, restricted to the `assoc` association code and filtered by `role`
+/// (RIND-derived; see roleMatchesRind). Backs HostFeatureGetAssociatedFeatureIDs so the
+/// framework's StructureEquipment association resolves — DistanceMark's standalone-symbol
+/// suppression and the structure->equipment text-placement lookup. The returned indices
+/// are the same opaque IDs lp_feature_ids/featureCache use. Writes up to `max` into `out`.
+///
+/// We MUST honor `assoc`: S-57 FFPT only models the structure<->equipment relationship (a
+/// beacon/buoy/landmark and its LIGHTS/DAYMAR/TOPMAR) and carries no S-101 association
+/// code, so StructureEquipment is the only code we can answer. The catalogue also queries
+/// 'TextAssociation' (PortrayalModel), which S-57 has no representation for. Answering that
+/// from FFPT returned wrong-class features, and the framework then read the
+/// TextPlacement-only attribute `.textType` on a beacon ("Invalid attribute code textType")
+/// -> the rule errored -> Default() painted QUESMRK1 on every FFPT-bearing aid. So any code
+/// other than StructureEquipment returns empty. O(frefs), non-empty only for FFPT-bearers.
+export fn tgp_assoc_features(i: usize, assoc_ptr: [*]const u8, assoc_len: usize, role_ptr: [*]const u8, role_len: usize, out: [*]usize, max: usize) callconv(.c) usize {
     const c = g_ctx orelse return 0;
+    if (!std.mem.eql(u8, assoc_ptr[0..assoc_len], "StructureEquipment")) return 0;
     if (i >= c.adapted.len) return 0;
     const fi = c.adapted[i].feature_index;
     if (fi >= c.cell.features.len) return 0;

@@ -111,6 +111,55 @@ test "golden Part-9 stream: FFPT StructureEquipment suppresses DistanceMark's st
     try std.testing.expect(!has(streams[1], "PointInstruction:DISMAR"));
 }
 
+test "golden Part-9 stream: FFPT-bearing named structure does not fall to QUESMRK1 (associationCode honored)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Regression for the A4 QUESMRK1 crash. HostFeatureGetAssociatedFeatureIDs MUST
+    // honor the S-101 associationCode. A named aid-to-navigation (beacon/buoy/landmark)
+    // carries an FFPT SLAVE pointer to its equipment and places its name via
+    // PortrayFeatureName -> AddTextInstruction, which first asks the feature for
+    // GetFeatureAssociations('TextAssociation'). If the shim ignores the code and answers
+    // that from FFPT, the framework then reads the TextPlacement-only attribute `.textType`
+    // on the equipment ("Invalid attribute code textType"), the rule errors, and Default()
+    // paints QUESMRK1 — the exact failure seen baking real NOAA cells (LateralBeacon,
+    // Landmark, LateralBuoy, ...). Since S-57 FFPT only models structure<->equipment, the
+    // shim answers StructureEquipment only; 'TextAssociation' stays empty and the name
+    // path is clean.
+    const light_foid: u64 = 0x1234AB;
+    const eq_ref = [_]s57.FeatureRef{.{ .lnam = light_foid, .rind = 2 }}; // slave -> equipment
+    const named = [_]s57.Attr{.{ .code = s57.ATTR_OBJNAM, .value = "Test Tower" }}; // -> featureName
+    const feats = [_]s57.Feature{
+        // LNDMRK -> Landmark: named, carries the FFPT slave pointer to its light.
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 74, .attrs = &named, .frefs = &eq_ref },
+        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 75, .foid = light_foid }, // LIGHTS equipment
+    };
+    var foid_index: std.AutoHashMapUnmanaged(u64, usize) = .{};
+    try foid_index.put(a, light_foid, 1);
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .foid_index = foid_index,
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 2), streams.len);
+
+    // [0] the named landmark: its name IS placed (proves the AddTextInstruction path that
+    // triggered the crash actually ran — not a vacuous pass) and it did NOT fall to the
+    // "?" QUESMRK1 default.
+    try std.testing.expect(has(streams[0], "TextInstruction"));
+    try std.testing.expect(!has(streams[0], "QUESMRK1"));
+}
+
 test "golden Part-9 stream: M_QUAL quality fills (DQUAL from CATZOC, NODATA03 when absent)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
