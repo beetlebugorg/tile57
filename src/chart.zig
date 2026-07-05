@@ -1750,7 +1750,10 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
     if (any_incl) {
         const samples = [_][2]f64{
             .{ (tb[0] + tb[2]) / 2, (tb[1] + tb[3]) / 2 },
-            .{ tb[0], tb[1] }, .{ tb[2], tb[1] }, .{ tb[0], tb[3] }, .{ tb[2], tb[3] },
+            .{ tb[0], tb[1] },
+            .{ tb[2], tb[1] },
+            .{ tb[0], tb[3] },
+            .{ tb[2], tb[3] },
         };
         var hole = false;
         for (samples) |p| {
@@ -1788,26 +1791,12 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
         }
     }
 
-    // Per-scale quilting + scamin-aware band handoff, the same rules as the baker
-    // (bake_enc TileGenCtx.gen): the finest covering cscl gates lines/patterns at
-    // the tile centre (derived extents count) and fills/points over the whole tile
-    // (real M_COVR only); carryGate turns blanket suppression into an smax-tagged
-    // carry where the tile's display window opens coarser than that cscl.
-    const w = tb[0];
-    const s_ = tb[1];
-    const e = tb[2];
-    const nlat = tb[3];
-    const clon = (w + e) / 2;
-    const clat = (s_ + nlat) / 2;
-    const gf_centre = finestCsclAtLive(ls, idxs.items, clon, clat, true);
-    var gf_whole: i32 = finestCsclAtLive(ls, idxs.items, clon, clat, false);
-    for ([_][2]f64{ .{ w, nlat }, .{ e, nlat }, .{ w, s_ }, .{ e, s_ } }) |corner| {
-        gf_whole = @max(gf_whole, finestCsclAtLive(ls, idxs.items, corner[0], corner[1], false));
-    }
-    const display_denom = assets.displayDenomZ(z, clat);
-    const ladders = gpa.alloc([]const u32, idxs.items.len) catch return false;
-    defer gpa.free(ladders);
-    for (idxs.items, 0..) |i, j| ladders[j] = ls.cells[i].scamins;
+    const clat = (tb[1] + tb[3]) / 2;
+    // The point-sampled cross-band quilting (finestCsclAtLive over centre+corners →
+    // carryGate → suppress/smax) is GONE — the coverage-clipped composite
+    // (bake_enc.coverClipForCell + scene.subtractCoverage/coveredByFiner) does it
+    // exactly per-feature, identically to the baker. Only the overscale scale-
+    // boundary scan (gf_tile) remains.
     // Scale-boundary overscale refinement (specs/overscale.md): the finest
     // compilation scale CONTRIBUTING to this tile — over the quilting's own
     // participant list, mirroring bake_enc TileGenCtx.gen. A cell hatches its
@@ -1823,30 +1812,33 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
         if (cs > 0 and cs < gf_tile) gf_tile = cs;
     }
 
+    const clip_box = tile.Box.default(tile.EXTENT, tile.BUFFER);
     for (idxs.items) |i| {
         const lc = &ls.cells[i];
         if (lc.cell) |*c| {
-            const g = bake_enc.carryGate(lc.cscl, gf_centre, gf_whole, display_denom, ladders);
+            // The exact best-available composite (same shared geometry as the baker,
+            // so live == bake): subtract the finer cells' M_COVR from this cell's
+            // fills/patterns and drop its points/strokes where a finer cell owns the
+            // ground. cover_clip is the ONE cross-band mechanism — no carryGate/smax.
+            const cover_clip = bake_enc.coverClipForCell(scratch, LazyCov{ .ls = ls }, idxs.items, null, lc.cscl, z, x, y, clip_box);
+            const wins_somewhere = cover_clip == null or !bake_enc.tileFullyCovered(scratch, cover_clip.?, clip_box);
             refs.append(gpa, .{
                 .cell = c,
                 .portrayal = lc.portrayal,
                 .portrayal_plain = lc.portrayal_plain,
                 .portrayal_simplified = lc.portrayal_simplified,
                 .band = @intFromEnum(lc.band),
-                .suppress_fills = g.suppress_whole,
-                .suppress_patterns = g.suppress_centre,
-                .suppress_lines = g.suppress_centre,
-                .suppress_points = g.suppress_whole,
-                .smax = g.smax,
-                // Overscale tag (S-52 §10.1.10.2): the X2 gate denominator
-                // (cscl / OVERSCALE_FACTOR). collectScaminCell adds it to the live
-                // SCAMIN ladder so the client crossing is exact + never fires early.
+                .suppress_fills = false,
+                .suppress_patterns = false,
+                .cover_clip = cover_clip,
+                .suppress_lines = false,
+                .suppress_points = false,
+                .smax = 0,
+                // Overscale (S-52 §10.1.10.2): X2 gate denominator; hatch only where a
+                // finer cell rides the tile (gf_tile < cscl) AND this cell still owns
+                // some of it (its fills aren't fully clipped away).
                 .oscl = bake_enc.overscaleGateDenom(lc.cscl),
-                // Hatch only where this cell is the best-available data at a scale
-                // boundary: a finer cell rides the tile (gf_tile < cscl) AND this
-                // cell wins the pure quilt somewhere (gf_whole >= cscl, pre-carry) —
-                // an occluded coarse overview contributes no hatch (specs/overscale.md v3).
-                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl and gf_whole >= lc.cscl and !holefill_set.contains(i),
+                .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl and wins_somewhere and !holefill_set.contains(i),
                 // SCAMIN standalone: the overlay below owns prim==1 SCAMIN features.
                 .skip_scamin_points = true,
                 .light_range_m = lc.light_range_m,
@@ -1861,18 +1853,19 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
     for (ridxs.items) |i| {
         const lc = &ls.cells[i];
         if (lc.cell) |*c| {
-            const g = bake_enc.carryGate(lc.cscl, gf_centre, gf_whole, display_denom, ladders);
+            // Reach-only: only this cell's light sector figures cross in; its own
+            // ground isn't in the tile, so nothing clips it and it clips nothing.
             refs.append(gpa, .{
                 .cell = c,
                 .portrayal = lc.portrayal,
                 .portrayal_plain = lc.portrayal_plain,
                 .portrayal_simplified = lc.portrayal_simplified,
                 .band = @intFromEnum(lc.band),
-                .suppress_fills = g.suppress_whole,
-                .suppress_patterns = g.suppress_centre,
-                .suppress_lines = g.suppress_centre,
-                .suppress_points = g.suppress_whole,
-                .smax = g.smax,
+                .suppress_fills = false,
+                .suppress_patterns = false,
+                .suppress_lines = false,
+                .suppress_points = false,
+                .smax = 0,
                 .oscl = bake_enc.overscaleGateDenom(lc.cscl),
                 .overscale_hatch = false,
                 .skip_scamin_points = true,

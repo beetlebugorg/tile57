@@ -199,6 +199,11 @@ pub fn build(b: *std.Build) void {
     }.f;
     addFont(b, render_mod);
 
+    // Integer computational geometry (src/geo/): the Martinez polygon boolean +
+    // the coverage-clipped best-available partition. Pure (std-only); the scene
+    // engine + baker use it for the cross-band composite.
+    const geo_mod = b.addModule("geo", .{ .root_source_file = b.path("src/geo/geo.zig") });
+
     // The tile engine (src/scene/): S-57 -> tile-surface generation plus the
     // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
     // internal/engine/baker — folded in as the engine's batch driver).
@@ -209,6 +214,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s100", .module = s100_mod },
             .{ .name = "tiles", .module = tiles_mod },
             .{ .name = "render", .module = render_mod },
+            .{ .name = "geo", .module = geo_mod },
         },
     });
 
@@ -267,6 +273,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "assets", .module = assets_mod },
+        .{ .name = "geo", .module = geo_mod },
     };
 
     // Full engine surface (the pure root.zig packages + the embedded-Lua `portray`

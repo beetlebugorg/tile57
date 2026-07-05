@@ -23,6 +23,7 @@ const scene = @import("scene.zig");
 const pmtiles = @import("tiles").pmtiles;
 const tile = @import("tiles").tile;
 const assets = @import("assets"); // displayDenomZ: the physical display-scale formula
+const geometry = @import("geo"); // Martinez boolean for the coverage-clipped composite
 
 /// A parsed + portrayed cell ready to bake. `portrayal` is the per-feature S-101
 /// instruction stream (null = bake with the classify() fallback); `bounds` is
@@ -156,6 +157,69 @@ fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64
 
 fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) bool {
     return coversAnyCtx(BackendCov{ .backends = backends }, idxs, lon, lat);
+}
+
+/// The finer-scale coverage to subtract from cell `cscl_self`'s fills in tile
+/// (z,x,y): the union of every strictly-finer cell's M_COVR (CATCOV=1), projected
+/// into the tile's i32 space and box-clipped, as a clean ring set. This is the
+/// coverage-clipped best-available composite's exact subtrahend
+/// (specs/cross-band-composition-redesign.md) — it replaces the point-sampled
+/// whole-tile suppress_whole with true geometry, so a coarse fill is cut exactly
+/// where a finer cell owns the ground (no seam double-draw) and kept everywhere
+/// else, including inside a finer no-data hole (no blank). null = nothing finer
+/// covers this tile (the cell is finest here → draw everything). Allocated in `a`
+/// (the per-tile scratch), so it lives exactly as long as the tile.
+pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, reach_only: ?[]const bool, cscl_self: i32, z: u8, x: u32, y: u32, box: tile.Box) ?[]const []const mvt.Point {
+    if (cscl_self <= 0) return null;
+    var covers = std.ArrayList(geometry.boolean.Polygon).empty;
+    for (idxs, 0..) |idx, j| {
+        if (reach_only) |ro| if (ro[j]) continue;
+        const cscl = ctx.cscl(idx);
+        if (cscl <= 0 or cscl >= cscl_self) continue; // only strictly finer
+        for (ctx.coverage(idx)) |rings| {
+            var poly = std.ArrayList([]const geometry.boolean.Pt).empty;
+            for (rings) |ring| {
+                if (ring.len < 3) continue;
+                const proj = a.alloc(mvt.Point, ring.len) catch return null;
+                for (ring, 0..) |pt, k| proj[k] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+                const clipped = tile.clipPolygon(a, proj, box) catch continue;
+                if (clipped.len < 3) continue;
+                const bring = a.alloc(geometry.boolean.Pt, clipped.len) catch return null;
+                for (clipped, 0..) |cp, k| bring[k] = .{ .x = cp.x, .y = cp.y };
+                poly.append(a, bring) catch return null;
+            }
+            if (poly.items.len > 0) covers.append(a, poly.items) catch return null;
+        }
+    }
+    if (covers.items.len == 0) return null;
+    const uni = geometry.boolean.unionAll(a, covers.items) catch return null;
+    if (uni.len == 0) return null;
+    const out = a.alloc([]const mvt.Point, uni.len) catch return null;
+    for (uni, 0..) |r, i| {
+        const mr = a.alloc(mvt.Point, r.len) catch return null;
+        for (r, 0..) |bp, k| mr[k] = .{ .x = @intCast(bp.x), .y = @intCast(bp.y) };
+        out[i] = mr;
+    }
+    return out;
+}
+
+/// Whether the finer coverage `cover_clip` covers the ENTIRE tile box — i.e. this
+/// coarser cell owns none of it (box minus coverage is empty). Used only for the
+/// overscale-hatch "wins somewhere" gate.
+pub fn tileFullyCovered(a: std.mem.Allocator, cover_clip: []const []const mvt.Point, box: tile.Box) bool {
+    const boxring = [_]geometry.boolean.Pt{
+        .{ .x = box.min, .y = box.min }, .{ .x = box.max, .y = box.min },
+        .{ .x = box.max, .y = box.max }, .{ .x = box.min, .y = box.max },
+    };
+    const subj = [_][]const geometry.boolean.Pt{&boxring};
+    var clip = std.ArrayList([]const geometry.boolean.Pt).empty;
+    for (cover_clip) |r| {
+        const br = a.alloc(geometry.boolean.Pt, r.len) catch return false;
+        for (r, 0..) |p, k| br[k] = .{ .x = p.x, .y = p.y };
+        clip.append(a, br) catch return false;
+    }
+    const rem = geometry.boolean.compute(a, &subj, clip.items, .diff) catch return false;
+    return rem.len == 0;
 }
 
 /// A read-only coverage participant from ANOTHER pack (bake --existing): its real
@@ -586,6 +650,7 @@ const TileGenCtx = struct {
         // coarser cell rides along tagged with the `smax` handoff denominator
         // instead — the band-floor blank-window fix.
         const tbll = tile.tileBoundsLonLat(z, x, y); // [minlon, minlat, maxlon, maxlat]
+        const box = tile.Box.default(tile.EXTENT, tile.BUFFER); // tile-space clip box (coverage projection)
         const clon = (tbll[0] + tbll[2]) * 0.5;
         const clat = (tbll[1] + tbll[3]) * 0.5;
         // Cross-band hole-fill (buildTileMap HOLEFILL_FLAG, .extend_min pass): a
@@ -612,8 +677,10 @@ const TileGenCtx = struct {
                 }
                 const samples = [_][2]f64{
                     .{ clon, clat },
-                    .{ tbll[0], tbll[1] }, .{ tbll[2], tbll[1] },
-                    .{ tbll[0], tbll[3] }, .{ tbll[2], tbll[3] },
+                    .{ tbll[0], tbll[1] },
+                    .{ tbll[2], tbll[1] },
+                    .{ tbll[0], tbll[3] },
+                    .{ tbll[2], tbll[3] },
                 };
                 var hole = false;
                 for (samples) |p| {
@@ -639,20 +706,11 @@ const TileGenCtx = struct {
                 }
             }
         }
-        // Fold peer-pack coverage (bake --existing) into the finest-scale scan so
-        // this pack's coarser cells defer to a finer peer where it covers — the
-        // cross-pack extension of the finest-cell suppression (finestCsclCtx). The
-        // overscale hatch below (gf_tile) stays own-cells-only: the peer renders its
-        // own hatch, so folding it here would double it.
-        const gf_centre_d = finestCsclCtx(c.context, clon, clat, finestCsclAt(c.backends, idxs, clon, clat, true));
-        var gf_whole: i32 = finestCsclCtx(c.context, clon, clat, finestCsclAt(c.backends, idxs, clon, clat, false));
-        const corners = [4][2]f64{ .{ tbll[0], tbll[1] }, .{ tbll[2], tbll[1] }, .{ tbll[0], tbll[3] }, .{ tbll[2], tbll[3] } };
-        for (corners) |cn| gf_whole = @max(gf_whole, finestCsclCtx(c.context, cn[0], cn[1], finestCsclAt(c.backends, idxs, cn[0], cn[1], false)));
-        // The display window's shallow end for a tile at zoom z: D(z, φ_tile). The
-        // participating cells' SCAMIN ladders quantize the handoff (quantizeHandoff).
-        const display_denom = assets.displayDenomZ(z, clat);
-        const ladders = scratch.alloc([]const u32, idxs.len) catch return;
-        for (idxs, 0..) |idx, j| ladders[j] = if (reach_only[j]) &.{} else c.backends[idx].scamins;
+        // The point-sampled cross-band quilting (finestCsclAt over centre+corners
+        // → carryGate → suppress_whole/centre/smax) is GONE — the coverage-clipped
+        // composite (coverClipForCell + subtractCoverage + coveredByFiner) does it
+        // exactly per-feature. All that remains here is the overscale scale-boundary
+        // scan: the finest compilation scale CONTRIBUTING to this tile.
         // Scale-boundary overscale refinement (specs/overscale.md): the finest
         // compilation scale CONTRIBUTING to this tile — over the quilting's own
         // participant list (any overlapping cell, reach-only riders excluded),
@@ -687,24 +745,18 @@ const TileGenCtx = struct {
         const refs = scratch.alloc(scene.CellRef, idxs.len + n_ov) catch return;
         for (idxs, 0..) |idx, j| {
             const be = &c.backends[idx];
-            const g = carryGate(be.cscl, gf_centre_d, gf_whole, display_denom, ladders);
-            // Overscale tag (S-52 §10.1.10.2): the display denominator at/below
-            // which this cell is grossly overscale (cscl / OVERSCALE_FACTOR = X2).
-            // A real ladder crossing (BakeSink scans emitted `oscl` into the SCAMIN
-            // manifest), so the client flip is exact and never fires before 1x.
+            // The exact best-available composite: subtract the finer cells' M_COVR
+            // from this cell's fills/patterns, and (in scene.appendCellFeatures) drop
+            // its points/strokes wherever a finer cell owns the ground. cover_clip is
+            // the ONE cross-band mechanism — no carryGate / suppress_whole / smax.
+            const cover_clip = coverClipForCell(scratch, BackendCov{ .backends = c.backends }, idxs, reach_only, be.cscl, z, x, y, box);
+            // Overscale (S-52 §10.1.10.2): the X2 gate denominator. Hatch this cell's
+            // OVERSC01 coverage only where it is the DISPLAYED data AT a scale boundary
+            // — a strictly-finer cell rides the tile (gf_tile < cscl) AND this cell
+            // still owns some of it (its fills aren't fully clipped away).
             const oscl: i64 = overscaleGateDenom(be.cscl);
-            // Hatch this cell's OVERSC01 coverage only where it is the DISPLAYED
-            // (best-available) data AT a scale boundary (specs/overscale.md v3):
-            //   gf_tile < cscl   — a strictly-finer cell rides the tile (a scale
-            //                      boundary exists; else it is whole-view overscale,
-            //                      the HUD readout's job — §10.1.10.1).
-            //   gf_whole >= cscl — this cell WINS the quilt at some sampled point
-            //                      (its fills are not suppressed everywhere): the
-            //                      PURE quilt result, before carryGate's band-floor
-            //                      flip, so a coarse overview occluded by finer fills
-            //                      (even when carried) contributes NO hatch.
-            const wins_somewhere = gf_whole >= be.cscl; // == !pure_suppress_whole (cscl>0)
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = g.suppress_whole, .suppress_patterns = g.suppress_centre, .suppress_lines = g.suppress_centre, .suppress_points = g.suppress_whole, .smax = g.smax, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
+            const wins_somewhere = cover_clip == null or !tileFullyCovered(scratch, cover_clip.?, box);
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .smax = 0, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
         }
         if (n_ov > 0) {
             const floor_denom = assets.displayDenomZ(z + 1, clat);

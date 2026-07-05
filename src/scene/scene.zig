@@ -13,6 +13,7 @@ const mvt = @import("tiles").mvt;
 const mlt = @import("tiles").mlt;
 const render = @import("render");
 const assets = @import("assets");
+const geometry = @import("geo"); // Martinez boolean; `geo` is a common param name here
 const rs = render.surface;
 
 /// The banded multi-cell ENC_ROOT -> PMTiles baker (folded in: it is the
@@ -316,6 +317,76 @@ fn clipSimplifyPoly(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]con
     return if (ring.len >= 3) ring else clipped[0..0];
 }
 
+// Coverage-clipped best-available composite (specs/cross-band-composition-redesign.md):
+// subtract the finer-scale coverage `clip` (already projected + box-clipped into this
+// tile's i32 space, a clean union) from a coarser cell's box-clipped area rings, so a
+// feature is emitted by exactly one cell — the finest whose M_COVR covers it. Replaces
+// the old point-sampled whole-tile suppress_fills: a fully-covered tile clips to
+// nothing (= suppression), a partial seam tile keeps only the coarse remnant (no
+// double-draw), and an interior finer no-data hole keeps the coarse fill (no blank).
+// Exact integer geometry via the Martinez boolean; `orientAreaRings` re-derives winding.
+fn subtractCoverage(a: Allocator, rings: []const []const mvt.Point, clip: []const []const mvt.Point) []const []const mvt.Point {
+    if (clip.len == 0 or rings.len == 0) return rings;
+    const subj = mvtToGeo(a, rings) catch return rings;
+    const clp = mvtToGeo(a, clip) catch return rings;
+    const diff = geometry.boolean.compute(a, subj, clp, .diff) catch return rings;
+    return geoToMvt(a, diff) catch return rings;
+}
+
+fn mvtToGeo(a: Allocator, rings: []const []const mvt.Point) ![]const []const geometry.boolean.Pt {
+    const out = try a.alloc([]const geometry.boolean.Pt, rings.len);
+    for (rings, 0..) |r, i| {
+        const br = try a.alloc(geometry.boolean.Pt, r.len);
+        for (r, 0..) |p, k| br[k] = .{ .x = p.x, .y = p.y };
+        out[i] = br;
+    }
+    return out;
+}
+
+fn geoToMvt(a: Allocator, polys: []const []const geometry.boolean.Pt) ![]const []const mvt.Point {
+    const out = try a.alloc([]const mvt.Point, polys.len);
+    for (polys, 0..) |r, i| {
+        const mr = try a.alloc(mvt.Point, r.len);
+        // Coords are within the tile box (both operands box-clipped) → fit i32.
+        for (r, 0..) |p, k| mr[k] = .{ .x = @intCast(p.x), .y = @intCast(p.y) };
+        out[i] = mr;
+    }
+    return out;
+}
+
+// Even-odd point-in-rings in tile i32 space (exact i128 arithmetic) — the point
+// half of the coverage-clipped composite: a coarser cell's point/line at a
+// location a finer cell's M_COVR contains is dropped (the finer cell owns it).
+fn pointInMvtRings(rings: []const []const mvt.Point, px: i64, py: i64) bool {
+    var inside = false;
+    for (rings) |ring| {
+        if (ring.len < 3) continue;
+        var j = ring.len - 1;
+        for (ring, 0..) |pi, i| {
+            const pj = ring[j];
+            j = i;
+            if ((@as(i64, pi.y) > py) != (@as(i64, pj.y) > py)) {
+                const dy: i128 = @as(i128, pj.y) - pi.y;
+                const lhs: i128 = (@as(i128, px) - pi.x) * dy;
+                const rhs: i128 = (@as(i128, py) - pi.y) * (@as(i128, pj.x) - pi.x);
+                if (dy > 0) {
+                    if (lhs < rhs) inside = !inside;
+                } else {
+                    if (lhs > rhs) inside = !inside;
+                }
+            }
+        }
+    }
+    return inside;
+}
+
+/// True when (lon,lat) falls inside this cell's finer-coverage clip — the finer
+/// cell owns that ground, so a coarser point/line there is dropped (best-available).
+fn coveredByFiner(cover_clip: []const []const mvt.Point, lon: f64, lat: f64, z: u8, x: u32, y: u32) bool {
+    const p = tile.project(lon, lat, z, x, y, tile.EXTENT);
+    return pointInMvtRings(cover_clip, p.x, p.y);
+}
+
 // Clip a line + simplify each kept run (drop runs that collapse below 2 vertices).
 fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]const []const mvt.Point {
     const sub = try tile.clipLine(a, proj, box);
@@ -452,6 +523,13 @@ pub const CellOpts = struct {
     /// the tile centre so they can't lap over finer land.
     suppress_fills: bool = false,
     suppress_patterns: bool = false,
+    /// Coverage-clipped best-available composite: the finer-scale coverage to
+    /// subtract from THIS (coarser) cell's area fills + patterns, already projected
+    /// and box-clipped into the tile's i32 space as a clean union of rings. null =
+    /// nothing finer covers here (this cell is finest — draw everything). This is
+    /// the exact geometric replacement for the point-sampled suppress_fills; see
+    /// subtractCoverage.
+    cover_clip: ?[]const []const mvt.Point = null,
     /// Best-band suppression for the remaining geometry of an overzoomed coarser cell:
     ///   suppress_lines  — drop boundary/line STROKES where a finer band covers the tile
     ///     centre. Lines double-draw beside the finer copy (no opaque fill hides them),
@@ -1587,17 +1665,23 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             const ring = try clipSimplifyPoly(a, proj, box);
             if (ring.len >= 3) try rings.append(a, ring);
         }
-        if (rings.items.len > 0) {
-            const rparts = try orientAreaRings(a, rings.items);
+        // Best-available: cut this cell's fill where a finer cell covers the ground.
+        const arings = if (opts.cover_clip) |cc| subtractCoverage(a, rings.items, cc) else rings.items;
+        if (arings.len > 0) {
+            const rparts = try orientAreaRings(a, arings);
             const dv = depthVals(f);
             const dr: ?rs.DepthRange = if (dv) |d| .{ .d1 = d[0], .d2 = d[1] } else null;
+            // A coverage-clipped fill owns its remnant at every scale (best-available),
+            // so it carries no band-handoff smax — the geometry did the handoff.
+            var fillmeta = fmeta;
+            if (opts.cover_clip != null) fillmeta.smax = 0;
             if (!opts.suppress_fills) if (p.fill_token) |token| {
-                try surf.beginFeature(&fmeta);
+                try surf.beginFeature(&fillmeta);
                 try surf.fillArea(token, rparts, dr);
                 try surf.endFeature();
             };
             if (!opts.suppress_patterns) for (p.patterns) |pat| {
-                try surf.beginFeature(&fmeta);
+                try surf.beginFeature(&fillmeta);
                 try surf.fillPattern(pat, rparts);
                 try surf.endFeature();
             };
@@ -2369,6 +2453,9 @@ pub const CellRef = struct {
     suppress_patterns: bool = false,
     suppress_lines: bool = false,
     suppress_points: bool = false,
+    /// Finer-scale coverage to subtract from this cell's fills/patterns (see
+    /// CellOpts.cover_clip) — the exact coverage-clipped composite.
+    cover_clip: ?[]const []const mvt.Point = null,
     /// Band-handoff carry-down tag (see CellOpts.smax): the handoff denominator
     /// stamped on every feature this cell emits into the tile; 0 = not carried.
     smax: i64 = 0,
@@ -2420,6 +2507,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .band = cr.band,
             .suppress_fills = cr.suppress_fills,
             .suppress_patterns = cr.suppress_patterns,
+            .cover_clip = cr.cover_clip,
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
             .smax = cr.smax,
@@ -2451,6 +2539,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .band = cr.band,
             .suppress_fills = cr.suppress_fills,
             .suppress_patterns = cr.suppress_patterns,
+            .cover_clip = cr.cover_clip,
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
             .smax = cr.smax,
@@ -2644,6 +2733,19 @@ fn appendCellFeatures(
         // only when its effective SCAMIN reaches the window [D(z), D(z+1)) and its
         // cap hasn't swallowed it.
         var fopts = opts;
+        // Coverage-clipped best-available composite (point/line half): where a
+        // finer cell's M_COVR contains this coarser feature, drop its symbols/text
+        // (points) and boundary strokes (lines). Areas (prim==3) are handled by the
+        // exact fill difference above, not this per-feature test. This is the exact
+        // geometry that REPLACES the old point-sampled suppress_whole/suppress_centre.
+        if (opts.cover_clip) |cc| if (f.prim != 3) {
+            if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
+                if (coveredByFiner(cc, (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5, z, x, y)) {
+                    fopts.suppress_points = true;
+                    fopts.suppress_lines = true;
+                }
+            };
+        };
         if (opts.feat_smax) |fs| if (fi < fs.len and fs[fi] > 0) {
             fopts.smax = fs[fi];
         };
