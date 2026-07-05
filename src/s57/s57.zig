@@ -419,8 +419,8 @@ test "area representative point uses polylabel when the centroid falls outside" 
     // area, so the naive centroid (and a vertex average) would place a symbol off the
     // polygon. The polylabel pole of inaccessibility must land strictly inside.
     var u = [_]LonLat{
-        LonLat.init(0, 0),  LonLat.init(10, 0), LonLat.init(10, 3), LonLat.init(3, 3),
-        LonLat.init(3, 7),  LonLat.init(10, 7), LonLat.init(10, 10), LonLat.init(0, 10),
+        LonLat.init(0, 0), LonLat.init(10, 0), LonLat.init(10, 3),  LonLat.init(3, 3),
+        LonLat.init(3, 7), LonLat.init(10, 7), LonLat.init(10, 10), LonLat.init(0, 10),
     };
     var parts = [_][]LonLat{u[0..]};
     const cen = ringCentroid(u[0..]).?;
@@ -1546,13 +1546,16 @@ fn mergeFile(
             }
             const ruin: u8 = if (is_update) frid[11] else 1;
             var f = Feature{ .rcnm = frid[0], .rcid = u32le(frid, 1), .prim = frid[5], .objl = u16le(frid, 7) };
-            // Merge key: FOID when the field is present (a short/garbled FOID keys
-            // as 0, matching the historical behaviour), else (RCNM,RCID).
-            var key = vkey.of(f.rcnm, f.rcid);
-            if (rec.field("FOID")) |fo| {
-                f.foid = foidKey(fo);
-                key = f.foid;
-            }
+            // Merge key: (RCNM,RCID), exactly like vector records. S-57 §8.4.2
+            // updates address feature RECORDS by RCID — NOAA feature DELETEs ship a
+            // bare FRID with RUIN=2 and NO FOID (US4MA1GF.001 drops 4 BOYSPP +
+            // 4 LIGHTS that way), so the old FOID-first key silently missed the
+            // delete: the aid survived, and once the update's spatial half landed
+            // its FSPT dangled → a stale symbol at a corrupted position. FOID stays
+            // on the record as the OBJECT identity (LNAM/FFPT resolve post-flatten)
+            // but never keys the update index.
+            const key = vkey.of(f.rcnm, f.rcid);
+            if (rec.field("FOID")) |fo| f.foid = foidKey(fo);
 
             if (ruin == 2) {
                 // See the spatial-delete note: drop the index entry so re-INSERT
@@ -1614,7 +1617,7 @@ fn mergeFile(
 
 /// Parse an S-57 base cell and apply its sequential update files (.001, .002, …
 /// in order). Updates are merged at the record level (S-57 §8.4): insert / delete
-/// / modify by FOID (features) or (RCNM,RCID) (vectors), with SGCC/FSPC control
+/// / modify by (RCNM,RCID) for features and vectors alike, with SGCC/FSPC control
 /// fields for indexed coordinate/pointer edits. Pass an empty `updates` for a
 /// plain base cell.
 pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []const []const u8) !Cell {
@@ -1795,6 +1798,45 @@ test "SGCC modify of one sounding preserves the rest (SG3D list)" {
     try std.testing.expectEqual(@as(f64, 1), out[0].depth); // preserved
     try std.testing.expectEqual(@as(f64, 9), out[1].depth); // modified
     try std.testing.expectEqual(@as(f64, 3), out[2].depth); // preserved
+}
+
+test "update DELETE by bare FRID (no FOID) removes the base feature" {
+    // The NOAA delete shape (US4MA1GF.001): a feature delete is a lone FRID with
+    // RUIN=2 and NO FOID — updates address feature records by (RCNM,RCID). The old
+    // FOID-first merge key missed these (base indexed under FOID, delete keyed by
+    // RCID), so the deleted aid survived with dangling geometry.
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // FRID: RCNM=100 RCID=7 PRIM=1 GRUP=2 OBJL=19(BOYSPP) RVER RUIN
+    const frid_base = [_]u8{ 100, 7, 0, 0, 0, 1, 2, 19, 0, 1, 0, 1 }; // RUIN=insert
+    const frid_del = [_]u8{ 100, 7, 0, 0, 0, 1, 2, 19, 0, 2, 0, 2 }; // RUIN=delete, no FOID
+    const foid = [_]u8{ 0x26, 0x02, 4, 0, 0, 0, 2, 0 }; // AGEN=550 FIDN=4 FIDS=2
+
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "FOID", .data = &foid } });
+    var upd = std.ArrayList(u8).empty;
+    defer upd.deinit(gpa);
+    try iso.writeRecord(gpa, &upd, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{.{ .tag = "FRID", .data = &frid_del }});
+
+    var feats = std.ArrayList(?Feature).empty;
+    var fidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer fidx.deinit();
+    var vecs = std.ArrayList(?VectorRecord).empty;
+    var vidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer vidx.deinit();
+
+    try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, base.items, 1, 1, false);
+    try std.testing.expectEqual(@as(usize, 1), feats.items.len);
+    try std.testing.expect(feats.items[0] != null);
+
+    try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, upd.items, 1, 1, true);
+    try std.testing.expect(feats.items[0] == null); // deleted — must not survive
 }
 
 test "mergeNatf appends national attrs, ATTF wins on code overlap" {

@@ -141,7 +141,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     var cell: engine.s57.Cell = undefined;
     var streams: []const ?[]const u8 = &.{};
     if (!from_bundle) {
-        cell = try engine.s57.parseCell(a, data);
+        // Auto-apply the cell's sequential .001.. updates beside it (like the
+        // streaming chart loader and `tile57 explore`) — a bare-.000 render of a
+        // real NOAA cell without its updates shows stale/deleted features.
+        cell = try engine.s57.parseCellWithUpdates(a, data, readUpdates(io, a, path));
         engine.portray.setQuiet(true);
         // LIVE portrayal context: the mariner's real safety contour / depth /
         // contours / styles evaluate INSIDE the rules — the native win over
@@ -230,4 +233,20 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     } else {
         std.debug.print("wrote {s}: tile {d}/{d}/{d}, {d}x{d}px, {d} draw ops, {d} bytes\n", .{ out, z, x, y, size_w, size_h, ps.ops.items.len, bytes.len });
     }
+}
+
+// Auto-discover a base cell's sequential .001.. update files beside it
+// (mirrors explore.exReadUpdates + the streaming chart loader). Missing file =
+// end of chain; a non-.000 source has no updates.
+fn readUpdates(io: std.Io, a: std.mem.Allocator, base_path: []const u8) []const []const u8 {
+    if (!std.mem.endsWith(u8, base_path, ".000")) return &.{};
+    const stem = base_path[0 .. base_path.len - 4];
+    var list = std.ArrayList([]const u8).empty;
+    var u: u32 = 1;
+    while (u <= 999) : (u += 1) {
+        const upn = std.fmt.allocPrint(a, "{s}.{d:0>3}", .{ stem, u }) catch break;
+        const ub = std.Io.Dir.cwd().readFileAlloc(io, upn, a, .unlimited) catch break;
+        list.append(a, ub) catch break;
+    }
+    return list.items;
 }

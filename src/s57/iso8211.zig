@@ -372,7 +372,8 @@ test "parse a synthesized minimal ISO 8211 file" {
 
 // Test helper: write a record (leader+directory+field area) with tag size 4,
 // length size 3, position size 4 (matching real S-57 entry maps closely enough).
-fn writeRecord(a: Allocator, out: *std.ArrayList(u8), leader_id: u8, fields: []const Field) !void {
+// pub so s57.zig's update-merge tests can synthesize base/update files too.
+pub fn writeRecord(a: Allocator, out: *std.ArrayList(u8), leader_id: u8, fields: []const Field) !void {
     const TAGN = 4;
     const LENN = 3;
     const POSN = 4;
