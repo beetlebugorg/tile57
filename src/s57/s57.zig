@@ -1030,6 +1030,16 @@ fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) void {
     deriveEndpoints(v);
 }
 
+/// The S-57 attribute-delete marker: an ATVL consisting solely of the DEL character
+/// (0x7F). An update record (RUIN = modify) sets an attribute's value to a lone DEL to
+/// DELETE that attribute (S-57 Ed 3.1 §8.4.2.2). DEL never occurs inside a real ATVL, so
+/// an all-DEL value means "attribute removed" — equivalent to absent.
+fn isDelMarker(v: []const u8) bool {
+    if (v.len == 0) return false;
+    for (v) |c| if (c != 0x7f) return false;
+    return true;
+}
+
 /// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are
 /// copied into `a` (the source field bytes are not retained).
 fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
@@ -1040,12 +1050,16 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
         off += 2;
         var end = off;
         while (end < data.len and data[end] != iso.UT) end += 1;
-        // Skip an empty ATVL (UT immediately after the 2-byte code): the oracle's
-        // `if valueEnd > offset` (feature.go parseAttributes) drops it rather than
-        // storing a present-but-empty attribute, so a feature with an empty value
-        // has NO such attribute — attr()/attrFloat() then see it as absent.
-        if (end > off)
-            try list.append(a, .{ .code = code, .value = try a.dupe(u8, data[off..end]) });
+        const val = data[off..end];
+        // Skip an ABSENT attribute value. Two forms: (1) an empty ATVL (UT right after
+        // the 2-byte code) — the oracle's `if valueEnd > offset` (feature.go
+        // parseAttributes) drops it rather than storing a present-but-empty attribute;
+        // (2) the S-57 DEL (0x7F) delete marker an update writes to REMOVE an attribute
+        // (e.g. a light demoted from sectored carries SECTR1/SECTR2 = 0x7F). Storing DEL
+        // verbatim made the S-101 framework build a malformed ScaledDecimal{Value=nil}
+        // that crashed the rule -> QUESMRK1. Either way attr()/attrFloat() see it absent.
+        if (val.len > 0 and !isDelMarker(val))
+            try list.append(a, .{ .code = code, .value = try a.dupe(u8, val) });
         off = end + 1; // skip UT
     }
     return list.items;
@@ -1812,6 +1826,27 @@ test "parseATTF drops an empty ATVL (matches oracle valueEnd > offset)" {
     const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 0, .attrs = attrs };
     try std.testing.expectEqual(@as(?[]const u8, null), f.attr(116));
     try std.testing.expectEqualStrings("5", f.attr(87).?);
+}
+
+test "parseATTF drops an S-57 DEL (0x7F) attribute-delete marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An update writes SECTR1(136)=DEL to REMOVE the sector bearing (a light demoted from
+    // sectored). The lone 0x7F must drop like an empty ATVL — storing it made the S-101
+    // framework build a malformed ScaledDecimal{Value=nil} and crash the rule (QUESMRK1
+    // on US4VA1DE/US5VA1QV). SECTR2(137)="90" survives to prove only the DEL-valued
+    // attribute is removed.
+    const bytes = [_]u8{ 136, 0, 0x7f, iso.UT } ++ [_]u8{ 137, 0 } ++ "90".* ++ [_]u8{iso.UT};
+    const attrs = try parseATTF(a, &bytes);
+    try std.testing.expectEqual(@as(usize, 1), attrs.len);
+    const f = Feature{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 75, .attrs = attrs };
+    try std.testing.expectEqual(@as(?[]const u8, null), f.attr(136)); // deleted
+    try std.testing.expectEqualStrings("90", f.attr(137).?);
+    try std.testing.expect(isDelMarker("\x7f"));
+    try std.testing.expect(isDelMarker("\x7f\x7f"));
+    try std.testing.expect(!isDelMarker(""));
+    try std.testing.expect(!isDelMarker("90"));
 }
 
 test "attrFloat / parseFloatOpt trim full ASCII whitespace (oracle TrimSpace)" {
