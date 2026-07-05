@@ -283,8 +283,8 @@ fn isDangerCode(code: []const u8) bool {
 // computed boolean with no S-57 source): a structure in the water is a navigational
 // hazard (viewingGroup 12200 + AlertReference:NavHazard) rather than a land feature.
 const IN_THE_WATER_CLASSES = [_][]const u8{
-    "Building",  "BuiltUpArea", "Crane",    "FortifiedStructure",
-    "Landmark",  "SiloTank",    "SlopeTopline", "WindTurbine",
+    "Building", "BuiltUpArea", "Crane",        "FortifiedStructure",
+    "Landmark", "SiloTank",    "SlopeTopline", "WindTurbine",
 };
 fn readsInTheWater(code: []const u8) bool {
     return listHasStr(&IN_THE_WATER_CLASSES, code);
@@ -801,6 +801,12 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         const code = resolveClass(f) orelse continue;
         const prim = primitiveName(f.prim);
         if (prim.len == 0) continue;
+        // S-65 Annex B §10.1.1: surface is NOT an allowable geometric primitive for
+        // Recommended Track, so "RECTRC of geometric primitive area will not be converted
+        // across to S-101" (the producer should have re-encoded it as FAIRWY/TWRTPT/DWRTPT
+        // or a line RECTRC). Converting it anyway routes to the Curve-only RecommendedTrack
+        // rule and paints QUESMRK1, so skip it here — it is simply not carried into S-101.
+        if (f.prim == 3 and std.mem.eql(u8, code, "RecommendedTrack")) continue;
         var attrs = std.ArrayList(NameVal).empty;
         var children = std.ArrayList(ChildEntry).empty;
         var name: []const u8 = "";
@@ -1258,6 +1264,37 @@ test "TS_FEB (objl 160) resolves to TidalStreamFloodEbb with synthesized attrs" 
     try std.testing.expectEqualStrings("195", root.simpleValue("orientationValue").?);
     // speed complex from CURVEL: feature.speed.speedMaximum
     try std.testing.expectEqualStrings("1.5", root.resolve("speed:1").?.simpleValue("speedMaximum").?);
+}
+
+test "S-65 10.1.1: area RECTRC is not converted; line RECTRC becomes RecommendedTrack" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // RECTRC (objl 109) is L,A in S-57 but Curve-only in S-101. S-65 Annex B 10.1.1: a surface
+    // (area) RECTRC "will not be converted across to S-101" — the producer should have re-encoded
+    // it (FAIRWY/TWRTPT/DWRTPT or a line RECTRC). So the adapter DROPS the area one rather than
+    // routing it to the Curve-only rule (which would paint QUESMRK1); the line one converts.
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 109 }, // area RECTRC -> dropped
+        .{ .rcnm = 100, .rcid = 2, .prim = 2, .objl = 109 }, // line RECTRC -> RecommendedTrack
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 1), adapted.len); // only the line RECTRC survives
+    try std.testing.expectEqualStrings("RecommendedTrack", adapted[0].code);
+    try std.testing.expectEqualStrings("Curve", adapted[0].primitive);
+    try std.testing.expectEqual(@as(usize, 1), adapted[0].feature_index); // = feats[1], the line one
 }
 
 test "TOPMAR folds into co-located buoy as the topmark complex" {
@@ -1784,7 +1821,7 @@ test "DepthIndex shoalest DRVAL1 lookup" {
     const t = std.testing;
     // Area A is a 10x10 box (DRVAL1 10); area B a 2..8 box inside it (DRVAL1 3).
     var ring_a = [_]s57.LonLat{
-        s57.LonLat.init(0, 0),  s57.LonLat.init(10, 0),
+        s57.LonLat.init(0, 0),   s57.LonLat.init(10, 0),
         s57.LonLat.init(10, 10), s57.LonLat.init(0, 10),
     };
     var ring_b = [_]s57.LonLat{
@@ -1817,7 +1854,7 @@ test "inTheWater predicate: containsPoint over water and land indices" {
     const t = std.testing;
     // Water = a 10x10 box; land = a 2..8 island nested inside it (overlapping ENC).
     var water_ring = [_]s57.LonLat{
-        s57.LonLat.init(0, 0),  s57.LonLat.init(10, 0),
+        s57.LonLat.init(0, 0),   s57.LonLat.init(10, 0),
         s57.LonLat.init(10, 10), s57.LonLat.init(0, 10),
     };
     var land_ring = [_]s57.LonLat{
