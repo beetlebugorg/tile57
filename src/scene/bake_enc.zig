@@ -1348,16 +1348,18 @@ fn findIntProp(props: []const mvt.Prop, key: []const u8) ?i64 {
     return null;
 }
 
-test "band handoff: the floor tile bakes in the coarser pass with both bands' content" {
+test "composite floor tile: the finer cell owns the ground (no carried smax copy)" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
     // Two cells at the same location near (0.35, 0.35): a coastal 1:200k with its
-    // bulk gated SCAMIN 260000, and a general 1:1.2M with SCAMIN 800000. The
-    // coastal M_COVR coverage blankets everything, so pre-handoff the general cell
-    // was fully suppressed at the shared z9 — the blank-window bug.
+    // bulk gated SCAMIN 260000, and a general 1:1.2M with SCAMIN 800000, both
+    // with the SAME blanket M_COVR. Under the coverage-clipped composite the
+    // fine cell owns all the ground it covers at the shared z9 floor tile: its
+    // own point emits untagged, and the coarse copy is geometrically clipped
+    // (coveredByFiner) — never carried with an smax handoff tag.
     const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }}; // SCAMIN
     const fine_feats = [_]s57.Feature{.{
         .rcnm = 0,
@@ -1392,9 +1394,12 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     const streams = [_]?[]const u8{"DrawingPriority:7;PointInstruction:BOYLAT01"};
     const fine_scamins = [_]u32{260_000};
     const coarse_scamins = [_]u32{800_000};
+    // Per-feature bbox of the single point — the composite's coveredByFiner test
+    // keys on it (a real bake gets this from portrayCell).
+    const pt_bbox = [_]?[4]f64{.{ 0.35, 0.35, 0.35, 0.35 }};
 
-    var fine = Backend{ .cell = fine_cell, .portrayal = &streams, .bounds = bounds, .cscl = 200_000, .coverage = &cover, .scamins = &fine_scamins };
-    const coarse = Backend{ .cell = coarse_cell, .portrayal = &streams, .bounds = bounds, .cscl = 1_200_000, .coverage = &cover, .scamins = &coarse_scamins };
+    var fine = Backend{ .cell = fine_cell, .portrayal = &streams, .bounds = bounds, .cscl = 200_000, .coverage = &cover, .scamins = &fine_scamins, .feat_bbox = &pt_bbox };
+    const coarse = Backend{ .cell = coarse_cell, .portrayal = &streams, .bounds = bounds, .cscl = 1_200_000, .coverage = &cover, .scamins = &coarse_scamins, .feat_bbox = &pt_bbox };
 
     var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
     var baker = Baker.init(gpa, 7, 10, .{ .ctx = &sink, .func = CollectSink.run });
@@ -1407,7 +1412,7 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     try std.testing.expect(sink.tiles.count() > 0);
 
     // General pass (coarsest populated): own cells + the coastal carry. The z9
-    // floor tile now exists and holds BOTH bands' points.
+    // floor tile exists; only the FINE cell's point survives the composite.
     var both = [_]Backend{ coarse, fine };
     try baker.bakeBand(.general, &both, 1, .extend_min, null, null, null);
     const t9 = lonLatToTile(0.35, 0.35, 9);
@@ -1415,7 +1420,7 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     const raw = try gzip.decompress(a, bytes);
     const layers = try mvt.decode(a, raw);
     var fine_pts: usize = 0;
-    var carried_pts: usize = 0;
+    var coarse_pts: usize = 0;
     for (layers) |L| {
         // v2 schema: SCAMIN points fold into the merged `point_symbols` layer; the
         // scamin-prop filter below selects the SCAMIN-bearing ones.
@@ -1428,16 +1433,15 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
                 try std.testing.expectEqual(@as(?i64, null), smax);
                 fine_pts += 1;
             } else if (scamin == 800_000) {
-                // The carried general-band copy: smax = quantizeUp(cscl_fine 200k)
-                // onto the fine ladder = 260000 — it hands off at the exact crossing
-                // where the fine bulk activates (no double-draw window in denom space).
-                try std.testing.expectEqual(@as(?i64, 260_000), smax);
-                carried_pts += 1;
+                coarse_pts += 1;
             }
         }
     }
     try std.testing.expectEqual(@as(usize, 1), fine_pts);
-    try std.testing.expectEqual(@as(usize, 1), carried_pts);
+    // The coarse copy is GEOMETRICALLY clipped (the fine cell's M_COVR contains
+    // its position — coveredByFiner), not carried with an smax tag: the
+    // coverage-clipped composite replaced the scamin-aware carry-down.
+    try std.testing.expectEqual(@as(usize, 0), coarse_pts);
 
     // The extend_min pass also filled below the general floor (z7 exists via the
     // coarsest-band extension even though nothing coarser was baked).

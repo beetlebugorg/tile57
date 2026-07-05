@@ -27,6 +27,20 @@ pub fn project(lon: f64, lat: f64, z: u8, tx: u32, ty: u32, extent: i32) mvt.Poi
     return worldToTile(lonLatToWorld(lon, lat), z, tx, ty, extent);
 }
 
+/// Inverse of `project`: tile-local coordinates (float pixels of tile z/tx/ty at
+/// `extent`) back to lon/lat degrees. Used by the coverage line clip, which cuts
+/// strokes in integer tile space and hands the kept runs back to the geo-space
+/// complex-linestyle tessellator.
+pub fn tileToLonLat(px: f64, py: f64, z: u8, tx: u32, ty: u32, extent: i32) [2]f64 {
+    const scale = @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+    const ext: f64 = @floatFromInt(extent);
+    const wx = (@as(f64, @floatFromInt(tx)) + px / ext) / scale;
+    const wy = (@as(f64, @floatFromInt(ty)) + py / ext) / scale;
+    const lon = wx * 360.0 - 180.0;
+    const lat = std.math.atan(std.math.sinh(std.math.pi * (1.0 - 2.0 * wy))) * 180.0 / std.math.pi;
+    return .{ lon, lat };
+}
+
 /// Project a normalised web-mercator world coord (`lonLatToWorld` output, [0,1])
 /// to tile-local MVT coordinates — the cheap part of `project` (no transcendentals),
 /// so a baker can compute world once per point and reproject it across tiles fast.

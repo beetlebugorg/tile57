@@ -541,6 +541,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "assets", .module = assets_mod },
+        .{ .name = "geo", .module = geo_mod },
     });
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
     // Geometry core for the cross-band composition redesign (pure, std-only).

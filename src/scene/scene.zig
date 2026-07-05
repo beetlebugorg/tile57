@@ -354,6 +354,60 @@ fn geoToMvt(a: Allocator, polys: []const []const geometry.boolean.Pt) ![]const [
     return out;
 }
 
+// Line half of the coverage-clipped composite (spec §2.3 LINES): cut away the
+// stretches of the box-clipped stroke runs that lie INSIDE the finer cells'
+// coverage — plane.clipLineOutsidePolys splits each segment at its coverage-edge
+// crossings and keeps the sub-runs whose midpoint is outside (the finer cell owns
+// the covered stretch and the seam stroke). Replaces the whole-feature
+// bbox-centre drop, which either kept a long coarse contour ENTIRELY (doubled
+// inside finer coverage — the "extra contour lines") or dropped it entirely (a
+// missing stroke outside). Fail-open on OOM: the un-clipped runs (a transient
+// coarse dupe beats a missing stroke).
+fn clipRunsOutsideCover(a: Allocator, runs: []const []const mvt.Point, cover: []const []const mvt.Point) []const []const mvt.Point {
+    if (cover.len == 0 or runs.len == 0) return runs;
+    const cov = mvtToGeo(a, cover) catch return runs;
+    var out = std.ArrayList([]const mvt.Point).empty;
+    for (runs) |run| {
+        if (run.len < 2) continue;
+        const line = a.alloc(geometry.boolean.Pt, run.len) catch return runs;
+        for (run, 0..) |p, k| line[k] = .{ .x = p.x, .y = p.y };
+        const kept = geometry.plane.clipLineOutsidePolys(a, line, cov) catch return runs;
+        for (kept) |kr| {
+            if (kr.len < 2) continue;
+            const mr = a.alloc(mvt.Point, kr.len) catch return runs;
+            for (kr, 0..) |p, k| mr[k] = .{ .x = @intCast(p.x), .y = @intCast(p.y) };
+            out.append(a, mr) catch return runs;
+        }
+    }
+    return out.items;
+}
+
+// The same coverage line clip for GEO-space stroke parts (the complex-linestyle
+// tessellator works in lon/lat): project each part to integer tile space, cut the
+// covered stretches, and map the kept runs back with tile.tileToLonLat. Dash
+// phase restarts at a cut — identical to any part boundary today, and the finer
+// cell draws its own stroke past the seam.
+fn clipGeoPartsOutsideCover(a: Allocator, parts: []const []s57.LonLat, cover: []const []const mvt.Point, z: u8, x: u32, y: u32) []const []s57.LonLat {
+    if (cover.len == 0 or parts.len == 0) return parts;
+    var out = std.ArrayList([]s57.LonLat).empty;
+    for (parts) |part| {
+        if (part.len < 2) continue;
+        const proj = a.alloc(mvt.Point, part.len) catch return parts;
+        for (part, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+        const runs = [_][]const mvt.Point{proj};
+        for (clipRunsOutsideCover(a, &runs, cover)) |kr| {
+            if (kr.len < 2) continue;
+            const gp = a.alloc(s57.LonLat, kr.len) catch return parts;
+            for (kr, 0..) |p, i| {
+                const ll = tile.tileToLonLat(@floatFromInt(p.x), @floatFromInt(p.y), z, x, y, tile.EXTENT);
+                gp[i] = s57.LonLat.init(ll[0], ll[1]);
+            }
+            out.append(a, gp) catch return parts;
+        }
+    }
+    return out.items;
+}
+
 // Even-odd point-in-rings in tile i32 space (exact i128 arithmetic) — the point
 // half of the coverage-clipped composite: a coarser cell's point/line at a
 // location a finer cell's M_COVR contains is dropped (the finer cell owns it).
@@ -1583,7 +1637,13 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     if (f.prim == 1) {
         const pg = cell.pointGeometry(f) orelse return;
         // Sector legs / arcs draw before the light's own symbols (S-52 stacking).
-        try emitAugFigures(a, p.aug_figures, pg, fmeta, z, x, y, box, surf);
+        // They INHERIT the anchor point's coverage verdict (suppress_points /
+        // suppress_lines) and are never independently clipped: a clipped-away
+        // light drops its arc with it (no cross-band double arc), a surviving
+        // light keeps its full arc even where it sweeps into finer coverage
+        // (no amputation at the seam). Spec §2.3 sector-arc rule.
+        if (!opts.suppress_points and !opts.suppress_lines)
+            try emitAugFigures(a, p.aug_figures, pg, fmeta, z, x, y, box, surf);
         if (pg.lon() < tb[0] or pg.lon() > tb[2] or pg.lat() < tb[1] or pg.lat() > tb[3]) return;
         const pt = tile.project(pg.lon(), pg.lat(), z, x, y, tile.EXTENT);
         if (!opts.suppress_points) {
@@ -1691,7 +1751,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     const valdco: ?f64 = if (f.objl == 43) f.attrFloat(s57.ATTR_VALDCO) else null;
 
     var stroke_geo: []const []s57.LonLat = geo_parts;
-    var stroke_proj: []const []mvt.Point = projected.items;
+    var stroke_proj: []const []const mvt.Point = projected.items;
     if (!opts.suppress_lines and p.lines.len > 0 and cell.needsDrawableBoundary(f)) {
         var stroke_storage = std.ArrayList([]mvt.Point).empty;
         const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
@@ -1704,6 +1764,14 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             try stroke_storage.append(a, proj);
         }
         stroke_proj = stroke_storage.items;
+    }
+    // Best-available: cut the covered stretches out of this cell's strokes — the
+    // exact line half of the composite (see clipRunsOutsideCover). The geo-space
+    // copy feeds the complex-linestyle tessellator, the projected copy the plain
+    // stroke path below; both cut by the identical coverage.
+    if (opts.cover_clip) |cc| {
+        stroke_geo = clipGeoPartsOutsideCover(a, stroke_geo, cc, z, x, y);
+        stroke_proj = clipRunsOutsideCover(a, stroke_proj, cc);
     }
 
     const force_dash = !quaposSolidClass(f.objl) and s57.isLowAccuracyQuapos(cell.featureQuapos(f));
@@ -2261,14 +2329,15 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     };
     try surf.beginFeature(&fmeta);
 
-    // Dashed CHGRD boundary on each ring (clipped to the tile). Best-band: drop the
-    // stroke where a finer band covers the tile centre (suppress_lines).
+    // Dashed CHGRD boundary on each ring (clipped to the tile, covered stretches
+    // cut by the finer cells' coverage — best-available).
     if (!opts.suppress_lines) for (geo_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try clipSimplifyLine(a, proj, box);
+        var sub = try clipSimplifyLine(a, proj, box);
+        if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -2320,14 +2389,17 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     // IALA A/B system boundary (MARSYS51). Both stroke in CHGRD.
     const boundary: []const u8 = if (f.attr(s57.ATTR_ORIENT) != null) "NAVARE51" else "MARSYS51";
 
+    // Best-available: cut the covered stretches before tessellating/stroking.
+    const nav_parts = if (opts.cover_clip) |cc| clipGeoPartsOutsideCover(a, geo_parts, cc, z, x, y) else geo_parts;
+
     // Tessellate the registered complex linestyle (dashes + the A/B letter symbols).
     if (g_linestyles.get(boundary)) |info| {
-        try emitComplexLine(a, geo_parts, info, "CHGRD", !opts.suppress_points, z, x, y, box, &fmeta, surf);
+        try emitComplexLine(a, nav_parts, info, "CHGRD", !opts.suppress_points, z, x, y, box, &fmeta, surf);
         return;
     }
     // No registered linestyle (live/host path, no table): a plain dashed CHGRD ring.
     try surf.beginFeature(&fmeta);
-    for (geo_parts) |gp| {
+    for (nav_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
@@ -2370,7 +2442,8 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try clipSimplifyLine(a, proj, box);
+        var sub = try clipSimplifyLine(a, proj, box);
+        if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -2733,16 +2806,21 @@ fn appendCellFeatures(
         // only when its effective SCAMIN reaches the window [D(z), D(z+1)) and its
         // cap hasn't swallowed it.
         var fopts = opts;
-        // Coverage-clipped best-available composite (point/line half): where a
-        // finer cell's M_COVR contains this coarser feature, drop its symbols/text
-        // (points) and boundary strokes (lines). Areas (prim==3) are handled by the
-        // exact fill difference above, not this per-feature test. This is the exact
-        // geometry that REPLACES the old point-sampled suppress_whole/suppress_centre.
+        // Coverage-clipped best-available composite (point half): where a finer
+        // cell's M_COVR contains this feature's position, drop its symbols/text —
+        // for a point the bbox centre IS the point, so the test is exact, and its
+        // augmented figures (sector arcs/legs) inherit the verdict via
+        // suppress_lines. Areas are handled by the exact fill difference above;
+        // line STROKES are cut exactly against the coverage (clipRunsOutsideCover /
+        // clipGeoPartsOutsideCover), so a long coarse contour keeps its stretch
+        // outside finer coverage and loses the stretch inside — the whole-feature
+        // bbox-centre drop doubled contours (centre outside → whole line kept).
+        // A line/area feature's centred label/symbol still drops by bbox centre.
         if (opts.cover_clip) |cc| if (f.prim != 3) {
             if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
                 if (coveredByFiner(cc, (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5, z, x, y)) {
                     fopts.suppress_points = true;
-                    fopts.suppress_lines = true;
+                    if (f.prim == 1) fopts.suppress_lines = true;
                 }
             };
         };
@@ -2858,7 +2936,8 @@ fn appendCellFeatures(
             if (!overlaps(geomBounds(gp), tb)) continue;
             const proj = try a.alloc(mvt.Point, gp.len);
             for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-            const sub = try clipSimplifyLine(a, proj, box);
+            var sub = try clipSimplifyLine(a, proj, box);
+            if (fopts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
             for (sub, 0..) |s, i| parts[i] = s;
