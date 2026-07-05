@@ -544,4 +544,5 @@ test "manifestJson: pins schema_version and couples tiles to portrayal" {
 
 test {
     _ = chartstyle;
+    _ = @import("style.zig"); // run style.zig's styleJson / buildFromTemplate tests too
 }

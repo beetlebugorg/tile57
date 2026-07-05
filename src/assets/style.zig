@@ -327,21 +327,17 @@ fn layerHead(js: *Stringify, id: []const u8, kind: []const u8, source_layer: []c
     try js.write(source_layer);
 }
 
-// One SCAMIN bucket layer's gating: a per-value layer (`sm`) gets a native fractional
-// `minzoom` (scaminDisplayZoom) + a `["==",scamin,v]` filter; the catch-all `#no` layer
-// (`no_lows` set) takes features WITHOUT scamin plus the folded below-floor values. The
-// default (`.{}`) is the unbucketed layer — no clause, no minzoom, no suffix — so a
-// non-SCAMIN layer renders byte-identically to before. The manifest path uses these
-// native minzoom buckets (§2); the no-manifest fallback uses the static K/2^zoom gate.
+// One SCAMIN gate layer's gating (one per render family in the v2 merged schema). A
+// merged layer carries EITHER the live client-driven filter-gate clause (filter_gate,
+// the exact ?scaminexact mode), OR the static K/2^zoom zoom-gate (zoom_gate, the default
+// self-gating "merged" mode), OR nothing (the plain `.{}` bucket, ?ignoreScamin). A
+// non-SCAMIN feature coalesces past every gate (coalesce(scamin,1e12) >= D).
 const Bucket = struct {
-    sm: ?u32 = null, // per-value bucket: filter scamin == sm
-    no_lows: ?[]const u32 = null, // #no bucket: !has(scamin) OR scamin in these folded low values
-    zoom_gate: bool = false, // no-manifest fallback: AND the static K/2^zoom SCAMIN gate
+    zoom_gate: bool = false, // default merged mode: AND the static K/2^zoom SCAMIN gate
     zoom_k: f64 = 0, // zoom_gate: the per-archive display-denominator constant K (scaminGateK)
-    filter_gate: bool = false, // scamin-layers.md: the live client-driven SCAMIN clause (no minzoom, no suffix)
+    filter_gate: bool = false, // scamin-layers.md: the live client-driven SCAMIN clause (?scaminexact)
     cur_denom: f64 = 0, // filter_gate: the current-display-scale denominator literal (client-overwritten)
-    minzoom: ?f64 = null,
-    suffix: []const u8 = "", // id suffix: "#sm<v>" / "#no" / "" (plain)
+    suffix: []const u8 = "", // id suffix: "#oscl" (overscaled fill pass) / "" (plain)
     // Overscale (oscl) clause role (S-52 §10.1.10, specs/overscale.md) — see OverscaleRole.
     oscl: OverscaleRole = .none,
 };
@@ -369,8 +365,9 @@ fn bucketWithOverscale(a: std.mem.Allocator, bkt: Bucket, role: OverscaleRole) !
 // display scale, so `scamin >= curDenom` is always true (missing SCAMIN => always shown).
 const SCAMIN_COALESCE_MAX = 1000000000000; // 1e12
 
-// The scamin filter clause for a bucket: `["==",["get","scamin"],v]` (per-value) or
-// `["any", ["!",["has","scamin"]], ["in",["get","scamin"],["literal",[lows…]]]]` (#no).
+// The SCAMIN filter clause for a merged gate layer — either the live client-driven
+// filter-gate (?scaminexact) or the static zoom-gate (the default merged mode). A
+// non-SCAMIN feature coalesces to 1e12 (>= any denominator) and always passes.
 fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
     if (bkt.filter_gate) {
         // scamin-layers.md: [">=", ["coalesce", ["get","scamin"], 1e12], curDenom].
@@ -387,47 +384,22 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
         try js.endArray();
         return;
     }
-    if (bkt.zoom_gate) {
-        // Static gate, latitude-correct: show a SCAMIN feature only when the display
-        // is at least as fine as its 1:N, i.e. scamin >= D(zoom) with D = K/2^zoom.
-        // A non-SCAMIN feature coalesces to 1e12 (>= any D) and always passes. Shares
-        // the smax/oscl gate's K (writeSmaxClause/.zoom_k), so the three stay in lockstep.
-        try js.write(.{ ">=", .{ "coalesce", .{ "get", "scamin" }, SCAMIN_COALESCE_MAX }, .{ "/", bkt.zoom_k, .{ "^", 2, .{"zoom"} } } });
-        return;
-    }
-    if (bkt.sm) |v| {
-        try js.beginArray();
-        try js.write("==");
-        try js.write(.{ "get", "scamin" });
-        try js.write(v);
-        try js.endArray();
-        return;
-    }
-    try js.beginArray();
-    try js.write("any");
-    try js.write(.{ "!", .{ "has", "scamin" } });
-    try js.beginArray();
-    try js.write("in");
-    try js.write(.{ "get", "scamin" });
-    try js.beginArray();
-    try js.write("literal");
-    try js.beginArray();
-    if (bkt.no_lows) |lows| for (lows) |v| try js.write(v);
-    try js.endArray();
-    try js.endArray();
-    try js.endArray();
-    try js.endArray();
+    // zoom_gate (the only other clause-bearing mode; has_clause guarantees it): static,
+    // latitude-correct gate — show a SCAMIN feature only when the display is at least as
+    // fine as its 1:N, i.e. scamin >= D(zoom) with D = K/2^zoom. Shares the smax/oscl
+    // gate's K (writeSmaxClause/.zoom_k), so the three stay in lockstep.
+    try js.write(.{ ">=", .{ "coalesce", .{ "get", "scamin" }, SCAMIN_COALESCE_MAX }, .{ "/", bkt.zoom_k, .{ "^", 2, .{"zoom"} } } });
 }
 
-// Write a layer's `filter` and native `minzoom`. The filter ANDs together (in order):
-// the `base` predicate (when has_base), the bucket's SCAMIN clause (per-value / #no /
-// zoom-gate), the band-handoff smax clause (s.smax), the shared mariner `common`
-// filters (s.common), and a layer-specific `extra` (the text-group filter on text
-// layers). All optional; a single part is written bare (no "all" wrapper) so a
-// template layer is byte-identical to the pre-mariner output. `has_base=false` for
-// layers with no base predicate (fills/patterns/complex/soundings).
+// Write a layer's `filter`. The filter ANDs together (in order): the `base` predicate
+// (when has_base), the merged layer's SCAMIN gate clause (filter-gate / zoom-gate), the
+// band-handoff smax clause (s.smax), the shared mariner `common` filters (s.common), and
+// a layer-specific `extra` (the text-group filter on text layers). All optional; a single
+// part is written bare (no "all" wrapper) so a template layer is byte-identical to the
+// pre-mariner output. `has_base=false` for layers with no base predicate
+// (fills/patterns/complex/soundings).
 fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *const SCtx, drop_smax: bool, extra: ?std.json.Value) !void {
-    const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate or bkt.filter_gate;
+    const has_clause = bkt.zoom_gate or bkt.filter_gate;
     // scamin-standalone.md §0/§3: the point / text / line families are band-INDEPENDENT —
     // their whole display lifecycle is the scamin gate, so the band-handoff `smax`
     // carry-down clause does NOT apply (a feature "should just exist regardless of band").
@@ -458,10 +430,6 @@ fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *c
         for (s.common) |c| try js.write(c);
         if (extra) |e| try js.write(e);
         if (wrap) try js.endArray();
-    }
-    if (bkt.minzoom) |mz| {
-        try js.objectField("minzoom");
-        try js.write(mz);
     }
 }
 
@@ -875,46 +843,26 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     const glyphs_on = opts.glyphs != null;
     const sea = if (palette.get("DEPDW")) |v| v.string else "#93aebb";
 
-    // SCAMIN gate buckets that ride EVERY merged source-layer (v2 schema: a family's
-    // base features and its former `_scamin` twin now share one layer, so every layer
-    // is mixed — like the old `soundings` layer). Modes:
-    //   ignore_scamin  -> one plain (ungated) bucket (§2 debug toggle shows everything).
-    //   filter_gate    -> one live-clause bucket (scamin-layers.md): the client-driven
-    //                     SCAMIN clause, no per-value buckets, no minzoom.
-    //   no manifest    -> one static K/2^zoom gate bucket (latitude-correct).
-    //   a manifest     -> a #no catch-all (non-SCAMIN + below-floor values) PLUS one
-    //                     native-minzoom #sm<v> bucket per above-floor value.
-    // The #no catch-all is ALWAYS present in the manifest path now (it carries each
-    // layer's bare non-SCAMIN features), where the pre-merge base layer used to.
+    // The SINGLE band-independent SCAMIN gate that rides every merged source-layer (one
+    // per render family). Exactly one mode, no per-value bucket layers:
+    //   ignore_scamin -> a plain (ungated) gate (§2 debug toggle shows everything).
+    //   filter_gate   -> the live client-driven clause (scamin-layers.md, ?scaminexact):
+    //                    the client rewrites curDenom via setFilter at ladder crossings.
+    //   default       -> the static K/2^zoom zoom-gate (the "merged" mode): one
+    //                    self-gating zoom expression, no client setFilter, no reload.
+    // A non-SCAMIN feature coalesces past the gate (coalesce(scamin,1e12) >= D). The
+    // `opts.scamin` manifest no longer produces per-value layers — it only feeds the
+    // TileJSON ladder (served separately) for the filter-gate client's crossings.
     var barena = std.heap.ArenaAllocator.init(alloc);
     defer barena.deinit();
     const ba = barena.allocator();
-    const floor: f64 = @floatFromInt(opts.minzoom);
-    var lows = std.ArrayList(u32).empty;
-    var his = std.ArrayList(Bucket).empty;
-    // The per-value bucket split is only needed for the manifest bucket path; skip it
-    // for ignore_scamin (single plain bucket) and filter_gate (single live-clause layer).
-    if (!opts.ignore_scamin and !opts.scamin_filter_gate) for (opts.scamin) |v| {
-        const mz = scaminDisplayZoom(@floatFromInt(v), opts.scamin_lat);
-        if (mz <= floor + 1e-6) {
-            try lows.append(ba, v);
-        } else {
-            try his.append(ba, .{ .sm = v, .minzoom = mz, .suffix = try std.fmt.allocPrint(ba, "#sm{d}", .{v}) });
-        }
-    };
-    const low_slice: []const u32 = lows.items;
-    var bucket_list = std.ArrayList(Bucket).empty;
-    if (opts.ignore_scamin) {
-        try bucket_list.append(ba, .{});
-    } else if (opts.scamin_filter_gate) {
-        try bucket_list.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
-    } else if (opts.scamin.len == 0) {
-        try bucket_list.append(ba, .{ .zoom_gate = true, .zoom_k = scaminGateK(opts.scamin_lat) });
-    } else {
-        try bucket_list.append(ba, .{ .no_lows = low_slice, .suffix = "#no" });
-        try bucket_list.appendSlice(ba, his.items);
-    }
-    const scamin_buckets: []const Bucket = bucket_list.items;
+    const gate: Bucket = if (opts.ignore_scamin)
+        .{}
+    else if (opts.scamin_filter_gate)
+        .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom }
+    else
+        .{ .zoom_gate = true, .zoom_k = scaminGateK(opts.scamin_lat) };
+    const scamin_buckets: []const Bucket = &.{gate};
 
     // The single style builder: resolve every mariner-aware colour / icon / display
     // filter ONCE through the chartstyle builders (retiring chartstyle.buildStyle's
@@ -1391,10 +1339,12 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
         .scamin = &sm,
     };
 
-    // Manifest present, gating ON -> per-value #sm buckets exist.
+    // Manifest present, gating ON -> the merged zoom-gate rides every layer (per-value
+    // #sm buckets are retired — a manifest never buckets now).
     const gated = try styleJson(a, base);
     defer a.free(gated);
-    try std.testing.expect(std.mem.indexOf(u8, gated, "#sm30000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "#sm") == null);
 
     // Manifest present, ignore_scamin -> no buckets at all.
     var ign = base;
@@ -1601,20 +1551,21 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
     try std.testing.expect(std.mem.indexOf(u8, o3, "\"vg\"") == null);
 }
 
-test "buildFromTemplateScamin: a manifest emits per-value buckets, no zoom-gate" {
+test "buildFromTemplateScamin: a manifest no longer buckets — the merged zoom-gate rides every layer" {
     const a = std.testing.allocator;
     const m = chartstyle.MarinerSettings{};
-    // No manifest -> the static K/2^zoom SCAMIN gate fallback, no #sm buckets.
+    // No manifest -> the static K/2^zoom SCAMIN zoom-gate, no #sm buckets.
     const plain = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "#sm") == null);
-    // With a manifest -> native fractional-minzoom bucket layers, no zoom-gate.
+    // With a manifest -> STILL the merged zoom-gate (per-value buckets retired): the
+    // manifest no longer produces #sm layers, only the TileJSON ladder (served apart).
     const scamin = [_]u32{ 89999, 259999 };
     const bucketed = try buildFromTemplateScamin(a, cs_template, &m, cs_ct, null, 1700000000, &scamin, 38.0);
     defer a.free(bucketed);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm89999") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm259999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm") == null);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "log2") == null);
 }
 
@@ -1932,7 +1883,7 @@ fn layerCount(a: std.mem.Allocator, style: []const u8) !usize {
     return p.value.object.get("layers").?.array.items.len;
 }
 
-test "styleJson: scamin_filter_gate collapses per-value buckets to one layer per render-type" {
+test "styleJson: both merged modes (zoom-gate default, filter-gate exact) give one layer per render-type — no per-value buckets" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
@@ -1947,30 +1898,28 @@ test "styleJson: scamin_filter_gate collapses per-value buckets to one layer per
         .scamin_lat = 38.0,
     };
 
-    // Bucketed (default): per-value #sm layers, each with a native minzoom.
-    const bucketed = try styleJson(a, base);
-    defer a.free(bucketed);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "minzoom") != null);
+    // Default (a manifest present): the merged zoom-gate — ONE self-gating layer per
+    // family, NO per-value #sm buckets, NO native minzoom.
+    const merged = try styleJson(a, base);
+    defer a.free(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "#sm") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "minzoom") == null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
 
-    // Filter-gate: no #sm buckets, no minzoom, the live SCAMIN clause instead.
+    // Filter-gate (?scaminexact): one live-clause layer per family — the SAME layer
+    // set, with the client-driven curDenom clause instead of the zoom expression.
     var fg = base;
     fg.scamin_filter_gate = true;
     const gated = try styleJson(a, fg);
     defer a.free(gated);
     try std.testing.expect(std.mem.indexOf(u8, gated, "#sm") == null); // no per-value buckets
     try std.testing.expect(std.mem.indexOf(u8, gated, "minzoom") == null); // no native minzoom gating
-    // The live clause [">=",["coalesce",["get","scamin"],1e12],curDenom]. 1e12 (the coalesce
-    // max) is unique to it; plain "coalesce" also appears in line-width so it isn't a marker.
     try std.testing.expect(std.mem.indexOf(u8, gated, "1000000000000") != null);
     try std.testing.expect(std.mem.indexOf(u8, gated, "\"scamin\"") != null);
 
-    // 7 denominators × ~9 SCAMIN render-types => buckets add ~7× the *_scamin layers;
-    // filter-gate adds 1×. So the bucketed style has far more layers.
-    const bn = try layerCount(a, bucketed);
-    const gn = try layerCount(a, gated);
-    try std.testing.expect(gn < bn);
-    try std.testing.expect(bn > gn * 2);
+    // Both merged modes collapse to the SAME one-layer-per-family set — no per-value
+    // explosion in either (the 7 denominators add zero layers).
+    try std.testing.expectEqual(try layerCount(a, merged), try layerCount(a, gated));
 }
 
 test "styleJson: scamin_filter_gate honors the cur_denom literal + ignore_scamin drops the clause" {
