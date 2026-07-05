@@ -1033,12 +1033,32 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         const zs: u8 = if (z_first >= super_dz) z_first - super_dz else 0;
 
         // Combined pass cells: own first (indices < n_own), then the finer band's
-        // carry — every state array below is index-aligned with this slice.
+        // carry, then the COARSE RIDERS — every strictly-coarser band's cells,
+        // joining this pass's tiles as extra contributors (Baker.rider_start) so a
+        // finer-band tile at a cell-bbox edge carries the coarser neighbour's
+        // content (the composite clips them to the ground finer coverage leaves).
+        // Riders never enumerate tiles; they load/evict through the same
+        // super-tile LRU as everything else. Every state array below is
+        // index-aligned with this slice.
+        var rider_entries = std.ArrayList(CellEntry).empty;
+        defer rider_entries.deinit(gpa);
+        {
+            var past_self = false;
+            for (Bands.bands_fine_to_coarse) |b2| {
+                if (b2 == band) {
+                    past_self = true;
+                    continue;
+                }
+                if (past_self) rider_entries.appendSlice(gpa, band_cells[@intFromEnum(b2)].items) catch {};
+            }
+        }
         const n_own = entries.len;
-        const n_all = n_own + carry_entries.len;
+        const n_nonrider = n_own + carry_entries.len;
+        const n_all = n_nonrider + rider_entries.items.len;
         const pass_entries = try a.alloc(CellEntry, n_all);
         @memcpy(pass_entries[0..n_own], entries);
-        @memcpy(pass_entries[n_own..], carry_entries);
+        @memcpy(pass_entries[n_own..n_nonrider], carry_entries);
+        @memcpy(pass_entries[n_nonrider..], rider_entries.items);
 
         // Inverted index: super-tile (sx,sy at zs) → the cell indices overlapping it.
         var stmap = std.AutoHashMap(u64, std.ArrayList(u32)).init(gpa);
@@ -1047,7 +1067,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             while (vit.next()) |v| v.deinit(gpa);
             stmap.deinit();
         }
-        for (pass_entries, 0..) |e, i| {
+        for (pass_entries[0..n_nonrider], 0..) |e, i| {
             const nw = lonLatToTile(e.bbox[0], e.bbox[3], zs);
             const se = lonLatToTile(e.bbox[2], e.bbox[1], zs);
             var sy = nw[1];
@@ -1087,6 +1107,20 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                 }
             }
         }
+        // Riders join only super-tiles that ALREADY exist (they never create one).
+        for (pass_entries[n_nonrider..], n_nonrider..) |e, i| {
+            const nw = lonLatToTile(e.bbox[0], e.bbox[3], zs);
+            const se = lonLatToTile(e.bbox[2], e.bbox[1], zs);
+            var sy = nw[1];
+            while (sy <= se[1]) : (sy += 1) {
+                var sx = nw[0];
+                while (sx <= se[0]) : (sx += 1) {
+                    const k = (@as(u64, sy) << 32) | sx;
+                    if (stmap.getPtr(k)) |lst| try lst.append(gpa, @intCast(i));
+                }
+            }
+        }
+
         const stkeys = try gpa.alloc(u64, stmap.count());
         defer gpa.free(stkeys);
         {
@@ -1115,18 +1149,19 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         var band_total: usize = 0;
         for (stkeys) |stk| {
             const cells = stmap.get(stk).?.items;
-            const spans = gpa.alloc(Bands.CellSpan, cells.len) catch continue;
-            defer gpa.free(spans);
+            var spans = std.ArrayList(Bands.CellSpan).empty;
+            defer spans.deinit(gpa);
             var st_own: usize = 0;
-            for (cells, 0..) |ci, j| {
+            for (cells) |ci| {
+                if (ci >= n_nonrider) continue; // riders don't enumerate tiles
                 const pe = pass_entries[ci];
-                spans[j] = .{ .bounds = pe.bbox, .light_bbox = pe.light.bbox, .light_range_m = pe.light.range_m };
+                spans.append(gpa, .{ .bounds = pe.bbox, .light_bbox = pe.light.bbox, .light_range_m = pe.light.range_m }) catch continue;
                 if (ci < n_own) st_own += 1;
             }
-            band_total += baker.plannedTiles(band, spans, st_own, floor, .{ .zs = zs, .sx = @intCast(stk & 0xFFFFFFFF), .sy = @intCast(stk >> 32) });
+            band_total += baker.plannedTiles(band, spans.items, st_own, floor, .{ .zs = zs, .sx = @intCast(stk & 0xFFFFFFFF), .sy = @intCast(stk >> 32) });
         }
         baker.band_total = band_total;
-        std.debug.print("\n  band {s}: {d}+{d} cells, {d} super-tiles (z{d}-{d}), ~{d} tiles — baking…\n", .{ @tagName(band), entries.len, carry_entries.len, stkeys.len, @min(z_first, zhi), zhi, band_total });
+        std.debug.print("\n  band {s}: {d}+{d} cells (+{d} coarse riders), {d} super-tiles (z{d}-{d}), ~{d} tiles — baking…\n", .{ @tagName(band), entries.len, carry_entries.len, rider_entries.items.len, stkeys.len, @min(z_first, zhi), zhi, band_total });
 
         // Per-pass caches (index-aligned with `pass_entries`): portrayal is RESIDENT
         // (computed once — the expensive Lua step — and cheap to keep); geometry is
@@ -1146,9 +1181,9 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         @memset(gave_up, false);
         var n_geom: usize = 0; // loaded-geometry count (the LRU target)
         if (carry) |c| {
-            @memcpy(portray[n_own..], c.portray);
-            @memcpy(geom[n_own..], c.geom);
-            @memcpy(gave_up[n_own..], c.gave_up);
+            @memcpy(portray[n_own..n_nonrider], c.portray);
+            @memcpy(geom[n_own..n_nonrider], c.geom);
+            @memcpy(gave_up[n_own..n_nonrider], c.gave_up);
             gpa.free(c.portray);
             gpa.free(c.geom);
             gpa.free(c.gave_up);
@@ -1188,6 +1223,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             var subset = std.ArrayList(Bands.Backend).empty;
             defer subset.deinit(gpa);
             var st_own: usize = 0;
+            var st_nonrider: usize = 0;
             for (cells) |ci| if (geom[ci]) |g| {
                 const p = portray[ci];
                 subset.append(gpa, .{
@@ -1206,7 +1242,9 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     .light_range_m = if (p) |pp| pp.light.range_m else pass_entries[ci].light.range_m,
                 }) catch continue;
                 if (ci < n_own) st_own += 1;
+                if (ci < n_nonrider) st_nonrider += 1;
             };
+            baker.rider_start = st_nonrider;
             baker.bakeBand(band, subset.items, st_own, floor, .{ .zs = zs, .sx = sx, .sy = sy }, prog, progress_user) catch {};
 
             // Evict least-recently-used GEOMETRY beyond the budget (never this

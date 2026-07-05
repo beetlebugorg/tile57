@@ -713,6 +713,12 @@ pub const Baker = struct {
     maxzoom: u8,
     emitted: std.AutoHashMap(u64, void),
     sink: TileSink,
+    // Coarse riders for the NEXT bakeBand call: backends[rider_start..] are
+    // strictly-coarser cells that JOIN the pass's tiles wherever their bbox
+    // overlaps — the composite clips them to the ground finer coverage leaves —
+    // but never enumerate tiles of their own. Set by the driver before
+    // bakeBand; consumed (reset to null) by it. null = no riders.
+    rider_start: ?usize = null,
     count: usize = 0, // tiles handed to the sink (cumulative across bands)
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
     format: scene.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
@@ -800,7 +806,8 @@ pub const Baker = struct {
             while (vit.next()) |v| v.deinit(self.gpa);
             tilemap.deinit();
         }
-        for (spans, 0..) |sp, i| {
+        const rider_lo = @min(self.rider_start orelse spans.len, spans.len);
+        for (spans[0..rider_lo], 0..) |sp, i| {
             const b = sp.bounds;
             var z = zlo;
             var zend = zext;
@@ -888,6 +895,26 @@ pub const Baker = struct {
                 }
             }
         }
+        // Coarse riders (spans[rider_lo..]): join every ALREADY-mapped tile their
+        // bbox overlaps as extra contributors. The composite clips them to the
+        // ground the finer coverage leaves (the finer-band bbox-edge tiles that
+        // used to lack the coarser neighbour's content), and a rider that wins a
+        // hole beyond X2 hatches OVERSC01 like any overscale-displayed cell.
+        if (rider_lo < spans.len) {
+            var rit = tilemap.iterator();
+            while (rit.next()) |e| {
+                const key = e.key_ptr.*;
+                const tz: u8 = @intCast(key >> 48);
+                const tx: u32 = @intCast((key >> 24) & 0xFFFFFF);
+                const ty: u32 = @intCast(key & 0xFFFFFF);
+                const tbll = tile.tileBoundsLonLat(tz, tx, ty);
+                for (spans[rider_lo..], rider_lo..) |sp, i| {
+                    const b = sp.bounds;
+                    if (b[0] > tbll[2] or b[2] < tbll[0] or b[1] > tbll[3] or b[3] < tbll[1]) continue;
+                    try e.value_ptr.append(self.gpa, @intCast(i));
+                }
+            }
+        }
         return tilemap;
     }
 
@@ -917,6 +944,7 @@ pub const Baker = struct {
     /// caller may free the own cells after the NEXT-coarser pass (or now, when
     /// `floor` is .extend_min — nothing was deferred).
     pub fn bakeBand(self: *Baker, band: Band, backends: []Backend, own_len: usize, floor: FloorMode, clip: ?TileClip, progress: Progress, ctx: ?*anyopaque) !void {
+        defer self.rider_start = null; // one-shot (see the field)
         if (backends.len == 0) return;
 
         // Cell spans (drive the tile map: bounds + light-figure reach) + the
@@ -1757,4 +1785,90 @@ test "ordersBefore: newer DSID date first, name breaks ties, dated beats undated
     try std.testing.expect(ordersBefore(ctx, 1, 2)); // same date -> name asc
     try std.testing.expect(!ordersBefore(ctx, 2, 1));
     try std.testing.expect(ordersBefore(ctx, 0, 3)); // dated beats undated
+}
+
+test "coarse rider fills a finer pass's tile beyond the fine coverage" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A harbor cell whose M_COVR covers only lon < 0.4, and a coarser approach
+    // cell charted at 0.45 — inside the harbor cell's BBOX (so the harbor pass
+    // enumerates the tile) but outside its coverage. As a rider the approach
+    // point must appear in the harbor pass's tile (the finer-band bbox-edge
+    // hole); the harbor's own point emits as usual.
+    const fine_feats = [_]s57.Feature{.{
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+    }};
+    const coarse_feats = [_]s57.Feature{.{
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+    }};
+    var fine_cell = try testCell(gpa, 0.3, 0.35, 20_000, &fine_feats);
+    defer fine_cell.deinit();
+    var coarse_cell = try testCell(gpa, 0.45, 0.35, 80_000, &coarse_feats);
+    defer coarse_cell.deinit();
+
+    const fine_ring = [_]s57.LonLat{
+        s57.LonLat.init(-2, -2), s57.LonLat.init(0.4, -2),
+        s57.LonLat.init(0.4, 3), s57.LonLat.init(-2, 3),
+        s57.LonLat.init(-2, -2),
+    };
+    const fine_rings = [_][]const s57.LonLat{&fine_ring};
+    const fine_cover = [_][]const []const s57.LonLat{&fine_rings};
+    const ring = [_]s57.LonLat{
+        s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2),
+        s57.LonLat.init(3, 3),   s57.LonLat.init(-2, 3),
+        s57.LonLat.init(-2, -2),
+    };
+    const rings = [_][]const s57.LonLat{&ring};
+    const coarse_cover = [_][]const []const s57.LonLat{&rings};
+    const bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
+    const streams = [_]?[]const u8{"DrawingPriority:7;PointInstruction:BOYLAT01"};
+    const fine_bbox = [_]?[4]f64{.{ 0.3, 0.35, 0.3, 0.35 }};
+    const coarse_bbox = [_]?[4]f64{.{ 0.45, 0.35, 0.45, 0.35 }};
+
+    var backs = [_]Backend{
+        .{ .cell = fine_cell, .portrayal = &streams, .bounds = bounds, .cscl = 20_000, .coverage = &fine_cover, .feat_bbox = &fine_bbox },
+        .{ .cell = coarse_cell, .portrayal = &streams, .bounds = bounds, .cscl = 80_000, .coverage = &coarse_cover, .feat_bbox = &coarse_bbox },
+    };
+
+    var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
+    var baker = Baker.init(gpa, 13, 13, .{ .ctx = &sink, .func = CollectSink.run });
+    defer baker.deinit();
+    baker.rider_start = 1; // backs[1..] = the coarse rider
+    try baker.bakeBand(.harbor, &backs, 1, .extend_min, null, null, null);
+
+    // The rider's point tile (lon 0.45) is enumerated by the FINE cell's bbox and
+    // must carry the coarse point; the fine point's own tile carries the fine one.
+    var fine_pt: usize = 0;
+    var coarse_pt: usize = 0;
+    var it = sink.tiles.iterator();
+    while (it.next()) |e| {
+        const raw = try gzip.decompress(a, e.value_ptr.*);
+        const layers = try mvt.decode(a, raw);
+        for (layers) |L| {
+            if (!std.mem.eql(u8, L.name, "point_symbols")) continue;
+            for (L.features) |f| {
+                _ = f;
+                const z: u8 = @intCast(e.key_ptr.* >> 48);
+                const x: u32 = @intCast((e.key_ptr.* >> 24) & 0xFFFFFF);
+                _ = z;
+                // lon 0.3 → x 4102, lon 0.45 → x 4106 at z13
+                if (x <= 4104) fine_pt += 1 else coarse_pt += 1;
+            }
+        }
+    }
+    try std.testing.expect(fine_pt >= 1);
+    // The bbox-edge hole: without riders this is 0 — the approach content was
+    // simply absent from the harbor pass's tiles beyond the fine coverage.
+    try std.testing.expect(coarse_pt >= 1);
 }
