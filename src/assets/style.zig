@@ -23,15 +23,12 @@ const FONT = .{"Noto Sans Regular"};
 // are mariner-dependent and now resolve through the chartstyle builders (one style
 // builder); only the mariner-INDEPENDENT layout exprs remain comptime tuples here.
 
-// SCAMIN display-scale denominator at z0 (0.28 mm OGC pixel, equator). Used by the
-// zoom-filter FALLBACK gate below — applied only when no SCAMIN manifest is supplied
-// (so a source without the manifest still gates by value, just at integer-zoom snap
-// + the OGC scale rather than the precise per-value native buckets).
-const DENOM_Z0 = 279541132.0;
-
-// Fallback per-feature gate: show a SCAMIN feature only at/above its 1:N display zoom.
-// Superseded by the native per-value minzoom buckets when the manifest is present.
-const SCAMIN_GATE = .{ ">=", .{"zoom"}, .{ "log2", .{ "/", DENOM_Z0, .{ "coalesce", .{ "get", "scamin" }, DENOM_Z0 } } } };
+// The static (no-manifest) SCAMIN/smax/oscl gate is now expressed as K / 2^zoom —
+// the SAME display-denominator form the bucket/smax path uses (styleJson computes
+// K = M_PER_PX_Z0·cos(scamin_lat)/(pitch/1000) once per archive). The old hardcoded
+// DENOM_Z0 (0.28 mm OGC pixel, equator) gated ~0.4 z late at mid-latitude and used
+// the uncalibrated CSS pixel; K is latitude-corrected and calibrated. See
+// scaminGateK() / writeScaminClause's .zoom_gate branch.
 
 // Physical-scale constants from the web client (web/src/lib/util.mjs), so an engine
 // SCAMIN bucket's native minzoom MATCHES the JS client's scaminDisplayZoom (the §7
@@ -49,6 +46,23 @@ pub fn scaminDisplayZoom(scamin: f64, lat: f64) f64 {
     const z = std.math.log2(M_PER_PX_Z0 * @cos(lat * std.math.pi / 180.0) /
         ((DEFAULT_PX_PITCH_MM / 1000.0) * scamin));
     return std.math.clamp(z, 0, 24);
+}
+
+/// The per-archive display-denominator constant K such that the on-screen 1:N
+/// denominator at Web-Mercator `zoom` is K / 2^zoom (== displayDenom). Baked into the
+/// static SCAMIN/smax/oscl gate at the archive-center latitude; the SAME constant the
+/// bucket/smax path computes (styleJson). Replaces the old equator-only OGC DENOM_Z0.
+pub fn scaminGateK(lat: f64) f64 {
+    return M_PER_PX_Z0 * @cos(lat * std.math.pi / 180.0) / (DEFAULT_PX_PITCH_MM / 1000.0);
+}
+
+test "scaminGateK: K/2^zoom equals displayDenom (one gate constant)" {
+    // The static gate's D(zoom) = K/2^zoom must match the physical displayDenom used
+    // by the bucket/smax path — so scamin/smax/oscl share one latitude-correct form.
+    const k = scaminGateK(38.9);
+    try std.testing.expectApproxEqRel(displayDenom(9.0, 38.9), k / std.math.exp2(9.0), 1e-12);
+    // Equator K is the calibrated-pixel world denominator (NOT the OGC 279.5M).
+    try std.testing.expectApproxEqRel(@as(f64, 78271.516964020485 / 0.0002645), scaminGateK(0), 1e-12);
 }
 
 test "scaminDisplayZoom matches the JS zoomForScalePhysical formula" {
@@ -233,8 +247,9 @@ const SmaxGate = union(enum) {
     // as the scamin clause; the live client rewrites both at ladder crossings.
     denom: f64,
     // Native/bucket + zoom-gate paths: DENOM computed from ["zoom"] — K / 2^zoom,
-    // K = the world denominator at z0 (physical at the style's fixed latitude for
-    // the bucket path, the OGC DENOM_Z0 for the no-manifest fallback).
+    // K = the per-archive display denominator at z0 (physical at the style's fixed
+    // latitude, scaminGateK) — the SAME constant for the bucket path AND the
+    // no-manifest fallback, so scamin/smax/oscl gate identically.
     zoom_k: f64,
 };
 
@@ -316,12 +331,13 @@ fn layerHead(js: *Stringify, id: []const u8, kind: []const u8, source_layer: []c
 // `minzoom` (scaminDisplayZoom) + a `["==",scamin,v]` filter; the catch-all `#no` layer
 // (`no_lows` set) takes features WITHOUT scamin plus the folded below-floor values. The
 // default (`.{}`) is the unbucketed layer — no clause, no minzoom, no suffix — so a
-// non-SCAMIN layer renders byte-identically to before. Replaces the old per-feature
-// `zoom`-filter (SCAMIN_GATE) with host-canonical native minzoom buckets (§2).
+// non-SCAMIN layer renders byte-identically to before. The manifest path uses these
+// native minzoom buckets (§2); the no-manifest fallback uses the static K/2^zoom gate.
 const Bucket = struct {
     sm: ?u32 = null, // per-value bucket: filter scamin == sm
     no_lows: ?[]const u32 = null, // #no bucket: !has(scamin) OR scamin in these folded low values
-    zoom_gate: bool = false, // no-manifest fallback: AND the per-feature SCAMIN_GATE zoom filter
+    zoom_gate: bool = false, // no-manifest fallback: AND the static K/2^zoom SCAMIN gate
+    zoom_k: f64 = 0, // zoom_gate: the per-archive display-denominator constant K (scaminGateK)
     filter_gate: bool = false, // scamin-layers.md: the live client-driven SCAMIN clause (no minzoom, no suffix)
     cur_denom: f64 = 0, // filter_gate: the current-display-scale denominator literal (client-overwritten)
     minzoom: ?f64 = null,
@@ -358,7 +374,11 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
         return;
     }
     if (bkt.zoom_gate) {
-        try js.write(SCAMIN_GATE);
+        // Static gate, latitude-correct: show a SCAMIN feature only when the display
+        // is at least as fine as its 1:N, i.e. scamin >= D(zoom) with D = K/2^zoom.
+        // A non-SCAMIN feature coalesces to 1e12 (>= any D) and always passes. Shares
+        // the smax/oscl gate's K (writeSmaxClause/.zoom_k), so the three stay in lockstep.
+        try js.write(.{ ">=", .{ "coalesce", .{ "get", "scamin" }, SCAMIN_COALESCE_MAX }, .{ "/", bkt.zoom_k, .{ "^", 2, .{"zoom"} } } });
         return;
     }
     if (bkt.sm) |v| {
@@ -850,10 +870,12 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         try allb.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
         try sndb.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
     } else if (opts.scamin.len == 0) {
-        // No manifest -> the per-feature zoom-filter fallback (still gates by value,
-        // integer-zoom snap) on every SCAMIN-bearing layer, incl. soundings.
-        try allb.append(ba, .{ .zoom_gate = true });
-        try sndb.append(ba, .{ .zoom_gate = true });
+        // No manifest -> the static K/2^zoom gate (integer-zoom snap) on every
+        // SCAMIN-bearing layer, incl. soundings. K is the per-archive, latitude-correct
+        // display denominator — the same constant the bucket/smax path uses.
+        const gate_k = scaminGateK(opts.scamin_lat);
+        try allb.append(ba, .{ .zoom_gate = true, .zoom_k = gate_k });
+        try sndb.append(ba, .{ .zoom_gate = true, .zoom_k = gate_k });
     } else {
         if (low_slice.len > 0) try allb.append(ba, .{ .no_lows = low_slice, .suffix = "#no" });
         try allb.appendSlice(ba, his.items);
@@ -888,10 +910,11 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         .text_group = if (filters_on) try chartstyle.textGroupFilter(b, &m) else null,
         .size_scale = opts.size_scale,
         // Band-handoff gate mode follows the SCAMIN gating mode: the filter-gate
-        // literal when the live client drives it (same injected DENOM), a
-        // zoom-derived denominator otherwise (physical at the manifest latitude
-        // for the bucket path, OGC z0 for the no-manifest fallback), and nothing
-        // under ?ignoreScamin (the debug toggle shows everything).
+        // literal when the live client drives it (same injected DENOM), the
+        // per-archive K/2^zoom denominator otherwise (physical at the archive
+        // latitude, scaminGateK — one constant for both the manifest bucket path
+        // and the no-manifest fallback), and nothing under ?ignoreScamin (the
+        // debug toggle shows everything).
         .smax = if (opts.ignore_scamin)
             .off
         else if (opts.scamin_filter_gate)
@@ -902,10 +925,12 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
             // placeholder to this clause's own show-all literal; the client
             // rewrites both clauses to the live denominator regardless.
             .{ .denom = if (opts.scamin_cur_denom == 0) 1e12 else opts.scamin_cur_denom }
-        else if (opts.scamin.len > 0)
-            .{ .zoom_k = M_PER_PX_Z0 * @cos(opts.scamin_lat * std.math.pi / 180.0) / (DEFAULT_PX_PITCH_MM / 1000.0) }
         else
-            .{ .zoom_k = DENOM_Z0 },
+            // Bucket path AND the no-manifest fallback now share ONE gate constant:
+            // the per-archive, latitude-correct K = display denominator at z0. (The
+            // fallback previously used the equator-only OGC DENOM_Z0, gating ~0.4 z
+            // late at mid-latitude.) scamin/smax/oscl are thereby in lockstep.
+            .{ .zoom_k = scaminGateK(opts.scamin_lat) },
         .show_overscale = m.show_overscale,
     };
 
@@ -1351,19 +1376,22 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "#sm") == null);
 
-    // No manifest, gating ON -> the per-feature zoom-gate fallback (log2) is present.
+    // No manifest, gating ON -> the static K/2^zoom SCAMIN gate is present (the
+    // scamin>=D(zoom) fallback shape, no per-value buckets).
     var nomanifest = base;
     nomanifest.scamin = &.{};
     const out_fb = try styleJson(a, nomanifest);
     defer a.free(out_fb);
-    try std.testing.expect(std.mem.indexOf(u8, out_fb, "log2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fb, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fb, "#sm") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fb, "log2") == null); // old form retired
 
-    // No manifest + ignore_scamin -> even the zoom-gate fallback is gone.
+    // No manifest + ignore_scamin -> even the static gate is gone.
     var nm_ign = nomanifest;
     nm_ign.ignore_scamin = true;
     const out_nm_ign = try styleJson(a, nm_ign);
     defer a.free(out_nm_ign);
-    try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "log2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "#sm") == null);
 }
 
@@ -1504,10 +1532,10 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
 test "buildFromTemplateScamin: a manifest emits per-value buckets, no zoom-gate" {
     const a = std.testing.allocator;
     const m = chartstyle.MarinerSettings{};
-    // No manifest -> the per-feature zoom-gate fallback (log2), no #sm buckets.
+    // No manifest -> the static K/2^zoom SCAMIN gate fallback, no #sm buckets.
     const plain = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "log2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "#sm") == null);
     // With a manifest -> native fractional-minzoom bucket layers, no zoom-gate.
     const scamin = [_]u32{ 89999, 259999 };
@@ -1599,13 +1627,15 @@ test "styleJson: bucket/zoom-gate modes derive the smax denominator from zoom; i
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],[\"/\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\"^\",2,[\"zoom\"]]") != null);
 
-    // No-manifest fallback: same clause with the OGC z0 denominator constant.
+    // No-manifest fallback: the SAME K/2^zoom smax clause as the bucket path (the
+    // per-archive latitude constant), NOT the retired equator-only OGC DENOM_Z0.
     var nm = base;
     nm.scamin = &.{};
     const fb = try styleJson(a, nm);
     defer a.free(fb);
     try std.testing.expect(std.mem.indexOf(u8, fb, "\"smax\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fb, "279541132") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fb, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fb, "279541132") == null);
 
     // ignore_scamin: the debug toggle shows everything — no smax gate anywhere.
     var ign = base;
