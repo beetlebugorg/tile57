@@ -342,14 +342,28 @@ const Bucket = struct {
     cur_denom: f64 = 0, // filter_gate: the current-display-scale denominator literal (client-overwritten)
     minzoom: ?f64 = null,
     suffix: []const u8 = "", // id suffix: "#sm<v>" / "#no" / "" (plain)
-    // Overscale (oscl) clause role (S-52 §10.1.10, specs/overscale.md):
-    //   .none — no oscl clause (every layer outside the overscale sandwich).
-    //   .overscaled — [">", coalesce(oscl,0), DENOM]: this cell's data is displayed
-    //     FINER than its compilation scale (the fills under the hatch + the hatch).
-    //   .at_scale — the ["!", …] negation: at-scale fills, drawn ABOVE the hatch so
-    //     finer opaque data occludes a coarser cell's hatch.
-    oscl: enum { none, overscaled, at_scale } = .none,
+    // Overscale (oscl) clause role (S-52 §10.1.10, specs/overscale.md) — see OverscaleRole.
+    oscl: OverscaleRole = .none,
 };
+
+// Overscale (oscl) clause role a fill/pattern layer plays in the AP(OVERSC01)
+// occlusion sandwich (S-52 §10.1.10, specs/overscale.md):
+//   .none — no oscl clause (every layer outside the sandwich).
+//   .overscaled — [">", coalesce(oscl,0), DENOM]: this cell's data is displayed FINER
+//     than its compilation scale (the fills under the hatch + the hatch itself).
+//   .at_scale — the ["!", …] negation: at-scale fills, drawn ABOVE the hatch so finer
+//     opaque data occludes a coarser cell's hatch.
+const OverscaleRole = enum { none, overscaled, at_scale };
+
+// Copy a SCAMIN bucket, adding an overscale role. The overscaled pass also gets an
+// "#oscl" id suffix so it stays distinct from the at-scale pass over the same merged
+// source-layer + bucket.
+fn bucketWithOverscale(a: std.mem.Allocator, bkt: Bucket, role: OverscaleRole) !Bucket {
+    var b = bkt;
+    b.oscl = role;
+    if (role == .overscaled) b.suffix = try std.fmt.allocPrint(a, "{s}#oscl", .{bkt.suffix});
+    return b;
+}
 
 // coalesce fallback for a feature with no `scamin`: a denominator larger than any real
 // display scale, so `scamin >= curDenom` is always true (missing SCAMIN => always shown).
@@ -414,14 +428,14 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
 // layers with no base predicate (fills/patterns/complex/soundings).
 fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *const SCtx, drop_smax: bool, extra: ?std.json.Value) !void {
     const has_clause = bkt.sm != null or bkt.no_lows != null or bkt.zoom_gate or bkt.filter_gate;
-    // scamin-standalone.md §0/§3: the SCAMIN POINT/TEXT/LINE layers (point_symbols_scamin,
-    // text-scamin, the scamin line variants) are band-INDEPENDENT — their whole display
-    // lifecycle is the scamin gate, so the band-handoff `smax` carry-down clause does NOT
-    // apply (a SCAMIN feature "should just exist regardless of band"). `drop_smax` is true
-    // only from those layer functions; it takes effect solely on the _scamin variant (the
-    // one carrying a scamin clause). smax STAYS on areas/patterns (§46 "area/line only" —
-    // fills need scale-appropriate generalization + occlusion), on SOUNDINGS ("stay
-    // as-is"), and on the carried plain (non-scamin) points/lines (has_clause=false).
+    // scamin-standalone.md §0/§3: the point / text / line families are band-INDEPENDENT —
+    // their whole display lifecycle is the scamin gate, so the band-handoff `smax`
+    // carry-down clause does NOT apply (a feature "should just exist regardless of band").
+    // Their layer functions pass `drop_smax=true`; in the v2 merged schema every such
+    // layer now carries a scamin clause (has_clause), so smax is dropped from the whole
+    // merged point/text/line family. smax STAYS on areas/patterns (§46 "area/line only" —
+    // fills need scale-appropriate generalization + occlusion) and on SOUNDINGS ("stay
+    // as-is"), which pass `drop_smax=false`.
     const has_smax = s.smax != .off and !(has_clause and drop_smax);
     const has_oscl = bkt.oscl != .none and s.smax != .off; // oscl rides the smax gate value
     var n: usize = s.common.len;
@@ -588,18 +602,17 @@ fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
 
 fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
-    const sfx = if (std.mem.eql(u8, sl, "text")) "" else "-scamin";
 
-    // text<sfx> — general collidable labels. Emitted BELOW light-text: MapLibre
+    // text — general collidable labels. Emitted BELOW light-text: MapLibre
     // gives collision precedence to UPPER symbol layers, and S-52 wants the
     // (high drawing-priority) light characteristics to win placement over
     // names — the within-layer sort key already ranks tgrp 23 above names,
     // but that only applies inside one layer.
     var buf2: [96]u8 = undefined;
-    const tid = try std.fmt.bufPrint(&buf2, "text{s}{s}", .{ sfx, bkt.suffix });
+    const tid = try std.fmt.bufPrint(&buf2, "text{s}", .{bkt.suffix});
     try js.beginObject();
     try layerHead(js, tid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // text-scamin band-independent
+    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // SCAMIN text band-independent (drop smax)
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -624,10 +637,10 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
 
     // light-text<sfx> — LIGHTS characteristics, top-anchored. Above `text`
     // so light descriptions take collision precedence over names.
-    const lid = try std.fmt.bufPrint(&buf, "light-text{s}{s}", .{ sfx, bkt.suffix });
+    const lid = try std.fmt.bufPrint(&buf, "light-text{s}", .{bkt.suffix});
     try js.beginObject();
     try layerHead(js, lid, "symbol", sl);
-    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // light-text-scamin band-independent
+    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // SCAMIN light-text band-independent (drop smax)
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -862,12 +875,17 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     const glyphs_on = opts.glyphs != null;
     const sea = if (palette.get("DEPDW")) |v| v.string else "#93aebb";
 
-    // SCAMIN buckets (host §2): split the manifest into below-source-floor values
-    // (folded into the catch-all #no bucket — they show from the floor anyway) and
-    // above-floor values (one #sm<v> bucket each, native minzoom = scaminDisplayZoom
-    // at the representative lat). `all_buckets` drives the all-SCAMIN *_scamin layers;
-    // `snd_buckets` drives the mixed `soundings` layer (always a #no for its bare
-    // non-SCAMIN soundings). An empty manifest -> a single plain (ungated) layer.
+    // SCAMIN gate buckets that ride EVERY merged source-layer (v2 schema: a family's
+    // base features and its former `_scamin` twin now share one layer, so every layer
+    // is mixed — like the old `soundings` layer). Modes:
+    //   ignore_scamin  -> one plain (ungated) bucket (§2 debug toggle shows everything).
+    //   filter_gate    -> one live-clause bucket (scamin-layers.md): the client-driven
+    //                     SCAMIN clause, no per-value buckets, no minzoom.
+    //   no manifest    -> one static K/2^zoom gate bucket (latitude-correct).
+    //   a manifest     -> a #no catch-all (non-SCAMIN + below-floor values) PLUS one
+    //                     native-minzoom #sm<v> bucket per above-floor value.
+    // The #no catch-all is ALWAYS present in the manifest path now (it carries each
+    // layer's bare non-SCAMIN features), where the pre-merge base layer used to.
     var barena = std.heap.ArenaAllocator.init(alloc);
     defer barena.deinit();
     const ba = barena.allocator();
@@ -885,35 +903,18 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         }
     };
     const low_slice: []const u32 = lows.items;
-    var allb = std.ArrayList(Bucket).empty;
-    var sndb = std.ArrayList(Bucket).empty;
+    var bucket_list = std.ArrayList(Bucket).empty;
     if (opts.ignore_scamin) {
-        // §2 ?ignoreScamin: no scale gating — every *_scamin layer is a single plain
-        // (ungated) bucket, so all features show in-band regardless of SCAMIN (this
-        // overrides both the per-value buckets and the no-manifest zoom-gate fallback).
-        try allb.append(ba, .{});
-        try sndb.append(ba, .{});
+        try bucket_list.append(ba, .{});
     } else if (opts.scamin_filter_gate) {
-        // scamin-layers.md: ONE layer per *_scamin render-type carrying the live
-        // client-driven SCAMIN clause — no per-value buckets, no minzoom. Collapses
-        // ~19×types bucket layers to ~1×type.
-        try allb.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
-        try sndb.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
+        try bucket_list.append(ba, .{ .filter_gate = true, .cur_denom = opts.scamin_cur_denom });
     } else if (opts.scamin.len == 0) {
-        // No manifest -> the static K/2^zoom gate (integer-zoom snap) on every
-        // SCAMIN-bearing layer, incl. soundings. K is the per-archive, latitude-correct
-        // display denominator — the same constant the bucket/smax path uses.
-        const gate_k = scaminGateK(opts.scamin_lat);
-        try allb.append(ba, .{ .zoom_gate = true, .zoom_k = gate_k });
-        try sndb.append(ba, .{ .zoom_gate = true, .zoom_k = gate_k });
+        try bucket_list.append(ba, .{ .zoom_gate = true, .zoom_k = scaminGateK(opts.scamin_lat) });
     } else {
-        if (low_slice.len > 0) try allb.append(ba, .{ .no_lows = low_slice, .suffix = "#no" });
-        try allb.appendSlice(ba, his.items);
-        try sndb.append(ba, .{ .no_lows = low_slice, .suffix = "#no" });
-        try sndb.appendSlice(ba, his.items);
+        try bucket_list.append(ba, .{ .no_lows = low_slice, .suffix = "#no" });
+        try bucket_list.appendSlice(ba, his.items);
     }
-    const all_buckets: []const Bucket = allb.items;
-    const snd_buckets: []const Bucket = sndb.items;
+    const scamin_buckets: []const Bucket = bucket_list.items;
 
     // The single style builder: resolve every mariner-aware colour / icon / display
     // filter ONCE through the chartstyle builders (retiring chartstyle.buildStyle's
@@ -1020,75 +1021,68 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     try js.endObject();
     try js.endObject();
 
-    // 2. area fills — base (plain) + one SCAMIN bucket layer per manifest value.
-    // With scale gating active (and a sprite to draw the hatch) the base fill
-    // layer splits around the AP(OVERSC01) overscale layer: overscaled cells'
-    // fills (fill-areas#oscl) UNDER the hatch, at-scale fills (fill-areas) ABOVE
-    // it — so finer opaque DEPARE/LNDARE occlude a coarser cell's hatch and it
-    // survives only on coarse-only patches (S-52 §10.1.10, specs/overscale.md).
-    // ignore_scamin (gate off) or no sprite keeps the single plain fill layer.
+    // 2. area fills over the merged `areas` layer (base + folded SCAMIN fills), ONE
+    // gated layer per SCAMIN bucket. With scale gating active (and a sprite to draw
+    // the hatch) each bucket's fill splits around the AP(OVERSC01) overscale layer:
+    // overscaled cells' fills (#oscl) UNDER the hatch, at-scale fills ABOVE it — so
+    // finer opaque DEPARE/LNDARE occlude a coarser cell's hatch and it survives only
+    // on coarse-only patches (S-52 §10.1.10, specs/overscale.md). ignore_scamin (gate
+    // off) or no sprite keeps a single plain fill layer per bucket.
     if (s.smax != .off and sprite_on) {
-        try fillLayer(js, &s, "areas", .{ .oscl = .overscaled, .suffix = "#oscl" });
+        for (scamin_buckets) |bkt| try fillLayer(js, &s, "areas", try bucketWithOverscale(ba, bkt, .overscaled));
         try overscaleLayer(js, &s);
-        try fillLayer(js, &s, "areas", .{ .oscl = .at_scale });
+        for (scamin_buckets) |bkt| try fillLayer(js, &s, "areas", try bucketWithOverscale(ba, bkt, .at_scale));
     } else {
-        try fillLayer(js, &s, "areas", .{});
+        for (scamin_buckets) |bkt| try fillLayer(js, &s, "areas", bkt);
     }
-    for (all_buckets) |bkt| try fillLayer(js, &s, "areas_scamin", bkt);
 
-    // 3. area fill patterns (sprite required)
+    // 3. area fill patterns over the merged `area_patterns` layer (sprite required).
     if (sprite_on) {
-        try patternLayer(js, &s, "area_patterns", .{});
-        for (all_buckets) |bkt| try patternLayer(js, &s, "area_patterns_scamin", bkt);
+        for (scamin_buckets) |bkt| try patternLayer(js, &s, "area_patterns", bkt);
     }
 
-    // 4. lines: solid/dashed/dotted over base + _scamin buckets. Complex
-    // (symbolised) lines fold into `lines` and light sector figures route through
-    // `lines` too (scene.zig endScene), so there are NO complex_lines /
-    // complex_lines_scamin / sector_lines source-layers to draw — the old style
-    // layers over them were dead (baked nothing) and were removed.
-    try lineLayers(js, &s, "lines", .{});
-    for (all_buckets) |bkt| try lineLayers(js, &s, "lines_scamin", bkt);
+    // 4. lines: solid/dashed/dotted over the merged `lines` layer, one gated set per
+    // SCAMIN bucket. Complex (symbolised) lines and light sector figures fold into
+    // `lines` too (scene.zig endScene), so there are NO complex_lines / sector_lines
+    // source-layers to draw.
+    for (scamin_buckets) |bkt| try lineLayers(js, &s, "lines", bkt);
 
-    // 5. point symbols + soundings (sprite required), stacked by z-order — draw_prio
-    // is the SOLE axis, partitioned at the soundings boundary (18):
+    // 5. point symbols + soundings (sprite required) over the merged `point_symbols`
+    // layer, stacked by z-order — draw_prio is the SOLE axis, partitioned at the
+    // soundings boundary (18):
     //   under-soundings symbols (effective-prio < 18) UNDER soundings,
     //   then soundings, then over-soundings symbols (effective-prio >= 18, plus the
     //   DANGER markers at effective 19 so a hazard stays on top of its own depth
     //   number), then LIGHTS on top. A base at draw_prio 30 lands in the over pass and
-    //   sorts above a danger's 19; a base at 5 stays under soundings.
+    //   sorts above a danger's 19; a base at 5 stays under soundings. One gated layer
+    //   set per SCAMIN bucket rides each pass.
     if (sprite_on) {
-        try pointSymbolLayers(js, &s, "point_symbols", .{}, .base);
-        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .base);
-        for (snd_buckets) |bkt| try soundingsLayer(js, &s, bkt);
+        for (scamin_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols", bkt, .base);
+        for (scamin_buckets) |bkt| try soundingsLayer(js, &s, bkt);
         // Over-soundings pass: high-priority symbols + the danger deviation (see PointMode).
-        try pointSymbolLayers(js, &s, "point_symbols", .{}, .dangers_only);
-        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .dangers_only);
+        for (scamin_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols", bkt, .dangers_only);
         // Danger depths ABOVE the danger markers: DANGER01/02 have an OPAQUE
         // DEPVS-filled interior (the S-52 oval masks the chart under it), and the
         // rules draw the marker FIRST then the digits on top (WRECKS05/OBSTRN07
         // instruction order) — below the ovals the depths were invisible. Never
         // collision-culled (see the soundings class split).
-        for (snd_buckets) |bkt| try dangerSoundingsLayer(js, &s, bkt);
+        for (scamin_buckets) |bkt| try dangerSoundingsLayer(js, &s, bkt);
         // LIGHTS on top: emitted after every other point symbol so a light always draws
         // over a same-priority bridge that lives in a different scamin bucket layer.
-        try pointSymbolLayers(js, &s, "point_symbols", .{}, .lights_only);
-        for (all_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols_scamin", bkt, .lights_only);
+        for (scamin_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols", bkt, .lights_only);
     }
 
-    // 8. contour value labels (DEPCNT VALDCO) — text, needs glyphs. Emitted AFTER the
-    // point symbols + soundings (oracle layer order: point_symbols, soundings,
-    // contour-labels, text), so a depth-contour value reads on top of the symbol group
-    // rather than being hidden under it. Was before the symbols (labels masked).
+    // 8. contour value labels (DEPCNT VALDCO) over the merged `lines` layer — text,
+    // needs glyphs. Emitted AFTER the point symbols + soundings (oracle layer order:
+    // point_symbols, soundings, contour-labels, text), so a depth-contour value reads
+    // on top of the symbol group rather than being hidden under it.
     if (glyphs_on) {
-        try contourLabelLayer(js, &s, "lines", .{});
-        for (all_buckets) |bkt| try contourLabelLayer(js, &s, "lines_scamin", bkt);
+        for (scamin_buckets) |bkt| try contourLabelLayer(js, &s, "lines", bkt);
     }
 
-    // 9. text labels — need an SDF glyph source.
+    // 9. text labels over the merged `text` layer — need an SDF glyph source.
     if (glyphs_on) {
-        try textLayers(js, &s, "text", .{});
-        for (all_buckets) |bkt| try textLayers(js, &s, "text_scamin", bkt);
+        for (scamin_buckets) |bkt| try textLayers(js, &s, "text", bkt);
     }
 
     try js.endArray(); // layers

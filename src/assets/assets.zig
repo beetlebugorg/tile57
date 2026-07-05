@@ -17,8 +17,10 @@ const std = @import("std");
 
 /// The tile-vocabulary version both halves of a bundle are stamped with: the MVT
 /// layer/property set in scene.zig and the style/colortables that render it.
-/// Bump on ANY change to layer names or feature property keys.
-pub const SCHEMA_VERSION = "tile57/1";
+/// Bump on ANY change to layer names or feature property keys. tile57/2 = the
+/// 6-source-layer schema (the `_scamin` twins folded into their base; SCAMIN is a
+/// per-feature `scamin` property the style gates band-independently).
+pub const SCHEMA_VERSION = "tile57/2";
 
 // MapLibre style.json generation lives in style.zig.
 pub const StyleOpts = @import("style.zig").StyleOpts;
@@ -529,7 +531,7 @@ test "manifestJson: pins schema_version and couples tiles to portrayal" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
     defer parsed.deinit();
     const o = parsed.value.object;
-    try std.testing.expectEqualStrings("tile57/1", o.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("tile57/2", o.get("schema_version").?.string);
     const data = o.get("data").?.object;
     try std.testing.expectEqualStrings("tiles/chart.pmtiles", data.get("tiles").?.string);
     try std.testing.expectEqual(@as(usize, 2), data.get("cells").?.array.items.len);

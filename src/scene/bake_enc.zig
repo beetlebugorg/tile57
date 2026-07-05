@@ -1331,7 +1331,9 @@ test "band handoff: the floor tile bakes in the coarser pass with both bands' co
     var fine_pts: usize = 0;
     var carried_pts: usize = 0;
     for (layers) |L| {
-        if (!std.mem.eql(u8, L.name, "point_symbols_scamin")) continue;
+        // v2 schema: SCAMIN points fold into the merged `point_symbols` layer; the
+        // scamin-prop filter below selects the SCAMIN-bearing ones.
+        if (!std.mem.eql(u8, L.name, "point_symbols")) continue;
         for (L.features) |f| {
             const scamin = findIntProp(f.properties, "scamin") orelse continue;
             const smax = findIntProp(f.properties, "smax");
@@ -1771,7 +1773,8 @@ test "scamin standalone: one deduped feature per tile, scale-window included" {
             const raw = try gzip.decompress(a, bytes);
             const layers = try mvt.decode(a, raw);
             for (layers) |L| {
-                if (!std.mem.eql(u8, L.name, "point_symbols_scamin")) continue;
+                // v2 schema: SCAMIN points fold into the merged `point_symbols` layer.
+                if (!std.mem.eql(u8, L.name, "point_symbols")) continue;
                 for (L.features) |ft| {
                     const sc = findIntProp(ft.properties, "scamin") orelse continue;
                     const sm = findIntProp(ft.properties, "smax");

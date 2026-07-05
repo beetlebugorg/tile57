@@ -716,18 +716,24 @@ pub const TileSurface = struct {
 
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const s = sp(ctx);
+        // v2 tile schema (tile57/2): fold each SCAMIN twin into its BASE source-layer,
+        // so the archive carries 6 vector layers (areas, area_patterns, lines,
+        // point_symbols, soundings, text) instead of 11. SCAMIN band-independence is
+        // now per-feature — a folded feature keeps its `scamin` property and the style
+        // gates it via coalesce(scamin,1e12). Only the emitted layer NAME merges; all
+        // the upstream SCAMIN routing / dedup / scale-window machinery is unchanged.
+        try s.areas.appendSlice(s.a, s.areas_scamin.items);
+        try s.area_patterns.appendSlice(s.a, s.area_patterns_scamin.items);
+        try s.lines.appendSlice(s.a, s.lines_scamin.items);
+        try s.points.appendSlice(s.a, s.points_scamin.items);
+        try s.texts.appendSlice(s.a, s.texts_scamin.items);
         var layers = std.ArrayList(mvt.Layer).empty;
         if (s.areas.items.len > 0) try layers.append(s.a, .{ .name = "areas", .features = s.areas.items });
-        if (s.areas_scamin.items.len > 0) try layers.append(s.a, .{ .name = "areas_scamin", .features = s.areas_scamin.items });
         if (s.area_patterns.items.len > 0) try layers.append(s.a, .{ .name = "area_patterns", .features = s.area_patterns.items });
-        if (s.area_patterns_scamin.items.len > 0) try layers.append(s.a, .{ .name = "area_patterns_scamin", .features = s.area_patterns_scamin.items });
         if (s.lines.items.len > 0) try layers.append(s.a, .{ .name = "lines", .features = s.lines.items });
-        if (s.lines_scamin.items.len > 0) try layers.append(s.a, .{ .name = "lines_scamin", .features = s.lines_scamin.items });
         if (s.points.items.len > 0) try layers.append(s.a, .{ .name = "point_symbols", .features = s.points.items });
-        if (s.points_scamin.items.len > 0) try layers.append(s.a, .{ .name = "point_symbols_scamin", .features = s.points_scamin.items });
         if (s.soundings.items.len > 0) try layers.append(s.a, .{ .name = "soundings", .features = s.soundings.items });
         if (s.texts.items.len > 0) try layers.append(s.a, .{ .name = "text", .features = s.texts.items });
-        if (s.texts_scamin.items.len > 0) try layers.append(s.a, .{ .name = "text_scamin", .features = s.texts_scamin.items });
         if (layers.items.len == 0) return out.alloc(u8, 0);
         return switch (s.format) {
             .mvt => mvt.encode(out, .{ .layers = layers.items }),
@@ -787,14 +793,14 @@ test "hasAdditionalInfo: INFORM/TXTDSC trigger; blank/absent/other don't" {
 }
 
 /// The vector layers this engine emits, in emit order — the source-layer ids the
-/// generated MapLibre style reads. Static: an archive may omit empties, but the
-/// TileJSON advertises the full set (mirrors the Go pmtiles metadataJSON, with this
-/// engine's actual layer split — points/text get _scamin buckets, complex lines fold
-/// into `lines`). Keep in sync with the layer appends in appendCellFeatures' finalize.
+/// generated MapLibre style reads. v2 tile schema (tile57/2): 6 layers, one per
+/// render family. Each former `_scamin` twin is folded into its base at emit time
+/// (endScene) — SCAMIN is now a per-feature `scamin` property the style gates, not a
+/// separate layer — and complex/sector lines fold into `lines`. Static: an archive
+/// may omit empties, but the TileJSON advertises the full set. Keep in sync with the
+/// layer appends in endScene.
 pub const VECTOR_LAYERS = [_][]const u8{
-    "areas",     "areas_scamin", "area_patterns", "area_patterns_scamin",
-    "lines",     "lines_scamin", "point_symbols", "point_symbols_scamin",
-    "soundings", "text",         "text_scamin",
+    "areas", "area_patterns", "lines", "point_symbols", "soundings", "text",
 };
 
 /// PMTiles archive metadata JSON: the static vector_layers list MapLibre reads from
@@ -3075,7 +3081,8 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
     const tb = [4]f64{ -1, -1, 1, 1 };
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
-    // SCAMIN-carrying point -> point_symbols_scamin, with draw_prio=7 + scamin=22000.
+    // SCAMIN-carrying point -> the internal scamin bucket (folded into `point_symbols`
+    // at emit), with draw_prio=7 + scamin=22000.
     const f_sc = s57.Feature{
         .rcnm = 0,
         .rcid = 1,
@@ -3104,6 +3111,14 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "scamin"));
     // No point-style variant -> common pass: no `pts` tag (client coalesces to 2).
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "pts"));
+
+    // v2 schema: endScene folds the SCAMIN twin into the base, so the emitted tile
+    // carries ONE merged `point_symbols` layer holding BOTH points — the folded one
+    // keeps its `scamin` (22000), the base one has none. (No `point_symbols_scamin`.)
+    _ = try surf.vtable.endScene(surf.ptr, a);
+    try std.testing.expectEqual(@as(usize, 2), ms.points.items.len);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "scamin"));
+    try std.testing.expectEqual(@as(i64, 22000), findProp(ms.points.items[1].properties, "scamin").?.int);
 }
 
 test "variantDiffers: absent/errored/identical = common, real change = split" {
