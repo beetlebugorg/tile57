@@ -160,6 +160,43 @@ test "golden Part-9 stream: FFPT-bearing named structure does not fall to QUESMR
     try std.testing.expect(!has(streams[0], "QUESMRK1"));
 }
 
+test "golden Part-9 stream: TidalStreamFloodEbb ebb (CAT_TS=2) renders via the rule override, not QUESMRK1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // TS_FEB (objl 160) point, ebb category (CAT_TS=2). The vendored TidalStreamFloodEbb rule's
+    // ebb branch has an upstream typo (`feature..orientationValue`, a stray `..`) that concatenates
+    // the feature table -> crash -> QUESMRK1. rules_embed ships a comptime-corrected copy that
+    // shadows the vendored source by name (the submodule stays pristine). The tidal-stream arrows
+    // only draw in the SimplifiedSymbols pass, so portray with that context on.
+    const attrs = [_]s57.Attr{
+        .{ .code = 188, .value = "2" }, // CAT_TS -> categoryOfTidalStream = 2 (ebb)
+        .{ .code = s57.ATTR_ORIENT, .value = "195" }, // ORIENT -> orientationValue
+        .{ .code = s57.ATTR_CURVEL, .value = "1.5" }, // CURVEL -> speed.speedMaximum
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 160, .attrs = &attrs }, // TS_FEB -> TidalStreamFloodEbb
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCellWith(a, &cell, "", .{ .simplified_symbols = true });
+    try std.testing.expectEqual(@as(usize, 1), streams.len);
+    // The ebb branch drew its arrow and did NOT fall to the "?" default (pre-override: QUESMRK1).
+    try std.testing.expect(has(streams[0], "PointInstruction:EBBSTR01"));
+    try std.testing.expect(!has(streams[0], "QUESMRK1"));
+}
+
 test "golden Part-9 stream: M_QUAL quality fills (DQUAL from CATZOC, NODATA03 when absent)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
