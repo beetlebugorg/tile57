@@ -197,6 +197,38 @@ test "golden Part-9 stream: TidalStreamFloodEbb ebb (CAT_TS=2) renders via the r
     try std.testing.expect(!has(streams[0], "QUESMRK1"));
 }
 
+test "golden Part-9 stream: SWPARE routes to HighConfidenceDepthArea (renamed from SweptArea), renders SWPARE51 not QUESMRK1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // IHO renamed the S-101 feature Swept Area -> High Confidence Depth Area and removed
+    // SweptArea.lua; our older Feature Catalogue still names it "SweptArea" (a class with no
+    // rule), so SWPARE used to require() a missing module -> QUESMRK1. resolveClass now routes
+    // SWPARE (objl 134) to HighConfidenceDepthArea, whose Surface branch draws SWPARE51 plus the
+    // swept depth ("swept to N") from DRVAL1 -> depthRangeMinimumValue.
+    const attrs = [_]s57.Attr{.{ .code = s57.ATTR_DRVAL1, .value = "12.3" }};
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 134, .attrs = &attrs }, // SWPARE (area)
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    portray.setQuiet(true);
+    const streams = try portray.portrayCell(a, &cell, "");
+    try std.testing.expectEqual(@as(usize, 1), streams.len);
+    try std.testing.expect(has(streams[0], "PointInstruction:SWPARE51"));
+    try std.testing.expect(!has(streams[0], "QUESMRK1"));
+}
+
 test "golden Part-9 stream: M_QUAL quality fills (DQUAL from CATZOC, NODATA03 when absent)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

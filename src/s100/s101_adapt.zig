@@ -552,6 +552,7 @@ pub fn resolveClass(f: s57.Feature) ?[]const u8 {
         s57.OBJL_ADMARE => if (catalogue.hasFeature("AdministrationArea")) return "AdministrationArea",
         s57.OBJL_MORFAC => if (resolveMooringClass(f)) |code| return code,
         s57.OBJL_TSELNE, s57.OBJL_TSEZNE => if (catalogue.hasFeature("SeparationZoneOrLine")) return "SeparationZoneOrLine",
+
         // CTRPNT (control point) has no S-101 class of its own; S-65 §4.3 re-models it
         // to Landmark (its categoryOfLandmark is synthesized from CATCTR in adaptCell).
         // Without this it resolves to null and the feature is dropped entirely.
@@ -1158,7 +1159,7 @@ test "Gap E: DepthArea drops QUASOU but keeps DRVAL1 through the adapter" {
     try std.testing.expect(root.simpleValue("qualityOfVerticalMeasurement") == null);
 }
 
-test "Gap E: SweptArea drops QUASOU/SOUACC/TECSOU, keeps DRVAL1" {
+test "Gap E: SWPARE (HighConfidenceDepthArea) drops QUASOU/SOUACC/TECSOU, keeps DRVAL1" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1188,7 +1189,7 @@ test "Gap E: SweptArea drops QUASOU/SOUACC/TECSOU, keeps DRVAL1" {
 
     const adapted = try adaptCell(a, &cell);
     try std.testing.expectEqual(@as(usize, 1), adapted.len);
-    try std.testing.expectEqualStrings("SweptArea", adapted[0].code);
+    try std.testing.expectEqualStrings("HighConfidenceDepthArea", adapted[0].code); // IHO rename of SweptArea
     const root = &adapted[0].root;
     try std.testing.expectEqualStrings("7", root.simpleValue("depthRangeMinimumValue").?);
     try std.testing.expect(root.simpleValue("qualityOfVerticalMeasurement") == null);
