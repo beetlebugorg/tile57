@@ -86,6 +86,19 @@ const char *tg_env_rules(void) { return getenv("TILE57_S101_RULES"); }
 static int g_portray_quiet = 0;
 void tg_set_quiet(int q) { g_portray_quiet = q; }
 
+/* TILE57_DEBUG env gate (read once, cached). When set (and not "0"), the framework Debug
+ * channel (l_debug_entry) and the per-feature QUESMRK1 diagnostic (Zig tgp_emit) print to
+ * stderr; default off, so a running server/bake isn't flooded by a chart's latent per-
+ * feature rule errors. Exported for the Zig side. */
+int tg_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("TILE57_DEBUG");
+        enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return enabled;
+}
+
 /* S-101 context parameters for one tg_portray_run pass — the values the
  * driver's cp() lines hand to the rules. Field order/types mirror the Zig
  * extern struct in portray.zig (keep in sync). A NULL ctx means the DEFAULTS
@@ -144,18 +157,25 @@ static int l_noop(lua_State *L) {
     (void)L;
     return 0;
 }
-/* HostDebuggerEntry(kind, message, ...): surface the framework's Debug channel so a rule
- * error is never a silent QUESMRK1 "?". S100Scripting overrides the global error() to call
- * Debug.FirstChanceError on EVERY raised error, so 'first_chance_error' carries the cause of
- * every "?" — always print it (a conformant catalogue raises none). 'trace' also carries
- * benign warnings (the Lua-version note, an empty-instruction TextPlacement, ...), so gate it
- * on !quiet to keep parallel bakes clean. Performance and 'break' entries are ignored. */
+/* HostDebuggerEntry(kind, message, ...): surface the framework's Debug channel, but ONLY
+ * when the TILE57_DEBUG env var is set (default off — a running server/bake stays silent).
+ * Enabled, it prints 'first_chance_error' (S100Scripting overrides the global error() to
+ * raise this on EVERY error — the cause of every QUESMRK1 "?") and 'trace' (main.lua names
+ * the class it fell back to Default for). Off by default because a chart carrying a handful
+ * of latent per-feature rule errors floods the log as tiles re-portray — the many identical
+ * "Invalid primitive type ..." lines are one such standard rule guard. Diagnose a "?" with:
+ *   TILE57_DEBUG=1 tile57 bake <cell.000> -o /tmp/x 2>&1 | grep '\[s101:'
+ * Performance ('*_performance') and 'break' entries are always ignored. */
 static int l_debug_entry(lua_State *L) {
+    if (!tg_debug_enabled()) return 0;
     const char *kind = lua_tostring(L, 1);
     if (!kind) return 0;
     int is_err = strcmp(kind, "first_chance_error") == 0;
-    if (is_err || (!g_portray_quiet && strcmp(kind, "trace") == 0)) {
+    if (is_err || strcmp(kind, "trace") == 0) {
         const char *msg = lua_tostring(L, 2);
+        /* The Lua-5.4-vs-5.1 EqMetaMethod note (main.lua) fires once per lua_State — i.e.
+         * per cell/thread — benign and high-volume, so drop it to keep the channel focused. */
+        if (msg && strstr(msg, "Non-standard Lua processor")) return 0;
         fprintf(stderr, "[s101:%s] %s\n", is_err ? "error" : "trace", msg ? msg : "");
     }
     return 0;

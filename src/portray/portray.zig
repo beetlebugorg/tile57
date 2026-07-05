@@ -56,6 +56,10 @@ const CContext = extern struct {
 // Suppress the per-cell "[s101] portrayed …" stderr summary (extern in lua_shim.c).
 extern fn tg_set_quiet(q: c_int) callconv(.c) void;
 
+// TILE57_DEBUG env gate (extern in lua_shim.c), shared with the framework Debug channel —
+// gates the per-feature QUESMRK1 diagnostic in tgp_emit.
+extern fn tg_debug_enabled() callconv(.c) c_int;
+
 /// Silence the per-cell portrayal stderr summary — set before a parallel bake so
 /// concurrent threads don't garble progress output.
 pub fn setQuiet(quiet: bool) void {
@@ -217,7 +221,20 @@ export fn tgp_assoc_features(i: usize, assoc_ptr: [*]const u8, assoc_len: usize,
 export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(.c) void {
     const c = g_ctx orelse return;
     if (i >= c.results.len) return;
-    c.results[i] = c.arena.dupe(u8, instr_ptr[0..instr_len]) catch "";
+    const instr = instr_ptr[0..instr_len];
+    c.results[i] = c.arena.dupe(u8, instr) catch "";
+    // Diagnostic (TILE57_DEBUG): a feature that couldn't be portrayed carries Default()'s
+    // QUESMRK1 "?". Name the exact offender — cell, S-101 class, primitive, S-57 rcid,
+    // position — so a "?" on the chart traces to one feature, not an anonymous rule error.
+    if (tg_debug_enabled() != 0 and i < c.adapted.len and std.mem.indexOf(u8, instr, "QUESMRK1") != null) {
+        const ad = c.adapted[i];
+        const rcid: u32 = if (ad.feature_index < c.cell.features.len) c.cell.features[ad.feature_index].rcid else 0;
+        const cell_name = if (c.cell.name.len > 0) c.cell.name else "?";
+        if (ad.points.len > 0)
+            std.debug.print("[s101:quesmrk] cell={s} class={s} prim={s} rcid={d} lonlat={d:.6},{d:.6}\n", .{ cell_name, ad.code, ad.primitive, rcid, ad.points[0][0], ad.points[0][1] })
+        else
+            std.debug.print("[s101:quesmrk] cell={s} class={s} prim={s} rcid={d}\n", .{ cell_name, ad.code, ad.primitive, rcid });
+    }
 }
 
 // ---- entry point ---------------------------------------------------------
