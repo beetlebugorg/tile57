@@ -95,6 +95,11 @@ pub const Portrayal = struct {
     // stream carries no DrawingPriority. Surfaced as the MVT `draw_prio` property
     // so the style can paint area fills in S-52 display order (DEPARE 3 < LNDARE 12).
     draw_prio: i64 = 0,
+    // S-101 DisplayPlane: 0 = UnderRadar (the near-universal default), 1 = OverRadar.
+    // Surfaced as the MVT `plane` property (emitted only when 1); the style's
+    // symbol-sort-key uses plane*64 + draw_prio, so an OverRadar symbol sorts above an
+    // UnderRadar one of equal priority.
+    plane: i64 = 0,
     // S-52 display-category rank (§10.3.4): 0=base, 1=standard, 2=other. The feature
     // takes the MOST-VISIBLE (lowest) band over its instructions' viewing groups;
     // standard (1) when none carries a category band. Surfaced as the MVT `cat`
@@ -173,6 +178,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
 
     var fill_token: ?[]const u8 = null;
     var draw_prio: i64 = 0; // feature DrawingPriority = max seen in the stream
+    var plane: i64 = 0; // S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar
     var cat: i64 = -1; // most-visible display-category rank; -1 until a banded VG is seen
     var vg: i64 = 0; // controlling viewing group = most-visible draw's banded VG (band(vg)==cat)
     var date_start: []const u8 = "";
@@ -364,8 +370,14 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // Feature-level validity period "start,end" (either bound may be empty).
             date_start = std.mem.trim(u8, nthCsv(val, 0), " ");
             date_end = std.mem.trim(u8, nthCsv(val, 1), " ");
+        } else if (std.mem.eql(u8, key, "DisplayPlane")) {
+            // S-101 draw plane vs the radar overlay. UnderRadar (the near-universal
+            // default) stays 0; OverRadar -> 1 so the style's symbol-sort-key
+            // (plane*64 + draw_prio) sorts it above an equal-priority UnderRadar symbol.
+            // Any other/unknown value stays 0.
+            if (std.mem.eql(u8, std.mem.trim(u8, val, " "), "OverRadar")) plane = 1;
         }
-        // DisplayPlane / AlertReference / etc. are display metadata we don't map yet.
+        // AlertReference / Hover / etc. are display metadata we don't map yet.
     }
 
     return .{
@@ -375,6 +387,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         .points = points.items,
         .texts = texts.items,
         .draw_prio = draw_prio,
+        .plane = plane,
         .cat = if (cat < 0) 1 else cat, // no banded VG -> Standard
         .vg = vg,
         .date_start = date_start,
@@ -423,8 +436,22 @@ test "parse the real DEPARE03 instruction stream" {
     try std.testing.expectEqual(@as(usize, 0), p.patterns.len);
     // draw_prio = max(3, 9) over the two viewing-group sections.
     try std.testing.expectEqual(@as(i64, 9), p.draw_prio);
+    // DisplayPlane:UnderRadar -> plane 0 (the default; emitted-untagged in the tile).
+    try std.testing.expectEqual(@as(i64, 0), p.plane);
     // Display category = most visible over {13030 -> Base, 90000 -> Other} = Base.
     try std.testing.expectEqual(@as(i64, 0), p.cat);
+}
+
+test "DisplayPlane:OverRadar parses to plane=1 (UnderRadar/absent stay 0)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const over = try parse(a, "ViewingGroup:27070;DrawingPriority:24;DisplayPlane:OverRadar;PointInstruction:LIGHTS13");
+    try std.testing.expectEqual(@as(i64, 1), over.plane);
+    const under = try parse(a, "ViewingGroup:27070;DrawingPriority:24;DisplayPlane:UnderRadar;PointInstruction:LIGHTS13");
+    try std.testing.expectEqual(@as(i64, 0), under.plane);
+    const none = try parse(a, "ViewingGroup:27070;DrawingPriority:24;PointInstruction:LIGHTS13");
+    try std.testing.expectEqual(@as(i64, 0), none.plane);
 }
 
 test "display category defaults to Standard when no banded viewing group" {

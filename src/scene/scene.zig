@@ -595,6 +595,7 @@ pub const TileSurface = struct {
         const s = sp(ctx);
         s.cur = .{
             .prio = meta.draw_prio,
+            .plane = meta.plane,
             .cat = meta.cat,
             .vg = meta.vg,
             .scamin = meta.scamin,
@@ -829,6 +830,7 @@ pub fn metadataJson(a: Allocator, scamin: []const u32) ![]const u8 {
 /// client's S-52 mariner filters can select on it.
 const Meta = struct {
     prio: i64,
+    plane: i64 = 0, // S-101 DisplayPlane (0 UnderRadar default, 1 OverRadar)
     cat: i64 = 1, // display-category rank (0 base, 1 standard, 2 other)
     vg: i64 = 0, // raw S-101 viewing-group number of the feature's primary draw (0 = none)
     scamin: ?i64 = null,
@@ -1062,6 +1064,9 @@ test "encodeS57Attrs: acronym->value JSON; skips blank + unknown; escapes" {
 
 fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
+    // S-101 DisplayPlane: emitted only for OverRadar (plane=1); the style's sort-key
+    // coalesces an absent plane to 0 (UnderRadar), so the common case stays untagged.
+    if (m.plane != 0) try props.append(a, .{ .key = "plane", .value = .{ .int = m.plane } });
     try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
     // Raw viewing group (§14.5): emitted only when the feature has a banded draw VG,
     // so undated/unbanded features keep their tile footprint unchanged.
@@ -1474,6 +1479,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
         .draw_prio = p.draw_prio,
+        .plane = p.plane,
         .cat = p.cat,
         .vg = p.vg,
         .scamin = scamin,

@@ -65,6 +65,7 @@ pub const TextStyle = struct {
 /// surfaces need not import s57/s100.
 pub const FeatureMeta = struct {
     draw_prio: i64 = 0,
+    plane: i64 = 0, // S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar
     cat: i64 = 1, // display category: 0 base, 1 standard, 2 other
     vg: i64 = 0, // raw viewing group (0 = none)
     scamin: ?i64 = null, // SCAMIN 1:N denominator (null = no display limit)
