@@ -136,11 +136,11 @@ test "MLT re-encode of the real tile matches the MVT decode (cross-codec parity)
     }
 
     // Property parity on the streams the BakeSink collector depends on: the
-    // scamin/smax denominators (SCAMIN ladder) and the soundings glyph stacks
+    // scamin denominators (SCAMIN ladder) and the soundings glyph stacks
     // (sym_s/sym_g composites) must survive the MLT round-trip unchanged.
     for (layers, layers2) |x, y| {
         for (x.features, y.features) |f1, f2| {
-            for ([_][]const u8{ "scamin", "smax", "sym_s", "sym_g", "sym_s_ft", "sym_g_ft", "symbol_names", "class", "color_token" }) |key| {
+            for ([_][]const u8{ "scamin", "sym_s", "sym_g", "sym_s_ft", "sym_g_ft", "symbol_names", "class", "color_token" }) |key| {
                 const v1 = prop(f1, key) orelse continue;
                 const v2 = prop(f2, key) orelse return error.MissingProp;
                 switch (v1) {

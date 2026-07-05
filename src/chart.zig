@@ -126,12 +126,8 @@ const LazyCell = struct {
     // suppression. Lives in cell.arena, freed (and reset) when the cell unloads.
     coverage: ?[]const []const []const s57.LonLat = null,
     // Distinct SCAMIN denominators (cell.arena, computed on load) — the cell's
-    // slice of the band-handoff quantization ladder (bake_enc.quantizeHandoff).
+    // slice of the tilejson scamin ladder (client filter-gate crossings).
     scamins: []const u32 = &.{},
-    // SCAMIN standalone: the cell's matchable SCAMIN point records
-    // (scamin_pts.collectRecs; cell.arena, Rec.cell stamped at gather time) —
-    // the live per-tile dedup's inputs. null until loaded.
-    recs: ?[]const scene.scamin_pts.Rec = null,
     // Sector-figure reach (scene.collectLightReach), computed on first load from
     // the portrayal streams and KEPT after eviction (plain values, no arena) so
     // tileRefs' reach candidacy doesn't have to reload the cell to test it.
@@ -224,6 +220,9 @@ const LazyCov = struct {
     }
     pub inline fn bounds(self: LazyCov, i: u32) [4]f64 {
         return self.ls.cells[i].bbox;
+    }
+    pub inline fn name(self: LazyCov, i: u32) []const u8 {
+        return self.ls.cells[i].name;
     }
 };
 
@@ -391,9 +390,6 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
     // cell.arena-owned, so it unloads with the cell).
     lc.scamins = bake_enc.collectScamins(cell.arena.allocator(), &cell) catch &.{};
     if (cell.params.cscl > 0) lc.cscl = cell.params.cscl;
-    // SCAMIN standalone: the cell's matchable point records for the live
-    // per-tile dedup (Rec.cell is stamped when gathered — 0 here).
-    lc.recs = scamin_pts.collectRecs(cell.arena.allocator(), &cell, lc.cscl, 0) catch null;
     // Sector-figure reach from the portrayal streams — plain values kept across
     // unload so reach candidacy never needs a reload just to test it.
     const lr = scene.collectLightReach(&cell, lc.portrayal);
@@ -410,7 +406,6 @@ fn lazyUnload(lc: *LazyCell) void {
     lc.portrayal = null;
     lc.coverage = null; // backing memory lived in cell.arena, freed by c.deinit()
     lc.scamins = &.{}; // ditto (cell.arena)
-    lc.recs = null; // ditto (cell.arena)
     lc.portrayal_plain = null;
     lc.portrayal_simplified = null;
     if (lc.arena) |p| {
@@ -1544,16 +1539,8 @@ fn appendCellGeoJson(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *s57.C
 // Collect a parsed cell's distinct SCAMIN denominators into `set`.
 fn collectScaminCell(cell: *const s57.Cell, set: *std.AutoHashMap(u32, void)) void {
     for (cell.features) |f| if (scene.featureScamin(f)) |sc| if (sc > 0) set.put(@intCast(sc), {}) catch {};
-    // The cell's compilation scale, quantized UP its own SCAMIN ladder — the value
-    // the raw-cscl smax handoff tag hands off at, so the live client ladder has a
-    // crossing to flip carried copies on (see bakeArchive's fold).
     const cscl = cell.params.cscl;
     if (cscl > 0) {
-        var best: i64 = std.math.maxInt(i64);
-        for (cell.features) |f| if (scene.featureScamin(f)) |sc| {
-            if (sc >= cscl and sc < best) best = sc;
-        };
-        set.put(if (best != std.math.maxInt(i64)) @intCast(best) else @intCast(cscl), {}) catch {};
         // The overscale (`oscl`) X2 gate denominator (cscl/OVERSCALE_FACTOR): the
         // AP(OVERSC01) hatch must flip on at a client crossing exactly at 2x, so
         // the live SCAMIN ladder needs this value too (the bake path picks it up
@@ -1671,7 +1658,7 @@ fn lightReachOverlap(ls: *LazySource, i: u32, tb: [4]f64, z: u8, ring: *const [4
 // coarse→fine.
 // Select + load the cells contributing to tile (z,x,y) and append their
 // quilted CellRefs (suppression/carry computed against the finest covering
-// compilation scale, bake_enc.carryGate). Returns false when nothing overlaps.
+// compilation scale). Returns false when nothing overlaps.
 // Factored from tileFromCells so renderView reuses the exact same selection.
 // `scratch` must outlive the tile's encode/append (the per-tile arena): the
 // SCAMIN-standalone overlay mini cells are built into it.
@@ -1791,9 +1778,8 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
         }
     }
 
-    const clat = (tb[1] + tb[3]) / 2;
     // The point-sampled cross-band quilting (finestCsclAtLive over centre+corners →
-    // carryGate → suppress/smax) is GONE — the coverage-clipped composite
+    // carryGate → suppress) is GONE — the coverage-clipped composite
     // (bake_enc.coverClipForCell + scene.subtractCoverage/coveredByFiner) does it
     // exactly per-feature, identically to the baker. Only the overscale scale-
     // boundary scan (gf_tile) remains.
@@ -1819,8 +1805,8 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
             // The exact best-available composite (same shared geometry as the baker,
             // so live == bake): subtract the finer cells' M_COVR from this cell's
             // fills/patterns and drop its points/strokes where a finer cell owns the
-            // ground. cover_clip is the ONE cross-band mechanism — no carryGate/smax.
-            const cover_clip = bake_enc.coverClipForCell(scratch, LazyCov{ .ls = ls }, idxs.items, null, lc.cscl, z, x, y, clip_box);
+            // ground. cover_clip is the ONE cross-band mechanism.
+            const cover_clip = bake_enc.coverClipForCell(scratch, LazyCov{ .ls = ls }, idxs.items, null, i, z, x, y, clip_box);
             const wins_somewhere = cover_clip == null or !bake_enc.tileFullyCovered(scratch, cover_clip.?, clip_box);
             refs.append(gpa, .{
                 .cell = c,
@@ -1833,14 +1819,12 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 .cover_clip = cover_clip,
                 .suppress_lines = false,
                 .suppress_points = false,
-                .smax = 0,
                 // Overscale (S-52 §10.1.10.2): X2 gate denominator; hatch only where a
                 // finer cell rides the tile (gf_tile < cscl) AND this cell still owns
                 // some of it (its fills aren't fully clipped away).
                 .oscl = bake_enc.overscaleGateDenom(lc.cscl),
                 .overscale_hatch = lc.cscl > 0 and gf_tile < lc.cscl and wins_somewhere and !holefill_set.contains(i),
-                // SCAMIN standalone: the overlay below owns prim==1 SCAMIN features.
-                .skip_scamin_points = true,
+                .eff_scamin_floor = bake_enc.effScaminFloor(lc.cscl),
                 .light_range_m = lc.light_range_m,
             }) catch {};
         }
@@ -1865,139 +1849,15 @@ fn tileRefs(ls: *LazySource, z: u8, x: u32, y: u32, refs: *std.ArrayList(scene.C
                 .suppress_patterns = false,
                 .suppress_lines = false,
                 .suppress_points = false,
-                .smax = 0,
                 .oscl = bake_enc.overscaleGateDenom(lc.cscl),
                 .overscale_hatch = false,
-                .skip_scamin_points = true,
+                .eff_scamin_floor = bake_enc.effScaminFloor(lc.cscl),
                 .light_range_m = lc.light_range_m,
             }) catch {};
         }
     }
 
-    // SCAMIN standalone (specs/scamin-standalone.md), live half: the deduped
-    // cross-cell SCAMIN point objects join this tile independent of bands. The
-    // dedup here is PER TILE over the covering cells' cached records — matching
-    // is local (copies sit within the FOID guard of each other), so it resolves
-    // exactly like the bake's global pre-pass.
-    appendLiveOverlay(ls, z, tb, clat, refs, scratch) catch {};
     return true;
-}
-
-// Gather the covering cells' SCAMIN point records around tile bounds `tb`,
-// dedup them locally, cap winners against the finest covering chart, and
-// append one mini-cell CellRef per contributing source cell (built into
-// `scratch`, which must outlive the tile's encode). Skipped entirely when the
-// tile's window is coarser than any plausible SCAMIN (MAX_OVERLAY_DENOM) so
-// low zooms don't lazily load the whole root.
-fn appendLiveOverlay(ls: *LazySource, z: u8, tb: [4]f64, clat: f64, refs: *std.ArrayList(scene.CellRef), scratch: std.mem.Allocator) !void {
-    const floor_denom = assets.displayDenomZ(z + 1, clat);
-    if (floor_denom > scamin_pts.MAX_OVERLAY_DENOM) return;
-
-    // Gather margin: one tile (sector-figure reach, mirroring the bake's mini
-    // padding) or the FOID guard, whichever is wider — so a group whose member
-    // sits just outside the tile still resolves with its full copy set.
-    const guard_deg = scamin_pts.FOID_GUARD_M / 111_320.0;
-    const gm_lon = @max(tb[2] - tb[0], guard_deg / @max(@cos(clat * std.math.pi / 180.0), 0.2));
-    const gm_lat = @max(tb[3] - tb[1], guard_deg);
-    const gtb = [4]f64{ tb[0] - gm_lon, tb[1] - gm_lat, tb[2] + gm_lon, tb[3] + gm_lat };
-
-    // Candidate cells: EVERY cell overlapping the gather bounds, loaded on
-    // demand regardless of band — the standalone model needs the fine cells'
-    // copies (winner geometry/attrs) in coarse tiles and vice versa. A cell
-    // whose light sector figures reach FURTHER than the shared margin (ground-
-    // length directional legs) also joins via its known reach ring.
-    var cand = std.ArrayList(u32).empty;
-    defer cand.deinit(gpa);
-    for (ls.cells, 0..) |lc, i| {
-        if (bboxOverlap(lc.bbox, gtb) or lightReachOverlap(ls, @intCast(i), tb, z, &gtb))
-            cand.append(gpa, @intCast(i)) catch {};
-    }
-    if (cand.items.len == 0) return;
-    for (cand.items) |i| lazyEnsureLoaded(ls, &ls.cells[i]);
-
-    // Gather + stamp the records in the window (Rec.cell = live cell index).
-    var recs = std.ArrayList(scamin_pts.Rec).empty;
-    defer recs.deinit(gpa);
-    for (cand.items) |i| {
-        const lc = &ls.cells[i];
-        const cell_recs = lc.recs orelse continue;
-        // Per-cell gather bounds: the shared margin, widened to the cell's own
-        // sector-figure reach so a far directional light's record still gathers.
-        var cg = gtb;
-        if (lc.light_known and lc.light_range_m > 0) {
-            const reach = scene.lightReachTiles(lc.light_range_m, z, clat);
-            cg[0] = @min(cg[0], tb[0] - (tb[2] - tb[0]) * reach);
-            cg[1] = @min(cg[1], tb[1] - (tb[3] - tb[1]) * reach);
-            cg[2] = @max(cg[2], tb[2] + (tb[2] - tb[0]) * reach);
-            cg[3] = @max(cg[3], tb[3] + (tb[3] - tb[1]) * reach);
-        }
-        for (cell_recs) |r0| {
-            if (r0.lon < cg[0] or r0.lon > cg[2] or r0.lat < cg[1] or r0.lat > cg[3]) continue;
-            var r = r0;
-            r.cell = i;
-            recs.append(gpa, r) catch return;
-        }
-    }
-    if (recs.items.len == 0) return;
-    try scamin_pts.dedup(gpa, recs.items);
-
-    // Winners: eligibility-clamp against this tile's window, cap against the
-    // finest covering chart (real M_COVR only — the same rule as the bake's
-    // resolveWinners), and bucket per source cell for the mini build. Emission
-    // bounds = tile + the source cell's sector-figure reach pad (one tile for
-    // display-mm figures, the honest span for ground-length directional legs;
-    // the per-feature cull inside appendCellFeatures owns the fine filtering).
-    var per_cell = std.AutoHashMap(u32, std.ArrayList(scamin_pts.MiniEntry)).init(gpa);
-    defer {
-        var vit = per_cell.valueIterator();
-        while (vit.next()) |v| v.deinit(gpa);
-        per_cell.deinit();
-    }
-    var ladders = std.ArrayList([]const u32).empty;
-    defer ladders.deinit(gpa);
-    for (recs.items) |r| {
-        if (!r.winner) continue;
-        const reach = scene.lightReachTiles(ls.cells[r.cell].light_range_m, z, clat);
-        const pad_lon = (tb[2] - tb[0]) * reach;
-        const pad_lat = (tb[3] - tb[1]) * reach;
-        if (r.lon < tb[0] - pad_lon or r.lon > tb[2] + pad_lon or
-            r.lat < tb[1] - pad_lat or r.lat > tb[3] + pad_lat) continue;
-        var finest: i32 = std.math.maxInt(i32);
-        ladders.clearRetainingCapacity();
-        for (cand.items) |i| {
-            const lc = &ls.cells[i];
-            if (lc.cscl <= 0) continue;
-            const cov = lazyCellCoverage(lc);
-            if (cov.len == 0) continue;
-            if (!s57.coverageContains(cov, r.lon, r.lat)) continue;
-            finest = @min(finest, lc.cscl);
-            ladders.append(gpa, lc.scamins) catch {};
-        }
-        const cap = scamin_pts.capFor(r.cscl, finest, ladders.items);
-        if (!scamin_pts.eligibleAt(r.effective, cap, floor_denom)) continue;
-        const gop = try per_cell.getOrPut(r.cell);
-        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(scamin_pts.MiniEntry).empty;
-        try gop.value_ptr.append(gpa, .{ .feat = r.feat, .lon = r.lon, .lat = r.lat, .effective = r.effective, .smax = cap });
-    }
-
-    var it = per_cell.iterator();
-    while (it.next()) |e| {
-        const lc = &ls.cells[e.key_ptr.*];
-        if (lc.cell == null) continue;
-        const cell = &lc.cell.?;
-        const mini = try scratch.create(scamin_pts.Mini);
-        mini.* = try scamin_pts.buildMini(scratch, cell, e.value_ptr.items, lc.portrayal, lc.portrayal_simplified);
-        try refs.append(gpa, .{
-            .cell = &mini.cell,
-            .portrayal = mini.portrayal,
-            .portrayal_simplified = mini.portrayal_simplified,
-            .feat_bbox = mini.feat_bbox,
-            .feat_smax = mini.feat_smax,
-            .scamin_floor = floor_denom,
-            .band = @intFromEnum(lc.band),
-            .light_range_m = lc.light_range_m,
-        });
-    }
 }
 
 fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, fmt: scene.TileFormat, pick_attrs: bool) ![]u8 {
@@ -2015,153 +1875,6 @@ fn tileFromCells(ls: *LazySource, z: u8, x: u32, y: u32, fmt: scene.TileFormat, 
 // ---- ENC_ROOT bake -------------------------------------------------------
 
 const BakeSource = struct { base: []const u8, updates: []const []const u8, name: []const u8 = "" };
-
-// ---- SCAMIN standalone pre-pass (specs/scamin-standalone.md) ---------------
-// Before ANY band pass bakes a tile, every cell is parsed once (parallel,
-// transient) and scanned for SCAMIN point records; the union is deduped
-// globally (FOID identity across US3/US4/US5 copies), each winner gets its
-// effective (MAX) scamin + smax cap, and the winner-owning cells are re-parsed
-// to portray JUST the winners (portrayCellSubset) into overlay mini cells.
-// The Baker then joins those minis into EVERY tile by per-feature scale-window
-// eligibility — independent of bands/emitted-skip/carry-down. The pre-pass
-// must be global and up-front because the finest bands bake first: a z16 tile
-// needs the effective scamin unioned from the US3 copy parsed only much later.
-
-const scamin_pts = scene.scamin_pts;
-
-const ScanWork = struct {
-    sources: []const BakeSource,
-    arenas: []?*std.heap.ArenaAllocator, // per-cell scan arenas (freed by the caller)
-    scans: []scamin_pts.CellScan,
-
-    fn run(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
-        _ = scratch;
-        const c: *ScanWork = @ptrCast(@alignCast(uptr));
-        const src = c.sources[i];
-        var cell = s57.parseCellWithUpdates(gpa, src.base, src.updates) catch return;
-        defer cell.deinit();
-        const pa = gpa.create(std.heap.ArenaAllocator) catch return;
-        pa.* = std.heap.ArenaAllocator.init(gpa);
-        c.scans[i] = scamin_pts.scanCell(pa.allocator(), &cell, @intCast(i)) catch {
-            pa.deinit();
-            gpa.destroy(pa);
-            return;
-        };
-        c.arenas[i] = pa;
-    }
-};
-
-const MiniWork = struct {
-    sources: []const BakeSource,
-    entries: []const []const scamin_pts.MiniEntry, // per-cell winners (resolveWinners)
-    rules_dir: []const u8,
-    arenas: []?*std.heap.ArenaAllocator, // per-cell mini arenas (freed by the caller)
-    minis: []?scamin_pts.Mini,
-
-    fn run(uptr: *anyopaque, i: usize, scratch: std.mem.Allocator) void {
-        _ = scratch;
-        const c: *MiniWork = @ptrCast(@alignCast(uptr));
-        if (c.entries[i].len == 0) return;
-        const src = c.sources[i];
-        var cell = s57.parseCellWithUpdates(gpa, src.base, src.updates) catch return;
-        defer cell.deinit();
-        cell.name = src.name;
-        const pa = gpa.create(std.heap.ArenaAllocator) catch return;
-        pa.* = std.heap.ArenaAllocator.init(gpa);
-        const a = pa.allocator();
-        var ok = false;
-        defer if (!ok) {
-            pa.deinit();
-            gpa.destroy(pa);
-        };
-        // Portray only the winner features (whole-cell adapt, subset rule run).
-        const mask = a.alloc(bool, cell.features.len) catch return;
-        @memset(mask, false);
-        for (c.entries[i]) |e| {
-            if (e.feat < mask.len) mask[e.feat] = true;
-        }
-        var tmp = std.heap.ArenaAllocator.init(gpa);
-        defer tmp.deinit();
-        const cp = portray.portrayCellSubset(tmp.allocator(), &cell, c.rules_dir, mask) catch portray.CellPortrayal{ .base = &.{} };
-        c.minis[i] = scamin_pts.buildMini(a, &cell, c.entries[i], cp.base, cp.simplified) catch return;
-        c.arenas[i] = pa;
-        ok = true;
-    }
-};
-
-/// The overlay state a bake driver holds for its whole run: the mini-cell
-/// Backends handed to Baker.overlay plus the arenas that own them.
-const BakeOverlay = struct {
-    backends: []bake_enc.Backend = &.{},
-    arenas: []?*std.heap.ArenaAllocator = &.{},
-
-    fn deinit(self: *BakeOverlay) void {
-        for (self.arenas) |pa| if (pa) |p| {
-            p.deinit();
-            gpa.destroy(p);
-        };
-        if (self.arenas.len > 0) gpa.free(self.arenas);
-        if (self.backends.len > 0) gpa.free(self.backends);
-    }
-};
-
-// Run the whole pre-pass over in-memory cell sources. Returns an empty overlay
-// on any failure (the bake then simply behaves band-quilted for points).
-fn buildBakeOverlay(sources: []const BakeSource, rules_dir: []const u8) BakeOverlay {
-    const n = sources.len;
-    if (n == 0) return .{};
-    var scratch = std.heap.ArenaAllocator.init(gpa);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
-
-    // Phase A: parallel parse + scan (cells freed immediately).
-    const scan_arenas = sa.alloc(?*std.heap.ArenaAllocator, n) catch return .{};
-    @memset(scan_arenas, null);
-    defer for (scan_arenas) |pa| if (pa) |p| {
-        p.deinit();
-        gpa.destroy(p);
-    };
-    const scans = sa.alloc(scamin_pts.CellScan, n) catch return .{};
-    @memset(scans, scamin_pts.CellScan{});
-    var sw = ScanWork{ .sources = sources, .arenas = scan_arenas, .scans = scans };
-    bake_enc.parallelFor(gpa, n, &sw, ScanWork.run);
-
-    // Phase B: global dedup + caps (serial, cheap).
-    const entries = scamin_pts.resolveWinners(gpa, sa, scans, n) catch return .{};
-
-    // Phase C: parallel re-parse + subset-portray + mini build for winner cells.
-    const mini_arenas = gpa.alloc(?*std.heap.ArenaAllocator, n) catch return .{};
-    @memset(mini_arenas, null);
-    const minis = sa.alloc(?scamin_pts.Mini, n) catch {
-        gpa.free(mini_arenas);
-        return .{};
-    };
-    @memset(minis, null);
-    var mw = MiniWork{ .sources = sources, .entries = entries, .rules_dir = rules_dir, .arenas = mini_arenas, .minis = minis };
-    bake_enc.parallelFor(gpa, n, &mw, MiniWork.run);
-
-    var backends = std.ArrayList(bake_enc.Backend).empty;
-    for (minis, mini_arenas) |m, pa| {
-        const mini = m orelse continue;
-        if (pa == null) continue;
-        // Deduped LIGHTS winners keep their sector-figure reach (see
-        // bundle.buildRootOverlay): the overlay tile pad widens to the
-        // ground-leg span so a directional light's leg isn't chopped.
-        const lr = scene.collectLightReach(&mini.cell, mini.portrayal);
-        backends.append(gpa, .{
-            .cell = mini.cell,
-            .portrayal = mini.portrayal,
-            .portrayal_simplified = mini.portrayal_simplified,
-            .feat_bbox = mini.feat_bbox,
-            .feat_smax = mini.feat_smax,
-            .bounds = mini.bounds,
-            .cscl = mini.cell.params.cscl,
-            .light_bbox = lr.bbox,
-            .light_range_m = lr.range_m,
-        }) catch break;
-    }
-    return .{ .backends = backends.toOwnedSlice(gpa) catch &.{}, .arenas = mini_arenas };
-}
 
 const BakeWork = struct {
     sources: []const BakeSource,
@@ -2263,22 +1976,6 @@ pub fn bakeArchive(
     var scamin_set = std.AutoHashMap(u32, void).init(gpa);
     defer scamin_set.deinit();
 
-    // SCAMIN standalone: build the deduped point overlay BEFORE any band pass
-    // (the finest bands bake first and already need the effective scamins the
-    // coarsest cells contribute). The smax caps join the crossing ladder — they
-    // are quantized onto real SCAMIN values, but a raw-CSCL fallback still needs
-    // its client crossing published.
-    var ov_sources = std.ArrayList(BakeSource).empty;
-    defer ov_sources.deinit(gpa);
-    for (cells_in) |in| ov_sources.append(gpa, .{ .base = in.base, .updates = in.updates, .name = in.name }) catch break;
-    var overlay = buildBakeOverlay(ov_sources.items, dir);
-    defer overlay.deinit();
-    baker.overlay = overlay.backends;
-    baker.scamin_standalone = true;
-    for (overlay.backends) |be| if (be.feat_smax) |fs| for (fs) |v| {
-        if (v > 0) scamin_set.put(@intCast(v), {}) catch {};
-    };
-
     // The coarsest populated band gets .extend_min (fill down to minzoom — the
     // live tileRefs coarsest-band fallback); every other populated band defers its
     // floor into the next-coarser pass (.defer_down, the band handoff).
@@ -2377,13 +2074,11 @@ pub fn bakeArchive(
             for (be.cell.features) |f| {
                 if (scene.featureScamin(f)) |sc| scamin_set.put(@intCast(sc), {}) catch {};
             }
-            // The cell's quantized compilation scale joins the ladder too: the
-            // overscale (`oscl`) and raw-cscl smax fallback tags need a client
-            // crossing at their emitted value. Quantizing against the cell's OWN
-            // ladder covers every per-tile result — a cross-cell quantization can
-            // only land on another cell's ladder value, folded above already.
+            // The cell's overscale gate denominator joins the ladder: the client
+            // needs a crossing at the exact emitted `oscl` value (spec §5), so
+            // the hatch flips exactly at the X2 boundary.
             if (be.cscl > 0) {
-                const q = bake_enc.quantizeHandoff(&.{be.scamins}, be.cscl);
+                const q = bake_enc.overscaleGateDenom(be.cscl);
                 if (q > 0) scamin_set.put(@intCast(q), {}) catch {};
             }
         }

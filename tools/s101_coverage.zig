@@ -41,50 +41,55 @@ const RULES_DIR = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
 // adapter grows new synthesis.
 const ADAPTER_SYNTHESIZED = [_][]const u8{
     // orientation / clearance complexes (s101_adapt.zig:122-127, 494-501)
-    "orientation",             "orientationValue",
-    "verticalClearanceClosed", "verticalClearanceFixed",
-    "verticalClearanceOpen",   "verticalClearanceValue",
-    "horizontalClearanceFixed", "horizontalClearanceValue",
+    "orientation",                      "orientationValue",
+    "verticalClearanceClosed",          "verticalClearanceFixed",
+    "verticalClearanceOpen",            "verticalClearanceValue",
+    "horizontalClearanceFixed",         "horizontalClearanceValue",
     // Gate's HORCLR -> horizontalClearanceOpen (class-keyed; the other 8 classes that
     // reference it bind …Fixed, so its absence there is an expected-absence)
     "horizontalClearanceOpen",
     // openingBridge synthesized from CATBRG 2..8 for BRIDGE->Bridge (s101_adapt.zig)
-    "openingBridge",
+             "openingBridge",
     // current velocity CURVEL -> speed.speedMaximum (s101_adapt.zig complex_from_simple)
-    "speed",                   "speedMaximum",
+    "speed",                            "speedMaximum",
     "speedMinimum",
     // NATSUR list -> surfaceCharacteristics[].natureOfSurface for SeabedArea
     // (s101_adapt.zig buildSurfaceCharacteristics; off-list values dropped)
-    "surfaceCharacteristics",
+                        "surfaceCharacteristics",
     // CATMOR {1,2} -> categoryOfDolphin for MORFAC-routed Dolphin (same coding)
     "categoryOfDolphin",
     // VALLMA -> valueOfLocalMagneticAnomaly.magneticAnomalyValue (LocalMagneticAnomaly)
-    "valueOfLocalMagneticAnomaly", "magneticAnomalyValue",
+                   "valueOfLocalMagneticAnomaly",
+    "magneticAnomalyValue",
     // inTheWater: producer spatial derivation (point over DEPARE and not over LNDARE),
     // no S-57 source (s101_adapt.zig readsInTheWater); true-only, else absent
-    "inTheWater",
+                "inTheWater",
     // light sector + rhythm synthesis (s101_adapt.zig:376-431, 697-710)
-    "sectorCharacteristics",   "lightSector",
-    "sectorLimit",             "sectorLimitOne",
-    "sectorLimitTwo",          "sectorBearing",
-    "directionalCharacter",    "rhythmOfLight",
-    "lightCharacteristic",     "signalGroup",
-    "signalPeriod",            "valueOfNominalRange",
+    "sectorCharacteristics",            "lightSector",
+    "sectorLimit",                      "sectorLimitOne",
+    "sectorLimitTwo",                   "sectorBearing",
+    "directionalCharacter",             "rhythmOfLight",
+    "lightCharacteristic",              "signalGroup",
+    "signalPeriod",                     "valueOfNominalRange",
     "lightVisibility",
     // featureName from OBJNAM (s101_adapt.zig:466, 477-480)
-    "featureName",             "name",
-    "language",                "nameUsage",
+                     "featureName",
+    "name",                             "language",
+    "nameUsage",
     // zoneOfConfidence from M_QUAL CATZOC (s101_adapt.zig:482-489)
-    "zoneOfConfidence",        "categoryOfZoneOfConfidenceInData",
+                           "zoneOfConfidence",
+    "categoryOfZoneOfConfidenceInData",
     // topmark fold (s101_adapt.zig:513-522, 641-643)
-    "topmark",                 "topmarkDaymarkShape",
+    "topmark",
+    "topmarkDaymarkShape",
     // QUAPOS aggregate -> feature attr (s101_adapt.zig:552-557)
-    "qualityOfHorizontalMeasurement",
+                 "qualityOfHorizontalMeasurement",
     // depth range served for DepthArea/DepthContour (s101_adapt.zig:607-610)
     "depthRangeMinimumValue",
     // underwater-hazard depths for UDWHAZ05/OBSTRN07/WRECKS05 (s101_adapt.zig:544-549):
     // defaultClearanceDepth always, surroundingDepth when the danger sits in a depth area
-    "surroundingDepth",        "defaultClearanceDepth",
+              "surroundingDepth",
+    "defaultClearanceDepth",
 };
 
 // ---- S-65 Annex B value-level rules (the "correctness" axis) ----------------

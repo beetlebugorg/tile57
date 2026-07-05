@@ -23,8 +23,8 @@ const FONT = .{"Noto Sans Regular"};
 // are mariner-dependent and now resolve through the chartstyle builders (one style
 // builder); only the mariner-INDEPENDENT layout exprs remain comptime tuples here.
 
-// The static (no-manifest) SCAMIN/smax/oscl gate is now expressed as K / 2^zoom —
-// the SAME display-denominator form the bucket/smax path uses (styleJson computes
+// The static (no-manifest) SCAMIN/oscl gate is now expressed as K / 2^zoom —
+// the SAME display-denominator form the bucket path uses (styleJson computes
 // K = M_PER_PX_Z0·cos(scamin_lat)/(pitch/1000) once per archive). The old hardcoded
 // DENOM_Z0 (0.28 mm OGC pixel, equator) gated ~0.4 z late at mid-latitude and used
 // the uncalibrated CSS pixel; K is latitude-corrected and calibrated. See
@@ -50,15 +50,15 @@ pub fn scaminDisplayZoom(scamin: f64, lat: f64) f64 {
 
 /// The per-archive display-denominator constant K such that the on-screen 1:N
 /// denominator at Web-Mercator `zoom` is K / 2^zoom (== displayDenom). Baked into the
-/// static SCAMIN/smax/oscl gate at the archive-center latitude; the SAME constant the
-/// bucket/smax path computes (styleJson). Replaces the old equator-only OGC DENOM_Z0.
+/// static SCAMIN/oscl gate at the archive-center latitude; the SAME constant the
+/// bucket path computes (styleJson). Replaces the old equator-only OGC DENOM_Z0.
 pub fn scaminGateK(lat: f64) f64 {
     return M_PER_PX_Z0 * @cos(lat * std.math.pi / 180.0) / (DEFAULT_PX_PITCH_MM / 1000.0);
 }
 
 test "scaminGateK: K/2^zoom equals displayDenom (one gate constant)" {
     // The static gate's D(zoom) = K/2^zoom must match the physical displayDenom used
-    // by the bucket/smax path — so scamin/smax/oscl share one latitude-correct form.
+    // by the bucket path — so scamin/oscl share one latitude-correct form.
     const k = scaminGateK(38.9);
     try std.testing.expectApproxEqRel(displayDenom(9.0, 38.9), k / std.math.exp2(9.0), 1e-12);
     // Equator K is the calibrated-pixel world denominator (NOT the OGC 279.5M).
@@ -229,55 +229,37 @@ const SCtx = struct {
     common: []const std.json.Value, // filters AND-ed onto every chart layer ([] = template)
     text_group: ?std.json.Value, // extra filter for text layers (null = template)
     size_scale: f64, // §4 physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
-    smax: SmaxGate, // band-handoff gate AND-ed onto every chart layer (see SmaxGate)
-    // The overscale clauses (writeOsclClause) reuse `smax` as their gate value —
-    // same modes, same injected DENOM literal, same show-all placeholder mapping.
+    // The overscale (oscl) clauses' gate value (writeOsclClause): the injected
+    // DENOM literal under the live filter-gate, else the per-archive K/2^zoom.
+    oscl_gate: DenomGate,
     show_overscale: bool, // S-52 §10.1.10 mariner toggle -> the overscale layer's visibility
 };
 
-// Band-handoff (smax) gate: a coarser-band feature carried down past a finer
-// band's coverage (bake_enc carryGate) is tagged with its handoff denominator
-// `smax` and must hide once the display is FINER than 1:smax — untagged features
-// always pass (coalesce -> 0 < any denominator). The gate rides EVERY chart layer
-// (base + _scamin + soundings): carried copies of ungated features (fills, plain
-// symbols) land in the base layers too.
-const SmaxGate = union(enum) {
-    off, // ignore_scamin: no scale gating at all (§2 debug toggle)
+// Display-denominator gate value for the overscale clauses.
+const DenomGate = union(enum) {
     // scamin-layers.md filter-gate: the DENOM literal is the SAME injected value
     // as the scamin clause; the live client rewrites both at ladder crossings.
     denom: f64,
     // Native/bucket + zoom-gate paths: DENOM computed from ["zoom"] — K / 2^zoom,
     // K = the per-archive display denominator at z0 (physical at the style's fixed
     // latitude, scaminGateK) — the SAME constant for the bucket path AND the
-    // no-manifest fallback, so scamin/smax/oscl gate identically.
+    // no-manifest fallback, so scamin/oscl gate identically.
     zoom_k: f64,
 };
-
-// The smax filter clause. The filter-gate form is EXACTLY
-//   ["<", ["coalesce", ["get","smax"], 0], DENOM]
-// — the live client pattern-matches this shape to rewrite DENOM alongside the
-// scamin clause, so keep the two in lockstep (band-handoff contract).
-fn writeSmaxClause(js: *Stringify, gate: SmaxGate) !void {
-    switch (gate) {
-        .off => {},
-        .denom => |d| try js.write(.{ "<", .{ "coalesce", .{ "get", "smax" }, 0 }, d }),
-        .zoom_k => |k| try js.write(.{ "<", .{ "coalesce", .{ "get", "smax" }, 0 }, .{ "/", k, .{ "^", 2, .{"zoom"} } } }),
-    }
-}
 
 // The overscale (oscl) clause — S-52 §10.1.10 (specs/overscale.md). The
 // filter-gate form is EXACTLY
 //   [">", ["coalesce", ["get","oscl"], 0], DENOM]
 // ("the display is FINER than the cell's quantized compilation scale"), or its
-// ["!", …] negation for the at-scale fill pass drawn ABOVE the hatch. It rides
-// the SAME gate value (and injected DENOM literal) as the smax clause — the live
-// client pattern-matches the inner shape to rewrite DENOM alongside scamin/smax,
-// so keep the three in lockstep (overscale contract). The shared boot/diff
-// placeholder (1e12) reads as hide-the-hatch / all-fills-at-scale — today's
-// rendering — until the client injects the live denominator.
-fn writeOsclClause(js: *Stringify, gate: SmaxGate, negate: bool) !void {
+// ["!", …] negation for the at-scale fill pass drawn ABOVE the hatch. It shares
+// the scamin clause's injected DENOM literal — the live client pattern-matches
+// the inner shape to rewrite DENOM alongside scamin (overscale contract). The
+// shared boot/diff placeholder (1e12) reads as hide-the-hatch / all-fills-at-
+// scale — today's rendering — until the client injects the live denominator.
+// Decoupled from SCAMIN gating per spec §5: ?ignoreScamin / declutter-off no
+// longer kill the hatch.
+fn writeOsclClause(js: *Stringify, gate: DenomGate, negate: bool) !void {
     switch (gate) {
-        .off => {},
         .denom => |d| if (negate)
             try js.write(.{ "!", .{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, d } })
         else
@@ -386,34 +368,23 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
     }
     // zoom_gate (the only other clause-bearing mode; has_clause guarantees it): static,
     // latitude-correct gate — show a SCAMIN feature only when the display is at least as
-    // fine as its 1:N, i.e. scamin >= D(zoom) with D = K/2^zoom. Shares the smax/oscl
+    // fine as its 1:N, i.e. scamin >= D(zoom) with D = K/2^zoom. Shares the oscl
     // gate's K (writeSmaxClause/.zoom_k), so the three stay in lockstep.
     try js.write(.{ ">=", .{ "coalesce", .{ "get", "scamin" }, SCAMIN_COALESCE_MAX }, .{ "/", bkt.zoom_k, .{ "^", 2, .{"zoom"} } } });
 }
 
 // Write a layer's `filter`. The filter ANDs together (in order): the `base` predicate
 // (when has_base), the merged layer's SCAMIN gate clause (filter-gate / zoom-gate), the
-// band-handoff smax clause (s.smax), the shared mariner `common` filters (s.common), and
-// a layer-specific `extra` (the text-group filter on text layers). All optional; a single
-// part is written bare (no "all" wrapper) so a template layer is byte-identical to the
-// pre-mariner output. `has_base=false` for layers with no base predicate
-// (fills/patterns/complex/soundings).
-fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *const SCtx, drop_smax: bool, extra: ?std.json.Value) !void {
+// the shared mariner `common` filters (s.common), and a layer-specific `extra` (the
+// text-group filter on text layers). All optional; a single part is written bare (no
+// "all" wrapper) so a template layer is byte-identical to the pre-mariner output.
+// `has_base=false` for layers with no base predicate (fills/patterns/complex/soundings).
+fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *const SCtx, extra: ?std.json.Value) !void {
     const has_clause = bkt.zoom_gate or bkt.filter_gate;
-    // scamin-standalone.md §0/§3: the point / text / line families are band-INDEPENDENT —
-    // their whole display lifecycle is the scamin gate, so the band-handoff `smax`
-    // carry-down clause does NOT apply (a feature "should just exist regardless of band").
-    // Their layer functions pass `drop_smax=true`; in the v2 merged schema every such
-    // layer now carries a scamin clause (has_clause), so smax is dropped from the whole
-    // merged point/text/line family. smax STAYS on areas/patterns (§46 "area/line only" —
-    // fills need scale-appropriate generalization + occlusion) and on SOUNDINGS ("stay
-    // as-is"), which pass `drop_smax=false`.
-    const has_smax = s.smax != .off and !(has_clause and drop_smax);
-    const has_oscl = bkt.oscl != .none and s.smax != .off; // oscl rides the smax gate value
+    const has_oscl = bkt.oscl != .none;
     var n: usize = s.common.len;
     if (has_base) n += 1;
     if (has_clause) n += 1;
-    if (has_smax) n += 1;
     if (has_oscl) n += 1;
     if (extra != null) n += 1;
     if (n > 0) {
@@ -425,8 +396,7 @@ fn applyBucket(js: *Stringify, base: anytype, has_base: bool, bkt: Bucket, s: *c
         }
         if (has_base) try js.write(base);
         if (has_clause) try writeScaminClause(js, bkt);
-        if (has_smax) try writeSmaxClause(js, s.smax);
-        if (has_oscl) try writeOsclClause(js, s.smax, bkt.oscl == .at_scale);
+        if (has_oscl) try writeOsclClause(js, s.oscl_gate, bkt.oscl == .at_scale);
         for (s.common) |c| try js.write(c);
         if (extra) |e| try js.write(e);
         if (wrap) try js.endArray();
@@ -438,7 +408,7 @@ fn lineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, name: []const u8, f
     const id = try std.fmt.bufPrint(&buf, "{s}-{s}{s}", .{ sl, name, bkt.suffix });
     try js.beginObject();
     try layerHead(js, id, "line", sl);
-    try applyBucket(js, filt, true, bkt, s, true, null); // line: scamin line variants band-independent
+    try applyBucket(js, filt, true, bkt, s, null); // line: scamin line variants band-independent
     try js.objectField("layout");
     try js.beginObject();
     // draw_prio as the sole intra-layer z-order axis (mirrors fill-/symbol-sort-key),
@@ -533,11 +503,11 @@ fn applyPointBucket(js: *Stringify, s: *const SCtx, bkt: Bucket, comptime rot_no
     switch (mode) {
         // UNDER soundings: effective-prio < 18, and neither a danger (rides the over
         // pass via its class) nor a light (its own top pass).
-        .base => try applyBucket(js, .{ "all", rot, .{ "<", EFF_PRIO, SOUNDINGS_PRIO }, not_light, .{ "!", IN_DANGER } }, true, bkt, s, true, null),
+        .base => try applyBucket(js, .{ "all", rot, .{ "<", EFF_PRIO, SOUNDINGS_PRIO }, not_light, .{ "!", IN_DANGER } }, true, bkt, s, null),
         // OVER soundings: effective-prio >= 18 OR a danger class (the deviation), not a light.
-        .dangers_only => try applyBucket(js, .{ "all", rot, .{ "any", .{ ">=", EFF_PRIO, SOUNDINGS_PRIO }, IN_DANGER }, not_light }, true, bkt, s, true, null),
+        .dangers_only => try applyBucket(js, .{ "all", rot, .{ "any", .{ ">=", EFF_PRIO, SOUNDINGS_PRIO }, IN_DANGER }, not_light }, true, bkt, s, null),
         // LIGHTS on top (kept a dedicated pass for legibility order).
-        .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s, true, null),
+        .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s, null),
     }
 }
 
@@ -580,7 +550,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     const tid = try std.fmt.bufPrint(&buf2, "text{s}", .{bkt.suffix});
     try js.beginObject();
     try layerHead(js, tid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // SCAMIN text band-independent (drop smax)
+    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, s.text_group); // SCAMIN text band-independent
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -608,7 +578,7 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     const lid = try std.fmt.bufPrint(&buf, "light-text{s}", .{bkt.suffix});
     try js.beginObject();
     try layerHead(js, lid, "symbol", sl);
-    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, true, s.text_group); // SCAMIN light-text band-independent (drop smax)
+    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, s.text_group); // SCAMIN light-text band-independent
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
@@ -675,7 +645,7 @@ fn fillLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void 
     try js.objectField("fill-antialias");
     try js.write(true);
     try js.endObject();
-    try applyBucket(js, .{}, false, bkt, s, false, null); // area fills stay band-quilted (keep smax)
+    try applyBucket(js, .{}, false, bkt, s, null); // area fills
     try js.endObject();
 }
 
@@ -695,7 +665,7 @@ fn patternLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !vo
     try js.objectField("fill-pattern");
     try js.write(.{ "concat", "pat:", .{ "coalesce", .{ "get", "pattern_name" }, "" } });
     try js.endObject();
-    try applyBucket(js, FILT_NOT_OVERSC, true, bkt, s, false, null); // area patterns stay band-quilted
+    try applyBucket(js, FILT_NOT_OVERSC, true, bkt, s, null); // area patterns stay band-quilted
     try js.endObject();
 }
 
@@ -720,7 +690,7 @@ fn overscaleLayer(js: *Stringify, s: *const SCtx) !void {
     try js.objectField("fill-pattern");
     try js.write("pat:OVERSC01");
     try js.endObject();
-    try applyBucket(js, FILT_OVERSC, true, .{ .oscl = .overscaled }, s, false, null); // overscale hatch rides the smax/oscl gate
+    try applyBucket(js, FILT_OVERSC, true, .{ .oscl = .overscaled }, s, null); // overscale hatch rides the oscl gate
     try js.endObject();
 }
 
@@ -731,7 +701,7 @@ fn complexLineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket)
     try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}{s}", .{ sl, bkt.suffix }), "line", sl);
     try js.objectField("paint");
     try linePaint(js, s.line_color, null, s.size_scale);
-    try applyBucket(js, .{}, false, bkt, s, true, null); // complex (symbolised) scamin lines band-independent
+    try applyBucket(js, .{}, false, bkt, s, null); // complex (symbolised) scamin lines band-independent
     try js.endObject();
 }
 
@@ -740,7 +710,7 @@ fn contourLabelLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}{s}", .{ sl, bkt.suffix }), "symbol", sl);
-    try applyBucket(js, .{ "has", "valdco" }, true, bkt, s, true, null); // contour value labels (scamin text) band-independent
+    try applyBucket(js, .{ "has", "valdco" }, true, bkt, s, null); // contour value labels (scamin text) band-independent
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("symbol-placement");
@@ -789,7 +759,7 @@ fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, FILT_SPOT_SND, true, bkt, s, false, null); // soundings stay as-is (band-quilted, keep smax)
+    try applyBucket(js, FILT_SPOT_SND, true, bkt, s, null); // soundings
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("icon-image");
@@ -808,7 +778,7 @@ fn dangerSoundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "danger_soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, FILT_DANGER_SND, true, bkt, s, false, null); // danger soundings stay as-is (band-quilted)
+    try applyBucket(js, FILT_DANGER_SND, true, bkt, s, null); // danger soundings stay as-is (band-quilted)
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("icon-image");
@@ -888,27 +858,19 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
         .common = if (filters_on) try chartstyle.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
         .text_group = if (filters_on) try chartstyle.textGroupFilter(b, &m) else null,
         .size_scale = opts.size_scale,
-        // Band-handoff gate mode follows the SCAMIN gating mode: the filter-gate
-        // literal when the live client drives it (same injected DENOM), the
-        // per-archive K/2^zoom denominator otherwise (physical at the archive
-        // latitude, scaminGateK — one constant for both the manifest bucket path
-        // and the no-manifest fallback), and nothing under ?ignoreScamin (the
-        // debug toggle shows everything).
-        .smax = if (opts.ignore_scamin)
-            .off
-        else if (opts.scamin_filter_gate)
+        // Overscale gate mode follows the SCAMIN gating mode: the filter-gate
+        // literal when the live client drives it (same injected DENOM), else the
+        // per-archive K/2^zoom denominator (physical at the archive latitude,
+        // scaminGateK — one constant for both the manifest bucket path and the
+        // no-manifest fallback). Deliberately NOT disabled by ?ignoreScamin —
+        // the overscale indication is independent of decluttering (spec §5).
+        .oscl_gate = if (opts.scamin_filter_gate)
             // The boot/diff placeholder denominator is 0 — show-all for the
-            // scamin clause (scamin >= 0) but show-NOTHING for this one
-            // (smax < 0 fails every feature), which blanked the chart between
-            // a style diff landing and the client's live injection. Map the
-            // placeholder to this clause's own show-all literal; the client
-            // rewrites both clauses to the live denominator regardless.
+            // scamin clause (scamin >= 0) but show-NOTHING inverted for oscl.
+            // Map the placeholder to hide-the-hatch (1e12); the client rewrites
+            // the clause to the live denominator regardless.
             .{ .denom = if (opts.scamin_cur_denom == 0) 1e12 else opts.scamin_cur_denom }
         else
-            // Bucket path AND the no-manifest fallback now share ONE gate constant:
-            // the per-archive, latitude-correct K = display denominator at z0. (The
-            // fallback previously used the equator-only OGC DENOM_Z0, gating ~0.4 z
-            // late at mid-latitude.) scamin/smax/oscl are thereby in lockstep.
             .{ .zoom_k = scaminGateK(opts.scamin_lat) },
         .show_overscale = m.show_overscale,
     };
@@ -976,7 +938,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     // finer opaque DEPARE/LNDARE occlude a coarser cell's hatch and it survives only
     // on coarse-only patches (S-52 §10.1.10, specs/overscale.md). ignore_scamin (gate
     // off) or no sprite keeps a single plain fill layer per bucket.
-    if (s.smax != .off and sprite_on) {
+    if (sprite_on) {
         for (scamin_buckets) |bkt| try fillLayer(js, &s, "areas", try bucketWithOverscale(ba, bkt, .overscaled));
         try overscaleLayer(js, &s);
         for (scamin_buckets) |bkt| try fillLayer(js, &s, "areas", try bucketWithOverscale(ba, bkt, .at_scale));
@@ -1569,68 +1531,13 @@ test "buildFromTemplateScamin: a manifest no longer buckets — the merged zoom-
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "log2") == null);
 }
 
-// ---- band-handoff smax gate tests -------------------------------------------
+// ---- smax removal -----------------------------------------------------------
 
-test "styleJson: the filter-gate smax clause has the EXACT client-matched shape" {
-    const a = std.testing.allocator;
-    const ct =
-        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
-    ;
-    const sm = [_]u32{ 45000, 90000 };
-    const gated = try styleJson(a, .{
-        .scheme = "day",
-        .colortables_json = ct,
-        .sprite = "sprite",
-        .glyphs = "glyphs/{fontstack}/{range}.pbf",
-        .scamin = &sm,
-        .scamin_lat = 38.0,
-        .scamin_filter_gate = true,
-        .scamin_cur_denom = 50000,
-    });
-    defer a.free(gated);
-    // The band-handoff gate, verbatim — chartplotter-go pattern-matches this shape
-    // (band-handoff contract) to rewrite DENOM beside the scamin clause. DENOM is
-    // the SAME injected literal as the scamin clause's.
-    try std.testing.expect(std.mem.indexOf(u8, gated, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],50000]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],50000]") != null);
-
-    // The boot/diff PLACEHOLDER (cur_denom 0) must be show-all for BOTH clauses:
-    // scamin keeps the 0 literal (scamin >= 0 passes everything) while smax maps
-    // to its own show-all end (smax < 1e12) — a 0 literal there hides every
-    // feature and blanked the chart until the client's live injection.
-    const boot = try styleJson(a, .{
-        .scheme = "day",
-        .colortables_json = ct,
-        .sprite = "sprite",
-        .glyphs = "glyphs/{fontstack}/{range}.pbf",
-        .scamin = &sm,
-        .scamin_lat = 38.0,
-        .scamin_filter_gate = true,
-        .scamin_cur_denom = 0,
-    });
-    defer a.free(boot);
-    try std.testing.expect(std.mem.indexOf(u8, boot, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],1000000000000]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, boot, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],0]") != null);
-
-    // The gate rides the BASE layers too: a carried copy of an ungated feature
-    // (fills, plain symbols) lands there and must still hand off.
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, gated, .{});
-    defer parsed.deinit();
-    for (parsed.value.object.get("layers").?.array.items) |lyr| {
-        const id = lyr.object.get("id").?.string;
-        if (std.mem.eql(u8, id, "fill-areas")) {
-            var buf = std.ArrayList(u8).empty;
-            defer buf.deinit(a);
-            var aw: std.Io.Writer.Allocating = .init(a);
-            defer aw.deinit();
-            var st: Stringify = .{ .writer = &aw.writer };
-            try st.write(lyr.object.get("filter").?);
-            try std.testing.expect(std.mem.indexOf(u8, aw.writer.buffered(), "smax") != null);
-        }
-    }
-}
-
-test "styleJson: bucket/zoom-gate modes derive the smax denominator from zoom; ignore_scamin drops it" {
+test "styleJson: no smax clause in any gating mode (band-handoff gate retired)" {
+    // The coverage-clipped composite owns cross-band occlusion geometrically
+    // (specs/cross-band-composition-redesign.md §3): no layer carries a
+    // band-handoff smax clause any more, in any gating mode — and the overscale
+    // gate survives ?ignoreScamin (decoupled per spec §5).
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
@@ -1644,28 +1551,33 @@ test "styleJson: bucket/zoom-gate modes derive the smax denominator from zoom; i
         .scamin = &sm,
         .scamin_lat = 38.0,
     };
-    // Bucket mode: DENOM = K/2^zoom at the manifest latitude (physical formula).
+
+    var gated_opts = base;
+    gated_opts.scamin_filter_gate = true;
+    gated_opts.scamin_cur_denom = 50000;
+    const gated = try styleJson(a, gated_opts);
+    defer a.free(gated);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "smax") == null);
+    // The scamin clause still gates (same injected DENOM literal).
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],50000]") != null);
+
     const bucketed = try styleJson(a, base);
     defer a.free(bucketed);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],[\"/\",") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\"^\",2,[\"zoom\"]]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "smax") == null);
 
-    // No-manifest fallback: the SAME K/2^zoom smax clause as the bucket path (the
-    // per-archive latitude constant), NOT the retired equator-only OGC DENOM_Z0.
     var nm = base;
     nm.scamin = &.{};
     const fb = try styleJson(a, nm);
     defer a.free(fb);
-    try std.testing.expect(std.mem.indexOf(u8, fb, "\"smax\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fb, "[\"<\",[\"coalesce\",[\"get\",\"smax\"],0],[\"/\",") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fb, "279541132") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fb, "smax") == null);
 
-    // ignore_scamin: the debug toggle shows everything — no smax gate anywhere.
     var ign = base;
     ign.ignore_scamin = true;
     const out_ign = try styleJson(a, ign);
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "smax") == null);
+    // ignoreScamin no longer kills the overscale indication (spec §5).
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") != null);
 }
 
 // ---- overscale (oscl) gate tests (specs/overscale.md) -----------------------
@@ -1688,7 +1600,7 @@ test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
     });
     defer a.free(gated);
     // The overscale gate, verbatim — chartplotter-go pattern-matches this shape
-    // (overscale contract) to rewrite DENOM beside the scamin/smax clauses. The
+    // (overscale contract) to rewrite DENOM beside the scamin clause. The
     // hatch + the under-hatch fill pass carry the positive clause; the at-scale
     // fill pass carries its ["!", …] negation (occlusion sandwich).
     try std.testing.expect(std.mem.indexOf(u8, gated, "[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],50000]") != null);
@@ -1699,7 +1611,7 @@ test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
 
     // The boot/diff PLACEHOLDER (cur_denom 0) maps to 1e12 — hide the hatch and
     // keep every fill in the at-scale pass (today's rendering) until the client
-    // injects the live denominator (the smax placeholder lesson, cb91c4d).
+    // injects the live denominator (the placeholder lesson, cb91c4d).
     const boot = try styleJson(a, .{
         .scheme = "day",
         .colortables_json = ct,
@@ -1737,7 +1649,7 @@ test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
     try std.testing.expectEqualStrings("visible", hatch.get("layout").?.object.get("visibility").?.string);
 }
 
-test "styleJson: showOverscale=false hides the hatch layer; ignore_scamin drops the machinery" {
+test "styleJson: showOverscale=false hides the hatch layer; ignoreScamin keeps it (decoupled)" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
@@ -1761,18 +1673,19 @@ test "styleJson: showOverscale=false hides the hatch layer; ignore_scamin drops 
     try std.testing.expect(std.mem.indexOf(u8, hidden, "{\"visibility\":\"none\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, hidden, "\"oscl\"") != null);
 
-    // Bucket mode derives the oscl DENOM from zoom (same K as the smax clause).
+    // Bucket mode derives the oscl DENOM from zoom (same K as the scamin clause).
     const bucketed = try styleJson(a, base);
     defer a.free(bucketed);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],[\"/\",") != null);
 
-    // ignore_scamin: no oscl clauses, no hatch layer, the single plain fill layer.
+    // ignore_scamin: the overscale indication is DECOUPLED from decluttering
+    // (spec §5) — the oscl clauses + hatch layer survive the debug toggle.
     var ign = base;
     ign.ignore_scamin = true;
     const out_ign = try styleJson(a, ign);
     defer a.free(out_ign);
-    try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_ign, "\"id\":\"overscale\",") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "\"id\":\"overscale\",") != null);
 
     // No sprite -> nothing can draw the hatch: single plain fill layer, no sandwich.
     var nospr = base;

@@ -132,7 +132,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
                 for (pts.items[i + 1 ..]) |pb| {
                     if (!std.mem.eql(u8, pa.class, pb.class) or !std.mem.eql(u8, pa.sym, pb.sym)) continue;
                     if (std.mem.eql(u8, pa.celln, pb.celln)) continue; // same-cell co-located aids are legit
-                    if (engine.scene.scamin_pts.distM(pa.lon, pa.lat, pb.lon, pb.lat) > 30.0) continue;
+                    if (distM(pa.lon, pa.lat, pb.lon, pb.lat) > 30.0) continue;
                     // Visibility windows (smax, scamin] must intersect for a pair to
                     // ever render simultaneously.
                     const lo = @max(pa.smax, pb.smax);
@@ -147,4 +147,13 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     std.debug.print("audit-pairs: {d} tiles, {d} scamin point features, {d} cross-cell simultaneous pairs\n", .{ tiles_scanned, feats_scanned, pairs });
     return;
+}
+
+// Ground distance in metres between two lon/lat points (equirectangular —
+// fine at aid-separation scales). Local copy of the old scamin_pts.distM.
+fn distM(lon1: f64, lat1: f64, lon2: f64, lat2: f64) f64 {
+    const mean_lat = (lat1 + lat2) * 0.5 * std.math.pi / 180.0;
+    const dx = (lon2 - lon1) * 111_320.0 * @cos(mean_lat);
+    const dy = (lat2 - lat1) * 111_320.0;
+    return std.math.hypot(dx, dy);
 }

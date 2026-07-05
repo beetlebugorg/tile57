@@ -485,8 +485,7 @@ test "viewing group: controlling VG = most-visible draw, band(vg)==cat" {
     // Most-visible across sections: a text group (21), then a Base draw (13030), then an
     // Other draw (90000). vg is the Base draw 13030 (most visible), NOT the first banded
     // draw — and band(vg) == cat == 0 (Base).
-    const both = try parse(a,
-        "ViewingGroup:21,29070;FontColor:CHBLK;TextInstruction:Bar;" ++
+    const both = try parse(a, "ViewingGroup:21,29070;FontColor:CHBLK;TextInstruction:Bar;" ++
         "ViewingGroup:13030;ColorFill:DEPMS;ViewingGroup:90000;AreaFillReference:FOO");
     try std.testing.expectEqual(@as(i64, 13030), both.vg);
     try std.testing.expectEqual(categoryRank(13030), both.cat);

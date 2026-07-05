@@ -69,8 +69,6 @@ pub const FeatureMeta = struct {
     cat: i64 = 1, // display category: 0 base, 1 standard, 2 other
     vg: i64 = 0, // raw viewing group (0 = none)
     scamin: ?i64 = null, // SCAMIN 1:N denominator (null = no display limit)
-    smax: i64 = 0, // band-handoff denominator: a carried coarser-band copy
-    // hides once the display is finer than 1:smax (0 = none)
     oscl: i64 = 0, // the source cell's X2 overscale gate denominator
     // (cscl/OVERSCALE_FACTOR, 0 = unknown): tagged on area fills +
     // patterns so the style can order/gate by overscale state;

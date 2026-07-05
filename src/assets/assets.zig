@@ -27,6 +27,7 @@ pub const StyleOpts = @import("style.zig").StyleOpts;
 pub const styleJson = @import("style.zig").styleJson;
 pub const displayDenom = @import("style.zig").displayDenom;
 pub const displayDenomZ = @import("style.zig").displayDenomZ;
+pub const scaminGateK = @import("style.zig").scaminGateK;
 pub const buildFromTemplate = @import("style.zig").buildFromTemplate;
 pub const buildFromTemplateScamin = @import("style.zig").buildFromTemplateScamin;
 pub const styleDiff = @import("style.zig").styleDiff;

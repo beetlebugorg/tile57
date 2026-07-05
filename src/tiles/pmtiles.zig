@@ -730,9 +730,15 @@ test "large archive shards the root into leaf directories and still round-trips"
 
 test "header serialize/parse round-trip" {
     const h = Header{
-        .root_dir_offset = 127, .root_dir_length = 50, .tile_data_offset = 300,
-        .min_zoom = 9, .max_zoom = 16, .num_addressed_tiles = 765,
-        .tile_compression = .gzip, .internal_compression = .none, .tile_type = .mvt,
+        .root_dir_offset = 127,
+        .root_dir_length = 50,
+        .tile_data_offset = 300,
+        .min_zoom = 9,
+        .max_zoom = 16,
+        .num_addressed_tiles = 765,
+        .tile_compression = .gzip,
+        .internal_compression = .none,
+        .tile_type = .mvt,
     };
     var buf: [HEADER_LEN]u8 = undefined;
     h.serialize(&buf);

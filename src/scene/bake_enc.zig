@@ -8,7 +8,7 @@
 //! Band handoff: a band's FLOOR-zoom tiles (the zoom it shares with the
 //! next-coarser band) are NOT baked in its own pass — they are deferred into the
 //! coarser band's pass, which bakes them with BOTH bands' cells alive, carrying
-//! the coarser band down scamin-aware (carryGate/`smax`) so the band boundary has
+//! the coarser band down (retired — the coverage-clipped composite owns the
 //! no blank window while the finer band's SCAMIN-gated bulk is still hidden.
 //!
 //! Pure engine code (no Lua): the caller parses + portrays one band's cells, calls
@@ -43,13 +43,8 @@ pub const Backend = struct {
     // coarser cell is suppressed there (the finer owns it; coarse only fills holes).
     coverage: []const []const []const s57.LonLat = &.{},
     // The cell's distinct SCAMIN denominators, ascending (collectScamins) — the
-    // scamin-ladder slice the band-handoff carry-down quantizes `smax` onto (see
-    // quantizeHandoff). Empty = the cell carries no SCAMIN (quantize falls back to
-    // the covering cell's raw CSCL).
+    // tilejson scamin ladder's per-cell slice (client filter-gate crossings).
     scamins: []const u32 = &.{},
-    // SCAMIN standalone (scene.scamin_pts): per-feature smax caps for an overlay
-    // mini-cell Backend (Baker.overlay); null for regular cells.
-    feat_smax: ?[]const i64 = null,
     // Sector-figure reach (scene.LightReach / collectLightReach): bbox of the
     // features whose portrayal constructs light-sector legs/arcs (null = none)
     // and the max ground-distance leg length. Figures extend beyond their anchors
@@ -149,6 +144,9 @@ const BackendCov = struct {
     pub inline fn bounds(self: BackendCov, i: u32) [4]f64 {
         return self.backends[i].bounds;
     }
+    pub inline fn name(self: BackendCov, i: u32) []const u8 {
+        return self.backends[i].cell.name;
+    }
 };
 
 fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
@@ -169,13 +167,20 @@ fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) b
 /// else, including inside a finer no-data hole (no blank). null = nothing finer
 /// covers this tile (the cell is finest here → draw everything). Allocated in `a`
 /// (the per-tile scratch), so it lives exactly as long as the tile.
-pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, reach_only: ?[]const bool, cscl_self: i32, z: u8, x: u32, y: u32, box: tile.Box) ?[]const []const mvt.Point {
+pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, reach_only: ?[]const bool, self_idx: u32, z: u8, x: u32, y: u32, box: tile.Box) ?[]const []const mvt.Point {
+    const cscl_self = ctx.cscl(self_idx);
     if (cscl_self <= 0) return null;
     var covers = std.ArrayList(geometry.boolean.Polygon).empty;
     for (idxs, 0..) |idx, j| {
         if (reach_only) |ro| if (ro[j]) continue;
+        if (idx == self_idx) continue;
         const cscl = ctx.cscl(idx);
-        if (cscl <= 0 or cscl >= cscl_self) continue; // only strictly finer
+        if (cscl <= 0 or cscl > cscl_self) continue; // coarser never clips finer
+        // Strictly finer coverage always clips. EQUAL-scale neighbours clip by a
+        // deterministic total order (cell name), so two adjacent same-band cells
+        // that both chart a seam object emit exactly one copy — spec §2.3:
+        // F(cell c) = union of M_COVR of all cells ordered strictly before c.
+        if (cscl == cscl_self and !std.mem.lessThan(u8, ctx.name(idx), ctx.name(self_idx))) continue;
         for (ctx.coverage(idx)) |rings| {
             var poly = std.ArrayList([]const geometry.boolean.Pt).empty;
             for (rings) |ring| {
@@ -250,7 +255,7 @@ fn finestCsclCtx(context: []const ContextCell, lon: f64, lat: f64, best_in: i32)
 
 /// A parsed cell's distinct SCAMIN denominators, sorted ascending — its slice of
 /// the archive's scamin ladder, kept per Backend/cell so the band-handoff can
-/// quantize `smax` onto values that really exist (see quantizeHandoff). Allocated
+/// feed the tilejson scamin ladder (client filter-gate crossings). Allocated
 /// in `a` (callers use the cell's own arena so the list lives exactly as long as
 /// the cell).
 pub fn collectScamins(a: std.mem.Allocator, cell: *const s57.Cell) ![]const u32 {
@@ -264,41 +269,6 @@ pub fn collectScamins(a: std.mem.Allocator, cell: *const s57.Cell) ![]const u32 
     }
     std.mem.sort(u32, vals.items, {}, std.sort.asc(u32));
     return vals.toOwnedSlice(a);
-}
-
-/// The band-handoff denominator for a coarser cell yielding to finer coverage of
-/// compilation scale `cscl_fine`: the smallest SCAMIN denominator >= cscl_fine
-/// among the participating cells' ladders (the crossing at which the finer cell's
-/// own gated bulk activates — the exact moment the carried copy must hand off),
-/// falling back to the raw cscl_fine when no ladder value reaches it. Quantizing
-/// UP onto a real ladder value keeps the client's crossing ladder unchanged and
-/// the handoff aligned to a crossing; an off-ladder smax would hand off late by
-/// up to one ladder gap.
-pub fn quantizeHandoff(ladders: []const []const u32, cscl_fine: i32) i64 {
-    if (cscl_fine <= 0) return cscl_fine;
-    const want: u32 = @intCast(cscl_fine);
-    var best: i64 = std.math.maxInt(i64);
-    for (ladders) |vals| {
-        // vals is ascending: the first value >= cscl_fine is this cell's candidate.
-        for (vals) |v| {
-            if (v >= want) {
-                if (v < best) best = v;
-                break;
-            }
-        }
-    }
-    // Snap onto a NEARBY ladder rung (keeps the handoff aligned to a real client
-    // crossing) — but reject a rung that overshoots cscl_fine by more than ~30%.
-    // Snapping across a wide ladder gap (observed: 2.16M -> 2.999M) pushes the
-    // handoff far above the covering cell's own activation scale, so carryGate's
-    // escape `display_denom > handoff` never fires for displays in
-    // (cscl_fine, rung) and the coarse cell is plainly suppressed there —
-    // re-opening the band-floor blank the carry exists to prevent. Beyond the
-    // cap, fall back to the raw crossing (a supported handoff; BakeSink folds it
-    // into the manifest, so the client still gets a crossing there).
-    const want_i: i64 = want;
-    if (best != std.math.maxInt(i64) and best * 10 <= want_i * 13) return best;
-    return want_i;
 }
 
 /// S-52 overscale factor at/above which AP(OVERSC01) marks a scale boundary.
@@ -330,67 +300,23 @@ pub fn overscaleGateDenom(cscl: i32) i64 {
     return @divTrunc(cscl, OVERSCALE_FACTOR);
 }
 
-/// One cell's per-tile quilting decision against the finest covering finer-scale
-/// coverage — shared by the baker (TileGenCtx.gen) and the live path (chart.zig
-/// tileRefs) so the two can't drift. `gf_centre` / `gf_whole` are finestCsclAt
-/// results (centre incl. derived extents / max over centre+corners, real M_COVR
-/// only); `display_denom` is the tile's display-window shallow end D(z, φ_tile).
-pub const CellGate = struct {
-    suppress_centre: bool = false, // line strokes + area patterns (tile-centre rule)
-    suppress_whole: bool = false, // fills + points/text (whole-tile rule)
-    smax: i64 = 0, // carry-down handoff denominator tag; 0 = not carried
-};
-
-/// Scamin-aware carry-down (band handoff): where a strictly-finer-CSCL cell's
-/// coverage owns the tile, the coarser cell is normally suppressed — but that is
-/// SCAMIN-blind: in the window where the display is still coarser than the finer
-/// cell's compilation scale (display_denom > cscl_fine), the finer content is
-/// largely SCAMIN-hidden and suppression leaves a hole (the band-floor blank).
-/// There the coarse cell is INCLUDED instead, tagged `smax` = the quantized
-/// handoff denominator, so the client hides the copy the moment the display gets
-/// finer than the handoff. The carry is skipped (plain suppression) when even the
-/// quantized handoff can't display inside this tile's window (display_denom <=
-/// smax) — the copy would be dead weight in the tile.
-// Diagnostic (compile-time): flip to `true` + rebuild to log every coarse (general/
-// overview) cell whose FILLS end up SUPPRESSED by best-available — i.e. where land /
-// depth-areas get CUT because the carry-down didn't fire. Prints cscl / gf_whole /
-// display / handoff so the cause is visible (handoff >> gf_whole = a SCAMIN-ladder gap
-// overshooting the band handoff). Off (dead-stripped) by default. Covers bake + live.
-const carry_dbg = false; // TEMP diagnostic hook: flip to true to log land-cut suppressions
-var carry_dbg_n = std.atomic.Value(usize).init(0);
-
-pub fn carryGate(cscl: i32, gf_centre: i32, gf_whole: i32, display_denom: f64, ladders: []const []const u32) CellGate {
-    var g = CellGate{
-        .suppress_centre = cscl > 0 and gf_centre < cscl, // a finer cell covers the centre
-        .suppress_whole = cscl > 0 and gf_whole < cscl, // a finer cell covers the whole tile
-    };
-    // Prefer the whole-tile gate's handoff (fills + points, the visible bulk); a
-    // centre-only carry (seam tiles) falls back to the centre gate's scale.
-    if (g.suppress_whole) {
-        const h = quantizeHandoff(ladders, gf_whole);
-        if (display_denom > @as(f64, @floatFromInt(h))) {
-            g.suppress_whole = false;
-            g.smax = h;
-        }
-    }
-    if (g.suppress_centre) {
-        const h = quantizeHandoff(ladders, gf_centre);
-        if (display_denom > @as(f64, @floatFromInt(h))) {
-            g.suppress_centre = false;
-            if (g.smax == 0) g.smax = h;
-        }
-    }
-    if (carry_dbg) {
-        // Self-verifying: the first ~60 calls print UNCONDITIONALLY (proof the flag is
-        // compiled + carryGate is on the bake path), then only suppressions (the land-cut
-        // cases) up to a cap. If you see NO lines at all → the running binary predates
-        // this edit. If you see "carryGate#.." but never sw=true → carryGate isn't the
-        // suppressor and the cut is elsewhere.
-        const nn = carry_dbg_n.fetchAdd(1, .monotonic);
-        if (nn < 60 or ((g.suppress_whole or g.suppress_centre) and nn < 5000))
-            std.debug.print("carryGate#{d} cscl={d} gf_whole={d} gf_centre={d} display={d:.0} handoff={d} sw={} sc={}\n", .{ nn, cscl, gf_whole, gf_centre, display_denom, quantizeHandoff(ladders, gf_whole), g.suppress_whole, g.suppress_centre });
-    }
-    return g;
+/// The effScamin floor for a cell (spec §4): the display denominator of the
+/// cell's band-floor zoom under the client's static gate constant
+/// (assets.scaminGateK at the equator — the largest K over all latitudes, so
+/// the clamp holds everywhere). A feature's emitted `scamin` is floored here so
+/// an aggressive SCAMIN cannot blank a point between the cell's floor tier and
+/// its own activation zoom — the finer cell owns that ground geometrically, so
+/// nothing else can show there. Tiles below the floor don't exist, so lifting a
+/// smaller scamin up to the floor denominator changes nothing below it.
+pub fn effScaminFloor(cscl: i32) i64 {
+    if (cscl <= 0) return 0;
+    const floor_z = bandZooms(bandOf(cscl)).min;
+    // The coarsest band has no coarser copy to hand off from, so no blank
+    // window can open — leave its SCAMINs raw (a z0 clamp would disable
+    // decluttering at world view entirely).
+    if (floor_z == 0) return 0;
+    const k = assets.scaminGateK(0);
+    return @intFromFloat(@ceil(k / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(floor_z)))));
 }
 
 /// Native [minzoom, maxzoom] Web-Mercator span for a navigational-purpose band.
@@ -577,17 +503,6 @@ pub fn parallelFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *co
     for (threads[0..spawned]) |t| t.join();
 }
 
-// Whether a SCAMIN-overlay mini cell joins tile `tbll`: its bounds padded by the
-// mini's sector-figure reach — one tile for display-mm legs/arcs, the honest
-// per-zoom span for ground-length directional legs (scene.lightReachTiles).
-fn overlayNear(ov: *const Backend, tbll: [4]f64, z: u8, clat: f64) bool {
-    const reach = scene.lightReachTiles(ov.light_range_m, z, clat);
-    const pad_lon = (tbll[2] - tbll[0]) * reach;
-    const pad_lat = (tbll[3] - tbll[1]) * reach;
-    return ov.bounds[0] <= tbll[2] + pad_lon and ov.bounds[2] >= tbll[0] - pad_lon and
-        ov.bounds[1] <= tbll[3] + pad_lat and ov.bounds[3] >= tbll[1] - pad_lat;
-}
-
 // Worker context for parallel per-tile MVT generation. Each index is an
 // independent tile; encodeTile only reads the cells, so this is race-free.
 const TileGenCtx = struct {
@@ -598,11 +513,6 @@ const TileGenCtx = struct {
     gpa: std.mem.Allocator,
     format: scene.TileFormat = .mvt,
     pick_attrs: bool = true, // emit the per-feature pick-report attrs (s57/cell); off = lean tiles
-    // SCAMIN standalone (Baker.overlay/scamin_standalone): the deduped SCAMIN
-    // point mini cells joining EVERY tile by per-feature scale-window
-    // eligibility, and the flag that makes regular cells skip their own copies.
-    overlay: []const Backend = &.{},
-    standalone: bool = false,
     // Cross-pack best-available (Baker.context): peer packs' coverage folded into
     // the finest-scale suppression scan so this pack's coarser cells defer where a
     // peer is finer. Read-only; emits nothing.
@@ -640,15 +550,6 @@ const TileGenCtx = struct {
             holefill[j] = (v & HOLEFILL_FLAG) != 0;
         }
         // Per-scale cell quilting: where a strictly-finer-CSCL cell's M_COVR coverage
-        // contains a location, the coarser cell is suppressed there (so two cells of
-        // different scale that both digitise a feature don't double-draw it). The
-        // finest cscl covering the tile CENTRE gates lines/patterns (+ derived bbox
-        // extents); fills/points need a finer cell over ALL of centre+4 corners (no
-        // derived) so a partial seam keeps the coarse fill (no no-data hole).
-        // Suppression is scamin-AWARE (carryGate): where the tile's display window
-        // still opens coarser than the covering finer cell's compilation scale, the
-        // coarser cell rides along tagged with the `smax` handoff denominator
-        // instead — the band-floor blank-window fix.
         const tbll = tile.tileBoundsLonLat(z, x, y); // [minlon, minlat, maxlon, maxlat]
         const box = tile.Box.default(tile.EXTENT, tile.BUFFER); // tile-space clip box (coverage projection)
         const clon = (tbll[0] + tbll[2]) * 0.5;
@@ -730,42 +631,21 @@ const TileGenCtx = struct {
 
         // refs + the encoded tile are transient (gzipped right below), so they ride
         // the per-thread scratch arena — reset after this tile, no per-tile mmap.
-        // SCAMIN-standalone overlay (specs/scamin-standalone.md): the deduped
-        // SCAMIN point mini cells join EVERY tile whose bounds they touch —
-        // independent of bands/emitted-skip — gated per feature by the tile's
-        // display window (scamin_floor = D(z+1, φ_tile); the CellRef clamp).
-        // Padded by the mini's sector-figure reach — one tile for display-mm
-        // legs/arcs (mirrors the LIGHT_AUG_REACH margin in the feature cull),
-        // the honest per-zoom span for ground-length directional legs — so a
-        // deduped light's figures reach the neighbouring tiles they cross.
-        var n_ov: usize = 0;
-        for (c.overlay) |*ov| {
-            if (overlayNear(ov, tbll, z, clat)) n_ov += 1;
-        }
-        const refs = scratch.alloc(scene.CellRef, idxs.len + n_ov) catch return;
+        const refs = scratch.alloc(scene.CellRef, idxs.len) catch return;
         for (idxs, 0..) |idx, j| {
             const be = &c.backends[idx];
             // The exact best-available composite: subtract the finer cells' M_COVR
             // from this cell's fills/patterns, and (in scene.appendCellFeatures) drop
             // its points/strokes wherever a finer cell owns the ground. cover_clip is
             // the ONE cross-band mechanism — no carryGate / suppress_whole / smax.
-            const cover_clip = coverClipForCell(scratch, BackendCov{ .backends = c.backends }, idxs, reach_only, be.cscl, z, x, y, box);
+            const cover_clip = coverClipForCell(scratch, BackendCov{ .backends = c.backends }, idxs, reach_only, idx, z, x, y, box);
             // Overscale (S-52 §10.1.10.2): the X2 gate denominator. Hatch this cell's
             // OVERSC01 coverage only where it is the DISPLAYED data AT a scale boundary
             // — a strictly-finer cell rides the tile (gf_tile < cscl) AND this cell
             // still owns some of it (its fills aren't fully clipped away).
             const oscl: i64 = overscaleGateDenom(be.cscl);
             const wins_somewhere = cover_clip == null or !tileFullyCovered(scratch, cover_clip.?, box);
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .smax = 0, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .skip_scamin_points = c.standalone, .light_range_m = be.light_range_m };
-        }
-        if (n_ov > 0) {
-            const floor_denom = assets.displayDenomZ(z + 1, clat);
-            var j = idxs.len;
-            for (c.overlay) |*ov| {
-                if (!overlayNear(ov, tbll, z, clat)) continue;
-                refs[j] = .{ .cell = @constCast(&ov.cell), .portrayal = ov.portrayal, .portrayal_simplified = ov.portrayal_simplified, .feat_bbox = ov.feat_bbox, .feat_smax = ov.feat_smax, .scamin_floor = floor_denom, .light_range_m = ov.light_range_m };
-                j += 1;
-            }
+            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .light_range_m = be.light_range_m };
         }
         const mvt_bytes = scene.encodeTile(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
@@ -808,14 +688,6 @@ pub const Baker = struct {
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
     format: scene.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
     pick_attrs: bool = true, // emit per-feature pick-report attrs (s57/cell); off = lean tiles
-    // SCAMIN standalone (specs/scamin-standalone.md): the deduped SCAMIN point
-    // mini cells (scene.scamin_pts, one Backend per contributing source cell),
-    // set ONCE by the driver before any pass and joined into every tile by
-    // per-feature scale-window eligibility. `scamin_standalone` makes regular
-    // cells skip their own prim==1 SCAMIN features (the overlay owns them);
-    // drivers set it whenever they built an overlay (even an empty one).
-    overlay: []const Backend = &.{},
-    scamin_standalone: bool = false,
     // Cross-pack best-available (bake --existing / tile57_bake_pmtiles context cells):
     // peer packs' M_COVR coverage + cscl, set ONCE by the driver. Folded into the
     // per-tile finest-scale suppression so this pack's overview defers where a peer
@@ -1053,7 +925,7 @@ pub const Baker = struct {
         // NUL-terminated — @tagName is a comptime string literal, safe across the ABI).
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .context = self.context, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .context = self.context, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
@@ -1134,7 +1006,7 @@ pub const Baker = struct {
 
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
-        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .overlay = self.overlay, .context = self.context, .standalone = self.scamin_standalone, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
+        var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .context = self.context, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
         parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
@@ -1225,67 +1097,6 @@ pub fn fillDownZooms(band: Band, minzoom: u8, maxzoom: u8) ?ZoomRange {
     const zhi = @min(maxzoom, fl - 1);
     if (minzoom > zhi) return null;
     return .{ .min = minzoom, .max = zhi };
-}
-
-test "quantizeHandoff: smallest ladder value >= cscl, raw-cscl fallback" {
-    const fine = [_]u32{ 90_000, 260_000, 350_000 };
-    const coarse = [_]u32{ 700_000, 1_000_000 };
-    const ladders = [_][]const u32{ &fine, &coarse };
-    // 200k quantizes up onto the fine cell's 260k (the crossing where its bulk
-    // activates) — a +30% snap, within the nearby-rung cap.
-    try std.testing.expectEqual(@as(i64, 260_000), quantizeHandoff(&ladders, 200_000));
-    // An exact ladder member maps to itself.
-    try std.testing.expectEqual(@as(i64, 260_000), quantizeHandoff(&ladders, 260_000));
-    // Above every fine value the only rung (700k) overshoots 400k by 75% — beyond
-    // the ~30% cap, so it is rejected in favour of the raw crossing (400k), keeping
-    // the band-floor carry window open instead of collapsing it up a ladder gap.
-    try std.testing.expectEqual(@as(i64, 400_000), quantizeHandoff(&ladders, 400_000));
-    // No ladder value reaches it -> raw cscl (BakeSink folds it into the manifest).
-    try std.testing.expectEqual(@as(i64, 2_000_000), quantizeHandoff(&ladders, 2_000_000));
-    try std.testing.expectEqual(@as(i64, 200_000), quantizeHandoff(&.{}, 200_000));
-}
-
-test "carryGate: D>cscl carries with quantized smax; D<=cscl suppresses" {
-    const fine = [_]u32{260_000};
-    const ladders = [_][]const u32{&fine};
-    const none = std.math.maxInt(i32);
-
-    // Display window opens coarser than the covering fine cell (D=578k > 200k):
-    // the coarse cell rides along tagged smax = quantizeUp(200k) = 260k.
-    const carried = carryGate(1_200_000, 200_000, 200_000, 578_000.0, &ladders);
-    try std.testing.expect(!carried.suppress_centre and !carried.suppress_whole);
-    try std.testing.expectEqual(@as(i64, 260_000), carried.smax);
-
-    // Display already finer than the fine cell's compilation scale: plain suppression.
-    const supp = carryGate(1_200_000, 200_000, 200_000, 150_000.0, &ladders);
-    try std.testing.expect(supp.suppress_centre and supp.suppress_whole);
-    try std.testing.expectEqual(@as(i64, 0), supp.smax);
-
-    // D inside (cscl, smax]: the quantized copy could never display in this tile's
-    // window (the client's crossing sits at 260k), so it stays suppressed.
-    const dead = carryGate(1_200_000, 200_000, 200_000, 230_000.0, &ladders);
-    try std.testing.expect(dead.suppress_centre and dead.suppress_whole);
-    try std.testing.expectEqual(@as(i64, 0), dead.smax);
-
-    // No finer coverage at all: best-available, untouched and untagged.
-    const plain = carryGate(1_200_000, none, none, 578_000.0, &ladders);
-    try std.testing.expect(!plain.suppress_centre and !plain.suppress_whole);
-    try std.testing.expectEqual(@as(i64, 0), plain.smax);
-
-    // Seam tile: finer coverage over the centre only (whole-tile gate unmet) —
-    // the centre classes carry, the whole classes were never suppressed.
-    const seam = carryGate(1_200_000, 200_000, none, 578_000.0, &ladders);
-    try std.testing.expect(!seam.suppress_centre and !seam.suppress_whole);
-    try std.testing.expectEqual(@as(i64, 260_000), seam.smax);
-
-    // Empty ladder: the handoff falls back to the raw covering cscl.
-    const raw = carryGate(1_200_000, 200_000, 200_000, 578_000.0, &.{});
-    try std.testing.expectEqual(@as(i64, 200_000), raw.smax);
-
-    // The fine cell itself never yields to its own scale.
-    const self_ok = carryGate(200_000, 200_000, 200_000, 578_000.0, &ladders);
-    try std.testing.expect(!self_ok.suppress_centre and !self_ok.suppress_whole);
-    try std.testing.expectEqual(@as(i64, 0), self_ok.smax);
 }
 
 test "floorDeferred / passHasWork: clamp-aware deferral + carry hosting" {
@@ -1428,8 +1239,11 @@ test "composite floor tile: the finer cell owns the ground (no carried smax copy
         for (L.features) |f| {
             const scamin = findIntProp(f.properties, "scamin") orelse continue;
             const smax = findIntProp(f.properties, "smax");
-            if (scamin == 260_000) {
-                // The fine band's own point: gated by its SCAMIN alone, never tagged.
+            if (scamin == @max(260_000, effScaminFloor(200_000))) {
+                // The fine band's own point, its SCAMIN clamped to the coastal
+                // floor denominator (effScamin, spec §4): it shows the moment
+                // its tile exists, closing the band-floor blank window the
+                // deleted carry-down used to paper over. Never smax-tagged.
                 try std.testing.expectEqual(@as(?i64, null), smax);
                 fine_pts += 1;
             } else if (scamin == 800_000) {
@@ -1740,155 +1554,6 @@ fn countOverscHatches(a: std.mem.Allocator, sink: *CollectSink, z: u8, x: u32, y
         };
     }
     return n;
-}
-
-test "scamin standalone: one deduped feature per tile, scale-window included" {
-    const scamin_pts = scene.scamin_pts;
-    const gpa = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // The acceptance shape in miniature: the SAME object (one FOID) charted in a
-    // coastal 1:200k cell (SCAMIN 260000) and a general 1:1.2M cell (SCAMIN
-    // 800000). Standalone model: ONE deduped feature — fine geometry/attrs,
-    // effective scamin 800000 — in every tile whose window it reaches; the
-    // regular band path emits NO copy of its own. Plus a coarse-only object
-    // (no fine copy) capped at the fine chart's handoff (smax 260000).
-    const fine_attrs = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
-    const fine_feats = [_]s57.Feature{.{
-        .rcnm = 100,
-        .rcid = 1,
-        .prim = 1,
-        .objl = 14,
-        .foid = 0xBEEF,
-        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
-        .attrs = &fine_attrs,
-    }};
-    const coarse_attrs = [_]s57.Attr{.{ .code = 133, .value = "800000" }};
-    const coarse_only_attrs = [_]s57.Attr{.{ .code = 133, .value = "900000" }};
-    const coarse_feats = [_]s57.Feature{ .{
-        .rcnm = 100,
-        .rcid = 1,
-        .prim = 1,
-        .objl = 14,
-        .foid = 0xBEEF,
-        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
-        .attrs = &coarse_attrs,
-    }, .{
-        .rcnm = 100,
-        .rcid = 2,
-        .prim = 1,
-        .objl = 14,
-        .foid = 0xD00D,
-        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 2 }, .ornt = 255 }},
-        .attrs = &coarse_only_attrs,
-    } };
-    var fine_cell = try testCell(gpa, 0.35, 0.35, 200_000, &fine_feats);
-    defer fine_cell.deinit();
-    var coarse_cell = try testCell(gpa, 0.35, 0.35, 1_200_000, &coarse_feats);
-    defer coarse_cell.deinit();
-    // The coarse-only object sits a bit away from the shared one, still covered.
-    try coarse_cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 2, s57.LonLat.init(0.36, 0.36));
-
-    const ring = [_]s57.LonLat{
-        s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2),
-        s57.LonLat.init(3, 3),   s57.LonLat.init(-2, 3),
-        s57.LonLat.init(-2, -2),
-    };
-    const rings = [_][]const s57.LonLat{&ring};
-    const cover = [_][]const []const s57.LonLat{&rings};
-    const bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
-    const streams = [_]?[]const u8{ "DrawingPriority:7;PointInstruction:BOYLAT01", "DrawingPriority:7;PointInstruction:BOYLAT01" };
-    const fine_scamins = [_]u32{260_000};
-    const coarse_scamins = [_]u32{ 800_000, 900_000 };
-
-    var fine = Backend{ .cell = fine_cell, .portrayal = streams[0..1], .bounds = bounds, .cscl = 200_000, .coverage = &cover, .scamins = &fine_scamins };
-    const coarse = Backend{ .cell = coarse_cell, .portrayal = &streams, .bounds = bounds, .cscl = 1_200_000, .coverage = &cover, .scamins = &coarse_scamins };
-
-    // Build the overlay the way the drivers do: collect recs, dedup, cap, minis.
-    var recs = std.ArrayList(scamin_pts.Rec).empty;
-    try recs.appendSlice(a, try scamin_pts.collectRecs(a, &fine_cell, 200_000, 0));
-    try recs.appendSlice(a, try scamin_pts.collectRecs(a, &coarse_cell, 1_200_000, 1));
-    try scamin_pts.dedup(gpa, recs.items);
-    var minis = std.ArrayList(Backend).empty;
-    const ladders = [_][]const u32{&fine_scamins};
-    for (0..2) |ci| {
-        var entries = std.ArrayList(scamin_pts.MiniEntry).empty;
-        for (recs.items) |r| {
-            if (!r.winner or r.cell != ci) continue;
-            // Both points are covered by the fine 1:200k coverage; a group whose
-            // finest copy is coarser than that gets the quantized cap.
-            const cap = scamin_pts.capFor(if (r.foid == 0xBEEF) 200_000 else 1_200_000, 200_000, &ladders);
-            try entries.append(a, .{ .feat = r.feat, .lon = r.lon, .lat = r.lat, .effective = r.effective, .smax = cap });
-        }
-        if (entries.items.len == 0) continue;
-        const src: *const s57.Cell = if (ci == 0) &fine_cell else &coarse_cell;
-        const mini = try scamin_pts.buildMini(a, src, entries.items, &streams, null);
-        try minis.append(a, .{ .cell = mini.cell, .portrayal = mini.portrayal, .portrayal_simplified = mini.portrayal_simplified, .feat_bbox = mini.feat_bbox, .feat_smax = mini.feat_smax, .bounds = mini.bounds, .cscl = src.params.cscl });
-    }
-    // The shared object's winner is the FINE copy; the coarse-only one is capped.
-    try std.testing.expectEqual(@as(usize, 2), minis.items.len);
-
-    var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
-    var baker = Baker.init(gpa, 7, 10, .{ .ctx = &sink, .func = CollectSink.run });
-    defer baker.deinit();
-    baker.overlay = minis.items;
-    baker.scamin_standalone = true;
-
-    try baker.bakeBand(.coastal, (&fine)[0..1], 1, .defer_down, null, null, null);
-    var both = [_]Backend{ coarse, fine };
-    try baker.bakeBand(.general, &both, 1, .extend_min, null, null, null);
-
-    // Per tile zoom: the deduped feature (scamin 800000, NO smax) appears exactly
-    // once from its eligibility floor (D(z+1) <= 800k near the equator => z >= 9)
-    // to maxzoom, across BOTH passes — no band handoff, no double-draw. The
-    // capped coarse-only object (scamin 900000, smax 260000) rides the same
-    // tiles while their windows open coarser than its cap.
-    var z: u8 = 7;
-    while (z <= 10) : (z += 1) {
-        // Count each object in ITS OWN tile (the two points diverge into
-        // different tiles at z10), summing distinct tiles once.
-        var deduped: usize = 0;
-        var capped: usize = 0;
-        var seen = std.AutoHashMap(u64, void).init(a);
-        for ([_][2]f64{ .{ 0.35, 0.35 }, .{ 0.36, 0.36 } }) |pt| {
-            const t = lonLatToTile(pt[0], pt[1], z);
-            const key = tileKey(z, t[0], t[1]);
-            if ((try seen.getOrPut(key)).found_existing) continue;
-            const bytes = sink.tiles.get(key) orelse {
-                try std.testing.expect(z <= 8); // the low zooms may legitimately be empty
-                continue;
-            };
-            const raw = try gzip.decompress(a, bytes);
-            const layers = try mvt.decode(a, raw);
-            for (layers) |L| {
-                // v2 schema: SCAMIN points fold into the merged `point_symbols` layer.
-                if (!std.mem.eql(u8, L.name, "point_symbols")) continue;
-                for (L.features) |ft| {
-                    const sc = findIntProp(ft.properties, "scamin") orelse continue;
-                    const sm = findIntProp(ft.properties, "smax");
-                    if (sc == 800_000) {
-                        try std.testing.expectEqual(@as(?i64, null), sm); // never capped/carried
-                        deduped += 1;
-                    } else if (sc == 900_000) {
-                        try std.testing.expectEqual(@as(?i64, 260_000), sm); // fine chart owns past 260k
-                        capped += 1;
-                    } else {
-                        // The fine cell's own 260000 copy must NEVER appear — the overlay owns it.
-                        try std.testing.expect(sc != 260_000);
-                    }
-                }
-            }
-        }
-        const floor_denom = assets.displayDenomZ(z + 1, 0.35);
-        try std.testing.expectEqual(@as(usize, if (800_000.0 >= floor_denom) 1 else 0), deduped);
-        try std.testing.expectEqual(@as(usize, if (scene.scamin_pts.eligibleAt(900_000, 260_000, floor_denom)) 1 else 0), capped);
-    }
-    // Sanity: the window really opens during the test range (z9/z10 carry it).
-    const t9 = lonLatToTile(0.35, 0.35, 9);
-    try std.testing.expect(sink.tiles.get(tileKey(9, t9[0], t9[1])) != null);
-    try std.testing.expect(800_000.0 >= assets.displayDenomZ(10, 0.35));
 }
 
 test "buildTileMap reach ring: a light cell contributes one ring beyond its bbox" {

@@ -69,8 +69,8 @@ test "encodeRgba: valid structure, IDAT round-trips to filter-0 scanlines" {
     const a = std.testing.allocator;
     // 2x2: red, green / blue, half-transparent white
     const rgba = [_]u8{
-        255, 0,   0,   255, 0,   255, 0,   255,
-        0,   0,   255, 255, 255, 255, 255, 128,
+        255, 0, 0,   255, 0,   255, 0,   255,
+        0,   0, 255, 255, 255, 255, 255, 128,
     };
     const bytes = try encodeRgba(a, &rgba, 2, 2);
     defer a.free(bytes);

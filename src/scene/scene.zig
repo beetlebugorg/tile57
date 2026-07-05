@@ -23,8 +23,6 @@ pub const bake_enc = @import("bake_enc.zig");
 /// SCAMIN standalone (specs/scamin-standalone.md): cross-cell point-object
 /// matching + SCAMIN union + scale-window eligibility for the *_scamin point/
 /// text layers. Shared by the bake pre-pass and the live per-tile dedup.
-pub const scamin_pts = @import("scamin_pts.zig");
-
 /// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile (optional).
 pub const TileFormat = enum { mvt, mlt };
 const s101 = @import("s100").s101_instr;
@@ -594,12 +592,6 @@ pub const CellOpts = struct {
     ///     drawn on top, wins where it has data); no labels lost over a coverage gap.
     suppress_lines: bool = false,
     suppress_points: bool = false,
-    /// Band-handoff carry-down (scamin-aware quilting): this coarser cell rides in a
-    /// tile whose display window opens coarser than the covering finer cell's
-    /// compilation scale, so instead of being suppressed its features are tagged with
-    /// the handoff denominator — the `smax` tile property the style gates on (hide
-    /// once the display is finer than 1:smax). 0 = not carried (no tag emitted).
-    smax: i64 = 0,
     /// The overscale gate denominator = cscl / OVERSCALE_FACTOR (X2 per S-52
     /// PresLib §10.1.10.2: "grossly overscale ... by X2 or more"). A real SCAMIN-
     /// ladder crossing so the client flip is exact and never fires before 1x;
@@ -617,21 +609,12 @@ pub const CellOpts = struct {
     /// area compiled from the smaller scale ENC"), never a coarse cell occluded
     /// by finer coverage.
     overscale_hatch: bool = false,
-    /// SCAMIN standalone (specs/scamin-standalone.md): this is a REGULAR cell in a
-    /// pipeline that emits deduped SCAMIN point objects from a scamin_pts overlay,
-    /// so its own prim==1 SCAMIN-carrying features are skipped entirely (the overlay
-    /// owns their symbols/text/sector-figures/soundings; emitting them here would
-    /// double-draw against the deduped copy). SOUNDG (129) stays as-is.
-    skip_scamin_points: bool = false,
-    /// SCAMIN standalone: this is a scamin_pts overlay mini cell; only features
-    /// whose SCAMIN reaches the tile's display window are emitted. The value is
-    /// D(z+1, tile_lat) — the window's fine end (scamin_pts.eligibleAt). 0 = off.
-    scamin_floor: f64 = 0,
-    /// SCAMIN standalone: per-feature smax caps for an overlay mini cell (indexed
-    /// by feature; 0 = uncapped). A capped feature hides once the display reaches
-    /// the finer covering chart's scale — and is excluded from tiles whose whole
-    /// window lies past the cap (smax >= D(z) = 2·scamin_floor).
-    feat_smax: ?[]const i64 = null,
+    /// The effScamin floor (spec §4, bake_enc.effScaminFloor): every emitted
+    /// feature's `scamin` is raised to at least this display denominator (the
+    /// cell's band-floor zoom), so an aggressive SCAMIN cannot blank a feature
+    /// in the window where this cell already owns the ground geometrically.
+    /// 0 = no clamp. Features without SCAMIN stay ungated.
+    eff_scamin_floor: i64 = 0,
     /// Emit the per-feature pick-report attributes (the `s57` blob + `cell` name) for
     /// the S-52 §10.8 cursor pick + dev inspector. Defaults ON (host wants a working
     /// pick report in the local-first deployment); a lean bake can turn it off via the
@@ -731,7 +714,6 @@ pub const TileSurface = struct {
             .cat = meta.cat,
             .vg = meta.vg,
             .scamin = meta.scamin,
-            .smax = meta.smax,
             .oscl = meta.oscl,
             .class = meta.class,
             .s57 = meta.s57_json,
@@ -881,6 +863,15 @@ pub fn featureScamin(f: s57.Feature) ?i64 {
     return if (n > 0) n else null;
 }
 
+/// The feature's SCAMIN clamped to the cell's effScamin floor (spec §4): a
+/// feature can never be SCAMIN-hidden above its own cell's band-floor zoom —
+/// where the composite has already assigned it the ground, hiding it would
+/// open a hole nothing else may fill. No SCAMIN stays no SCAMIN.
+fn effScamin(f: s57.Feature, opts: CellOpts) ?i64 {
+    const sc = featureScamin(f) orelse return null;
+    return @max(sc, opts.eff_scamin_floor);
+}
+
 /// S-52 §10.6.1.1: does the feature carry ancillary information warranting the
 /// SY(INFORM01) "additional information available" marker? True when it has a
 /// non-blank INFORM/NINFOM (textual note) or TXTDSC/NTXTDS/PICREP (referenced
@@ -972,9 +963,6 @@ const Meta = struct {
     cat: i64 = 1, // display-category rank (0 base, 1 standard, 2 other)
     vg: i64 = 0, // raw S-101 viewing-group number of the feature's primary draw (0 = none)
     scamin: ?i64 = null,
-    // Band-handoff carry-down tag: the handoff denominator a carried coarser-band
-    // feature hides beyond (the style's smax gate). 0 = not carried (omitted).
-    smax: i64 = 0,
     // The source cell's compilation scale quantized up the scamin ladder (0 =
     // unknown/omitted). Emitted on area fills + patterns only (fillArea /
     // fillPattern), NOT via appendMeta — points/lines/text don't need it.
@@ -1214,10 +1202,6 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     if (m.s57.len > 0) try props.append(a, .{ .key = "s57", .value = .{ .string = m.s57 } });
     if (m.cell.len > 0) try props.append(a, .{ .key = "cell", .value = .{ .string = m.cell } });
     if (m.scamin) |sc| try props.append(a, .{ .key = "scamin", .value = .{ .int = sc } });
-    // Band-handoff carry-down: only a carried coarser-band copy is tagged (see
-    // CellOpts.smax) — untagged features keep their tile footprint unchanged and
-    // pass the style's smax gate via its coalesce-0 fallback.
-    if (m.smax > 0) try props.append(a, .{ .key = "smax", .value = .{ .int = m.smax } });
     // bnd/pts are emitted only for the style-variant passes (0/1); the common case
     // (2) is left off so the client coalesces to 2 (always shown) — keeping every
     // unvarying feature's tile footprint unchanged.
@@ -1612,7 +1596,7 @@ fn appendDepthVals(a: Allocator, props: *std.ArrayList(mvt.Prop), f: s57.Feature
 /// attrs). The engine work happens here — geometry assembly, projection, tile
 /// clipping/simplification, anchoring — so surfaces only ever see draw calls.
 fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
-    const scamin = featureScamin(f);
+    const scamin = effScamin(f, opts);
     const s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "";
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
@@ -1621,7 +1605,6 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         .cat = p.cat,
         .vg = p.vg,
         .scamin = scamin,
-        .smax = opts.smax,
         .oscl = opts.oscl,
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = s57_json,
@@ -1731,10 +1714,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             const rparts = try orientAreaRings(a, arings);
             const dv = depthVals(f);
             const dr: ?rs.DepthRange = if (dv) |d| .{ .d1 = d[0], .d2 = d[1] } else null;
-            // A coverage-clipped fill owns its remnant at every scale (best-available),
-            // so it carries no band-handoff smax — the geometry did the handoff.
-            var fillmeta = fmeta;
-            if (opts.cover_clip != null) fillmeta.smax = 0;
+            const fillmeta = fmeta;
             if (!opts.suppress_fills) if (p.fill_token) |token| {
                 try surf.beginFeature(&fillmeta);
                 try surf.fillArea(token, rparts, dr);
@@ -2320,8 +2300,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 
     const fmeta = rs.FeatureMeta{
         .draw_prio = 6,
-        .scamin = featureScamin(f),
-        .smax = opts.smax,
+        .scamin = effScamin(f, opts),
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -2377,8 +2356,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 
     const fmeta = rs.FeatureMeta{
         .draw_prio = 12,
-        .scamin = featureScamin(f),
-        .smax = opts.smax,
+        .scamin = effScamin(f, opts),
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -2429,8 +2407,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
 
     const fmeta = rs.FeatureMeta{
         .draw_prio = 6,
-        .scamin = featureScamin(f),
-        .smax = opts.smax,
+        .scamin = effScamin(f, opts),
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -2468,9 +2445,7 @@ fn isCoverageFeature(f: s57.Feature) bool {
 /// CellOpts.oscl). The style shows it only while the display is grossly overscale
 /// (denominator FINER/smaller than oscl, i.e. X2+) and paints it ABOVE overscaled
 /// cells' fills but BELOW at-scale (finer) cells' fills — the occlusion trick that
-/// leaves the hatch only on coarse-only patches (specs/overscale.md). Rides the
-/// cell's carry tag (smax) so a band-handoff copy hides with the rest of the
-/// cell's content past its handoff.
+/// leaves the hatch only on coarse-only patches (specs/overscale.md).
 fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
@@ -2491,7 +2466,6 @@ fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         // payload — the hatch is an indication, not a chartable feature.
         .draw_prio = 3,
         .cat = 0,
-        .smax = opts.smax,
         .band = opts.band,
         .oscl = opts.oscl,
         .overscale = true,
@@ -2529,9 +2503,6 @@ pub const CellRef = struct {
     /// Finer-scale coverage to subtract from this cell's fills/patterns (see
     /// CellOpts.cover_clip) — the exact coverage-clipped composite.
     cover_clip: ?[]const []const mvt.Point = null,
-    /// Band-handoff carry-down tag (see CellOpts.smax): the handoff denominator
-    /// stamped on every feature this cell emits into the tile; 0 = not carried.
-    smax: i64 = 0,
     /// The cell's X2 overscale gate denominator (see CellOpts.oscl): tags area
     /// fills/patterns + gates the AP(OVERSC01) overscale hatch; 0 = unknown.
     oscl: i64 = 0,
@@ -2539,13 +2510,8 @@ pub const CellRef = struct {
     /// a strictly-finer-CSCL cell rides this tile (scale boundary) AND this cell
     /// wins the pure quilt somewhere (it is the displayed smaller-scale data).
     overscale_hatch: bool = false,
-    /// SCAMIN standalone (see the CellOpts twins): regular cells set
-    /// skip_scamin_points when a scamin_pts overlay owns their SCAMIN point
-    /// features; overlay mini-cell refs carry the tile's eligibility floor
-    /// (scamin_floor = D(z+1, tile_lat)) + the per-feature smax caps.
-    skip_scamin_points: bool = false,
-    scamin_floor: f64 = 0,
-    feat_smax: ?[]const i64 = null,
+    /// The effScamin floor for this cell (see CellOpts.eff_scamin_floor).
+    eff_scamin_floor: i64 = 0,
     /// Max ground-distance sector-leg length (metres) among the cell's lights
     /// (see CellOpts.light_range_m) — the honest LIGHTS cull margin.
     light_range_m: f64 = 0,
@@ -2583,12 +2549,9 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .cover_clip = cr.cover_clip,
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
-            .smax = cr.smax,
             .oscl = cr.oscl,
             .overscale_hatch = cr.overscale_hatch,
-            .skip_scamin_points = cr.skip_scamin_points,
-            .scamin_floor = cr.scamin_floor,
-            .feat_smax = cr.feat_smax,
+            .eff_scamin_floor = cr.eff_scamin_floor,
             .pick_attrs = pick_attrs,
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
@@ -2615,12 +2578,9 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .cover_clip = cr.cover_clip,
             .suppress_lines = cr.suppress_lines,
             .suppress_points = cr.suppress_points,
-            .smax = cr.smax,
             .oscl = cr.oscl,
             .overscale_hatch = cr.overscale_hatch,
-            .skip_scamin_points = cr.skip_scamin_points,
-            .scamin_floor = cr.scamin_floor,
-            .feat_smax = cr.feat_smax,
+            .eff_scamin_floor = cr.eff_scamin_floor,
             .pick_attrs = pick_attrs,
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
@@ -2741,8 +2701,7 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
     const fmeta = rs.FeatureMeta{
         .draw_prio = prio,
         .cat = cat,
-        .scamin = featureScamin(f),
-        .smax = opts.smax,
+        .scamin = effScamin(f, opts),
         .class = catalogue.acronymByObjl(f.objl) orelse "",
         .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
         .cell_name = if (opts.pick_attrs) cell.name else "",
@@ -2796,19 +2755,12 @@ fn appendCellFeatures(
         if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
             if (b[2] < tb[0] - ml or b[0] > tb[2] + ml or b[3] < tb[1] - mt or b[1] > tb[3] + mt) continue;
         };
-        // SCAMIN standalone: a regular cell's prim==1 SCAMIN features are owned by
-        // the scamin_pts overlay (deduped cross-cell, scale-window included), so
-        // emitting them here would double-draw against the deduped copy. SOUNDG
-        // multipoints (129) stay as-is per the spec.
-        if (opts.skip_scamin_points and f.prim == 1 and f.objl != 129 and featureScamin(f) != null) continue;
-        // Overlay mini cells: per-feature smax cap + the tile's scale-window
-        // eligibility clamp (scamin_pts.eligibleAt) — a feature enters this tile
-        // only when its effective SCAMIN reaches the window [D(z), D(z+1)) and its
-        // cap hasn't swallowed it.
         var fopts = opts;
         // Coverage-clipped best-available composite (point half): where a finer
-        // cell's M_COVR contains this feature's position, drop its symbols/text —
-        // for a point the bbox centre IS the point, so the test is exact, and its
+        // cell's M_COVR contains this feature's position, drop its symbols/text.
+        // A POINT tests its own node geometry — exact, and independent of the
+        // per-feature bbox cache (the live path carries none; keying on feat_bbox
+        // silently kept every coarse point copy there — the landmark dup). Its
         // augmented figures (sector arcs/legs) inherit the verdict via
         // suppress_lines. Areas are handled by the exact fill difference above;
         // line STROKES are cut exactly against the coverage (clipRunsOutsideCover /
@@ -2817,20 +2769,18 @@ fn appendCellFeatures(
         // bbox-centre drop doubled contours (centre outside → whole line kept).
         // A line/area feature's centred label/symbol still drops by bbox centre.
         if (opts.cover_clip) |cc| if (f.prim != 3) {
-            if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b| {
-                if (coveredByFiner(cc, (b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5, z, x, y)) {
-                    fopts.suppress_points = true;
-                    if (f.prim == 1) fopts.suppress_lines = true;
-                }
+            const pos: ?s57.LonLat = if (f.prim == 1)
+                cell.pointGeometry(f)
+            else blk: {
+                if (feat_bbox) |fbb| if (fi < fbb.len) if (fbb[fi]) |b|
+                    break :blk s57.LonLat.init((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
+                break :blk null;
+            };
+            if (pos) |pg| if (coveredByFiner(cc, pg.lon(), pg.lat(), z, x, y)) {
+                fopts.suppress_points = true;
+                if (f.prim == 1) fopts.suppress_lines = true;
             };
         };
-        if (opts.feat_smax) |fs| if (fi < fs.len and fs[fi] > 0) {
-            fopts.smax = fs[fi];
-        };
-        if (opts.scamin_floor > 0) {
-            const sc = featureScamin(f) orelse continue;
-            if (!scamin_pts.eligibleAt(sc, fopts.smax, opts.scamin_floor)) continue;
-        }
         if (!fopts.suppress_points and hasAdditionalInfo(f)) {
             try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, fopts, surf);
         }
@@ -2855,8 +2805,7 @@ fn appendCellFeatures(
                 .class = "SOUNDG",
                 .s57_json = if (fopts.pick_attrs) try encodeS57Attrs(a, f) else "",
                 .cell_name = if (fopts.pick_attrs) cell.name else "",
-                .scamin = featureScamin(f),
-                .smax = fopts.smax,
+                .scamin = effScamin(f, opts),
                 .band = fopts.band,
             };
             try emitSoundings(a, cell.*, f, smeta, z, x, y, tb, surf);
@@ -2920,9 +2869,6 @@ fn appendCellFeatures(
             try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
             try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
             try aprops.append(a, .{ .key = "band", .value = .{ .int = fopts.band } });
-            // Band-handoff carry-down tag — the classify() schema predates appendMeta
-            // but a carried copy still must hide past its handoff (style smax gate).
-            if (fopts.smax > 0) try aprops.append(a, .{ .key = "smax", .value = .{ .int = fopts.smax } });
             // Quantized compilation scale (overscale fill ordering — see fillArea).
             if (fopts.oscl > 0) try aprops.append(a, .{ .key = "oscl", .value = .{ .int = fopts.oscl } });
             try appendDepthVals(a, &aprops, f);
@@ -2941,11 +2887,10 @@ fn appendCellFeatures(
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
             for (sub, 0..) |s, i| parts[i] = s;
-            const lprops = try a.alloc(mvt.Prop, if (fopts.smax > 0) 4 else 3);
+            const lprops = try a.alloc(mvt.Prop, 3);
             lprops[0] = .{ .key = "class", .value = .{ .string = cls.name } };
             lprops[1] = .{ .key = "color_token", .value = .{ .string = cls.color } };
             lprops[2] = .{ .key = "dash", .value = .{ .string = cls.dash } };
-            if (fopts.smax > 0) lprops[3] = .{ .key = "smax", .value = .{ .int = fopts.smax } };
             try ms.lines.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = lprops });
         }
     }
@@ -3559,7 +3504,6 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
 
 test {
     _ = bake_enc;
-    _ = scamin_pts;
 }
 
 // ---- bundle-sourced replay (baked tile -> Surface calls) --------------------
@@ -3613,7 +3557,6 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
         .cat = propInt(props, "cat", 1),
         .vg = propInt(props, "vg", 0),
         .scamin = if (propOf(props, "scamin")) |_| propInt(props, "scamin", 0) else null,
-        .smax = propInt(props, "smax", 0),
         .class = propStr(props, "class"),
         .band = @intCast(std.math.clamp(propInt(props, "band", 0), 0, 255)),
         .bnd = propInt(props, "bnd", 2),
