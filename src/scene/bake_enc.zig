@@ -85,43 +85,77 @@ pub const REACH_FLAG: u32 = 1 << 31;
 /// else drops it (the tile then bakes byte-identically to the pre-hole-fill baker).
 pub const HOLEFILL_FLAG: u32 = 1 << 30;
 
-/// The finest (smallest 1:N) compilation scale among `backends[idxs]` whose coverage
-/// contains (lon,lat); `maxInt` when none — so `finestCsclAt(...) < my_cscl` means "a
-/// strictly finer cell covers this point" (a cell never undercuts itself: its own
-/// cscl isn't < its own cscl). A cell with no M_COVR uses its bbox as coverage only
-/// when `include_derived` (the Go rule: derived extents count for points/lines, never
-/// fills). cscl<=0 (unknown) can't be a finer owner.
-fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
+// The cross-band coverage oracle, ONCE. `finestCsclAt`/`coversAny` used to be
+// re-coded byte-for-byte on the live path (chart.zig `finestCsclAtLive`/
+// `coversAnyLive`) — the single largest bake-vs-live drift source. Both sides now
+// call these generics with a small duck-typed accessor (`ctx`) that exposes the
+// only things that differed: `cscl(i) i32`, `coverage(i) []const []const []const
+// s57.LonLat`, `bounds(i) [4]f64`. Byte-identical to the old pair by construction.
+
+/// The finest (smallest 1:N) compilation scale among `idxs` whose coverage
+/// contains (lon,lat); `maxInt` when none — so `finestCsclAtCtx(...) < my_cscl`
+/// means "a strictly finer cell covers this point" (a cell never undercuts
+/// itself: its own cscl isn't < its own cscl). A cell with no M_COVR uses its
+/// bbox as coverage only when `include_derived` (the Go rule: derived extents
+/// count for points/lines, never fills). cscl<=0 (unknown) can't be a finer owner.
+pub fn finestCsclAtCtx(ctx: anytype, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
     var best: i32 = std.math.maxInt(i32);
     for (idxs) |i| {
-        const be = &backends[i];
-        if (be.cscl <= 0 or be.cscl >= best) continue;
-        const covered = if (be.coverage.len > 0)
-            s57.coverageContains(be.coverage, lon, lat)
-        else
-            include_derived and (lon >= be.bounds[0] and lon <= be.bounds[2] and lat >= be.bounds[1] and lat <= be.bounds[3]);
-        if (covered) best = be.cscl;
+        const cscl = ctx.cscl(i);
+        if (cscl <= 0 or cscl >= best) continue;
+        const cov = ctx.coverage(i);
+        const covered = if (cov.len > 0)
+            s57.coverageContains(cov, lon, lat)
+        else dv: {
+            const bb = ctx.bounds(i);
+            break :dv include_derived and (lon >= bb[0] and lon <= bb[2] and lat >= bb[1] and lat <= bb[3]);
+        };
+        if (covered) best = cscl;
     }
     return best;
 }
 
 /// Whether ANY cell in `idxs` covers (lon,lat): real M_COVR containment, or the
-/// cell's bbox when it has no M_COVR. Unlike finestCsclAt this also counts
+/// cell's bbox when it has no M_COVR. Unlike finestCsclAtCtx this also counts
 /// cscl<=0 cells — a coverage-hole test must treat any present data as coverage
 /// (an unknown-scale cell still fills the ground). Used by the cross-band
 /// hole-fill admission: a coarser in-window band leaves a HOLE at a sampled point
 /// none of its cells cover, and a finer out-of-window cell that DOES cover there
 /// is admitted to fill it (see TileGenCtx.gen / chart.zig tileRefs).
-fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) bool {
+pub fn coversAnyCtx(ctx: anytype, idxs: []const u32, lon: f64, lat: f64) bool {
     for (idxs) |i| {
-        const be = &backends[i];
-        const covered = if (be.coverage.len > 0)
-            s57.coverageContains(be.coverage, lon, lat)
-        else
-            (lon >= be.bounds[0] and lon <= be.bounds[2] and lat >= be.bounds[1] and lat <= be.bounds[3]);
+        const cov = ctx.coverage(i);
+        const covered = if (cov.len > 0)
+            s57.coverageContains(cov, lon, lat)
+        else dv: {
+            const bb = ctx.bounds(i);
+            break :dv (lon >= bb[0] and lon <= bb[2] and lat >= bb[1] and lat <= bb[3]);
+        };
         if (covered) return true;
     }
     return false;
+}
+
+/// The baker's own-cell accessor for the shared oracle above.
+const BackendCov = struct {
+    backends: []const Backend,
+    pub inline fn cscl(self: BackendCov, i: u32) i32 {
+        return self.backends[i].cscl;
+    }
+    pub inline fn coverage(self: BackendCov, i: u32) []const []const []const s57.LonLat {
+        return self.backends[i].coverage;
+    }
+    pub inline fn bounds(self: BackendCov, i: u32) [4]f64 {
+        return self.backends[i].bounds;
+    }
+};
+
+fn finestCsclAt(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
+    return finestCsclAtCtx(BackendCov{ .backends = backends }, idxs, lon, lat, include_derived);
+}
+
+fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) bool {
+    return coversAnyCtx(BackendCov{ .backends = backends }, idxs, lon, lat);
 }
 
 /// A read-only coverage participant from ANOTHER pack (bake --existing): its real

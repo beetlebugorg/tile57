@@ -208,47 +208,31 @@ fn lazyCellCoverage(lc: *LazyCell) []const []const []const s57.LonLat {
     return &.{};
 }
 
-fn coverageContains(polys: []const []const []const s57.LonLat, lon: f64, lat: f64) bool {
-    for (polys) |rings| if (s57.pointInRings(rings, lon, lat)) return true;
-    return false;
-}
+// The live oracle's per-cell accessor for the shared cross-band coverage oracle
+// (bake_enc.finestCsclAtCtx / coversAnyCtx). `coverage(i)` lazy-loads + caches the
+// cell's M_COVR on first touch. This is what makes the live path quilt + band-
+// hand-off byte-identically to the baker: one implementation, two accessors —
+// retiring the old `finestCsclAtLive`/`coversAnyLive` re-code and its private
+// `coverageContains` duplicate of s57.coverageContains.
+const LazyCov = struct {
+    ls: *LazySource,
+    pub inline fn cscl(self: LazyCov, i: u32) i32 {
+        return self.ls.cells[i].cscl;
+    }
+    pub inline fn coverage(self: LazyCov, i: u32) []const []const []const s57.LonLat {
+        return lazyCellCoverage(&self.ls.cells[i]);
+    }
+    pub inline fn bounds(self: LazyCov, i: u32) [4]f64 {
+        return self.ls.cells[i].bbox;
+    }
+};
 
-// The finest (smallest 1:N) compilation scale among the indexed cells whose
-// M_COVR coverage contains (lon,lat); maxInt when none — the live twin of
-// bake_enc.finestCsclAt, same derived-extent rule (a cell with no M_COVR counts
-// via its bbox only when `include_derived`: points/lines, never fills), so the
-// live path quilts + band-hands-off exactly like the baker.
 fn finestCsclAtLive(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64, include_derived: bool) i32 {
-    var best: i32 = std.math.maxInt(i32);
-    for (idxs) |i| {
-        const lc = &ls.cells[i];
-        if (lc.cscl <= 0 or lc.cscl >= best) continue;
-        const cov = lazyCellCoverage(lc);
-        const covered = if (cov.len > 0)
-            coverageContains(cov, lon, lat)
-        else
-            include_derived and (lon >= lc.bbox[0] and lon <= lc.bbox[2] and lat >= lc.bbox[1] and lat <= lc.bbox[3]);
-        if (covered) best = lc.cscl;
-    }
-    return best;
+    return bake_enc.finestCsclAtCtx(LazyCov{ .ls = ls }, idxs, lon, lat, include_derived);
 }
 
-// Whether ANY indexed cell in `idxs` covers (lon,lat): real M_COVR containment,
-// or its bbox when it has no M_COVR. The live twin of bake_enc.coversAny — counts
-// cscl<=0 cells too (a coverage-hole test treats any present data as coverage).
-// Cells must already be lazy-loaded (their coverage is read). Used by tileRefs'
-// cross-band hole-fill admission.
 fn coversAnyLive(ls: *LazySource, idxs: []const u32, lon: f64, lat: f64) bool {
-    for (idxs) |i| {
-        const lc = &ls.cells[i];
-        const cov = lazyCellCoverage(lc);
-        const covered = if (cov.len > 0)
-            coverageContains(cov, lon, lat)
-        else
-            (lon >= lc.bbox[0] and lon <= lc.bbox[2] and lat >= lc.bbox[1] and lat <= lc.bbox[3]);
-        if (covered) return true;
-    }
-    return false;
+    return bake_enc.coversAnyCtx(LazyCov{ .ls = ls }, idxs, lon, lat);
 }
 
 fn bboxOverlap(a_: [4]f64, b_: [4]f64) bool {
@@ -1992,7 +1976,7 @@ fn appendLiveOverlay(ls: *LazySource, z: u8, tb: [4]f64, clat: f64, refs: *std.A
             if (lc.cscl <= 0) continue;
             const cov = lazyCellCoverage(lc);
             if (cov.len == 0) continue;
-            if (!coverageContains(cov, r.lon, r.lat)) continue;
+            if (!s57.coverageContains(cov, r.lon, r.lat)) continue;
             finest = @min(finest, lc.cscl);
             ladders.append(gpa, lc.scamins) catch {};
         }
