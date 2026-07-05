@@ -9,6 +9,7 @@
 const std = @import("std");
 const s57 = @import("s57");
 const adapt = @import("s100").s101_adapt;
+const catalogue = @import("s100").catalogue; // S-57 OBJL -> acronym for the quesmrk diagnostic
 
 // The embedded S-101 rules accessor (tg_embedded_lua) — referenced so its C-ABI
 // exports land in the compiled module; the Lua `require` searcher in lua_shim.c
@@ -228,12 +229,15 @@ export fn tgp_emit(i: usize, instr_ptr: [*]const u8, instr_len: usize) callconv(
     // position — so a "?" on the chart traces to one feature, not an anonymous rule error.
     if (tg_debug_enabled() != 0 and i < c.adapted.len and std.mem.indexOf(u8, instr, "QUESMRK1") != null) {
         const ad = c.adapted[i];
-        const rcid: u32 = if (ad.feature_index < c.cell.features.len) c.cell.features[ad.feature_index].rcid else 0;
+        const in_range = ad.feature_index < c.cell.features.len;
+        const rcid: u32 = if (in_range) c.cell.features[ad.feature_index].rcid else 0;
+        const objl: u16 = if (in_range) c.cell.features[ad.feature_index].objl else 0;
+        const s57acr = catalogue.acronymByObjl(objl) orelse "?"; // S-57 source class, for mis-route triage
         const cell_name = if (c.cell.name.len > 0) c.cell.name else "?";
         if (ad.points.len > 0)
-            std.debug.print("[s101:quesmrk] cell={s} class={s} prim={s} rcid={d} lonlat={d:.6},{d:.6}\n", .{ cell_name, ad.code, ad.primitive, rcid, ad.points[0][0], ad.points[0][1] })
+            std.debug.print("[s101:quesmrk] cell={s} class={s} s57={s} prim={s} rcid={d} lonlat={d:.6},{d:.6}\n", .{ cell_name, ad.code, s57acr, ad.primitive, rcid, ad.points[0][0], ad.points[0][1] })
         else
-            std.debug.print("[s101:quesmrk] cell={s} class={s} prim={s} rcid={d}\n", .{ cell_name, ad.code, ad.primitive, rcid });
+            std.debug.print("[s101:quesmrk] cell={s} class={s} s57={s} prim={s} rcid={d}\n", .{ cell_name, ad.code, s57acr, ad.primitive, rcid });
     }
 }
 
