@@ -369,6 +369,12 @@ pub fn bandOf(cscl: i32) Band {
     return .overview;
 }
 
+/// Overscale fill-up cap: how many zooms past its native max a band's own
+/// cells keep baking (only where nothing finer already emitted). +2 ≈ X4
+/// display overscale — the ECDIS-sane stretch limit; beyond it MapLibre
+/// parent-stretches (absent tiles are 404s, not empty 204s).
+pub const FILLUP_DZ: u8 = 2;
+
 /// A band's native zoom span (Go Band.ZoomRange). Adjacent bands overlap by one
 /// zoom; best-band dedup resolves the overlap to the finer band.
 pub fn bandZooms(band: Band) ZoomRange {
@@ -769,6 +775,14 @@ pub const Baker = struct {
         const zr = bandZooms(band);
         var zlo = @max(self.minzoom, zr.min);
         const zhi = @min(self.maxzoom, zr.max);
+        // Capped overscale fill-up (spec §3, bounded): a band's OWN cells also
+        // enumerate FILLUP_DZ zooms past the band's native max. Finest bakes
+        // first + emitted-skip, so the extension lands only on coarse-only
+        // ground — rendered overscaled (~X4 at +2, the client HUD warns) instead
+        // of the single-source deep-zoom hole (blank water past a band's window
+        // wherever nothing finer covers). Past the cap the server 404s absent
+        // tiles and MapLibre stretches the deepest ancestor.
+        const zext: u8 = @min(self.maxzoom, @min(zr.max +| FILLUP_DZ, 24));
         switch (floor) {
             // Defer the band's own floor tiles to the next-coarser pass — but only
             // when this pass would otherwise bake them (zlo == the real floor).
@@ -789,7 +803,7 @@ pub const Baker = struct {
         for (spans, 0..) |sp, i| {
             const b = sp.bounds;
             var z = zlo;
-            var zend = zhi;
+            var zend = zext;
             // Carry (finer-band) cells normally contribute only at the deferred
             // floor (carry_z = this band's max). In the coarsest (.extend_min) pass
             // they ALSO ride the below-window extend zooms [zlo..carry_z-1] as
@@ -806,7 +820,7 @@ pub const Baker = struct {
                 } else {
                     z = cz;
                 }
-            } else if (zlo > zhi) continue;
+            } else if (zlo > zext) continue;
             while (z <= zend) : (z += 1) {
                 const holefill_z = if (holefill_top) |top| z < top else false;
                 const tag: u32 = if (holefill_z) HOLEFILL_FLAG else 0;
