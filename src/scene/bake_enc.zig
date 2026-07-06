@@ -371,9 +371,17 @@ pub fn bandOf(cscl: i32) Band {
 
 /// Overscale fill-up cap: how many zooms past its native max a band's own
 /// cells keep baking (only where nothing finer already emitted). +2 ≈ X4
-/// display overscale — the ECDIS-sane stretch limit; beyond it MapLibre
-/// parent-stretches (absent tiles are 404s, not empty 204s).
+/// display overscale — the ECDIS-sane stretch limit.
 pub const FILLUP_DZ: u8 = 2;
+
+/// Absolute fill-up ceiling: extension zooms never exceed this. The fill-up
+/// serves the MID-ZOOM seam where a coarse chart is the finest coverage (the
+/// blank bay at z12-15); letting fine bands extend too (harbor→z17-18,
+/// berthing→z19-20) quadruples the tile count per extra zoom across every
+/// harbor footprint for content nobody needs — a district pack ballooned from
+/// ~800k to 13M+ planned tiles. A band's NATIVE window is never clamped by
+/// this; past its data the camera stops at the probed depth instead.
+pub const FILLUP_CEIL: u8 = 15;
 
 /// A band's native zoom span (Go Band.ZoomRange). Adjacent bands overlap by one
 /// zoom; best-band dedup resolves the overlap to the finer band.
@@ -788,7 +796,7 @@ pub const Baker = struct {
         // of the single-source deep-zoom hole (blank water past a band's window
         // wherever nothing finer covers). Past the cap the server 404s absent
         // tiles and MapLibre stretches the deepest ancestor.
-        const zext: u8 = @min(self.maxzoom, @min(zr.max +| FILLUP_DZ, 24));
+        const zext: u8 = @min(self.maxzoom, @max(zr.max, @min(zr.max +| FILLUP_DZ, FILLUP_CEIL)));
         switch (floor) {
             // Defer the band's own floor tiles to the next-coarser pass — but only
             // when this pass would otherwise bake them (zlo == the real floor).

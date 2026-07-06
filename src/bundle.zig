@@ -1043,13 +1043,24 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         var rider_entries = std.ArrayList(CellEntry).empty;
         defer rider_entries.deinit(gpa);
         {
+            // NEXT-COARSER POPULATED band only. All-coarser riders made the giant
+            // general/overview cells overlap EVERY super-tile of a fine pass —
+            // thousands of LRU-thrashing re-parses ("painfully slow" district
+            // bakes) — while the edge-hole they'd fill (a tile where NO nearer
+            // band covers either) is vanishingly rare: harbor cells sit inside
+            // approach coverage, approach inside coastal, and each pass's own
+            // holes are filled by ITS immediate coarser neighbour in ITS pass.
             var past_self = false;
             for (Bands.bands_fine_to_coarse) |b2| {
                 if (b2 == band) {
                     past_self = true;
                     continue;
                 }
-                if (past_self) rider_entries.appendSlice(gpa, band_cells[@intFromEnum(b2)].items) catch {};
+                if (!past_self) continue;
+                const items = band_cells[@intFromEnum(b2)].items;
+                if (items.len == 0) continue;
+                rider_entries.appendSlice(gpa, items) catch {};
+                break;
             }
         }
         const n_own = entries.len;
