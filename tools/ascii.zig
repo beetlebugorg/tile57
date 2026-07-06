@@ -122,6 +122,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 // carriage-returns), alternate screen + hidden cursor, terminal re-measured
 // every frame so a resize just repaints.
 fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat0: f64, zoom0: f64, palette: render.resolve.PaletteId, m: *render.resolve.MarinerSettings, ansi: bool, kitty: bool) !void {
+    // The interactive TUI is POSIX-only: std.posix.termios is `void` on Windows,
+    // so gate the whole raw-mode body out at comptime (same idiom as common.zig's
+    // terminalSize). The non-interactive `ascii` render paths stay cross-platform.
+    if (@import("builtin").os.tag == .windows) return usageErr("--tui is not supported on Windows");
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
     const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");
