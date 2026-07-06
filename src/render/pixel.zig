@@ -260,7 +260,7 @@ pub const PixelSurface = struct {
             if (longest < 100) return; // too short to label at this zoom
             var buf: [24]u8 = undefined;
             const label = if (self.settings.depth_unit == .feet)
-                std.fmt.bufPrint(&buf, "{d}", .{@floor(v * sndfrm.M_TO_FT * 10.0) / 10.0}) catch return
+                std.fmt.bufPrint(&buf, "{d}", .{@floor(v * sndfrm.M_TO_FT)}) catch return
             else
                 std.fmt.bufPrint(&buf, "{d}", .{@round(v)}) catch return;
             // CHGRD by day, bright neutral at dusk/night (contourLabelColor).

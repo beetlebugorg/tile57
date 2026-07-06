@@ -6,7 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Metres -> feet, for the recreational feet display variant (always_tenths).
+/// Metres -> feet, for the recreational whole-feet display variant.
 pub const M_TO_FT: f64 = 3.280839895;
 
 /// The S-52 symbol scale every point symbol / sounding is drawn at: screen px
@@ -24,7 +24,7 @@ pub const SYMBOL_SCALE: f64 = 0.02834627777338028;
 /// STATUS). NOTE: the rule's spatial-QUAPOS fallback for the ring (when the direct
 /// attrs are absent) is not yet wired — soundings whose only low-accuracy signal is
 /// a poor spatial quality-of-position still miss the ring; the direct attrs match.
-pub fn syms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: bool, always_tenths: bool) ![]const u8 {
+pub fn syms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: bool, whole_feet: bool) ![]const u8 {
     const d = @abs(depth);
     // TRUNCATE to tenths (round DOWN), matching SNDFRM04: the rule splits the depth's
     // decimal string and takes string.sub(fractional, 1, 1) — the FIRST fractional
@@ -35,7 +35,11 @@ pub fn syms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: 
     // a genuine sub-tenth value (a unit conversion, e.g. metres->feet) still floors down.
     // Was @round (nearest), which rounded UP across the half (14.76 ft -> 14.8) — both a
     // spec divergence AND the unsafe direction.
-    const tenths: i64 = @intFromFloat(@floor(d * 10.0 + 1e-6));
+    const raw_tenths: i64 = @intFromFloat(@floor(d * 10.0 + 1e-6));
+    // The feet display is a recreational unit shown as WHOLE feet — drop the tenth
+    // (still truncated DOWN, so it stays shallow-erring). 14.76 ft -> "14", 32.8 -> "32".
+    // Metres keep SNDFRM04's first-fractional-digit tenth (below 31 m).
+    const tenths: i64 = if (whole_feet) @divTrunc(raw_tenths, 10) * 10 else raw_tenths;
     const idepth: i64 = @divTrunc(tenths, 10);
     const frac: u8 = @intCast(@mod(tenths, 10));
     var dbuf: [12]u8 = undefined;
@@ -68,12 +72,10 @@ pub fn syms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: 
     if (idepth < 10) {
         try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[0] }));
         if (frac != 0) try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));
-    } else if (idepth < 100 and frac != 0 and (idepth < 31 or always_tenths)) {
-        // Two integer digits + a subscript tenth. SNDFRM04 only does this below 31
-        // (native metres rule); `always_tenths` extends it to 99 for a CONVERTED value
-        // (feet) so a converted sounding never collapses to a whole number — we don't
-        // round conversions. (>= 100 displayed units still drop the tenth: the 3-digit
-        // glyph arrangement has no subscript slot.)
+    } else if (idepth < 100 and frac != 0 and idepth < 31) {
+        // Two integer digits + a subscript tenth — SNDFRM04's native metres rule below
+        // 31 m. Feet never reaches here: `whole_feet` zeroed the tenth above (frac == 0),
+        // so a converted sounding shows as whole feet, not a subscript fraction.
         try toks.append(a, try std.fmt.allocPrint(a, "{s}2{c}", .{ prefix, ds[0] }));
         try toks.append(a, try std.fmt.allocPrint(a, "{s}1{c}", .{ prefix, ds[1] }));
         try toks.append(a, try std.fmt.allocPrint(a, "{s}5{d}", .{ prefix, frac }));

@@ -256,9 +256,9 @@ fn soundingQualityFlags(f: s57.Feature) struct { swept: bool, low_acc: bool } {
 /// style's safety-depth split compares against. Returns false (nothing appended) when
 /// the depth composes to no glyphs. The safety split stays in metres (`depth`); only
 /// the displayed digits convert. The metres value follows SNDFRM04 (whole >= 31 m); the
-/// feet value is a CONVERSION, so it keeps its tenth at every magnitude (`always_tenths`)
-/// — we never round a conversion to a whole number. A 4.5 m obstruction reads "14.8"
-/// (ft); a 10 m one reads "32.8" (ft), not "32".
+/// feet value is a recreational display shown as WHOLE feet (`whole_feet`), TRUNCATED
+/// down so it stays shallow-erring. A 4.5 m obstruction reads "14" (ft, 14.76 floored);
+/// a 10 m one reads "32" (ft, 32.8 floored).
 fn appendSoundingProps(a: Allocator, props: *std.ArrayList(mvt.Prop), depth_m: f64, swept: bool, low_acc: bool) !bool {
     const sym_s = try sndfrmSyms(a, "SOUNDS", depth_m, swept, low_acc, false);
     if (sym_s.len == 0) return false;
@@ -2915,10 +2915,10 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     try std.testing.expectEqualStrings("SOUNDG22,SOUNDG11,SOUNDG56", try sndfrmSyms(a, "SOUNDG", 21.6, false, false, false));
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS07", try sndfrmSyms(a, "SOUNDS", 47.0, false, false, false));
 
-    // always_tenths (a CONVERTED value, e.g. feet): 32.8 keeps its tenth at every
-    // magnitude — never collapse a conversion to a whole number. Native (metres) drops
-    // the tenth >= 31 per SNDFRM04 (32.8 m -> "32").
-    try std.testing.expectEqualStrings("SOUNDS23,SOUNDS12,SOUNDS58", try sndfrmSyms(a, "SOUNDS", 32.8, false, false, true));
+    // whole_feet (the recreational feet display): 32.8 shows as WHOLE feet "32",
+    // truncated down (no subscript tenth) — matching native metres >= 31 (which also
+    // drops the tenth per SNDFRM04). A converted value never shows a fractional foot.
+    try std.testing.expectEqualStrings("SOUNDS13,SOUNDS02", try sndfrmSyms(a, "SOUNDS", 32.8, false, false, true));
     try std.testing.expectEqualStrings("SOUNDS13,SOUNDS02", try sndfrmSyms(a, "SOUNDS", 32.8, false, false, false));
 
     // >= 1000 m (4-digit, codes 2,1,0,4) — previously dropped entirely.
@@ -2942,14 +2942,14 @@ test "SNDFRM04 digit composition matches the Lua rule" {
     try std.testing.expectEqualStrings("SOUNDSB1,SOUNDSC3,SOUNDSA3,SOUNDS21,SOUNDS12,SOUNDS53", try sndfrmSyms(a, "SOUNDS", -12.3, true, true, false));
 }
 
-test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)" {
+test "appendSoundingProps: feet variant is whole feet, truncated down" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // A 4.5 m obstruction: metres reads "4.5" (SOUNDS14,SOUNDS55); feet TRUNCATES to
-    // "14.7" (4.5*3.280839895 = 14.76 → SNDFRM04 takes the first fractional digit, round
-    // DOWN), NOT "14.8" (nearest) and NOT "15" (whole). Errs shallow = the safe direction.
+    // A 4.5 m obstruction: metres reads "4.5" (SOUNDS14,SOUNDS55); feet shows WHOLE
+    // "14" (4.5*3.280839895 = 14.76 → floored), NOT "14.8" (nearest), "14.7" (tenth), or
+    // "15" (rounded). Truncated down errs shallow = the safe direction.
     var props = std.ArrayList(mvt.Prop).empty;
     try std.testing.expect(try appendSoundingProps(a, &props, 4.5, false, false));
     var sym_s: []const u8 = "";
@@ -2959,7 +2959,7 @@ test "appendSoundingProps: feet variant keeps one decimal place (not whole feet)
         if (std.mem.eql(u8, p.key, "sym_s_ft")) sym_s_ft = p.value.string;
     }
     try std.testing.expectEqualStrings("SOUNDS14,SOUNDS55", sym_s); // 4.5 m
-    try std.testing.expectEqualStrings("SOUNDS21,SOUNDS14,SOUNDS57", sym_s_ft); // 14.7 ft (truncated)
+    try std.testing.expectEqualStrings("SOUNDS11,SOUNDS04", sym_s_ft); // 14 ft (14.76 floored)
 }
 
 test "appendTextProps: LocalOffset (mm) -> loff key in text-body units (round mm/3.51)" {
