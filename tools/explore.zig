@@ -1394,6 +1394,10 @@ fn exLoadCell(
 // transmit-once-per-view + place, deleted each frame — the same cached-region
 // pattern as the ascii kitty TUI, so it never scrolls the layout.
 fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, source: []const u8) !void {
+    // The interactive TUI is POSIX-only: std.posix.termios is `void` on Windows,
+    // so gate the whole raw-mode body out at comptime (same idiom as common.zig's
+    // terminalSize). The non-interactive `explore` paths stay cross-platform.
+    if (@import("builtin").os.tag == .windows) return usageErr("--tui is not supported on Windows");
     const stdout = std.Io.File.stdout();
     const stdin_fd = std.Io.File.stdin().handle;
     const old = std.posix.tcgetattr(stdin_fd) catch return usageErr("--tui needs a terminal");

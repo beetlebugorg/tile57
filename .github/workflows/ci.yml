@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  # push only on main; PR branches are covered by pull_request. Scoping push this
+  # way avoids the double run (a push to a branch with an open PR otherwise fires
+  # both events).
+  push:
+    branches: [main]
+  pull_request:
+
+# libtile57 (the static lib linked into chartplotter's CGO binary) and the tile57
+# CLI are built with Zig 0.16. The nested submodules carry the IHO S-101 catalogues
+# that are embedded at build time, so checkout must be recursive.
+#
+# chartplotter cross-compiles its CGO binary against this engine with `zig cc` for
+# linux + windows, amd64/arm64 (see chartplotter's release/xbuild). A default
+# `zig build` builds BOTH libtile57.a and the `tile57` CLI exe, so the whole engine
+# — not just the lib — has to compile for every one of those targets. The
+# cross-compile matrix guards that here, in the engine repo, instead of only
+# surfacing downstream when chartplotter tags a release.
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build (native)
+        run: zig build -Doptimize=ReleaseFast
+      - name: Test
+        run: zig build test
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
+          - x86_64-windows-gnu
+          - aarch64-windows-gnu
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # Builds libtile57.a + the tile57 CLI exe for the target. This is exactly
+      # what chartplotter's `xbuild` invokes per target before linking the Go
+      # binary, so a green matrix means the downstream cross-build will link.
+      - name: Cross-compile ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
