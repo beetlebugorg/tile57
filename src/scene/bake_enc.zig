@@ -171,6 +171,50 @@ fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
     return std.mem.lessThan(u8, ctx.name(a_idx), ctx.name(b_idx));
 }
 
+/// coverClipForCell's per-tile verdict — the cheap FULL/EMPTY/SEAM classifier
+/// (spec §2.2) in front of the Martinez boolean:
+///   .none  — no finer/earlier coverage touches this tile: emit unclipped (the
+///            overwhelmingly common case; zero geometry cost).
+///   .full  — some one covering cell's coverage contains the WHOLE tile: the
+///            cell contributes nothing here, skip it entirely.
+///   .rings — a coverage EDGE crosses the tile (a true seam): the exact
+///            projected+unioned subtrahend, Martinez runs only here.
+pub const CoverClip = union(enum) { none, full, rings: []const []const mvt.Point };
+
+// Does segment a-b intersect the axis-aligned lon/lat rect [w,s,e,n]?
+// Conservative-fast: endpoint-in-rect, else standard slab rejection + a
+// crossing test against each rect edge via orientation signs.
+fn segTouchesRect(ax: f64, ay: f64, bx: f64, by: f64, w: f64, so: f64, e: f64, n: f64) bool {
+    if (ax >= w and ax <= e and ay >= so and ay <= n) return true;
+    if (bx >= w and bx <= e and by >= so and by <= n) return true;
+    if (@max(ax, bx) < w or @min(ax, bx) > e or @max(ay, by) < so or @min(ay, by) > n) return false;
+    // The segment's bbox overlaps the rect but no endpoint is inside: it crosses
+    // iff the rect's corners are not all on one side of the segment line.
+    const dx = bx - ax;
+    const dy = by - ay;
+    const s1 = dx * (so - ay) - dy * (w - ax);
+    const s2 = dx * (so - ay) - dy * (e - ax);
+    const s3 = dx * (n - ay) - dy * (e - ax);
+    const s4 = dx * (n - ay) - dy * (w - ax);
+    const any_pos = s1 > 0 or s2 > 0 or s3 > 0 or s4 > 0;
+    const any_neg = s1 < 0 or s2 < 0 or s3 < 0 or s4 < 0;
+    return any_pos and any_neg;
+}
+
+// Does any edge of `rings` touch the lon/lat rect?
+fn ringsTouchRect(rings: []const []const s57.LonLat, w: f64, so: f64, e: f64, n: f64) bool {
+    for (rings) |ring| {
+        if (ring.len < 2) continue;
+        var j = ring.len - 1;
+        for (ring, 0..) |p, k| {
+            const q = ring[j];
+            j = k;
+            if (segTouchesRect(p.lon(), p.lat(), q.lon(), q.lat(), w, so, e, n)) return true;
+        }
+    }
+    return false;
+}
+
 /// The finer-scale coverage to subtract from cell `cscl_self`'s fills in tile
 /// (z,x,y): the union of every strictly-finer cell's M_COVR (CATCOV=1), projected
 /// into the tile's i32 space and box-clipped, as a clean ring set. This is the
@@ -181,7 +225,7 @@ fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
 /// else, including inside a finer no-data hole (no blank). null = nothing finer
 /// covers this tile (the cell is finest here → draw everything). Allocated in `a`
 /// (the per-tile scratch), so it lives exactly as long as the tile.
-pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, reach_only: ?[]const bool, self_idx: u32, z: u8, x: u32, y: u32, box: tile.Box) ?[]const []const mvt.Point {
+pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, reach_only: ?[]const bool, self_idx: u32, z: u8, x: u32, y: u32, box: tile.Box) CoverClip {
     // No-M_COVR / unknown-scale cells (cscl <= 0) follow the asymmetric rule
     // (spec §2.1/Q1): they render their own content but ARE clipped by finer
     // real coverage — at bandOf's default scale, the same one their band floor
@@ -189,6 +233,44 @@ pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, r
     // bbox must not cut coarser cells across its empty corners).
     const raw_self = ctx.cscl(self_idx);
     const cscl_self: i32 = if (raw_self > 0) raw_self else 50_000;
+    // Cheap FULL/EMPTY/SEAM classification in lon/lat BEFORE any projection or
+    // boolean: most tiles are either fully inside one covering cell (drop the
+    // whole cell) or touched by no covering edge (emit unclipped) — a rider
+    // deep inside or far outside the finer coverage costs a few segment/rect
+    // tests instead of a per-tile Martinez union.
+    const tbll = tile.tileBoundsLonLat(z, x, y);
+    // Pad by the tile buffer so the box-clipped operands the SEAM path builds
+    // agree with the classification (BUFFER/EXTENT of the tile span per side).
+    const pad_x = (tbll[2] - tbll[0]) * (@as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT)));
+    const pad_y = (tbll[3] - tbll[1]) * (@as(f64, @floatFromInt(tile.BUFFER)) / @as(f64, @floatFromInt(tile.EXTENT)));
+    const w = tbll[0] - pad_x;
+    const so = tbll[1] - pad_y;
+    const e = tbll[2] + pad_x;
+    const n = tbll[3] + pad_y;
+    const cx = (tbll[0] + tbll[2]) * 0.5;
+    const cy = (tbll[1] + tbll[3]) * 0.5;
+    var any_seam = false;
+    for (idxs, 0..) |idx, j| {
+        if (reach_only) |ro| if (ro[j]) continue;
+        if (idx == self_idx) continue;
+        const cscl = ctx.cscl(idx);
+        if (cscl <= 0 or cscl > cscl_self) continue;
+        if (cscl == cscl_self and !ordersBefore(ctx, idx, self_idx)) continue;
+        const b = ctx.bounds(idx);
+        if (b[0] > e or b[2] < w or b[1] > n or b[3] < so) continue;
+        for (ctx.coverage(idx)) |rings| {
+            if (ringsTouchRect(rings, w, so, e, n)) {
+                any_seam = true;
+            } else if (s57.pointInRings(rings, cx, cy)) {
+                // No edge in the (padded) tile and the centre is inside: the
+                // whole tile is covered by this cell — nothing of self survives.
+                return .full;
+            }
+        }
+        if (any_seam) break;
+    }
+    if (!any_seam) return .none;
+
     var covers = std.ArrayList(geometry.boolean.Polygon).empty;
     for (idxs, 0..) |idx, j| {
         if (reach_only) |ro| if (ro[j]) continue;
@@ -206,27 +288,27 @@ pub fn coverClipForCell(a: std.mem.Allocator, ctx: anytype, idxs: []const u32, r
             var poly = std.ArrayList([]const geometry.boolean.Pt).empty;
             for (rings) |ring| {
                 if (ring.len < 3) continue;
-                const proj = a.alloc(mvt.Point, ring.len) catch return null;
+                const proj = a.alloc(mvt.Point, ring.len) catch return .none;
                 for (ring, 0..) |pt, k| proj[k] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
                 const clipped = tile.clipPolygon(a, proj, box) catch continue;
                 if (clipped.len < 3) continue;
-                const bring = a.alloc(geometry.boolean.Pt, clipped.len) catch return null;
+                const bring = a.alloc(geometry.boolean.Pt, clipped.len) catch return .none;
                 for (clipped, 0..) |cp, k| bring[k] = .{ .x = cp.x, .y = cp.y };
-                poly.append(a, bring) catch return null;
+                poly.append(a, bring) catch return .none;
             }
-            if (poly.items.len > 0) covers.append(a, poly.items) catch return null;
+            if (poly.items.len > 0) covers.append(a, poly.items) catch return .none;
         }
     }
-    if (covers.items.len == 0) return null;
-    const uni = geometry.boolean.unionAll(a, covers.items) catch return null;
-    if (uni.len == 0) return null;
-    const out = a.alloc([]const mvt.Point, uni.len) catch return null;
+    if (covers.items.len == 0) return .none;
+    const uni = geometry.boolean.unionAll(a, covers.items) catch return .none;
+    if (uni.len == 0) return .none;
+    const out = a.alloc([]const mvt.Point, uni.len) catch return .none;
     for (uni, 0..) |r, i| {
-        const mr = a.alloc(mvt.Point, r.len) catch return null;
+        const mr = a.alloc(mvt.Point, r.len) catch return .none;
         for (r, 0..) |bp, k| mr[k] = .{ .x = @intCast(bp.x), .y = @intCast(bp.y) };
         out[i] = mr;
     }
-    return out;
+    return .{ .rings = out };
 }
 
 /// Whether the finer coverage `cover_clip` covers the ENTIRE tile box — i.e. this
@@ -673,22 +755,32 @@ const TileGenCtx = struct {
         // refs + the encoded tile are transient (gzipped right below), so they ride
         // the per-thread scratch arena — reset after this tile, no per-tile mmap.
         const refs = scratch.alloc(scene.CellRef, idxs.len) catch return;
+        var nrefs: usize = 0;
         for (idxs, 0..) |idx, j| {
             const be = &c.backends[idx];
             // The exact best-available composite: subtract the finer cells' M_COVR
             // from this cell's fills/patterns, and (in scene.appendCellFeatures) drop
             // its points/strokes wherever a finer cell owns the ground. cover_clip is
             // the ONE cross-band mechanism — no carryGate / suppress_whole / smax.
-            const cover_clip = coverClipForCell(scratch, BackendCov{ .backends = c.backends }, idxs, reach_only, idx, z, x, y, box);
+            // The FULL/EMPTY/SEAM classifier keeps the common cases free: .full
+            // (a covering cell owns the whole tile) skips the cell entirely,
+            // .none emits it unclipped, and only true seam tiles run Martinez.
+            const clip = coverClipForCell(scratch, BackendCov{ .backends = c.backends }, idxs, reach_only, idx, z, x, y, box);
+            if (clip == .full) continue;
+            const cover_clip: ?[]const []const mvt.Point = switch (clip) {
+                .rings => |r| r,
+                else => null,
+            };
             // Overscale (S-52 §10.1.10.2): the X2 gate denominator. Hatch this cell's
             // OVERSC01 coverage only where it is the DISPLAYED data AT a scale boundary
             // — a strictly-finer cell rides the tile (gf_tile < cscl) AND this cell
             // still owns some of it (its fills aren't fully clipped away).
             const oscl: i64 = overscaleGateDenom(be.cscl);
             const wins_somewhere = cover_clip == null or !tileFullyCovered(scratch, cover_clip.?, box);
-            refs[j] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .light_range_m = be.light_range_m };
+            refs[nrefs] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .light_range_m = be.light_range_m };
+            nrefs += 1;
         }
-        const mvt_bytes = scene.encodeTile(scratch, scratch, refs, z, x, y, c.format, c.pick_attrs) catch return;
+        const mvt_bytes = scene.encodeTile(scratch, scratch, refs[0..nrefs], z, x, y, c.format, c.pick_attrs) catch return;
         // Gzip here, in the worker — the expensive step done in parallel; the serial
         // collection then only dedups + writes the already-compressed tile. The
         // gzipped result must outlive the scratch reset, so it comes from `c.gpa`.
