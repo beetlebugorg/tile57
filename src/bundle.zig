@@ -1412,10 +1412,11 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                     }
                 }
             };
-            for (portray[0..n_own], 0..) |p, ci| if (p != null) {
-                portray[ci].?.arena.deinit();
-                gpa.destroy(portray[ci].?.arena);
-            };
+            // Portrayal arenas are owned by the bake-lifetime pcache (freed once
+            // when the bake returns) — do NOT free them here. These own cells'
+            // portrayal is registered in pcache at load, so freeing it per pass
+            // double-frees it at pcache teardown (the coarsest band is always
+            // non-deferred, so this else branch runs every bake).
         }
         const parses = g_parses.load(.monotonic) - parses0;
         const band_secs = nowSec() - band_start;
