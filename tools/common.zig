@@ -14,7 +14,7 @@ pub const DEFAULT_MAXZOOM: u8 = 16;
 // Lazy-baker tuning (bake-root): LRU budget = parsed cells kept loaded across
 // super-tiles; super-tile depth = how far below a band's min zoom the spatial
 // batch tile sits. Overridable via --lru / --superdz for tuning.
-pub const DEFAULT_LRU_BUDGET: usize = 64;
+pub const DEFAULT_LRU_BUDGET: usize = 256;
 pub const DEFAULT_SUPER_DZ: u8 = 3;
 
 // Env access lives in the Lua C shim (Zig 0.16 gates env behind std.Io);

@@ -270,7 +270,9 @@ pub const BakeOpts = struct {
     created: []const u8 = "", // manifest created stamp (ISO8601; "" = unset)
     minzoom: u8 = 8,
     maxzoom: u8 = 16,
-    lru: usize = 64, // lazy-bake tuning: parsed cells held resident
+    lru: usize = 256, // lazy-bake tuning: parsed-GEOMETRY cells held resident. Coarse
+    // riders span many super-tiles, so 64 thrashed re-parses on district bakes;
+    // 256 holds a row of super-tiles' working set. TILE57_LRU_BUDGET overrides.
     super_dz: u8 = 3, // lazy-bake tuning: spatial super-tile depth
     format: engine.scene.TileFormat = .mlt,
     // Cross-pack best-available: a peer pack's ENC_ROOT (same provider) read for
@@ -573,10 +575,7 @@ const CarryState = struct {
                 gpa.destroy(ga);
             }
         };
-        for (self.portray) |p| if (p) |pp| {
-            pp.arena.deinit();
-            gpa.destroy(pp.arena);
-        };
+        // Portrayal arenas are owned by the bake-lifetime pcache; free only the slice.
         gpa.free(self.portray);
         gpa.free(self.geom);
         gpa.free(self.gave_up);
@@ -796,6 +795,10 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // on parsed+portrayed cells kept between super-tiles. Read once per bake.
     const lru_budget = envUsizeOr("TILE57_LRU_BUDGET", lru_budget_arg);
     const super_dz: u8 = @intCast(@min(envUsizeOr("TILE57_SUPER_DZ", super_dz_arg), @as(usize, 16)));
+    // Overscale fill-up depth (crisp zooms past each band's window; 0-2). Cost
+    // ~4x that band's uncovered footprint per zoom; blank water never returns
+    // at 0 (camera cap + one-level stretch) — this dial buys crisp depth.
+    const fillup_dz: u8 = @intCast(@min(envUsizeOr("TILE57_FILLUP_DZ", engine.bake_enc.FILLUP_DZ), @as(usize, 2)));
     // Progress sink: the caller's callback, else the built-in console writer (the CLI
     // path, byte-identical to before). Both only touch stderr — never the tile bytes.
     const prog: engine.bake_enc.Progress = progress orelse cliProgress;
@@ -805,6 +808,21 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // rounds every allocation up to a page and mmaps it, churning page faults;
     // smp_allocator pools and reuses freed blocks.
     const gpa = std.heap.smp_allocator;
+    // Bake-lifetime portrayal cache, keyed by cell path: a cell can appear in
+    // SEVERAL passes (its own band, a coarse-rider slot in the next-finer pass,
+    // a carry slot in the next-coarser) and portrayal is ~80% of the bake — so
+    // it runs ONCE per cell per bake, whichever pass loads it first. The cache
+    // owns every portrayal arena (pass-end no longer frees them; CarryState
+    // frees only its slices) and releases them all when the bake returns.
+    var pcache = std.StringHashMap(CellPortray).init(gpa);
+    defer {
+        var pit = pcache.valueIterator();
+        while (pit.next()) |pc| {
+            pc.arena.deinit();
+            gpa.destroy(pc.arena);
+        }
+        pcache.deinit();
+    }
     // Input may be a whole ENC_ROOT directory OR a single cell `.000` file; either
     // way the lazy super-tile bake below streams to disk through the SAME path. For
     // a single file the "dir" is its parent (the worker reads the cell + its `.001…`
@@ -933,6 +951,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
     // composites + SCAMIN manifest an MVT bake does.
     var sink = BakeSink{ .sw = &sw, .sounds = &sounds, .scamin = &scamin, .a = a, .gpa = gpa, .collect_sounds = collect_sounds, .format = format };
     var baker = Bands.Baker.init(gpa, minzoom, maxzoom, .{ .ctx = &sink, .func = BakeSink.run });
+    baker.fillup_dz = fillup_dz;
     baker.format = format;
     baker.pick_attrs = pick_attrs;
     defer baker.deinit();
@@ -1217,12 +1236,23 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
             // only re-parsed, never re-portrayed.
             var miss = std.ArrayList(u32).empty;
             defer miss.deinit(gpa);
-            for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(gpa, ci) catch {};
+            for (cells) |ci| if (geom[ci] == null and !gave_up[ci]) {
+                // Portrayal computed by ANY earlier pass (rider/carry/own) is
+                // reused — the worker then only re-parses geometry.
+                if (portray[ci] == null) {
+                    if (pcache.get(pass_entries[ci].path)) |pc| portray[ci] = pc;
+                }
+                miss.append(gpa, ci) catch {};
+            };
             if (miss.items.len > 0) {
                 var lw = LoadWork{ .cells = miss.items, .entries = pass_entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = gpa };
                 Bands.parallelFor(gpa, miss.items.len, &lw, LoadWork.run);
                 for (miss.items) |ci| {
                     if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
+                    if (portray[ci]) |pc| {
+                        const gop = pcache.getOrPut(pass_entries[ci].path) catch continue;
+                        if (!gop.found_existing) gop.value_ptr.* = pc;
+                    }
                 }
             }
             tick += 1;
@@ -1309,12 +1339,21 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                 // fill-down tiles are broad low-zoom, so no super-tile clip applies.
                 var miss = std.ArrayList(u32).empty;
                 defer miss.deinit(gpa);
-                for (fd.items) |ci| if (geom[ci] == null and !gave_up[ci]) miss.append(gpa, ci) catch {};
+                for (fd.items) |ci| if (geom[ci] == null and !gave_up[ci]) {
+                    if (portray[ci] == null) {
+                        if (pcache.get(pass_entries[ci].path)) |pc| portray[ci] = pc;
+                    }
+                    miss.append(gpa, ci) catch {};
+                };
                 if (miss.items.len > 0) {
                     var lw = LoadWork{ .cells = miss.items, .entries = pass_entries, .dir = dir, .io = io, .portray = portray, .geom = geom, .rules_dir = rules_dir, .gpa = gpa };
                     Bands.parallelFor(gpa, miss.items.len, &lw, LoadWork.run);
                     for (miss.items) |ci| {
                         if (geom[ci] != null) n_geom += 1 else gave_up[ci] = true;
+                        if (portray[ci]) |pc| {
+                            const gop = pcache.getOrPut(pass_entries[ci].path) catch continue;
+                            if (!gop.found_existing) gop.value_ptr.* = pc;
+                        }
                     }
                 }
                 var subset = std.ArrayList(Bands.Backend).empty;
@@ -1353,10 +1392,8 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
                 }
             }
         };
-        for (portray[n_own..], n_own..) |p, ci| if (p != null) {
-            portray[ci].?.arena.deinit();
-            gpa.destroy(portray[ci].?.arena);
-        };
+        // Portrayal arenas are owned by the bake-lifetime pcache now — nothing
+        // to free per pass (geometry above still is).
         if (deferred) {
             const po = try gpa.alloc(?CellPortray, n_own);
             @memcpy(po, portray[0..n_own]);

@@ -369,10 +369,14 @@ pub fn bandOf(cscl: i32) Band {
     return .overview;
 }
 
-/// Overscale fill-up cap: how many zooms past its native max a band's own
-/// cells keep baking (only where nothing finer already emitted). +2 ≈ X4
-/// display overscale — the ECDIS-sane stretch limit.
-pub const FILLUP_DZ: u8 = 2;
+/// Overscale fill-up depth DEFAULT: how many zooms past its native max a
+/// band's own cells keep baking (only where nothing finer already emitted).
+/// Every extension zoom ~4x that band's tile count over its uncovered
+/// footprint (measured: +2 turned a 5.6k-tile approach pass into 41k), so the
+/// default is ONE crisp overscale zoom; TILE57_FILLUP_DZ=0..2 overrides per
+/// bake (Baker.fillup_dz). 0 never blanks — the client camera stops at the
+/// probed data depth and MapLibre stretches one level past it.
+pub const FILLUP_DZ: u8 = 1;
 
 /// Absolute fill-up ceiling: extension zooms never exceed this. The fill-up
 /// serves the MID-ZOOM seam where a coarse chart is the finest coverage (the
@@ -727,6 +731,9 @@ pub const Baker = struct {
     // but never enumerate tiles of their own. Set by the driver before
     // bakeBand; consumed (reset to null) by it. null = no riders.
     rider_start: ?usize = null,
+    // Overscale fill-up depth for this bake (see FILLUP_DZ; drivers may override
+    // from TILE57_FILLUP_DZ).
+    fillup_dz: u8 = FILLUP_DZ,
     count: usize = 0, // tiles handed to the sink (cumulative across bands)
     union_b: [4]f64 = .{ 1e9, 1e9, -1e9, -1e9 }, // w, s, e, n
     format: scene.TileFormat = .mvt, // output tile encoding (mvt default; mlt optional)
@@ -796,7 +803,7 @@ pub const Baker = struct {
         // of the single-source deep-zoom hole (blank water past a band's window
         // wherever nothing finer covers). Past the cap the server 404s absent
         // tiles and MapLibre stretches the deepest ancestor.
-        const zext: u8 = @min(self.maxzoom, @max(zr.max, @min(zr.max +| FILLUP_DZ, FILLUP_CEIL)));
+        const zext: u8 = @min(self.maxzoom, @max(zr.max, @min(zr.max +| self.fillup_dz, FILLUP_CEIL)));
         switch (floor) {
             // Defer the band's own floor tiles to the next-coarser pass — but only
             // when this pass would otherwise bake them (zlo == the real floor).
