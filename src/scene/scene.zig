@@ -1748,10 +1748,19 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     // Best-available: cut the covered stretches out of this cell's strokes — the
     // exact line half of the composite (see clipRunsOutsideCover). The geo-space
     // copy feeds the complex-linestyle tessellator, the projected copy the plain
-    // stroke path below; both cut by the identical coverage.
+    // stroke path below. The coverage cut is the per-segment-vs-cover hotspot, so
+    // clip ONLY the copy an actual line instruction will consume: a feature whose
+    // lines are all plain (solid/dashed) never touches stroke_geo, and one with
+    // only complex linestyles never touches stroke_proj — clipping the unused copy
+    // is pure waste. Same output, one cut instead of two on the common path.
     if (opts.cover_clip) |cc| {
-        stroke_geo = clipGeoPartsOutsideCover(a, stroke_geo, cc, z, x, y);
-        stroke_proj = clipRunsOutsideCover(a, stroke_proj, cc);
+        var want_geo = false;
+        var want_proj = false;
+        if (!opts.suppress_lines) for (p.lines) |ln| {
+            if (!std.mem.eql(u8, ln.style, "solid") and g_linestyles.get(ln.style) != null) want_geo = true else want_proj = true;
+        };
+        if (want_geo) stroke_geo = clipGeoPartsOutsideCover(a, stroke_geo, cc, z, x, y);
+        if (want_proj) stroke_proj = clipRunsOutsideCover(a, stroke_proj, cc);
     }
 
     const force_dash = !quaposSolidClass(f.objl) and s57.isLowAccuracyQuapos(cell.featureQuapos(f));
