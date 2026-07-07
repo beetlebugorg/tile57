@@ -76,10 +76,22 @@ typedef struct {
  * the pick report for free. */
 
 /* Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
- * same directory) as a LIVE chart: portrayed on open, then rendered per view via
- * tile57_chart_render_surface_cb, with real M_COVR coverage from tile57_chart_coverage.
- * Rules are the library's embedded catalogue. NULL/failure -> NULL. */
+ * same directory) by BAKING it to an in-memory PMTiles and serving the fast reader
+ * render path (tile57_chart_render_surface_cb), with the cell's real M_COVR coverage
+ * (tile57_chart_coverage) and compilation scale (chart_info.native_scale) attached.
+ * The bake costs ~1-2s; a host rendering per view should run it off-thread. See the
+ * header/zoom variants for a cheap scan pass + progressive load. NULL/fail -> NULL. */
 tile57_chart *tile57_chart_open(const char *path);
+
+/* Open ONE cell for METADATA ONLY — bbox, native_scale, and M_COVR coverage — via a
+ * cheap parse with NO tile bake, for a host's chart-database/header scan. Do NOT
+ * render_surface this handle (it has no portrayal). NULL/failure -> NULL. */
+tile57_chart *tile57_chart_open_header(const char *path);
+
+/* Open ONE cell baking only [minzoom, maxzoom] to an in-memory PMTiles: bake a narrow
+ * native band fast for first paint, then re-open the full range in the background
+ * (progressive load). Renders via the fast reader path. NULL/failure -> NULL. */
+tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t maxzoom);
 
 /* Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked streaming
  * chart: enumerates cells + peeks each bbox/scale, reads bytes on demand (working
@@ -110,6 +122,8 @@ typedef struct {
     bool     has_bounds; double west, south, east, north;
     bool     has_anchor; double anchor_lat, anchor_lon, anchor_zoom;
     uint8_t  tile_type;                                   /* tile57_tile_type */
+    int32_t  native_scale; /* compilation scale (1:N) for a live cell; 0 = unknown
+                            * (PMTiles: derive the scale from the zoom band instead) */
 } tile57_chart_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_chart_info *out);
 

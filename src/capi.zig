@@ -68,14 +68,29 @@ fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]chart.CellI
     return out;
 }
 
-/// Open an on-disk ENC_ROOT directory (or single .000) as a streaming chart. See tile57.h.
 /// Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
-/// same directory) as a live chart — a `.cell` backend that render_surface_cb and
-/// tile57_chart_coverage support. For a whole ENC_ROOT directory use
-/// tile57_charts_open. See tile57.h.
+/// same directory) by baking it to an in-memory PMTiles and serving the fast reader
+/// path — with the cell's real M_COVR coverage + compilation scale attached. For a
+/// whole ENC_ROOT directory use tile57_charts_open. See tile57.h.
 export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
     const p = spanOpt(path) orelse return null;
     return chart.openCellPath(p, null, true) catch null;
+}
+
+/// Open ONE cell for METADATA ONLY (bbox + native scale + M_COVR coverage): a cheap
+/// parse, no tile bake — for a host's header/scan pass. Do NOT render_surface this
+/// handle (no portrayal). See tile57.h.
+export fn tile57_chart_open_header(path: ?[*:0]const u8) callconv(.c) ?*Chart {
+    const p = spanOpt(path) orelse return null;
+    return chart.openCellHeader(p, null, true) catch null;
+}
+
+/// Open ONE cell by baking only [minzoom, maxzoom] to an in-memory PMTiles — a host
+/// bakes a narrow band fast for first paint, then re-opens the full range in the
+/// background (progressive load). Renders via the fast reader path. See tile57.h.
+export fn tile57_chart_open_zoom(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8) callconv(.c) ?*Chart {
+    const p = spanOpt(path) orelse return null;
+    return chart.openCellBaked(p, null, true, minzoom, maxzoom) catch null;
 }
 
 /// Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked chart — the
@@ -125,6 +140,7 @@ const CChartInfo = extern struct {
     // backend reports its archive's stored type; a cell backend its live
     // generation format. Appended for ABI-append-safety.
     tile_type: u8,
+    native_scale: i32, // live cell compilation scale (1:N); 0 = derive from zoom
 };
 
 // tile57_tile_type values (keep in sync with tile57.h).
@@ -139,6 +155,7 @@ export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) voi
     const zr = s.zoomRange();
     out.min_zoom = zr.min;
     out.max_zoom = zr.max;
+    out.native_scale = s.nativeScale();
     out.bands = s.bands();
     out.tile_type = switch (s.tileType()) {
         .mlt => TILE_TYPE_MLT,
