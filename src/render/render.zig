@@ -34,6 +34,7 @@ pub const symbols = @import("symbols.zig");
 pub const sndfrm = @import("sndfrm.zig");
 pub const font = @import("font.zig");
 pub const pdf = @import("pdf.zig");
+pub const cb_canvas = @import("cb_canvas.zig");
 
 test {
     _ = surface;

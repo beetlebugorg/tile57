@@ -869,7 +869,7 @@ pub const Chart = struct {
     /// labels + declutter over the whole canvas. Returns PNG bytes (gpa-owned;
     /// free with freeBytes). Cell-backed sources only; a baked PMTiles source
     /// has no portrayal to render from (bundle-sourced rendering is future work).
-    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, output: render.pixel.Output) ![]u8 {
+    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, output: render.pixel.Output, cb_table: ?*const render.cb_canvas.CCanvas) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -905,6 +905,7 @@ pub const Chart = struct {
         var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, @import("tiles").tile.EXTENT);
         ps.store = store.asStore();
         ps.output = output;
+        ps.cb = cb_table;
 
         switch (self.backend) {
             .reader => |*rd| {

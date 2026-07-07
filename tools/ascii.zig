@@ -103,7 +103,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Kitty, WezTerm, Konsole): the grid's cell count times the
         // terminal's cell-pixel size (or the 10x20 guess off-TTY).
         const cp = cellPx(terminalSize(io));
-        const png_bytes = c.renderView(v.lon, v.lat, v.zoom, cols * cp[0], rows * cp[1], palette, &m, .png) catch return usageErr("render failed");
+        const png_bytes = c.renderView(v.lon, v.lat, v.zoom, cols * cp[0], rows * cp[1], palette, &m, .png, null) catch return usageErr("render failed");
         defer chart.freeBytes(png_bytes);
         const seq = render.kitty.encodePng(a, png_bytes) catch return usageErr("encode failed");
         std.Io.File.stdout().writeStreamingAll(io, seq) catch {};
@@ -205,7 +205,7 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
                 r.h = view_h * 3;
                 r.tl_x = vc[0] - @as(f64, @floatFromInt(r.w)) / 2.0;
                 r.tl_y = vc[1] - @as(f64, @floatFromInt(r.h)) / 2.0;
-                const png_bytes = c.renderView(lon, lat, zoom, r.w, r.h, palette, m, .png) catch break;
+                const png_bytes = c.renderView(lon, lat, zoom, r.w, r.h, palette, m, .png, null) catch break;
                 const seq = render.kitty.transmitPng(a, png_bytes, r.id) catch break;
                 chart.freeBytes(png_bytes);
                 stdout.writeStreamingAll(io, seq) catch {};

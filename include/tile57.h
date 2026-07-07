@@ -256,6 +256,45 @@ int tile57_chart_render_pdf(tile57_chart *chart, double lon, double lat, double 
                             const struct tile57_mariner *m,
                             uint8_t **out, size_t *out_len);
 
+/* ---- callback Canvas: tile57_chart_render_view's GPU/vector twin ----------
+ * Run the SAME view portrayal as tile57_chart_render_view, but paint every
+ * resolved, flattened primitive through a table of C function pointers instead
+ * of rasterising to PNG. The embedder (e.g. a GPU chart plugin) feeds these to
+ * its own renderer. Geometry is emitted in canvas PIXEL space (y down), in
+ * final paint order; colours are fully resolved for the active palette. */
+typedef struct { float x, y; } tile57_point;   /* canvas pixels */
+typedef struct { uint8_t r, g, b, a; } tile57_rgba;  /* resolved straight-alpha */
+/* A multi-ring path: flat vertex array `pts`; ring k spans
+ * [ring_starts[k], ring_starts[k+1]) (last runs to `n`). Rings closed implicitly. */
+typedef struct {
+    const tile57_point *pts;  uint32_t n;
+    const uint32_t *ring_starts;  uint32_t ring_count;
+} tile57_rings;
+/* The paint table. Every callback gets `ctx` back verbatim. Calls arrive in
+ * paint order (no priority key needed). */
+typedef struct {
+    void *ctx;
+    /* Fill closed rings; even_odd != 0 selects the even-odd rule. */
+    void (*fill_path)   (void *ctx, const tile57_rings *rings, tile57_rgba color, int even_odd);
+    /* Stroke polylines width_px wide; dash on/off in px (0,0 = solid). */
+    void (*stroke_path) (void *ctx, const tile57_rings *rings, float width_px,
+                         float dash_on, float dash_off, tile57_rgba color);
+    /* Fill rings with a repeating RGBA8 pattern cell (pw*ph*4 bytes). */
+    void (*fill_pattern)(void *ctx, const tile57_rings *rings, uint32_t pw, uint32_t ph,
+                         const uint8_t *rgba);
+    /* Draw a shaped label as flattened outline rings (px), optional halo
+     * (halo.a == 0 => none). */
+    void (*draw_glyphs) (void *ctx, const tile57_rings *outline, tile57_rgba color,
+                         tile57_rgba halo, float halo_px);
+} tile57_canvas_cb;
+/* Returns (INVERTED, matches tile57_chart_render_view): 0 ok / -1 bad handle /
+ * -2 render failure / -3 unsupported source. Same threading rules as the rest
+ * of a tile57_chart (serialise per handle). */
+int tile57_chart_render_view_cb(tile57_chart *chart, double lon, double lat, double zoom,
+                                uint32_t width, uint32_t height,
+                                const struct tile57_mariner *m,
+                                const tile57_canvas_cb *canvas);
+
 /* The chart's per-cell metadata as a JSON array, one object per cell:
  *   [{"name":"US5MD1MC","scale":12000,"edition":"13","update":"3",
  *     "issueDate":"20240105","agency":550,"bbox":[west,south,east,north]}, ...]

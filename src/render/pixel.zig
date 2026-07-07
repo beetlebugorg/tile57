@@ -25,6 +25,7 @@ const sym = @import("symbols.zig");
 const sndfrm = @import("sndfrm.zig");
 const fontmod = @import("font.zig");
 const pdf = @import("pdf.zig");
+const cb_canvas = @import("cb_canvas.zig");
 
 /// Unmapped color tokens paint magenta, same as the MapLibre style's fallback —
 /// visible, never silent.
@@ -57,7 +58,7 @@ const Op = struct {
     kind: OpKind,
 };
 
-pub const Output = enum { png, pdf };
+pub const Output = enum { png, pdf, callback };
 
 /// A selection HIGHLIGHT overlay painted ON TOP of the finished chart raster —
 /// the `explore --tui` live cell map sets it so the SELECTED feature stands out
@@ -101,8 +102,10 @@ pub const PixelSurface = struct {
     /// fills/lines-only render). Wired from the sprite module's nanosvg-backed
     /// store, or a test fake.
     store: ?sym.SymbolStore = null,
-    /// endScene output format: raster PNG (default) or vector PDF.
+    /// endScene output format: raster PNG (default), vector PDF, or callback.
     output: Output = .png,
+    /// For output == .callback: the C paint table geometry is forwarded to.
+    cb: ?*const cb_canvas.CCanvas = null,
     /// Background colour token the scene clears to (null = "NODTA", the S-52
     /// no-data shade, as every whole-scene render does). Overridden only by the
     /// isolated single-feature thumbnail, which frames one feature on a solid
@@ -562,6 +565,23 @@ pub const PixelSurface = struct {
                 try self.paintOps(canvas, &dropped);
                 try self.drawHighlight(canvas);
                 return pc.finish(out);
+            },
+            .callback => {
+                // Forward every resolved, flattened primitive to the C paint
+                // table (pixel space, endScene paint order). No bytes returned.
+                var cc = cb_canvas.CbCanvas.init(self.a, self.cb.?);
+                const canvas = cc.asCanvas();
+                // NODTA background as a full-canvas fill, first (base layer).
+                const bg = [_]cv.Point{
+                    .{ .x = 0, .y = 0 },
+                    .{ .x = @floatFromInt(self.w_px), .y = 0 },
+                    .{ .x = @floatFromInt(self.w_px), .y = @floatFromInt(self.h_px) },
+                    .{ .x = 0, .y = @floatFromInt(self.h_px) },
+                };
+                const bg_rings = [_][]const cv.Point{&bg};
+                try canvas.fillPath(&bg_rings, self.resolveColor(self.bg_token orelse "NODTA"), .nonzero);
+                try self.paintOps(canvas, &dropped);
+                return out.alloc(u8, 0);
             },
         }
     }

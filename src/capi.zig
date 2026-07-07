@@ -327,7 +327,7 @@ export fn tile57_chart_render_view(
         .dusk => .dusk,
         .night => .night,
     };
-    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .png) catch |e| switch (e) {
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .png, null) catch |e| switch (e) {
         error.Unsupported => return -3,
         else => return -2,
     };
@@ -431,12 +431,47 @@ export fn tile57_chart_render_pdf(
         .dusk => .dusk,
         .night => .night,
     };
-    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .pdf) catch |e| switch (e) {
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .pdf, null) catch |e| switch (e) {
         error.Unsupported => return -3,
         else => return -2,
     };
     out.* = bytes.ptr;
     out_len.* = bytes.len;
+    return 0;
+}
+
+const CbCanvas = @import("render").cb_canvas.CCanvas;
+
+/// tile57_chart_render_view's GPU/vector twin: run the SAME view portrayal, but
+/// paint every resolved, flattened primitive through the C callback table
+/// `canvas` (see tile57.h) instead of rasterising. Geometry is emitted in canvas
+/// PIXEL space (y down) in paint order; colours are resolved for the palette.
+/// Same INVERTED return convention as tile57_chart_render_view:
+///   0 ok / -1 bad handle / -2 render failure / -3 unsupported source.
+export fn tile57_chart_render_view_cb(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    canvas: ?*const CbCanvas,
+) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    const cb = canvas orelse return -2;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
+    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const palette: RenderPalette = switch (settings.scheme) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .callback, cb) catch |e| switch (e) {
+        error.Unsupported => return -3,
+        else => return -2,
+    };
+    chart.freeBytes(bytes); // the callback path returns an empty buffer
     return 0;
 }
 
