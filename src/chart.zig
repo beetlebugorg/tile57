@@ -977,6 +977,7 @@ pub const Chart = struct {
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
         var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
         vs.store = store.asStore();
+        vs.view_zoom = zoom;   // scale at which labels/symbols declutter
         const surf = vs.asSurface();
 
         var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);

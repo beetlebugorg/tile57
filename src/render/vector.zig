@@ -93,6 +93,42 @@ pub const CSurface = extern struct {
     draw_pattern: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, *const CWorldRings) callconv(.c) void = null,
 };
 
+/// Greedy screen-box occupancy for label/symbol declutter. Features arrive in
+/// draw-priority order, so placing the highest priority first and skipping
+/// lower-priority overlaps IS the S-52 collision rule. Boxes are screen px at
+/// the portray zoom. Shared so other surfaces can adopt it (dropping their own).
+pub const Declutter = struct {
+    cells: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    const CELL: f64 = 8.0;
+    fn cellKey(cx: i32, cy: i32) u64 {
+        return (@as(u64, @as(u32, @bitCast(cx))) << 32) | @as(u64, @as(u32, @bitCast(cy)));
+    }
+    /// Reserve a box centred at (sx,sy) px, half-extent (hw,hh). `force` places
+    /// unconditionally (and blocks later boxes); else returns false on a
+    /// collision (caller skips drawing) — the higher-priority box already there.
+    pub fn place(self: *Declutter, a: Allocator, sx: f64, sy: f64, hw: f64, hh: f64, force: bool) bool {
+        const x0: i32 = @intFromFloat(@floor((sx - hw) / CELL));
+        const x1: i32 = @intFromFloat(@floor((sx + hw) / CELL));
+        const y0: i32 = @intFromFloat(@floor((sy - hh) / CELL));
+        const y1: i32 = @intFromFloat(@floor((sy + hh) / CELL));
+        if (!force) {
+            var y = y0;
+            while (y <= y1) : (y += 1) {
+                var x = x0;
+                while (x <= x1) : (x += 1)
+                    if (self.cells.contains(cellKey(x, y))) return false;
+            }
+        }
+        var y = y0;
+        while (y <= y1) : (y += 1) {
+            var x = x0;
+            while (x <= x1) : (x += 1)
+                self.cells.put(a, cellKey(x, y), {}) catch {};
+        }
+        return true;
+    }
+};
+
 // ---- the Surface implementation --------------------------------------------
 pub const VectorSurface = struct {
     a: Allocator,
@@ -111,6 +147,11 @@ pub const VectorSurface = struct {
 
     cur: rs.FeatureMeta = .{},
     cur_visible: bool = true,
+
+    /// Portray zoom (set by the driver) — the scale at which labels/symbols are
+    /// decluttered, and the shared occupancy grid.
+    view_zoom: f64 = 0,
+    declutter: Declutter = .{},
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -280,7 +321,9 @@ pub const VectorSurface = struct {
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
         const s = store.get(eff) orelse return;
         // Draw as an atlas sprite when the host supports it; else tessellate.
-        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale)
+        // Navaid point symbols place unconditionally (force) — they anchor the
+        // declutter and lower-priority soundings/text yield around them.
+        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, true)
         else try self.emitSymbol(s, at, rot_deg, scale);
     }
 
@@ -289,7 +332,7 @@ pub const VectorSurface = struct {
     /// atlas cell drawn centred on the anchor reproduces the vector placement —
     /// for point symbols AND multi-glyph soundings, whose per-glyph pivots lay
     /// out the number.
-    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64) void {
+    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, force: bool) void {
         const k = scale * 100.0 * self.refDev();
         var hw: f64 = 0;
         var hh: f64 = 0;
@@ -300,8 +343,13 @@ pub const VectorSurface = struct {
             if (ly > hh) hh = ly;
         };
         if (hw <= 0 or hh <= 0) return;
+        const anchor = self.worldOf(at);
+        // Declutter: navaid symbols place unconditionally (force) and block; a
+        // sounding yields if its box is already taken.
+        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
+        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, hw, hh, force)) return;
         const feat = self.cur_feature();
-        draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, self.worldOf(at), @floatCast(rot_deg), @floatCast(hw), @floatCast(hh));
+        draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, anchor, @floatCast(rot_deg), @floatCast(hw), @floatCast(hh));
     }
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
@@ -312,11 +360,18 @@ pub const VectorSurface = struct {
         const shown = if (feet) depth_m * sndfrm.M_TO_FT else depth_m;
         const prefix: []const u8 = if (depth_m <= self.settings.safety_depth) "SOUNDS" else "SOUNDG";
         const list = try sndfrm.syms(self.a, prefix, shown, swept, low_acc, feet);
+        // Declutter the WHOLE sounding as one box (so a digit of a number is
+        // never dropped on its own); a crowded-out sounding is skipped entirely.
+        const anchor = self.worldOf(at);
+        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
+        const rd = self.refDev();
+        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, 13.0 * rd, 8.0 * rd, false)) return;
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE)
+            // force: the sounding as a whole already passed declutter.
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, true)
             else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
         }
     }
@@ -352,6 +407,13 @@ pub const VectorSurface = struct {
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
         const font_css: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);
+        // Declutter: estimate the label box (width ~ chars × 0.55 em) and yield
+        // if it collides with a higher-priority label/symbol already placed.
+        const px = @as(f64, font_css) * self.refDev();
+        const w = @as(f64, @floatFromInt(text.len)) * px * 0.55;
+        const anchor = self.worldOf(at);
+        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
+        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, w * 0.5, px * 0.6, false)) return;
         try self.emitText(text, font_css, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), at);
     }
 
