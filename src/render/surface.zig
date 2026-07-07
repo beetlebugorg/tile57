@@ -43,6 +43,18 @@ pub const SymbolPlacement = enum { point, line };
 /// Null when the area is not a depth area.
 pub const DepthRange = struct { d1: f32, d2: f32 };
 
+/// Split an S-101 ColorFill token "NAME[,transparency]" into the colour name and
+/// an alpha byte. `transparency` is the fraction transparent (0 = opaque .. 1 =
+/// clear; e.g. `CHGRF,0.5` is 50% see-through), so alpha = (1 - transparency)*255.
+/// No comma => fully opaque. Only area fills carry transparency (line/text tokens
+/// have no comma, so they pass through unchanged).
+pub fn fillToken(token: ColorToken) struct { name: []const u8, alpha: u8 } {
+    const comma = std.mem.indexOfScalar(u8, token, ',') orelse return .{ .name = token, .alpha = 255 };
+    const t = std.fmt.parseFloat(f64, std.mem.trim(u8, token[comma + 1 ..], " ")) catch 0;
+    const a: u8 = @intFromFloat(std.math.clamp((1.0 - t) * 255.0, 0.0, 255.0));
+    return .{ .name = token[0..comma], .alpha = a };
+}
+
 /// Text-label style carried by drawText.
 ///
 /// An empty `halign` marks a MINIMAL label: no alignment/offset/halo/group was

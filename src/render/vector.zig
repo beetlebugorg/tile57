@@ -276,7 +276,11 @@ pub const VectorSurface = struct {
         if (!self.cur_visible) return;
         const feat = self.cur_feature();
         var wr = try self.worldRings(rings);
-        self.cb.fill_area(self.cb.ctx, &feat, &wr, ccolor(self.resolveColor(token)), 0);
+        // ColorFill "NAME[,transparency]": apply the S-101 fill transparency (alpha).
+        const ft = rs.fillToken(token);
+        var col = self.resolveColor(ft.name);
+        col.a = ft.alpha;
+        self.cb.fill_area(self.cb.ctx, &feat, &wr, ccolor(col), 0);
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {

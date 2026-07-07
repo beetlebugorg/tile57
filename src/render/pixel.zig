@@ -209,7 +209,11 @@ pub const PixelSurface = struct {
         _ = depth; // the rule resolved the depth token against the real context
         const self = sp(ctx);
         if (!self.cur_visible) return;
-        try self.push(.area, .{ .fill = .{ .rings = try self.toCanvas(rings), .color = self.resolveColor(token) } });
+        // ColorFill "NAME[,transparency]": apply the S-101 fill transparency (alpha).
+        const ft = rs.fillToken(token);
+        var col = self.resolveColor(ft.name);
+        col.a = ft.alpha;
+        try self.push(.area, .{ .fill = .{ .rings = try self.toCanvas(rings), .color = col } });
     }
 
     /// Device px per CSS px: the supersample factor (a 512px tile is the @2x
