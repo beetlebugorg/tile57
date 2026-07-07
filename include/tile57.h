@@ -75,12 +75,16 @@ typedef struct {
  * (the zero-initialised default) keeps them — so existing callers that pass 0 get
  * the pick report for free. */
 
-/* Open an on-disk ENC_ROOT directory (or a single .000 file) as a streaming chart:
- * the engine enumerates the cells + peeks each one's bbox/scale at open, then reads
- * cell bytes on demand (working set only), so RSS tracks what tiles need, not the
- * whole ENC_ROOT. Rules are the library's embedded catalogue. NULL/failure -> NULL.
- * */
+/* Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
+ * same directory) as a LIVE chart: portrayed on open, then rendered per view via
+ * tile57_chart_render_surface_cb, with real M_COVR coverage from tile57_chart_coverage.
+ * Rules are the library's embedded catalogue. NULL/failure -> NULL. */
 tile57_chart *tile57_chart_open(const char *path);
+
+/* Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked streaming
+ * chart: enumerates cells + peeks each bbox/scale, reads bytes on demand (working
+ * set only). For tile fetch / bake, NOT live render_surface_cb. NULL/failure -> NULL. */
+tile57_chart *tile57_charts_open(const char *path);
 
 /* Open one in-memory ENC cell (base .000 bytes) as a resident chart. Bytes are copied.
  * NULL/failure -> NULL. */
@@ -390,6 +394,17 @@ typedef struct {
  * the pick tolerance tracks on-screen distance. Returns 0 ok, -1 bad args. */
 int tile57_chart_query(tile57_chart *chart, double lon, double lat, double zoom,
                        const tile57_query_cb *cb);
+
+/* The chart's M_COVR(CATCOV=1) data-coverage polygons — the real coverage a host
+ * reports so a quilt fills gaps to coarser cells (vs. the bounding box). ring() is
+ * called once per polygon with its exterior ring as `npts` interleaved lon,lat
+ * doubles (valid only during the call). Only the live-cell backend (an opened
+ * .000) carries this; a baked PMTiles returns 0 with no calls. 0 ok, -1 bad args. */
+typedef struct {
+    void *ctx;
+    void (*ring)(void *ctx, const double *lonlat, size_t npts);
+} tile57_coverage_cb;
+int tile57_chart_coverage(tile57_chart *chart, const tile57_coverage_cb *cb);
 
 /* The chart's per-cell metadata as a JSON array, one object per cell:
  *   [{"name":"US5MD1MC","scale":12000,"edition":"13","update":"3",

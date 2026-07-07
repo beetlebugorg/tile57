@@ -69,7 +69,18 @@ fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]chart.CellI
 }
 
 /// Open an on-disk ENC_ROOT directory (or single .000) as a streaming chart. See tile57.h.
+/// Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
+/// same directory) as a live chart — a `.cell` backend that render_surface_cb and
+/// tile57_chart_coverage support. For a whole ENC_ROOT directory use
+/// tile57_charts_open. See tile57.h.
 export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
+    const p = spanOpt(path) orelse return null;
+    return chart.openCellPath(p, null, true) catch null;
+}
+
+/// Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked chart — the
+/// `.cells` backend, for tile fetch / bake, not live render_surface_cb. See tile57.h.
+export fn tile57_charts_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
     const p = spanOpt(path) orelse return null;
     return Chart.openPath(p, null, true) catch null;
 }
@@ -157,6 +168,36 @@ export fn tile57_chart_query(handle: ?*Chart, lon: f64, lat: f64, zoom: f64, cb:
     const self = handle orelse return -1;
     const cbp = cb orelse return -1;
     self.queryPoint(lon, lat, zoom, cbp) catch return -1;
+    return 0;
+}
+
+const CCoverageCb = extern struct {
+    ctx: ?*anyopaque,
+    ring: *const fn (?*anyopaque, lonlat: [*]const f64, npts: usize) callconv(.c) void,
+};
+
+/// The chart's M_COVR data-coverage polygons (live-cell backend only): cb->ring is
+/// called once per polygon with its exterior ring as interleaved lon,lat doubles.
+/// A baked PMTiles chart carries no coverage polygon (returns 0, no calls).
+/// 0 ok, -1 bad args. See tile57.h.
+export fn tile57_chart_coverage(handle: ?*Chart, cb: ?*const CCoverageCb) callconv(.c) c_int {
+    const self = handle orelse return -1;
+    const cbp = cb orelse return -1;
+    const polys = self.coverage() orelse return 0;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (polys) |poly| {
+        if (poly.len == 0) continue;
+        const ring = poly[0]; // exterior ring
+        if (ring.len < 3) continue;
+        const out = a.alloc(f64, ring.len * 2) catch continue;
+        for (ring, 0..) |p, i| {
+            out[2 * i] = @as(f64, @floatFromInt(p.lon_e7)) / 1e7;
+            out[2 * i + 1] = @as(f64, @floatFromInt(p.lat_e7)) / 1e7;
+        }
+        cbp.ring(cbp.ctx, out.ptr, ring.len);
+    }
     return 0;
 }
 

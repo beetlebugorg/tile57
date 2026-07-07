@@ -102,6 +102,7 @@ const CellBackend = struct {
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     portray_arena: ?*std.heap.ArenaAllocator = null,
+    coverage: []const []const []const s57.LonLat = &.{}, // M_COVR (in portray_arena)
 };
 
 // One cell in the lazy ENC_ROOT index: its owned bytes + cheap metadata (bbox +
@@ -435,15 +436,14 @@ fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const 
     var cb = CellBackend{ .cell = cell };
     const pa = gpa.create(std.heap.ArenaAllocator) catch return cb;
     pa.* = std.heap.ArenaAllocator.init(gpa);
+    cb.portray_arena = pa;
+    // Real M_COVR data-coverage polygons for the host to report as chart coverage.
+    cb.coverage = cb.cell.mcovrCoverage(pa.allocator());
     if (portray.portrayCellVariants(pa.allocator(), &cb.cell, dir)) |cp| {
         cb.portrayal = cp.base;
         cb.portrayal_plain = cp.plain;
         cb.portrayal_simplified = cp.simplified;
-        cb.portray_arena = pa;
-    } else |_| {
-        pa.deinit();
-        gpa.destroy(pa);
-    }
+    } else |_| {}
     return cb;
 }
 
@@ -462,6 +462,52 @@ fn openCell(bytes: []const u8, rules_dir: ?[]const u8) ?*Chart {
         return null;
     };
     src.* = .{ .backend = .{ .cell = cb }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    return src;
+}
+
+/// Open a SINGLE .000 cell (+ its sequential .001.. update chain, read from the
+/// cell's directory) as a live `.cell` chart — the backend render_surface_cb and
+/// coverage() support (unlike the lazy `.cells` backend openPath builds, which is
+/// bake-only). For a whole ENC_ROOT directory use openPath.
+pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
+    const threaded = try gpa.create(std.Io.Threaded);
+    threaded.* = .init(gpa, .{});
+    defer {
+        threaded.deinit();
+        gpa.destroy(threaded);
+    }
+    const io = threaded.io();
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
+
+    const bn = std.fs.path.basename(path);
+    const base = try dir.readFileAlloc(io, bn, gpa, .unlimited);
+    defer gpa.free(base);
+    var updates = std.ArrayList([]u8).empty;
+    defer {
+        for (updates.items) |u| gpa.free(u);
+        updates.deinit(gpa);
+    }
+    if (bn.len > 4) {
+        const stem = bn[0 .. bn.len - 4]; // strip ".000"
+        var u: u32 = 1;
+        while (u <= 999) : (u += 1) {
+            const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
+            defer gpa.free(upn);
+            const ub = dir.readFileAlloc(io, upn, gpa, .unlimited) catch break;
+            updates.append(gpa, ub) catch {
+                gpa.free(ub);
+                break;
+            };
+        }
+    }
+    var cb = buildCellBackend(base, updates.items, resolveRulesDir(rules_dir)) orelse return error.OpenFailed;
+    const src = gpa.create(Chart) catch {
+        freeCellBackend(&cb);
+        return error.OpenFailed;
+    };
+    src.* = .{ .backend = .{ .cell = cb }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa), .pick_attrs = pick_attrs };
     return src;
 }
 
@@ -697,6 +743,17 @@ pub const Chart = struct {
         return switch (self.backend) {
             .reader => .pmtiles,
             .cell, .cells => .s57_cell,
+        };
+    }
+
+    /// The cell's M_COVR(CATCOV=1) data-coverage polygons (polygon -> rings ->
+    /// lon/lat points), for the host to report as chart coverage so OpenCPN quilts
+    /// gaps to coarser cells. Only the live-cell backend has it (a baked PMTiles
+    /// carries no coverage polygon); null otherwise.
+    pub fn coverage(self: *const Chart) ?[]const []const []const s57.LonLat {
+        return switch (self.backend) {
+            .cell => |*c| if (c.coverage.len > 0) c.coverage else null,
+            else => null,
         };
     }
 
