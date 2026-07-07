@@ -363,6 +363,19 @@ int tile57_chart_render_surface_cb(tile57_chart *chart, double lon, double lat, 
                                    const struct tile57_mariner *m,
                                    const tile57_surface_cb *surface);
 
+/* Cursor object-query (S-52 pick): feature() is invoked once per feature the
+ * point (lon,lat) falls in — area point-in-polygon, line/point within a small
+ * radius — with the S-57 object-class acronym, the attribute JSON (acronym->value),
+ * and the source cell name. Pointers are valid only for the duration of the call. */
+typedef struct {
+    void *ctx;
+    void (*feature)(void *ctx, const char *cls, size_t cls_len,
+                    const char *s57, size_t s57_len,
+                    const char *cell, size_t cell_len);
+} tile57_query_cb;
+/* Returns 0 ok, -1 bad args. */
+int tile57_chart_query(tile57_chart *chart, double lon, double lat, const tile57_query_cb *cb);
+
 /* The chart's per-cell metadata as a JSON array, one object per cell:
  *   [{"name":"US5MD1MC","scale":12000,"edition":"13","update":"3",
  *     "issueDate":"20240105","agency":550,"bbox":[west,south,east,north]}, ...]

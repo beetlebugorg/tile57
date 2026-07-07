@@ -148,6 +148,18 @@ export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) voi
     }
 }
 
+const CQueryCb = @import("render").query.QueryCb;
+
+/// Cursor object-query at (lon,lat): invokes cb->feature once per feature the
+/// point falls in, with its S-57 class, attribute JSON, and source cell.
+/// 0=ok, -1=bad args. See tile57.h.
+export fn tile57_chart_query(handle: ?*Chart, lon: f64, lat: f64, cb: ?*const CQueryCb) callconv(.c) c_int {
+    const self = handle orelse return -1;
+    const cbp = cb orelse return -1;
+    self.queryPoint(lon, lat, cbp) catch return -1;
+    return 0;
+}
+
 // Progress callback for tile57_bake_pmtiles / tile57_bake_bundle (matches the header
 // typedef + chart.Progress + bake_enc.Progress).
 const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;

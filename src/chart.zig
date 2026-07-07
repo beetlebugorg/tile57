@@ -1012,6 +1012,53 @@ pub const Chart = struct {
         _ = try surf.endScene(a);
     }
 
+    /// Cursor object-query: replay the finest tile covering (lon,lat) through a
+    /// QuerySurface and report each feature the point falls in (class + S-57
+    /// attribute JSON + source cell) via `cb`. Used for the S-52 §10.8 pick.
+    pub fn queryPoint(self: *Chart, lon: f64, lat: f64, cb: *const render.query.QueryCb) !void {
+        const t = @import("tiles").tile;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const z: u8 = @intCast(self.zoomRange().max);
+        const world = t.lonLatToWorld(lon, lat);
+        const n = std.math.exp2(@as(f64, @floatFromInt(z)));
+        const tx: u32 = @intFromFloat(@floor(world[0] * n));
+        const ty: u32 = @intFromFloat(@floor(world[1] * n));
+        const local = t.project(lon, lat, z, tx, ty, t.EXTENT);
+        var qs = render.query.QuerySurface{
+            .qx = @floatFromInt(local.x),
+            .qy = @floatFromInt(local.y),
+            .radius = 96.0, // ~6 px at native tile scale
+            .cb = cb,
+        };
+        const surf = qs.asSurface();
+        try surf.beginScene(z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                const is_mlt = rd.header.tile_type == .mlt;
+                const bytes = (rd.getTile(a, z, tx, ty) catch return) orelse return;
+                if (bytes.len == 0) return;
+                const layers = if (is_mlt)
+                    @import("tiles").mlt.decode(a, bytes) catch return
+                else
+                    @import("tiles").mvt.decode(a, bytes) catch return;
+                scene.replayTile(surf, layers) catch return;
+            },
+            .cell => |*cb2| {
+                const one = [_]scene.CellRef{.{
+                    .cell = &cb2.cell,
+                    .portrayal = cb2.portrayal,
+                    .portrayal_plain = cb2.portrayal_plain,
+                    .portrayal_simplified = cb2.portrayal_simplified,
+                }};
+                scene.appendTile(surf, a, &one, z, tx, ty, self.pick_attrs) catch return;
+            },
+            .cells => return,
+        }
+        _ = surf.endScene(a) catch {};
+    }
+
     /// Render a VIEW as ASCII art — renderView's shape on the text surface:
     /// one Unicode character per terminal cell (cols x rows), optional
     /// ANSI-256 color. Returns UTF-8 bytes, one '\n'-terminated row per grid

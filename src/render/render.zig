@@ -23,6 +23,7 @@
 pub const surface = @import("surface.zig");
 pub const noop = @import("noop.zig");
 pub const inspect = @import("inspect.zig"); // recording surface (the `tile57 explore` learning tool)
+pub const query = @import("query.zig"); // point-query surface (cursor object-query / pick)
 pub const resolve = @import("resolve.zig");
 pub const canvas = @import("canvas.zig");
 pub const raster = @import("raster.zig");
