@@ -6,6 +6,23 @@ C ABI is not yet frozen.
 
 ## [Unreleased]
 
+### Added — C ABI: host-surface rendering, object query, sprite atlas
+- **`tile57_chart_render_surface_cb`** + the **`tile57_surface_cb`** vtable: hand
+  the portrayed scene to a host as world-space draw calls (area/line geometry in
+  web-mercator, point symbols/text as a world anchor plus a reference-px outline,
+  each call tagged with its SCAMIN) so a GPU host tessellates once and pans/zooms
+  by transforming the vertices. Includes optional `draw_sprite` / `draw_pattern`
+  callbacks that name atlas entries to draw point symbols and area patterns as
+  textured quads. See [docs/c-api.md](docs/docs/c-api.md).
+- **`tile57_chart_query`** + **`tile57_query_cb`**: the S-52 cursor pick — report
+  every feature under a lon/lat (area point-in-polygon; line/point within a small
+  radius) with its class, S-57 attribute JSON, and source cell.
+- **`tile57_bake_sprite_mln`**: bake just the MapLibre sprite-mln atlas (pivot-
+  centered symbol cells + a name-to-rect index) for a GPU host to load.
+- **Fix**: the reader (baked PMTiles) replay now copies the baked `s57` / `cell`
+  tile properties into `FeatureMeta`, so a baked chart's object query returns
+  attributes, not just the class.
+
 ### Added — S-52 overscale indication (AP(OVERSC01), specs/overscale.md)
 - **Baked overscale hatch geometry**: every cell contributing to a tile
   (including band-handoff carried cells) now emits its M_COVR (CATCOV=1)
