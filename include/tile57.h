@@ -295,6 +295,60 @@ int tile57_chart_render_view_cb(tile57_chart *chart, double lon, double lat, dou
                                 const struct tile57_mariner *m,
                                 const tile57_canvas_cb *canvas);
 
+/* ---- world-space Surface callback: the GPU vector twin ----------------------
+ * tile57_chart_render_surface_cb runs the SAME view portrayal as
+ * tile57_chart_render_view_cb but emits a WORLD-SPACE, semantically TAGGED
+ * stream rather than resolved pixels: area/line geometry in web-mercator [0,1]
+ * (y down); point symbols and text as a WORLD anchor + a LOCAL outline in
+ * reference px (a constant screen size); every draw call tagged with its
+ * feature's S-57 class and SCAMIN. A GPU host applies its own view transform,
+ * pins symbols/text at the anchor, and culls by SCAMIN per frame — so pan and
+ * zoom re-portray NOTHING. Works for a baked bundle (tile replay) or a live
+ * cell (full S-52 portrayal). See render_surface.md. */
+typedef struct { double x, y; } tile57_world_point;  /* web-mercator [0,1], y down */
+typedef struct { float  x, y; } tile57_local_point;  /* anchor-relative reference px */
+
+typedef struct {
+    const tile57_world_point *pts;  uint32_t n;
+    const uint32_t *ring_starts;    uint32_t ring_count;
+} tile57_world_rings;
+typedef struct {
+    const tile57_local_point *pts;  uint32_t n;
+    const uint32_t *ring_starts;    uint32_t ring_count;
+} tile57_local_rings;
+
+/* The feature the following draw calls belong to. `cls` is the S-57 object-class
+ * acronym (NUL-terminated; "" if none); `scamin` is the SCAMIN 1:N denominator
+ * (<= 0 => always visible); `plane` is the S-52 draw priority (paint hint). */
+typedef struct {
+    const char *cls;
+    int64_t scamin;
+    int32_t plane;
+} tile57_feature;
+
+/* Draw table. Pointers are valid only for the duration of the call; ctx is
+ * passed back verbatim. Calls arrive in Surface emission order (the host owns
+ * final paint order + label collision). */
+typedef struct {
+    void *ctx;
+    /* Filled area (world). even_odd != 0 selects the even-odd rule. */
+    void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings, tile57_rgba color, int even_odd);
+    /* Stroked line (world); width in reference px, dash on/off px (0,0 solid). */
+    void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines, float width_px, float dash_on, float dash_off, tile57_rgba color);
+    /* Point symbol: world anchor + local outline (px). even_odd for compound
+     * glyphs; stroke_w > 0 => the rings are a polyline stroked stroke_w px wide. */
+    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_rgba color, int even_odd, float stroke_w);
+    /* Text: world anchor + local glyph outlines (px, even-odd) + halo
+     * (halo.a == 0 => none). */
+    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px);
+} tile57_surface_cb;
+
+/* Returns 0 ok / -1 bad handle / -2 render failure / -3 unsupported source. */
+int tile57_chart_render_surface_cb(tile57_chart *chart, double lon, double lat, double zoom,
+                                   uint32_t width, uint32_t height,
+                                   const struct tile57_mariner *m,
+                                   const tile57_surface_cb *surface);
+
 /* The chart's per-cell metadata as a JSON array, one object per cell:
  *   [{"name":"US5MD1MC","scale":12000,"edition":"13","update":"3",
  *     "issueDate":"20240105","agency":550,"bbox":[west,south,east,north]}, ...]

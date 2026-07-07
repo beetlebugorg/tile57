@@ -475,6 +475,41 @@ export fn tile57_chart_render_view_cb(
     return 0;
 }
 
+const CSurface = @import("render").vector.CSurface;
+
+/// GPU vector twin of render_view_cb: run the SAME view portrayal, but emit a
+/// WORLD-SPACE tagged stream (areas/lines in web-mercator [0,1]; symbols/text as
+/// a world anchor + local reference-px outline; per-feature class + SCAMIN) to
+/// the C surface callback `surface` (see tile57.h). The host transforms geometry
+/// and pins symbols/text at a constant screen size, culling by SCAMIN — no
+/// re-portrayal per pan/zoom. Works for a baked bundle OR a live cell.
+///   0 ok / -1 bad handle / -2 render failure / -3 unsupported source.
+export fn tile57_chart_render_surface_cb(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    const sfc = surface orelse return -2;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
+    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const palette: RenderPalette = switch (settings.scheme) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+    c.renderSurfaceView(lon, lat, zoom, width, height, palette, &settings, sfc) catch |e| switch (e) {
+        error.Unsupported => return -3,
+        else => return -2,
+    };
+    return 0;
+}
+
 /// Free any engine-returned buffer (tiles, style, scamin array, colortables, …). See tile57.h.
 /// (chart-api.md — the universal free.)
 export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {

@@ -35,9 +35,11 @@ pub const sndfrm = @import("sndfrm.zig");
 pub const font = @import("font.zig");
 pub const pdf = @import("pdf.zig");
 pub const cb_canvas = @import("cb_canvas.zig");
+pub const vector = @import("vector.zig");
 
 test {
     _ = surface;
+    _ = vector;
     _ = noop;
     _ = inspect;
     _ = resolve;

@@ -943,6 +943,74 @@ pub const Chart = struct {
         }
     }
 
+    /// renderView's GPU-vector twin: drive a VectorSurface over the same view
+    /// tiles, emitting a WORLD-SPACE tagged stream to the C surface callback
+    /// (see render/vector.zig). Live for both a baked bundle (.reader tile
+    /// replay) and a live cell (.cell portrayal). No bytes are produced.
+    pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, cb: *const render.vector.CSurface) !void {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+        const css_name = switch (palette) {
+            .day => "daySvgStyle",
+            .dusk => "duskSvgStyle",
+            .night => "nightSvgStyle",
+        };
+        var css_data: []const u8 = "";
+        for (embedded_assets.css) |e| {
+            if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
+        }
+        const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+        for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+        const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+        for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+        const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+        defer store.deinit();
+
+        var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+        defer ls_srcs.deinit(gpa);
+        for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+        scene.registerLinestylesXml(gpa, ls_srcs.items);
+
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
+        vs.store = store.asStore();
+        const surf = vs.asSurface();
+
+        var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+        try surf.beginScene(vt.z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                const is_mlt = rd.header.tile_type == .mlt;
+                while (vt.next()) |t| {
+                    const bytes = (rd.getTile(a, t.z, t.x, t.y) catch continue) orelse continue;
+                    const layers = if (is_mlt)
+                        @import("tiles").mlt.decode(a, bytes) catch continue
+                    else
+                        @import("tiles").mvt.decode(a, bytes) catch continue;
+                    vs.setTile(t.z, t.x, t.y);
+                    scene.replayTile(surf, layers) catch continue;
+                }
+            },
+            .cell => |*cb2| {
+                const one = [_]scene.CellRef{.{
+                    .cell = &cb2.cell,
+                    .portrayal = cb2.portrayal,
+                    .portrayal_plain = cb2.portrayal_plain,
+                    .portrayal_simplified = cb2.portrayal_simplified,
+                }};
+                while (vt.next()) |t| {
+                    vs.setTile(t.z, t.x, t.y);
+                    scene.appendTile(surf, a, &one, t.z, t.x, t.y, self.pick_attrs) catch continue;
+                }
+            },
+            .cells => return error.Unsupported,
+        }
+        _ = try surf.endScene(a);
+    }
+
     /// Render a VIEW as ASCII art — renderView's shape on the text surface:
     /// one Unicode character per terminal cell (cols x rows), optional
     /// ANSI-256 color. Returns UTF-8 bytes, one '\n'-terminated row per grid
