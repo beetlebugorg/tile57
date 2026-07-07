@@ -91,6 +91,12 @@ pub const CSurface = extern struct {
     /// prefix) + the fill rings (world). Tile the pattern cell across the polygon
     /// at a constant screen size. Null => patterns fall back to a flat tint.
     draw_pattern: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, *const CWorldRings) callconv(.c) void = null,
+    /// Text label as a STRING for the host's SDF glyph atlas: world anchor + the
+    /// anchor-relative baseline-left origin in px (ox,oy, alignment already applied)
+    /// + UTF-8 text (ptr,len) + the glyph pixel size + colour + halo. The host lays
+    /// the string out from its glyph metrics and draws SDF quads. Null => text
+    /// tessellates via draw_text instead. Must be the LAST field (ABI-appended).
+    draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, CColor, CColor) callconv(.c) void = null,
 };
 
 /// Greedy screen-box occupancy for label/symbol declutter. Features arrive in
@@ -410,15 +416,42 @@ pub const VectorSurface = struct {
         const self = sp(ctx);
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
+        const f = &(self.fnt orelse return);
         const font_css: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);
-        // Declutter: estimate the label box (width ~ chars × 0.55 em) and yield
-        // if it collides with a higher-priority label/symbol already placed.
-        const px = @as(f64, font_css) * self.refDev();
-        const w = @as(f64, @floatFromInt(text.len)) * px * 0.55;
+        const px = font_css * @as(f32, @floatCast(self.refDev()));
+        if (px <= 1) return;
+
+        // Real advance width — the declutter box and (SDF path) the alignment.
+        var pen: f32 = 0;
+        var it = (std.unicode.Utf8View.init(text) catch return).iterator();
+        while (it.nextCodepoint()) |cp| pen += f.advance(f.glyphIndex(cp)) * px;
+        if (pen <= 0) return;
+
         const anchor = self.worldOf(at);
         const scale_px = 256.0 * std.math.exp2(self.view_zoom);
-        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, w * 0.5, px * 0.6, false)) return;
-        try self.emitText(text, font_css, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), at);
+        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, @as(f64, pen) * 0.5, @as(f64, px) * 0.6, false)) return;
+
+        const halign = if (style.halign.len > 0) style.halign else "center";
+        const valign = if (style.valign.len > 0) style.valign else "middle";
+        // SDF glyph-atlas host: send the string + aligned baseline-left origin.
+        if (self.cb.draw_text_str) |dts| {
+            const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.refDev());
+            var x0: f32 = @as(f32, @floatCast(style.offset_x)) * mm_px;
+            if (std.mem.eql(u8, halign, "center")) x0 -= pen / 2;
+            if (std.mem.eql(u8, halign, "right")) x0 -= pen;
+            var baseline: f32 = @as(f32, @floatCast(style.offset_y)) * mm_px;
+            if (std.mem.eql(u8, valign, "top")) {
+                baseline += f.ascent * px;
+            } else if (std.mem.eql(u8, valign, "middle")) {
+                baseline += (f.ascent - f.descent) / 2 * px;
+            } else {
+                baseline -= f.descent * px;
+            }
+            const feat = self.cur_feature();
+            dts(self.cb.ctx, &feat, anchor, x0, baseline, text.ptr, text.len, px, ccolor(self.resolveColor(style.color)), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            return;
+        }
+        try self.emitText(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), at);
     }
 
     fn glyphOutline(self: *VectorSurface, gid: u16) ![]const []const cv.Point {

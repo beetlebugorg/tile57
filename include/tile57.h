@@ -196,6 +196,12 @@ int  tile57_bake_assets(const char *catalog_dir, tile57_assets *out);
  * atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON); other
  * fields are NULL. Free with tile57_assets_free. 1=ok, 0=error. */
 int  tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out);
+/* SDF glyph atlas for GPU text: sprite_png is the RGBA signed-distance-field atlas
+ * of the label font; sprite_json is {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,
+ * v1,off_x,off_y,w,h,advance]}} with the quad geometry in EM units (multiply by the
+ * text pixel size). A host draws each glyph as a textured quad sampling the SDF.
+ * Only sprite_* filled. Free with tile57_assets_free. 1=ok, 0=error. */
+int  tile57_bake_glyph_sdf(tile57_assets *out);
 void tile57_assets_free(tile57_assets *out);
 
 /* Release a chart and all cached tiles. Must not be called while any renderer
@@ -353,8 +359,14 @@ typedef struct {
     void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
     /* Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
      * prefix) + the fill rings (world). Tile the cell across the polygon at a
-     * constant screen size. NULL => flat tint. Must be the LAST field. */
+     * constant screen size. NULL => flat tint. */
     void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, const tile57_world_rings *rings);
+    /* Text as a STRING for the host's SDF glyph atlas (tile57_bake_glyph_sdf):
+     * world anchor + the anchor-relative baseline-left origin in px (ox,oy, with
+     * alignment already applied) + UTF-8 text (ptr,len) + the glyph pixel size +
+     * colour + halo. The host lays the string out from its glyph metrics and draws
+     * SDF quads. NULL => text tessellates via draw_text. Must be the LAST field. */
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, tile57_rgba color, tile57_rgba halo);
 } tile57_surface_cb;
 
 /* Returns 0 ok / -1 bad handle / -2 render failure / -3 unsupported source. */

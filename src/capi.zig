@@ -650,6 +650,50 @@ export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, out: *CAssets) cal
     return 1;
 }
 
+const glyph_sdf = @import("sprite").glyph;
+
+// Glyph metrics as compact JSON: {"em_px","pad","glyphs":{cp:[u0,v0,u1,v1,ox,oy,w,h,adv]}}.
+fn glyphMetricsJson(a: std.mem.Allocator, atlas: *const glyph_sdf.Atlas) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.print(a, "{{\"em_px\":{d},\"pad\":{d},\"glyphs\":{{", .{ atlas.em_px, atlas.pad });
+    var it = atlas.glyphs.iterator();
+    var first = true;
+    while (it.next()) |e| {
+        const g = e.value_ptr.*;
+        if (!first) try out.append(a, ',');
+        first = false;
+        try out.print(a, "\"{d}\":[{d},{d},{d},{d},{d},{d},{d},{d},{d}]", .{ e.key_ptr.*, g.u0, g.v0, g.u1, g.v1, g.off_x, g.off_y, g.w, g.h, g.advance });
+    }
+    try out.appendSlice(a, "}}");
+    return out.toOwnedSlice(a);
+}
+
+/// SDF glyph atlas for GPU text: sprite_png = the RGBA SDF atlas, sprite_json =
+/// {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,v1,ox,oy,w,h,adv]}} (EM units).
+/// Only sprite_* filled. Free with tile57_assets_free. 1=ok, 0=error. See tile57.h.
+export fn tile57_bake_glyph_sdf(out: *CAssets) callconv(.c) c_int {
+    out.* = .{};
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const font = @import("render").font.notosans;
+    const cps = glyph_sdf.defaultCodepoints(a) catch return 0;
+    var atlas = glyph_sdf.build(a, font, cps, 32.0, 6) catch return 0;
+    const png = (atlas.encodePng(a) catch return 0) orelse return 0;
+    const json = glyphMetricsJson(a, &atlas) catch return 0;
+    out.sprite_png = (gpa.dupe(u8, png) catch {
+        tile57_assets_free(out);
+        return 0;
+    }).ptr;
+    out.sprite_png_len = png.len;
+    out.sprite_json = (gpa.dupe(u8, json) catch {
+        tile57_assets_free(out);
+        return 0;
+    }).ptr;
+    out.sprite_json_len = json.len;
+    return 1;
+}
+
 /// Free every non-null buffer in *out and zero the struct. See tile57.h.
 export fn tile57_assets_free(out: *CAssets) callconv(.c) void {
     if (out.colortables) |p| chart.freeBytes(p[0..out.colortables_len]);
