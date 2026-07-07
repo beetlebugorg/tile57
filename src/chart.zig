@@ -591,6 +591,20 @@ pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) 
     return openCellBaked(path, rules_dir, pick_attrs, 0, 18);
 }
 
+/// Populate the process-global READ-ONLY registries (the S-100 feature catalogue and
+/// the complex-linestyle table) on the CALLING thread. Both are idempotent lazy-init
+/// and thereafter read-only. A host that renders or bakes cells from multiple threads
+/// MUST call this once on its main thread before spawning them: then concurrent
+/// bake/render is race-free (the allocator is thread-safe, the portrayal context is
+/// thread-local, and these two globals are already populated so nobody writes them).
+pub fn warmup() void {
+    catalogue.warmUp();
+    var ls_srcs = std.ArrayList(assets.LineStyleSrc).empty;
+    defer ls_srcs.deinit(gpa);
+    for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+    scene.registerLinestylesXml(gpa, ls_srcs.items);
+}
+
 // Parallel open worker: peek each cell's band + bbox and copy its bytes.
 const OpenWork = struct {
     inputs: []const CellInput,

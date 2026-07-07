@@ -98,6 +98,14 @@ tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t 
  * set only). For tile fetch / bake, NOT live render_surface_cb. NULL/failure -> NULL. */
 tile57_chart *tile57_charts_open(const char *path);
 
+/* Populate the process-global read-only registries (the S-100 feature catalogue and
+ * the complex-linestyle table) on the calling thread. Both are idempotent lazy-init
+ * and thereafter read-only. Call this ONCE on your main thread before opening or
+ * baking cells from worker threads, so those globals are fully populated first and
+ * concurrent bake/render is race-free (the allocator is thread-safe and the portrayal
+ * context is thread-local). Cheap and safe to call more than once. */
+void tile57_warmup(void);
+
 /* Open one in-memory ENC cell (base .000 bytes) as a resident chart. Bytes are copied.
  * NULL/failure -> NULL. */
 tile57_chart *tile57_chart_open_bytes(const uint8_t *base, size_t len);

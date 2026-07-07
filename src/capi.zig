@@ -100,6 +100,13 @@ export fn tile57_charts_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
     return Chart.openPath(p, null, true) catch null;
 }
 
+/// Populate the process-global read-only registries (S-100 catalogue + linestyles) on
+/// the calling thread. Call ONCE on the main thread before opening/baking cells from
+/// worker threads, so concurrent bake/render is race-free. See tile57.h.
+export fn tile57_warmup() callconv(.c) void {
+    chart.warmup();
+}
+
 /// Open one in-memory ENC cell (base .000 bytes) as a resident chart. See tile57.h.
 export fn tile57_chart_open_bytes(base: [*]const u8, len: usize) callconv(.c) ?*Chart {
     if (len == 0) return null;
