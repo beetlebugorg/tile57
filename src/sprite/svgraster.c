@@ -18,6 +18,32 @@
 #include "nanosvgrast.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+
+// One glyph's signed-distance field for the SDF text atlas. `font`/`font_len` is
+// the TrueType file; `cp` a codepoint; `em_px` the pixels one em maps to (the
+// field resolution); `pad` the SDF spread in px. Returns a malloc'd single-channel
+// SDF bitmap (w*h, 128 = edge, >128 inside) and sets its size, the top-left pixel
+// offset from the pen origin (y down), and the pen advance — all in `em_px` units,
+// so the caller normalizes by em_px to get size-independent (em) metrics. NULL for
+// blank glyphs (space): *w=*h=0 but *advance is still set. Free with tg_glyph_free.
+unsigned char *tg_glyph_sdf(const unsigned char *font, int font_len, int cp,
+                            float em_px, int pad, int *w, int *h,
+                            int *xoff, int *yoff, float *advance) {
+    (void)font_len;
+    stbtt_fontinfo f;
+    if (!stbtt_InitFont(&f, font, stbtt_GetFontOffsetForIndex(font, 0))) return NULL;
+    float scale = stbtt_ScaleForMappingEmToPixels(&f, em_px);
+    int adv = 0, lsb = 0;
+    stbtt_GetCodepointHMetrics(&f, cp, &adv, &lsb);
+    *advance = (float)adv * scale;
+    unsigned char onedge = 128;
+    float dist_scale = 127.0f / (float)pad; // ±pad px -> the byte range
+    *w = 0; *h = 0; *xoff = 0; *yoff = 0;
+    return stbtt_GetCodepointSDF(&f, scale, cp, pad, onedge, dist_scale, w, h, xoff, yoff);
+}
+void tg_glyph_free(unsigned char *p) { stbtt_FreeSDF(p, NULL); }
 
 // Rasterize a flattened SVG (viewBox normalized to "0 0 W H") at `scale` device
 // px per user unit. Forces even-odd winding on every shape — the S-101 danger
