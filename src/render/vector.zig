@@ -87,6 +87,10 @@ pub const CSurface = extern struct {
     /// reference px (draw the atlas cell as a quad of that half-size, centred on
     /// the anchor). Null => symbols tessellate via draw_symbol instead.
     draw_sprite: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, CWorldPt, f32, f32, f32) callconv(.c) void = null,
+    /// Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
+    /// prefix) + the fill rings (world). Tile the pattern cell across the polygon
+    /// at a constant screen size. Null => patterns fall back to a flat tint.
+    draw_pattern: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, *const CWorldRings) callconv(.c) void = null,
 };
 
 // ---- the Surface implementation --------------------------------------------
@@ -235,14 +239,17 @@ pub const VectorSurface = struct {
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
-        _ = name;
         const self = sp(ctx);
         if (!self.cur_visible) return;
-        // v1: approximate the S-101 area pattern as a flat translucent tint (the
-        // host has no pattern raster). A dedicated pattern channel can follow.
         const feat = self.cur_feature();
         var wr = try self.worldRings(rings);
-        self.cb.fill_area(self.cb.ctx, &feat, &wr, .{ .r = 160, .g = 160, .b = 170, .a = 140 }, 0);
+        // Tile the real S-101 pattern cell when the host supports it; else fall
+        // back to a flat translucent tint.
+        if (self.cb.draw_pattern) |dp| {
+            dp(self.cb.ctx, &feat, name.ptr, name.len, &wr);
+        } else {
+            self.cb.fill_area(self.cb.ctx, &feat, &wr, .{ .r = 160, .g = 160, .b = 170, .a = 140 }, 0);
+        }
     }
 
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {

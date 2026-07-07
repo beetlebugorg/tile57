@@ -351,6 +351,10 @@ typedef struct {
      * quad of that half-size, centred on the anchor. NULL => symbols tessellate
      * via draw_symbol instead. Must be the LAST field (ABI-appended). */
     void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
+    /* Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
+     * prefix) + the fill rings (world). Tile the cell across the polygon at a
+     * constant screen size. NULL => flat tint. Must be the LAST field. */
+    void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, const tile57_world_rings *rings);
 } tile57_surface_cb;
 
 /* Returns 0 ok / -1 bad handle / -2 render failure / -3 unsupported source. */
