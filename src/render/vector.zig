@@ -309,7 +309,6 @@ pub const VectorSurface = struct {
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
         _ = rot_north;
-        _ = placement;
         const self = sp(ctx);
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, GATE_ZOOM, self.settings)) return;
@@ -321,10 +320,13 @@ pub const VectorSurface = struct {
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
         const s = store.get(eff) orelse return;
         // Draw as an atlas sprite when the host supports it; else tessellate.
-        // Navaid point symbols place unconditionally (force) — they anchor the
-        // declutter and lower-priority soundings/text yield around them.
-        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, true)
-        else try self.emitSymbol(s, at, rot_deg, scale);
+        // A .point navaid draws at display size (refDev) and force-places into
+        // the declutter. A .line brick draws at NATIVE size (dev 1.0) so it
+        // tiles at the engine's tile-space spacing, and is not decluttered.
+        if (self.cb.draw_sprite) |ds| {
+            if (placement == .point) self.emitSprite(ds, eff, s, at, rot_deg, scale, self.refDev(), true)
+            else self.emitSprite(ds, eff, s, at, rot_deg, scale, 1.0, null);
+        } else try self.emitSymbol(s, at, rot_deg, scale);
     }
 
     /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
@@ -332,8 +334,12 @@ pub const VectorSurface = struct {
     /// atlas cell drawn centred on the anchor reproduces the vector placement —
     /// for point symbols AND multi-glyph soundings, whose per-glyph pivots lay
     /// out the number.
-    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, force: bool) void {
-        const k = scale * 100.0 * self.refDev();
+    /// `dev` = the device scale for the symbol size (refDev for display-sized
+    /// point symbols; 1.0 for line bricks, which must match the engine's native
+    /// tile-space spacing so they tile). `declut` null = no declutter (line
+    /// patterns), else place with that `force`.
+    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, declut: ?bool) void {
+        const k = scale * 100.0 * dev;
         var hw: f64 = 0;
         var hh: f64 = 0;
         for (s.paths) |p| for (p.contours) |contour| for (contour) |c| {
@@ -344,10 +350,10 @@ pub const VectorSurface = struct {
         };
         if (hw <= 0 or hh <= 0) return;
         const anchor = self.worldOf(at);
-        // Declutter: navaid symbols place unconditionally (force) and block; a
-        // sounding yields if its box is already taken.
-        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
-        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, hw, hh, force)) return;
+        if (declut) |force| {
+            const scale_px = 256.0 * std.math.exp2(self.view_zoom);
+            if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, hw, hh, force)) return;
+        }
         const feat = self.cur_feature();
         draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, anchor, @floatCast(rot_deg), @floatCast(hw), @floatCast(hh));
     }
@@ -371,7 +377,7 @@ pub const VectorSurface = struct {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
             // force: the sounding as a whole already passed declutter.
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, true)
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), true)
             else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
         }
     }
