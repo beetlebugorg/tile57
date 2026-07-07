@@ -617,6 +617,27 @@ export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: *CAssets) callcon
     return 1;
 }
 
+/// Like tile57_bake_assets but the sprite_* fields carry the MapLibre sprite-mln
+/// atlas: each symbol pivot-centred in its cell + {name:{x,y,width,height,
+/// pixelRatio}} JSON. Only sprite_json/sprite_png are filled. Free with
+/// tile57_assets_free. 1=ok, 0=error. See tile57.h.
+export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, out: *CAssets) callconv(.c) c_int {
+    out.* = .{};
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cd = spanOpt(catalog_dir) orelse "";
+    const spr = bundle.spriteMlnBytes(io, a, cd, bundle.DEFAULT_CSS, &[_][]const u8{}) catch return 0;
+    fillAssets(out, "", "", spr.json, spr.png, "", "") catch {
+        tile57_assets_free(out);
+        return 0;
+    };
+    return 1;
+}
+
 /// Free every non-null buffer in *out and zero the struct. See tile57.h.
 export fn tile57_assets_free(out: *CAssets) callconv(.c) void {
     if (out.colortables) |p| chart.freeBytes(p[0..out.colortables_len]);

@@ -82,6 +82,11 @@ pub const CSurface = extern struct {
     /// Text label: world anchor + local glyph outlines (px, even-odd) + halo
     /// (halo.a == 0 => none).
     draw_text: *const fn (?*anyopaque, *const CFeature, CWorldPt, *const CLocalRings, CColor, CColor, f32) callconv(.c) void,
+    /// Point symbol as a sprite: name (ptr,len) to look up in the atlas, world
+    /// anchor, rotation (deg), and the symbol's un-rotated half-extent in
+    /// reference px (draw the atlas cell as a quad of that half-size, centred on
+    /// the anchor). Null => symbols tessellate via draw_symbol instead.
+    draw_sprite: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, CWorldPt, f32, f32, f32) callconv(.c) void = null,
 };
 
 // ---- the Surface implementation --------------------------------------------
@@ -267,7 +272,29 @@ pub const VectorSurface = struct {
         var eff = name;
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
         const s = store.get(eff) orelse return;
-        try self.emitSymbol(s, at, rot_deg, scale);
+        // Draw as an atlas sprite when the host supports it; else tessellate.
+        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale)
+        else try self.emitSymbol(s, at, rot_deg, scale);
+    }
+
+    /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
+    /// half-extent (reference px) + world anchor + rotation. The pivot-centred
+    /// atlas cell drawn centred on the anchor reproduces the vector placement —
+    /// for point symbols AND multi-glyph soundings, whose per-glyph pivots lay
+    /// out the number.
+    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64) void {
+        const k = scale * 100.0 * self.refDev();
+        var hw: f64 = 0;
+        var hh: f64 = 0;
+        for (s.paths) |p| for (p.contours) |contour| for (contour) |c| {
+            const lx = @abs((c.x - s.pivot.x) * k);
+            const ly = @abs((c.y - s.pivot.y) * k);
+            if (lx > hw) hw = lx;
+            if (ly > hh) hh = ly;
+        };
+        if (hw <= 0 or hh <= 0) return;
+        const feat = self.cur_feature();
+        draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, self.worldOf(at), @floatCast(rot_deg), @floatCast(hw), @floatCast(hh));
     }
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
@@ -281,7 +308,9 @@ pub const VectorSurface = struct {
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
-            if (store.get(glyph)) |s| try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
+            const s = store.get(glyph) orelse continue;
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE)
+            else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
         }
     }
 

@@ -192,6 +192,10 @@ typedef struct {
     uint8_t *pattern_json; size_t pattern_json_len;  uint8_t *pattern_png; size_t pattern_png_len;
 } tile57_assets;
 int  tile57_bake_assets(const char *catalog_dir, tile57_assets *out);
+/* Like tile57_bake_assets but sprite_json/sprite_png carry the MapLibre sprite-mln
+ * atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON); other
+ * fields are NULL. Free with tile57_assets_free. 1=ok, 0=error. */
+int  tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out);
 void tile57_assets_free(tile57_assets *out);
 
 /* Release a chart and all cached tiles. Must not be called while any renderer
@@ -341,6 +345,12 @@ typedef struct {
     /* Text: world anchor + local glyph outlines (px, even-odd) + halo
      * (halo.a == 0 => none). */
     void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px);
+    /* Point symbol as a sprite: symbol name (ptr,len) to look up in the atlas
+     * (tile57_bake_assets sprite_png/json), world anchor, rotation (deg), and the
+     * symbol's un-rotated half-extent in reference px. Draw the atlas cell as a
+     * quad of that half-size, centred on the anchor. NULL => symbols tessellate
+     * via draw_symbol instead. Must be the LAST field (ABI-appended). */
+    void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
 } tile57_surface_cb;
 
 /* Returns 0 ok / -1 bad handle / -2 render failure / -3 unsupported source. */
