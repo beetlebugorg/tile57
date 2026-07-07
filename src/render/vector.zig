@@ -320,13 +320,12 @@ pub const VectorSurface = struct {
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
         const s = store.get(eff) orelse return;
         // Draw as an atlas sprite when the host supports it; else tessellate.
-        // A .point navaid draws at display size (refDev) and force-places into
-        // the declutter. A .line brick draws at NATIVE size (dev 1.0) so it
-        // tiles at the engine's tile-space spacing, and is not decluttered.
-        if (self.cb.draw_sprite) |ds| {
-            if (placement == .point) self.emitSprite(ds, eff, s, at, rot_deg, scale, self.refDev(), true)
-            else self.emitSprite(ds, eff, s, at, rot_deg, scale, 1.0, null);
-        } else try self.emitSymbol(s, at, rot_deg, scale);
+        // Symbols never participate in declutter (S-52 icon-allow-overlap — they
+        // all draw). A .point navaid draws at display size (refDev); a .line
+        // brick draws at NATIVE size (dev 1.0) so it tiles at the engine spacing.
+        const dev: f64 = if (placement == .point) self.refDev() else 1.0;
+        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null)
+        else try self.emitSymbol(s, at, rot_deg, scale);
     }
 
     /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
@@ -366,18 +365,13 @@ pub const VectorSurface = struct {
         const shown = if (feet) depth_m * sndfrm.M_TO_FT else depth_m;
         const prefix: []const u8 = if (depth_m <= self.settings.safety_depth) "SOUNDS" else "SOUNDG";
         const list = try sndfrm.syms(self.a, prefix, shown, swept, low_acc, feet);
-        // Declutter the WHOLE sounding as one box (so a digit of a number is
-        // never dropped on its own); a crowded-out sounding is skipped entirely.
-        const anchor = self.worldOf(at);
-        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
-        const rd = self.refDev();
-        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, 13.0 * rd, 8.0 * rd, false)) return;
+        // Soundings are symbols (S-52 icon-allow-overlap): they do NOT declutter;
+        // density is governed by SCAMIN. Each digit self-positions by its pivot.
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
-            // force: the sounding as a whole already passed declutter.
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), true)
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), null)
             else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
         }
     }
