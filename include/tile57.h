@@ -373,8 +373,11 @@ typedef struct {
                     const char *s57, size_t s57_len,
                     const char *cell, size_t cell_len);
 } tile57_query_cb;
-/* Returns 0 ok, -1 bad args. */
-int tile57_chart_query(tile57_chart *chart, double lon, double lat, const tile57_query_cb *cb);
+/* `zoom` is the current view's web-mercator zoom: the query uses the tile at that
+ * zoom, so it reports the features actually DISPLAYED there (SCAMIN-bucketed) and
+ * the pick tolerance tracks on-screen distance. Returns 0 ok, -1 bad args. */
+int tile57_chart_query(tile57_chart *chart, double lon, double lat, double zoom,
+                       const tile57_query_cb *cb);
 
 /* The chart's per-cell metadata as a JSON array, one object per cell:
  *   [{"name":"US5MD1MC","scale":12000,"edition":"13","update":"3",

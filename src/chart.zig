@@ -1015,12 +1015,17 @@ pub const Chart = struct {
     /// Cursor object-query: replay the finest tile covering (lon,lat) through a
     /// QuerySurface and report each feature the point falls in (class + S-57
     /// attribute JSON + source cell) via `cb`. Used for the S-52 §10.8 pick.
-    pub fn queryPoint(self: *Chart, lon: f64, lat: f64, cb: *const render.query.QueryCb) !void {
+    pub fn queryPoint(self: *Chart, lon: f64, lat: f64, zoom: f64, cb: *const render.query.QueryCb) !void {
         const t = @import("tiles").tile;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const z: u8 = @intCast(self.zoomRange().max);
+        // Query the tile at the VIEW zoom, not the finest: its features are already
+        // SCAMIN-bucketed to what's displayed, the tile exists (it's what's drawn),
+        // and the pick radius (tile units) maps to a constant on-screen distance.
+        const zr = self.zoomRange();
+        const zc = std.math.clamp(@round(zoom), @as(f64, @floatFromInt(zr.min)), @as(f64, @floatFromInt(zr.max)));
+        const z: u8 = @intFromFloat(zc);
         const world = t.lonLatToWorld(lon, lat);
         const n = std.math.exp2(@as(f64, @floatFromInt(z)));
         const tx: u32 = @intFromFloat(@floor(world[0] * n));
@@ -1030,6 +1035,7 @@ pub const Chart = struct {
             .qx = @floatFromInt(local.x),
             .qy = @floatFromInt(local.y),
             .radius = 96.0, // ~6 px at native tile scale
+            .view_zoom = zoom, // raw view zoom for the SCAMIN cull
             .cb = cb,
         };
         const surf = qs.asSurface();

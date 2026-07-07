@@ -6,6 +6,7 @@
 //! the FeatureMeta contract, so no S-57 decode is needed here.
 const std = @import("std");
 const rs = @import("surface.zig");
+const resolve = @import("resolve.zig");
 
 /// C callback: one call per feature the query point falls in. Pointers are valid
 /// only for the duration of the call.
@@ -18,9 +19,11 @@ pub const QuerySurface = struct {
     qx: f64,
     qy: f64,
     radius: f64, // near-hit radius for line/point features (tile units)
+    view_zoom: f64, // the view zoom, for the SCAMIN visibility cull
     cb: *const QueryCb,
     cur: rs.FeatureMeta = .{},
     hit: bool = false,
+    visible: bool = false, // current feature passes SCAMIN at view_zoom
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -47,10 +50,13 @@ pub const QuerySurface = struct {
         const self = sp(ctx);
         self.cur = meta.*;
         self.hit = false;
+        // Only report what the view actually shows: apply the same SCAMIN cull the
+        // renderer does, so a zoomed-out click doesn't return finer-scale features.
+        self.visible = resolve.scaminVisible(meta.scamin, self.view_zoom);
     }
     fn endFeature(ctx: *anyopaque) anyerror!void {
         const self = sp(ctx);
-        if (!self.hit) return;
+        if (!self.hit or !self.visible) return;
         const m = self.cur;
         self.cb.feature(self.cb.ctx, m.class.ptr, m.class.len, m.s57_json.ptr, m.s57_json.len, m.cell_name.ptr, m.cell_name.len);
     }

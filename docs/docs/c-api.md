@@ -213,12 +213,18 @@ The CLI mirrors these as `tile57 cells`, `tile57 features`, and
 
 ## Query the features under a point (object query / pick)
 
-The S-52 cursor pick. Given a lon/lat, tile57 replays the finest tile that covers
-the point and reports every feature the point falls in — an area you are inside,
-or a line or point symbol within a small radius. Each hit calls you back with the
-S-57 object-class acronym, the attribute JSON (acronym to value), and the source
-cell name. This is what a chart application shows when you tap a feature to see
-what it is.
+The S-52 cursor pick. Given a lon/lat and the current view `zoom`, tile57 replays
+the tile at that zoom and reports every feature the point falls in — an area you
+are inside, or a line or point symbol within a small radius. Each hit calls you
+back with the S-57 object-class acronym, the attribute JSON (acronym to value),
+and the source cell name. This is what a chart application shows when you tap a
+feature to see what it is.
+
+Passing the view zoom matters: the query reports the features actually DISPLAYED
+at that zoom (it applies the same SCAMIN cull the renderer does), and the pick
+tolerance tracks on-screen distance instead of ground distance — so a buoy is just
+as easy to tap zoomed out as zoomed in, and a zoomed-out click doesn't return
+finer-scale features that aren't drawn.
 
 ```c
 typedef struct {
@@ -228,9 +234,10 @@ typedef struct {
                     const char *cell, size_t cell_len);
 } tile57_query_cb;
 
-/* Calls cb->feature once per feature under (lon,lat). 0 ok, -1 bad args.
- * The pointers passed to the callback are valid only during that call. */
-int tile57_chart_query(tile57_chart *chart, double lon, double lat, const tile57_query_cb *cb);
+/* Calls cb->feature once per displayed feature under (lon,lat) at view `zoom`.
+ * 0 ok, -1 bad args. Callback pointers are valid only during that call. */
+int tile57_chart_query(tile57_chart *chart, double lon, double lat, double zoom,
+                       const tile57_query_cb *cb);
 ```
 
 The class and cell come through for any chart. The attribute JSON is filled in

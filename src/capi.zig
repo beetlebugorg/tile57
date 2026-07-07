@@ -150,13 +150,13 @@ export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) voi
 
 const CQueryCb = @import("render").query.QueryCb;
 
-/// Cursor object-query at (lon,lat): invokes cb->feature once per feature the
-/// point falls in, with its S-57 class, attribute JSON, and source cell.
-/// 0=ok, -1=bad args. See tile57.h.
-export fn tile57_chart_query(handle: ?*Chart, lon: f64, lat: f64, cb: ?*const CQueryCb) callconv(.c) c_int {
+/// Cursor object-query at (lon,lat) for the view `zoom` (web-mercator): invokes
+/// cb->feature once per displayed feature the point falls in, with its S-57 class,
+/// attribute JSON, and source cell. 0=ok, -1=bad args. See tile57.h.
+export fn tile57_chart_query(handle: ?*Chart, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb) callconv(.c) c_int {
     const self = handle orelse return -1;
     const cbp = cb orelse return -1;
-    self.queryPoint(lon, lat, cbp) catch return -1;
+    self.queryPoint(lon, lat, zoom, cbp) catch return -1;
     return 0;
 }
 
