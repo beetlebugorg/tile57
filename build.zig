@@ -370,6 +370,12 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("colorprofile_registry", colorprofile_registry);
     lib_mod.addImport("catalog", catalog_embed); // chart.renderView symbol/pattern store
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
+    // Bundle compiler-rt INTO the static archive. A non-Zig linker (the CGO host's gcc/clang,
+    // `go test`) has no access to Zig's compiler-rt, so builtins the code references — e.g.
+    // `roundq` (f128 @round, pulled in by std.json's number→int coercion in coverage decode) —
+    // would be undefined at link time. Static libs default to NOT bundling it; force it on so
+    // libtile57.a is self-contained for C consumers.
+    lib.bundle_compiler_rt = true;
     if (target.result.os.tag == .macos) {
         // Apple's ld64 rejects 64-bit mach-o archive members whose offsets aren't
         // 8-byte aligned, and Zig's archiver doesn't align them — so the raw

@@ -140,6 +140,32 @@ export fn tile57_compose(
     return 0;
 }
 
+/// Streaming disk-to-disk composite: combine the `n` per-cell PMTiles at `paths` (each from
+/// tile57_bake_cell_bytes, written to disk) into one merged PMTiles at `out_path`. The per-cell
+/// files are mmap'd (never all resident) and the output is streamed, so a whole district
+/// composes in bounded memory. Writes the count of contributing cells to *out_cells if
+/// non-null. Returns 1 on success, 0 if nothing composed, -1 on error. See tile57.h.
+export fn tile57_compose_files(
+    paths: ?[*]const ?[*:0]const u8,
+    n: usize,
+    out_path: ?[*:0]const u8,
+    out_cells: ?*u32,
+) callconv(.c) c_int {
+    const ps = paths orelse return -1;
+    const op = spanOpt(out_path) orelse return -1;
+    if (n == 0) return 0;
+    const list = gpa.alloc([]const u8, n) catch return -1;
+    defer gpa.free(list);
+    for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return -1;
+
+    // The lib has no std.process.Init; stand up a threaded std.Io for the file I/O.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const nc = bundle.composeArchivesToFile(threaded.io(), gpa, list, op) catch return -1;
+    if (out_cells) |p| p.* = @intCast(nc);
+    return if (nc > 0) 1 else 0;
+}
+
 /// The metadata JSON blob of a PMTiles archive (e.g. the embedded per-cell "coverage"
 /// a single-cell bake carries), into *out / *out_len (free with tile57_free). 1=ok,
 /// 0=no metadata, -1=error. See tile57.h.

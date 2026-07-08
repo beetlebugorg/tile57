@@ -234,6 +234,44 @@ func Compose(archives [][]byte) ([]byte, error) {
 	}
 }
 
+// ComposeFiles streaming-composes the per-cell PMTiles at `paths` (each written by [BakeCell]
+// to disk) into one merged PMTiles at outPath. The per-cell files are mmap'd (never all
+// resident) and the output is streamed, so a whole district composes in bounded memory —
+// prefer this over [Compose] for large cell sets. Returns the number of contributing cells.
+func ComposeFiles(paths []string, outPath string) (int, error) {
+	if len(paths) == 0 {
+		return 0, fmt.Errorf("tile57: ComposeFiles needs at least one path: %w", ErrEmptyInput)
+	}
+	if outPath == "" {
+		return 0, fmt.Errorf("tile57: ComposeFiles needs an output path: %w", ErrEmptyInput)
+	}
+	cpaths := make([]*C.char, len(paths))
+	for i, p := range paths {
+		cpaths[i] = C.CString(p)
+	}
+	defer func() {
+		for _, cp := range cpaths {
+			C.free(unsafe.Pointer(cp))
+		}
+	}()
+	cOut := C.CString(outPath)
+	defer C.free(unsafe.Pointer(cOut))
+
+	var cells C.uint32_t
+	rc := C.tile57_compose_files(
+		(**C.char)(unsafe.Pointer(&cpaths[0])), C.size_t(len(paths)),
+		cOut, &cells,
+	)
+	switch rc {
+	case 1:
+		return int(cells), nil
+	case 0:
+		return 0, fmt.Errorf("tile57: compose produced no tiles: %w", ErrNoCoverage)
+	default:
+		return 0, fmt.Errorf("tile57: compose files failed")
+	}
+}
+
 // PMTilesMetadata returns a PMTiles archive's metadata JSON blob (decompressed), or
 // nil if the archive carries none. A [BakeCell] archive embeds the cell's coverage
 // under a "coverage" key. The pmtiles bytes are read but not retained.

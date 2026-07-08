@@ -112,6 +112,15 @@ int tile57_compose(const uint8_t *blob, size_t blob_len,
                    const size_t *lens, size_t n,
                    uint8_t **out, size_t *out_len);
 
+/* Streaming disk-to-disk composite: combine the `n` per-cell PMTiles at `paths` (each written
+ * by tile57_bake_cell_bytes) into one merged PMTiles at `out_path`. The per-cell files are
+ * mmap'd (never all resident) and the output is streamed, so a whole district composes in
+ * bounded memory — prefer this over tile57_compose for large cell sets. Writes the count of
+ * contributing cells to *out_cells if non-NULL. Returns 1 on success, 0 if nothing composed,
+ * -1 on error. */
+int tile57_compose_files(const char *const *paths, size_t n, const char *out_path,
+                         uint32_t *out_cells);
+
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +
  * cscl + date/name under a "coverage" key, so the composite stitcher rebuilds the
