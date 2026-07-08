@@ -40,6 +40,7 @@ const audit_holes = @import("audit_holes.zig");
 const audit_pairs = @import("audit_pairs.zig");
 const objlcount = @import("objlcount.zig");
 const cell = @import("cell.zig");
+const partdbg_png = @import("partdbg_png.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -74,6 +75,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "png") or std.mem.eql(u8, sub, "renderpng")) {
         return render.run(io, arena, args, .png);
+    }
+    if (std.mem.eql(u8, sub, "partdbg-png")) {
+        return partdbg_png.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "pdf")) {

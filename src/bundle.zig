@@ -655,7 +655,9 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
     const span_deg = @max(0.01, @as(f64, @floatFromInt(ubox[2] - ubox[0])) / 1e7);
     const cz: u8 = @intFromFloat(std.math.clamp(std.math.log2(720.0 / span_deg), @as(f64, @floatFromInt(minzoom)), @as(f64, @floatFromInt(maxzoom))));
     const bytes = try engine.pmtiles.write(gpa, inputs.items, .{
-        .metadata_json = "{\"name\":\"partition-debug\",\"description\":\"ownership partition faces (debug); layer=partition, props: cell,cscl,band,tier,oi,color\"}",
+        // MapLibre/pmtiles.io build their style from `vector_layers`; without it the
+        // "partition" layer is invisible to a viewer no matter the geometry.
+        .metadata_json = "{\"name\":\"partition-debug\",\"format\":\"pbf\",\"vector_layers\":[{\"id\":\"partition\",\"fields\":{\"cell\":\"String\",\"cscl\":\"Number\",\"band\":\"Number\",\"tier\":\"Number\",\"oi\":\"Number\",\"color\":\"String\"}}]}",
         .tile_type = .mvt,
         .min_lon_e7 = ubox[0],
         .min_lat_e7 = ubox[1],
