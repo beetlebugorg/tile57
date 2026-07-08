@@ -27,5 +27,6 @@ pub const s101_instr = root.s101_instr;
 pub const s101_adapt = root.s101_adapt;
 pub const catalogue = root.catalogue;
 pub const bake_enc = root.bake_enc;
+pub const geo = @import("geo"); // integer geometry: boolean, plane, partition
 
 pub const portray = @import("portray");

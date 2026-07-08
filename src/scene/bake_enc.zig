@@ -160,15 +160,18 @@ fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) b
     return coversAnyCtx(BackendCov{ .backends = backends }, idxs, lon, lat);
 }
 
-// Whether cell `a` orders strictly before cell `b` in the equal-scale clip
-// order: newer DSID issue/update date first (YYYYMMDD compares lexically; a
-// dated cell orders before an undated one), then cell name ascending - total
-// and deterministic for distinct cells, so bake output is byte-stable.
-fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
-    const da = ctx.date(a_idx);
-    const db = ctx.date(b_idx);
+// Whether (date da, name na) orders strictly before (db, nb) in the equal-scale
+// clip order: newer DSID issue/update date first (YYYYMMDD compares lexically; a
+// dated cell orders before an undated one), then cell name ascending - total and
+// deterministic for distinct cells, so bake output is byte-stable. Public so the
+// ownership partition assigns the same tie-break winner as the bake.
+pub fn ordersBeforeKeys(da: []const u8, na: []const u8, db: []const u8, nb: []const u8) bool {
     if (!std.mem.eql(u8, da, db)) return std.mem.lessThan(u8, db, da); // newer first
-    return std.mem.lessThan(u8, ctx.name(a_idx), ctx.name(b_idx));
+    return std.mem.lessThan(u8, na, nb);
+}
+
+fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
+    return ordersBeforeKeys(ctx.date(a_idx), ctx.name(a_idx), ctx.date(b_idx), ctx.name(b_idx));
 }
 
 /// coverClipForCell's per-tile verdict — the cheap FULL/EMPTY/SEAM classifier

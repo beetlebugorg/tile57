@@ -31,6 +31,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var super_dz: u8 = DEFAULT_SUPER_DZ; // lazy-bake tuning: spatial super-tile depth
     var format: engine.scene.TileFormat = .mlt; // tile encoding: mlt (default) or mvt
     var existing: []const u8 = ""; // cross-pack best-available: a peer pack's ENC_ROOT
+    var partition_debug = false; // emit the ownership-partition debug PMTiles instead of a bundle
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -55,6 +56,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else if (std.mem.eql(u8, arg, "--format")) {
             const v = f.val(arg) orelse return;
             format = if (std.mem.eql(u8, v, "mlt")) .mlt else if (std.mem.eql(u8, v, "mvt")) .mvt else return usageErr("--format must be mvt or mlt");
+        } else if (std.mem.eql(u8, arg, "--partition-debug")) {
+            partition_debug = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -69,6 +72,21 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
     if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
     if (lru < 1) return usageErr("--lru must be >= 1");
+
+    // Debug: emit the ownership partition (which cell owns which ground per band) as a
+    // single PMTiles with no portrayed content, for eyeballing the composite quilt.
+    if (partition_debug) {
+        // Full overview→approach range by default (z13+ shows harbor detail but the
+        // face-tile count grows ~4^z, so raise --maxzoom on demand).
+        const dbg_minz: u8 = if (minzoom == DEFAULT_MINZOOM) 0 else minzoom;
+        const dbg_maxz: u8 = if (maxzoom == DEFAULT_MAXZOOM) 12 else maxzoom;
+        const nc = bundle.bakePartitionDebug(io, a, base_path, out_dir, dbg_minz, dbg_maxz) catch |err| {
+            std.debug.print("error: partition-debug bake of {s} failed ({s})\n", .{ base_path, @errorName(err) });
+            return;
+        };
+        std.debug.print("partition-debug: {d} cell(s) -> {s} (z{d}-{d}, layer \"partition\": cell/cscl/band/tier/oi/color)\n", .{ nc, out_dir, dbg_minz, dbg_maxz });
+        return;
+    }
 
     // The whole tiles + assets + manifest pipeline lives in the `bundle` lib module
     // (bundle.bakeBundle) so any consumer (the C ABI, a Go/JS binding) emits the same

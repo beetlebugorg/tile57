@@ -491,6 +491,170 @@ fn loadContextCoverage(io: std.Io, a: std.mem.Allocator, path: []const u8) []eng
     return out.toOwnedSlice(a) catch &.{};
 }
 
+// A cyclic palette so adjacent ownership faces get distinct colours in the debug
+// view; a face carries its colour as a `color` property for a trivial data-driven style.
+const DEBUG_PALETTE = [_][]const u8{
+    "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4", "#46f0f0", "#f032e6",
+    "#bcf60c", "#fabebe", "#008080", "#e6beff", "#9a6324", "#fffac8", "#800000", "#aaffc3",
+};
+
+/// Bake a DEBUG PMTiles of the ownership PARTITION only: the composited faces (which
+/// cell renders which ground at each band), tagged with the owning cell's identity —
+/// NO portrayed chart content. Lets the partition be eyeballed in the client. Reuses
+/// the ENC_ROOT discovery + `readParseCell` loader and the standard mvt/pmtiles emit;
+/// the partition math is `engine.geo`. Returns the cell count. `out_path` is a single
+/// `.pmtiles` file (not a bundle dir).
+pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8, out_path: []const u8, minzoom: u8, maxzoom_arg: u8) !usize {
+    const geo = engine.geo;
+    const mvt = engine.mvt;
+    const tile = engine.tile;
+    const maxzoom = @min(maxzoom_arg, @as(u8, 14)); // face tiles grow ~4^z; clamp to stay sane
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    // --- 1. Discover + parse cells (reuse readParseCell); widen M_COVR to integer
+    //        points, take cscl/date/name. One entry per stem (dedup like bakeRoot).
+    const Loaded = struct { cell: geo.plane.Cell, name: []const u8, date: []const u8 };
+    var loaded = std.ArrayList(Loaded).empty;
+    var seen = std.StringHashMap(void).init(a);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
+        const stem = std.fs.path.stem(std.fs.path.basename(entry.path));
+        if (seen.contains(stem)) continue;
+        const stem_d = try a.dupe(u8, stem);
+        try seen.put(stem_d, {});
+
+        var cell = readParseCell(io, dir, entry.path) orelse continue;
+        defer cell.deinit();
+        const cov = cell.mcovrCoverage(a); // float rings, copied into `a`
+        if (cov.len == 0) continue;
+
+        const cov1 = try a.alloc(geo.plane.Poly, cov.len);
+        for (cov, 0..) |feat, fi| {
+            const rings = try a.alloc([]const geo.plane.Pt, feat.len);
+            for (feat, 0..) |ring, ri| {
+                const pts = try a.alloc(geo.plane.Pt, ring.len);
+                for (ring, 0..) |p, pi| pts[pi] = .{ .x = p.lon_e7, .y = p.lat_e7 };
+                rings[ri] = pts;
+            }
+            cov1[fi] = rings;
+        }
+        const cscl = cell.params.cscl;
+        try loaded.append(a, .{
+            .cell = .{ .cscl = cscl, .band_floor = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cscl)).min, .order = 0, .cov1 = cov1 },
+            .name = stem_d,
+            .date = try a.dupe(u8, cell.dsid.isdt),
+        });
+    }
+    const ncells = loaded.items.len;
+    if (ncells == 0) return error.NoGeometry;
+
+    // --- 2. Assign the DSID order (same tie-break as the bake), build the partition.
+    const rank = try a.alloc(usize, ncells);
+    for (rank, 0..) |*v, i| v.* = i;
+    std.mem.sort(usize, rank, loaded.items, struct {
+        fn lt(ls: []const Loaded, x: usize, y: usize) bool {
+            return engine.bake_enc.ordersBeforeKeys(ls[x].date, ls[x].name, ls[y].date, ls[y].name);
+        }
+    }.lt);
+    const cells = try a.alloc(geo.plane.Cell, ncells);
+    for (rank, 0..) |ci, r| loaded.items[ci].cell.order = r;
+    for (loaded.items, 0..) |lc, i| cells[i] = lc.cell;
+
+    std.debug.print("partition-debug: {d} cells from {s}, building z{d}-{d}\n", .{ ncells, root_path, minzoom, maxzoom });
+    var part = try geo.partition.build(gpa, cells);
+    defer part.deinit();
+
+    // --- 3. Slice each band's faces into tiles (reuse tile.project + clipPolygon).
+    const TileKey = struct { z: u8, x: u32, y: u32 };
+    var tilemap = std.AutoHashMap(TileKey, std.ArrayList(mvt.Feature)).init(a);
+
+    var z: u8 = minzoom;
+    while (z <= maxzoom) : (z += 1) {
+        const map = part.mapForZoom(z) orelse continue;
+        const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+        for (map.faces) |face| {
+            if (face.owned.len == 0) continue;
+            const lc = loaded.items[face.index];
+
+            // Face lon/lat bbox → the tile x/y range it can touch at this zoom.
+            var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+            for (face.owned) |ring| for (ring) |p| {
+                const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
+                const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
+                fb[0] = @min(fb[0], lon);
+                fb[1] = @min(fb[1], lat);
+                fb[2] = @max(fb[2], lon);
+                fb[3] = @max(fb[3], lat);
+            };
+            const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // min lon, max lat → top-left
+            const w_br = tile.lonLatToWorld(fb[2], fb[1]); // max lon, min lat → bottom-right
+            const tx0 = worldAxisToTile(w_tl[0], scale);
+            const tx1 = worldAxisToTile(w_br[0], scale);
+            const ty0 = worldAxisToTile(w_tl[1], scale);
+            const ty1 = worldAxisToTile(w_br[1], scale);
+
+            const props = try a.dupe(mvt.Prop, &.{
+                .{ .key = "cell", .value = .{ .string = lc.name } },
+                .{ .key = "cscl", .value = .{ .int = lc.cell.cscl } },
+                .{ .key = "band", .value = .{ .int = @intFromEnum(engine.bake_enc.bandOf(lc.cell.cscl)) } },
+                .{ .key = "tier", .value = .{ .int = map.tier } },
+                .{ .key = "oi", .value = .{ .int = @intCast(face.index) } },
+                .{ .key = "color", .value = .{ .string = DEBUG_PALETTE[face.index % DEBUG_PALETTE.len] } },
+            });
+
+            var tx = tx0;
+            while (tx <= tx1) : (tx += 1) {
+                var ty = ty0;
+                while (ty <= ty1) : (ty += 1) {
+                    var parts = std.ArrayList([]const mvt.Point).empty;
+                    for (face.owned) |ring| {
+                        const proj = try a.alloc(mvt.Point, ring.len);
+                        for (ring, 0..) |p, k| proj[k] = tile.project(@as(f64, @floatFromInt(p.x)) / 1e7, @as(f64, @floatFromInt(p.y)) / 1e7, z, tx, ty, tile.EXTENT);
+                        const clipped = try tile.clipPolygon(a, proj, tile.Box.default(tile.EXTENT, 256));
+                        if (clipped.len >= 3) try parts.append(a, clipped);
+                    }
+                    if (parts.items.len == 0) continue;
+                    const gop = try tilemap.getOrPut(.{ .z = z, .x = tx, .y = ty });
+                    if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(mvt.Feature).empty;
+                    try gop.value_ptr.append(a, .{ .geom_type = .polygon, .parts = try parts.toOwnedSlice(a), .properties = props });
+                }
+            }
+        }
+    }
+
+    // --- 4. Encode each tile and write the archive (reuse mvt.encode + pmtiles.write).
+    var inputs = std.ArrayList(engine.pmtiles.InputTile).empty;
+    var it = tilemap.iterator();
+    while (it.next()) |kv| {
+        const layers = [_]mvt.Layer{.{ .name = "partition", .features = kv.value_ptr.items }};
+        const enc = try mvt.encode(a, .{ .layers = &layers });
+        try inputs.append(a, .{ .z = kv.key_ptr.z, .x = kv.key_ptr.x, .y = kv.key_ptr.y, .mvt = enc });
+    }
+    const bytes = try engine.pmtiles.write(gpa, inputs.items, .{
+        .metadata_json = "{\"name\":\"partition-debug\",\"description\":\"ownership partition faces (debug); layer=partition, props: cell,cscl,band,tier,oi,color\"}",
+        .tile_type = .mvt,
+    });
+    defer gpa.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
+    return ncells;
+}
+
+// A normalised web-mercator world axis coordinate ([0,1]) → tile index at `scale`
+// (= 2^z), clamped to [0, scale-1].
+fn worldAxisToTile(w: f64, scale: f64) u32 {
+    const f = @floor(w * scale);
+    if (f < 0) return 0;
+    return @intFromFloat(@min(f, scale - 1));
+}
+
 const LightScanWork = struct {
     entries: []const CellEntry,
     dir: std.Io.Dir,
