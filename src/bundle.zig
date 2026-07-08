@@ -1051,10 +1051,42 @@ fn composeZoom(
         const ty0 = worldAxisToTile(w_tl[1], scale);
         const ty1 = worldAxisToTile(w_br[1], scale);
 
+        // FULL/EMPTY/SEAM classifier over this owner's owned face (integer lon/lat). A tile the
+        // owner covers ENTIRELY (its buffer too, no seam crossing) is copied VERBATIM from the
+        // per-cell bake — byte-identical, no decode/clip/re-encode; only seam tiles run the
+        // geometry path. Bucket ≈ one tile wide. (classify's `covered` is the owned face, so its
+        // labels are inverted from their names: center-inside → `.empty` = fully owned.)
+        const tile_w_e7: i64 = @max(1, @divFloor(@as(i64, 3_600_000_000), @as(i64, 1) << @intCast(z)));
+        var grid = try engine.geo.plane.EdgeGrid.init(sa, face.owned, tile_w_e7);
+        defer grid.deinit();
+
         var tx = tx0;
         while (tx <= tx1) : (tx += 1) {
             var ty = ty0;
             while (ty <= ty1) : (ty += 1) {
+                // Classify (z,tx,ty) against the owned face, the box expanded by the render
+                // BUFFER so a passthrough only fires when the owner owns the tile AND its buffer.
+                const tb = tile.tileBoundsLonLat(z, tx, ty); // [min_lon, min_lat, max_lon, max_lat]
+                const lon0: i64 = @intFromFloat(@round(tb[0] * 1e7));
+                const lat0: i64 = @intFromFloat(@round(tb[1] * 1e7));
+                const lon1: i64 = @intFromFloat(@round(tb[2] * 1e7));
+                const lat1: i64 = @intFromFloat(@round(tb[3] * 1e7));
+                const bufx = @divTrunc((lon1 - lon0) * @as(i64, tile.BUFFER), @as(i64, tile.EXTENT));
+                const bufy = @divTrunc((lat1 - lat0) * @as(i64, tile.BUFFER), @as(i64, tile.EXTENT));
+                const box = engine.geo.plane.Box{ .min_x = lon0 - bufx, .min_y = lat0 - bufy, .max_x = lon1 + bufx, .max_y = lat1 + bufy };
+                switch (grid.classify(box)) {
+                    .full => continue, // owner owns none of this tile (buffer included): skip
+                    .empty => {
+                        // Owner owns the whole tile: copy its native blob verbatim if present
+                        // (byte-identical), else fall through to the overscale/clip path.
+                        if (try readers[ci].getCompressed(z, tx, ty)) |blob| {
+                            try sw.addCompressed(z, tx, ty, blob);
+                            continue;
+                        }
+                    },
+                    .seam => {}, // real geometry: decode + clip below
+                }
+
                 // The cell's tile content at (z,tx,ty): its native tile, or — one fill-up zoom
                 // past its band — its deepest native ancestor scaled up (overscale). null =
                 // nothing reachable here.
@@ -2352,6 +2384,40 @@ test "composeArchives: a coarse owner overscales one fill-up zoom past its nativ
     try testing.expect(al.features.len >= 1);
     // The overscaled coastal fill covers the child tile interior.
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(tile.EXTENT, 2), @divTrunc(tile.EXTENT, 2)));
+}
+
+test "composeArchives: an interior tile is copied byte-identical from the per-cell bake" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tile = engine.tile;
+
+    // A single harbor cell whose coverage spans a 3×3 tile block, with a native tile at the
+    // centre (z14). The centre tile + its buffer is fully interior to the owned face (a lone
+    // cell owns everything), so the compositor must copy it VERBATIM — byte-identical to the
+    // per-cell bake, no decode/clip/re-encode.
+    const z: u8 = 14;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+    const w = tile.lonLatToWorld(-76.5, 39.0);
+    const tx = worldAxisToTile(w[0], scale);
+    const ty = worldAxisToTile(w[1], scale);
+    const tb = tile.tileBoundsLonLat(z, tx, ty);
+    const dlon = tb[2] - tb[0];
+    const dlat = tb[3] - tb[1];
+    const arc = try synthCell(gpa, a, "INTERIOR", tb[0] - dlon, tb[1] - dlat, tb[2] + dlon, tb[3] + dlat, 20_000, z, tx, ty);
+    defer gpa.free(arc);
+
+    const composed = (try composeArchives(gpa, &.{arc})) orelse return error.TestUnexpectedResult;
+    defer gpa.free(composed);
+
+    var rc = try engine.pmtiles.Reader.init(gpa, composed);
+    defer rc.deinit();
+    var rp = try engine.pmtiles.Reader.init(gpa, arc);
+    defer rp.deinit();
+    const got = (try rc.getCompressed(z, tx, ty)) orelse return error.TestUnexpectedResult;
+    const want = (try rp.getCompressed(z, tx, ty)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, want, got); // verbatim passthrough
 }
 
 test "composeArchivesToFile: streams a seam split disk-to-disk" {
