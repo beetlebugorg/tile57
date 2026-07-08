@@ -472,7 +472,12 @@ pub const StreamWriter = struct {
             }
             try merged.append(a, e);
         }
+        defer merged.deinit(a);
         const dirs = try buildDirectories(a, merged.items);
+        // `dirs` + `merged` are copied into `out` below, so free them once the archive prefix
+        // is assembled (they are heap-owned by `a`; `leaves` may be the empty sentinel).
+        defer a.free(dirs.root);
+        defer if (dirs.leaves.len > 0) a.free(dirs.leaves);
         const metadata = opts.metadata_json;
         const root_off: u64 = HEADER_LEN;
         const meta_off: u64 = root_off + dirs.root.len;
