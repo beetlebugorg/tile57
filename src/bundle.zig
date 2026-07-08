@@ -793,48 +793,46 @@ fn worldAxisToTile(w: f64, scale: f64) u32 {
 
 const N_COMPOSE_LAYERS = engine.scene.VECTOR_LAYERS.len;
 
-/// Compose per-cell PMTiles archives (BORROWED — kept alive by the caller) into one merged
-/// PMTiles. Returns the composed archive bytes (`gpa`-owned; free with `gpa.free` /
-/// `tile57_free`), or null if nothing composed. The partition is rebuilt from each archive's
-/// embedded coverage (no `.000` re-parse), via the same `toPlaneCells` adapter the bake uses.
-///
-/// Native-scale only for now: a cell contributes a tile only where it has a baked tile, so
-/// ground a cell owns OUTSIDE its native zoom band is left empty at that zoom — cross-band
-/// zoom expansion (overscale / fill-down) is a separate compositor stage.
-pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[]u8 {
+// The archive framing composeInto computes for the caller to seal the PMTiles: metadata JSON
+// (gpa-owned; caller frees), union bbox (E7), a viewer center zoom, and the cell count.
+const Framing = struct {
+    meta: []const u8,
+    ubox: [4]i32,
+    center_zoom: u8,
+    cells: usize,
+};
+
+// The shared compose core: recover each reader's embedded coverage + SCAMIN ladder, rebuild the
+// ownership partition (via the canonical toPlaneCells adapter), and stream every composed tile
+// into `sw` — one governing band per zoom (partition.mapForZoom), each owner's tiles clipped to
+// its owned face and merged per layer, with cross-band overscale one zoom past each band. `sw`
+// may be in-memory (composeArchives) or file-backed (composeArchivesToFile); this is agnostic.
+// Returns the framing to seal the archive, or null if no cell carried coverage or no tile
+// composed. Readers are BORROWED — kept alive by the caller; `readers` indexing aligns with the
+// partition (readers without coverage are filtered out here).
+fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers: []const *engine.pmtiles.Reader) !?Framing {
     const geo = engine.geo;
-    const pmtiles = engine.pmtiles;
     const scene = engine.scene;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // 1. Open a Reader per archive and recover its embedded coverage + SCAMIN ladder. Archives
-    //    with no coverage key are skipped. Readers are heap-stable (created in `a`) so getTile's
-    //    lazy leaf-dir decode mutates them in place; they borrow the archive bytes.
-    const readers = try a.alloc(*pmtiles.Reader, archives.len);
+    // 1. Recover embedded coverage + SCAMIN from each reader; keep only those carrying coverage,
+    //    aligned so cell index == kept-reader index for composeZoom.
+    var kept = std.ArrayList(*engine.pmtiles.Reader).empty;
     var shims = std.ArrayList(LoadedCov).empty;
     var scamins = std.AutoHashMap(u32, void).init(a);
     var ubox = [4]i32{ std.math.maxInt(i32), std.math.maxInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
-    var n: usize = 0;
-    for (archives) |arc| {
-        const rp = a.create(pmtiles.Reader) catch continue;
-        rp.* = pmtiles.Reader.init(gpa, arc) catch continue;
-        const meta = readMetaJson(a, rp) orelse {
-            rp.deinit();
-            continue;
-        };
-        const cc = (scene.coverage.decodeFromMetadata(a, meta) catch null) orelse {
-            rp.deinit();
-            continue;
-        };
+    for (readers) |rp| {
+        const meta = readMetaJson(a, rp) orelse continue;
+        const cc = (scene.coverage.decodeFromMetadata(a, meta) catch null) orelse continue;
         for (parseScamin(a, meta)) |s| scamins.put(s, {}) catch {};
         ubox[0] = @min(ubox[0], cc.bbox[0]);
         ubox[1] = @min(ubox[1], cc.bbox[1]);
         ubox[2] = @max(ubox[2], cc.bbox[2]);
         ubox[3] = @max(ubox[3], cc.bbox[3]);
-        readers[n] = rp;
+        try kept.append(a, rp);
         try shims.append(a, .{
             .name = cc.name,
             .date = cc.date,
@@ -847,19 +845,17 @@ pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[
                 @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,
             },
         });
-        n += 1;
     }
-    defer for (readers[0..n]) |rp| rp.deinit();
-    if (n == 0) return null;
+    if (shims.items.len == 0) return null;
 
-    // 2. Adapt to plane.Cell (THE canonical adapter: band floor via bandOf + the DSID
-    //    ordersBeforeKeys tie-break, ranked across the whole set) and materialise the per-band
-    //    ownership partition. `part` borrows `cells` (arena-backed) — keep `a` alive for it.
+    // 2. Adapt to plane.Cell (band floor via bandOf + the DSID ordersBeforeKeys tie-break) and
+    //    materialise the per-band ownership partition. `part` borrows `cells` (arena-backed).
     const cells = try toPlaneCells(a, shims.items);
     var part = try geo.partition.build(gpa, cells);
     defer part.deinit();
 
-    // 3. Output zoom span = union of the cells' native band windows.
+    // 3. Output zoom span = union of the cells' native band windows, plus one fill-up zoom past
+    //    the deepest band (overscale; deeper coarse-only zooms → client camera + overzoom).
     var minz: u8 = 255;
     var maxz: u8 = 0;
     for (shims.items) |lc| {
@@ -867,41 +863,147 @@ pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[
         minz = @min(minz, zr.min);
         maxz = @max(maxz, zr.max);
     }
-
-    // 4. Stream: one governing band per zoom (partition.mapForZoom), scatter each owner's
-    //    native tiles, clip to its owned face, merge per layer, re-encode. The loop runs one
-    //    fill-up zoom past the deepest native band (bounded by FILLUP_CEIL) so a coarser owner's
-    //    ground stays covered just past its band (overscale); deeper coarse-only zooms are left
-    //    to the client camera + MapLibre overzoom.
     const fill_max = @min(maxz + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);
     const loop_max = @max(maxz, fill_max);
-    var sw = pmtiles.StreamWriter.init(gpa);
-    defer sw.deinit();
-    var zoom_arena = std.heap.ArenaAllocator.init(gpa); // one zoom's tiles resident at a time
+
+    // 4. Stream one zoom at a time (only one zoom's tiles resident).
+    var zoom_arena = std.heap.ArenaAllocator.init(gpa);
     defer zoom_arena.deinit();
     var z: u8 = minz;
     while (z <= loop_max) : (z += 1) {
         _ = zoom_arena.reset(.retain_capacity);
-        try composeZoom(&sw, zoom_arena.allocator(), &part, readers[0..n], z);
+        try composeZoom(sw, zoom_arena.allocator(), &part, kept.items, z);
     }
     if (sw.num_addressed == 0) return null;
 
-    // 5. Frame a viewer on the data + metadata (VECTOR_LAYERS + the union SCAMIN ladder; the
-    //    composite carries no single-cell coverage).
+    // 5. Framing: VECTOR_LAYERS + union SCAMIN metadata (no single-cell coverage), bbox, center.
     const scamin_list = try scaminSorted(a, &scamins);
-    const meta = try scene.metadataJson(gpa, scamin_list, null);
-    defer gpa.free(meta);
+    const meta = try scene.metadataJson(gpa, scamin_list, null); // gpa-owned: survives `arena`
     const span_deg = @max(0.01, @as(f64, @floatFromInt(ubox[2] - ubox[0])) / 1e7);
     const cz: u8 = @intFromFloat(std.math.clamp(std.math.log2(720.0 / span_deg), @as(f64, @floatFromInt(minz)), @as(f64, @floatFromInt(maxz))));
-    return try sw.finishBytes(.{
-        .metadata_json = meta,
+    return .{ .meta = meta, .ubox = ubox, .center_zoom = cz, .cells = shims.items.len };
+}
+
+fn writeOpts(fr: Framing) engine.pmtiles.WriteOptions {
+    return .{
+        .metadata_json = fr.meta,
         .tile_type = .mlt,
-        .min_lon_e7 = ubox[0],
-        .min_lat_e7 = ubox[1],
-        .max_lon_e7 = ubox[2],
-        .max_lat_e7 = ubox[3],
-        .center_zoom = cz,
-    });
+        .min_lon_e7 = fr.ubox[0],
+        .min_lat_e7 = fr.ubox[1],
+        .max_lon_e7 = fr.ubox[2],
+        .max_lat_e7 = fr.ubox[3],
+        .center_zoom = fr.center_zoom,
+    };
+}
+
+/// Compose per-cell PMTiles archives (BORROWED — kept alive by the caller) into one merged
+/// PMTiles, returned as bytes (`gpa`-owned; free with `gpa.free` / `tile57_free`), or null if
+/// nothing composed. The partition is rebuilt from each archive's embedded coverage (no `.000`
+/// re-parse). IN-MEMORY: holds all archives + the composed output resident — for whole districts
+/// use `composeArchivesToFile` (mmap + streamed output).
+pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[]u8 {
+    const pmtiles = engine.pmtiles;
+    var ra = std.heap.ArenaAllocator.init(gpa);
+    defer ra.deinit();
+    const raa = ra.allocator();
+
+    var readers = std.ArrayList(*pmtiles.Reader).empty;
+    defer for (readers.items) |rp| rp.deinit();
+    for (archives) |arc| {
+        const rp = raa.create(pmtiles.Reader) catch continue;
+        rp.* = pmtiles.Reader.init(gpa, arc) catch continue;
+        readers.append(raa, rp) catch rp.deinit();
+    }
+    if (readers.items.len == 0) return null;
+
+    var sw = pmtiles.StreamWriter.init(gpa);
+    defer sw.deinit();
+    const fr = (try composeInto(gpa, &sw, readers.items)) orelse return null;
+    defer gpa.free(fr.meta);
+    return try sw.finishBytes(writeOpts(fr));
+}
+
+/// Streaming disk-to-disk compose: mmap each per-cell PMTiles at `paths` (so the OS pages tiles
+/// on demand — the whole cell set is never resident) and stream the merged archive to `out_path`
+/// (tile data to a temp file, then header/directories/metadata prepended). Peak memory is the
+/// partition + one zoom's composed tiles + the touched-page working set — independent of the
+/// number of cells. Returns the count of cells that contributed, or 0 if none. This is the path
+/// a whole-district composite takes.
+pub fn composeArchivesToFile(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, out_path: []const u8) !usize {
+    const pmtiles = engine.pmtiles;
+    var ra = std.heap.ArenaAllocator.init(gpa);
+    defer ra.deinit();
+    const raa = ra.allocator();
+
+    // mmap each cell (read-only, private). Close the fd right after mapping — the mapping
+    // survives it, and keeping hundreds of fds open would hit the process limit.
+    var readers = std.ArrayList(*pmtiles.Reader).empty;
+    var maps = std.ArrayList([]align(std.heap.page_size_min) const u8).empty;
+    defer {
+        for (readers.items) |rp| rp.deinit();
+        for (maps.items) |m| std.posix.munmap(m);
+    }
+    for (paths) |path| {
+        var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
+        const st = f.stat(io) catch {
+            f.close(io);
+            continue;
+        };
+        const len: usize = @intCast(st.size);
+        if (len == 0) {
+            f.close(io);
+            continue;
+        }
+        const map = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0) catch {
+            f.close(io);
+            continue;
+        };
+        f.close(io);
+        maps.append(raa, map) catch {
+            std.posix.munmap(map);
+            continue;
+        };
+        const rp = raa.create(pmtiles.Reader) catch continue;
+        rp.* = pmtiles.Reader.init(gpa, map) catch continue;
+        readers.append(raa, rp) catch rp.deinit();
+    }
+    if (readers.items.len == 0) return 0;
+
+    // Stream the composed tile data to a temp file; the header/dirs/metadata prefix is assembled
+    // last and written ahead of it (mirrors the streaming root bake).
+    const data_tmp = try std.fmt.allocPrint(raa, "{s}.data.tmp", .{out_path});
+    var data_file = try std.Io.Dir.cwd().createFile(io, data_tmp, .{ .read = true });
+    errdefer {
+        data_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
+    }
+    var sw = pmtiles.StreamWriter.initFile(gpa, io, data_file);
+    defer sw.deinit();
+
+    const fr = (try composeInto(gpa, &sw, readers.items)) orelse {
+        data_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
+        return 0;
+    };
+    defer gpa.free(fr.meta);
+
+    const pre = try sw.prefix(raa, writeOpts(fr));
+    var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    try out_file.writeStreamingAll(io, pre);
+    {
+        const chunk = try raa.alloc(u8, 1 << 20); // 1 MiB
+        var pos: u64 = 0;
+        while (pos < sw.data_len) {
+            const want: usize = @intCast(@min(@as(u64, chunk.len), sw.data_len - pos));
+            _ = try data_file.readPositionalAll(io, chunk[0..want], pos);
+            try out_file.writeStreamingAll(io, chunk[0..want]);
+            pos += want;
+        }
+    }
+    out_file.close(io);
+    data_file.close(io);
+    std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
+    return fr.cells;
 }
 
 /// Compose every tile of one zoom `z`: for each owning cell (the band governing `z`), fetch
@@ -2250,4 +2352,64 @@ test "composeArchives: a coarse owner overscales one fill-up zoom past its nativ
     try testing.expect(al.features.len >= 1);
     // The overscaled coastal fill covers the child tile interior.
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(tile.EXTENT, 2), @divTrunc(tile.EXTENT, 2)));
+}
+
+test "composeArchivesToFile: streams a seam split disk-to-disk" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tile = engine.tile;
+
+    // Same split as the in-memory seam test, but the per-cell archives go to disk, are mmap'd,
+    // and the composite streams back to a file.
+    const z: u8 = 13;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+    const w = tile.lonLatToWorld(-76.48, 38.97);
+    const tx = worldAxisToTile(w[0], scale);
+    const ty = worldAxisToTile(w[1], scale);
+    const bnds = tile.tileBoundsLonLat(z, tx, ty);
+    const lon0 = bnds[0];
+    const lat0 = bnds[1];
+    const lon1 = bnds[2];
+    const lat1 = bnds[3];
+    const midlon = (lon0 + lon1) / 2.0;
+    const dlat = (lat1 - lat0) * 0.01;
+
+    const arc_a = try synthCell(gpa, a, "AAAAAAAA", lon0, lat0 + dlat, midlon, lat1 - dlat, 20_000, z, tx, ty);
+    defer gpa.free(arc_a);
+    const arc_b = try synthCell(gpa, a, "BBBBBBBB", midlon, lat0 + dlat, lon1, lat1 - dlat, 20_000, z, tx, ty);
+    defer gpa.free(arc_b);
+
+    const dir = std.Io.Dir.cwd();
+    const pa = ".zig-cache/compose_stream_a.pmtiles.tmp";
+    const pb = ".zig-cache/compose_stream_b.pmtiles.tmp";
+    const po = ".zig-cache/compose_stream_out.pmtiles.tmp";
+    try dir.writeFile(io, .{ .sub_path = pa, .data = arc_a });
+    try dir.writeFile(io, .{ .sub_path = pb, .data = arc_b });
+    defer {
+        dir.deleteFile(io, pa) catch {};
+        dir.deleteFile(io, pb) catch {};
+        dir.deleteFile(io, po) catch {};
+    }
+
+    const nc = try composeArchivesToFile(io, gpa, &.{ pa, pb }, po);
+    try testing.expectEqual(@as(usize, 2), nc);
+
+    const bytes = try dir.readFileAlloc(io, po, a, .unlimited);
+    var r = try engine.pmtiles.Reader.init(gpa, bytes);
+    defer r.deinit();
+    try testing.expectEqual(engine.pmtiles.TileType.mlt, r.header.tile_type);
+    const raw = (try r.getTile(a, z, tx, ty)) orelse return error.TestUnexpectedResult;
+    const layers = try engine.mlt.decode(a, raw);
+    var areas: ?engine.mvt.DecodedLayer = null;
+    for (layers) |l| {
+        if (std.mem.eql(u8, l.name, "areas")) areas = l;
+    }
+    const al = areas orelse return error.TestUnexpectedResult;
+    const E = tile.EXTENT;
+    const midy: i64 = @divTrunc(E, 2);
+    try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(E, 4), midy));
+    try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(@as(i64, E) * 3, 4), midy));
 }

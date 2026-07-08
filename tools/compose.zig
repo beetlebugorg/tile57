@@ -1,14 +1,16 @@
-//! `compose <cell.000 | ENC_ROOT> -o <out.pmtiles> [--rules DIR]` — the per-cell composite
-//! bake. Bake each cell to its OWN native-scale PMTiles (with its M_COVR coverage embedded in
-//! the metadata), then combine them via the ownership partition into ONE merged PMTiles
-//! (bundle.composeArchives). This is the two-stage model that retires the streaming in-bake
-//! cross-cell combiner: dumb, cacheable per-cell bakes + a compositor driven by precomputed
-//! per-band ownership. Native scale only for now — cross-band zoom expansion is a later stage.
+//! `compose <cell.000 | ENC_ROOT> -o <out.pmtiles> [--rules DIR] [--keep-cells]` — the
+//! per-cell composite bake, disk-to-disk. Bake each cell to its OWN native-scale PMTiles (with
+//! its M_COVR coverage embedded in the metadata), written to a temp file so only ONE cell's
+//! archive is ever resident; then stream them through the ownership partition into one merged
+//! PMTiles (bundle.composeArchivesToFile mmaps the per-cell files, so the whole cell set is
+//! never loaded into memory at once). This is the two-stage model that retires the streaming
+//! in-bake cross-cell combiner. Native scale only for now — cross-band overscale one zoom past
+//! each band; deeper coarse-only zooms are left to the client camera + MapLibre overzoom.
 
 const std = @import("std");
 const engine = @import("engine");
 const chart = @import("chart"); // per-cell bake (bakeCellBytes) + freeBytes
-const bundle = @import("bundle"); // composeArchives (the partition-driven compositor)
+const bundle = @import("bundle"); // composeArchivesToFile (the partition-driven compositor)
 const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
@@ -18,6 +20,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var rules: ?[]const u8 = null;
+    var keep_cells = false; // retain the per-cell temp PMTiles (a reusable cache) instead of deleting
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -25,6 +28,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             out = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules = f.val(arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--keep-cells")) {
+            keep_cells = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -37,16 +42,11 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     const out_path = out orelse return usageErr("missing -o/--output <out.pmtiles>");
     const rules_dir = resolveRulesDir(rules);
 
-    // 1. Bake each cell to its own per-cell PMTiles (native band scale, coverage embedded).
-    //    Archive bytes are owned by chart's global allocator (free with chart.freeBytes).
-    var archives = std.ArrayList([]u8).empty;
-    defer {
-        for (archives.items) |arc| chart.freeBytes(arc);
-        archives.deinit(a);
-    }
-
+    // 1. Enumerate the cell .000 paths (dedup by stem — a boundary cell shared by two districts
+    //    bakes once).
+    var cell_paths = std.ArrayList([]const u8).empty;
     if (std.mem.endsWith(u8, base_path, ".000")) {
-        if (try chart.bakeCellBytes(base_path, rules_dir)) |arc| try archives.append(a, arc);
+        try cell_paths.append(a, base_path);
     } else {
         var dir = std.Io.Dir.cwd().openDir(io, base_path, .{ .iterate = true }) catch return usageErr("cannot open ENC_ROOT");
         defer dir.close(io);
@@ -56,28 +56,42 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         while (walker.next(io) catch null) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
             const stem = std.fs.path.stem(std.fs.path.basename(entry.path));
-            if (seen.contains(stem)) continue; // a boundary cell shared by two districts: once
+            if (seen.contains(stem)) continue;
             seen.put(a.dupe(u8, stem) catch continue, {}) catch {};
-            const full = std.fs.path.join(a, &.{ base_path, entry.path }) catch continue;
-            const arc = (chart.bakeCellBytes(full, rules_dir) catch |err| {
-                std.debug.print("  warn: bake of {s} failed ({s}); skipping\n", .{ stem, @errorName(err) });
-                continue;
-            }) orelse continue;
-            try archives.append(a, arc);
-            if (archives.items.len % 25 == 0) std.debug.print("  baked {d} cells…\n", .{archives.items.len});
+            cell_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
         }
     }
-    if (archives.items.len == 0) return usageErr("no cells baked (no .000 with M_COVR found)");
+    if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
 
-    // 2. Combine the per-cell archives via the ownership partition into one PMTiles.
-    const composed = (bundle.composeArchives(a, archives.items) catch |err| {
+    // 2. Bake each cell to its own temp PMTiles file (one cell resident at a time — the bytes
+    //    are freed as soon as they are written).
+    var tmp_paths = std.ArrayList([]const u8).empty;
+    defer if (!keep_cells) for (tmp_paths.items) |p| {
+        std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    };
+    for (cell_paths.items) |cp| {
+        const arc = (chart.bakeCellBytes(cp, rules_dir) catch |err| {
+            std.debug.print("  warn: bake of {s} failed ({s}); skipping\n", .{ cp, @errorName(err) });
+            continue;
+        }) orelse continue;
+        defer chart.freeBytes(arc);
+        const stem = std.fs.path.stem(std.fs.path.basename(cp));
+        const tmp = std.fmt.allocPrint(a, "{s}.{s}.cell.tmp", .{ out_path, stem }) catch continue;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = arc }) catch continue;
+        tmp_paths.append(a, tmp) catch {};
+        if (tmp_paths.items.len % 25 == 0) std.debug.print("  baked {d}/{d} cells…\n", .{ tmp_paths.items.len, cell_paths.items.len });
+    }
+    if (tmp_paths.items.len == 0) return usageErr("no cells baked (no .000 with M_COVR found)");
+
+    // 3. Stream-compose the per-cell files into one PMTiles (mmap in, streamed out — the cell
+    //    set is never all resident).
+    const nc = bundle.composeArchivesToFile(io, a, tmp_paths.items, out_path) catch |err| {
         std.debug.print("error: compose failed ({s})\n", .{@errorName(err)});
         return;
-    }) orelse {
+    };
+    if (nc == 0) {
         std.debug.print("compose produced no tiles\n", .{});
         return;
-    };
-
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = composed });
-    std.debug.print("composed {d} cell(s) -> {s} ({d} bytes)\n", .{ archives.items.len, out_path, composed.len });
+    }
+    std.debug.print("composed {d} cell(s) -> {s}{s}\n", .{ nc, out_path, if (keep_cells) " (per-cell temp files kept)" else "" });
 }
