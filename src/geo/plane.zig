@@ -124,6 +124,77 @@ pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     return out.toOwnedSlice(gpa);
 }
 
+fn polyBbox(rings: []const []const Pt) [4]i64 {
+    var b = [4]i64{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+    for (rings) |ring| for (ring) |p| {
+        b[0] = @min(b[0], p.x);
+        b[1] = @min(b[1], p.y);
+        b[2] = @max(b[2], p.x);
+        b[3] = @max(b[3], p.y);
+    };
+    return b;
+}
+
+fn bboxOverlap(a: [4]i64, b: [4]i64) bool {
+    return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3];
+}
+
+/// Identical result to `ownedAtTier`, built for scale. `ownedAtTier` accumulates a
+/// GLOBAL union of every finer cell and differences each cell against it — the
+/// operands grow to the whole nation, so it is O(cells²) in operand size (a
+/// national district takes seconds). Here each cell is differenced only against
+/// the finer eligible cells whose bounding box OVERLAPS it. A finer cell whose
+/// bbox is disjoint cannot remove any area, so the result is the same partition
+/// (cross-checked by the test below); charts overlap locally, so the per-cell
+/// subtrahend stays small. Use this variant for real ENC data.
+pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
+    var order = std.ArrayList(usize).empty;
+    defer order.deinit(gpa);
+    for (cells, 0..) |c, i| {
+        if (c.band_floor <= tier) try order.append(gpa, i);
+    }
+    std.mem.sort(usize, order.items, cells, struct {
+        fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
+            return finerLess({}, cs[ia], cs[ib]);
+        }
+    }.lt);
+
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    // Coverage + bbox per eligible cell (in finest→coarsest order), computed once.
+    const m = order.items.len;
+    const covs = try sa.alloc([][]Pt, m);
+    const bbs = try sa.alloc([4]i64, m);
+    for (order.items, 0..) |ci, k| {
+        covs[k] = try cellCoverage(sa, cells[ci]);
+        bbs[k] = polyBbox(covs[k]);
+    }
+
+    var out = std.ArrayList(OwnedCell).empty;
+    errdefer {
+        for (out.items) |c| boolean.freePolygon(gpa, c.owned);
+        out.deinit(gpa);
+    }
+
+    for (order.items, 0..) |ci, k| {
+        // owned = cov \ (∪ finer cells whose bbox overlaps this one).
+        var subtr = std.ArrayList(Poly).empty;
+        for (0..k) |j| {
+            if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(sa, covs[j]);
+        }
+        const owned = if (subtr.items.len == 0)
+            try dupePolygonGpa(gpa, covs[k])
+        else blk: {
+            const uni = try boolean.unionAll(sa, subtr.items);
+            break :blk try boolean.compute(gpa, covs[k], uni, .diff);
+        };
+        try out.append(gpa, .{ .index = ci, .owned = owned });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 fn dupePolygonGpa(gpa: Allocator, poly: Poly) ![][]Pt {
     const out = try gpa.alloc([]Pt, poly.len);
     errdefer gpa.free(out);
@@ -448,6 +519,45 @@ test "ownedAtTier: below-floor fine cell drops out of the pool (no blank window)
     try testing.expectEqual(@as(i32, 100_000), cells[t10[0].index].cscl);
     try testing.expect(boolean.pointInEvenOdd(t10[0].owned, 50, 50));
     try testing.expect(boolean.pointInEvenOdd(t10[0].owned, 10, 10));
+}
+
+test "ownedAtTierIndexed matches ownedAtTier (owner-at-point, overlap + adjacency)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A mix: coarse [0,100]² with a nested fine [40,60]² (vertical overlap), plus
+    // two same-cscl [0,50]² / [50,100]² halves that abut (horizontal adjacency).
+    const coarse = try boxPoly(a, 0, 0, 100, 100);
+    const fine = try boxPoly(a, 40, 40, 60, 60);
+    const west = try boxPoly(a, 0, 0, 50, 100);
+    const east = try boxPoly(a, 50, 0, 100, 100);
+    const cells = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coarse} },
+        .{ .cscl = 20_000, .band_floor = 9, .order = 0, .cov1 = &.{fine} },
+        .{ .cscl = 50_000, .band_floor = 9, .order = 0, .cov1 = &.{west} },
+        .{ .cscl = 50_000, .band_floor = 9, .order = 1, .cov1 = &.{east} },
+    };
+
+    const plain = try ownedAtTier(a, &cells, 9);
+    const idx = try ownedAtTierIndexed(a, &cells, 9);
+
+    const ownerAt = struct {
+        fn f(faces: []const OwnedCell, x: i64, y: i64) ?usize {
+            for (faces) |oc| if (boolean.pointInEvenOdd(oc.owned, x, y)) return oc.index;
+            return null;
+        }
+    }.f;
+
+    // Step 7 from 2 never lands on an edge (40/50/60/100), avoiding even-odd
+    // ambiguity; the two builders must name the same owner at every point.
+    var y: i64 = 2;
+    while (y < 100) : (y += 7) {
+        var x: i64 = 2;
+        while (x < 100) : (x += 7) {
+            try testing.expectEqual(ownerAt(plain, x, y), ownerAt(idx, x, y));
+        }
+    }
 }
 
 test "fuzz: partition == per-point finest-eligible-covering, zero overlap, zero gap" {
