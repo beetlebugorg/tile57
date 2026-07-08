@@ -22,6 +22,9 @@ pub const BandMap = struct {
     /// One face per cell owning ground at this band; `face.index` indexes
     /// `Partition.cells`. `gpa`-owned.
     faces: []plane.OwnedCell,
+    /// `n_cells`-long: global cell index → its slot in `faces`, or -1 if the cell
+    /// owns nothing at this band. Lets the compositor fetch a cell's face in O(1).
+    pos: []i32,
 };
 
 pub const Partition = struct {
@@ -34,7 +37,10 @@ pub const Partition = struct {
     maps: []BandMap,
 
     pub fn deinit(self: *Partition) void {
-        for (self.maps) |m| plane.freeOwned(self.gpa, m.faces);
+        for (self.maps) |m| {
+            plane.freeOwned(self.gpa, m.faces);
+            self.gpa.free(m.pos);
+        }
         self.gpa.free(self.maps);
         self.gpa.free(self.tiers);
     }
@@ -66,6 +72,18 @@ pub const Partition = struct {
         }
         return null;
     }
+
+    /// Cell `ci`'s owned face at the band governing zoom `z` — the rings (integer
+    /// lon/lat, degrees × 10⁷) of the ground it renders there, or null if it owns
+    /// nothing at that band. This is the region the compositor clips cell `ci`'s
+    /// features to before merging.
+    pub fn ownedFace(self: *const Partition, ci: usize, z: u8) ?[]const []const plane.Pt {
+        const m = self.mapForZoom(z) orelse return null;
+        if (ci >= m.pos.len) return null;
+        const slot = m.pos[ci];
+        if (slot < 0) return null;
+        return m.faces[@intCast(slot)].owned;
+    }
 };
 
 /// Build the per-band ownership stack over `cells` (borrowed). One indexed partition
@@ -89,9 +107,17 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
     const maps = try gpa.alloc(BandMap, tiers.len);
     errdefer gpa.free(maps);
     var built: usize = 0;
-    errdefer for (maps[0..built]) |m| plane.freeOwned(gpa, m.faces);
+    errdefer for (maps[0..built]) |m| {
+        plane.freeOwned(gpa, m.faces);
+        gpa.free(m.pos);
+    };
     for (tiers, 0..) |t, i| {
-        maps[i] = .{ .tier = t, .faces = try plane.ownedAtTierIndexed(gpa, cells, t) };
+        const faces = try plane.ownedAtTierIndexed(gpa, cells, t);
+        errdefer plane.freeOwned(gpa, faces);
+        const pos = try gpa.alloc(i32, cells.len);
+        @memset(pos, -1);
+        for (faces, 0..) |f, slot| pos[f.index] = @intCast(slot);
+        maps[i] = .{ .tier = t, .faces = faces, .pos = pos };
         built = i + 1;
     }
 
@@ -146,4 +172,13 @@ test "partition band-stack: tiers descending, mapForZoom + ownerAt resolve per b
     try testing.expectEqual(@as(?usize, 0), part.ownerAt(3, 50, 50));
     // Outside all coverage: a true gap.
     try testing.expectEqual(@as(?usize, null), part.ownerAt(14, 200, 200));
+
+    // ownedFace hands the compositor a cell's owned geometry to clip against.
+    const hf = part.ownedFace(1, 14) orelse return error.TestUnexpectedResult;
+    try testing.expect(boolean.pointInEvenOdd(hf, 50, 50)); // harbor owns its box
+    const cf = part.ownedFace(0, 14) orelse return error.TestUnexpectedResult;
+    try testing.expect(boolean.pointInEvenOdd(cf, 10, 10)); // coarse owns the surround
+    try testing.expect(!boolean.pointInEvenOdd(cf, 50, 50)); // ...but NOT the harbor hole
+    try testing.expect(part.ownedFace(1, 10) == null); // harbor below its floor: owns nothing
+    try testing.expect(part.ownedFace(99, 14) == null); // out of range
 }
