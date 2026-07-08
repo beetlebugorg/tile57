@@ -496,7 +496,8 @@ fn ringContains(ring: []const mvt.Point, pt: mvt.Point) bool {
 /// independent of the FSPT USAG tags, and keeps disjoint multi-part areas
 /// (multiple exteriors) working as a proper multipolygon. `rings` are the clipped
 /// rings (open, >= 3 pts); returned parts may reverse a ring into a fresh copy.
-fn orientAreaRings(a: Allocator, rings: []const []const mvt.Point) ![]const []const mvt.Point {
+/// Public so the ownership-partition debug bake gets the same MVT winding.
+pub fn orientAreaRings(a: Allocator, rings: []const []const mvt.Point) ![]const []const mvt.Point {
     const n = rings.len;
     const depth = try a.alloc(usize, n);
     for (rings, 0..) |ri, i| {

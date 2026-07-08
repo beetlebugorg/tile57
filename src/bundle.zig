@@ -521,6 +521,8 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
     //        points, take cscl/date/name. One entry per stem (dedup like bakeRoot).
     const Loaded = struct { cell: geo.plane.Cell, name: []const u8, date: []const u8 };
     var loaded = std.ArrayList(Loaded).empty;
+    // Union bbox (E7) so the archive header points a viewer at the data, not the world.
+    var ubox = [4]i32{ std.math.maxInt(i32), std.math.maxInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
     var seen = std.StringHashMap(void).init(a);
     var walker = try dir.walk(a);
     defer walker.deinit();
@@ -541,7 +543,13 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
             const rings = try a.alloc([]const geo.plane.Pt, feat.len);
             for (feat, 0..) |ring, ri| {
                 const pts = try a.alloc(geo.plane.Pt, ring.len);
-                for (ring, 0..) |p, pi| pts[pi] = .{ .x = p.lon_e7, .y = p.lat_e7 };
+                for (ring, 0..) |p, pi| {
+                    pts[pi] = .{ .x = p.lon_e7, .y = p.lat_e7 };
+                    ubox[0] = @min(ubox[0], p.lon_e7);
+                    ubox[1] = @min(ubox[1], p.lat_e7);
+                    ubox[2] = @max(ubox[2], p.lon_e7);
+                    ubox[3] = @max(ubox[3], p.lat_e7);
+                }
                 rings[ri] = pts;
             }
             cov1[fi] = rings;
@@ -622,9 +630,13 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
                         if (clipped.len >= 3) try parts.append(a, clipped);
                     }
                     if (parts.items.len == 0) continue;
+                    // Boolean rings have unspecified winding; MVT/MapLibre fills by
+                    // winding, so orient exteriors +area / holes -area (same authority
+                    // the real bake uses) or nothing renders.
+                    const oriented = try engine.scene.orientAreaRings(a, parts.items);
                     const gop = try tilemap.getOrPut(.{ .z = z, .x = tx, .y = ty });
                     if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(mvt.Feature).empty;
-                    try gop.value_ptr.append(a, .{ .geom_type = .polygon, .parts = try parts.toOwnedSlice(a), .properties = props });
+                    try gop.value_ptr.append(a, .{ .geom_type = .polygon, .parts = oriented, .properties = props });
                 }
             }
         }
@@ -638,9 +650,18 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
         const enc = try mvt.encode(a, .{ .layers = &layers });
         try inputs.append(a, .{ .z = kv.key_ptr.z, .x = kv.key_ptr.x, .y = kv.key_ptr.y, .mvt = enc });
     }
+    // Frame a viewer on the data (a zoom where the bbox is ~2 tiles wide), so it
+    // doesn't open at world scale where the district is an invisible speck.
+    const span_deg = @max(0.01, @as(f64, @floatFromInt(ubox[2] - ubox[0])) / 1e7);
+    const cz: u8 = @intFromFloat(std.math.clamp(std.math.log2(720.0 / span_deg), @as(f64, @floatFromInt(minzoom)), @as(f64, @floatFromInt(maxzoom))));
     const bytes = try engine.pmtiles.write(gpa, inputs.items, .{
         .metadata_json = "{\"name\":\"partition-debug\",\"description\":\"ownership partition faces (debug); layer=partition, props: cell,cscl,band,tier,oi,color\"}",
         .tile_type = .mvt,
+        .min_lon_e7 = ubox[0],
+        .min_lat_e7 = ubox[1],
+        .max_lon_e7 = ubox[2],
+        .max_lat_e7 = ubox[3],
+        .center_zoom = cz,
     });
     defer gpa.free(bytes);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });

@@ -366,6 +366,7 @@ pub const WriteOptions = struct {
     max_lon_e7: i32 = 1800000000,
     max_lat_e7: i32 = 850000000,
     tile_type: TileType = .mvt, // .mlt for MapLibre Tile output
+    center_zoom: ?u8 = null, // header center zoom; defaults to the archive's min zoom
 };
 
 /// Streaming archive writer: feed tiles one at a time (each gzipped + content-
@@ -500,7 +501,7 @@ pub const StreamWriter = struct {
             .min_lat_e7 = opts.min_lat_e7,
             .max_lon_e7 = opts.max_lon_e7,
             .max_lat_e7 = opts.max_lat_e7,
-            .center_zoom = min_z,
+            .center_zoom = opts.center_zoom orelse min_z,
             .center_lon_e7 = @divTrunc(opts.min_lon_e7 + opts.max_lon_e7, 2),
             .center_lat_e7 = @divTrunc(opts.min_lat_e7 + opts.max_lat_e7, 2),
         };
@@ -618,14 +619,14 @@ pub fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8
         .clustered = 1,
         .internal_compression = .none,
         .tile_compression = .gzip,
-        .tile_type = .mvt,
+        .tile_type = opts.tile_type,
         .min_zoom = min_z,
         .max_zoom = max_z,
         .min_lon_e7 = opts.min_lon_e7,
         .min_lat_e7 = opts.min_lat_e7,
         .max_lon_e7 = opts.max_lon_e7,
         .max_lat_e7 = opts.max_lat_e7,
-        .center_zoom = min_z,
+        .center_zoom = opts.center_zoom orelse min_z,
         .center_lon_e7 = @divTrunc(opts.min_lon_e7 + opts.max_lon_e7, 2),
         .center_lat_e7 = @divTrunc(opts.min_lat_e7 + opts.max_lat_e7, 2),
     };
