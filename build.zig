@@ -553,6 +553,14 @@ pub fn build(b: *std.Build) void {
     _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
     // Geometry core for the cross-band composition redesign (pure, std-only).
     _ = addPkgTest(b, test_step, "src/geo/geo.zig", target, optimize, &.{});
+    // De-risk probe for the per-cell composite ownership partition: runs the E7
+    // partition on a real ENC district (slivers / perf / float-oracle agreement).
+    // Its own step so it is isolated from `zig build test`; needs only s57+geo.
+    const partition_probe_step = b.step("partition-probe", "Run the ownership-partition de-risk probe on a real ENC district");
+    _ = addPkgTest(b, partition_probe_step, "src/scene/partition_adapt.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "geo", .module = geo_mod },
+    });
     // The render module: Surface contract + noop lifecycle smoke test (pins
     // the contract), resolver gates/colors, Canvas + RasterCanvas + PNG +
     // PixelSurface.
