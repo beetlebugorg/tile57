@@ -192,6 +192,48 @@ func BakeCell(path string) ([]byte, error) {
 	}
 }
 
+// Compose combines per-cell PMTiles archives (each from [BakeCell], coverage embedded)
+// into one merged PMTiles via the ownership partition: at every tile each owning cell's
+// features are clipped to the ground it owns and merged, with cross-band overscale one zoom
+// past each band. Native scale only otherwise — deeper coarse-only zooms are left to the
+// client camera + MapLibre overzoom. Returns the composed archive bytes.
+func Compose(archives [][]byte) ([]byte, error) {
+	if len(archives) == 0 {
+		return nil, fmt.Errorf("tile57: Compose needs at least one archive: %w", ErrEmptyInput)
+	}
+	// CGo-safe marshalling: concatenate the archives into one pointer-free buffer plus a
+	// lengths array, so C receives single pointers to memory holding no Go pointers.
+	lens := make([]C.size_t, len(archives))
+	total := 0
+	for i, a := range archives {
+		lens[i] = C.size_t(len(a))
+		total += len(a)
+	}
+	if total == 0 {
+		return nil, fmt.Errorf("tile57: Compose archives are all empty: %w", ErrEmptyInput)
+	}
+	blob := make([]byte, 0, total)
+	for _, a := range archives {
+		blob = append(blob, a...)
+	}
+
+	var out *C.uint8_t
+	var outLen C.size_t
+	rc := C.tile57_compose(
+		(*C.uint8_t)(unsafe.Pointer(&blob[0])), C.size_t(len(blob)),
+		(*C.size_t)(unsafe.Pointer(&lens[0])), C.size_t(len(archives)),
+		&out, &outLen,
+	)
+	switch rc {
+	case 1:
+		return tileBytes(out, outLen), nil
+	case 0:
+		return nil, fmt.Errorf("tile57: compose produced no tiles: %w", ErrNoCoverage)
+	default:
+		return nil, fmt.Errorf("tile57: compose failed")
+	}
+}
+
 // PMTilesMetadata returns a PMTiles archive's metadata JSON blob (decompressed), or
 // nil if the archive carries none. A [BakeCell] archive embeds the cell's coverage
 // under a "coverage" key. The pmtiles bytes are read but not retained.

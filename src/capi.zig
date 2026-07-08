@@ -107,6 +107,39 @@ export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, out: *[*]u8, out_len: *us
     return 0;
 }
 
+/// Combine N per-cell PMTiles archives (each from tile57_bake_cell_bytes, coverage
+/// embedded) into one merged PMTiles via the ownership partition. The archives are passed
+/// CONCATENATED in `blob` (total `blob_len` bytes), split by the `n` `lens`
+/// (sum(lens) == blob_len). Returns 1 with the composed archive in *out / *out_len (free
+/// with tile57_free), 0 if nothing composed, -1 on error. See tile57.h.
+export fn tile57_compose(
+    blob: ?[*]const u8,
+    blob_len: usize,
+    lens: ?[*]const usize,
+    n: usize,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const b = blob orelse return -1;
+    const ls = lens orelse return -1;
+    if (n == 0) return 0;
+    const archives = gpa.alloc([]const u8, n) catch return -1;
+    defer gpa.free(archives);
+    var off: usize = 0;
+    for (0..n) |i| {
+        if (off + ls[i] > blob_len) return -1; // lengths overrun the blob
+        archives[i] = b[off .. off + ls[i]];
+        off += ls[i];
+    }
+    const composed = bundle.composeArchives(gpa, archives) catch return -1;
+    if (composed) |c| {
+        out.* = c.ptr;
+        out_len.* = c.len;
+        return 1;
+    }
+    return 0;
+}
+
 /// The metadata JSON blob of a PMTiles archive (e.g. the embedded per-cell "coverage"
 /// a single-cell bake carries), into *out / *out_len (free with tile57_free). 1=ok,
 /// 0=no metadata, -1=error. See tile57.h.

@@ -102,6 +102,16 @@ tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t 
  * -1=error. */
 int tile57_bake_cell_bytes(const char *path, uint8_t **out, size_t *out_len);
 
+/* Combine N per-cell PMTiles (each from tile57_bake_cell_bytes, coverage embedded) into
+ * one merged PMTiles via the ownership partition: at every tile each owning cell's features
+ * are clipped to the ground it owns and merged, with cross-band overscale one zoom past each
+ * band. The archives are passed CONCATENATED in `blob` (blob_len bytes total), split by the
+ * `n` lengths in `lens` (their sum must equal blob_len). Returns 1 with the composed archive
+ * in *out / *out_len (free with tile57_free), 0 if nothing composed, -1 on error. */
+int tile57_compose(const uint8_t *blob, size_t blob_len,
+                   const size_t *lens, size_t n,
+                   uint8_t **out, size_t *out_len);
+
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +
  * cscl + date/name under a "coverage" key, so the composite stitcher rebuilds the
