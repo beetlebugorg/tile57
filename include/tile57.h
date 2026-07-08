@@ -214,6 +214,18 @@ int tile57_bake_bundle(const char *input, const char *out_dir,
                        const tile57_bake_opts *opts,
                        uint32_t *out_cell_count, double *out_bbox);
 
+/* Bake the ownership-partition DEBUG tiles from an ENC_ROOT (on-disk path) into a
+ * single PMTiles at out_path: the composited ownership faces (which cell renders which
+ * ground at each band), one polygon per owning cell tagged with the properties
+ * cell/cscl/band/tier/oi/color, and NO portrayed chart content — for building a
+ * partition-debug UI. band < 0 emits the band GOVERNING each zoom (the natural view);
+ * 0..5 (berthing..overview) emits one band's own map at every zoom. minzoom/maxzoom
+ * bound the tiles (harbor-level detail needs maxzoom >= 13; coarser bands are much
+ * cheaper). out_cell_count is optional. Returns 1=ok, 0=nothing covered, -1=error. */
+int tile57_bake_partition_debug(const char *enc_root, const char *out_path,
+                                uint8_t minzoom, uint8_t maxzoom, int8_t band,
+                                uint32_t *out_cell_count);
+
 /* All portrayal assets in memory (the same files bake_bundle writes to disk), from the
  * library's embedded catalogue (catalog_dir NULL/"") or an on-disk one. Pairs with
  * tile57_bake_pmtiles + tile57_build_style for a full in-memory bundle. Returns 1 with

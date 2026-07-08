@@ -349,6 +349,31 @@ export fn tile57_bake_bundle(
     return 1;
 }
 
+/// Bake the ownership-partition DEBUG tiles from an ENC_ROOT (on-disk path) into a
+/// single PMTiles at out_path: the composited faces (which cell renders which ground
+/// at each band), tagged cell/cscl/band/tier/oi/color, NO portrayed content — for a
+/// partition-debug UI. `band` < 0 = the band governing each zoom (the natural view);
+/// 0..5 (berthing..overview) = one band's own map at every zoom. out_cell_count is
+/// optional. 1=ok, 0=nothing covered (no M_COVR), -1=error. See tile57.h.
+export fn tile57_bake_partition_debug(
+    enc_root: [*:0]const u8,
+    out_path: [*:0]const u8,
+    minzoom: u8,
+    maxzoom: u8,
+    band: i8,
+    out_cell_count: ?*u32,
+) callconv(.c) c_int {
+    // The debug bake does filesystem I/O (read ENC_ROOT, write the pmtiles); the lib
+    // has no std.process.Init, so stand up a threaded std.Io for the call. It streams
+    // internally (StreamWriter over gpa), so pass the real gpa, not a scratch arena.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const nc = bundle.bakePartitionDebug(io, gpa, std.mem.span(enc_root), std.mem.span(out_path), minzoom, maxzoom, band) catch |err| return if (err == error.NoGeometry) 0 else -1;
+    if (out_cell_count) |p| p.* = @intCast(nc);
+    return 1;
+}
+
 /// Release a chart and all cached tiles. See tile57.h.
 export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {
     if (handle) |s| s.deinit();
