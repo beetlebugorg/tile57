@@ -570,6 +570,11 @@ pub fn build(b: *std.Build) void {
     const compose_step = b.step("compose-test", "Run the compose-core (clip-to-face) tests");
     _ = addPkgTest(b, compose_step, "src/scene/compose.zig", target, optimize, &compose_deps);
     _ = addPkgTest(b, test_step, "src/scene/compose.zig", target, optimize, &compose_deps);
+    // Per-cell coverage sidecar (JSON round-trip carried in PMTiles metadata): pure
+    // over s57 + std.json. Part of the main suite.
+    _ = addPkgTest(b, test_step, "src/scene/coverage.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+    });
     // The render module: Surface contract + noop lifecycle smoke test (pins
     // the contract), resolver gates/colors, Canvas + RasterCanvas + PNG +
     // PixelSurface.
