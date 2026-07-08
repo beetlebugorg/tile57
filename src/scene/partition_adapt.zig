@@ -218,10 +218,13 @@ test "PROBE: ownership partition on a real ENC district (slivers, perf, oracle)"
         n_elig += 1;
     };
 
-    // --- BUILD (timed). Naive global-union kernel: no bbox reject, no prune.
+    // --- BUILD both, timed: naive global-union kernel vs the bbox-indexed one.
     const t0 = std.Io.Clock.now(.awake, io);
-    const faces = try plane.ownedAtTier(a, cells, PROBE_TIER);
-    const build_ms: f64 = @as(f64, @floatFromInt((std.Io.Clock.now(.awake, io).nanoseconds - t0.nanoseconds))) / 1e6;
+    const faces_naive = try plane.ownedAtTier(a, cells, PROBE_TIER);
+    const naive_ms: f64 = @as(f64, @floatFromInt((std.Io.Clock.now(.awake, io).nanoseconds - t0.nanoseconds))) / 1e6;
+    const t1 = std.Io.Clock.now(.awake, io);
+    const faces = try plane.ownedAtTierIndexed(a, cells, PROBE_TIER);
+    const idx_ms: f64 = @as(f64, @floatFromInt((std.Io.Clock.now(.awake, io).nanoseconds - t1.nanoseconds))) / 1e6;
 
     // --- SLIVER check: Σ(face area) vs area(union of all eligible coverage).
     var sum_faces: f64 = 0;
@@ -264,6 +267,7 @@ test "PROBE: ownership partition on a real ENC district (slivers, perf, oracle)"
     var mismatch_same_scale: usize = 0; // seam tiebreak / edge-proximity (benign)
     var mismatch_diff_scale: usize = 0; // real overlap-resolution divergence
     var part_gap_oracle_owns: usize = 0; // oracle owns, partition says gap
+    var builder_disagree: usize = 0; // indexed builder owner != naive builder owner
     var gy: usize = 0;
     while (gy < GRID) : (gy += 1) {
         var gx: usize = 0;
@@ -273,7 +277,7 @@ test "PROBE: ownership partition on a real ENC district (slivers, perf, oracle)"
             const xe: i64 = @intFromFloat(@round(lon * 1e7));
             const ye: i64 = @intFromFloat(@round(lat * 1e7));
 
-            // Partition owner (integer): faces containing the point.
+            // Partition owner (integer): indexed faces containing the point.
             var pj_owner: ?usize = null;
             var pj_count: usize = 0;
             for (faces) |f| {
@@ -282,6 +286,13 @@ test "PROBE: ownership partition on a real ENC district (slivers, perf, oracle)"
                     pj_owner = f.index;
                 }
             }
+            // Naive-builder owner at the same point, to prove indexed == naive on
+            // real data (the unit test only covers synthetic cells).
+            var naive_owner: ?usize = null;
+            for (faces_naive) |f| {
+                if (boolean.pointInEvenOdd(f.owned, xe, ye)) naive_owner = f.index;
+            }
+            if (pj_owner != naive_owner) builder_disagree += 1;
             // Oracle owner (float): finest eligible covering cell, broken by the
             // SAME (cscl, then DSID order) rule the partition uses — so a same-scale
             // adjacency seam is not a spurious mismatch, isolating true divergence.
@@ -322,7 +333,8 @@ test "PROBE: ownership partition on a real ENC district (slivers, perf, oracle)"
         \\========== ownership-partition PROBE ({s}) ==========
         \\ cells loaded ....... {d}   eligible@z{d} ... {d}
         \\ faces (owners) ..... {d}
-        \\ BUILD (naive kernel)  {d:.1} ms   ({d:.2} ms/eligible-cell)
+        \\ BUILD  naive {d:.1} ms    indexed {d:.1} ms    (speedup {d:.1}x)
+        \\ builder cross-check  {d} disagreements (indexed vs naive owner; MUST be 0)
         \\ SLIVER check:
         \\   Σ face area ...... {e:.3}
         \\   union area ....... {e:.3}
@@ -337,7 +349,8 @@ test "PROBE: ownership partition on a real ENC district (slivers, perf, oracle)"
         \\
     , .{
         root,       n,          PROBE_TIER,          n_elig,
-        faces.len,  build_ms,   build_ms / @as(f64, @floatFromInt(@max(1, n_elig))),
+        faces.len,  naive_ms,   idx_ms,              naive_ms / @max(0.001, idx_ms),
+        builder_disagree,
         sum_faces,  union_area, conservation,        symdiff_ppm,
         samples,    matches,    mismatches,          mismatch_same_scale,
         mismatch_diff_scale,    overlaps,            part_gap_oracle_owns,
@@ -350,5 +363,6 @@ test "PROBE: ownership partition on a real ENC district (slivers, perf, oracle)"
     // tiny fraction of a percent.
     try testing.expectEqual(@as(usize, 0), overlaps);
     try testing.expectEqual(@as(usize, 0), part_gap_oracle_owns);
+    try testing.expectEqual(@as(usize, 0), builder_disagree); // indexed == naive on real data
     try testing.expect(symdiff_ppm < 100.0); // < 0.01% of union area
 }
