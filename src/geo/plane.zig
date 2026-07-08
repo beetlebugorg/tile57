@@ -1,6 +1,6 @@
-//! Coverage-clipped best-available partition — the Stage-0 planar partition of
-//! the cross-band composition redesign (specs/cross-band-composition-redesign.md,
-//! Phase 0). "The finest cell whose M_COVR(CATCOV=1) covers a point owns that
+//! Coverage-clipped best-available partition — the first-stage planar partition of
+//! the cross-band chart composition. "The finest cell whose M_COVR(CATCOV=1) covers
+//! a point owns that
 //! ground; every other cell is clipped away there." This module turns a set of
 //! ENC cells (each carrying a compilation scale, a band-eligibility floor, and
 //! coverage rings) into, per **zoom tier**, one `owned` region per cell — a
@@ -12,9 +12,9 @@
 //! basin owned by a below-floor fine cell (the HOLES blocker); recomputing per
 //! distinct floor (≤6 tiers) closes it geometrically.
 //!
-//! Everything runs on the E7 integer lattice via `boolean.Pt` (i64) — coverage
-//! coordinates are `round(deg·1e7)`, so seams that adjacent cells digitised
-//! independently collapse to exact integer equality before any boolean runs.
+//! Everything runs on integer coordinates via `boolean.Pt` (i64): coverage is
+//! stored as degrees × 10⁷, so seams that adjacent cells digitised independently
+//! round to the same integers before any boolean runs.
 //! All set algebra goes through `boolean` (Martinez, overlap-typed, deterministic).
 //!
 //! Phase 0 scope: this computes and validates the partition, the tile classifier
@@ -32,7 +32,8 @@ pub const Pt = boolean.Pt;
 /// A polygon: a set of even-odd rings (exterior + holes). One M_COVR feature.
 pub const Poly = boolean.Polygon;
 
-/// One ENC cell as the partition sees it. Coverage is already on the E7 lattice.
+/// One ENC cell as the partition sees it. Coverage is already in integer
+/// coordinates (degrees × 10⁷).
 /// `cov1`/`cov2` are bags of features that may mutually overlap — they are
 /// `unionAll`-cleaned into one simple region before use.
 pub const Cell = struct {
@@ -594,7 +595,7 @@ fn clipCellToBox(a: Allocator, cell: Cell, box: Box) !Cell {
     };
 }
 
-test "quadrant-split Stage 0 stitches to the same partition (shared E7 lattice)" {
+test "quadrant-split partition stitches to the same result (shared integer grid)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -602,7 +603,7 @@ test "quadrant-split Stage 0 stitches to the same partition (shared E7 lattice)"
     var prng = std.Random.DefaultPrng.init(0x9042BEEF);
     const rnd = prng.random();
     const grid: i64 = 64;
-    // Split seam on the E7 lattice; cell coords are grid multiples so coverage
+    // Split seam on the integer grid; cell coords are grid multiples so coverage
     // edges meeting the seam collapse to exact equality.
     const sx: i64 = 0;
     const sy: i64 = 0;

@@ -1,26 +1,25 @@
 //! Integer polygon boolean operations — a Martinez–Rueda–Feito sweep-line.
 //!
-//! This is the geometry core of the cross-band composition redesign
-//! (specs/cross-band-composition-redesign.md, Phase 0). It computes the
-//! union / intersection / difference / symmetric-difference of two polygons
-//! whose vertices live on an integer lattice (the E7 coverage lattice for the
-//! Stage-0 partition, or world-pixel space for per-tile emission). Integers are
-//! deliberate: adjacent ENC cells that digitise a shared seam independently
-//! collapse to *exact* integer equality once snapped to the lattice, so the
-//! dominant seam case is a run of coincident edges rather than a cloud of
+//! This is the geometry core of the cross-band chart composition. It computes the
+//! union / intersection / difference / symmetric-difference of two polygons whose
+//! vertices are integers (coverage in degrees × 10⁷ for the partition, or
+//! world-pixel space for per-tile emission). Integers are deliberate: adjacent ENC
+//! cells that digitise a shared seam independently round to the *same* integers, so
+//! the dominant seam case is a run of coincident edges rather than a cloud of
 //! near-misses. The sweep types those coincident (overlapping) edges
 //! (SAME_TRANSITION / DIFFERENT_TRANSITION / NON_CONTRIBUTING) so a shared seam
 //! contributes to the result exactly once.
 //!
 //! Coordinate discipline:
-//!   * `Pt` holds i64. E7 degrees are ±1.8e9 (fit i32), but *differences* reach
-//!     3.6e9 (need i64) and orientation cross-products reach ~1.3e19 (overflow
-//!     i64) — every orientation / area predicate therefore promotes to i128.
+//!   * `Pt` holds i64. Coverage coordinates (degrees × 10⁷) are ±1.8e9 (fit i32),
+//!     but *differences* reach 3.6e9 (need i64) and orientation cross-products
+//!     reach ~1.3e19 (overflow i64) — every orientation / area predicate therefore
+//!     promotes to i128.
 //!   * A proper crossing point is rational; it is computed from exact i128
-//!     numerators in f64 and rounded to the nearest lattice point. Both sides of
+//!     numerators in f64 and rounded to the nearest integer point. Both sides of
 //!     a seam compute the same crossing from the same integer endpoints, so the
-//!     snap is deterministic (bake == live) and the ≤0.5-unit error is ~0.5 cm
-//!     at E7. Collinear-overlap endpoints are real input vertices, so they are
+//!     snap is deterministic (bake == live) and the ≤0.5-unit error is ~0.5 cm.
+//!     Collinear-overlap endpoints are real input vertices, so they are
 //!     reproduced exactly.
 //!
 //! Determinism: the event order and the sweep-status order share one strict
@@ -36,7 +35,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// A lattice point. i64 holds any E7 or world-pixel coordinate with headroom.
+/// A point. i64 holds any coordinate (degrees × 10⁷, or world pixels) with headroom.
 pub const Pt = struct {
     x: i64,
     y: i64,
@@ -152,14 +151,14 @@ fn segBelow(e1: *SweepEvent, e2: *SweepEvent) bool {
 /// `p0`), or 2 (a collinear overlap spanning [`p0`,`p1`]).
 pub const Inter = struct { n: u2, p0: Pt, p1: Pt };
 
-/// Intersect segment a0→a1 with b0→b1 on the integer lattice. Public so the
+/// Intersect segment a0→a1 with b0→b1 on integer coordinates. Public so the
 /// coverage clip (plane.zig) can reuse the exact classification + snapped point.
 pub fn segIntersect(a0: Pt, a1: Pt, b0: Pt, b1: Pt) Inter {
     return findIntersection(a0, a1, b0, b1);
 }
 
 inline fn roundDiv(a: Pt, num: i128, den: i128, d: Pt) Pt {
-    // a + (num/den)*d, rounded to nearest lattice point. den != 0.
+    // a + (num/den)*d, rounded to the nearest integer point. den != 0.
     const t = @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
     const rx = @round(@as(f64, @floatFromInt(a.x)) + t * @as(f64, @floatFromInt(d.x)));
     const ry = @round(@as(f64, @floatFromInt(a.y)) + t * @as(f64, @floatFromInt(d.y)));
