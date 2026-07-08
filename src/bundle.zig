@@ -869,13 +869,18 @@ pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[
     }
 
     // 4. Stream: one governing band per zoom (partition.mapForZoom), scatter each owner's
-    //    native tiles, clip to its owned face, merge per layer, re-encode.
+    //    native tiles, clip to its owned face, merge per layer, re-encode. The loop runs one
+    //    fill-up zoom past the deepest native band (bounded by FILLUP_CEIL) so a coarser owner's
+    //    ground stays covered just past its band (overscale); deeper coarse-only zooms are left
+    //    to the client camera + MapLibre overzoom.
+    const fill_max = @min(maxz + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);
+    const loop_max = @max(maxz, fill_max);
     var sw = pmtiles.StreamWriter.init(gpa);
     defer sw.deinit();
     var zoom_arena = std.heap.ArenaAllocator.init(gpa); // one zoom's tiles resident at a time
     defer zoom_arena.deinit();
     var z: u8 = minz;
-    while (z <= maxz) : (z += 1) {
+    while (z <= loop_max) : (z += 1) {
         _ = zoom_arena.reset(.retain_capacity);
         try composeZoom(&sw, zoom_arena.allocator(), &part, readers[0..n], z);
     }
@@ -925,6 +930,7 @@ fn composeZoom(
     for (map.faces) |face| {
         if (face.owned.len == 0) continue;
         const ci = face.index;
+        const cscl = part.cells[ci].cscl;
 
         // Tile cover of this owner's face bbox (lon/lat → world → tile index), nw..se.
         var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
@@ -947,12 +953,13 @@ fn composeZoom(
         while (tx <= tx1) : (tx += 1) {
             var ty = ty0;
             while (ty <= ty1) : (ty += 1) {
-                // The cell's per-cell baked tile at (z,tx,ty) — absent outside its native band.
-                const raw = (try readers[ci].getTile(sa, z, tx, ty)) orelse continue;
+                // The cell's tile content at (z,tx,ty): its native tile, or — one fill-up zoom
+                // past its band — its deepest native ancestor scaled up (overscale). null =
+                // nothing reachable here.
+                const layers = (try ownerTile(sa, readers[ci], cscl, z, tx, ty)) orelse continue;
                 // Project the owned face into THIS tile; empty = the cell owns no pixels here.
                 const face_px = try compose.projectFace(sa, face.owned, z, tx, ty);
                 if (face_px.len == 0) continue;
-                const layers = try decodeTile(sa, readers[ci].header.tile_type, raw);
 
                 const gop = try tilemap.getOrPut(.{ .x = tx, .y = ty });
                 if (!gop.found_existing) for (gop.value_ptr) |*b| {
@@ -997,6 +1004,41 @@ fn decodeTile(a: std.mem.Allocator, tt: engine.pmtiles.TileType, raw: []const u8
     return switch (tt) {
         .mlt => engine.mlt.decode(a, raw),
         else => engine.mvt.decode(a, raw),
+    };
+}
+
+// The decoded layers cell `r` contributes at (z,tx,ty): its native tile if it has one, else —
+// when z is within the fill-up window just past the cell's band native max — its deepest native
+// ancestor tile with the features scaled up into this descendant (overscale). null = nothing
+// reachable (below native, or a coarse-only zoom beyond the fill-up window, where the client
+// camera + MapLibre overzoom take over). Everything is arena-allocated in `a`.
+fn ownerTile(a: std.mem.Allocator, r: *engine.pmtiles.Reader, cscl: i32, z: u8, tx: u32, ty: u32) !?[]engine.mvt.DecodedLayer {
+    const tt = r.header.tile_type;
+    if (try r.getTile(a, z, tx, ty)) |raw| return try decodeTile(a, tt, raw);
+
+    const nmax = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cscl)).max;
+    if (z <= nmax or z > nmax + engine.bake_enc.FILLUP_DZ or z > engine.bake_enc.FILLUP_CEIL) return null;
+    const shift: u5 = @intCast(z - nmax);
+    const anc = (try r.getTile(a, nmax, tx >> shift, ty >> shift)) orelse return null;
+    const layers = try decodeTile(a, tt, anc);
+    scaleUpTile(layers, shift, tx, ty);
+    return layers;
+}
+
+// Scale an ancestor tile's features up into descendant (tx,ty) — the sub-cell `shift` levels
+// finer: pixel (px,py) → (px<<shift − sx·EXTENT, py<<shift − sy·EXTENT), where (sx,sy) is the
+// descendant's position in the ancestor's 2^shift grid. Out-of-sub-cell geometry lands outside
+// the tile box and is dropped by the later clip-to-owned-face. In place; `shift` is bounded by
+// FILLUP_DZ so the scaled coordinates stay within i32.
+fn scaleUpTile(layers: []engine.mvt.DecodedLayer, shift: u5, tx: u32, ty: u32) void {
+    const E: i64 = engine.tile.EXTENT;
+    const scale: i64 = @as(i64, 1) << @as(u6, shift);
+    const mask: u32 = (@as(u32, 1) << shift) - 1;
+    const sx: i64 = @intCast(tx & mask);
+    const sy: i64 = @intCast(ty & mask);
+    for (layers) |layer| for (layer.features) |feat| for (feat.parts) |part| for (part) |*p| {
+        p.x = @intCast(@as(i64, p.x) * scale - sx * E);
+        p.y = @intCast(@as(i64, p.y) * scale - sy * E);
     };
 }
 
@@ -2170,4 +2212,42 @@ test "composeArchives: two abutting cells split a shared tile at the seam, no do
     // (disjoint partition — the seam split the tile, it did not double-draw it).
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(E, 4), midy));
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(@as(i64, E) * 3, 4), midy));
+}
+
+test "composeArchives: a coarse owner overscales one fill-up zoom past its native band" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tile = engine.tile;
+
+    // A coastal cell (cscl 300000 → coastal, native z9-11) with a single tile at its native
+    // MAX z11. Composing it alone must still yield a z12 tile (one fill-up zoom past z11),
+    // overscaled from the z11 tile — the cross-band-down gap the compositor fills.
+    const z: u8 = 11;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+    const w = tile.lonLatToWorld(-76.3, 38.5);
+    const tx = worldAxisToTile(w[0], scale);
+    const ty = worldAxisToTile(w[1], scale);
+    const b = tile.tileBoundsLonLat(z, tx, ty);
+    const arc = try synthCell(gpa, a, "COAST001", b[0], b[1], b[2], b[3], 300_000, z, tx, ty);
+    defer gpa.free(arc);
+
+    const composed = (try composeArchives(gpa, &.{arc})) orelse return error.TestUnexpectedResult;
+    defer gpa.free(composed);
+
+    var r = try engine.pmtiles.Reader.init(gpa, composed);
+    defer r.deinit();
+    // Native z11 present, and its NW z12 child materialised by overscale.
+    try testing.expect((try r.getTile(a, z, tx, ty)) != null);
+    const child = (try r.getTile(a, z + 1, tx * 2, ty * 2)) orelse return error.TestUnexpectedResult;
+    const layers = try engine.mlt.decode(a, child);
+    var areas: ?engine.mvt.DecodedLayer = null;
+    for (layers) |l| {
+        if (std.mem.eql(u8, l.name, "areas")) areas = l;
+    }
+    const al = areas orelse return error.TestUnexpectedResult;
+    try testing.expect(al.features.len >= 1);
+    // The overscaled coastal fill covers the child tile interior.
+    try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(tile.EXTENT, 2), @divTrunc(tile.EXTENT, 2)));
 }
