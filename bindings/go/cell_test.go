@@ -16,7 +16,7 @@ func TestBakeCellEmbedsCoverage(t *testing.T) {
 		t.Skipf("no test cell %s: %v", testCell, err)
 	}
 
-	pm, err := BakeCell(testCell, 0, 16)
+	pm, err := BakeCell(testCell)
 	if err != nil {
 		t.Fatalf("BakeCell: %v", err)
 	}

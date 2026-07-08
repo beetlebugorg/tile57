@@ -591,14 +591,16 @@ pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) 
     return openCellBaked(path, rules_dir, pick_attrs, 0, 18);
 }
 
-/// Bake a SINGLE .000 cell (+ updates) to a PMTiles archive in [minzoom, maxzoom] and
-/// return the bytes (gpa-owned; free with tile57_free). For a host to persist a
-/// per-cell tile cache to disk so the (slow) bake is one-time. null = nothing baked.
+/// Bake a SINGLE .000 cell (+ updates) to a PMTiles archive over its NATIVE band's
+/// zoom range (`bandZooms(bandOf(cscl))`) and nothing else — the composite model bakes
+/// each cell at its own compilation scale; the stitcher combines them and handles any
+/// cross-band zoom expansion. Returns the bytes (gpa-owned; free with tile57_free).
+/// null = nothing baked.
 ///
 /// The archive metadata embeds the cell's own coverage (M_COVR + cscl + date/name),
 /// so the composite stitcher rebuilds the ownership partition from the baked archives
 /// without re-parsing the .000. Read it back with `cellCoverageFromArchive`.
-pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8, minzoom: u8, maxzoom: u8) !?[]u8 {
+pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     var cf = try readCellFiles(cell_path);
     defer cf.deinit();
 
@@ -607,17 +609,21 @@ pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8, minzoom: u8,
     var cov_arena = std.heap.ArenaAllocator.init(gpa);
     defer cov_arena.deinit();
     var coverage_json: ?[]const u8 = null;
+    var cscl: i32 = s57.peekScale(gpa, cf.base) orelse 0;
     if (s57.parseCellWithUpdates(gpa, cf.base, cf.updates)) |parsed| {
         var cell = parsed;
         defer cell.deinit();
+        cscl = cell.params.cscl;
         const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
-        const band: u8 = @intFromEnum(bake_enc.bandOf(cell.params.cscl));
+        const band: u8 = @intFromEnum(bake_enc.bandOf(cscl));
         const cc = scene.coverage.fromCell(cov_arena.allocator(), &cell, stem, band);
         coverage_json = scene.coverage.encodeJson(cov_arena.allocator(), cc) catch null;
     } else |_| {}
 
+    // Native scale only: the cell's band window, no fill-down / overscale.
+    const zr = bake_enc.bandZooms(bake_enc.bandOf(cscl));
     const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
-    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, true, null, null, coverage_json);
+    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), zr.min, zr.max, .mlt, true, null, null, coverage_json);
 }
 
 /// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null

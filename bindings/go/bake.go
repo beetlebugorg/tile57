@@ -168,11 +168,11 @@ func BakeBundle(input, outDir string, opts BakeOpts, progress func(BakeProgress)
 }
 
 // BakeCell bakes ONE on-disk cell (a .000 path + its .001.. updates) to a PMTiles
-// archive over [minZoom, maxZoom] and returns the bytes — the per-cell tile store the
-// composite stitcher consumes. The archive metadata embeds that cell's own coverage
-// (M_COVR + cscl + date/name); read it back with [PMTilesMetadata]. minZoom/maxZoom
-// 0/0 bakes the engine default range.
-func BakeCell(path string, minZoom, maxZoom uint8) ([]byte, error) {
+// archive over its NATIVE band zoom range and returns the bytes — the per-cell tile
+// store the composite stitcher consumes (the stitcher handles any cross-band zoom
+// expansion). The archive metadata embeds that cell's own coverage (M_COVR + cscl +
+// date/name); read it back with [PMTilesMetadata].
+func BakeCell(path string) ([]byte, error) {
 	if path == "" {
 		return nil, fmt.Errorf("tile57: BakeCell needs a cell path: %w", ErrEmptyInput)
 	}
@@ -181,7 +181,7 @@ func BakeCell(path string, minZoom, maxZoom uint8) ([]byte, error) {
 
 	var out *C.uint8_t
 	var outLen C.size_t
-	rc := C.tile57_bake_cell_bytes(cPath, C.uint8_t(minZoom), C.uint8_t(maxZoom), &out, &outLen)
+	rc := C.tile57_bake_cell_bytes(cPath, &out, &outLen)
 	switch rc {
 	case 1:
 		return tileBytes(out, outLen), nil

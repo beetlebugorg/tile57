@@ -93,12 +93,12 @@ export fn tile57_chart_open_zoom(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8)
     return chart.openCellBaked(p, null, true, minzoom, maxzoom) catch null;
 }
 
-/// Bake ONE cell (+ its updates, read from disk) to PMTiles bytes in [minzoom,
-/// maxzoom], into *out / *out_len (free with tile57_free). For persisting a per-cell
+/// Bake ONE cell (+ its updates, read from disk) to PMTiles bytes over its NATIVE band
+/// zoom range, into *out / *out_len (free with tile57_free). For persisting a per-cell
 /// tile cache to disk. 1=ok, 0=nothing baked, -1=error. See tile57.h.
-export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
     const p = spanOpt(path) orelse return -1;
-    const archive = chart.bakeCellBytes(p, null, minzoom, maxzoom) catch return -1;
+    const archive = chart.bakeCellBytes(p, null) catch return -1;
     if (archive) |a| {
         out.* = a.ptr;
         out_len.* = a.len;

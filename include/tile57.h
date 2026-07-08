@@ -93,12 +93,14 @@ tile57_chart *tile57_chart_open_header(const char *path);
  * (progressive load). Renders via the fast reader path. NULL/failure -> NULL. */
 tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t maxzoom);
 
-/* Bake ONE cell (+ its .001.. updates, read from disk) to PMTiles bytes in
- * [minzoom, maxzoom], returned in *out / *out_len (free with tile57_free). For a host
- * to persist a per-cell tile cache to disk so the slow bake is one-time — then reopen
- * the written file with tile57_chart_open_pmtiles. 1=ok, 0=nothing baked, -1=error. */
-int tile57_bake_cell_bytes(const char *path, uint8_t minzoom, uint8_t maxzoom,
-                           uint8_t **out, size_t *out_len);
+/* Bake ONE cell (+ its .001.. updates, read from disk) to PMTiles bytes over its
+ * NATIVE band zoom range and nothing else — the composite model bakes each cell at its
+ * own compilation scale; the stitcher combines them and handles any cross-band zoom.
+ * Returned in *out / *out_len (free with tile57_free). For a host to persist a per-cell
+ * tile cache to disk — then reopen with tile57_chart_open_pmtiles. The metadata embeds
+ * the cell's coverage (read via tile57_pmtiles_metadata). 1=ok, 0=nothing baked,
+ * -1=error. */
+int tile57_bake_cell_bytes(const char *path, uint8_t **out, size_t *out_len);
 
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +
