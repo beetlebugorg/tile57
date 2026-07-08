@@ -570,6 +570,25 @@ pub fn build(b: *std.Build) void {
     const compose_step = b.step("compose-test", "Run the compose-core (clip-to-face) tests");
     _ = addPkgTest(b, compose_step, "src/scene/compose.zig", target, optimize, &compose_deps);
     _ = addPkgTest(b, test_step, "src/scene/compose.zig", target, optimize, &compose_deps);
+
+    // The chart-bundle module hosts the per-cell composite driver (composeArchives). Its full
+    // dep set (engine + assets/sprite/catalog) needs libc, so create the test module directly
+    // rather than via addPkgTest (which omits link_libc).
+    const bundle_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full },
+            .{ .name = "assets", .module = assets_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+        },
+    });
+    const bundle_test_step = b.step("bundle-test", "Run the bundle / per-cell composite tests");
+    bundle_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bundle_test_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bundle_test_mod })).step);
     // Per-cell coverage sidecar (JSON round-trip carried in PMTiles metadata): pure
     // over s57 + std.json. Part of the main suite.
     _ = addPkgTest(b, test_step, "src/scene/coverage.zig", target, optimize, &.{

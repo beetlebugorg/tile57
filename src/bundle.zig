@@ -778,6 +778,272 @@ fn worldAxisToTile(w: f64, scale: f64) u32 {
     return @intFromFloat(@min(f, scale - 1));
 }
 
+// ===========================================================================
+// Per-cell composite — Step 3: composeArchives
+// ===========================================================================
+//
+// Combine N per-cell PMTiles (each native-band-scale, its M_COVR coverage embedded in the
+// metadata) into ONE merged PMTiles driven by the ownership partition. At every output tile,
+// each owning cell's decoded features are clipped to the ground it OWNS (partition.ownedFace,
+// projected into the tile) and concatenated per layer. The faces are a disjoint partition, so
+// there is no double-draw at a seam and no z-order re-sort — S-52 draw priority rides the
+// per-feature `draw_prio` property, which the style sorts client-side (so feature order within
+// a tile is cosmetic). This retires the streaming in-bake cross-cell combiner: the per-cell
+// bakes stay dumb + cacheable, and all cross-cell logic is precomputed as the partition.
+
+const N_COMPOSE_LAYERS = engine.scene.VECTOR_LAYERS.len;
+
+/// Compose per-cell PMTiles archives (BORROWED — kept alive by the caller) into one merged
+/// PMTiles. Returns the composed archive bytes (`gpa`-owned; free with `gpa.free` /
+/// `tile57_free`), or null if nothing composed. The partition is rebuilt from each archive's
+/// embedded coverage (no `.000` re-parse), via the same `toPlaneCells` adapter the bake uses.
+///
+/// Native-scale only for now: a cell contributes a tile only where it has a baked tile, so
+/// ground a cell owns OUTSIDE its native zoom band is left empty at that zoom — cross-band
+/// zoom expansion (overscale / fill-down) is a separate compositor stage.
+pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[]u8 {
+    const geo = engine.geo;
+    const pmtiles = engine.pmtiles;
+    const scene = engine.scene;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 1. Open a Reader per archive and recover its embedded coverage + SCAMIN ladder. Archives
+    //    with no coverage key are skipped. Readers are heap-stable (created in `a`) so getTile's
+    //    lazy leaf-dir decode mutates them in place; they borrow the archive bytes.
+    const readers = try a.alloc(*pmtiles.Reader, archives.len);
+    var shims = std.ArrayList(LoadedCov).empty;
+    var scamins = std.AutoHashMap(u32, void).init(a);
+    var ubox = [4]i32{ std.math.maxInt(i32), std.math.maxInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
+    var n: usize = 0;
+    for (archives) |arc| {
+        const rp = a.create(pmtiles.Reader) catch continue;
+        rp.* = pmtiles.Reader.init(gpa, arc) catch continue;
+        const meta = readMetaJson(a, rp) orelse {
+            rp.deinit();
+            continue;
+        };
+        const cc = (scene.coverage.decodeFromMetadata(a, meta) catch null) orelse {
+            rp.deinit();
+            continue;
+        };
+        for (parseScamin(a, meta)) |s| scamins.put(s, {}) catch {};
+        ubox[0] = @min(ubox[0], cc.bbox[0]);
+        ubox[1] = @min(ubox[1], cc.bbox[1]);
+        ubox[2] = @max(ubox[2], cc.bbox[2]);
+        ubox[3] = @max(ubox[3], cc.bbox[3]);
+        readers[n] = rp;
+        try shims.append(a, .{
+            .name = cc.name,
+            .date = cc.date,
+            .cscl = cc.cscl,
+            .coverage = cc.cov1,
+            .bounds = .{
+                @as(f64, @floatFromInt(cc.bbox[0])) / 1e7,
+                @as(f64, @floatFromInt(cc.bbox[1])) / 1e7,
+                @as(f64, @floatFromInt(cc.bbox[2])) / 1e7,
+                @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,
+            },
+        });
+        n += 1;
+    }
+    defer for (readers[0..n]) |rp| rp.deinit();
+    if (n == 0) return null;
+
+    // 2. Adapt to plane.Cell (THE canonical adapter: band floor via bandOf + the DSID
+    //    ordersBeforeKeys tie-break, ranked across the whole set) and materialise the per-band
+    //    ownership partition. `part` borrows `cells` (arena-backed) — keep `a` alive for it.
+    const cells = try toPlaneCells(a, shims.items);
+    var part = try geo.partition.build(gpa, cells);
+    defer part.deinit();
+
+    // 3. Output zoom span = union of the cells' native band windows.
+    var minz: u8 = 255;
+    var maxz: u8 = 0;
+    for (shims.items) |lc| {
+        const zr = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(lc.cscl));
+        minz = @min(minz, zr.min);
+        maxz = @max(maxz, zr.max);
+    }
+
+    // 4. Stream: one governing band per zoom (partition.mapForZoom), scatter each owner's
+    //    native tiles, clip to its owned face, merge per layer, re-encode.
+    var sw = pmtiles.StreamWriter.init(gpa);
+    defer sw.deinit();
+    var zoom_arena = std.heap.ArenaAllocator.init(gpa); // one zoom's tiles resident at a time
+    defer zoom_arena.deinit();
+    var z: u8 = minz;
+    while (z <= maxz) : (z += 1) {
+        _ = zoom_arena.reset(.retain_capacity);
+        try composeZoom(&sw, zoom_arena.allocator(), &part, readers[0..n], z);
+    }
+    if (sw.num_addressed == 0) return null;
+
+    // 5. Frame a viewer on the data + metadata (VECTOR_LAYERS + the union SCAMIN ladder; the
+    //    composite carries no single-cell coverage).
+    const scamin_list = try scaminSorted(a, &scamins);
+    const meta = try scene.metadataJson(gpa, scamin_list, null);
+    defer gpa.free(meta);
+    const span_deg = @max(0.01, @as(f64, @floatFromInt(ubox[2] - ubox[0])) / 1e7);
+    const cz: u8 = @intFromFloat(std.math.clamp(std.math.log2(720.0 / span_deg), @as(f64, @floatFromInt(minz)), @as(f64, @floatFromInt(maxz))));
+    return try sw.finishBytes(.{
+        .metadata_json = meta,
+        .tile_type = .mlt,
+        .min_lon_e7 = ubox[0],
+        .min_lat_e7 = ubox[1],
+        .max_lon_e7 = ubox[2],
+        .max_lat_e7 = ubox[3],
+        .center_zoom = cz,
+    });
+}
+
+/// Compose every tile of one zoom `z`: for each owning cell (the band governing `z`), fetch
+/// its native tile, project its owned face into that tile, clip each decoded feature, and
+/// accumulate per layer; then orient the merged polygons and stream each tile out. `sa` is a
+/// per-zoom arena the caller resets, so only one zoom's tiles are resident.
+fn composeZoom(
+    sw: *engine.pmtiles.StreamWriter,
+    sa: std.mem.Allocator,
+    part: *const engine.geo.partition.Partition,
+    readers: []const *engine.pmtiles.Reader,
+    z: u8,
+) !void {
+    const mvt = engine.mvt;
+    const tile = engine.tile;
+    const scene = engine.scene;
+    const compose = scene.compose;
+
+    const map = part.mapForZoom(z) orelse return;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+
+    const TileKey = struct { x: u32, y: u32 };
+    const Buckets = [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature);
+    var tilemap = std.AutoHashMap(TileKey, Buckets).init(sa);
+
+    for (map.faces) |face| {
+        if (face.owned.len == 0) continue;
+        const ci = face.index;
+
+        // Tile cover of this owner's face bbox (lon/lat → world → tile index), nw..se.
+        var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+        for (face.owned) |ring| for (ring) |p| {
+            const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
+            const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
+            fb[0] = @min(fb[0], lon);
+            fb[1] = @min(fb[1], lat);
+            fb[2] = @max(fb[2], lon);
+            fb[3] = @max(fb[3], lat);
+        };
+        const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // NW: min lon, max lat
+        const w_br = tile.lonLatToWorld(fb[2], fb[1]); // SE: max lon, min lat
+        const tx0 = worldAxisToTile(w_tl[0], scale);
+        const tx1 = worldAxisToTile(w_br[0], scale);
+        const ty0 = worldAxisToTile(w_tl[1], scale);
+        const ty1 = worldAxisToTile(w_br[1], scale);
+
+        var tx = tx0;
+        while (tx <= tx1) : (tx += 1) {
+            var ty = ty0;
+            while (ty <= ty1) : (ty += 1) {
+                // The cell's per-cell baked tile at (z,tx,ty) — absent outside its native band.
+                const raw = (try readers[ci].getTile(sa, z, tx, ty)) orelse continue;
+                // Project the owned face into THIS tile; empty = the cell owns no pixels here.
+                const face_px = try compose.projectFace(sa, face.owned, z, tx, ty);
+                if (face_px.len == 0) continue;
+                const layers = try decodeTile(sa, readers[ci].header.tile_type, raw);
+
+                const gop = try tilemap.getOrPut(.{ .x = tx, .y = ty });
+                if (!gop.found_existing) for (gop.value_ptr) |*b| {
+                    b.* = std.ArrayList(mvt.Feature).empty;
+                };
+                for (layers) |layer| {
+                    const li = layerIndex(layer.name) orelse continue;
+                    for (layer.features) |feat| {
+                        try compose.clipFeatureToFace(sa, &gop.value_ptr[li], feat, face_px);
+                    }
+                }
+            }
+        }
+    }
+
+    // Encode each composed tile: per-layer concat (VECTOR_LAYERS order), polygons re-oriented
+    // (boolean intersect output has unspecified winding), then MLT — matching the per-cell input.
+    var it = tilemap.iterator();
+    while (it.next()) |kv| {
+        var layers = std.ArrayList(mvt.Layer).empty;
+        for (kv.value_ptr, 0..) |bucket, li| {
+            if (bucket.items.len == 0) continue;
+            const feats = try orientPolys(sa, bucket.items);
+            try layers.append(sa, .{ .name = scene.VECTOR_LAYERS[li], .features = feats });
+        }
+        if (layers.items.len == 0) continue;
+        const enc = try engine.mlt.encode(sa, .{ .layers = layers.items });
+        try sw.add(z, kv.key_ptr.x, kv.key_ptr.y, enc);
+    }
+}
+
+// The output-layer slot for a decoded layer name (one of scene.VECTOR_LAYERS), or null to drop.
+fn layerIndex(name: []const u8) ?usize {
+    for (engine.scene.VECTOR_LAYERS, 0..) |ln, i| {
+        if (std.mem.eql(u8, ln, name)) return i;
+    }
+    return null;
+}
+
+// Decode a per-cell tile by its stored type (.mlt for our bakes, .mvt otherwise).
+fn decodeTile(a: std.mem.Allocator, tt: engine.pmtiles.TileType, raw: []const u8) ![]engine.mvt.DecodedLayer {
+    return switch (tt) {
+        .mlt => engine.mlt.decode(a, raw),
+        else => engine.mvt.decode(a, raw),
+    };
+}
+
+// Re-orient each polygon feature's rings (the sole MVT winding authority). Non-area features
+// pass through; the input `properties` are borrowed unchanged (draw_prio et al. survive).
+fn orientPolys(a: std.mem.Allocator, feats: []const engine.mvt.Feature) ![]const engine.mvt.Feature {
+    const mvt = engine.mvt;
+    const out = try a.alloc(mvt.Feature, feats.len);
+    for (feats, 0..) |f, i| {
+        out[i] = if (f.geom_type == .polygon)
+            .{ .id = f.id, .geom_type = .polygon, .parts = try engine.scene.orientAreaRings(a, f.parts), .properties = f.properties }
+        else
+            f;
+    }
+    return out;
+}
+
+// The metadata JSON of an archive (decompressed), borrowed from the reader (or `a` if gzipped),
+// or null if absent/unreadable.
+fn readMetaJson(a: std.mem.Allocator, r: *engine.pmtiles.Reader) ?[]const u8 {
+    const h = r.header;
+    if (h.metadata_length == 0) return null;
+    const raw = r.bytes[@intCast(h.metadata_offset)..][0..@intCast(h.metadata_length)];
+    return switch (h.internal_compression) {
+        .none => raw,
+        .gzip => engine.gzip.decompress(a, raw) catch return null,
+        else => null,
+    };
+}
+
+// The "scamin" ladder from an archive's metadata JSON, or empty if absent/unparseable.
+fn parseScamin(a: std.mem.Allocator, meta: []const u8) []const u32 {
+    const Dto = struct { scamin: []const u32 = &.{} };
+    const v = std.json.parseFromSliceLeaky(Dto, a, meta, .{ .ignore_unknown_fields = true }) catch return &.{};
+    return v.scamin;
+}
+
+// The distinct SCAMIN denominators, ascending — the composed metadata's ladder.
+fn scaminSorted(a: std.mem.Allocator, set: *std.AutoHashMap(u32, void)) ![]const u32 {
+    const out = try a.alloc(u32, set.count());
+    var it = set.keyIterator();
+    var i: usize = 0;
+    while (it.next()) |k| : (i += 1) out[i] = k.*;
+    std.mem.sort(u32, out, {}, comptime std.sort.asc(u32));
+    return out;
+}
+
 const LightScanWork = struct {
     entries: []const CellEntry,
     dir: std.Io.Dir,
@@ -1774,4 +2040,134 @@ fn lonLatToTile(lon: f64, lat: f64, z: u8) [2]u32 {
 /// Degrees -> PMTiles E7 fixed-point.
 fn toE7(v: f64) i32 {
     return @intFromFloat(@round(v * 1e7));
+}
+
+// ===========================================================================
+// Tests — composeArchives (per-cell composite Step 3)
+// ===========================================================================
+
+const testing = std.testing;
+
+// Build a synthetic per-cell PMTiles: coverage = one M_COVR box (lon0..lon1 × lat0..lat1,
+// degrees), plus ONE MLT tile at (z,tx,ty) whose "areas" layer is a single polygon covering
+// the whole tile box — so composing clips it down to the ground the cell owns. Bytes are
+// gpa-owned (free with gpa.free); scratch lives in arena `a`.
+fn synthCell(gpa: std.mem.Allocator, a: std.mem.Allocator, name: []const u8, lon0: f64, lat0: f64, lon1: f64, lat1: f64, cscl: i32, z: u8, tx: u32, ty: u32) ![]u8 {
+    const s57 = engine.s57;
+    const scene = engine.scene;
+    const mvt = engine.mvt;
+    const tile = engine.tile;
+    const pmtiles = engine.pmtiles;
+
+    const ring = try a.alloc(s57.LonLat, 4);
+    ring[0] = .{ .lon_e7 = toE7(lon0), .lat_e7 = toE7(lat0) };
+    ring[1] = .{ .lon_e7 = toE7(lon1), .lat_e7 = toE7(lat0) };
+    ring[2] = .{ .lon_e7 = toE7(lon1), .lat_e7 = toE7(lat1) };
+    ring[3] = .{ .lon_e7 = toE7(lon0), .lat_e7 = toE7(lat1) };
+    const feat = try a.dupe([]const s57.LonLat, &.{ring});
+    const cov1 = try a.dupe([]const []const s57.LonLat, &.{feat});
+    const cc = scene.coverage.CellCoverage{
+        .name = name,
+        .date = "20200101",
+        .cscl = cscl,
+        .band = @intFromEnum(engine.bake_enc.bandOf(cscl)),
+        .bbox = .{ toE7(lon0), toE7(lat0), toE7(lon1), toE7(lat1) },
+        .cov1 = cov1,
+    };
+    const cov_json = try scene.coverage.encodeJson(a, cc);
+    const meta = try scene.metadataJson(a, &.{}, cov_json);
+
+    const box = try a.alloc(mvt.Point, 4);
+    box[0] = .{ .x = 0, .y = 0 };
+    box[1] = .{ .x = tile.EXTENT, .y = 0 };
+    box[2] = .{ .x = tile.EXTENT, .y = tile.EXTENT };
+    box[3] = .{ .x = 0, .y = tile.EXTENT };
+    const parts = try a.dupe([]const mvt.Point, &.{box});
+    const feats = try a.dupe(mvt.Feature, &.{.{ .geom_type = .polygon, .parts = parts }});
+    const layers = try a.dupe(mvt.Layer, &.{.{ .name = "areas", .features = feats }});
+    const tilebytes = try engine.mlt.encode(a, .{ .layers = layers });
+
+    var sw = pmtiles.StreamWriter.init(gpa);
+    defer sw.deinit();
+    try sw.add(z, tx, ty, tilebytes);
+    return sw.finishBytes(.{
+        .metadata_json = meta,
+        .tile_type = .mlt,
+        .min_lon_e7 = cc.bbox[0],
+        .min_lat_e7 = cc.bbox[1],
+        .max_lon_e7 = cc.bbox[2],
+        .max_lat_e7 = cc.bbox[3],
+    });
+}
+
+// How many of `feats` (decoded polygons) contain (x,y) under the even-odd rule.
+fn countContains(a: std.mem.Allocator, feats: []engine.mvt.DecodedFeature, x: i64, y: i64) usize {
+    const boolean = engine.geo.boolean;
+    var count: usize = 0;
+    for (feats) |f| {
+        if (f.geom_type != .polygon) continue;
+        var rings = std.ArrayList([]const boolean.Pt).empty;
+        for (f.parts) |part| {
+            const w = a.alloc(boolean.Pt, part.len) catch unreachable;
+            for (part, 0..) |p, i| w[i] = .{ .x = p.x, .y = p.y };
+            rings.append(a, w) catch unreachable;
+        }
+        if (boolean.pointInEvenOdd(rings.items, x, y)) count += 1;
+    }
+    return count;
+}
+
+test "composeArchives: two abutting cells split a shared tile at the seam, no double-draw" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tile = engine.tile;
+
+    // A harbor-band location; find the z13 tile containing it, then split that tile's ground
+    // between two cells at the vertical mid-line.
+    const clon = -76.48;
+    const clat = 38.97;
+    const z: u8 = 13;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+    const w = tile.lonLatToWorld(clon, clat);
+    const tx = worldAxisToTile(w[0], scale);
+    const ty = worldAxisToTile(w[1], scale);
+    const bnds = tile.tileBoundsLonLat(z, tx, ty); // [min_lon, min_lat, max_lon, max_lat]
+    const lon0 = bnds[0];
+    const lat0 = bnds[1];
+    const lon1 = bnds[2];
+    const lat1 = bnds[3];
+    const midlon = (lon0 + lon1) / 2.0;
+    const dlat = (lat1 - lat0) * 0.01; // keep each coverage bbox inside this one tile row
+
+    const cscl: i32 = 20_000; // harbor band (z13-16); shared cscl → same governing band
+    const arc_a = try synthCell(gpa, a, "AAAAAAAA", lon0, lat0 + dlat, midlon, lat1 - dlat, cscl, z, tx, ty);
+    defer gpa.free(arc_a);
+    const arc_b = try synthCell(gpa, a, "BBBBBBBB", midlon, lat0 + dlat, lon1, lat1 - dlat, cscl, z, tx, ty);
+    defer gpa.free(arc_b);
+
+    const composed = (try composeArchives(gpa, &.{ arc_a, arc_b })) orelse return error.TestUnexpectedResult;
+    defer gpa.free(composed);
+
+    var r = try engine.pmtiles.Reader.init(gpa, composed);
+    defer r.deinit();
+    // Composed archive is MLT, native harbor band only → the z13 tile exists.
+    try testing.expectEqual(engine.pmtiles.TileType.mlt, r.header.tile_type);
+    const raw = (try r.getTile(a, z, tx, ty)) orelse return error.TestUnexpectedResult;
+    const layers = try engine.mlt.decode(a, raw);
+
+    var areas: ?engine.mvt.DecodedLayer = null;
+    for (layers) |l| {
+        if (std.mem.eql(u8, l.name, "areas")) areas = l;
+    }
+    const al = areas orelse return error.TestUnexpectedResult;
+    try testing.expect(al.features.len >= 2); // A's left half + B's right half, clipped at the seam
+
+    const E = tile.EXTENT;
+    const midy: i64 = @divTrunc(E, 2);
+    // Left quarter owned by exactly one cell; right quarter by exactly one; neither by both
+    // (disjoint partition — the seam split the tile, it did not double-draw it).
+    try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(E, 4), midy));
+    try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(@as(i64, E) * 3, 4), midy));
 }
