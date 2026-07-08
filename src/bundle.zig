@@ -606,7 +606,7 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
     const bytes = try sw.finishBytes(.{
         // MapLibre/pmtiles.io build their style from `vector_layers`; without it the
         // "partition" layer is invisible to a viewer no matter the geometry.
-        .metadata_json = "{\"name\":\"partition-debug\",\"format\":\"pbf\",\"vector_layers\":[{\"id\":\"partition\",\"fields\":{\"cell\":\"String\",\"cscl\":\"Number\",\"band\":\"Number\",\"tier\":\"Number\",\"oi\":\"Number\",\"color\":\"String\"}}]}",
+        .metadata_json = "{\"name\":\"partition-debug\",\"format\":\"pbf\",\"vector_layers\":[{\"id\":\"partition\",\"fields\":{\"cell\":\"String\",\"cscl\":\"Number\",\"band\":\"Number\",\"tier\":\"Number\",\"oi\":\"Number\",\"color\":\"String\"}},{\"id\":\"labels\",\"fields\":{\"cell\":\"String\"}}]}",
         .tile_type = .mvt,
         .min_lon_e7 = ubox[0],
         .min_lat_e7 = ubox[1],
@@ -691,7 +691,8 @@ fn emitFacesZoom(sw: *engine.pmtiles.StreamWriter, sa: std.mem.Allocator, faces:
     const tile = engine.tile;
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
     const TileKey = struct { x: u32, y: u32 };
-    var tilemap = std.AutoHashMap(TileKey, std.ArrayList(mvt.Feature)).init(sa);
+    const TileFeat = struct { polys: std.ArrayList(mvt.Feature), labels: std.ArrayList(mvt.Feature) };
+    var tilemap = std.AutoHashMap(TileKey, TileFeat).init(sa);
 
     for (faces) |face| {
         if (face.owned.len == 0) continue;
@@ -736,16 +737,35 @@ fn emitFacesZoom(sw: *engine.pmtiles.StreamWriter, sa: std.mem.Allocator, faces:
                 if (parts.items.len == 0) continue;
                 const oriented = try engine.scene.orientAreaRings(sa, parts.items);
                 const gop = try tilemap.getOrPut(.{ .x = tx, .y = ty });
-                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(mvt.Feature).empty;
-                try gop.value_ptr.append(sa, .{ .geom_type = .polygon, .parts = oriented, .properties = props });
+                if (!gop.found_existing) gop.value_ptr.* = .{ .polys = .empty, .labels = .empty };
+                try gop.value_ptr.polys.append(sa, .{ .geom_type = .polygon, .parts = oriented, .properties = props });
+
+                // Label this face's part IN THIS tile, at the centre of its clipped
+                // extent, so the owning cell name is readable wherever the face shows
+                // (layer "labels"). MapLibre collision-dedups the repeats across tiles.
+                var lb = [4]i32{ std.math.maxInt(i32), std.math.maxInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
+                for (oriented) |ring| for (ring) |p| {
+                    lb[0] = @min(lb[0], p.x);
+                    lb[1] = @min(lb[1], p.y);
+                    lb[2] = @max(lb[2], p.x);
+                    lb[3] = @max(lb[3], p.y);
+                };
+                const lpt = try sa.alloc(mvt.Point, 1);
+                lpt[0] = .{ .x = @divTrunc(lb[0] + lb[2], 2), .y = @divTrunc(lb[1] + lb[3], 2) };
+                const lparts = try sa.alloc([]const mvt.Point, 1);
+                lparts[0] = lpt;
+                try gop.value_ptr.labels.append(sa, .{ .geom_type = .point, .parts = lparts, .properties = try sa.dupe(mvt.Prop, &.{.{ .key = "cell", .value = .{ .string = lc.name } }}) });
             }
         }
     }
 
     var it = tilemap.iterator();
     while (it.next()) |kv| {
-        const layers = [_]mvt.Layer{.{ .name = "partition", .features = kv.value_ptr.items }};
-        const enc = try mvt.encode(sa, .{ .layers = &layers });
+        var layers = std.ArrayList(mvt.Layer).empty;
+        if (kv.value_ptr.polys.items.len > 0) try layers.append(sa, .{ .name = "partition", .features = kv.value_ptr.polys.items });
+        if (kv.value_ptr.labels.items.len > 0) try layers.append(sa, .{ .name = "labels", .features = kv.value_ptr.labels.items });
+        if (layers.items.len == 0) continue;
+        const enc = try mvt.encode(sa, .{ .layers = layers.items });
         try sw.add(z, kv.key_ptr.x, kv.key_ptr.y, enc);
     }
 }
