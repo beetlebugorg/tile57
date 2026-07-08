@@ -388,8 +388,32 @@ pub const VectorSurface = struct {
         const shown = if (feet) depth_m * sndfrm.M_TO_FT else depth_m;
         const prefix: []const u8 = if (depth_m <= self.settings.safety_depth) "SOUNDS" else "SOUNDG";
         const list = try sndfrm.syms(self.a, prefix, shown, swept, low_acc, feet);
-        // Soundings are symbols (S-52 icon-allow-overlap): they do NOT declutter;
-        // density is governed by SCAMIN. Each digit self-positions by its pivot.
+        // S-52 lets soundings overlap (icon-allow-overlap), but the HiDPI ×size_scale
+        // enlargement crowds them into an unreadable mass. Thin them: declutter each
+        // NUMBER as one box (the union of its digit glyphs), placed once — keep the
+        // first-emitted (higher draw-priority) and drop later numbers it overlaps. The
+        // digits themselves still draw ungated (below) so the kept number stays intact.
+        const k_decl = sndfrm.SYMBOL_SCALE * 100.0 * self.refDev();
+        var uw: f64 = 0;
+        var uh: f64 = 0;
+        {
+            var itb = std.mem.splitScalar(u8, list, ',');
+            while (itb.next()) |glyph| {
+                if (glyph.len == 0) continue;
+                const s = store.get(glyph) orelse continue;
+                for (s.paths) |p| for (p.contours) |contour| for (contour) |c| {
+                    const lx = @abs((c.x - s.pivot.x) * k_decl);
+                    const ly = @abs((c.y - s.pivot.y) * k_decl);
+                    if (lx > uw) uw = lx;
+                    if (ly > uh) uh = ly;
+                };
+            }
+        }
+        if (uw > 0 and uh > 0) {
+            const scale_px = 256.0 * std.math.exp2(self.view_zoom);
+            const anchor = self.worldOf(at);
+            if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, uw, uh, false)) return;
+        }
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
