@@ -620,21 +620,29 @@ pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8, minzoom: u8,
     return bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, true, null, null, coverage_json);
 }
 
-/// Decode the per-cell coverage embedded in a baked per-cell archive's metadata, or
-/// null if absent. The whole result (rings + strings) is allocated in `a`. The
-/// composite stitcher calls this over each cell's archive to rebuild the ownership
-/// partition without re-parsing the source .000.
-pub fn cellCoverageFromArchive(a: std.mem.Allocator, archive: []const u8) !?scene.coverage.CellCoverage {
+/// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null
+/// if the archive carries none. For a host to read the embedded scamin / coverage
+/// without a full open. This engine writes metadata uncompressed; gzip is handled for
+/// archives from another writer.
+pub fn pmtilesMetadata(a: std.mem.Allocator, archive: []const u8) !?[]u8 {
     var r = try pmtiles.Reader.init(a, archive);
     defer r.deinit();
     const h = r.header;
     if (h.metadata_length == 0) return null;
     const raw = r.bytes[@intCast(h.metadata_offset)..][0..@intCast(h.metadata_length)];
-    const json: []const u8 = switch (h.internal_compression) {
-        .none => raw,
+    return switch (h.internal_compression) {
+        .none => try a.dupe(u8, raw),
         .gzip => try gzip.decompress(a, raw),
-        else => return null,
+        else => null,
     };
+}
+
+/// Decode the per-cell coverage embedded in a baked per-cell archive's metadata, or
+/// null if absent. The whole result (rings + strings) is allocated in `a`. The
+/// composite stitcher calls this over each cell's archive to rebuild the ownership
+/// partition without re-parsing the source .000.
+pub fn cellCoverageFromArchive(a: std.mem.Allocator, archive: []const u8) !?scene.coverage.CellCoverage {
+    const json = (try pmtilesMetadata(a, archive)) orelse return null;
     return scene.coverage.decodeFromMetadata(a, json);
 }
 

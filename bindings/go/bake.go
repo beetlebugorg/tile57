@@ -167,6 +167,51 @@ func BakeBundle(input, outDir string, opts BakeOpts, progress func(BakeProgress)
 	}
 }
 
+// BakeCell bakes ONE on-disk cell (a .000 path + its .001.. updates) to a PMTiles
+// archive over [minZoom, maxZoom] and returns the bytes — the per-cell tile store the
+// composite stitcher consumes. The archive metadata embeds that cell's own coverage
+// (M_COVR + cscl + date/name); read it back with [PMTilesMetadata]. minZoom/maxZoom
+// 0/0 bakes the engine default range.
+func BakeCell(path string, minZoom, maxZoom uint8) ([]byte, error) {
+	if path == "" {
+		return nil, fmt.Errorf("tile57: BakeCell needs a cell path: %w", ErrEmptyInput)
+	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	var out *C.uint8_t
+	var outLen C.size_t
+	rc := C.tile57_bake_cell_bytes(cPath, C.uint8_t(minZoom), C.uint8_t(maxZoom), &out, &outLen)
+	switch rc {
+	case 1:
+		return tileBytes(out, outLen), nil
+	case 0:
+		return nil, fmt.Errorf("tile57: cell bake produced no tiles: %w", ErrNoCoverage)
+	default:
+		return nil, fmt.Errorf("tile57: cell bake failed")
+	}
+}
+
+// PMTilesMetadata returns a PMTiles archive's metadata JSON blob (decompressed), or
+// nil if the archive carries none. A [BakeCell] archive embeds the cell's coverage
+// under a "coverage" key. The pmtiles bytes are read but not retained.
+func PMTilesMetadata(pmtiles []byte) ([]byte, error) {
+	if len(pmtiles) == 0 {
+		return nil, fmt.Errorf("tile57: PMTilesMetadata needs archive bytes: %w", ErrEmptyInput)
+	}
+	var out *C.uint8_t
+	var outLen C.size_t
+	rc := C.tile57_pmtiles_metadata((*C.uint8_t)(unsafe.Pointer(&pmtiles[0])), C.size_t(len(pmtiles)), &out, &outLen)
+	switch rc {
+	case 1:
+		return tileBytes(out, outLen), nil
+	case 0:
+		return nil, nil // archive has no metadata
+	default:
+		return nil, fmt.Errorf("tile57: read metadata failed")
+	}
+}
+
 // PartitionBand selects which ownership-partition map [BakePartitionDebug] emits.
 type PartitionBand int8
 

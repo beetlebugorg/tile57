@@ -107,6 +107,20 @@ export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8,
     return 0;
 }
 
+/// The metadata JSON blob of a PMTiles archive (e.g. the embedded per-cell "coverage"
+/// a single-cell bake carries), into *out / *out_len (free with tile57_free). 1=ok,
+/// 0=no metadata, -1=error. See tile57.h.
+export fn tile57_pmtiles_metadata(pmtiles_ptr: ?[*]const u8, len: usize, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+    const p = pmtiles_ptr orelse return -1;
+    const meta = chart.pmtilesMetadata(gpa, p[0..len]) catch return -1;
+    if (meta) |m| {
+        out.* = m.ptr;
+        out_len.* = m.len;
+        return 1;
+    }
+    return 0;
+}
+
 /// Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked chart — the
 /// `.cells` backend, for tile fetch / bake, not live render_surface_cb. See tile57.h.
 export fn tile57_charts_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {

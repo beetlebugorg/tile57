@@ -100,6 +100,13 @@ tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t 
 int tile57_bake_cell_bytes(const char *path, uint8_t minzoom, uint8_t maxzoom,
                            uint8_t **out, size_t *out_len);
 
+/* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
+ * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +
+ * cscl + date/name under a "coverage" key, so the composite stitcher rebuilds the
+ * ownership partition without re-parsing the .000. 1=ok, 0=no metadata, -1=error. */
+int tile57_pmtiles_metadata(const uint8_t *pmtiles, size_t len,
+                            uint8_t **out, size_t *out_len);
+
 /* Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked streaming
  * chart: enumerates cells + peeks each bbox/scale, reads bytes on demand (working
  * set only). For tile fetch / bake, NOT live render_surface_cb. NULL/failure -> NULL. */
