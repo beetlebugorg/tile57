@@ -11,8 +11,10 @@
 
 pub const boolean = @import("boolean.zig");
 pub const plane = @import("plane.zig");
+pub const partition = @import("partition.zig");
 
 test {
     _ = boolean;
     _ = plane;
+    _ = partition;
 }
