@@ -950,10 +950,12 @@ pub const VECTOR_LAYERS = [_][]const u8{
 /// PMTiles archive metadata JSON: the static vector_layers list MapLibre reads from
 /// the TileJSON, plus a "scamin" array of the distinct SCAMIN denominators present
 /// (ascending) so the client builds one native-minzoom bucket layer per value at
-/// load (host-canonical-backend.md §2) instead of probing tiles. Mirrors the Go
-/// pmtiles.Builder.metadata (vector_layers + scamin splice). `scamin` empty -> omit
-/// the field. Caller owns the returned bytes (allocated in `a`).
-pub fn metadataJson(a: Allocator, scamin: []const u32) ![]const u8 {
+/// load instead of probing tiles. Mirrors the Go pmtiles.Builder.metadata
+/// (vector_layers + scamin splice). `scamin` empty -> omit the field. `coverage_json`,
+/// when non-null, is a per-cell coverage object (see `coverage.encodeJson`) spliced
+/// under a "coverage" key — a single-cell composite bake carries its own M_COVR there.
+/// Caller owns the returned bytes (allocated in `a`).
+pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u8) ![]const u8 {
     var b = std.ArrayList(u8).empty;
     try b.appendSlice(a, "{\"name\":\"chartplotter\",\"format\":\"pbf\",\"vector_layers\":[");
     for (VECTOR_LAYERS, 0..) |name, i| {
@@ -971,6 +973,10 @@ pub fn metadataJson(a: Allocator, scamin: []const u32) ![]const u8 {
             try b.appendSlice(a, std.fmt.bufPrint(&nbuf, "{d}", .{v}) catch unreachable);
         }
         try b.append(a, ']');
+    }
+    if (coverage_json) |cj| {
+        try b.appendSlice(a, ",\"coverage\":");
+        try b.appendSlice(a, cj);
     }
     try b.append(a, '}');
     return b.toOwnedSlice(a);

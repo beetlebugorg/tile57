@@ -577,7 +577,7 @@ pub fn openCellBaked(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool,
     } else |_| {}
 
     const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
-    const archive = (bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, pick_attrs, null, null) catch null) orelse return error.OpenFailed;
+    const archive = (bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, pick_attrs, null, null, null) catch null) orelse return error.OpenFailed;
     defer gpa.free(archive);
     const src = try Chart.openBytes(archive, .pmtiles, rules_dir);
     src.cscl_override = cscl;
@@ -594,11 +594,48 @@ pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) 
 /// Bake a SINGLE .000 cell (+ updates) to a PMTiles archive in [minzoom, maxzoom] and
 /// return the bytes (gpa-owned; free with tile57_free). For a host to persist a
 /// per-cell tile cache to disk so the (slow) bake is one-time. null = nothing baked.
+///
+/// The archive metadata embeds the cell's own coverage (M_COVR + cscl + date/name),
+/// so the composite stitcher rebuilds the ownership partition from the baked archives
+/// without re-parsing the .000. Read it back with `cellCoverageFromArchive`.
 pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8, minzoom: u8, maxzoom: u8) !?[]u8 {
     var cf = try readCellFiles(cell_path);
     defer cf.deinit();
+
+    // Capture coverage for the embedded sidecar (one cheap parse, as openCellBaked
+    // does). The stem is the ownership tie-break name — matches the coverage loader.
+    var cov_arena = std.heap.ArenaAllocator.init(gpa);
+    defer cov_arena.deinit();
+    var coverage_json: ?[]const u8 = null;
+    if (s57.parseCellWithUpdates(gpa, cf.base, cf.updates)) |parsed| {
+        var cell = parsed;
+        defer cell.deinit();
+        const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
+        const band: u8 = @intFromEnum(bake_enc.bandOf(cell.params.cscl));
+        const cc = scene.coverage.fromCell(cov_arena.allocator(), &cell, stem, band);
+        coverage_json = scene.coverage.encodeJson(cov_arena.allocator(), cc) catch null;
+    } else |_| {}
+
     const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
-    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, true, null, null);
+    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, true, null, null, coverage_json);
+}
+
+/// Decode the per-cell coverage embedded in a baked per-cell archive's metadata, or
+/// null if absent. The whole result (rings + strings) is allocated in `a`. The
+/// composite stitcher calls this over each cell's archive to rebuild the ownership
+/// partition without re-parsing the source .000.
+pub fn cellCoverageFromArchive(a: std.mem.Allocator, archive: []const u8) !?scene.coverage.CellCoverage {
+    var r = try pmtiles.Reader.init(a, archive);
+    defer r.deinit();
+    const h = r.header;
+    if (h.metadata_length == 0) return null;
+    const raw = r.bytes[@intCast(h.metadata_offset)..][0..@intCast(h.metadata_length)];
+    const json: []const u8 = switch (h.internal_compression) {
+        .none => raw,
+        .gzip => try gzip.decompress(a, raw),
+        else => return null,
+    };
+    return scene.coverage.decodeFromMetadata(a, json);
 }
 
 /// Populate the process-global READ-ONLY registries (the S-100 feature catalogue and
@@ -1916,6 +1953,10 @@ pub fn bakeArchive(
     pick_attrs: bool,
     progress: Progress,
     user: ?*anyopaque,
+    // A single-cell composite bake passes that cell's coverage object (from
+    // `scene.coverage.encodeJson`) to embed in the archive metadata; multi-cell
+    // bakes pass null (no single coverage to carry).
+    coverage_json: ?[]const u8,
 ) !?[]u8 {
     const dir = resolveRulesDir(rules_dir);
 
@@ -2129,7 +2170,7 @@ pub fn bakeArchive(
         while (it.next()) |k| try scamin_vals.append(gpa, k.*);
         std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
     }
-    const meta = try scene.metadataJson(gpa, scamin_vals.items);
+    const meta = try scene.metadataJson(gpa, scamin_vals.items, coverage_json);
     defer gpa.free(meta);
     return try sw.finishBytes(.{
         .metadata_json = meta,

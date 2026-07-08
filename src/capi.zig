@@ -292,7 +292,7 @@ export fn tile57_bake_pmtiles(
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return -1;
-    const archive = chart.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, bakeFormat(o.format), !o.omit_pick_attrs, o.progress, o.progress_user) catch return -1;
+    const archive = chart.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, bakeFormat(o.format), !o.omit_pick_attrs, o.progress, o.progress_user, null) catch return -1;
     if (archive) |a| {
         out.* = a.ptr;
         out_len.* = a.len;

@@ -1728,7 +1728,7 @@ fn bakeRoot(io: std.Io, a: std.mem.Allocator, root_path: []const u8, out_path: [
         while (it.next()) |k| try scamin_vals.append(a, k.*);
         std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
     }
-    const meta = try engine.scene.metadataJson(a, scamin_vals.items);
+    const meta = try engine.scene.metadataJson(a, scamin_vals.items, null); // multi-cell root bake: no single cell's coverage
     const opts = engine.pmtiles.WriteOptions{
         .metadata_json = meta,
         .min_lon_e7 = toE7(ubox[0]),
