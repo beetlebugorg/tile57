@@ -20,6 +20,7 @@ const rs = render.surface;
 /// batch driver of this engine). Re-exported for the CLI + lib root.
 pub const bake_enc = @import("bake_enc.zig");
 pub const coverage = @import("coverage.zig"); // per-cell coverage sidecar (in PMTiles metadata)
+pub const compose = @import("compose.zig"); // per-cell-composite clip-to-owned-face + face projection
 
 /// SCAMIN standalone (specs/scamin-standalone.md): cross-cell point-object
 /// matching + SCAMIN union + scale-window eligibility for the *_scamin point/

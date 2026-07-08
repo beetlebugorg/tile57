@@ -3,13 +3,17 @@
 //! into one composed tile with no double-draw at a seam.
 //!
 //! `face` is the cell's owned rings (from `partition.ownedFace`) projected to THIS tile's
-//! pixel space, i64. Areas are intersected with the face, lines clipped to inside it,
-//! points kept iff their node is inside. Reuses the geometry primitives — `boolean.compute`
-//! (.intersect), `plane.clipLineInsidePolys`, `boolean.pointInEvenOdd` — so there is no new
-//! set algebra here, only the mvt↔integer adapters and the per-geometry-type dispatch.
+//! pixel space, i64 — `projectFace` does that projection, mirroring EXACTLY the baker's
+//! `tile.project` + `tile.clipPolygon` on the cell's features, so the face and the features
+//! share one pixel space and the intersection is seam-exact. Areas are intersected with the
+//! face, lines clipped to inside it, points kept iff their node is inside. Reuses the
+//! geometry primitives — `boolean.compute` (.intersect), `plane.clipLineInsidePolys`,
+//! `boolean.pointInEvenOdd` — so there is no new set algebra here, only the mvt↔integer
+//! adapters and the per-geometry-type dispatch.
 
 const std = @import("std");
 const mvt = @import("tiles").mvt;
+const tile = @import("tiles").tile;
 const geo = @import("geo");
 const boolean = geo.boolean;
 const plane = geo.plane;
@@ -68,6 +72,34 @@ pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature),
         },
         .unknown => {},
     }
+}
+
+/// Project a cell's owned face — `partition.ownedFace` rings in integer lon/lat (degrees ×
+/// 10⁷) — into tile `(z, tx, ty)` pixel space and clip to the tile box, returning the even-odd
+/// ring set `clipFeatureToFace` expects (boolean.Pt, i64), freshly allocated in `a`. This is
+/// the SAME projection the per-cell baker applied to that tile's features (`tile.project` +
+/// `tile.clipPolygon` over `Box.default(EXTENT, BUFFER)` with the same round), so the face and
+/// the decoded features live in one pixel space and the clip is seam-exact. Rings collapsing
+/// below a triangle are dropped; an empty result means the cell owns no pixels in this tile.
+pub fn projectFace(a: std.mem.Allocator, face: []const []const Pt, z: u8, tx: u32, ty: u32) ![]const []const Pt {
+    var rings = std.ArrayList([]const Pt).empty;
+    for (face) |ring| {
+        const proj = try a.alloc(mvt.Point, ring.len);
+        for (ring, 0..) |p, i| proj[i] = tile.project(
+            @as(f64, @floatFromInt(p.x)) / 1e7,
+            @as(f64, @floatFromInt(p.y)) / 1e7,
+            z,
+            tx,
+            ty,
+            tile.EXTENT,
+        );
+        const clipped = try tile.clipPolygon(a, proj, tile.Box.default(tile.EXTENT, tile.BUFFER));
+        if (clipped.len < 3) continue;
+        const widened = try a.alloc(Pt, clipped.len);
+        for (clipped, 0..) |cp, i| widened[i] = .{ .x = cp.x, .y = cp.y };
+        try rings.append(a, widened);
+    }
+    return rings.toOwnedSlice(a);
 }
 
 // ===========================================================================
@@ -176,4 +208,65 @@ test "clipFeatureToFace: feature entirely outside the face is dropped" {
     var out = std.ArrayList(mvt.Feature).empty;
     try clipFeatureToFace(a, &out, feat, face);
     try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "projectFace: a lon/lat face box inside the tile lands vertex-for-vertex at tile.project" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Web-mercator tile z2/(1,1) spans lon [-90,0], lat [0,66.51]. A face box in integer
+    // lon/lat (degrees × 1e7) fully INSIDE it, so the box clip is a no-op and every projected
+    // vertex must equal tile.project of the same lon/lat (projectFace adds no transform beyond
+    // E7→deg + the shared clip). SW→SE→NE→NW ring order.
+    const box = [_]Pt{
+        .{ .x = -600_000_000, .y = 200_000_000 }, // lon -60, lat 20
+        .{ .x = -300_000_000, .y = 200_000_000 }, // lon -30, lat 20
+        .{ .x = -300_000_000, .y = 500_000_000 }, // lon -30, lat 50
+        .{ .x = -600_000_000, .y = 500_000_000 }, // lon -60, lat 50
+    };
+    const rings = [_][]const Pt{&box};
+
+    const z: u8 = 2;
+    const tx: u32 = 1;
+    const ty: u32 = 1;
+    const face_px = try projectFace(a, &rings, z, tx, ty);
+    try testing.expectEqual(@as(usize, 1), face_px.len);
+    try testing.expectEqual(@as(usize, 4), face_px[0].len);
+
+    for (box, 0..) |p, i| {
+        const want = tile.project(
+            @as(f64, @floatFromInt(p.x)) / 1e7,
+            @as(f64, @floatFromInt(p.y)) / 1e7,
+            z,
+            tx,
+            ty,
+            tile.EXTENT,
+        );
+        try testing.expectEqual(@as(i64, want.x), face_px[0][i].x);
+        try testing.expectEqual(@as(i64, want.y), face_px[0][i].y);
+        // Inside the tile → inside the pixel box.
+        try testing.expect(face_px[0][i].x >= 0 and face_px[0][i].x <= tile.EXTENT);
+        try testing.expect(face_px[0][i].y >= 0 and face_px[0][i].y <= tile.EXTENT);
+    }
+    // Axis sanity: east lon → larger x; north lat (larger lat) → smaller y (y grows down).
+    try testing.expect(face_px[0][1].x > face_px[0][0].x); // lon -30 east of -60
+    try testing.expect(face_px[0][2].y < face_px[0][1].y); // lat 50 north of lat 20
+}
+
+test "projectFace: a ring fully outside the tile box is dropped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A face far to the east (lon ≈ +160) cannot touch tile z2/(1,1) (lon [-90,0]).
+    const east = [_]Pt{
+        .{ .x = 1_600_000_000, .y = 100_000_000 },
+        .{ .x = 1_700_000_000, .y = 100_000_000 },
+        .{ .x = 1_700_000_000, .y = 200_000_000 },
+        .{ .x = 1_600_000_000, .y = 200_000_000 },
+    };
+    const rings = [_][]const Pt{&east};
+    const face_px = try projectFace(a, &rings, 2, 1, 1);
+    try testing.expectEqual(@as(usize, 0), face_px.len);
 }
