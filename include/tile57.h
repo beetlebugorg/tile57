@@ -93,6 +93,13 @@ tile57_chart *tile57_chart_open_header(const char *path);
  * (progressive load). Renders via the fast reader path. NULL/failure -> NULL. */
 tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t maxzoom);
 
+/* Bake ONE cell (+ its .001.. updates, read from disk) to PMTiles bytes in
+ * [minzoom, maxzoom], returned in *out / *out_len (free with tile57_free). For a host
+ * to persist a per-cell tile cache to disk so the slow bake is one-time — then reopen
+ * the written file with tile57_chart_open_pmtiles. 1=ok, 0=nothing baked, -1=error. */
+int tile57_bake_cell_bytes(const char *path, uint8_t minzoom, uint8_t maxzoom,
+                           uint8_t **out, size_t *out_len);
+
 /* Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked streaming
  * chart: enumerates cells + peeks each bbox/scale, reads bytes on demand (working
  * set only). For tile fetch / bake, NOT live render_surface_cb. NULL/failure -> NULL. */

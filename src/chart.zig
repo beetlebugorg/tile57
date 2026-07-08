@@ -591,6 +591,16 @@ pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) 
     return openCellBaked(path, rules_dir, pick_attrs, 0, 18);
 }
 
+/// Bake a SINGLE .000 cell (+ updates) to a PMTiles archive in [minzoom, maxzoom] and
+/// return the bytes (gpa-owned; free with tile57_free). For a host to persist a
+/// per-cell tile cache to disk so the (slow) bake is one-time. null = nothing baked.
+pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8, minzoom: u8, maxzoom: u8) !?[]u8 {
+    var cf = try readCellFiles(cell_path);
+    defer cf.deinit();
+    const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
+    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, true, null, null);
+}
+
 /// Populate the process-global READ-ONLY registries (the S-100 feature catalogue and
 /// the complex-linestyle table) on the CALLING thread. Both are idempotent lazy-init
 /// and thereafter read-only. A host that renders or bakes cells from multiple threads
