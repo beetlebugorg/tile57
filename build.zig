@@ -561,6 +561,15 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
         .{ .name = "geo", .module = geo_mod },
     });
+    // Compose core (clip-to-face): pure over mvt + geo. Its own step for fast iteration,
+    // and part of the main suite.
+    const compose_deps = [_]std.Build.Module.Import{
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "geo", .module = geo_mod },
+    };
+    const compose_step = b.step("compose-test", "Run the compose-core (clip-to-face) tests");
+    _ = addPkgTest(b, compose_step, "src/scene/compose.zig", target, optimize, &compose_deps);
+    _ = addPkgTest(b, test_step, "src/scene/compose.zig", target, optimize, &compose_deps);
     // The render module: Surface contract + noop lifecycle smoke test (pins
     // the contract), resolver gates/colors, Canvas + RasterCanvas + PNG +
     // PixelSurface.
