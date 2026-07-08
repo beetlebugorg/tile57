@@ -28,26 +28,32 @@ func TestColortablesDefault(t *testing.T) {
 	}
 }
 
-// A resident chart (OpenChartBytes) portrays live, so its generated tiles carry the
-// S-52 §10.8 pick-report attributes (class / cell / s57) on every feature by default.
-// The per-cell Name badge and the pick-attrs opt-out were parameters of the dropped
-// multi-cell open (chart-api.md); the surviving live-open surface always includes the
-// pick report.
+// Pick-report attributes (class / s57 / cell, S-52 §10.8) ride on BAKED tiles by default
+// (pick_attrs on). Cell-backed charts are metadata-only — bake first, serve the archive —
+// so bake the fixture to PMTiles and scan its tiles for the pick-report keys.
 func TestPickAttrs(t *testing.T) {
 	data, err := os.ReadFile(testCell)
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	src, err := OpenChartBytes(data)
+	pm, err := BakePmtiles([]Cell{{Base: data}}, BakeOpts{MaxZoom: 24}, nil)
 	if err != nil {
-		t.Fatalf("OpenChartBytes: %v", err)
+		t.Fatalf("BakePmtiles: %v", err)
+	}
+	tmp := t.TempDir() + "/chart.pmtiles"
+	if err := os.WriteFile(tmp, pm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := OpenPMTiles(tmp)
+	if err != nil {
+		t.Fatalf("OpenPMTiles: %v", err)
 	}
 	defer src.Close()
 
 	// Scan the tile grid covering the chart bounds until a tile carries the pick-report
 	// property keys (present on every feature when pick attrs are on).
 	info := src.Info()
-	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
+	for z := info.MinZoom; z <= info.MaxZoom && z <= 16; z++ {
 		x0, y0 := lonLatToTile(info.West, info.North, z)
 		x1, y1 := lonLatToTile(info.East, info.South, z)
 		for x := x0; x <= x1; x++ {
@@ -62,10 +68,13 @@ func TestPickAttrs(t *testing.T) {
 			}
 		}
 	}
-	t.Fatal("resident chart tiles carry no pick-report attributes (class/s57) — expected them by default")
+	t.Fatal("baked tiles carry no pick-report attributes (class/s57) — expected them by default")
 }
 
-func TestOpenCellAndTile(t *testing.T) {
+// A cell-backed chart (OpenChartBytes) is METADATA-ONLY: it exposes bounds/scale for a
+// header scan but never generates tiles on demand — the chart-api contract is "bake first,
+// serve the archive". Assert the metadata is present and that Tile() is refused.
+func TestOpenCellMetadata(t *testing.T) {
 	data, err := os.ReadFile(testCell)
 	if err != nil {
 		t.Skipf("no test cell: %v", err)
@@ -77,36 +86,21 @@ func TestOpenCellAndTile(t *testing.T) {
 	defer src.Close()
 
 	info := src.Info()
-	if info.MaxZoom < info.MinZoom {
-		t.Fatalf("bad zoom range %d..%d", info.MinZoom, info.MaxZoom)
+	if info.MaxZoom < info.MinZoom || !info.HasBounds {
+		t.Fatalf("cell metadata looks unset: %+v", info)
 	}
-	if !info.HasBounds {
-		t.Fatal("expected known bounds for a single cell")
-	}
-	t.Logf("zoom %d..%d, bands=%#b, bounds W=%.4f S=%.4f E=%.4f N=%.4f",
-		info.MinZoom, info.MaxZoom, info.Bands, info.West, info.South, info.East, info.North)
+	t.Logf("zoom %d..%d, bounds W=%.4f S=%.4f E=%.4f N=%.4f",
+		info.MinZoom, info.MaxZoom, info.West, info.South, info.East, info.North)
 
-	// Address the tile covering the cell's bounds centre at each zoom; assert at
-	// least one non-empty MVT is produced across the cell's range.
-	got := false
-	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
-		tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, z)
-		body, err := src.Tile(z, tx, ty)
-		if err != nil {
-			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
-		}
-		if len(body) > 0 {
-			got = true
-			t.Logf("tile %d/%d/%d -> %d bytes MVT", z, tx, ty, len(body))
-		}
-	}
-	if !got {
-		t.Fatal("no non-empty tile produced across the cell's zoom range")
+	// Cell-backed tiles are refused by design — bake first (BakeCell / BakePmtiles).
+	if _, err := src.Tile(info.MinZoom, 0, 0); err == nil {
+		t.Fatal("cell-backed Tile() should be refused (metadata-only; bake first)")
 	}
 }
 
-// TestOpenPath opens the testdata directory as a STREAMING chart (engine enumerates
-// + reads the .000 on demand) and asserts it tiles like the byte-opened cell.
+// TestOpenPath opens a directory as a STREAMING chart (the engine enumerates cell
+// metadata + reads the .000 on demand). Like a cell-backed chart it is metadata-only:
+// bounds/zoom are known, but tiles come from a bake, not on-demand generation.
 func TestOpenPath(t *testing.T) {
 	if _, err := os.Stat(testCell); err != nil {
 		t.Skipf("no test cell: %v", err)
@@ -124,19 +118,9 @@ func TestOpenPath(t *testing.T) {
 	t.Logf("streamed: zoom %d..%d bounds W=%.4f S=%.4f E=%.4f N=%.4f",
 		info.MinZoom, info.MaxZoom, info.West, info.South, info.East, info.North)
 
-	got := false
-	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
-		tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, z)
-		body, err := src.Tile(z, tx, ty)
-		if err != nil {
-			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
-		}
-		if len(body) > 0 {
-			got = true
-		}
-	}
-	if !got {
-		t.Fatal("no non-empty tile from the streamed chart")
+	// Streaming cell-backed tiles are refused by design — bake first.
+	if _, err := src.Tile(info.MinZoom, 0, 0); err == nil {
+		t.Fatal("streaming cell-backed Tile() should be refused (metadata-only; bake first)")
 	}
 }
 

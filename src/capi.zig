@@ -69,12 +69,13 @@ fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]chart.CellI
 }
 
 /// Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
-/// same directory) by baking it to an in-memory PMTiles and serving the fast reader
-/// path — with the cell's real M_COVR coverage + compilation scale attached. For a
-/// whole ENC_ROOT directory use tile57_charts_open. See tile57.h.
+/// same directory) — or a whole ENC_ROOT directory — via the STREAMING path-open: cell
+/// metadata (name/scale/M_COVR) is enumerated up front and tiles are baked lazily per
+/// request. Unlike a bake-to-reader open, this backend exposes the per-cell list
+/// (tile57_chart_cells) — a header/metadata scan needs no tile bake. See tile57.h.
 export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
     const p = spanOpt(path) orelse return null;
-    return chart.openCellPath(p, null, true) catch null;
+    return chart.Chart.openPath(p, null, true) catch null;
 }
 
 /// Open ONE cell for METADATA ONLY (bbox + native scale + M_COVR coverage): a cheap
