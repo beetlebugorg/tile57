@@ -16,6 +16,10 @@ extern fn tg_svg_rasterize(svg: [*:0]u8, scale: f32, out_w: *c_int, out_h: *c_in
 extern fn tg_png_encode(rgba: [*]const u8, w: c_int, h: c_int, out_len: *c_int) ?[*]u8;
 extern fn tg_svg_free(p: ?*anyopaque) void;
 
+/// SDF glyph atlas for GPU text (stb_truetype), a sibling baked asset.
+pub const glyph = @import("glyph.zig");
+test { _ = glyph; }
+
 /// device px per 0.01-mm symbol unit (matches the Go oracle's raster.go pxPerUnit).
 pub const px_per_unit: f64 = 0.08;
 const px_per_mm: f64 = px_per_unit * 100.0; // 8 px/mm

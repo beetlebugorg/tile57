@@ -527,6 +527,13 @@ pub fn build(b: *std.Build) void {
     // module import does NOT pull another module's `test {}` blocks in.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+    // The sprite module (SDF glyph atlas lives here): needs the C glue
+    // (stb_truetype/nanosvg) + libc + render.
+    const sprite_test = addPkgTest(b, test_step, "src/sprite/sprite.zig", target, optimize, &.{
+        .{ .name = "render", .module = render_mod },
+    });
+    sprite_test.link_libc = true;
+    addSvgRaster(b, sprite_test);
 
     _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{});
     const s100_test = addPkgTest(b, test_step, "src/s100/s100.zig", target, optimize, &.{

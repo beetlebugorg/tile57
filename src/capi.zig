@@ -68,10 +68,57 @@ fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]chart.CellI
     return out;
 }
 
-/// Open an on-disk ENC_ROOT directory (or single .000) as a streaming chart. See tile57.h.
+/// Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
+/// same directory) by baking it to an in-memory PMTiles and serving the fast reader
+/// path — with the cell's real M_COVR coverage + compilation scale attached. For a
+/// whole ENC_ROOT directory use tile57_charts_open. See tile57.h.
 export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
     const p = spanOpt(path) orelse return null;
+    return chart.openCellPath(p, null, true) catch null;
+}
+
+/// Open ONE cell for METADATA ONLY (bbox + native scale + M_COVR coverage): a cheap
+/// parse, no tile bake — for a host's header/scan pass. Do NOT render_surface this
+/// handle (no portrayal). See tile57.h.
+export fn tile57_chart_open_header(path: ?[*:0]const u8) callconv(.c) ?*Chart {
+    const p = spanOpt(path) orelse return null;
+    return chart.openCellHeader(p, null, true) catch null;
+}
+
+/// Open ONE cell by baking only [minzoom, maxzoom] to an in-memory PMTiles — a host
+/// bakes a narrow band fast for first paint, then re-opens the full range in the
+/// background (progressive load). Renders via the fast reader path. See tile57.h.
+export fn tile57_chart_open_zoom(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8) callconv(.c) ?*Chart {
+    const p = spanOpt(path) orelse return null;
+    return chart.openCellBaked(p, null, true, minzoom, maxzoom) catch null;
+}
+
+/// Bake ONE cell (+ its updates, read from disk) to PMTiles bytes in [minzoom,
+/// maxzoom], into *out / *out_len (free with tile57_free). For persisting a per-cell
+/// tile cache to disk. 1=ok, 0=nothing baked, -1=error. See tile57.h.
+export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8, out: *[*]u8, out_len: *usize) callconv(.c) c_int {
+    const p = spanOpt(path) orelse return -1;
+    const archive = chart.bakeCellBytes(p, null, minzoom, maxzoom) catch return -1;
+    if (archive) |a| {
+        out.* = a.ptr;
+        out_len.* = a.len;
+        return 1;
+    }
+    return 0;
+}
+
+/// Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked chart — the
+/// `.cells` backend, for tile fetch / bake, not live render_surface_cb. See tile57.h.
+export fn tile57_charts_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
+    const p = spanOpt(path) orelse return null;
     return Chart.openPath(p, null, true) catch null;
+}
+
+/// Populate the process-global read-only registries (S-100 catalogue + linestyles) on
+/// the calling thread. Call ONCE on the main thread before opening/baking cells from
+/// worker threads, so concurrent bake/render is race-free. See tile57.h.
+export fn tile57_warmup() callconv(.c) void {
+    chart.warmup();
 }
 
 /// Open one in-memory ENC cell (base .000 bytes) as a resident chart. See tile57.h.
@@ -114,6 +161,7 @@ const CChartInfo = extern struct {
     // backend reports its archive's stored type; a cell backend its live
     // generation format. Appended for ABI-append-safety.
     tile_type: u8,
+    native_scale: i32, // live cell compilation scale (1:N); 0 = derive from zoom
 };
 
 // tile57_tile_type values (keep in sync with tile57.h).
@@ -128,6 +176,7 @@ export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) voi
     const zr = s.zoomRange();
     out.min_zoom = zr.min;
     out.max_zoom = zr.max;
+    out.native_scale = s.nativeScale();
     out.bands = s.bands();
     out.tile_type = switch (s.tileType()) {
         .mlt => TILE_TYPE_MLT,
@@ -146,6 +195,48 @@ export fn tile57_chart_get_info(src: ?*Chart, out: *CChartInfo) callconv(.c) voi
         out.anchor_lon = a.lon;
         out.anchor_zoom = a.zoom;
     }
+}
+
+const CQueryCb = @import("render").query.QueryCb;
+
+/// Cursor object-query at (lon,lat) for the view `zoom` (web-mercator): invokes
+/// cb->feature once per displayed feature the point falls in, with its S-57 class,
+/// attribute JSON, and source cell. 0=ok, -1=bad args. See tile57.h.
+export fn tile57_chart_query(handle: ?*Chart, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb) callconv(.c) c_int {
+    const self = handle orelse return -1;
+    const cbp = cb orelse return -1;
+    self.queryPoint(lon, lat, zoom, cbp) catch return -1;
+    return 0;
+}
+
+const CCoverageCb = extern struct {
+    ctx: ?*anyopaque,
+    ring: *const fn (?*anyopaque, lonlat: [*]const f64, npts: usize) callconv(.c) void,
+};
+
+/// The chart's M_COVR data-coverage polygons (live-cell backend only): cb->ring is
+/// called once per polygon with its exterior ring as interleaved lon,lat doubles.
+/// A baked PMTiles chart carries no coverage polygon (returns 0, no calls).
+/// 0 ok, -1 bad args. See tile57.h.
+export fn tile57_chart_coverage(handle: ?*Chart, cb: ?*const CCoverageCb) callconv(.c) c_int {
+    const self = handle orelse return -1;
+    const cbp = cb orelse return -1;
+    const polys = self.coverage() orelse return 0;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (polys) |poly| {
+        if (poly.len == 0) continue;
+        const ring = poly[0]; // exterior ring
+        if (ring.len < 3) continue;
+        const out = a.alloc(f64, ring.len * 2) catch continue;
+        for (ring, 0..) |p, i| {
+            out[2 * i] = @as(f64, @floatFromInt(p.lon_e7)) / 1e7;
+            out[2 * i + 1] = @as(f64, @floatFromInt(p.lat_e7)) / 1e7;
+        }
+        cbp.ring(cbp.ctx, out.ptr, ring.len);
+    }
+    return 0;
 }
 
 // Progress callback for tile57_bake_pmtiles / tile57_bake_bundle (matches the header
@@ -327,7 +418,7 @@ export fn tile57_chart_render_view(
         .dusk => .dusk,
         .night => .night,
     };
-    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .png) catch |e| switch (e) {
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .png, null) catch |e| switch (e) {
         error.Unsupported => return -3,
         else => return -2,
     };
@@ -431,12 +522,82 @@ export fn tile57_chart_render_pdf(
         .dusk => .dusk,
         .night => .night,
     };
-    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .pdf) catch |e| switch (e) {
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .pdf, null) catch |e| switch (e) {
         error.Unsupported => return -3,
         else => return -2,
     };
     out.* = bytes.ptr;
     out_len.* = bytes.len;
+    return 0;
+}
+
+const CbCanvas = @import("render").cb_canvas.CCanvas;
+
+/// tile57_chart_render_view's GPU/vector twin: run the SAME view portrayal, but
+/// paint every resolved, flattened primitive through the C callback table
+/// `canvas` (see tile57.h) instead of rasterising. Geometry is emitted in canvas
+/// PIXEL space (y down) in paint order; colours are resolved for the palette.
+/// Same INVERTED return convention as tile57_chart_render_view:
+///   0 ok / -1 bad handle / -2 render failure / -3 unsupported source.
+export fn tile57_chart_render_view_cb(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    canvas: ?*const CbCanvas,
+) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    const cb = canvas orelse return -2;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
+    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const palette: RenderPalette = switch (settings.scheme) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+    const bytes = c.renderView(lon, lat, zoom, width, height, palette, &settings, .callback, cb) catch |e| switch (e) {
+        error.Unsupported => return -3,
+        else => return -2,
+    };
+    chart.freeBytes(bytes); // the callback path returns an empty buffer
+    return 0;
+}
+
+const CSurface = @import("render").vector.CSurface;
+
+/// GPU vector twin of render_view_cb: run the SAME view portrayal, but emit a
+/// WORLD-SPACE tagged stream (areas/lines in web-mercator [0,1]; symbols/text as
+/// a world anchor + local reference-px outline; per-feature class + SCAMIN) to
+/// the C surface callback `surface` (see tile57.h). The host transforms geometry
+/// and pins symbols/text at a constant screen size, culling by SCAMIN — no
+/// re-portrayal per pan/zoom. Works for a baked bundle OR a live cell.
+///   0 ok / -1 bad handle / -2 render failure / -3 unsupported source.
+export fn tile57_chart_render_surface_cb(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+) callconv(.c) c_int {
+    const c = handle orelse return -1;
+    const sfc = surface orelse return -2;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
+    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const palette: RenderPalette = switch (settings.scheme) {
+        .day => .day,
+        .dusk => .dusk,
+        .night => .night,
+    };
+    c.renderSurfaceView(lon, lat, zoom, width, height, palette, &settings, sfc) catch |e| switch (e) {
+        error.Unsupported => return -3,
+        else => return -2,
+    };
     return 0;
 }
 
@@ -544,6 +705,71 @@ export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: *CAssets) callcon
         tile57_assets_free(out);
         return 0;
     };
+    return 1;
+}
+
+/// Like tile57_bake_assets but the sprite_* fields carry the MapLibre sprite-mln
+/// atlas: each symbol pivot-centred in its cell + {name:{x,y,width,height,
+/// pixelRatio}} JSON. Only sprite_json/sprite_png are filled. Free with
+/// tile57_assets_free. 1=ok, 0=error. See tile57.h.
+export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, out: *CAssets) callconv(.c) c_int {
+    out.* = .{};
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cd = spanOpt(catalog_dir) orelse "";
+    const spr = bundle.spriteMlnBytes(io, a, cd, bundle.DEFAULT_CSS, &[_][]const u8{}) catch return 0;
+    fillAssets(out, "", "", spr.json, spr.png, "", "") catch {
+        tile57_assets_free(out);
+        return 0;
+    };
+    return 1;
+}
+
+const glyph_sdf = @import("sprite").glyph;
+
+// Glyph metrics as compact JSON: {"em_px","pad","glyphs":{cp:[u0,v0,u1,v1,ox,oy,w,h,adv]}}.
+fn glyphMetricsJson(a: std.mem.Allocator, atlas: *const glyph_sdf.Atlas) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    try out.print(a, "{{\"em_px\":{d},\"pad\":{d},\"glyphs\":{{", .{ atlas.em_px, atlas.pad });
+    var it = atlas.glyphs.iterator();
+    var first = true;
+    while (it.next()) |e| {
+        const g = e.value_ptr.*;
+        if (!first) try out.append(a, ',');
+        first = false;
+        try out.print(a, "\"{d}\":[{d},{d},{d},{d},{d},{d},{d},{d},{d}]", .{ e.key_ptr.*, g.u0, g.v0, g.u1, g.v1, g.off_x, g.off_y, g.w, g.h, g.advance });
+    }
+    try out.appendSlice(a, "}}");
+    return out.toOwnedSlice(a);
+}
+
+/// SDF glyph atlas for GPU text: sprite_png = the RGBA SDF atlas, sprite_json =
+/// {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,v1,ox,oy,w,h,adv]}} (EM units).
+/// Only sprite_* filled. Free with tile57_assets_free. 1=ok, 0=error. See tile57.h.
+export fn tile57_bake_glyph_sdf(out: *CAssets) callconv(.c) c_int {
+    out.* = .{};
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const font = @import("render").font.notosans;
+    const cps = glyph_sdf.defaultCodepoints(a) catch return 0;
+    var atlas = glyph_sdf.build(a, font, cps, 32.0, 6) catch return 0;
+    const png = (atlas.encodePng(a) catch return 0) orelse return 0;
+    const json = glyphMetricsJson(a, &atlas) catch return 0;
+    out.sprite_png = (gpa.dupe(u8, png) catch {
+        tile57_assets_free(out);
+        return 0;
+    }).ptr;
+    out.sprite_png_len = png.len;
+    out.sprite_json = (gpa.dupe(u8, json) catch {
+        tile57_assets_free(out);
+        return 0;
+    }).ptr;
+    out.sprite_json_len = json.len;
     return 1;
 }
 

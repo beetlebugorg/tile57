@@ -43,6 +43,18 @@ pub const SymbolPlacement = enum { point, line };
 /// Null when the area is not a depth area.
 pub const DepthRange = struct { d1: f32, d2: f32 };
 
+/// Split an S-101 ColorFill token "NAME[,transparency]" into the colour name and
+/// an alpha byte. `transparency` is the fraction transparent (0 = opaque .. 1 =
+/// clear; e.g. `CHGRF,0.5` is 50% see-through), so alpha = (1 - transparency)*255.
+/// No comma => fully opaque. Only area fills carry transparency (line/text tokens
+/// have no comma, so they pass through unchanged).
+pub fn fillToken(token: ColorToken) struct { name: []const u8, alpha: u8 } {
+    const comma = std.mem.indexOfScalar(u8, token, ',') orelse return .{ .name = token, .alpha = 255 };
+    const t = std.fmt.parseFloat(f64, std.mem.trim(u8, token[comma + 1 ..], " ")) catch 0;
+    const a: u8 = @intFromFloat(std.math.clamp((1.0 - t) * 255.0, 0.0, 255.0));
+    return .{ .name = token[0..comma], .alpha = a };
+}
+
 /// Text-label style carried by drawText.
 ///
 /// An empty `halign` marks a MINIMAL label: no alignment/offset/halo/group was
@@ -124,6 +136,19 @@ pub const Surface = struct {
         endFeature: *const fn (*anyopaque) anyerror!void,
         /// Finalize the scene; returns encoded bytes owned by `out`.
         endScene: *const fn (*anyopaque, out: Allocator) anyerror![]u8,
+
+        // ---- Optional (appended; default null so existing vtable literals compile) ----
+
+        /// A RENDER surface's display scale (settings.size_scale). Present on
+        /// pixel/vector output surfaces so the engine can walk complex-linestyle
+        /// periods display-scaled at render time. Null (=> 1.0) on the bake encoder.
+        size_scale: ?*const fn (*anyopaque) f64 = null,
+        /// Present ONLY on the bake encoder: store an un-tessellated clipped
+        /// complex-linestyle run (tile-local integer points) + the style id so
+        /// replay can re-lookup its LsInfo and re-walk the period at render time.
+        /// The baked tile stays display-independent (the disk cache survives a
+        /// display change). Null on render surfaces (they walk, not store).
+        store_complex_run: ?*const fn (*anyopaque, style: []const u8, color: ColorToken, width_px: f64, arc0: f64, run: []const TilePoint) anyerror!void = null,
     };
 
     pub fn beginScene(self: Surface, z: u8) anyerror!void {
@@ -155,5 +180,18 @@ pub const Surface = struct {
     }
     pub fn endScene(self: Surface, out: Allocator) anyerror![]u8 {
         return self.vtable.endScene(self.ptr, out);
+    }
+
+    /// This render surface's display scale (1.0 when unset — the bake encoder).
+    pub fn sizeScale(self: Surface) f64 {
+        return if (self.vtable.size_scale) |f| f(self.ptr) else 1.0;
+    }
+    /// True on the bake encoder: complex runs are stored (not walked) here.
+    pub fn canStoreComplexRun(self: Surface) bool {
+        return self.vtable.store_complex_run != null;
+    }
+    /// Store one clipped, un-tessellated complex-linestyle run (bake path only).
+    pub fn storeComplexRun(self: Surface, style: []const u8, color: ColorToken, width_px: f64, arc0: f64, run: []const TilePoint) anyerror!void {
+        return self.vtable.store_complex_run.?(self.ptr, style, color, width_px, arc0, run);
     }
 };

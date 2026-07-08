@@ -75,12 +75,43 @@ typedef struct {
  * (the zero-initialised default) keeps them — so existing callers that pass 0 get
  * the pick report for free. */
 
-/* Open an on-disk ENC_ROOT directory (or a single .000 file) as a streaming chart:
- * the engine enumerates the cells + peeks each one's bbox/scale at open, then reads
- * cell bytes on demand (working set only), so RSS tracks what tiles need, not the
- * whole ENC_ROOT. Rules are the library's embedded catalogue. NULL/failure -> NULL.
- * */
+/* Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
+ * same directory) by BAKING it to an in-memory PMTiles and serving the fast reader
+ * render path (tile57_chart_render_surface_cb), with the cell's real M_COVR coverage
+ * (tile57_chart_coverage) and compilation scale (chart_info.native_scale) attached.
+ * The bake costs ~1-2s; a host rendering per view should run it off-thread. See the
+ * header/zoom variants for a cheap scan pass + progressive load. NULL/fail -> NULL. */
 tile57_chart *tile57_chart_open(const char *path);
+
+/* Open ONE cell for METADATA ONLY — bbox, native_scale, and M_COVR coverage — via a
+ * cheap parse with NO tile bake, for a host's chart-database/header scan. Do NOT
+ * render_surface this handle (it has no portrayal). NULL/failure -> NULL. */
+tile57_chart *tile57_chart_open_header(const char *path);
+
+/* Open ONE cell baking only [minzoom, maxzoom] to an in-memory PMTiles: bake a narrow
+ * native band fast for first paint, then re-open the full range in the background
+ * (progressive load). Renders via the fast reader path. NULL/failure -> NULL. */
+tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t maxzoom);
+
+/* Bake ONE cell (+ its .001.. updates, read from disk) to PMTiles bytes in
+ * [minzoom, maxzoom], returned in *out / *out_len (free with tile57_free). For a host
+ * to persist a per-cell tile cache to disk so the slow bake is one-time — then reopen
+ * the written file with tile57_chart_open_pmtiles. 1=ok, 0=nothing baked, -1=error. */
+int tile57_bake_cell_bytes(const char *path, uint8_t minzoom, uint8_t maxzoom,
+                           uint8_t **out, size_t *out_len);
+
+/* Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked streaming
+ * chart: enumerates cells + peeks each bbox/scale, reads bytes on demand (working
+ * set only). For tile fetch / bake, NOT live render_surface_cb. NULL/failure -> NULL. */
+tile57_chart *tile57_charts_open(const char *path);
+
+/* Populate the process-global read-only registries (the S-100 feature catalogue and
+ * the complex-linestyle table) on the calling thread. Both are idempotent lazy-init
+ * and thereafter read-only. Call this ONCE on your main thread before opening or
+ * baking cells from worker threads, so those globals are fully populated first and
+ * concurrent bake/render is race-free (the allocator is thread-safe and the portrayal
+ * context is thread-local). Cheap and safe to call more than once. */
+void tile57_warmup(void);
 
 /* Open one in-memory ENC cell (base .000 bytes) as a resident chart. Bytes are copied.
  * NULL/failure -> NULL. */
@@ -106,6 +137,8 @@ typedef struct {
     bool     has_bounds; double west, south, east, north;
     bool     has_anchor; double anchor_lat, anchor_lon, anchor_zoom;
     uint8_t  tile_type;                                   /* tile57_tile_type */
+    int32_t  native_scale; /* compilation scale (1:N) for a live cell; 0 = unknown
+                            * (PMTiles: derive the scale from the zoom band instead) */
 } tile57_chart_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_chart_info *out);
 
@@ -192,6 +225,16 @@ typedef struct {
     uint8_t *pattern_json; size_t pattern_json_len;  uint8_t *pattern_png; size_t pattern_png_len;
 } tile57_assets;
 int  tile57_bake_assets(const char *catalog_dir, tile57_assets *out);
+/* Like tile57_bake_assets but sprite_json/sprite_png carry the MapLibre sprite-mln
+ * atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON); other
+ * fields are NULL. Free with tile57_assets_free. 1=ok, 0=error. */
+int  tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out);
+/* SDF glyph atlas for GPU text: sprite_png is the RGBA signed-distance-field atlas
+ * of the label font; sprite_json is {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,
+ * v1,off_x,off_y,w,h,advance]}} with the quad geometry in EM units (multiply by the
+ * text pixel size). A host draws each glyph as a textured quad sampling the SDF.
+ * Only sprite_* filled. Free with tile57_assets_free. 1=ok, 0=error. */
+int  tile57_bake_glyph_sdf(tile57_assets *out);
 void tile57_assets_free(tile57_assets *out);
 
 /* Release a chart and all cached tiles. Must not be called while any renderer
@@ -255,6 +298,142 @@ int tile57_chart_render_pdf(tile57_chart *chart, double lon, double lat, double 
                             uint32_t width, uint32_t height,
                             const struct tile57_mariner *m,
                             uint8_t **out, size_t *out_len);
+
+/* ---- callback Canvas: tile57_chart_render_view's GPU/vector twin ----------
+ * Run the SAME view portrayal as tile57_chart_render_view, but paint every
+ * resolved, flattened primitive through a table of C function pointers instead
+ * of rasterising to PNG. The embedder (e.g. a GPU chart plugin) feeds these to
+ * its own renderer. Geometry is emitted in canvas PIXEL space (y down), in
+ * final paint order; colours are fully resolved for the active palette. */
+typedef struct { float x, y; } tile57_point;   /* canvas pixels */
+typedef struct { uint8_t r, g, b, a; } tile57_rgba;  /* resolved straight-alpha */
+/* A multi-ring path: flat vertex array `pts`; ring k spans
+ * [ring_starts[k], ring_starts[k+1]) (last runs to `n`). Rings closed implicitly. */
+typedef struct {
+    const tile57_point *pts;  uint32_t n;
+    const uint32_t *ring_starts;  uint32_t ring_count;
+} tile57_rings;
+/* The paint table. Every callback gets `ctx` back verbatim. Calls arrive in
+ * paint order (no priority key needed). */
+typedef struct {
+    void *ctx;
+    /* Fill closed rings; even_odd != 0 selects the even-odd rule. */
+    void (*fill_path)   (void *ctx, const tile57_rings *rings, tile57_rgba color, int even_odd);
+    /* Stroke polylines width_px wide; dash on/off in px (0,0 = solid). */
+    void (*stroke_path) (void *ctx, const tile57_rings *rings, float width_px,
+                         float dash_on, float dash_off, tile57_rgba color);
+    /* Fill rings with a repeating RGBA8 pattern cell (pw*ph*4 bytes). */
+    void (*fill_pattern)(void *ctx, const tile57_rings *rings, uint32_t pw, uint32_t ph,
+                         const uint8_t *rgba);
+    /* Draw a shaped label as flattened outline rings (px), optional halo
+     * (halo.a == 0 => none). */
+    void (*draw_glyphs) (void *ctx, const tile57_rings *outline, tile57_rgba color,
+                         tile57_rgba halo, float halo_px);
+} tile57_canvas_cb;
+/* Returns (INVERTED, matches tile57_chart_render_view): 0 ok / -1 bad handle /
+ * -2 render failure / -3 unsupported source. Same threading rules as the rest
+ * of a tile57_chart (serialise per handle). */
+int tile57_chart_render_view_cb(tile57_chart *chart, double lon, double lat, double zoom,
+                                uint32_t width, uint32_t height,
+                                const struct tile57_mariner *m,
+                                const tile57_canvas_cb *canvas);
+
+/* ---- world-space Surface callback: the GPU vector twin ----------------------
+ * tile57_chart_render_surface_cb runs the SAME view portrayal as
+ * tile57_chart_render_view_cb but emits a WORLD-SPACE, semantically TAGGED
+ * stream rather than resolved pixels: area/line geometry in web-mercator [0,1]
+ * (y down); point symbols and text as a WORLD anchor + a LOCAL outline in
+ * reference px (a constant screen size); every draw call tagged with its
+ * feature's S-57 class and SCAMIN. A GPU host applies its own view transform,
+ * pins symbols/text at the anchor, and culls by SCAMIN per frame — so pan and
+ * zoom re-portray NOTHING. Works for a baked bundle (tile replay) or a live
+ * cell (full S-52 portrayal). See render_surface.md. */
+typedef struct { double x, y; } tile57_world_point;  /* web-mercator [0,1], y down */
+typedef struct { float  x, y; } tile57_local_point;  /* anchor-relative reference px */
+
+typedef struct {
+    const tile57_world_point *pts;  uint32_t n;
+    const uint32_t *ring_starts;    uint32_t ring_count;
+} tile57_world_rings;
+typedef struct {
+    const tile57_local_point *pts;  uint32_t n;
+    const uint32_t *ring_starts;    uint32_t ring_count;
+} tile57_local_rings;
+
+/* The feature the following draw calls belong to. `cls` is the S-57 object-class
+ * acronym (NUL-terminated; "" if none); `scamin` is the SCAMIN 1:N denominator
+ * (<= 0 => always visible); `plane` is the S-52 draw priority (paint hint). */
+typedef struct {
+    const char *cls;
+    int64_t scamin;
+    int32_t plane;
+} tile57_feature;
+
+/* Draw table. Pointers are valid only for the duration of the call; ctx is
+ * passed back verbatim. Calls arrive in Surface emission order (the host owns
+ * final paint order + label collision). */
+typedef struct {
+    void *ctx;
+    /* Filled area (world). even_odd != 0 selects the even-odd rule. */
+    void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings, tile57_rgba color, int even_odd);
+    /* Stroked line (world); width in reference px, dash on/off px (0,0 solid). */
+    void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines, float width_px, float dash_on, float dash_off, tile57_rgba color);
+    /* Point symbol: world anchor + local outline (px). even_odd for compound
+     * glyphs; stroke_w > 0 => the rings are a polyline stroked stroke_w px wide. */
+    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_rgba color, int even_odd, float stroke_w);
+    /* Text: world anchor + local glyph outlines (px, even-odd) + halo
+     * (halo.a == 0 => none). */
+    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px);
+    /* Point symbol as a sprite: symbol name (ptr,len) to look up in the atlas
+     * (tile57_bake_assets sprite_png/json), world anchor, rotation (deg), and the
+     * symbol's un-rotated half-extent in reference px. Draw the atlas cell as a
+     * quad of that half-size, centred on the anchor. NULL => symbols tessellate
+     * via draw_symbol instead. Must be the LAST field (ABI-appended). */
+    void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
+    /* Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
+     * prefix) + the fill rings (world). Tile the cell across the polygon at a
+     * constant screen size. NULL => flat tint. */
+    void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, const tile57_world_rings *rings);
+    /* Text as a STRING for the host's SDF glyph atlas (tile57_bake_glyph_sdf):
+     * world anchor + the anchor-relative baseline-left origin in px (ox,oy, with
+     * alignment already applied) + UTF-8 text (ptr,len) + the glyph pixel size +
+     * colour + halo. The host lays the string out from its glyph metrics and draws
+     * SDF quads. NULL => text tessellates via draw_text. Must be the LAST field. */
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, tile57_rgba color, tile57_rgba halo);
+} tile57_surface_cb;
+
+/* Returns 0 ok / -1 bad handle / -2 render failure / -3 unsupported source. */
+int tile57_chart_render_surface_cb(tile57_chart *chart, double lon, double lat, double zoom,
+                                   uint32_t width, uint32_t height,
+                                   const struct tile57_mariner *m,
+                                   const tile57_surface_cb *surface);
+
+/* Cursor object-query (S-52 pick): feature() is invoked once per feature the
+ * point (lon,lat) falls in — area point-in-polygon, line/point within a small
+ * radius — with the S-57 object-class acronym, the attribute JSON (acronym->value),
+ * and the source cell name. Pointers are valid only for the duration of the call. */
+typedef struct {
+    void *ctx;
+    void (*feature)(void *ctx, const char *cls, size_t cls_len,
+                    const char *s57, size_t s57_len,
+                    const char *cell, size_t cell_len);
+} tile57_query_cb;
+/* `zoom` is the current view's web-mercator zoom: the query uses the tile at that
+ * zoom, so it reports the features actually DISPLAYED there (SCAMIN-bucketed) and
+ * the pick tolerance tracks on-screen distance. Returns 0 ok, -1 bad args. */
+int tile57_chart_query(tile57_chart *chart, double lon, double lat, double zoom,
+                       const tile57_query_cb *cb);
+
+/* The chart's M_COVR(CATCOV=1) data-coverage polygons — the real coverage a host
+ * reports so a quilt fills gaps to coarser cells (vs. the bounding box). ring() is
+ * called once per polygon with its exterior ring as `npts` interleaved lon,lat
+ * doubles (valid only during the call). Only the live-cell backend (an opened
+ * .000) carries this; a baked PMTiles returns 0 with no calls. 0 ok, -1 bad args. */
+typedef struct {
+    void *ctx;
+    void (*ring)(void *ctx, const double *lonlat, size_t npts);
+} tile57_coverage_cb;
+int tile57_chart_coverage(tile57_chart *chart, const tile57_coverage_cb *cb);
 
 /* The chart's per-cell metadata as a JSON array, one object per cell:
  *   [{"name":"US5MD1MC","scale":12000,"edition":"13","update":"3",

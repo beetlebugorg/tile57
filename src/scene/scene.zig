@@ -674,6 +674,9 @@ pub const TileSurface = struct {
         .drawText = drawText,
         .endFeature = endFeature,
         .endScene = endScene,
+        // Bake path: store complex runs un-tessellated (no size_scale set — bake is
+        // native; replay re-walks the period display-scaled).
+        .store_complex_run = storeComplexRun,
     };
 
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
@@ -767,6 +770,22 @@ pub const TileSurface = struct {
         if (valdco) |v| try props.append(s.a, .{ .key = "valdco", .value = .{ .double = v } });
         try appendMeta(s.a, &props, s.cur);
         try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = lines, .properties = props.items });
+    }
+
+    /// Store one clipped complex-linestyle run un-tessellated (display-independent
+    /// bake): a `lines` feature tagged with `ls_style`/`ls_arc0` so replayTile
+    /// re-looks-up the LsInfo and re-walks the period display-scaled at render time.
+    fn storeComplexRun(ctx: *anyopaque, style: []const u8, color: rs.ColorToken, width_px: f64, arc0: f64, run: []const rs.TilePoint) anyerror!void {
+        const s = sp(ctx);
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(s.a, .{ .key = "color_token", .value = .{ .string = color } });
+        try props.append(s.a, .{ .key = "width_px", .value = .{ .double = width_px } });
+        try props.append(s.a, .{ .key = "ls_style", .value = .{ .string = style } });
+        try props.append(s.a, .{ .key = "ls_arc0", .value = .{ .double = arc0 } });
+        try appendMeta(s.a, &props, s.cur);
+        const parts = try s.a.alloc([]const mvt.Point, 1);
+        parts[0] = run;
+        try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -1769,7 +1788,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         if (!std.mem.eql(u8, ln.style, "solid")) {
             if (g_linestyles.get(ln.style)) |info| {
                 // Complex linestyle: tessellated dash runs + tangent-rotated symbols.
-                try emitComplexLine(a, stroke_geo, info, ln.color, !opts.suppress_points, z, x, y, box, &fmeta, surf);
+                try emitComplexLine(a, stroke_geo, info, ln.style, ln.color, !opts.suppress_points, z, x, y, box, &fmeta, surf);
                 continue;
             }
         }
@@ -2238,11 +2257,68 @@ fn lsSubPathByArc(a: Allocator, rp: []const tile.FPoint, rarc: []const f64, d0_i
 
 /// Tessellate a complex linestyle along a feature's geometry parts into this tile.
 /// `emit_symbols` is false when best-band suppression drops the coarse cell's points.
-fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, fmeta: *const rs.FeatureMeta, surf: rs.Surface) !void {
+/// Stage B: walk ONE clipped tile-local run by the complex-linestyle period,
+/// emitting dash "on" segments and tangent-rotated embedded symbols. Runs are
+/// already tile-local (no z/x/y needed). At RENDER the period AND the px offsets
+/// are multiplied by `size_scale`, so spacing and brick size both scale with the
+/// display (vector.zig scales the brick to match) and the BAKED tiles stay
+/// display-independent. `size_scale <= 0` (bake / CLI) collapses to 1.0.
+fn walkComplexRun(a: Allocator, rp: []const tile.FPoint, arc0: f64, info: LsInfo, color: []const u8, size_scale: f64, emit_symbols: bool, surf: rs.Surface) !void {
+    if (rp.len < 2) return;
     const ext: f64 = @floatFromInt(tile.EXTENT);
     const px_scale = ext / 256.0; // figures are laid out in 256-px-per-tile space
-    const period = info.period_px * px_scale;
+    const ss = if (size_scale > 0) size_scale else 1.0;
+    const period = info.period_px * px_scale * ss;
     if (period < 1e-6) return;
+    const rarc = try a.alloc(f64, rp.len);
+    rarc[0] = 0;
+    for (1..rp.len) |i| rarc[i] = rarc[i - 1] + std.math.hypot(rp[i].x - rp[i - 1].x, rp[i].y - rp[i - 1].y);
+    const g0 = arc0;
+    const run_end = g0 + rarc[rp.len - 1];
+    var k: i64 = @intFromFloat(@floor(g0 / period));
+    while (@as(f64, @floatFromInt(k)) * period < run_end) : (k += 1) {
+        const base = @as(f64, @floatFromInt(k)) * period;
+        for (info.on_runs) |on| { // dash on-runs -> line segments
+            const lo = @max(base + on[0] * px_scale * ss, g0);
+            const hi = @min(base + on[1] * px_scale * ss, run_end);
+            if (hi - lo < 1e-6) continue;
+            const sub = try lsSubPathByArc(a, rp, rarc, lo - g0, hi - g0);
+            if (sub.len < 2) continue;
+            const seg = try a.alloc(mvt.Point, sub.len);
+            for (sub, 0..) |spt, i| seg[i] = tile.quantizeF(spt);
+            const segparts = try a.alloc([]const mvt.Point, 1);
+            segparts[0] = seg;
+            try surf.strokeLine(color, info.width_px, .solid, segparts, null);
+        }
+        if (!emit_symbols) continue;
+        for (info.symbols) |sym| { // embedded symbols -> tangent-rotated points
+            if (sym.name.len == 0) continue;
+            const gp = base + sym.offset_px * px_scale * ss;
+            if (gp < g0 or gp > run_end) continue;
+            const tp = lsPointAndTangent(rp, rarc, gp - g0) orelse continue;
+            const qp = tile.quantizeF(tp.p);
+            // Own each embedded symbol by exactly ONE tile: emit it only when its
+            // position lands inside the RAW tile [0,EXTENT). The dash-run lines
+            // keep the buffered clip (seamless strokes across the seam), but a
+            // symbol in the buffer zone would otherwise be tessellated by BOTH
+            // this tile and its neighbour -> the same symbol drawn twice at every
+            // tile seam (user-reported "double symbols"). Half-open so a symbol on
+            // the seam belongs to exactly one side (no gap, no double).
+            if (qp.x < 0 or qp.x >= tile.EXTENT or qp.y < 0 or qp.y >= tile.EXTENT) continue;
+            const rot = std.math.atan2(tp.dy, tp.dx) * 180.0 / std.math.pi;
+            try surf.drawSymbol(sym.name, qp, rot, SYMBOL_SCALE, true, .line, null);
+        }
+    }
+}
+
+/// Tessellate a complex linestyle along a feature's geometry parts into this tile.
+/// `emit_symbols` is false when best-band suppression drops the coarse cell's points.
+/// `style` is the linestyle id: at BAKE we store each clipped run un-tessellated
+/// (tagged with the id) so replay can re-walk the period display-scaled; on a live
+/// render surface we walk it here at that surface's size_scale.
+fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, style: []const u8, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, fmeta: *const rs.FeatureMeta, surf: rs.Surface) !void {
+    const store = surf.canStoreComplexRun();
+    const ss = surf.sizeScale();
     try surf.beginFeature(fmeta);
     for (parts) |part| {
         if (part.len < 2) continue;
@@ -2252,46 +2328,15 @@ fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, colo
         arc[0] = 0;
         for (1..part.len) |i| arc[i] = arc[i - 1] + std.math.hypot(fpts[i].x - fpts[i - 1].x, fpts[i].y - fpts[i - 1].y);
         for (try tile.clipLinePhased(a, fpts, arc, box)) |run| {
-            const rp = run.points;
-            if (rp.len < 2) continue;
-            const rarc = try a.alloc(f64, rp.len);
-            rarc[0] = 0;
-            for (1..rp.len) |i| rarc[i] = rarc[i - 1] + std.math.hypot(rp[i].x - rp[i - 1].x, rp[i].y - rp[i - 1].y);
-            const g0 = run.arc0;
-            const run_end = g0 + rarc[rp.len - 1];
-            var k: i64 = @intFromFloat(@floor(g0 / period));
-            while (@as(f64, @floatFromInt(k)) * period < run_end) : (k += 1) {
-                const base = @as(f64, @floatFromInt(k)) * period;
-                for (info.on_runs) |on| { // dash on-runs -> line segments
-                    const lo = @max(base + on[0] * px_scale, g0);
-                    const hi = @min(base + on[1] * px_scale, run_end);
-                    if (hi - lo < 1e-6) continue;
-                    const sub = try lsSubPathByArc(a, rp, rarc, lo - g0, hi - g0);
-                    if (sub.len < 2) continue;
-                    const seg = try a.alloc(mvt.Point, sub.len);
-                    for (sub, 0..) |spt, i| seg[i] = tile.quantizeF(spt);
-                    const segparts = try a.alloc([]const mvt.Point, 1);
-                    segparts[0] = seg;
-                    try surf.strokeLine(color, info.width_px, .solid, segparts, null);
-                }
-                if (!emit_symbols) continue;
-                for (info.symbols) |sym| { // embedded symbols -> tangent-rotated points
-                    if (sym.name.len == 0) continue;
-                    const gp = base + sym.offset_px * px_scale;
-                    if (gp < g0 or gp > run_end) continue;
-                    const tp = lsPointAndTangent(rp, rarc, gp - g0) orelse continue;
-                    const qp = tile.quantizeF(tp.p);
-                    // Own each embedded symbol by exactly ONE tile: emit it only when its
-                    // position lands inside the RAW tile [0,EXTENT). The dash-run lines
-                    // keep the buffered clip (seamless strokes across the seam), but a
-                    // symbol in the buffer zone would otherwise be tessellated by BOTH
-                    // this tile and its neighbour -> the same symbol drawn twice at every
-                    // tile seam (user-reported "double symbols"). Half-open so a symbol on
-                    // the seam belongs to exactly one side (no gap, no double).
-                    if (qp.x < 0 or qp.x >= tile.EXTENT or qp.y < 0 or qp.y >= tile.EXTENT) continue;
-                    const rot = std.math.atan2(tp.dy, tp.dx) * 180.0 / std.math.pi;
-                    try surf.drawSymbol(sym.name, qp, rot, SYMBOL_SCALE, true, .line, null);
-                }
+            if (run.points.len < 2) continue;
+            if (store) {
+                // BAKE: store the clipped run un-tessellated (display-independent).
+                const qpts = try a.alloc(mvt.Point, run.points.len);
+                for (run.points, 0..) |p, i| qpts[i] = tile.quantizeF(p);
+                try surf.storeComplexRun(style, color, info.width_px, run.arc0, qpts);
+            } else {
+                // LIVE / CLI render: walk the period at this surface's display scale.
+                try walkComplexRun(a, run.points, run.arc0, info, color, ss, emit_symbols, surf);
             }
         }
     }
@@ -2381,7 +2426,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 
     // Tessellate the registered complex linestyle (dashes + the A/B letter symbols).
     if (g_linestyles.get(boundary)) |info| {
-        try emitComplexLine(a, nav_parts, info, "CHGRD", !opts.suppress_points, z, x, y, box, &fmeta, surf);
+        try emitComplexLine(a, nav_parts, info, boundary, "CHGRD", !opts.suppress_points, z, x, y, box, &fmeta, surf);
         return;
     }
     // No registered linestyle (live/host path, no table): a plain dashed CHGRD ring.
@@ -3567,6 +3612,8 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
         .vg = propInt(props, "vg", 0),
         .scamin = if (propOf(props, "scamin")) |_| propInt(props, "scamin", 0) else null,
         .class = propStr(props, "class"),
+        .s57_json = propStr(props, "s57"), // cursor-pick attribute blob (baked)
+        .cell_name = propStr(props, "cell"), // source cell badge (baked)
         .band = @intCast(std.math.clamp(propInt(props, "band", 0), 0, 255)),
         .bnd = propInt(props, "bnd", 2),
         .pts = propInt(props, "pts", 2),
@@ -3577,7 +3624,7 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
 
 /// Replay one decoded tile's layers as Surface calls (between the caller's
 /// begin/endScene). Layer names route exactly as TileSurface emitted them.
-pub fn replayTile(surf: rs.Surface, layers: []const mvt.DecodedLayer) !void {
+pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLayer) !void {
     for (layers) |layer| {
         const is_areas = std.mem.startsWith(u8, layer.name, "areas");
         const is_patterns = std.mem.startsWith(u8, layer.name, "area_patterns");
@@ -3596,6 +3643,27 @@ pub fn replayTile(surf: rs.Surface, layers: []const mvt.DecodedLayer) !void {
                 const dr: ?rs.DepthRange = if (d1) |v| .{ .d1 = @floatCast(v), .d2 = @floatCast(propF64(f.properties, "drval2") orelse v) } else null;
                 try surf.fillArea(propStr(f.properties, "color_token"), f.parts, dr);
             } else if (is_lines) {
+                // Complex (symbolised) linestyle: the bake stored the clipped run
+                // un-tessellated (tagged ls_style). Re-walk the period at the render
+                // surface's display scale so spacing + brick size track the display.
+                const ls_style = propStr(f.properties, "ls_style");
+                if (ls_style.len > 0) {
+                    if (g_linestyles.get(ls_style)) |info| {
+                        const color = propStr(f.properties, "color_token");
+                        const arc0 = propF64(f.properties, "ls_arc0") orelse 0;
+                        for (f.parts) |part| {
+                            if (part.len < 2) continue;
+                            const fpts = try a.alloc(tile.FPoint, part.len);
+                            for (part, 0..) |p, i| fpts[i] = .{ .x = @floatFromInt(p.x), .y = @floatFromInt(p.y) };
+                            try walkComplexRun(a, fpts, arc0, info, color, surf.sizeScale(), true, surf);
+                        }
+                        continue;
+                    }
+                    // Style not registered (host without the table): fall back to a
+                    // plain dashed stroke so the line never disappears.
+                    try surf.strokeLine(propStr(f.properties, "color_token"), propF64(f.properties, "width_px") orelse 1, .dashed, f.parts, null);
+                    continue;
+                }
                 const dash: rs.Dash = if (std.mem.eql(u8, propStr(f.properties, "dash"), "solid")) .solid else .dashed;
                 try surf.strokeLine(propStr(f.properties, "color_token"), propF64(f.properties, "width_px") orelse 1, dash, f.parts, propF64(f.properties, "valdco"));
             } else if (is_points) {

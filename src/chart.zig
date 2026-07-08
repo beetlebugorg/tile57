@@ -102,6 +102,14 @@ const CellBackend = struct {
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     portray_arena: ?*std.heap.ArenaAllocator = null,
+    coverage: []const []const []const s57.LonLat = &.{}, // M_COVR (in portray_arena)
+    cscl: i32 = 0, // compilation scale (DSPM CSCL, 1:N)
+    // Baker-style per-cell caches (in portray_arena), built once at open so each of
+    // the view's tiles reuses them instead of re-assembling geometry + re-projecting
+    // + re-processing every feature every rebuild (see renderSurfaceView's .cell arm).
+    geo: ?scene.GeoParts = null, // assembled ring geometry
+    geo_world: ?scene.GeoWorld = null, // its web-mercator projection
+    feat_bbox: ?[]const ?[4]f64 = null, // per-feature lon/lat bbox (spatial cull)
 };
 
 // One cell in the lazy ENC_ROOT index: its owned bytes + cheap metadata (bbox +
@@ -432,18 +440,25 @@ fn openPmtiles(copy: []u8) ?*Chart {
 // but does not take ownership. Portrayal failure is non-fatal (classify() fallback).
 fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const u8) ?CellBackend {
     const cell = s57.parseCellWithUpdates(gpa, base, updates) catch return null;
-    var cb = CellBackend{ .cell = cell };
+    var cb = CellBackend{ .cell = cell, .cscl = s57.peekScale(gpa, base) orelse 0 };
     const pa = gpa.create(std.heap.ArenaAllocator) catch return cb;
     pa.* = std.heap.ArenaAllocator.init(gpa);
+    cb.portray_arena = pa;
+    // Real M_COVR data-coverage polygons for the host to report as chart coverage.
+    cb.coverage = cb.cell.mcovrCoverage(pa.allocator());
     if (portray.portrayCellVariants(pa.allocator(), &cb.cell, dir)) |cp| {
         cb.portrayal = cp.base;
         cb.portrayal_plain = cp.plain;
         cb.portrayal_simplified = cp.simplified;
-        cb.portray_arena = pa;
-    } else |_| {
-        pa.deinit();
-        gpa.destroy(pa);
-    }
+    } else |_| {}
+    // Assemble geometry + its projection + per-feature bboxes ONCE (the baker's
+    // per-cell caches) so live per-view rendering reuses them across the view's tiles
+    // instead of re-assembling + re-projecting + re-processing every feature per tile.
+    if (scene.buildGeoCache(pa.allocator(), &cb.cell)) |g| {
+        cb.geo = g;
+        cb.geo_world = scene.buildGeoWorld(pa.allocator(), g) catch null;
+        cb.feat_bbox = scene.buildFeatBBox(pa.allocator(), &cb.cell, g) catch null;
+    } else |_| {}
     return cb;
 }
 
@@ -463,6 +478,141 @@ fn openCell(bytes: []const u8, rules_dir: ?[]const u8) ?*Chart {
     };
     src.* = .{ .backend = .{ .cell = cb }, .data = null, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
     return src;
+}
+
+/// A single ENC cell's on-disk bytes: base .000 + its sequential .001.. update chain.
+const CellFiles = struct {
+    base: []u8,
+    updates: [][]u8,
+    fn deinit(self: *CellFiles) void {
+        gpa.free(self.base);
+        for (self.updates) |u| gpa.free(u);
+        gpa.free(self.updates);
+    }
+};
+
+/// Read a .000 cell + its .001.. updates from the cell's directory into gpa buffers.
+fn readCellFiles(path: []const u8) !CellFiles {
+    const threaded = try gpa.create(std.Io.Threaded);
+    threaded.* = .init(gpa, .{});
+    defer {
+        threaded.deinit();
+        gpa.destroy(threaded);
+    }
+    const io = threaded.io();
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    defer dir.close(io);
+
+    const bn = std.fs.path.basename(path);
+    const base = try dir.readFileAlloc(io, bn, gpa, .unlimited);
+    errdefer gpa.free(base);
+    var updates = std.ArrayList([]u8).empty;
+    errdefer {
+        for (updates.items) |u| gpa.free(u);
+        updates.deinit(gpa);
+    }
+    if (bn.len > 4) {
+        const stem = bn[0 .. bn.len - 4]; // strip ".000"
+        var u: u32 = 1;
+        while (u <= 999) : (u += 1) {
+            const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
+            defer gpa.free(upn);
+            const ub = dir.readFileAlloc(io, upn, gpa, .unlimited) catch break;
+            updates.append(gpa, ub) catch {
+                gpa.free(ub);
+                break;
+            };
+        }
+    }
+    return .{ .base = base, .updates = try updates.toOwnedSlice(gpa) };
+}
+
+/// Open a SINGLE .000 cell (+ updates) for its METADATA ONLY — bbox, compilation
+/// scale, and M_COVR coverage — via a cheap parse (no portrayal, no geometry cache,
+/// no tile bake). For the host's header/scan pass, where nothing renders. The
+/// resulting `.cell` chart must NOT be render_surface'd (it has no portrayal).
+pub fn openCellHeader(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
+    _ = rules_dir;
+    var cf = try readCellFiles(path);
+    defer cf.deinit();
+    const cell = s57.parseCellWithUpdates(gpa, cf.base, cf.updates) catch return error.OpenFailed;
+    var cb = CellBackend{ .cell = cell, .cscl = s57.peekScale(gpa, cf.base) orelse 0 };
+    const pa = gpa.create(std.heap.ArenaAllocator) catch {
+        freeCellBackend(&cb);
+        return error.OpenFailed;
+    };
+    pa.* = std.heap.ArenaAllocator.init(gpa);
+    cb.portray_arena = pa;
+    cb.coverage = cb.cell.mcovrCoverage(pa.allocator());
+    const src = gpa.create(Chart) catch {
+        freeCellBackend(&cb);
+        return error.OpenFailed;
+    };
+    src.* = .{ .backend = .{ .cell = cb }, .cache = std.AutoHashMap(u64, []u8).init(gpa), .pick_attrs = pick_attrs };
+    return src;
+}
+
+/// Open a SINGLE .000 cell (+ updates) by BAKING it to an in-memory PMTiles across
+/// [minzoom, maxzoom] and serving it via the fast `.reader` path — a live cell
+/// re-portrayed per view is orders of magnitude slower. The baked tiles carry no
+/// M_COVR / CSCL, so the source cell's real coverage + compilation scale are captured
+/// and attached (coverage()/nativeScale()). A host can bake a narrow band quickly
+/// then re-open the full range in the background (progressive load).
+pub fn openCellBaked(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool, minzoom: u8, maxzoom: u8) !*Chart {
+    var cf = try readCellFiles(path);
+    defer cf.deinit();
+    const cscl = s57.peekScale(gpa, cf.base) orelse 0;
+    var cov_arena = try gpa.create(std.heap.ArenaAllocator);
+    cov_arena.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer {
+        cov_arena.deinit();
+        gpa.destroy(cov_arena);
+    }
+    var coverage: []const []const []const s57.LonLat = &.{};
+    if (s57.parseCellWithUpdates(gpa, cf.base, cf.updates)) |parsed| {
+        var cell = parsed;
+        coverage = cell.mcovrCoverage(cov_arena.allocator()); // assembled into cov_arena
+        cell.deinit();
+    } else |_| {}
+
+    const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
+    const archive = (bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, pick_attrs, null, null) catch null) orelse return error.OpenFailed;
+    defer gpa.free(archive);
+    const src = try Chart.openBytes(archive, .pmtiles, rules_dir);
+    src.cscl_override = cscl;
+    src.coverage_override = coverage;
+    src.coverage_arena = cov_arena;
+    return src;
+}
+
+/// Bake the full zoom range (the default single-cell open).
+pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
+    return openCellBaked(path, rules_dir, pick_attrs, 0, 18);
+}
+
+/// Bake a SINGLE .000 cell (+ updates) to a PMTiles archive in [minzoom, maxzoom] and
+/// return the bytes (gpa-owned; free with tile57_free). For a host to persist a
+/// per-cell tile cache to disk so the (slow) bake is one-time. null = nothing baked.
+pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8, minzoom: u8, maxzoom: u8) !?[]u8 {
+    var cf = try readCellFiles(cell_path);
+    defer cf.deinit();
+    const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
+    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, true, null, null);
+}
+
+/// Populate the process-global READ-ONLY registries (the S-100 feature catalogue and
+/// the complex-linestyle table) on the CALLING thread. Both are idempotent lazy-init
+/// and thereafter read-only. A host that renders or bakes cells from multiple threads
+/// MUST call this once on its main thread before spawning them: then concurrent
+/// bake/render is race-free (the allocator is thread-safe, the portrayal context is
+/// thread-local, and these two globals are already populated so nobody writes them).
+pub fn warmup() void {
+    catalogue.warmUp();
+    var ls_srcs = std.ArrayList(assets.LineStyleSrc).empty;
+    defer ls_srcs.deinit(gpa);
+    for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+    scene.registerLinestylesXml(gpa, ls_srcs.items);
 }
 
 // Parallel open worker: peek each cell's band + bbox and copy its bytes.
@@ -518,6 +668,13 @@ pub const Chart = struct {
     // backend ignores it — stored tiles serve verbatim in their baked encoding
     // (see tileType).
     tile_format: scene.TileFormat = .mvt,
+    // A live cell baked to an in-memory PMTiles (openCellBaked) is a .reader for
+    // fast render, but still carries the source cell's real M_COVR coverage and
+    // compilation scale (the baked tiles don't). These override coverage()/
+    // nativeScale(); coverage_arena owns the copied polygons (freed in deinit).
+    coverage_override: []const []const []const s57.LonLat = &.{},
+    coverage_arena: ?*std.heap.ArenaAllocator = null,
+    cscl_override: i32 = 0,
 
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
@@ -689,6 +846,10 @@ pub const Chart = struct {
         while (it.next()) |v| gpa.free(v.*);
         self.cache.deinit();
         if (self.data) |d| gpa.free(d);
+        if (self.coverage_arena) |ca| {
+            ca.deinit();
+            gpa.destroy(ca);
+        }
         gpa.destroy(self);
     }
 
@@ -697,6 +858,29 @@ pub const Chart = struct {
         return switch (self.backend) {
             .reader => .pmtiles,
             .cell, .cells => .s57_cell,
+        };
+    }
+
+    /// The cell's M_COVR(CATCOV=1) data-coverage polygons (polygon -> rings ->
+    /// lon/lat points), for the host to report as chart coverage so OpenCPN quilts
+    /// gaps to coarser cells. Only the live-cell backend has it (a baked PMTiles
+    /// carries no coverage polygon); null otherwise.
+    pub fn coverage(self: *const Chart) ?[]const []const []const s57.LonLat {
+        if (self.coverage_override.len > 0) return self.coverage_override;
+        return switch (self.backend) {
+            .cell => |*c| if (c.coverage.len > 0) c.coverage else null,
+            else => null,
+        };
+    }
+
+    /// The cell's compilation scale (DSPM CSCL, 1:N) — the live-cell chart's native
+    /// scale, so the host doesn't derive an over-detailed one from the 0..18 zoom
+    /// range. 0 (unknown) for a PMTiles chart (derive from the zoom band instead).
+    pub fn nativeScale(self: *const Chart) i32 {
+        if (self.cscl_override != 0) return self.cscl_override;
+        return switch (self.backend) {
+            .cell => |*c| c.cscl,
+            else => 0,
         };
     }
 
@@ -869,7 +1053,7 @@ pub const Chart = struct {
     /// labels + declutter over the whole canvas. Returns PNG bytes (gpa-owned;
     /// free with freeBytes). Cell-backed sources only; a baked PMTiles source
     /// has no portrayal to render from (bundle-sourced rendering is future work).
-    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, output: render.pixel.Output) ![]u8 {
+    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, output: render.pixel.Output, cb_table: ?*const render.cb_canvas.CCanvas) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -905,6 +1089,7 @@ pub const Chart = struct {
         var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, @import("tiles").tile.EXTENT);
         ps.store = store.asStore();
         ps.output = output;
+        ps.cb = cb_table;
 
         switch (self.backend) {
             .reader => |*rd| {
@@ -923,7 +1108,7 @@ pub const Chart = struct {
                     else
                         @import("tiles").mvt.decode(a, bytes) catch continue;
                     ps.setOrigin(t.origin_x, t.origin_y);
-                    scene.replayTile(surf, layers) catch return error.TileGen;
+                    scene.replayTile(a, surf, layers) catch return error.TileGen;
                 }
                 return surf.endScene(gpa) catch error.TileGen;
             },
@@ -940,6 +1125,131 @@ pub const Chart = struct {
             // the baker's composition — bake, then render the archive.
             .cells => return error.TileGen,
         }
+    }
+
+    /// renderView's GPU-vector twin: drive a VectorSurface over the same view
+    /// tiles, emitting a WORLD-SPACE tagged stream to the C surface callback
+    /// (see render/vector.zig). Live for both a baked bundle (.reader tile
+    /// replay) and a live cell (.cell portrayal). No bytes are produced.
+    pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, cb: *const render.vector.CSurface) !void {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+        const css_name = switch (palette) {
+            .day => "daySvgStyle",
+            .dusk => "duskSvgStyle",
+            .night => "nightSvgStyle",
+        };
+        var css_data: []const u8 = "";
+        for (embedded_assets.css) |e| {
+            if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
+        }
+        const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+        for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+        const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+        for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+        const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+        defer store.deinit();
+
+        var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+        defer ls_srcs.deinit(gpa);
+        for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+        scene.registerLinestylesXml(gpa, ls_srcs.items);
+
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
+        vs.store = store.asStore();
+        vs.view_zoom = zoom;   // scale at which labels/symbols declutter
+        const surf = vs.asSurface();
+
+        var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+        try surf.beginScene(vt.z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                const is_mlt = rd.header.tile_type == .mlt;
+                while (vt.next()) |t| {
+                    const bytes = (rd.getTile(a, t.z, t.x, t.y) catch continue) orelse continue;
+                    const layers = if (is_mlt)
+                        @import("tiles").mlt.decode(a, bytes) catch continue
+                    else
+                        @import("tiles").mvt.decode(a, bytes) catch continue;
+                    vs.setTile(t.z, t.x, t.y);
+                    scene.replayTile(a, surf, layers) catch continue;
+                }
+            },
+            .cell => |*cb2| {
+                const one = [_]scene.CellRef{.{
+                    .cell = &cb2.cell,
+                    .portrayal = cb2.portrayal,
+                    .portrayal_plain = cb2.portrayal_plain,
+                    .portrayal_simplified = cb2.portrayal_simplified,
+                    .geo = cb2.geo,
+                    .geo_world = cb2.geo_world,
+                    .feat_bbox = cb2.feat_bbox,
+                }};
+                while (vt.next()) |t| {
+                    vs.setTile(t.z, t.x, t.y);
+                    scene.appendTile(surf, a, &one, t.z, t.x, t.y, self.pick_attrs) catch continue;
+                }
+            },
+            .cells => return error.Unsupported,
+        }
+        _ = try surf.endScene(a);
+    }
+
+    /// Cursor object-query: replay the finest tile covering (lon,lat) through a
+    /// QuerySurface and report each feature the point falls in (class + S-57
+    /// attribute JSON + source cell) via `cb`. Used for the S-52 §10.8 pick.
+    pub fn queryPoint(self: *Chart, lon: f64, lat: f64, zoom: f64, cb: *const render.query.QueryCb) !void {
+        const t = @import("tiles").tile;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        // Query the tile at the VIEW zoom, not the finest: its features are already
+        // SCAMIN-bucketed to what's displayed, the tile exists (it's what's drawn),
+        // and the pick radius (tile units) maps to a constant on-screen distance.
+        const zr = self.zoomRange();
+        const zc = std.math.clamp(@round(zoom), @as(f64, @floatFromInt(zr.min)), @as(f64, @floatFromInt(zr.max)));
+        const z: u8 = @intFromFloat(zc);
+        const world = t.lonLatToWorld(lon, lat);
+        const n = std.math.exp2(@as(f64, @floatFromInt(z)));
+        const tx: u32 = @intFromFloat(@floor(world[0] * n));
+        const ty: u32 = @intFromFloat(@floor(world[1] * n));
+        const local = t.project(lon, lat, z, tx, ty, t.EXTENT);
+        var qs = render.query.QuerySurface{
+            .qx = @floatFromInt(local.x),
+            .qy = @floatFromInt(local.y),
+            .radius = 96.0, // ~6 px at native tile scale
+            .view_zoom = zoom, // raw view zoom for the SCAMIN cull
+            .cb = cb,
+        };
+        const surf = qs.asSurface();
+        try surf.beginScene(z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                const is_mlt = rd.header.tile_type == .mlt;
+                const bytes = (rd.getTile(a, z, tx, ty) catch return) orelse return;
+                if (bytes.len == 0) return;
+                const layers = if (is_mlt)
+                    @import("tiles").mlt.decode(a, bytes) catch return
+                else
+                    @import("tiles").mvt.decode(a, bytes) catch return;
+                scene.replayTile(a, surf, layers) catch return;
+            },
+            .cell => |*cb2| {
+                const one = [_]scene.CellRef{.{
+                    .cell = &cb2.cell,
+                    .portrayal = cb2.portrayal,
+                    .portrayal_plain = cb2.portrayal_plain,
+                    .portrayal_simplified = cb2.portrayal_simplified,
+                }};
+                scene.appendTile(surf, a, &one, z, tx, ty, self.pick_attrs) catch return;
+            },
+            .cells => return,
+        }
+        _ = surf.endScene(a) catch {};
     }
 
     /// Render a VIEW as ASCII art — renderView's shape on the text surface:
@@ -975,7 +1285,7 @@ pub const Chart = struct {
                     else
                         @import("tiles").mvt.decode(a, bytes) catch continue;
                     as.setOrigin(t.origin_x, t.origin_y);
-                    scene.replayTile(surf, layers) catch return error.TileGen;
+                    scene.replayTile(a, surf, layers) catch return error.TileGen;
                 }
                 return surf.endScene(gpa) catch error.TileGen;
             },
