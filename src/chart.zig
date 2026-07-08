@@ -1935,12 +1935,16 @@ const BakeWork = struct {
                 portrayal_plain = cp.plain;
                 portrayal_simplified = cp.simplified;
             } else |_| {}
-            if (c.build_geo) geo = scene.buildGeoCache(p.allocator(), &cell) catch null;
-            // Per-feature label point (polylabel) cache — tile-invariant, so compute it ONCE
-            // per cell (only for features whose portrayal draws a Text/centred-symbol) instead
-            // of re-running the pole-of-inaccessibility search for every tile a feature touches.
-            // Without this the per-tile recompute dominates the bake of large coarse cells
-            // (measured US1GC09M: 6m17s → seconds). Mirrors bakeRoot; arena outlives via c.arenas.
+            // Build the geometry cache for EVERY cell (as bakeRoot does — unconditional).
+            // `build_geo` (cacheGeoForBand) gated it to the finer bands, but coarse cells are
+            // exactly the ones that hurt without it: the geo cache both cheapens per-tile
+            // reprojection AND lets buildLabelCache assemble each feature's parts to populate
+            // the label-point cache. Skipping it left the pole-of-inaccessibility (polylabel)
+            // search running per tile on huge coarse cells (US1GC09M: minutes).
+            geo = scene.buildGeoCache(p.allocator(), &cell) catch null;
+            // Per-feature label-point (polylabel) cache — tile-invariant, so compute it ONCE
+            // per cell (only for Text/centred-symbol features) instead of re-running the search
+            // for every tile a feature touches. Mirrors bakeRoot; arena outlives via c.arenas.
             cell.label_cache = scene.buildLabelCache(p.allocator(), &cell, geo, portrayal) catch null;
         }
         // M_COVR coverage + scale for per-cell quilting (allocate into the cell's own

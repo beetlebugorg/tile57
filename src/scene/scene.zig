@@ -1339,10 +1339,15 @@ pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, stre
     var tmp = std.heap.ArenaAllocator.init(a);
     defer tmp.deinit();
     for (cell.features, 0..) |f, i| {
-        if (f.prim != 2 and f.prim != 3) continue;
+        // Polylabel (areaRepresentativePoint) is AREA-only — lines anchor at their mid-vertex.
+        // Cache every portrayed area: labelPoint is consulted not just for Text/PointInstruction
+        // labels but also for the native INFORM01/QUESMRK1 centred markers (which carry no such
+        // instruction), so the earlier Text/Point-only gate left those recomputing per tile —
+        // the dominant cost on large coarse cells. Byte-identical: labelPoint returns the same
+        // point cached or live.
+        if (f.prim != 3) continue;
         if (i >= ss.len) break;
-        const s = ss[i] orelse continue;
-        if (std.mem.indexOf(u8, s, "TextInstruction") == null and std.mem.indexOf(u8, s, "PointInstruction") == null) continue;
+        _ = ss[i] orelse continue; // portrayed at all (an unportrayed area never reaches labelPoint)
         const parts = featureParts(tmp.allocator(), cell.*, geo, i, f) catch continue;
         out[i] = s57.areaRepresentativePoint(tmp.allocator(), parts);
         _ = tmp.reset(.retain_capacity);
