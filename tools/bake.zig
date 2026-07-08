@@ -32,6 +32,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var format: engine.scene.TileFormat = .mlt; // tile encoding: mlt (default) or mvt
     var existing: []const u8 = ""; // cross-pack best-available: a peer pack's ENC_ROOT
     var partition_debug = false; // emit the ownership-partition debug PMTiles instead of a bundle
+    var part_band: i8 = -1; // partition-debug: <0 = band governing each zoom; 0..5 = one band's map
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -58,6 +59,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             format = if (std.mem.eql(u8, v, "mlt")) .mlt else if (std.mem.eql(u8, v, "mvt")) .mvt else return usageErr("--format must be mvt or mlt");
         } else if (std.mem.eql(u8, arg, "--partition-debug")) {
             partition_debug = true;
+        } else if (std.mem.eql(u8, arg, "--band")) {
+            const v = f.val(arg) orelse return;
+            part_band = bandArg(v) orelse return usageErr("--band must be a rank 0..5 or a name (berthing..overview)");
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -80,11 +84,11 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         // face-tile count grows ~4^z, so raise --maxzoom on demand).
         const dbg_minz: u8 = if (minzoom == DEFAULT_MINZOOM) 0 else minzoom;
         const dbg_maxz: u8 = if (maxzoom == DEFAULT_MAXZOOM) 12 else maxzoom;
-        const nc = bundle.bakePartitionDebug(io, a, base_path, out_dir, dbg_minz, dbg_maxz) catch |err| {
+        const nc = bundle.bakePartitionDebug(io, a, base_path, out_dir, dbg_minz, dbg_maxz, part_band) catch |err| {
             std.debug.print("error: partition-debug bake of {s} failed ({s})\n", .{ base_path, @errorName(err) });
             return;
         };
-        std.debug.print("partition-debug: {d} cell(s) -> {s} (z{d}-{d}, layer \"partition\": cell/cscl/band/tier/oi/color)\n", .{ nc, out_dir, dbg_minz, dbg_maxz });
+        std.debug.print("partition-debug: {d} cell(s) -> {s} (z{d}-{d}, band {d}, layer \"partition\": cell/cscl/band/tier/oi/color)\n", .{ nc, out_dir, dbg_minz, dbg_maxz, part_band });
         return;
     }
 
@@ -113,4 +117,12 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         "bundled {d} cell(s) -> {s}/\n  tiles/chart.pmtiles + assets/colortables.json + sprite-mln + style-{{day,dusk,night}}.json + manifest.json (schema {s})\n",
         .{ res.cell_count, out_dir, assets.SCHEMA_VERSION },
     );
+}
+
+// Parse a --band value: a rank 0..5, or a navigational-purpose name (finest→coarsest).
+fn bandArg(v: []const u8) ?i8 {
+    const names = [_][]const u8{ "berthing", "harbor", "approach", "coastal", "general", "overview" };
+    for (names, 0..) |nm, i| if (std.mem.eql(u8, v, nm)) return @intCast(i);
+    const n = std.fmt.parseInt(i8, v, 10) catch return null;
+    return if (n < 0 or n > 5) null else n;
 }

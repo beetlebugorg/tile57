@@ -462,19 +462,38 @@ fn readParseCell(io: std.Io, dir: std.Io.Dir, bpath: []const u8) ?engine.s57.Cel
     return engine.s57.parseCellWithUpdates(gpa, base, ups.items) catch null;
 }
 
-/// Cross-pack best-available (BakeOpts.existing_input / bake --existing): peer packs'
-/// M_COVR coverage + cscl, read from a sibling ENC_ROOT for suppression context only
-/// (never emitted). One cell resident at a time; coverage is copied into `a` so each
-/// cell frees right after. "" / a missing dir yields no context (a plain bake).
-fn loadContextCoverage(io: std.Io, a: std.mem.Allocator, path: []const u8) []engine.bake_enc.ContextCell {
+/// One ENC cell loaded for coverage-level work: its M_COVR(CATCOV=1) rings, bbox,
+/// compilation scale, DSNM stem, and DSID date. The eager cell-loader's output; the
+/// cross-pack context uses a subset, the partition debug bake widens it to points.
+pub const LoadedCov = struct {
+    name: []const u8, // DSNM stem
+    date: []const u8, // DSID issue/update date (YYYYMMDD)
+    cscl: i32, // compilation scale (1:N)
+    coverage: []const []const []const engine.s57.LonLat, // M_COVR(CATCOV=1) rings
+    bounds: [4]f64, // [w,s,e,n] over the coverage
+};
+
+/// THE eager cell-coverage loader: walk an ENC_ROOT, parse each cell once (base +
+/// updates via readParseCell), and capture its M_COVR coverage + bbox + cscl + name
+/// + date. One entry per stem (a boundary cell shared by two districts loads once).
+/// Coverage is copied into `a` and survives the cell's deinit. "" / a missing dir
+/// yields none; cells with no M_COVR are skipped. The single load path composed by
+/// the cross-pack context, the partition debug bake, and the compositor.
+fn loadCells(io: std.Io, a: std.mem.Allocator, path: []const u8) []LoadedCov {
     if (path.len == 0) return &.{};
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
+    var out = std.ArrayList(LoadedCov).empty;
+    var seen = std.StringHashMap(void).init(a);
     var walker = dir.walk(a) catch return &.{};
     defer walker.deinit();
-    var out = std.ArrayList(engine.bake_enc.ContextCell).empty;
     while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
+        const stem = std.fs.path.stem(std.fs.path.basename(entry.path));
+        if (seen.contains(stem)) continue;
+        const stem_d = a.dupe(u8, stem) catch continue;
+        seen.put(stem_d, {}) catch {};
+
         var cell = readParseCell(io, dir, entry.path) orelse continue;
         defer cell.deinit();
         const cov = cell.mcovrCoverage(a); // copied into `a`; survives cell.deinit()
@@ -486,9 +505,25 @@ fn loadContextCoverage(io: std.Io, a: std.mem.Allocator, path: []const u8) []eng
             b[2] = @max(b[2], p.lon());
             b[3] = @max(b[3], p.lat());
         };
-        out.append(a, .{ .coverage = cov, .bounds = b, .cscl = cell.params.cscl }) catch {};
+        out.append(a, .{
+            .name = stem_d,
+            .date = a.dupe(u8, cell.dsid.isdt) catch "",
+            .cscl = cell.params.cscl,
+            .coverage = cov,
+            .bounds = b,
+        }) catch {};
     }
     return out.toOwnedSlice(a) catch &.{};
+}
+
+/// Cross-pack best-available context (BakeOpts.existing_input / bake --existing):
+/// peer packs' M_COVR + cscl for suppression only (never emitted) — the ContextCell
+/// projection of loadCells.
+fn loadContextCoverage(io: std.Io, a: std.mem.Allocator, path: []const u8) []engine.bake_enc.ContextCell {
+    const cells = loadCells(io, a, path);
+    const out = a.alloc(engine.bake_enc.ContextCell, cells.len) catch return &.{};
+    for (cells, 0..) |c, i| out[i] = .{ .coverage = c.coverage, .bounds = c.bounds, .cscl = c.cscl };
+    return out;
 }
 
 // A cyclic palette so adjacent ownership faces get distinct colours in the debug
@@ -498,163 +533,77 @@ const DEBUG_PALETTE = [_][]const u8{
     "#bcf60c", "#fabebe", "#008080", "#e6beff", "#9a6324", "#fffac8", "#800000", "#aaffc3",
 };
 
-/// Bake a DEBUG PMTiles of the ownership PARTITION only: the composited faces (which
-/// cell renders which ground at each band), tagged with the owning cell's identity —
-/// NO portrayed chart content. Lets the partition be eyeballed in the client. Reuses
-/// the ENC_ROOT discovery + `readParseCell` loader and the standard mvt/pmtiles emit;
-/// the partition math is `engine.geo`. Returns the cell count. `out_path` is a single
-/// `.pmtiles` file (not a bundle dir).
-pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8, out_path: []const u8, minzoom: u8, maxzoom_arg: u8) !usize {
+/// Bake a DEBUG PMTiles of the ownership PARTITION (which cell renders which ground),
+/// NO portrayed content, for eyeballing the composite quilt. `band` < 0 emits the band
+/// GOVERNING each zoom (the natural view); 0..5 (berthing..overview) emits only that
+/// band's own map, at every zoom. Composes the single paths — loadCells + toPlaneCells
+/// + geo.plane partition + the mvt/tile/pmtiles primitives — and STREAMS tiles (one
+/// tier + one zoom resident) so it scales to the whole corpus. Returns the cell count;
+/// `out_path` is a single `.pmtiles` file.
+pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8, out_path: []const u8, minzoom: u8, maxzoom_arg: u8, band: i8) !usize {
     const geo = engine.geo;
-    const mvt = engine.mvt;
-    const tile = engine.tile;
-    const maxzoom = @min(maxzoom_arg, @as(u8, 14)); // face tiles grow ~4^z; clamp to stay sane
+    const maxzoom = @min(maxzoom_arg, @as(u8, 16));
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
-    defer dir.close(io);
+    // Single load + adapt paths.
+    const loaded = loadCells(io, a, root_path);
+    if (loaded.len == 0) return error.NoGeometry;
+    const cells = try toPlaneCells(a, loaded);
 
-    // --- 1. Discover + parse cells (reuse readParseCell); widen M_COVR to integer
-    //        points, take cscl/date/name. One entry per stem (dedup like bakeRoot).
-    const Loaded = struct { cell: geo.plane.Cell, name: []const u8, date: []const u8 };
-    var loaded = std.ArrayList(Loaded).empty;
-    // Union bbox (E7) so the archive header points a viewer at the data, not the world.
+    // Union bbox (E7) for the header, so a viewer opens on the data not the world.
     var ubox = [4]i32{ std.math.maxInt(i32), std.math.maxInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
-    var seen = std.StringHashMap(void).init(a);
-    var walker = try dir.walk(a);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
-        const stem = std.fs.path.stem(std.fs.path.basename(entry.path));
-        if (seen.contains(stem)) continue;
-        const stem_d = try a.dupe(u8, stem);
-        try seen.put(stem_d, {});
+    for (loaded) |c| {
+        ubox[0] = @min(ubox[0], deg7(c.bounds[0]));
+        ubox[1] = @min(ubox[1], deg7(c.bounds[1]));
+        ubox[2] = @max(ubox[2], deg7(c.bounds[2]));
+        ubox[3] = @max(ubox[3], deg7(c.bounds[3]));
+    }
+    std.debug.print("partition-debug: {d} cells from {s}, z{d}-{d}, band {d}\n", .{ loaded.len, root_path, minzoom, maxzoom, band });
 
-        var cell = readParseCell(io, dir, entry.path) orelse continue;
-        defer cell.deinit();
-        const cov = cell.mcovrCoverage(a); // float rings, copied into `a`
-        if (cov.len == 0) continue;
+    // Stream tiles (gzipped + deduped) so the whole archive never lives uncompressed.
+    var sw = engine.pmtiles.StreamWriter.init(gpa);
+    defer sw.deinit();
+    var zoom_arena = std.heap.ArenaAllocator.init(gpa); // one zoom's tiles at a time
+    defer zoom_arena.deinit();
 
-        const cov1 = try a.alloc(geo.plane.Poly, cov.len);
-        for (cov, 0..) |feat, fi| {
-            const rings = try a.alloc([]const geo.plane.Pt, feat.len);
-            for (feat, 0..) |ring, ri| {
-                const pts = try a.alloc(geo.plane.Pt, ring.len);
-                for (ring, 0..) |p, pi| {
-                    pts[pi] = .{ .x = p.lon_e7, .y = p.lat_e7 };
-                    ubox[0] = @min(ubox[0], p.lon_e7);
-                    ubox[1] = @min(ubox[1], p.lat_e7);
-                    ubox[2] = @max(ubox[2], p.lon_e7);
-                    ubox[3] = @max(ubox[3], p.lat_e7);
-                }
-                rings[ri] = pts;
+    if (band >= 0) {
+        // One band's own map: build its tier once, emit across every zoom.
+        const bandv: engine.bake_enc.Band = @enumFromInt(@as(u8, @intCast(@min(band, @as(i8, 5)))));
+        const tier = engine.bake_enc.bandZooms(bandv).min;
+        const faces = try geo.plane.ownedAtTierIndexed(gpa, cells, tier);
+        defer geo.plane.freeOwned(gpa, faces);
+        var z: u8 = minzoom;
+        while (z <= maxzoom) : (z += 1) {
+            _ = zoom_arena.reset(.retain_capacity);
+            try emitFacesZoom(&sw, zoom_arena.allocator(), faces, loaded, z, tier);
+        }
+    } else {
+        // Merged: the band governing each zoom. Build that tier lazily, one resident at
+        // a time (coarse→fine as z rises), so the finest tier is only built if reached.
+        const floors = try distinctFloorsDesc(a, cells);
+        var cur_tier: i16 = -1;
+        var cur_faces: []geo.plane.OwnedCell = &.{};
+        defer if (cur_tier >= 0) geo.plane.freeOwned(gpa, cur_faces);
+        var z: u8 = minzoom;
+        while (z <= maxzoom) : (z += 1) {
+            const t = governingTier(floors, z);
+            if (cur_tier != @as(i16, t)) {
+                if (cur_tier >= 0) geo.plane.freeOwned(gpa, cur_faces);
+                cur_faces = try geo.plane.ownedAtTierIndexed(gpa, cells, t);
+                cur_tier = t;
             }
-            cov1[fi] = rings;
-        }
-        const cscl = cell.params.cscl;
-        try loaded.append(a, .{
-            .cell = .{ .cscl = cscl, .band_floor = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cscl)).min, .order = 0, .cov1 = cov1 },
-            .name = stem_d,
-            .date = try a.dupe(u8, cell.dsid.isdt),
-        });
-    }
-    const ncells = loaded.items.len;
-    if (ncells == 0) return error.NoGeometry;
-
-    // --- 2. Assign the DSID order (same tie-break as the bake), build the partition.
-    const rank = try a.alloc(usize, ncells);
-    for (rank, 0..) |*v, i| v.* = i;
-    std.mem.sort(usize, rank, loaded.items, struct {
-        fn lt(ls: []const Loaded, x: usize, y: usize) bool {
-            return engine.bake_enc.ordersBeforeKeys(ls[x].date, ls[x].name, ls[y].date, ls[y].name);
-        }
-    }.lt);
-    const cells = try a.alloc(geo.plane.Cell, ncells);
-    for (rank, 0..) |ci, r| loaded.items[ci].cell.order = r;
-    for (loaded.items, 0..) |lc, i| cells[i] = lc.cell;
-
-    std.debug.print("partition-debug: {d} cells from {s}, building z{d}-{d}\n", .{ ncells, root_path, minzoom, maxzoom });
-    var part = try geo.partition.build(gpa, cells);
-    defer part.deinit();
-
-    // --- 3. Slice each band's faces into tiles (reuse tile.project + clipPolygon).
-    const TileKey = struct { z: u8, x: u32, y: u32 };
-    var tilemap = std.AutoHashMap(TileKey, std.ArrayList(mvt.Feature)).init(a);
-
-    var z: u8 = minzoom;
-    while (z <= maxzoom) : (z += 1) {
-        const map = part.mapForZoom(z) orelse continue;
-        const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
-        for (map.faces) |face| {
-            if (face.owned.len == 0) continue;
-            const lc = loaded.items[face.index];
-
-            // Face lon/lat bbox → the tile x/y range it can touch at this zoom.
-            var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
-            for (face.owned) |ring| for (ring) |p| {
-                const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
-                const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
-                fb[0] = @min(fb[0], lon);
-                fb[1] = @min(fb[1], lat);
-                fb[2] = @max(fb[2], lon);
-                fb[3] = @max(fb[3], lat);
-            };
-            const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // min lon, max lat → top-left
-            const w_br = tile.lonLatToWorld(fb[2], fb[1]); // max lon, min lat → bottom-right
-            const tx0 = worldAxisToTile(w_tl[0], scale);
-            const tx1 = worldAxisToTile(w_br[0], scale);
-            const ty0 = worldAxisToTile(w_tl[1], scale);
-            const ty1 = worldAxisToTile(w_br[1], scale);
-
-            const props = try a.dupe(mvt.Prop, &.{
-                .{ .key = "cell", .value = .{ .string = lc.name } },
-                .{ .key = "cscl", .value = .{ .int = lc.cell.cscl } },
-                .{ .key = "band", .value = .{ .int = @intFromEnum(engine.bake_enc.bandOf(lc.cell.cscl)) } },
-                .{ .key = "tier", .value = .{ .int = map.tier } },
-                .{ .key = "oi", .value = .{ .int = @intCast(face.index) } },
-                .{ .key = "color", .value = .{ .string = DEBUG_PALETTE[face.index % DEBUG_PALETTE.len] } },
-            });
-
-            var tx = tx0;
-            while (tx <= tx1) : (tx += 1) {
-                var ty = ty0;
-                while (ty <= ty1) : (ty += 1) {
-                    var parts = std.ArrayList([]const mvt.Point).empty;
-                    for (face.owned) |ring| {
-                        const proj = try a.alloc(mvt.Point, ring.len);
-                        for (ring, 0..) |p, k| proj[k] = tile.project(@as(f64, @floatFromInt(p.x)) / 1e7, @as(f64, @floatFromInt(p.y)) / 1e7, z, tx, ty, tile.EXTENT);
-                        const clipped = try tile.clipPolygon(a, proj, tile.Box.default(tile.EXTENT, 256));
-                        if (clipped.len >= 3) try parts.append(a, clipped);
-                    }
-                    if (parts.items.len == 0) continue;
-                    // Boolean rings have unspecified winding; MVT/MapLibre fills by
-                    // winding, so orient exteriors +area / holes -area (same authority
-                    // the real bake uses) or nothing renders.
-                    const oriented = try engine.scene.orientAreaRings(a, parts.items);
-                    const gop = try tilemap.getOrPut(.{ .z = z, .x = tx, .y = ty });
-                    if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(mvt.Feature).empty;
-                    try gop.value_ptr.append(a, .{ .geom_type = .polygon, .parts = oriented, .properties = props });
-                }
-            }
+            _ = zoom_arena.reset(.retain_capacity);
+            try emitFacesZoom(&sw, zoom_arena.allocator(), cur_faces, loaded, z, t);
         }
     }
 
-    // --- 4. Encode each tile and write the archive (reuse mvt.encode + pmtiles.write).
-    var inputs = std.ArrayList(engine.pmtiles.InputTile).empty;
-    var it = tilemap.iterator();
-    while (it.next()) |kv| {
-        const layers = [_]mvt.Layer{.{ .name = "partition", .features = kv.value_ptr.items }};
-        const enc = try mvt.encode(a, .{ .layers = &layers });
-        try inputs.append(a, .{ .z = kv.key_ptr.z, .x = kv.key_ptr.x, .y = kv.key_ptr.y, .mvt = enc });
-    }
-    // Frame a viewer on the data (a zoom where the bbox is ~2 tiles wide), so it
-    // doesn't open at world scale where the district is an invisible speck.
+    // Frame a viewer on the data (a zoom where the bbox is ~2 tiles wide).
     const span_deg = @max(0.01, @as(f64, @floatFromInt(ubox[2] - ubox[0])) / 1e7);
     const cz: u8 = @intFromFloat(std.math.clamp(std.math.log2(720.0 / span_deg), @as(f64, @floatFromInt(minzoom)), @as(f64, @floatFromInt(maxzoom))));
-    const bytes = try engine.pmtiles.write(gpa, inputs.items, .{
+    const bytes = try sw.finishBytes(.{
         // MapLibre/pmtiles.io build their style from `vector_layers`; without it the
         // "partition" layer is invisible to a viewer no matter the geometry.
         .metadata_json = "{\"name\":\"partition-debug\",\"format\":\"pbf\",\"vector_layers\":[{\"id\":\"partition\",\"fields\":{\"cell\":\"String\",\"cscl\":\"Number\",\"band\":\"Number\",\"tier\":\"Number\",\"oi\":\"Number\",\"color\":\"String\"}}]}",
@@ -667,7 +616,138 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
     });
     defer gpa.free(bytes);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes });
-    return ncells;
+    return loaded.len;
+}
+
+// deg → E7 integer.
+fn deg7(d: f64) i32 {
+    return @intFromFloat(@round(d * 1e7));
+}
+
+// Distinct band floors, DESCENDING (finest floor first) — the tier ladder.
+fn distinctFloorsDesc(a: std.mem.Allocator, cells: []const engine.geo.plane.Cell) ![]u8 {
+    var seen = std.AutoHashMap(u8, void).init(a);
+    for (cells) |c| try seen.put(c.band_floor, {});
+    const out = try a.alloc(u8, seen.count());
+    var it = seen.keyIterator();
+    var i: usize = 0;
+    while (it.next()) |k| : (i += 1) out[i] = k.*;
+    std.mem.sort(u8, out, {}, comptime std.sort.desc(u8));
+    return out;
+}
+
+// The band floor governing zoom `z`: the largest floor ≤ z, or the coarsest if z is
+// below every floor (so zooming out never falls off the bottom).
+fn governingTier(floors_desc: []const u8, z: u8) u8 {
+    for (floors_desc) |t| if (t <= z) return t;
+    return floors_desc[floors_desc.len - 1];
+}
+
+/// The s57-coverage → geo.plane.Cell adapter: widen each cell's M_COVR to integer
+/// points, set the band floor (bandOf), and assign the deterministic DSID order (same
+/// tie-break as the bake) across the whole set. Arena-allocated in `a`. THE single
+/// conversion path; the partition-debug bake and the compositor both use it.
+fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]engine.geo.plane.Cell {
+    const geo = engine.geo;
+    const n = loaded.len;
+    const rank = try a.alloc(usize, n);
+    for (rank, 0..) |*v, i| v.* = i;
+    std.mem.sort(usize, rank, loaded, struct {
+        fn lt(ls: []const LoadedCov, x: usize, y: usize) bool {
+            return engine.bake_enc.ordersBeforeKeys(ls[x].date, ls[x].name, ls[y].date, ls[y].name);
+        }
+    }.lt);
+    const order = try a.alloc(u64, n);
+    for (rank, 0..) |ci, r| order[ci] = r;
+
+    const cells = try a.alloc(geo.plane.Cell, n);
+    for (loaded, 0..) |lc, i| {
+        const out = try a.alloc(geo.plane.Poly, lc.coverage.len);
+        for (lc.coverage, 0..) |feat, fi| {
+            const rings = try a.alloc([]const geo.plane.Pt, feat.len);
+            for (feat, 0..) |ring, ri| {
+                const pts = try a.alloc(geo.plane.Pt, ring.len);
+                for (ring, 0..) |p, pi| pts[pi] = .{ .x = p.lon_e7, .y = p.lat_e7 };
+                rings[ri] = pts;
+            }
+            out[fi] = rings;
+        }
+        cells[i] = .{
+            .cscl = lc.cscl,
+            .band_floor = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(lc.cscl)).min,
+            .order = order[i],
+            .cov1 = out,
+        };
+    }
+    return cells;
+}
+
+/// Project + clip one tier's faces into the tiles of zoom `z` and stream them to `sw`
+/// (layer "partition"). `sa` is a per-zoom arena the caller resets, so only one zoom's
+/// tiles are resident. Reuses tile.project/clipPolygon + scene.orientAreaRings (the MVT
+/// winding authority) + mvt.encode.
+fn emitFacesZoom(sw: *engine.pmtiles.StreamWriter, sa: std.mem.Allocator, faces: []const engine.geo.plane.OwnedCell, loaded: []const LoadedCov, z: u8, tier: u8) !void {
+    const mvt = engine.mvt;
+    const tile = engine.tile;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+    const TileKey = struct { x: u32, y: u32 };
+    var tilemap = std.AutoHashMap(TileKey, std.ArrayList(mvt.Feature)).init(sa);
+
+    for (faces) |face| {
+        if (face.owned.len == 0) continue;
+        const lc = loaded[face.index];
+
+        var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+        for (face.owned) |ring| for (ring) |p| {
+            const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
+            const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
+            fb[0] = @min(fb[0], lon);
+            fb[1] = @min(fb[1], lat);
+            fb[2] = @max(fb[2], lon);
+            fb[3] = @max(fb[3], lat);
+        };
+        const w_tl = tile.lonLatToWorld(fb[0], fb[3]);
+        const w_br = tile.lonLatToWorld(fb[2], fb[1]);
+        const tx0 = worldAxisToTile(w_tl[0], scale);
+        const tx1 = worldAxisToTile(w_br[0], scale);
+        const ty0 = worldAxisToTile(w_tl[1], scale);
+        const ty1 = worldAxisToTile(w_br[1], scale);
+
+        const props = try sa.dupe(mvt.Prop, &.{
+            .{ .key = "cell", .value = .{ .string = lc.name } },
+            .{ .key = "cscl", .value = .{ .int = lc.cscl } },
+            .{ .key = "band", .value = .{ .int = @intFromEnum(engine.bake_enc.bandOf(lc.cscl)) } },
+            .{ .key = "tier", .value = .{ .int = tier } },
+            .{ .key = "oi", .value = .{ .int = @intCast(face.index) } },
+            .{ .key = "color", .value = .{ .string = DEBUG_PALETTE[face.index % DEBUG_PALETTE.len] } },
+        });
+
+        var tx = tx0;
+        while (tx <= tx1) : (tx += 1) {
+            var ty = ty0;
+            while (ty <= ty1) : (ty += 1) {
+                var parts = std.ArrayList([]const mvt.Point).empty;
+                for (face.owned) |ring| {
+                    const proj = try sa.alloc(mvt.Point, ring.len);
+                    for (ring, 0..) |p, k| proj[k] = tile.project(@as(f64, @floatFromInt(p.x)) / 1e7, @as(f64, @floatFromInt(p.y)) / 1e7, z, tx, ty, tile.EXTENT);
+                    const clipped = try tile.clipPolygon(sa, proj, tile.Box.default(tile.EXTENT, 256));
+                    if (clipped.len >= 3) try parts.append(sa, clipped);
+                }
+                if (parts.items.len == 0) continue;
+                const oriented = try engine.scene.orientAreaRings(sa, parts.items);
+                const gop = try tilemap.getOrPut(.{ .x = tx, .y = ty });
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(mvt.Feature).empty;
+                try gop.value_ptr.append(sa, .{ .geom_type = .polygon, .parts = oriented, .properties = props });
+            }
+        }
+    }
+
+    var it = tilemap.iterator();
+    while (it.next()) |kv| {
+        const layers = [_]mvt.Layer{.{ .name = "partition", .features = kv.value_ptr.items }};
+        const enc = try mvt.encode(sa, .{ .layers = &layers });
+        try sw.add(z, kv.key_ptr.x, kv.key_ptr.y, enc);
+    }
 }
 
 // A normalised web-mercator world axis coordinate ([0,1]) → tile index at `scale`
