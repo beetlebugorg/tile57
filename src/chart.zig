@@ -1108,7 +1108,7 @@ pub const Chart = struct {
                     else
                         @import("tiles").mvt.decode(a, bytes) catch continue;
                     ps.setOrigin(t.origin_x, t.origin_y);
-                    scene.replayTile(surf, layers) catch return error.TileGen;
+                    scene.replayTile(a, surf, layers) catch return error.TileGen;
                 }
                 return surf.endScene(gpa) catch error.TileGen;
             },
@@ -1176,7 +1176,7 @@ pub const Chart = struct {
                     else
                         @import("tiles").mvt.decode(a, bytes) catch continue;
                     vs.setTile(t.z, t.x, t.y);
-                    scene.replayTile(surf, layers) catch continue;
+                    scene.replayTile(a, surf, layers) catch continue;
                 }
             },
             .cell => |*cb2| {
@@ -1236,7 +1236,7 @@ pub const Chart = struct {
                     @import("tiles").mlt.decode(a, bytes) catch return
                 else
                     @import("tiles").mvt.decode(a, bytes) catch return;
-                scene.replayTile(surf, layers) catch return;
+                scene.replayTile(a, surf, layers) catch return;
             },
             .cell => |*cb2| {
                 const one = [_]scene.CellRef{.{
@@ -1285,7 +1285,7 @@ pub const Chart = struct {
                     else
                         @import("tiles").mvt.decode(a, bytes) catch continue;
                     as.setOrigin(t.origin_x, t.origin_y);
-                    scene.replayTile(surf, layers) catch return error.TileGen;
+                    scene.replayTile(a, surf, layers) catch return error.TileGen;
                 }
                 return surf.endScene(gpa) catch error.TileGen;
             },

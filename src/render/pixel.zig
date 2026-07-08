@@ -132,6 +132,7 @@ pub const PixelSurface = struct {
         .drawText = drawText,
         .endFeature = endFeature,
         .endScene = endScene,
+        .size_scale = sizeScale,
     };
 
     /// `a` should be the same scratch arena the engine allocates geometry
@@ -223,6 +224,14 @@ pub const PixelSurface = struct {
     /// a calibrated display).
     fn devScale(self: *const PixelSurface) f64 {
         return self.settings.size_scale * @as(f64, @floatCast(self.px_per_tile)) / 256.0;
+    }
+
+    /// Surface contract: the physical-size multiplier the engine uses to walk
+    /// complex-linestyle periods (scene.walkComplexRun), so --scale widens the
+    /// spacing AND enlarges the bricks together (matching drawSymbol's devScale).
+    /// NOT devScale: the period is in tile-coord and gets px_per_tile separately.
+    fn sizeScale(ctx: *anyopaque) f64 {
+        return sp(ctx).settings.size_scale;
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {

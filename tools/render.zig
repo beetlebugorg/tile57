@@ -204,7 +204,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             else
                 engine.mvt.decode(a, tb) catch continue;
             ps.setOrigin(t.origin_x, t.origin_y);
-            try engine.scene.replayTile(surf, layers);
+            try engine.scene.replayTile(a, surf, layers);
         }
         break :blk try surf.endScene(a);
     } else blk: {

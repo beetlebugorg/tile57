@@ -170,6 +170,9 @@ pub const VectorSurface = struct {
         .drawText = drawText,
         .endFeature = endFeature,
         .endScene = endScene,
+        // Render surface: the engine walks complex-linestyle periods at this scale.
+        // (No store_complex_run — this surface WALKS/renders runs, never stores.)
+        .size_scale = sizeScale,
     };
 
     pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.MarinerSettings, cb: *const CSurface) VectorSurface {
@@ -210,6 +213,13 @@ pub const VectorSurface = struct {
     /// 256 baseline), so symbol/text px are a constant screen size.
     fn refDev(self: *const VectorSurface) f64 {
         return self.settings.size_scale;
+    }
+
+    /// Surface contract: this render surface's display scale (settings.size_scale).
+    /// The engine reads it to walk complex-linestyle periods display-scaled so a
+    /// HiDPI display gets both wider spacing AND bigger bricks (baked tiles native).
+    fn sizeScale(ctx: *anyopaque) f64 {
+        return sp(ctx).refDev();
     }
 
     /// Tile-space point -> web-mercator world [0,1] (y down).
@@ -319,6 +329,7 @@ pub const VectorSurface = struct {
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
         _ = rot_north;
+        _ = placement; // both .point and .line now draw at display size (refDev)
         const self = sp(ctx);
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, GATE_ZOOM, self.settings)) return;
@@ -331,9 +342,11 @@ pub const VectorSurface = struct {
         const s = store.get(eff) orelse return;
         // Draw as an atlas sprite when the host supports it; else tessellate.
         // Symbols never participate in declutter (S-52 icon-allow-overlap — they
-        // all draw). A .point navaid draws at display size (refDev); a .line
-        // brick draws at NATIVE size (dev 1.0) so it tiles at the engine spacing.
-        const dev: f64 = if (placement == .point) self.refDev() else 1.0;
+        // all draw). Both .point navaids AND .line bricks draw at display size
+        // (refDev): the complex-linestyle period is now walked at render time
+        // scaled by size_scale (scene.walkComplexRun), so the brick must scale to
+        // match — otherwise bricks would be native-sized at display-scaled spacing.
+        const dev: f64 = self.refDev();
         if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null)
         else try self.emitSymbol(s, at, rot_deg, scale);
     }
