@@ -232,14 +232,12 @@ fn pointInEvenOddF(rings: Poly, x: f64, y: f64) bool {
     return inside;
 }
 
-/// Keep the parts of `line` that lie OUTSIDE `covered`. Each segment is split at
-/// its integer crossings with every covered edge; a sub-run survives iff its
-/// midpoint is outside `covered` (the finer cell owns the covered side and the
-/// seam stroke). Returns a list of poly-lines allocated in `gpa`.
-///
-/// This is the line analogue of the area difference — no polygon boolean, so a
-/// coarse coastline inside finer coverage is dropped whole (not offset-doubled).
-pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
+/// Split `line` at every integer crossing with `covered`'s edges and keep each
+/// sub-run whose midpoint is on the wanted side — INSIDE `covered` when `keep_inside`,
+/// else OUTSIDE. Returns a list of poly-lines allocated in `gpa`. The line analogue of
+/// a polygon intersect/difference: no polygon boolean, so a line crossing the boundary
+/// is cut cleanly, not offset-doubled.
+fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_inside: bool) ![][]Pt {
     var out = std.ArrayList([]Pt).empty;
     errdefer {
         for (out.items) |r| gpa.free(r);
@@ -283,8 +281,8 @@ pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![]
         }
         std.mem.sort(SplitPt, splits.items, {}, SplitPt.lt);
 
-        // Walk consecutive distinct split points; keep sub-runs whose midpoint is
-        // outside covered.
+        // Walk consecutive distinct split points; keep sub-runs whose midpoint is on
+        // the wanted side of `covered`.
         var prev = splits.items[0].p;
         if (run.items.len == 0) try run.append(gpa, prev);
         for (splits.items[1..]) |sp| {
@@ -292,8 +290,8 @@ pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![]
             if (q.eql(prev)) continue;
             const mx = (@as(f64, @floatFromInt(prev.x)) + @as(f64, @floatFromInt(q.x))) / 2;
             const my = (@as(f64, @floatFromInt(prev.y)) + @as(f64, @floatFromInt(q.y))) / 2;
-            if (pointInEvenOddF(covered, mx, my)) {
-                // Sub-run is covered: flush the kept run (it ends at prev) and skip.
+            if (pointInEvenOddF(covered, mx, my) != keep_inside) {
+                // Sub-run is on the unwanted side: flush the kept run (ends at prev), skip.
                 try flushRun(gpa, &out, &run);
                 try run.append(gpa, q);
             } else {
@@ -304,6 +302,18 @@ pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![]
     }
     try flushRun(gpa, &out, &run);
     return out.toOwnedSlice(gpa);
+}
+
+/// Keep the parts of `line` OUTSIDE `covered` — the parts a cell owns when `covered`
+/// is the finer coverage that beats it (the seam stroke stays on the covered side).
+pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
+    return clipLineByCoverage(gpa, line, covered, false);
+}
+
+/// Keep the parts of `line` INSIDE `covered` — clips a cell's line features to its
+/// owned face at compose time (`covered` = the cell's owned region).
+pub fn clipLineInsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
+    return clipLineByCoverage(gpa, line, covered, true);
 }
 
 const SplitPt = struct {
@@ -679,6 +689,21 @@ test "clipLineOutsidePolys: fully-covered line yields nothing; fully-outside lin
     const out_runs = try clipLineOutsidePolys(a, &outside, cov2);
     try testing.expectEqual(@as(usize, 1), out_runs.len);
     try testing.expectEqual(@as(usize, 3), out_runs[0].len);
+}
+
+test "clipLineInsidePolys: keeps the inside, drops the outside (compose clip-to-face)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const covered = try boxPoly(a, 40, -10, 60, 10); // covers x∈[40,60] on the y=0 line
+    const line = [_]Pt{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 } };
+    const runs = try clipLineInsidePolys(a, &line, covered);
+    // Complement of the OUTSIDE clip: keep only the covered middle [40,60].
+    try testing.expectEqual(@as(usize, 1), runs.len);
+    const r = runs[0];
+    try testing.expectEqual(@as(i64, 40), @min(r[0].x, r[r.len - 1].x));
+    try testing.expectEqual(@as(i64, 60), @max(r[0].x, r[r.len - 1].x));
 }
 
 // Clip every coverage feature of a cell to `box` (a quadrant), dropping empties —
