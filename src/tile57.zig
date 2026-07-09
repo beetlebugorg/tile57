@@ -12,7 +12,7 @@
 //! same Zig API (see capi.zig).
 //!
 //! Surface:
-//!   - High-level engine: `Chart` (open → tile), `bakeArchive`, `buildStyle`   [Phase 2]
+//!   - High-level engine: `Chart` (open → render/inspect), `bakeArchive`, `style.build`
 //!   - Portrayal assets:  `assets` (colortables, linestyles, sprite/pattern)
 //!   - Style patching:    `chartstyle`
 //!   - Tiling:            `mvt`, `tile`, `pmtiles`, `bake_enc`, `scene`
