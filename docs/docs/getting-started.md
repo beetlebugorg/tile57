@@ -44,14 +44,14 @@ $T version
 
 Run `tile57 help` for usage. The full subcommand list: `bake`, `compose-tile`,
 `assets`, `sprite`, `pattern`, `sprite-mln`, `style`, `png`, `pdf`, `ascii`,
-`cells`, `catalog`, `features`, `inspect`, `cell`, `objlcount`, `version`,
-`help`.
+`explore`, `cells`, `catalog`, `features`, `inspect`, `cell`, `objlcount`,
+`version`, `help`.
 
 :::info Tiles are MLT by default
 Bakes encode [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec)
 (MLT) by default; rendering them needs **MapLibre GL JS ≥ 5.12** (which decodes
-MLT natively — the generated styles carry the source `encoding` hint). Pass
-`--format mvt` to bake Mapbox Vector Tiles for older or other consumers.
+MLT natively — the generated styles carry the source `encoding` hint). The
+engine can also encode Mapbox Vector Tiles for consumers without an MLT decoder.
 :::
 
 And a crowd-pleaser — the chart in your terminal, as a Unicode grid with
@@ -122,10 +122,9 @@ const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
 //   or read per-cell metadata (chart.cellsJson) …
 ```
 
-The Zig `Chart` renders views, queries features, and reads metadata;
-`tile57.bakeArchive` bakes an ENC_ROOT to one band-streamed PMTiles archive
-offline. The runtime tile compositor (bake per cell, compose on demand) is
-exposed through the [C ABI](./c-api.md). See the [Zig API](./zig-api.md).
+The Zig `Chart` renders views, queries features, and reads metadata. Tile
+production (bake each cell, then compose on demand) is exposed through the
+[C ABI](./c-api.md). See the [Zig API](./zig-api.md).
 
 ## ENC_ROOT and updates
 

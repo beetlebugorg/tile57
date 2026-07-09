@@ -94,7 +94,7 @@ const json = try tile57.style.build(/* … */);     // tile57.style.Mariner sett
 
 | Surface | What it does |
 |---------|--------------|
-| `tile57.style.build` (`chartstyle.buildStyle`) | patch a MapLibre style template with mariner settings + colortables. |
+| `tile57.style.build` (`assets.buildFromTemplate`) | build a MapLibre style from a template + mariner settings + colortables. |
 | `tile57.style.Mariner` | the S-52 mariner display options struct. |
 | `tile57.assets` | colortables / linestyles / style.json / manifest generation. |
 | `tile57.sprite` | S-101 sprite + area-fill pattern atlases (SVG raster). |

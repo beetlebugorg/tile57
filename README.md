@@ -61,8 +61,8 @@ entirely with AI assistance. A few specific goals shape its design:
 ---
 
 **tile57** decodes NOAA/IHO **S-57** ENC cells and generates **vector tiles** by
-`(z, x, y)` — MapLibre Tiles (MLT, the default bake format; MapLibre GL JS ≥ 5.12
-decodes them natively) or Mapbox Vector Tiles (`--format mvt`) — running the
+`(z, x, y)` — MapLibre Tiles (MLT, the default; MapLibre GL JS ≥ 5.12
+decodes them natively) or Mapbox Vector Tiles — running the
 official IHO **S-101 Portrayal Catalogue** in embedded Lua to produce S-52
 nautical portrayal. Alongside the tiles it emits a **MapLibre GL style** and the
 portrayal **assets** it references — colour tables, line styles, and the sprite
@@ -78,8 +78,7 @@ It is **high-performance and low-memory** by design:
   catalogue.
 - **Per-cell bakes.** Each ENC cell bakes to its own PMTiles at its compilation
   scale, so a bake holds one cell at a time; the runtime compositor stitches the
-  cells by `(z, x, y)` on demand. (An offline whole-ENC_ROOT archive bake streams
-  band-by-band, so its peak memory tracks the largest single band.)
+  cells by `(z, x, y)` on demand.
 - **Pure-Zig core.** The foundational format/encode packages have no libc; only
   the Lua portrayal + sprite rasterizer pull in C.
 
@@ -119,10 +118,9 @@ const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
 // … render a view (chart.renderView), query features, or bake an archive …
 ```
 
-`Chart` renders views, queries features, and reads metadata; `tile57.bakeArchive`
-bakes an ENC_ROOT to one band-streamed PMTiles archive offline. The runtime tile
-compositor (bake per cell, then compose by `(z, x, y)`) is exposed through the
-[C ABI](include/tile57.h). See [the Zig API docs](docs/docs/zig-api.md).
+`Chart` renders views, queries features, and reads metadata. The runtime tile
+path — bake each cell, then compose by `(z, x, y)` on demand — is exposed through
+the [C ABI](include/tile57.h). See [the Zig API docs](docs/docs/zig-api.md).
 
 ## Use it from C
 

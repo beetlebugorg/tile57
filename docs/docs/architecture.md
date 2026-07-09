@@ -60,14 +60,14 @@ Unicode terminal grid (with optional ANSI colour, or real pixels inline via the
 kitty graphics protocol). One engine, pluggable outputs — see
 [The Rendering Engine](./rendering.md).
 
-### Tile formats: MLT by default, MVT on request
+### Tile formats: MLT by default, MVT optional
 
 Bakes encode **MLT** ([MapLibre Tile](https://github.com/maplibre/maplibre-tile-spec))
 by default; MapLibre GL JS ≥ 5.12 decodes it natively via the vector source
-`encoding` option, and the generated styles carry that hint. Pass
-`--format mvt` (CLI) to bake Mapbox Vector Tiles for consumers without an MLT
-decoder. `tile57_chart_info.tile_type` reports which encoding a chart's tiles
-use, so a host hints its renderer correctly.
+`encoding` option, and the generated styles carry that hint. The engine can also
+encode Mapbox Vector Tiles for consumers without an MLT decoder.
+`tile57_chart_info.tile_type` reports which encoding a chart's tiles use, so a
+host hints its renderer correctly.
 
 ### Band handoff (coverage-clipped ownership)
 
@@ -122,11 +122,11 @@ The public surface composes the packages into high-level entry points:
   difference. (`tile57_chart_render_view` / `tile57_chart_render_pdf` /
   `tile57_chart_render_surface_cb` / `tile57_chart_query` in the C ABI.)
 - **Tile production** — bake each cell to its own PMTiles at its compilation scale
-  (`tile57_bake_cell_bytes`), then a runtime **compositor** stitches the overlapping
-  cells for any `(z, x, y)` tile on demand through an ownership partition
-  (`tile57_compose_open` / `tile57_compose_serve`). `bakeArchive`
-  (`scene/bake_enc.zig`) is the offline alternative — a whole ENC_ROOT to one
-  band-streamed PMTiles archive.
+  (`tile57_bake_cell_bytes`, which runs the banded bake engine `scene/bake_enc.zig`
+  on a single cell), then a runtime **compositor** stitches the overlapping cells
+  for any `(z, x, y)` tile on demand through an ownership partition
+  (`tile57_compose_open` / `tile57_compose_serve`). The public Zig `bakeArchive`
+  runs the same engine over a slice of cells to make one merged archive.
 - **`style.build`** (`assets/chartstyle.zig`) + **`assets`** / **`sprite`** —
   generate the MapLibre style and the portrayal assets it references
   (`tile57_build_style` / `tile57_bake_assets` in the C ABI).
@@ -146,9 +146,10 @@ tile57 is built to hold only its working set:
   `tile57_chart_open`) take per-cell metadata (bbox + scale) plus a reader; a cell's
   bytes are read only on demand and freed on eviction. A host then holds only the
   working set's bytes, not the whole catalogue — the right choice for a large ENC_ROOT.
-- **Band-streamed bakes.** `bakeArchive` streams band-by-band (finest →
-  coarsest), so peak memory tracks the largest single band rather than the whole
-  archive.
+- **Per-cell bakes.** Each cell bakes independently at its own compilation scale,
+  so a bake holds a single cell's parsed data at a time — memory doesn't grow with
+  the size of the catalogue. (The multi-cell `bakeArchive` streams band-by-band,
+  finest → coarsest, so its peak memory tracks the largest single band.)
 - **Tile cache.** Generated/decoded tiles are memoized per chart (keyed
   `z<<48 | x<<24 | y`) and released with the chart, so a long-running host bounds
   memory by closing charts it no longer renders.
@@ -171,6 +172,6 @@ cells on demand (`tile57_compose_serve`), so re-baking one cell doesn't rewrite 
 whole district. The portrayal assets are generated separately (`tile57 assets` /
 `style`); the tiles carry S-52 colour **tokens**, never RGB, and both halves come
 from the *same* S-101 catalogue, so they cannot drift. The tile-schema vocabulary
-(`tile57/1`) is the contract a renderer checks.
+(`tile57/2`) is the contract a renderer checks.
 
 See the [**Tile Schema**](./tile-schema.md) for the vector-tile layer contract.
