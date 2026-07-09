@@ -24,6 +24,7 @@ const common = @import("common.zig");
 
 const bake = @import("bake.zig");
 const compose = @import("compose.zig");
+const compose_tile = @import("compose_tile.zig");
 const assets = @import("assets.zig");
 const sprite = @import("sprite.zig");
 const pattern = @import("pattern.zig");
@@ -55,6 +56,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, sub, "compose")) {
         return compose.run(io, arena, args);
+    }
+    if (std.mem.eql(u8, sub, "compose-tile")) {
+        return compose_tile.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "assets")) {

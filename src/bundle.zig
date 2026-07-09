@@ -1373,6 +1373,135 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Par
     return try engine.pmtiles.StreamWriter.gzipTile(gpa, enc);
 }
 
+/// A resident compositor: the per-cell archives held mmap'd and the ownership partition built once
+/// (or loaded from a sidecar), so `serve` composes any tile without a whole-district pass. Open once,
+/// serve many, deinit. Only coverage-carrying archives are kept; cell index == reader index. This is
+/// the runtime backing for on-demand serving — the batch is for producing a full archive; this is for
+/// a camera asking for tiles.
+pub const ComposeSource = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator, // owns the readers/maps arrays + adapted cells (borrowed by part)
+    maps: []const []align(std.heap.page_size_min) const u8,
+    readers: []const *engine.pmtiles.Reader,
+    part: engine.geo.partition.Partition,
+    minz: u8,
+    maxz: u8,
+    loop_max: u8, // deepest zoom the sources can serve (native windows + one fill-up overscale zoom)
+
+    /// Compose one tile → gzipped MLT (gpa-owned; null if no cell owns it), byte-identical to batch.
+    pub fn serve(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !?[]u8 {
+        return composeTile(gpa, &self.part, self.readers, z, tx, ty);
+    }
+    pub fn deinit(self: *ComposeSource) void {
+        const gpa = self.gpa;
+        self.part.deinit();
+        for (self.readers) |rp| rp.deinit();
+        for (self.maps) |m| std.posix.munmap(m);
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// Open a resident ComposeSource over per-cell PMTiles at `paths` (mmap'd, so the cell set is never
+/// fully resident). If `load_partition` is non-null and valid for this cell set the partition is
+/// loaded (no build); else it is built. Returns null if no archive carries coverage. Free with
+/// `ComposeSource.deinit`.
+pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, load_partition: ?[]const u8) !?*ComposeSource {
+    const pmtiles = engine.pmtiles;
+    const scene = engine.scene;
+    const src = try gpa.create(ComposeSource);
+    src.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .maps = &.{}, .readers = &.{}, .part = undefined, .minz = 0, .maxz = 0, .loop_max = 0 };
+    errdefer {
+        src.arena.deinit();
+        gpa.destroy(src);
+    }
+    const a = src.arena.allocator();
+
+    // mmap + open each archive; keep only those carrying coverage, so readers/maps/shims stay
+    // aligned (cell index == reader index) exactly as composeInto arranges them.
+    var readers = std.ArrayList(*pmtiles.Reader).empty;
+    var maps = std.ArrayList([]align(std.heap.page_size_min) const u8).empty;
+    var shims = std.ArrayList(LoadedCov).empty;
+    var built_part = false;
+    errdefer {
+        for (readers.items) |rp| rp.deinit();
+        for (maps.items) |m| std.posix.munmap(m);
+        if (built_part) src.part.deinit();
+    }
+    var minz: u8 = 255;
+    var maxz: u8 = 0;
+    for (paths) |path| {
+        var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
+        const st = f.stat(io) catch {
+            f.close(io);
+            continue;
+        };
+        const len: usize = @intCast(st.size);
+        if (len == 0) {
+            f.close(io);
+            continue;
+        }
+        const map = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0) catch {
+            f.close(io);
+            continue;
+        };
+        f.close(io);
+        const rp = a.create(pmtiles.Reader) catch {
+            std.posix.munmap(map);
+            continue;
+        };
+        rp.* = pmtiles.Reader.init(gpa, map) catch {
+            std.posix.munmap(map);
+            continue;
+        };
+        const meta = readMetaJson(a, rp) orelse {
+            rp.deinit();
+            std.posix.munmap(map);
+            continue;
+        };
+        const cc = (scene.coverage.decodeFromMetadata(a, meta) catch null) orelse {
+            rp.deinit();
+            std.posix.munmap(map);
+            continue;
+        };
+        const bz = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cc.cscl));
+        minz = @min(minz, bz.min);
+        maxz = @max(maxz, bz.max);
+        try maps.append(a, map);
+        try readers.append(a, rp);
+        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = .{
+            @as(f64, @floatFromInt(cc.bbox[0])) / 1e7, @as(f64, @floatFromInt(cc.bbox[1])) / 1e7,
+            @as(f64, @floatFromInt(cc.bbox[2])) / 1e7, @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,
+        } });
+    }
+    if (readers.items.len == 0) {
+        src.arena.deinit();
+        gpa.destroy(src);
+        return null;
+    }
+
+    const cells = try toPlaneCells(a, shims.items);
+    for (cells, readers.items) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
+
+    var loaded = false;
+    if (load_partition) |bytes| {
+        if (engine.geo.partition.deserialize(gpa, bytes, cells)) |p| {
+            src.part = p;
+            loaded = true;
+        } else |err| std.debug.print("  partition sidecar unusable ({s}); building\n", .{@errorName(err)});
+    }
+    if (!loaded) src.part = try engine.geo.partition.build(gpa, cells);
+    built_part = true;
+
+    const fill_max = @min(maxz + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);
+    src.maps = maps.items;
+    src.readers = readers.items;
+    src.minz = minz;
+    src.maxz = maxz;
+    src.loop_max = @max(maxz, fill_max);
+    return src;
+}
+
 // The output-layer slot for a decoded layer name (one of scene.VECTOR_LAYERS), or null to drop.
 fn layerIndex(name: []const u8) ?usize {
     for (engine.scene.VECTOR_LAYERS, 0..) |ln, i| {
