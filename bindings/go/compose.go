@@ -100,6 +100,22 @@ func (c *ComposeSource) Meta() ComposeMeta {
 	}
 }
 
+// SavePartition serializes the resident ownership partition to path — a sidecar a later
+// OpenCompose can load (as partitionPath) to skip the owned-face build.
+func (c *ComposeSource) SavePartition(path string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ptr == nil {
+		return fmt.Errorf("tile57: SavePartition on a closed ComposeSource")
+	}
+	var ar cArena
+	defer ar.free()
+	if C.tile57_compose_save_partition(c.ptr, ar.str(path)) != 1 {
+		return fmt.Errorf("tile57: SavePartition to %q failed", path)
+	}
+	return nil
+}
+
 // Close releases the compositor (munmaps the archives, frees the partition). Idempotent.
 func (c *ComposeSource) Close() error {
 	c.mu.Lock()

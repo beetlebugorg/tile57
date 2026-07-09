@@ -1397,6 +1397,11 @@ pub const ComposeSource = struct {
     pub fn serve(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !?[]u8 {
         return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
     }
+    /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can
+    /// load to skip the owned-face build.
+    pub fn serializePartition(self: *ComposeSource, gpa: std.mem.Allocator) ![]u8 {
+        return engine.geo.partition.serialize(gpa, &self.part);
+    }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
         self.part.deinit();

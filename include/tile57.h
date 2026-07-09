@@ -161,6 +161,10 @@ int tile57_compose_serve(tile57_compose_source *src, uint8_t z, uint32_t x, uint
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_meta_get(tile57_compose_source *src, tile57_compose_meta *out);
 
+/* Serialize the compositor's ownership partition to the file `path` (a sidecar a later
+ * tile57_compose_open can load to skip the build). Returns 1 ok, -1 on error. */
+int tile57_compose_save_partition(tile57_compose_source *src, const char *path);
+
 /* Release a compositor opened by tile57_compose_open (munmaps the archives, frees the partition). */
 void tile57_compose_close(tile57_compose_source *src);
 

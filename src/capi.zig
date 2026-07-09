@@ -270,6 +270,19 @@ export fn tile57_compose_meta_get(handle: ?*bundle.ComposeSource, out: *CCompose
     };
 }
 
+/// Serialize the compositor's ownership partition to the file `path` (a sidecar a later
+/// tile57_compose_open can load to skip the build). 1=ok, -1=error. See tile57.h.
+export fn tile57_compose_save_partition(handle: ?*bundle.ComposeSource, path: ?[*:0]const u8) callconv(.c) c_int {
+    const src = handle orelse return -1;
+    const p = spanOpt(path) orelse return -1;
+    const bytes = src.serializePartition(gpa) catch return -1;
+    defer gpa.free(bytes);
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = p, .data = bytes }) catch return -1;
+    return 1;
+}
+
 /// Release a compositor opened by tile57_compose_open (munmaps the archives, frees the partition).
 export fn tile57_compose_close(handle: ?*bundle.ComposeSource) callconv(.c) void {
     if (handle) |src| src.deinit();
