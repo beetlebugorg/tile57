@@ -606,6 +606,16 @@ fn parWorker(pc: *ParCtx) void {
     }
 }
 
+/// Run func(user, i, scratch) for every i in [0, n) SERIALLY on the calling thread (a per-thread
+/// scratch arena reset between items, exactly like parallelFor with one thread). Tile generation
+/// uses this: the parallel unit is the CELL (chart.bakeCellsParallel runs one worker per cell), so
+/// per-cell tile-gen stays single-threaded and W workers stay W threads — no nested thread pool.
+pub fn serialFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *const fn (*anyopaque, usize, std.mem.Allocator) void) void {
+    if (n == 0) return;
+    var pc = ParCtx{ .next = std.atomic.Value(usize).init(0), .n = n, .user = user, .func = func, .gpa = gpa };
+    parWorker(&pc);
+}
+
 /// Run func(user, i, scratch) for every i in [0, n) across the CPU threads. func
 /// must be safe to call concurrently for distinct i (no shared mutable state).
 /// `scratch` is a per-thread arena reset between items — use it for transient
@@ -1101,7 +1111,7 @@ pub const Baker = struct {
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
         var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .context = self.context, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
-        parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
+        serialFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
             const mvt_bytes = mvt_opt orelse continue;
@@ -1182,7 +1192,7 @@ pub const Baker = struct {
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
         var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .context = self.context, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
-        parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
+        serialFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
             const mvt_bytes = mvt_opt orelse continue;

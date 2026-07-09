@@ -644,6 +644,8 @@ const BakeCtx = struct {
 };
 
 fn bakeCellWorker(ctx: *BakeCtx) void {
+    // One cell per thread. Tile generation is serial (bake_enc.serialFor), so a worker is exactly
+    // one thread — W workers stay W threads, never W x cpus.
     while (true) {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.paths.len) return;
