@@ -1,4 +1,5 @@
-//! `compose <cell.000 | ENC_ROOT> -o <out.pmtiles> [--rules DIR] [--keep-cells]` — the
+//! `compose <cell.000 | ENC_ROOT | archive-dir> -o <out.pmtiles> [--rules DIR] [--keep-cells]
+//! [--from-archives]` — the
 //! per-cell composite bake, disk-to-disk. Bake each cell to its OWN native-scale PMTiles (with
 //! its M_COVR coverage embedded in the metadata), written to a temp file so only ONE cell's
 //! archive is ever resident; then stream them through the ownership partition into one merged
@@ -21,6 +22,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var out: ?[]const u8 = null;
     var rules: ?[]const u8 = null;
     var keep_cells = false; // retain the per-cell temp PMTiles (a reusable cache) instead of deleting
+    var from_archives = false; // compose a dir of pre-baked archives (skip the bake)
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -30,6 +32,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             rules = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--keep-cells")) {
             keep_cells = true;
+        } else if (std.mem.eql(u8, arg, "--from-archives")) {
+            from_archives = true; // <base> is a DIR of pre-baked *.cell.tmp / *.pmtiles — skip baking
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -61,15 +65,29 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             cell_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
         }
     }
-    if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
+    if (!from_archives and cell_paths.items.len == 0) return usageErr("no .000 cells found");
 
     // 2. Bake each cell to its own temp PMTiles file (one cell resident at a time — the bytes
     //    are freed as soon as they are written).
     var tmp_paths = std.ArrayList([]const u8).empty;
-    defer if (!keep_cells) for (tmp_paths.items) |p| {
+    defer if (!keep_cells and !from_archives) for (tmp_paths.items) |p| {
         std.Io.Dir.cwd().deleteFile(io, p) catch {};
     };
-    for (cell_paths.items) |cp| {
+    if (from_archives) {
+        // <base> is a directory of pre-baked *.cell.tmp / *.pmtiles — compose them directly.
+        // The fast recompose loop over a --keep-cells cache: the bake (~minutes for a
+        // district) is skipped, only the partition + compose (~seconds to minutes) reruns.
+        var dir = std.Io.Dir.cwd().openDir(io, base_path, .{ .iterate = true }) catch return usageErr("cannot open archives dir");
+        defer dir.close(io);
+        var walker = dir.walk(a) catch return usageErr("cannot walk archives dir");
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".cell.tmp") and !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
+            tmp_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
+        }
+        std.debug.print("recompose: {d} pre-baked archives from {s}\n", .{ tmp_paths.items.len, base_path });
+    } else for (cell_paths.items) |cp| {
         const arc = (chart.bakeCellBytes(cp, rules_dir) catch |err| {
             std.debug.print("  warn: bake of {s} failed ({s}); skipping\n", .{ cp, @errorName(err) });
             continue;
