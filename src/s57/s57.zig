@@ -751,7 +751,7 @@ pub const Cell = struct {
     /// lineGeometryParts (which only checks the current tail against the NEXT FSPT
     /// edge) fragments it into spurious parts. Byte-identical to lineGeometryParts
     /// when the FSPT list is already connected (the index's first-unused-touching
-    /// pick is then the next edge). The result feeds orientAreaRings, which derives
+    /// pick is then the next edge). The result feeds mvt.orientAreaRings, which derives
     /// exterior-vs-hole by geometric nesting, so ring USAG/order is not needed here.
     /// Lines keep the FSPT-order assembly (the oracle's constructLineStringGeometry
     /// is FSPT-order too).

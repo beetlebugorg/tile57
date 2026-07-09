@@ -28,7 +28,7 @@
 //!
 //! Winding: the result contours are emitted as *open* rings with unspecified
 //! orientation — even-odd fill of the returned ring-set is the region. Callers
-//! that need MVT winding hand the rings to scene.orientAreaRings (the sole
+//! that need MVT winding hand the rings to mvt.orientAreaRings (the sole
 //! winding authority); nothing here relies on input orientation either, so
 //! every operand is interpreted even-odd.
 
@@ -476,7 +476,7 @@ fn addRing(sw: *Sweeper, ring: []const Pt, subject: bool, gpa: Allocator) !void 
 // the even-degree survivor graph every non-start vertex always has an exit, so the
 // walk always returns to its start on a real edge; the loop's implied edges are
 // exactly the walked edges, keeping even-odd exact. Winding/nesting is deferred to
-// scene.orientAreaRings.
+// mvt.orientAreaRings.
 
 const EdgeKey = struct { ax: i64, ay: i64, bx: i64, by: i64 };
 

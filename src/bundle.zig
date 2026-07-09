@@ -535,7 +535,7 @@ fn emitFacesZoom(sw: *engine.pmtiles.StreamWriter, sa: std.mem.Allocator, faces:
                     if (clipped.len >= 3) try parts.append(sa, clipped);
                 }
                 if (parts.items.len == 0) continue;
-                const oriented = try engine.scene.orientAreaRings(sa, parts.items);
+                const oriented = try engine.mvt.orientAreaRings(sa, parts.items);
                 const gop = try tilemap.getOrPut(.{ .x = tx, .y = ty });
                 if (!gop.found_existing) gop.value_ptr.* = .{ .polys = .empty, .labels = .empty };
                 try gop.value_ptr.polys.append(sa, .{ .geom_type = .polygon, .parts = oriented, .properties = props });
@@ -591,7 +591,7 @@ fn worldAxisToTile(w: f64, scale: f64) u32 {
 // a tile is cosmetic). This retires the streaming in-bake cross-cell combiner: the per-cell
 // bakes stay dumb + cacheable, and all cross-cell logic is precomputed as the partition.
 
-const N_COMPOSE_LAYERS = engine.scene.VECTOR_LAYERS.len;
+const N_COMPOSE_LAYERS = engine.mvt.VECTOR_LAYERS.len;
 
 // The tile-index cover (nw..se) of an owner face's lon/lat bbox at zoom `scale = 1<<z`. The
 // on-demand composeTile culls candidate tiles through this exact box.
@@ -661,7 +661,7 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const engine.geometry.partition
     for (&buckets, 0..) |*bucket, li| {
         if (bucket.items.len == 0) continue;
         const feats = try orientPolys(ta, bucket.items);
-        try out_layers.append(ta, .{ .name = engine.scene.VECTOR_LAYERS[li], .features = feats });
+        try out_layers.append(ta, .{ .name = engine.mvt.VECTOR_LAYERS[li], .features = feats });
     }
     if (out_layers.items.len == 0) return null;
     return try engine.mlt.encode(ta, .{ .layers = out_layers.items });
@@ -875,7 +875,7 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
 
 // The output-layer slot for a decoded layer name (one of scene.VECTOR_LAYERS), or null to drop.
 fn layerIndex(name: []const u8) ?usize {
-    for (engine.scene.VECTOR_LAYERS, 0..) |ln, i| {
+    for (engine.mvt.VECTOR_LAYERS, 0..) |ln, i| {
         if (std.mem.eql(u8, ln, name)) return i;
     }
     return null;
@@ -951,7 +951,7 @@ fn orientPolys(a: std.mem.Allocator, feats: []const engine.mvt.Feature) ![]const
     const out = try a.alloc(mvt.Feature, feats.len);
     for (feats, 0..) |f, i| {
         out[i] = if (f.geom_type == .polygon)
-            .{ .id = f.id, .geom_type = .polygon, .parts = try engine.scene.orientAreaRings(a, f.parts), .properties = f.properties }
+            .{ .id = f.id, .geom_type = .polygon, .parts = try engine.mvt.orientAreaRings(a, f.parts), .properties = f.properties }
         else
             f;
     }

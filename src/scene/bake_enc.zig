@@ -426,63 +426,24 @@ pub fn effScaminFloor(cscl: i32) i64 {
     return @intFromFloat(@ceil(k / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(floor_z)))));
 }
 
-/// Native [minzoom, maxzoom] Web-Mercator span for a navigational-purpose band.
-pub const ZoomRange = struct { min: u8, max: u8 };
+// The navigational-band / scale->zoom mapping lives in tiles.band (a pure leaf
+// both the baker and the compositor share). Re-exported here so this module's
+// callers (chart, coverage) keep reaching it through bake_enc. (Inline @import
+// rather than a `band` binding, so the many `band: Band` parameters below don't
+// shadow it.)
+pub const ZoomRange = @import("tiles").band.ZoomRange;
+pub const Band = @import("tiles").band.Band;
+pub const bands_fine_to_coarse = @import("tiles").band.bands_fine_to_coarse;
+pub const bandOf = @import("tiles").band.bandOf;
+pub const FILLUP_DZ = @import("tiles").band.FILLUP_DZ;
+pub const FILLUP_CEIL = @import("tiles").band.FILLUP_CEIL;
+pub const bandZooms = @import("tiles").band.bandZooms;
 
 /// Restricts a bakeBand pass to the tiles under one "super-tile" (a tile at the
 /// coarser zoom `zs`): only (z,x,y) with z >= zs whose ancestor at zs is (sx,sy)
 /// are generated. Lets the lazy baker process a band one spatial super-tile at a
 /// time — loading only the cells overlapping it — instead of the whole band.
 pub const TileClip = struct { zs: u8, sx: u32, sy: u32 };
-
-/// Navigational-purpose bands, finest → coarsest (the order bands must be baked in
-/// for best-band dedup). Mirrors chartplotter-go bake.Band.
-pub const Band = enum(u8) { berthing = 0, harbor, approach, coastal, general, overview };
-
-/// All bands finest → coarsest (the bakeBand call order).
-pub const bands_fine_to_coarse = [_]Band{ .berthing, .harbor, .approach, .coastal, .general, .overview };
-
-/// Map a compilation-scale denominator (CSCL, 1:N) to its band (Go BandForScale).
-pub fn bandOf(cscl: i32) Band {
-    const n: i64 = if (cscl <= 0) 50_000 else cscl;
-    if (n <= 8_000) return .berthing;
-    if (n <= 32_000) return .harbor;
-    if (n <= 130_000) return .approach;
-    if (n <= 500_000) return .coastal;
-    if (n <= 2_300_000) return .general;
-    return .overview;
-}
-
-/// Overscale fill-up depth DEFAULT: how many zooms past its native max a
-/// band's own cells keep baking (only where nothing finer already emitted).
-/// Every extension zoom ~4x that band's tile count over its uncovered
-/// footprint (measured: +2 turned a 5.6k-tile approach pass into 41k), so the
-/// default is ONE crisp overscale zoom; TILE57_FILLUP_DZ=0..2 overrides per
-/// bake (Baker.fillup_dz). 0 never blanks — the client camera stops at the
-/// probed data depth and MapLibre stretches one level past it.
-pub const FILLUP_DZ: u8 = 1;
-
-/// Absolute fill-up ceiling: extension zooms never exceed this. The fill-up
-/// serves the MID-ZOOM seam where a coarse chart is the finest coverage (the
-/// blank bay at z12-15); letting fine bands extend too (harbor→z17-18,
-/// berthing→z19-20) quadruples the tile count per extra zoom across every
-/// harbor footprint for content nobody needs — a district pack ballooned from
-/// ~800k to 13M+ planned tiles. A band's NATIVE window is never clamped by
-/// this; past its data the camera stops at the probed depth instead.
-pub const FILLUP_CEIL: u8 = 15;
-
-/// A band's native zoom span (Go Band.ZoomRange). Adjacent bands overlap by one
-/// zoom; best-band dedup resolves the overlap to the finer band.
-pub fn bandZooms(band: Band) ZoomRange {
-    return switch (band) {
-        .berthing => .{ .min = 16, .max = 18 },
-        .harbor => .{ .min = 13, .max = 16 },
-        .approach => .{ .min = 11, .max = 13 },
-        .coastal => .{ .min = 9, .max = 11 },
-        .general => .{ .min = 7, .max = 9 },
-        .overview => .{ .min = 0, .max = 7 },
-    };
-}
 
 /// The live-path fallback band for a tile whose zoom sits OUTSIDE every
 /// overlapping cell's native window (chart.zig tileRefs). ABOVE every window

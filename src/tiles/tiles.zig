@@ -6,6 +6,7 @@
 //!   pmtiles — PMTiles v3 archive read/write
 //!   tile    — web-mercator tile math: projection, extent, clipping,
 //!             simplification (the geometry side of tiling)
+//!   band    — compilation-scale -> zoom-range mapping (navigational bands)
 //!
 //! Pure std; the leaf bundle everything tile-shaped builds on.
 
@@ -14,6 +15,7 @@ pub const mlt = @import("mlt.zig");
 pub const gzip = @import("gzip.zig");
 pub const pmtiles = @import("pmtiles.zig");
 pub const tile = @import("tile.zig");
+pub const band = @import("band.zig");
 
 test {
     _ = mvt;
@@ -21,4 +23,5 @@ test {
     _ = gzip;
     _ = pmtiles;
     _ = tile;
+    _ = band;
 }

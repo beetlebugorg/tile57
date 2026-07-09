@@ -454,103 +454,6 @@ fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]con
     return out.items;
 }
 
-/// Shoelace signed area (x2) of a ring in tile space; only its sign is used.
-/// y is down, so a positive value is a clockwise (exterior) ring per the MVT spec.
-fn ringSignedArea(ring: []const mvt.Point) i64 {
-    if (ring.len < 3) return 0;
-    var area: i64 = 0;
-    var j: usize = ring.len - 1;
-    for (ring, 0..) |p, i| {
-        const q = ring[j];
-        area += @as(i64, q.x) * @as(i64, p.y) - @as(i64, p.x) * @as(i64, q.y);
-        j = i;
-    }
-    return area;
-}
-
-/// Even-odd ray test: is tile-space point `pt` inside `ring`?
-fn ringContains(ring: []const mvt.Point, pt: mvt.Point) bool {
-    if (ring.len < 3) return false;
-    var inside = false;
-    const px: f64 = @floatFromInt(pt.x);
-    const py: f64 = @floatFromInt(pt.y);
-    var j: usize = ring.len - 1;
-    for (ring, 0..) |p, i| {
-        const q = ring[j];
-        const ax: f64 = @floatFromInt(p.x);
-        const ay: f64 = @floatFromInt(p.y);
-        const bx: f64 = @floatFromInt(q.x);
-        const by: f64 = @floatFromInt(q.y);
-        if ((ay > py) != (by > py) and
-            px < (bx - ax) * (py - ay) / (by - ay) + ax)
-        {
-            inside = !inside;
-        }
-        j = i;
-    }
-    return inside;
-}
-
-/// Orient + order a feature's clipped area rings into MVT multipolygon parts so
-/// holes are SUBTRACTED instead of filled (e.g. an island inside a sea/depth
-/// area). Mirrors the Go reference encodePolygon: classify each ring by geometric
-/// nesting depth (even = exterior, odd = hole), force exteriors to a positive
-/// signed area (clockwise in y-down tile space) and holes to negative, and emit
-/// each exterior immediately followed by the holes it directly contains. This is
-/// independent of the FSPT USAG tags, and keeps disjoint multi-part areas
-/// (multiple exteriors) working as a proper multipolygon. `rings` are the clipped
-/// rings (open, >= 3 pts); returned parts may reverse a ring into a fresh copy.
-/// Public so the ownership-partition debug bake gets the same MVT winding.
-pub fn orientAreaRings(a: Allocator, rings: []const []const mvt.Point) ![]const []const mvt.Point {
-    const n = rings.len;
-    const depth = try a.alloc(usize, n);
-    for (rings, 0..) |ri, i| {
-        var d: usize = 0;
-        for (rings, 0..) |rj, j| {
-            if (i != j and ringContains(rj, ri[0])) d += 1;
-        }
-        depth[i] = d;
-    }
-
-    const done = try a.alloc(bool, n);
-    @memset(done, false);
-    var out = std.ArrayList([]const mvt.Point).empty;
-
-    const emit = struct {
-        fn one(al: Allocator, list: *std.ArrayList([]const mvt.Point), ring: []const mvt.Point, d: usize) !void {
-            const want_pos = (d % 2) == 0; // even depth = exterior (positive), odd = hole
-            if ((ringSignedArea(ring) >= 0) == want_pos) {
-                try list.append(al, ring);
-            } else {
-                const rev = try al.alloc(mvt.Point, ring.len);
-                for (ring, 0..) |p, k| rev[ring.len - 1 - k] = p;
-                try list.append(al, rev);
-            }
-        }
-    }.one;
-
-    // Each exterior (even depth) followed by the holes it directly contains, so a
-    // decoder attaches each hole to the right exterior (depth exactly +1, inside).
-    for (0..n) |i| {
-        if (done[i] or depth[i] % 2 != 0) continue;
-        done[i] = true;
-        try emit(a, &out, rings[i], depth[i]);
-        for (0..n) |k| {
-            if (done[k] or depth[k] != depth[i] + 1) continue;
-            if (ringContains(rings[i], rings[k][0])) {
-                done[k] = true;
-                try emit(a, &out, rings[k], depth[k]);
-            }
-        }
-    }
-    // Safety net: emit anything not placed (malformed nesting) on its own.
-    for (0..n) |i| {
-        if (done[i]) continue;
-        done[i] = true;
-        try emit(a, &out, rings[i], depth[i]);
-    }
-    return out.items;
-}
 
 fn geomBounds(g: []const s57.LonLat) [4]f64 {
     var b = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
@@ -939,16 +842,10 @@ test "hasAdditionalInfo: INFORM/TXTDSC trigger; blank/absent/other don't" {
     try std.testing.expect(!hasAdditionalInfo(.{ .rcnm = 100, .rcid = 5, .prim = 1, .objl = 75, .attrs = &.{.{ .code = inform, .value = "  \t " }} }));
 }
 
-/// The vector layers this engine emits, in emit order — the source-layer ids the
-/// generated MapLibre style reads. v2 tile schema (tile57/2): 6 layers, one per
-/// render family. Each former `_scamin` twin is folded into its base at emit time
-/// (endScene) — SCAMIN is now a per-feature `scamin` property the style gates, not a
-/// separate layer — and complex/sector lines fold into `lines`. Static: an archive
-/// may omit empties, but the TileJSON advertises the full set. Keep in sync with the
-/// layer appends in endScene.
-pub const VECTOR_LAYERS = [_][]const u8{
-    "areas", "area_patterns", "lines", "point_symbols", "soundings", "text",
-};
+/// The vector layers this engine emits, in emit order — the tile57/2 source-layer
+/// set. Defined in tiles.mvt (shared with the compositor) and re-exported here;
+/// keep the layer appends in endScene in sync with it.
+pub const VECTOR_LAYERS = mvt.VECTOR_LAYERS;
 
 /// PMTiles archive metadata JSON: the static vector_layers list MapLibre reads from
 /// the TileJSON, plus a "scamin" array of the distinct SCAMIN denominators present
@@ -1746,7 +1643,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         // Best-available: cut this cell's fill where a finer cell covers the ground.
         const arings = if (opts.cover_clip) |cc| subtractCoverage(a, rings.items, cc) else rings.items;
         if (arings.len > 0) {
-            const rparts = try orientAreaRings(a, arings);
+            const rparts = try mvt.orientAreaRings(a, arings);
             const dv = depthVals(f);
             const dr: ?rs.DepthRange = if (dv) |d| .{ .d1 = d[0], .d2 = d[1] } else null;
             const fillmeta = fmeta;
@@ -2529,7 +2426,7 @@ fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (ring.len >= 3) try rings.append(a, ring);
     }
     if (rings.items.len == 0) return;
-    const parts = try orientAreaRings(a, rings.items);
+    const parts = try mvt.orientAreaRings(a, rings.items);
     const fmeta = rs.FeatureMeta{
         // S-52 §10.1.10.2: the overscale pattern draws at display priority 3 in
         // DISPLAY BASE (the indication is never optional content). No class/pick
@@ -2934,7 +2831,7 @@ fn appendCellFeatures(
                 if (ring.len >= 3) try rings.append(a, ring);
             }
             if (rings.items.len == 0) continue;
-            const parts = try orientAreaRings(a, rings.items);
+            const parts = try mvt.orientAreaRings(a, rings.items);
             var aprops = std.ArrayList(mvt.Prop).empty;
             try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
             try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
@@ -3111,53 +3008,6 @@ test "listHasAny splits S-57 comma lists and matches any target" {
     try std.testing.expect(!listHasAny("", &.{18}));
 }
 
-test "orientAreaRings subtracts a hole: exterior CW (+), interior CCW (-)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // A sea-area exterior square (CCW as authored) with a smaller island hole
-    // inside it (also CCW as authored). y is down in tile space.
-    const ext = [_]mvt.Point{
-        .{ .x = 0, .y = 0 },     .{ .x = 0, .y = 100 },
-        .{ .x = 100, .y = 100 }, .{ .x = 100, .y = 0 },
-    };
-    const hole = [_]mvt.Point{
-        .{ .x = 40, .y = 40 }, .{ .x = 40, .y = 60 },
-        .{ .x = 60, .y = 60 }, .{ .x = 60, .y = 40 },
-    };
-    // Pass the hole first to prove ordering is by geometry, not input order.
-    const rings = [_][]const mvt.Point{ hole[0..], ext[0..] };
-    const out = try orientAreaRings(a, &rings);
-
-    try std.testing.expectEqual(@as(usize, 2), out.len);
-    // First emitted ring is the exterior (positive signed area), then its hole
-    // (negative). This is the winding MapLibre reads to cut the hole out.
-    try std.testing.expect(ringSignedArea(out[0]) > 0);
-    try std.testing.expect(ringSignedArea(out[1]) < 0);
-    // The exterior must be the 100x100 ring, the hole the 20x20 one.
-    try std.testing.expect(@abs(ringSignedArea(out[0])) > @abs(ringSignedArea(out[1])));
-}
-
-test "orientAreaRings keeps disjoint parts as separate exteriors (multipolygon)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Two disjoint squares (CTNARE-style multi-part area): both are exteriors,
-    // both wound positive, neither becomes a hole of the other.
-    const r0 = [_]mvt.Point{
-        .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 10 }, .{ .x = 10, .y = 10 }, .{ .x = 10, .y = 0 },
-    };
-    const r1 = [_]mvt.Point{
-        .{ .x = 50, .y = 50 }, .{ .x = 50, .y = 60 }, .{ .x = 60, .y = 60 }, .{ .x = 60, .y = 50 },
-    };
-    const rings = [_][]const mvt.Point{ r0[0..], r1[0..] };
-    const out = try orientAreaRings(a, &rings);
-    try std.testing.expectEqual(@as(usize, 2), out.len);
-    try std.testing.expect(ringSignedArea(out[0]) > 0);
-    try std.testing.expect(ringSignedArea(out[1]) > 0);
-}
 
 fn findProp(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
     for (props) |pr| if (std.mem.eql(u8, pr.key, key)) return pr.value;
