@@ -236,8 +236,10 @@ export fn tile57_compose_open(
 }
 
 /// Compose the tile (z,x,y) on demand, returning the RAW (decompressed) MLT in *out / *out_len (free
-/// with tile57_free) — what a live tile server hands its HTTP layer. 1=served, 0=no cell owns this
-/// tile, -1=error. Byte-faithful to the batch compositor. See tile57.h.
+/// with tile57_free) — what a live tile server hands its HTTP layer. Returns 1 = served (bytes set),
+/// 2 = OWNED-but-empty (a cell owns this ground per the partition but produced nothing — transient
+/// during a bake, an error state once bakes are done), 0 = not owned (true empty ocean, safe to
+/// cache), -1 = error. Byte-faithful to the batch compositor. See tile57.h.
 export fn tile57_compose_serve(
     handle: ?*bundle.ComposeSource,
     z: u8,
@@ -247,13 +249,13 @@ export fn tile57_compose_serve(
     out_len: *usize,
 ) callconv(.c) c_int {
     const src = handle orelse return -1;
-    const tile = src.serve(gpa, z, x, y) catch return -1;
-    if (tile) |t| {
+    const res = src.serve(gpa, z, x, y) catch return -1;
+    if (res.tile) |t| {
         out.* = t.ptr;
         out_len.* = t.len;
         return 1;
     }
-    return 0;
+    return if (res.owned) 2 else 0;
 }
 
 /// Fill `out` with the compositor's zoom range + union coverage bounds. See tile57.h.

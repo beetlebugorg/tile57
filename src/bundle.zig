@@ -1332,9 +1332,9 @@ fn composeZoom(
 /// server wants — the HTTP layer gzips on the wire). gpa-owned; null if no cell owns this tile. This
 /// is the runtime compositor: with the partition loaded once, serving a tile is a classify plus
 /// either one memcpy/decompress or one decode/clip/encode, not a whole-district pass.
-pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Partition, readers: []const *engine.pmtiles.Reader, z: u8, tx: u32, ty: u32, gzip: bool) !?[]u8 {
+pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Partition, readers: []const *engine.pmtiles.Reader, z: u8, tx: u32, ty: u32, gzip: bool) !TileResult {
     const compose = engine.scene.compose;
-    const map = part.mapForZoom(z) orelse return null;
+    const map = part.mapForZoom(z) orelse return .{ .tile = null, .owned = false };
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1345,6 +1345,9 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Par
     // by face bbox, classify. The FIRST owner that fully owns the tile (buffer included) and has a
     // native blob wins the verbatim copy — faces are a disjoint partition, so that owner is unique.
     // Every other contributing owner (seam, or fully-owned-but-no-native) is collected in face order.
+    // `owned` = at least one cell's coverage face covers this tile (the partition says it SHOULD
+    // render here) — so a caller can tell a transient/erroneous empty from true empty ocean.
+    var owned = false;
     var slots = std.ArrayList(u32).empty;
     for (map.faces, 0..) |face, slot| {
         if (face.owned.len == 0) continue;
@@ -1358,23 +1361,31 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Par
         switch (grid.classify(tileClassifyBox(z, tx, ty))) {
             .full => continue, // owns none of this tile
             .empty => { // owns the whole tile: verbatim blob if present, else fall through
+                owned = true;
                 if (gzip) {
-                    if (try readers[ci].getCompressed(z, tx, ty)) |blob| return try gpa.dupe(u8, blob);
-                } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return try gpa.dupe(u8, raw);
+                    if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .tile = try gpa.dupe(u8, blob), .owned = true };
+                } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .tile = try gpa.dupe(u8, raw), .owned = true };
             },
-            .seam => {},
+            .seam => owned = true,
         }
         if (!(try ownerHasTile(readers[ci], cscl, z, tx, ty))) continue;
         const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
         if (face_px.len == 0) continue;
         try slots.append(ta, @intCast(slot));
     }
-    if (slots.items.len == 0) return null;
+    if (slots.items.len == 0) return .{ .tile = null, .owned = owned };
 
-    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, z, tx, ty)) orelse return null;
+    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, z, tx, ty)) orelse return .{ .tile = null, .owned = owned };
     // gzip=true → match the archive's stored (gzipped) bytes; gzip=false → hand back the raw MLT.
-    return if (gzip) try engine.pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
+    const bytes = if (gzip) try engine.pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
+    return .{ .tile = bytes, .owned = true };
 }
+
+/// The outcome of composing one tile: its bytes (null if nothing rendered) and whether the ownership
+/// partition says a cell SHOULD render here. `tile == null and owned` = expected-but-empty (a cell
+/// owns the ground but produced nothing — transient during a bake, suspect once a bake is done);
+/// `tile == null and !owned` = true empty (no cell owns this ground — open ocean, safe to cache).
+pub const TileResult = struct { tile: ?[]u8, owned: bool };
 
 /// A resident compositor: the per-cell archives held mmap'd and the ownership partition built once
 /// (or loaded from a sidecar), so `serve` composes any tile without a whole-district pass. Open once,
@@ -1392,9 +1403,10 @@ pub const ComposeSource = struct {
     loop_max: u8, // deepest zoom the sources can serve (native windows + one fill-up overscale zoom)
     bounds: [4]f64, // union coverage [west, south, east, north] in degrees
 
-    /// Compose one tile → raw (decompressed) MLT (gpa-owned; null if no cell owns it). This is what
-    /// a live tile server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
-    pub fn serve(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !?[]u8 {
+    /// Compose one tile → raw (decompressed) MLT + the ownership flag (gpa-owned bytes; null when
+    /// nothing rendered — `owned` then says whether a cell SHOULD have). This is what a live tile
+    /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
+    pub fn serve(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileResult {
         return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
     }
     /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can
@@ -2825,7 +2837,7 @@ fn verifyComposeTileMatchesBatch(gpa: std.mem.Allocator, arcs: []const []const u
             var ty = nw[1] -| 1;
             while (ty <= se[1] + 1) : (ty += 1) {
                 const want = try truth.getCompressed(z, tx, ty); // borrowed from truth's arena
-                const got = try composeTile(gpa, &part, readers, z, tx, ty, true); // gzip → archive-identical
+                const got = (try composeTile(gpa, &part, readers, z, tx, ty, true)).tile; // gzip → archive-identical
                 defer if (got) |g| gpa.free(g);
                 if (want == null and got == null) continue;
                 if (want == null or got == null) return error.ComposeTileMismatch;

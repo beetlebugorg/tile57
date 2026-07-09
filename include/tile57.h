@@ -153,8 +153,13 @@ tile57_compose_source *tile57_compose_open(const char *const *paths, size_t n,
                                            const char *partition_path);
 
 /* Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out / *out_len (free with
- * tile57_free) — what a live tile server hands its HTTP layer (which gzips on the wire). Returns 1
- * served, 0 if no cell owns this tile, -1 on error. Byte-faithful to the batch compositor. */
+ * tile57_free) — what a live tile server hands its HTTP layer (which gzips on the wire). Returns:
+ *   1  served (bytes in *out/*out_len),
+ *   2  OWNED but empty — a cell owns this ground per the ownership partition but produced nothing
+ *      (transient while its per-cell bake is still running; an error state once bakes are done),
+ *   0  not owned — true empty ocean (no cell owns this ground; safe to cache),
+ *  -1  error.
+ * Byte-faithful to the batch compositor. */
 int tile57_compose_serve(tile57_compose_source *src, uint8_t z, uint32_t x, uint32_t y,
                          uint8_t **out, size_t *out_len);
 

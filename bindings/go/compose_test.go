@@ -58,21 +58,27 @@ func TestOpenComposeServe(t *testing.T) {
 		z = m.MaxZoom
 	}
 	cx, cy := lonLatToTile((m.West+m.East)/2, (m.South+m.North)/2, z)
-	tile, err := src.Serve(z, cx, cy)
+	tile, owned, err := src.Serve(z, cx, cy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("served z%d/%d/%d: %d bytes (raw MLT)", z, cx, cy, len(tile))
+	t.Logf("served z%d/%d/%d: %d bytes (raw MLT), owned=%v", z, cx, cy, len(tile), owned)
 	if len(tile) == 0 {
 		t.Fatalf("centre tile z%d/%d/%d is blank — expected content", z, cx, cy)
 	}
+	if !owned {
+		t.Fatalf("centre tile z%d/%d/%d has content but owned=false", z, cx, cy)
+	}
 
-	// A tile far outside coverage must be blank (nil), not an error.
-	blank, err := src.Serve(z, 0, 0)
+	// A tile far outside coverage must be blank (nil) AND not owned (true empty ocean), not an error.
+	blank, blankOwned, err := src.Serve(z, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if blank != nil {
 		t.Fatalf("tile z%d/0/0 should be blank, got %d bytes", z, len(blank))
+	}
+	if blankOwned {
+		t.Fatalf("tile z%d/0/0 (far outside coverage) should be unowned", z)
 	}
 }

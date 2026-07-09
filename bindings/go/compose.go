@@ -59,24 +59,29 @@ func OpenCompose(paths []string, partitionPath string) (*ComposeSource, error) {
 	return &ComposeSource{ptr: ptr}, nil
 }
 
-// Serve composes the tile (z,x,y) on demand, returning raw (decompressed) MLT bytes, or (nil, nil)
-// if no cell owns the tile (a blank tile). Thread-safe (serialised).
-func (c *ComposeSource) Serve(z uint8, x, y uint32) ([]byte, error) {
+// Serve composes the tile (z,x,y) on demand, returning raw (decompressed) MLT bytes plus `owned` —
+// whether the ownership partition says a cell SHOULD render here. body!=nil → served (owned). body
+// ==nil && owned → a cell owns this ground but produced nothing (transient while its per-cell bake
+// runs; an error state once bakes are done). body==nil && !owned → true empty ocean (safe to cache).
+// Thread-safe (serialised).
+func (c *ComposeSource) Serve(z uint8, x, y uint32) (body []byte, owned bool, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.ptr == nil {
-		return nil, fmt.Errorf("tile57: Serve on a closed ComposeSource")
+		return nil, false, fmt.Errorf("tile57: Serve on a closed ComposeSource")
 	}
 	var out *C.uint8_t
 	var outLen C.size_t
 	rc := C.tile57_compose_serve(c.ptr, C.uint8_t(z), C.uint32_t(x), C.uint32_t(y), &out, &outLen)
 	switch rc {
 	case 1:
-		return tileBytes(out, outLen), nil
+		return tileBytes(out, outLen), true, nil // served (content implies owned)
+	case 2:
+		return nil, true, nil // owned but empty
 	case 0:
-		return nil, nil // no cell owns this tile
+		return nil, false, nil // not owned — true empty
 	default:
-		return nil, fmt.Errorf("tile57: compose serve failed at %d/%d/%d", z, x, y)
+		return nil, false, fmt.Errorf("tile57: compose serve failed at %d/%d/%d", z, x, y)
 	}
 }
 
