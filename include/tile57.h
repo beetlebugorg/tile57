@@ -221,14 +221,18 @@ int tile57_bake_cell_bytes(const char *path, uint8_t **out, size_t *out_len);
 int tile57_bake_cells(const char *const *paths, size_t n, uint32_t workers,
                       uint8_t **out_bytes, size_t *out_lens);
 
-/* Like tile57_bake_cells, but the engine WRITES each cell's PMTiles to out_paths[i] (plus an
- * <out_path>.sha content-hash sidecar) and frees each archive right after — so the host never
- * holds N archives in memory (peak ~ workers). The APP owns the cache and names every out path,
- * so distinct library consumers each own their own chart library without clashing. in_paths[i] is
- * the .000 to bake, out_paths[i] the file to write; both arrays length n. `workers` is a MEMORY
- * bound — pass a small count. Returns the number of cells written, or -1 on bad args. */
-int tile57_bake_cells_to_files(const char *const *in_paths, const char *const *out_paths,
-                               size_t n, uint32_t workers);
+/* Walk `in_dir` for S-57 base cells (*.000) and bake each IN PARALLEL to the SAME relative path
+ * under `out_dir` with a .pmtiles extension (in_dir/d1/US4CT1AA.000 -> out_dir/d1/US4CT1AA.pmtiles),
+ * plus an <out>.sha content-hash sidecar; output subdirs are created as needed. The engine writes
+ * and frees each archive as it goes, so the host never holds N archives in memory (peak ~ workers).
+ * `in_dir` is the source ENC data; `out_dir` is the caller's OWN cache — it owns the location + the
+ * layout, so distinct library consumers each keep their own chart library without clashing.
+ * `workers` is a MEMORY bound — pass a small count. `progress(progress_ctx, done, total)` (or NULL)
+ * fires after each cell for an import progress bar; it may be called CONCURRENTLY from worker
+ * threads, so it must be thread-safe. Returns the number of cells baked, or -1. */
+typedef void (*tile57_bake_progress)(void *ctx, uint32_t done, uint32_t total);
+int tile57_bake_tree(const char *in_dir, const char *out_dir, uint32_t workers,
+                     tile57_bake_progress progress, void *progress_ctx);
 
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +

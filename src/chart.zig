@@ -683,6 +683,12 @@ pub fn bakeCellsParallel(paths: []const []const u8, rules_dir: ?[]const u8, work
 // APP owns the cache: it names every out_path, so distinct library consumers don't clash. A
 // <out_path>.sha content-hash sidecar is written beside each archive for the host's cache token.
 
+/// Progress callback: invoked with (ctx, done, total) after each cell is processed, so a host can
+/// drive an import progress bar. It may be called CONCURRENTLY from worker threads (done arrives
+/// monotonically per fetch but can be delivered slightly out of order), so the callback must be
+/// thread-safe. Null to skip.
+pub const BakeProgress = ?*const fn (?*anyopaque, u32, u32) callconv(.c) void;
+
 const BakeFileCtx = struct {
     next: std.atomic.Value(usize),
     in_paths: []const []const u8,
@@ -690,39 +696,48 @@ const BakeFileCtx = struct {
     rules_dir: ?[]const u8,
     io: std.Io,
     ok: []bool,
+    progress: BakeProgress,
+    progress_ctx: ?*anyopaque,
+    done: std.atomic.Value(u32),
 };
+
+fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
+    const arc = (bakeCellBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
+    defer freeBytes(arc);
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ctx.out_paths[i], .data = arc }) catch return;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(arc, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var sha_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    if (std.fmt.bufPrint(&sha_buf, "{s}.sha", .{ctx.out_paths[i]})) |sha_path| {
+        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = sha_path, .data = &hex }) catch {};
+    } else |_| {}
+    ctx.ok[i] = true;
+}
 
 fn bakeFileWorker(ctx: *BakeFileCtx) void {
     while (true) {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.in_paths.len) return;
-        const arc = (bakeCellBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse continue;
-        defer freeBytes(arc);
-        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ctx.out_paths[i], .data = arc }) catch continue;
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(arc, &digest, .{});
-        const hex = std.fmt.bytesToHex(digest, .lower);
-        var sha_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
-        if (std.fmt.bufPrint(&sha_buf, "{s}.sha", .{ctx.out_paths[i]})) |sha_path| {
-            std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = sha_path, .data = &hex }) catch {};
-        } else |_| {}
-        ctx.ok[i] = true;
+        bakeOneToFile(ctx, i);
+        const d = ctx.done.fetchAdd(1, .monotonic) + 1; // attempted count (smooth progress)
+        if (ctx.progress) |cb| cb(ctx.progress_ctx, d, @intCast(ctx.in_paths.len));
     }
 }
 
 /// Bake each in_paths[i] in parallel (up to `workers` threads) and WRITE its PMTiles to
 /// out_paths[i] (plus an <out_path>.sha content-hash sidecar), freeing each archive right after
 /// the write — so the host never holds N archives (peak memory ~ the worker count). The app owns
-/// the cache and names every out_path. Race-free (warms up first; each bake is independent).
-/// Returns the number of cells written. `workers` is a MEMORY bound — keep it small.
-pub fn bakeCellsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize) usize {
+/// the cache and names every out_path. `progress(progress_ctx, done, total)` fires (serialised)
+/// after each cell. Race-free (warms up first; each bake is independent). Returns the count written.
+pub fn bakeCellsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) usize {
     std.debug.assert(out_paths.len == in_paths.len);
     if (in_paths.len == 0) return 0;
     warmup();
     const ok = gpa.alloc(bool, in_paths.len) catch return 0;
     defer gpa.free(ok);
     @memset(ok, false);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok };
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0) };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     if (n <= 1) {
@@ -739,6 +754,39 @@ pub fn bakeCellsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []c
         if (o) count += 1;
     }
     return count;
+}
+
+/// Walk `in_dir` for S-57 base cells (*.000) and bake each, IN PARALLEL, to the SAME relative path
+/// under `out_dir` with a .pmtiles extension (in_dir/d1/US4CT1AA.000 -> out_dir/d1/US4CT1AA.pmtiles),
+/// plus an <out>.sha sidecar. Output subdirs are created as needed. `in_dir` is the source ENC data;
+/// `out_dir` is the caller's own cache (it owns the location + names, so consumers don't clash). The
+/// engine writes + frees each archive, so the host never holds N in memory. `progress` fires per
+/// cell (serialised) for an import progress bar. Returns the count baked.
+pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var in_paths = std.ArrayList([]const u8).empty;
+    var out_paths = std.ArrayList([]const u8).empty;
+
+    var dir = std.Io.Dir.cwd().openDir(io, in_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var walker = dir.walk(a) catch return 0;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
+        const in_path = std.fs.path.join(a, &.{ in_dir, entry.path }) catch continue;
+        // Mirror the relative path, swapping .000 -> .pmtiles.
+        const rel_noext = entry.path[0 .. entry.path.len - ".000".len];
+        const out_rel = std.fmt.allocPrint(a, "{s}.pmtiles", .{rel_noext}) catch continue;
+        const out_path = std.fs.path.join(a, &.{ out_dir, out_rel }) catch continue;
+        if (std.fs.path.dirname(out_path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
+        in_paths.append(a, in_path) catch continue;
+        out_paths.append(a, out_path) catch continue;
+    }
+    if (in_paths.items.len == 0) return 0;
+    return bakeCellsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx);
 }
 
 /// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null
