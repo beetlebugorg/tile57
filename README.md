@@ -76,9 +76,10 @@ It is **high-performance and low-memory** by design:
   under an LRU bound. A **streaming** open reads a cell's bytes on demand (and
   frees them on eviction), so a host holds only the working set — not the whole
   catalogue.
-- **Band-streamed bakes.** Baking an ENC_ROOT to one PMTiles archive streams
-  band-by-band (finest → coarsest, best-band dedup), so peak memory tracks the
-  largest single band.
+- **Per-cell bakes.** Each ENC cell bakes to its own PMTiles at its compilation
+  scale, so a bake holds one cell at a time; the runtime compositor stitches the
+  cells by `(z, x, y)` on demand. (An offline whole-ENC_ROOT archive bake streams
+  band-by-band, so its peak memory tracks the largest single band.)
 - **Pure-Zig core.** The foundational format/encode packages have no libc; only
   the Lua portrayal + sprite rasterizer pull in C.
 
@@ -114,32 +115,37 @@ const tile57 = @import("tile57");
 var chart = try tile57.Chart.openPath("ENC_ROOT/", null, true);
 defer chart.deinit();
 
-if (try chart.tile(z, x, y)) |mvt| {   // decompressed MVT bytes, or null if empty
-    defer tile57.freeBytes(mvt);
-    // … hand to your renderer …
-}
+const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
+// … render a view (chart.renderView), query features, or bake an archive …
 ```
 
-`Chart.openPath` streams cells on demand (working-set only); `Chart.openBytes` opens a
-single in-memory cell. See [the Zig API docs](docs/docs/zig-api.md).
+`Chart` renders views, queries features, and reads metadata; `tile57.bakeArchive`
+bakes an ENC_ROOT to one band-streamed PMTiles archive offline. The runtime tile
+compositor (bake per cell, then compose by `(z, x, y)`) is exposed through the
+[C ABI](include/tile57.h). See [the Zig API docs](docs/docs/zig-api.md).
 
 ## Use it from C
 
-The same engine behind a thin C ABI ([`include/tile57.h`](include/tile57.h)):
+The same engine behind a thin C ABI ([`include/tile57.h`](include/tile57.h)).
+Tiles are made one way — bake each cell to its own PMTiles, then compose on
+demand — the structure `tile57 bake ENC_ROOT -o out/` writes:
 
 ```c
-// Open an on-disk ENC_ROOT directory (or a single .000 file).
-tile57_chart *chart = tile57_chart_open("ENC_ROOT/");
-uint8_t *mvt; size_t n;
-if (tile57_chart_tile(chart, z, x, y, &mvt, &n) == TILE57_TILE_OK) {
-    /* … render mvt … */
-    tile57_free(mvt, n);
+// out/ holds tiles/<CELL>.pmtiles (one per cell) + partition.tpart
+const char *paths[] = { "out/tiles/US5MD1MC.pmtiles" };
+tile57_compose_source *src = tile57_compose_open(paths, 1, "out/partition.tpart");
+
+uint8_t *tile; size_t n;
+if (tile57_compose_serve(src, z, x, y, &tile, &n) == 1) {   /* decompressed MLT */
+    /* … hand the tile to your renderer … */
+    tile57_free(tile, n);
 }
-tile57_chart_close(chart);
+tile57_compose_close(src);
 ```
 
-`libtile57.a` also exposes the ENC_ROOT bake, the MapLibre style builder, and the
-asset/atlas generators. See [the C API docs](docs/docs/c-api.md).
+A separate `tile57_chart` handle renders finished PNG/PDF views and answers
+metadata + object queries; `libtile57.a` also exposes the MapLibre style builder
+and the asset/atlas generators. See [the C API docs](docs/docs/c-api.md).
 
 ## The `tile57` CLI
 
@@ -147,8 +153,8 @@ The offline tool bakes charts and emits portrayal assets:
 
 ```sh
 zig build                                    # builds zig-out/bin/tile57
-tile57 bake CELL.000 -o out/                 # one cell -> bundle (tiles + style + assets + manifest)
-tile57 bake ENC_ROOT -o out/                 # whole catalogue, band-streamed -> same bundle
+tile57 bake CELL.000 -o out/                 # one cell -> out/tiles/<CELL>.pmtiles + partition.tpart
+tile57 bake ENC_ROOT -o out/                 # whole catalogue -> per-cell tiles/ + partition.tpart
 tile57 assets   -o assets/                   # colortables + linestyles + sprite + patterns
 tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
 tile57 pdf ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
@@ -172,7 +178,7 @@ Docs source lives in [`docs/`](docs/): [intro](docs/docs/intro.md),
 [getting started](docs/docs/getting-started.md), the
 [Zig API](docs/docs/zig-api.md), the [C API](docs/docs/c-api.md),
 the [architecture](docs/docs/architecture.md), and the
-[tile schema](docs/docs/tile-schema.md). See also [`CHANGELOG.md`](CHANGELOG.md).
+[tile schema](docs/docs/tile-schema.md).
 
 ## License
 
