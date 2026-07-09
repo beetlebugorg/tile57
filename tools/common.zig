@@ -8,15 +8,6 @@ const bundle = @import("bundle"); // chart-bundle pipeline (asset emitters etc.)
 
 pub const VERSION = "tile57 0.1.0";
 
-pub const DEFAULT_MINZOOM: u8 = 8;
-pub const DEFAULT_MAXZOOM: u8 = 16;
-
-// Lazy-baker tuning (bake-root): LRU budget = parsed cells kept loaded across
-// super-tiles; super-tile depth = how far below a band's min zoom the spatial
-// batch tile sits. Overridable via --lru / --superdz for tuning.
-pub const DEFAULT_LRU_BUDGET: usize = 256;
-pub const DEFAULT_SUPER_DZ: u8 = 3;
-
 // Env access lives in the Lua C shim (Zig 0.16 gates env behind std.Io);
 // returns the S-101 rules dir from TILE57_S101_RULES or null. Mirrors capi.zig.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
@@ -151,26 +142,20 @@ pub fn printUsage() void {
         \\{s} — offline S-57 -> PMTiles baker / inspector
         \\
         \\usage:
-        \\  tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [options]
-        \\      Bake a single S-57 cell OR a whole ENC_ROOT (every <CELL>.000 +
-        \\      its auto-discovered updates, zoom-banded per cell by compilation
-        \\      scale) into a self-contained chart bundle, streamed to disk:
-        \\      <out>/tiles/chart.pmtiles + assets/colortables.json + sprite-mln +
-        \\      style-{{day,dusk,night}}.json + manifest.json (pins schema_version,
-        \\      couples tiles to portrayal).
-        \\      -o, --output DIR    output bundle directory (required)
+        \\  tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]
+        \\      Produce a live-composite structure: bake each cell (a single .000 +
+        \\      its auto-discovered updates, OR every <CELL>.000 in an ENC_ROOT, at
+        \\      native band scale) to its own <out>/tiles/<STEM>.pmtiles with M_COVR
+        \\      coverage embedded, then write the ownership partition to
+        \\      <out>/partition.tpart. A runtime compositor (compose-tile / the C ABI)
+        \\      serves any tile ON DEMAND from this structure — there is no merged archive.
+        \\      -o, --output DIR    output directory (required)
         \\      --rules DIR         S-101 portrayal rules directory (default: embedded)
-        \\      --catalog DIR       PortrayalCatalog (default: parent of --rules)
-        \\      --minzoom N         lowest zoom to bake (default {d})
-        \\      --maxzoom N         highest zoom to bake (default {d})
-        \\      --created ISO8601   stamp the manifest (no wall clock in-process)
-        \\      --lru N             parsed cells held resident (lazy-bake tuning; trade
-        \\                          memory for fewer re-parses; default {d})
-        \\      --superdz N         spatial super-tile depth below a band's min zoom
-        \\                          (lazy-bake tuning; default {d})
-        \\      --format mlt|mvt    tile encoding (default mlt = MapLibre Tile;
-        \\                          mvt = Mapbox Vector Tile, kept for consumers
-        \\                          without an MLT decoder)
+        \\      --from-archives     <base> is already a dir of per-cell archives; skip
+        \\                          baking, only (re)build partition.tpart over them
+        \\  tile57 compose-tile <tiles-dir> <z> <x> <y> [--load-partition FILE] [-o out] [--bench N]
+        \\      Serve ONE composed tile on demand from a live-composite structure
+        \\      (the runtime compositor); --bench N times an NxN block around (x,y).
         \\  tile57 assets <portrayal-catalog-dir> -o <out-dir>
         \\      Emit just the portrayal assets (colortables.json today) for a
         \\      catalogue, independent of any cell.
@@ -208,5 +193,5 @@ pub fn printUsage() void {
         \\  tile57 version
         \\  tile57 help
         \\
-    , .{ VERSION, DEFAULT_MINZOOM, DEFAULT_MAXZOOM, DEFAULT_LRU_BUDGET, DEFAULT_SUPER_DZ });
+    , .{VERSION});
 }
