@@ -34,26 +34,33 @@ replace github.com/beetlebugorg/tile57/bindings/go => /path/to/chartplotter-nati
 ```go
 import tile57 "github.com/beetlebugorg/tile57/bindings/go"
 
-// Bake a single cell.000 or a whole ENC_ROOT dir into a self-contained bundle.
-cells, bbox, err := tile57.BakeBundle("/enc/ENC_ROOT", "/out/bundle", "", "", "", 0, 16, nil)
+// Bake an ENC_ROOT: each cell becomes its own PMTiles under <out>/tiles/, plus
+// an ownership partition at <out>/partition.tpart.
+n, err := tile57.BakeTree("/enc/ENC_ROOT", "/out", 4, nil)
 
-// Or serve tiles live, and publish the SCAMIN manifest for the style.
-src, _ := tile57.Open("/enc/ENC_ROOT")
+// Open the compositor over the baked archives + partition, and serve tiles.
+src, _ := tile57.OpenCompose([]string{"/out/tiles/US5MD1MC.pmtiles"}, "/out/partition.tpart")
 defer src.Close()
-mvt, _ := src.Tile(13, 2359, 3139)
-manifest := src.Scamin() // []uint32, ascending
+body, owned, _ := src.Serve(13, 2359, 3139) // owned=false, body=nil => open ocean
+
+// Or open one cell/archive for metadata (cells, features, SCAMIN, bounds).
+chart, _ := tile57.Open("/enc/ENC_ROOT")
+defer chart.Close()
+cells, _ := chart.Cells()
+scamin := chart.Scamin() // []uint32, ascending
 ```
 
 ## Surface
 
-- **Charts** — `Open` (path, streaming), `OpenChartBytes` (one in-memory cell),
-  `OpenPMTiles` (baked bundle); `Source.Tile`, `Info`, `Meta`, `Scamin`,
-  `ClearCache`, `Close`.
-- **Bake** — `BakeCells` (→ one PMTiles archive in memory), `BakeBundle` (→ a full
-  on-disk bundle: tiles + assets + per-scheme styles + manifest).
-- **Assets / style** — `ColortablesDefault`, `Colortables`, `Linestyles`,
-  `SpriteAtlas`, `PatternAtlas`, `StyleTemplate`, `BuildStyle`, `Style`,
-  `MarinerDefaults`.
+- **Charts (metadata + query)** — `Open` (path, streaming), `OpenChartBytes` (one
+  in-memory cell), `OpenPMTiles` (a baked archive); `Source.Info`, `Meta`, `Cells`,
+  `Features`, `Scamin`, `Close`.
+- **Bake** — `BakeCell` (one cell → PMTiles bytes), `BakeTree` (an ENC_ROOT → per-cell
+  archives + `partition.tpart`), `BakeAssets` (portrayal assets in memory).
+- **Compose** — `OpenCompose` (archives + partition); `ComposeSource.Serve` (a tile,
+  with an ownership flag), `Meta`, `SavePartition`, `Close`.
+- **Style** — `ColortablesDefault`, `Style`, `BuildStyle`, `StyleDiff`,
+  `MarinerDefaults`, `CatalogEntries`.
 
 `libtile57` is not internally synchronized; every `Source` method is mutex-guarded,
 so a `Source` is safe for concurrent use.

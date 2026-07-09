@@ -16,9 +16,8 @@ navigation.** See [Known limitations](./limitations.md).
 
 :::
 
-**tile57** is a high-performance, low-memory **S-57/S-101 → vector-tile +
-S-52 style engine**, embeddable from **Zig**, **C**, or **Go**, targeting native
-and WASM. It decodes IHO/NOAA **S-57** ENC cells and generates **vector tiles**
+**tile57** is an **S-57/S-101 → vector-tile + S-52 style engine**, embeddable
+from **Zig**, **C**, or **Go**, targeting native and WASM. It decodes IHO/NOAA **S-57** ENC cells and generates **vector tiles**
 by `(z, x, y)` — [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec)
 (MLT, the default) or Mapbox Vector Tiles (MVT) — running the official IHO
 **S-101 Portrayal Catalogue** in embedded Lua to produce S-52 nautical
@@ -81,18 +80,18 @@ render Surface ──► MVT / MLT tiles + PMTiles (src/tiles/)  +  MapLibre sty
              └───► PNG raster / vector PDF / terminal text (src/render/)
 ```
 
-## Why tile57 is fast and small
+## The memory model
 
-The engine is **high-performance and low-memory by design**:
+The engine holds only its working set:
 
 - **Lazy, per-cell work.** A multi-cell ENC_ROOT is indexed cheaply (band +
   bbox); cells are parsed and portrayed only when a requested tile needs them,
   then held under an LRU bound. A **streaming** open reads a cell's bytes on
   demand (and frees them on eviction), so a host holds only the working set — not
   the whole catalogue.
-- **Band-streamed bakes.** Baking an ENC_ROOT to one PMTiles archive streams
-  band-by-band (finest → coarsest, best-band dedup), so peak memory tracks the
-  largest single band.
+- **Per-cell bakes.** Each cell bakes to its own PMTiles at its compilation scale,
+  so a bake holds one cell at a time; the runtime compositor stitches the cells by
+  `(z, x, y)` on demand through an ownership partition.
 - **Pure-Zig core.** The foundational format/encode modules (`iso8211`, `s57`,
   `s101`, `tiles`, `render`, `scene`, `style`) have no libc; only the Lua
   portrayal (`portray`) and the sprite rasterizer (`sprite`) pull in C.
@@ -107,7 +106,7 @@ hex, so a renderer can switch palette without regenerating tiles.
 ## Where to go next
 
 - [**Installation**](./installation.md) — Zig 0.16, submodules, `zig build`.
-- [**Getting Started**](./getting-started.md) — bake a bundle and fetch a tile
+- [**Getting Started**](./getting-started.md) — bake cells and fetch a tile
   from Zig or C.
 - [**Zig API**](./zig-api.md) — the `@import("tile57")` surface.
 - [**C API**](./c-api.md) — the `tile57_*` C ABI (`include/tile57.h`).

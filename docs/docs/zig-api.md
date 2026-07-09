@@ -73,32 +73,46 @@ The streaming open uses the extern types `tile57.CellMeta` (bbox + `cscl`),
 library), and `tile57.CellReadFn` (the reader callback). Multi-cell input for
 `openCells` is `tile57.CellInput`.
 
-## Bake an ENC_ROOT
+## Bake + compose
+
+Baking and compositing are separate steps. `tile57.bake` writes each cell to its
+own PMTiles at its compilation scale; `tile57.compose` stitches those archives
+into one tile for any `(z, x, y)` on demand, using an ownership partition so cells
+never double-draw at a seam.
 
 ```zig
-// Band-streamed: peak memory tracks the largest single band, not the whole archive.
-const pmtiles_bytes = try tile57.bakeArchive(/* … */);
-defer tile57.freeBytes(pmtiles_bytes);
+// Bake an ENC_ROOT: each cell -> <out>/tiles/<STEM>.pmtiles + <out>/partition.tpart.
+const n = tile57.bake.tree(io, "/enc/ENC_ROOT", "/out", null, 4, null, null);
+
+// Open the compositor over the archives + partition, then serve tiles.
+var src = (try tile57.compose.openComposeSourceFiles(io, gpa, paths, "/out/partition.tpart")).?;
+defer src.deinit();
+const result = try src.serve(gpa, 13, 2359, 3139); // result.tile: ?[]u8, result.owned: bool
 ```
 
-`tile57.bakeArchive` bakes a whole ENC_ROOT into one PMTiles archive, zoom-banded
-per cell by compilation scale; `tile57.Progress` is the optional progress
-callback type.
+| Surface | What it does |
+|---------|--------------|
+| `tile57.bake.cellBytes(path, rules)` | bake one cell (+ updates) to PMTiles bytes. |
+| `tile57.bake.cellsToFiles(...)` / `bake.tree(...)` | bake many cells / a whole ENC_ROOT to files. |
+| `tile57.bake.archive(...)` | the offline path: merge a slice of cells into one archive. |
+| `tile57.bake.Progress` | the optional progress-callback type. |
+| `tile57.compose.openComposeSourceFiles(...)` | open a `ComposeSource` over on-disk archives + a partition. |
+| `tile57.compose.composeTile(...)` | compose one tile (the stateless core `serve` uses). |
+| `tile57.partition` | the ownership partition and its `.tpart` sidecar (serialize / deserialize). |
 
 ## Style + portrayal assets
 
 ```zig
 // MapLibre style from a template + mariner S-52 display settings + colortables.
-const json = try tile57.style.build(/* … */);     // tile57.style.Mariner settings
+const json = try tile57.style.buildFromTemplate(/* … */);     // tile57.Mariner settings
 ```
 
 | Surface | What it does |
 |---------|--------------|
-| `tile57.style.build` (`style.buildFromTemplate`) | build a MapLibre style from a template + mariner settings + colortables. |
-| `tile57.style.Mariner` | the S-52 mariner display options struct (`style.mariner.Settings`). |
-| `tile57.style` | color tables, line styles, and style.json generation. |
-| `tile57.sprite` | S-101 sprite + area-fill pattern atlases (SVG raster). |
+| `tile57.style` | the MapLibre style: `json`, `Options`, `diff`, `buildFromTemplate`, color tables, line styles. |
 | `tile57.style.mariner` | the S-52 mariner settings model and expression builders. |
+| `tile57.Mariner` | the S-52 mariner display options struct (`style.mariner.Settings`). |
+| `tile57.sprite` | S-101 sprite + area-fill pattern atlases (SVG raster). |
 
 ## Tiling + encoding
 

@@ -1,7 +1,7 @@
 <h1 align="center">tile57</h1>
 
 <p align="center">
-  <b>⚓ A high-performance, low-memory S-57/S-101 chart engine: vector tiles, S-52 styles, PNG and PDF.</b><br>
+  <b>⚓ An S-57/S-101 chart engine: vector tiles, S-52 styles, PNG and PDF.</b><br>
   tile57 turns IHO S-57 ENC cells into Mapbox Vector Tiles with a matching MapLibre S-52
   style, or renders finished charts directly to PNG and PDF — one Zig library with a
   C ABI, compiled natively or to WASM.
@@ -48,11 +48,10 @@ entirely with AI assistance. A few specific goals shape its design:
 - **Language-agnostic embedding.** A thin C ABI (`libtile57.a`) bridges the Zig core to any
   language with C FFI. Go bindings ship in the repo; others are straightforward additions.
 
-- **An engine anyone can build on.** The end goal is an easy-to-use S-57/S-100 chart
-  rendering engine that anyone can use to build their marine app ideas — without first
-  becoming an IHO spec expert. Open a chart, get tiles, PNGs, or PDFs; the S-52 rules,
-  portrayal catalogue, and mariner settings are the engine's problem. Ideas it should make
-  easy:
+- **An engine to build on.** The goal is an S-57/S-100 chart engine you can use to build
+  a marine app without first becoming an IHO spec expert. Open a chart, get tiles, PNGs,
+  or PDFs; the S-52 rules, portrayal catalogue, and mariner settings are the engine's
+  problem. It aims to support:
   - an **anchor alarm** that draws your swing circle over a real chart,
   - a **Windy plugin** overlaying forecast weather on ENC charts,
   - a **native cross-platform Qt6 C++ chartplotter**,
@@ -69,7 +68,7 @@ portrayal **assets** it references — colour tables, line styles, and the sprit
 + area-fill pattern atlases — so a renderer like
 [MapLibre](https://github.com/maplibre/maplibre-native) can draw a chart directly.
 
-It is **high-performance and low-memory** by design:
+It holds only its working set:
 
 - **Lazy, per-cell work.** A multi-cell ENC_ROOT is indexed cheaply (band + bbox);
   cells are parsed and portrayed only when a requested tile needs them, then held

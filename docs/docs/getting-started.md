@@ -54,7 +54,7 @@ MLT natively — the generated styles carry the source `encoding` hint). The
 engine can also encode Mapbox Vector Tiles for consumers without an MLT decoder.
 :::
 
-And a crowd-pleaser — the chart in your terminal, as a Unicode grid with
+The chart also renders in your terminal, as a Unicode grid with
 ANSI colour, with `--tui` for an interactive pan/zoom loop (`--kitty` paints
 real S-52 pixels inline on kitty-graphics terminals like Ghostty or Kitty):
 
