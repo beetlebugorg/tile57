@@ -782,10 +782,10 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
         const out_rel = std.fmt.allocPrint(a, "{s}.pmtiles", .{rel_noext}) catch continue;
         const out_path = std.fs.path.join(a, &.{ out_dir, out_rel }) catch continue;
         // Incremental: skip a cell whose mirrored archive already exists and is at least as new as
-        // its source .000 — so re-baking a provider (e.g. after adding a district) only bakes what
-        // changed. A re-downloaded cell rewrites the .000 → its mtime advances → we re-bake it.
+        // its whole input — the .000 AND its update chain (.001, .002, …) — so re-baking a provider
+        // (adding a district, or dropping a new .001 update) only re-bakes what actually changed.
         if (fileModNs(io, out_path)) |out_ns| {
-            if (fileModNs(io, in_path)) |in_ns| {
+            if (newestInputNs(io, in_path)) |in_ns| {
                 if (out_ns >= in_ns) continue;
             }
         }
@@ -803,6 +803,27 @@ fn fileModNs(io: std.Io, path: []const u8) ?i96 {
     defer f.close(io);
     const st = f.stat(io) catch return null;
     return st.mtime.nanoseconds;
+}
+
+/// The NEWEST mtime across a cell's whole input: its base .000 (`in_path`) and its contiguous
+/// update chain <stem>.001, .002, … (stopping at the first gap — the same discovery readCellFiles
+/// uses to apply them). Null if the base is missing. So a freshly-dropped .001 makes the cell newer
+/// than a previously-baked archive, forcing a re-bake.
+fn newestInputNs(io: std.Io, in_path: []const u8) ?i96 {
+    var newest = fileModNs(io, in_path) orelse return null;
+    const dir = std.fs.path.dirname(in_path) orelse ".";
+    const bn = std.fs.path.basename(in_path);
+    if (bn.len > 4) {
+        const stem = bn[0 .. bn.len - 4]; // strip ".000"
+        var u: u32 = 1;
+        while (u <= 999) : (u += 1) {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const up = std.fmt.bufPrint(&buf, "{s}{s}{s}.{d:0>3}", .{ dir, std.fs.path.sep_str, stem, u }) catch break;
+            const ns = fileModNs(io, up) orelse break; // gap → the chain ends here
+            if (ns > newest) newest = ns;
+        }
+    }
+    return newest;
 }
 
 /// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null
