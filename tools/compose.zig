@@ -81,11 +81,24 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         defer dir.close(io);
         var walker = dir.walk(a) catch return usageErr("cannot walk archives dir");
         defer walker.deinit();
-        while (walker.next(io) catch null) |entry| {
+        while (walker.next(io) catch |err| blk: {
+            // A mid-walk I/O error would silently compose a PARTIAL cell set — say so.
+            std.debug.print("  warn: archive walk aborted early ({s}); composing what was found\n", .{@errorName(err)});
+            break :blk null;
+        }) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.path, ".cell.tmp") and !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
             tmp_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
         }
+        // Sort the archive paths: the ownership tie-break falls back to input order for
+        // archives carrying identical (date, name) keys (e.g. two generations of one
+        // cell in a polluted cache), and directory enumeration order is unspecified —
+        // sorting makes any such tie, and the composed bytes, deterministic.
+        std.mem.sort([]const u8, tmp_paths.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
         std.debug.print("recompose: {d} pre-baked archives from {s}\n", .{ tmp_paths.items.len, base_path });
     } else for (cell_paths.items) |cp| {
         const arc = (chart.bakeCellBytes(cp, rules_dir) catch |err| {
