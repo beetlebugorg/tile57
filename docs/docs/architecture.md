@@ -105,8 +105,13 @@ libc/Lua) and target-agnostic:
 | `tiles` | MVT + MLT encoders, gzip, the PMTiles container, web-mercator tile math |
 | `render` | the Surface contract, the resolver (colours, display gates), and the pixel machinery (Canvas, PNG, PDF, ASCII) |
 | `scene` | S-57 → tile-surface scene generation + the banded ENC_ROOT baker (`bake_enc.zig`) |
-| `style` | color tables, line styles, and the MapLibre style.json layer set (includes `mariner.zig`, the S-52 mariner settings model) |
-| `sprite` | S-101 sprite + area-fill pattern atlases (SVG raster; links libc) |
+| `style` | the S-101 color tables and line styles, the MapLibre style.json layer set, and the S-52 `mariner` settings model (`mariner.zig`) |
+| `sprite` | the S-101 sprite + area-fill pattern atlases from the catalogue Symbols/AreaFills (SVG raster; links libc) |
+
+The `style` and `sprite` modules generate the S-101/S-52 portrayal assets — color
+tables, line styles, sprites, and patterns — from the S-101 Portrayal Catalogue.
+They read the catalogue bytes as input rather than importing `s101`, so they stay
+independent modules a caller can grab on their own.
 | `engine` | the pure packages re-exported as one import (the test root) |
 | `tile57` | the curated public surface (`src/tile57.zig`) |
 
