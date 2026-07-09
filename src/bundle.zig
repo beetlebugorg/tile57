@@ -877,13 +877,15 @@ fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers
     const fill_max = @min(maxz + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);
     const loop_max = @max(maxz, fill_max);
 
-    // 4. Stream one zoom at a time (only one zoom's tiles resident).
+    // 4. Stream one zoom at a time. The zoom arena holds only the discovery state (classifier
+    //    grids + per-tile owner lists); the composed tiles themselves live one at a time in
+    //    composeZoom's per-tile scratch.
     var zoom_arena = std.heap.ArenaAllocator.init(gpa);
     defer zoom_arena.deinit();
     var z: u8 = minz;
     while (z <= loop_max) : (z += 1) {
         _ = zoom_arena.reset(.retain_capacity);
-        try composeZoom(sw, zoom_arena.allocator(), &part, kept.items, z);
+        try composeZoom(sw, gpa, zoom_arena.allocator(), &part, kept.items, z);
     }
     if (sw.num_addressed == 0) return null;
 
@@ -1017,12 +1019,22 @@ pub fn composeArchivesToFile(io: std.Io, gpa: std.mem.Allocator, paths: []const 
     return fr.cells;
 }
 
-/// Compose every tile of one zoom `z`: for each owning cell (the band governing `z`), fetch
-/// its native tile, project its owned face into that tile, clip each decoded feature, and
-/// accumulate per layer; then orient the merged polygons and stream each tile out. `sa` is a
-/// per-zoom arena the caller resets, so only one zoom's tiles are resident.
+/// Compose every tile of one zoom `z`, tile-major, so peak memory is ONE tile's working set
+/// rather than the whole zoom's. Pass 1 walks the governing band's owners face-major —
+/// exactly the order the compositor always used — streaming every fully-owned tile VERBATIM
+/// on the spot and recording, for each remaining (seam / overscale) tile, WHICH owners
+/// contribute: a directory-existence probe plus the owned-face projection, no decode. Pass 2
+/// then composes one recorded tile at a time — decode + clip + orient + encode in a per-tile
+/// arena reset between tiles — and streams it out. Byte-identity with the one-pass
+/// compositor this replaces is by construction: the verbatim adds interleave identically,
+/// pass 1's record predicate equals the old accumulate predicate, the discovery map has the
+/// same key type and insertion sequence as the old zoom-wide feature map (so it iterates in
+/// the same order), and each tile's features concatenate in the same face order. `sa` is a
+/// per-zoom arena the caller resets — it now holds only classifier grids and the per-tile
+/// owner lists; `gpa` backs the per-tile scratch.
 fn composeZoom(
     sw: *engine.pmtiles.StreamWriter,
+    gpa: std.mem.Allocator,
     sa: std.mem.Allocator,
     part: *const engine.geo.partition.Partition,
     readers: []const *engine.pmtiles.Reader,
@@ -1036,11 +1048,17 @@ fn composeZoom(
     const map = part.mapForZoom(z) orelse return;
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
 
+    // Owners contributing to each pending tile, as slots into `map.faces`, appended in face
+    // order — the per-tile accumulation order of the old zoom-wide feature map.
     const TileKey = struct { x: u32, y: u32 };
-    const Buckets = [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature);
-    var tilemap = std.AutoHashMap(TileKey, Buckets).init(sa);
+    var pending = std.AutoHashMap(TileKey, std.ArrayList(u32)).init(sa);
 
-    for (map.faces) |face| {
+    // Per-tile scratch: face projection in pass 1, decode/clip/encode in pass 2. Reset
+    // between tiles, so no per-tile allocation outlives its tile.
+    var tile_scratch = std.heap.ArenaAllocator.init(gpa);
+    defer tile_scratch.deinit();
+
+    for (map.faces, 0..) |face, slot| {
         if (face.owned.len == 0) continue;
         const ci = face.index;
         const cscl = part.cells[ci].cscl;
@@ -1098,41 +1116,63 @@ fn composeZoom(
                     .seam => {}, // real geometry: decode + clip below
                 }
 
-                // The cell's tile content at (z,tx,ty): its native tile, or — one fill-up zoom
-                // past its band — its deepest native ancestor scaled up (overscale). null =
-                // nothing reachable here.
-                const layers = (try ownerTile(sa, readers[ci], cscl, z, tx, ty)) orelse continue;
-                // Project the owned face into THIS tile; empty = the cell owns no pixels here.
-                const face_px = try compose.projectFace(sa, face.owned, z, tx, ty);
+                // Record this owner iff the compose pass would keep it: reachable content
+                // (a native blob, or — in the fill-up window — an overscale ancestor) AND a
+                // non-empty owned face in this tile's pixel space. No decode yet; pass 2
+                // pays that one tile at a time.
+                if (!(try ownerHasTile(readers[ci], cscl, z, tx, ty))) continue;
+                _ = tile_scratch.reset(.retain_capacity);
+                const face_px = try compose.projectFace(tile_scratch.allocator(), face.owned, z, tx, ty);
                 if (face_px.len == 0) continue;
 
-                const gop = try tilemap.getOrPut(.{ .x = tx, .y = ty });
-                if (!gop.found_existing) for (gop.value_ptr) |*b| {
-                    b.* = std.ArrayList(mvt.Feature).empty;
-                };
-                for (layers) |layer| {
-                    const li = layerIndex(layer.name) orelse continue;
-                    for (layer.features) |feat| {
-                        try compose.clipFeatureToFace(sa, &gop.value_ptr[li], feat, face_px);
-                    }
-                }
+                const gop = try pending.getOrPut(.{ .x = tx, .y = ty });
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                try gop.value_ptr.append(sa, @intCast(slot));
             }
         }
     }
 
-    // Encode each composed tile: per-layer concat (VECTOR_LAYERS order), polygons re-oriented
-    // (boolean intersect output has unspecified winding), then MLT — matching the per-cell input.
-    var it = tilemap.iterator();
+    // Pass 2 — compose each pending tile: decode every contributing owner's tile (native or
+    // overscaled ancestor), clip its features to the owner's projected face, then per-layer
+    // concat (VECTOR_LAYERS order), polygons re-oriented (boolean intersect output has
+    // unspecified winding), MLT-encoded — matching the per-cell input — and streamed out.
+    // Everything lives in the per-tile scratch, freed before the next tile.
+    var it = pending.iterator();
     while (it.next()) |kv| {
+        const tx = kv.key_ptr.x;
+        const ty = kv.key_ptr.y;
+        _ = tile_scratch.reset(.retain_capacity);
+        const ta = tile_scratch.allocator();
+
+        var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
+        for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
+        for (kv.value_ptr.items) |slot| {
+            const face = map.faces[slot];
+            const ci = face.index;
+            // The cell's tile content at (z,tx,ty): its native tile, or — one fill-up zoom
+            // past its band — its deepest native ancestor scaled up (overscale).
+            const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty)) orelse continue;
+            // The owned face in THIS tile's pixel space (recomputed — caching every pending
+            // tile's projection is exactly the zoom-sized retention this pass removes).
+            const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
+            if (face_px.len == 0) continue;
+            for (layers) |layer| {
+                const li = layerIndex(layer.name) orelse continue;
+                for (layer.features) |feat| {
+                    try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
+                }
+            }
+        }
+
         var layers = std.ArrayList(mvt.Layer).empty;
-        for (kv.value_ptr, 0..) |bucket, li| {
+        for (&buckets, 0..) |*bucket, li| {
             if (bucket.items.len == 0) continue;
-            const feats = try orientPolys(sa, bucket.items);
-            try layers.append(sa, .{ .name = scene.VECTOR_LAYERS[li], .features = feats });
+            const feats = try orientPolys(ta, bucket.items);
+            try layers.append(ta, .{ .name = scene.VECTOR_LAYERS[li], .features = feats });
         }
         if (layers.items.len == 0) continue;
-        const enc = try engine.mlt.encode(sa, .{ .layers = layers.items });
-        try sw.add(z, kv.key_ptr.x, kv.key_ptr.y, enc);
+        const enc = try engine.mlt.encode(ta, .{ .layers = layers.items });
+        try sw.add(z, tx, ty, enc);
     }
 }
 
@@ -1168,6 +1208,18 @@ fn ownerTile(a: std.mem.Allocator, r: *engine.pmtiles.Reader, cscl: i32, z: u8, 
     const layers = try decodeTile(a, tt, anc);
     scaleUpTile(layers, shift, tx, ty);
     return layers;
+}
+
+// Cheap existence mirror of `ownerTile` (directory probes only — no decompress, no decode):
+// would it return content for cell `r` at (z,tx,ty)? Must stay in lockstep with it — the
+// tile-major compositor's discovery pass uses this to reproduce the compose predicate, and
+// the two passes must agree on which tiles compose.
+fn ownerHasTile(r: *engine.pmtiles.Reader, cscl: i32, z: u8, tx: u32, ty: u32) !bool {
+    if ((try r.getCompressed(z, tx, ty)) != null) return true;
+    const nmax = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cscl)).max;
+    if (z <= nmax or z > nmax + engine.bake_enc.FILLUP_DZ or z > engine.bake_enc.FILLUP_CEIL) return false;
+    const shift: u5 = @intCast(z - nmax);
+    return (try r.getCompressed(nmax, tx >> shift, ty >> shift)) != null;
 }
 
 // Scale an ancestor tile's features up into descendant (tx,ty) — the sub-cell `shift` levels
