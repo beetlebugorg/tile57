@@ -8,8 +8,8 @@ const std = @import("std");
 const chart = @import("chart.zig");
 const s57 = @import("s57");
 const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
-const chartstyle = @import("assets").chartstyle;
-const assets = @import("assets");
+const chartstyle = @import("style").chartstyle;
+const style = @import("style");
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
@@ -663,7 +663,7 @@ fn embeddedColorProfileXml() ?[]const u8 {
 /// 1=ok + out/out_len (free with tile57_free), 0=error.
 export fn tile57_colortables_default(out: *[*]u8, out_len: *usize) callconv(.c) c_int {
     const xml = embeddedColorProfileXml() orelse return 0;
-    const json = assets.colorTablesJson(gpa, xml) catch return 0;
+    const json = style.colorTablesJson(gpa, xml) catch return 0;
     out.* = json.ptr;
     out_len.* = json.len;
     return 1;
@@ -942,9 +942,9 @@ export fn tile57_build_style(
     // Single style builder: regenerate the full style with the mariner baked in
     // (chartstyle.buildStyle's template-patch pass is retired). buildFromTemplate lifts
     // the source config out of the passed template and drives the one styleJson.
-    const style = assets.buildFromTemplateScamin(gpa, tmpl, &m, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
-    out.* = style.ptr;
-    out_len.* = style.len;
+    const style_json = style.buildFromTemplateScamin(gpa, tmpl, &m, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
+    out.* = style_json.ptr;
+    out_len.* = style_json.len;
     return 1;
 }
 
@@ -981,12 +981,12 @@ export fn tile57_style_diff(
     // on both sides — otherwise a clock tick could show as a spurious date-filter op.
     const now_unix: i64 = @intCast(time(null));
 
-    const old_style = assets.buildFromTemplateScamin(gpa, tmpl, &om, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
+    const old_style = style.buildFromTemplateScamin(gpa, tmpl, &om, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
     defer gpa.free(old_style);
-    const new_style = assets.buildFromTemplateScamin(gpa, tmpl, &nm, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
+    const new_style = style.buildFromTemplateScamin(gpa, tmpl, &nm, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
     defer gpa.free(new_style);
 
-    const ops = assets.styleDiff(gpa, old_style, new_style) catch return 0;
+    const ops = style.styleDiff(gpa, old_style, new_style) catch return 0;
     out.* = ops.ptr;
     out_len.* = ops.len;
     return 1;
@@ -1018,9 +1018,9 @@ export fn tile57_style_template(
     out_len: *usize,
 ) callconv(.c) c_int {
     const xml = embeddedColorProfileXml() orelse return 0;
-    const cts = assets.colorTablesJson(gpa, xml) catch return 0;
+    const cts = style.colorTablesJson(gpa, xml) catch return 0;
     defer gpa.free(cts);
-    var opts = assets.StyleOpts{
+    var opts = style.StyleOpts{
         .scheme = switch (scheme) {
             1 => "dusk",
             2 => "night",
@@ -1034,9 +1034,9 @@ export fn tile57_style_template(
     opts.minzoom = minzoom;
     if (maxzoom != 0) opts.maxzoom = maxzoom;
     if (tile_encoding == TILE_TYPE_MLT) opts.encoding = "mlt";
-    const style = assets.styleJson(gpa, opts) catch return 0;
-    out.* = style.ptr;
-    out_len.* = style.len;
+    const style_json = style.styleJson(gpa, opts) catch return 0;
+    out.* = style_json.ptr;
+    out_len.* = style_json.len;
     return 1;
 }
 

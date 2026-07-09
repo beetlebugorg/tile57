@@ -1,9 +1,8 @@
-//! style.zig — MapLibre GL style.json generation for the chart bundle. Resolves
-//! each S-52 colour token to hex for a palette and emits the fill / line / symbol
-//! / text layer set. Ported from the chartplotter web frontend's s52-style.mjs /
-//! chart-style.mjs (and the now-removed style/build_style.py, kept in git history;
-//! it was verified layer-for-layer identical during the port). The sole style
-//! generator now. Part of the `assets` module.
+//! maplibre.zig — MapLibre GL style.json generation. Resolves each S-52 colour
+//! token to hex for a palette and emits the fill / line / symbol / text layer
+//! set. Ported from the chartplotter web frontend's s52-style.mjs /
+//! chart-style.mjs, verified layer-for-layer identical during the port. The one
+//! style.json generator; part of the `style` module.
 //!
 //! MapLibre expressions are written as Zig comptime tuples — `.{ "get", "drval1" }`
 //! serialises to `["get","drval1"]` — through std.json's Stringify write-stream,

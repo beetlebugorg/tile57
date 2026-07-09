@@ -22,7 +22,7 @@ const s57 = @import("s57");
 const scene = @import("scene.zig");
 const pmtiles = @import("tiles").pmtiles;
 const tile = @import("tiles").tile;
-const assets = @import("assets"); // displayDenomZ: the physical display-scale formula
+const style = @import("style"); // displayDenomZ: the physical display-scale formula
 const geometry = @import("geo"); // Martinez boolean for the coverage-clipped composite
 
 /// A parsed + portrayed cell ready to bake. `portrayal` is the per-feature S-101
@@ -407,7 +407,7 @@ pub fn overscaleGateDenom(cscl: i32) i64 {
 
 /// The effScamin floor for a cell (spec §4): the display denominator of the
 /// cell's band-floor zoom under the client's static gate constant
-/// (assets.scaminGateK at the equator — the largest K over all latitudes, so
+/// (style.scaminGateK at the equator — the largest K over all latitudes, so
 /// the clamp holds everywhere). A feature's emitted `scamin` is floored here so
 /// an aggressive SCAMIN cannot blank a point between the cell's floor tier and
 /// its own activation zoom — the finer cell owns that ground geometrically, so
@@ -422,7 +422,7 @@ pub fn effScaminFloor(cscl: i32) i64 {
     // window can open — leave its SCAMINs raw (a z0 clamp would disable
     // decluttering at world view entirely).
     if (floor_z == 0) return 0;
-    const k = assets.scaminGateK(0);
+    const k = style.scaminGateK(0);
     return @intFromFloat(@ceil(k / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(floor_z)))));
 }
 

@@ -10,7 +10,7 @@
 //! default, so a partial (or empty, or invalid) blob still yields a usable style.
 
 const std = @import("std");
-const chartstyle = @import("assets").chartstyle;
+const chartstyle = @import("style").chartstyle;
 
 pub const MarinerSettings = chartstyle.MarinerSettings;
 

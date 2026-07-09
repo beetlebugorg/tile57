@@ -17,7 +17,7 @@ const tile = @import("tiles").tile;
 const mvt = @import("tiles").mvt;
 const mlt = @import("tiles").mlt;
 const render = @import("render");
-const assets = @import("assets");
+const style = @import("style");
 const geometry = @import("geo"); // Martinez boolean; `geo` is a common param name here
 const rs = render.surface;
 
@@ -655,7 +655,7 @@ pub const TileSurface = struct {
     texts: std.ArrayList(mvt.Feature) = .empty,
     // SCAMIN buckets: a feature carrying SCAMIN (s57 attr 133) routes here instead
     // of the base list, and carries a `scamin` property so the style gates its
-    // display below the feature's 1:N scale (see ATTR_SCAMIN / assets/style.zig).
+    // display below the feature's 1:N scale (see ATTR_SCAMIN / style/maplibre.zig).
     areas_scamin: std.ArrayList(mvt.Feature) = .empty,
     area_patterns_scamin: std.ArrayList(mvt.Feature) = .empty,
     lines_scamin: std.ArrayList(mvt.Feature) = .empty,
@@ -780,12 +780,12 @@ pub const TileSurface = struct {
     /// Store one clipped complex-linestyle run un-tessellated (display-independent
     /// bake): a `lines` feature tagged with `ls_style`/`ls_arc0` so replayTile
     /// re-looks-up the LsInfo and re-walks the period display-scaled at render time.
-    fn storeComplexRun(ctx: *anyopaque, style: []const u8, color: rs.ColorToken, width_px: f64, arc0: f64, run: []const rs.TilePoint) anyerror!void {
+    fn storeComplexRun(ctx: *anyopaque, line_style: []const u8, color: rs.ColorToken, width_px: f64, arc0: f64, run: []const rs.TilePoint) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try props.append(s.a, .{ .key = "color_token", .value = .{ .string = color } });
         try props.append(s.a, .{ .key = "width_px", .value = .{ .double = width_px } });
-        try props.append(s.a, .{ .key = "ls_style", .value = .{ .string = style } });
+        try props.append(s.a, .{ .key = "ls_style", .value = .{ .string = line_style } });
         try props.append(s.a, .{ .key = "ls_arc0", .value = .{ .double = arc0 } });
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
@@ -838,10 +838,10 @@ pub const TileSurface = struct {
         try s.soundings.append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 
-    fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
+    fn drawText(ctx: *anyopaque, text: []const u8, text_style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
-        try appendTextProps(s.a, &props, text, style); // text already shortened by engine
+        try appendTextProps(s.a, &props, text, text_style); // text already shortened by engine
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
         const single = try s.a.alloc(mvt.Point, 1);
@@ -1111,16 +1111,16 @@ fn shortenName(a: Allocator, text: []const u8) ![]const u8 {
 /// Serialize a text label's props in the tile schema order. `text` arrives already
 /// shortened/resolved by the engine. A minimal label (empty halign — see
 /// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
-fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, style: *const rs.TextStyle) !void {
+fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, text_style: *const rs.TextStyle) !void {
     // Resolved body size: the FontSize modifier px, or 12 (oracle default). Drives
     // both the emitted font_size_px and the halo gate below.
-    const font_px: f64 = if (style.font_size > 0) style.font_size else 12;
+    const font_px: f64 = if (text_style.font_size > 0) text_style.font_size else 12;
     try props.append(a, .{ .key = "text", .value = .{ .string = text } });
-    try props.append(a, .{ .key = "color_token", .value = .{ .string = style.color } });
+    try props.append(a, .{ .key = "color_token", .value = .{ .string = text_style.color } });
     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = font_px } });
-    if (style.halign.len == 0) return; // minimal label: no alignment/halo/group spec
-    try props.append(a, .{ .key = "halign", .value = .{ .string = style.halign } });
-    try props.append(a, .{ .key = "valign", .value = .{ .string = style.valign } });
+    if (text_style.halign.len == 0) return; // minimal label: no alignment/halo/group spec
+    try props.append(a, .{ .key = "halign", .value = .{ .string = text_style.halign } });
+    try props.append(a, .{ .key = "valign", .value = .{ .string = text_style.valign } });
     // S-101 LocalOffset -> label-offset key in text-body units (3.51 mm = one text
     // body height = 1 em): the style's text-offset match keys on "ux,uy" to shift a
     // name clear of its symbol (PortrayFeatureName emits 0,-3.51 = one body up).
@@ -1128,21 +1128,21 @@ fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const 
     // right / +y down, which matches MapLibre's text-offset.
     {
         const TEXT_BODY_MM = 3.51;
-        const ux: i64 = @intFromFloat(@round(style.offset_x / TEXT_BODY_MM));
-        const uy: i64 = @intFromFloat(@round(style.offset_y / TEXT_BODY_MM));
+        const ux: i64 = @intFromFloat(@round(text_style.offset_x / TEXT_BODY_MM));
+        const uy: i64 = @intFromFloat(@round(text_style.offset_y / TEXT_BODY_MM));
         if (ux != 0 or uy != 0)
             try props.append(a, .{ .key = "loff", .value = .{ .string = try std.fmt.allocPrint(a, "{d},{d}", .{ ux, uy }) } });
     }
     // §10 text halo: the oracle attaches a CHWHT, 1px halo to text >= 10 px
     // (s101emit.go:130-133) and emits it as halo_color_token / halo_width tile
     // properties (bake.go:1147-1148); smaller text gets no halo ("" / 0). Our served
-    // style still renders text solid (no halo) by deliberate S-52 choice (style.zig
+    // style still renders text solid (no halo) by deliberate S-52 choice (maplibre.zig
     // textPaint passes halo_width 0) — these are tile-parity properties for a client
     // that wants the legibility halo.
     const haloed = font_px >= 10;
     try props.append(a, .{ .key = "halo_color_token", .value = .{ .string = if (haloed) "CHWHT" else "" } });
     try props.append(a, .{ .key = "halo_width", .value = .{ .double = if (haloed) 1 else 0 } });
-    try props.append(a, .{ .key = "tgrp", .value = .{ .int = style.group } });
+    try props.append(a, .{ .key = "tgrp", .value = .{ .int = text_style.group } });
 }
 
 /// JSON-escape `s` (surrounding quotes included) into `buf`: escapes ", \, and the
@@ -1693,7 +1693,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 try surf.endFeature();
             }
             for (p.texts) |t| {
-                const style = rs.TextStyle{
+                const ts = rs.TextStyle{
                     .color = t.color,
                     .font_size = t.font_size,
                     .halign = t.halign,
@@ -1703,7 +1703,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                     .group = t.group,
                 };
                 try surf.beginFeature(&fmeta);
-                try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, pt);
+                try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &ts, pt);
                 try surf.endFeature();
             }
         }
@@ -1829,7 +1829,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 for (p.texts) |t| {
-                    const style = rs.TextStyle{
+                    const ts = rs.TextStyle{
                         .color = t.color,
                         .font_size = t.font_size,
                         .halign = t.halign,
@@ -1839,7 +1839,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                         .group = t.group,
                     };
                     try surf.beginFeature(&fmeta);
-                    try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, cpt);
+                    try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &ts, cpt);
                     try surf.endFeature();
                 }
             }
@@ -2160,14 +2160,14 @@ fn buildSyminsPortrayal(a: Allocator, f: s57.Feature) !?s101.Portrayal {
 // tessellated per zoom: walk the line by arc length and emit, per period, the dash
 // "on" runs as line segments + each embedded symbol as a point rotated to the local
 // tangent. Mirrors Go bake/complexline.go + linestyle_catalog.go. The mm geometry is
-// parsed by assets.parseLineStyle; the baker converts it to LsInfo at the PresLib
+// parsed by style.parseLineStyle; the baker converts it to LsInfo at the PresLib
 // FEATURE scale (ls_px_per_mm) and registers it before baking.
 
 const ls_feature_scale: f64 = 0.01 / 0.35278; // px per 0.01-mm PresLib unit (= SYMBOL_SCALE)
 const ls_px_per_mm: f64 = 100.0 * ls_feature_scale; // mm -> screen px
 /// The mm->px feature scale the baker must apply when building an LsInfo from the raw
-/// millimetre LineStyles geometry (assets.parseLineStyle), so the tessellator and the
-/// table agree. Differs from the symbol-scale assets.analysePattern uses for the
+/// millimetre LineStyles geometry (style.parseLineStyle), so the tessellator and the
+/// table agree. Differs from the symbol-scale style.analysePattern uses for the
 /// client linestyles.json.
 pub const LINESTYLE_PX_PER_MM = ls_px_per_mm;
 
@@ -2204,11 +2204,11 @@ pub fn clearLinestyles(gpa: Allocator) void {
 /// (MARSYS51, cables, pipelines, …) to generic dashed strokes. Mirrors the
 /// Go lsInfoFromCatalog: mm geometry at the PresLib feature scale, S-52
 /// minimum pen width. `gpa` + `srcs` must outlive all tile generation.
-pub fn registerLinestylesXml(gpa: Allocator, srcs: []const assets.LineStyleSrc) void {
+pub fn registerLinestylesXml(gpa: Allocator, srcs: []const style.LineStyleSrc) void {
     if (g_linestyles.count() > 0) return;
     const px = LINESTYLE_PX_PER_MM;
     for (srcs) |s| {
-        const parsed = assets.parseLineStyle(gpa, s.xml) catch continue;
+        const parsed = style.parseLineStyle(gpa, s.xml) catch continue;
         const period = parsed.interval_length * px;
         if (period < 0.5) continue; // no interval to tile (pure-symbol style)
         var runs = std.ArrayList([2]f64).empty;
@@ -2332,7 +2332,7 @@ fn walkComplexRun(a: Allocator, rp: []const tile.FPoint, arc0: f64, info: LsInfo
 /// `style` is the linestyle id: at BAKE we store each clipped run un-tessellated
 /// (tagged with the id) so replay can re-walk the period display-scaled; on a live
 /// render surface we walk it here at that surface's size_scale.
-fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, style: []const u8, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, fmeta: *const rs.FeatureMeta, surf: rs.Surface) !void {
+fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, line_style: []const u8, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, fmeta: *const rs.FeatureMeta, surf: rs.Surface) !void {
     const store = surf.canStoreComplexRun();
     const ss = surf.sizeScale();
     try surf.beginFeature(fmeta);
@@ -2349,7 +2349,7 @@ fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, styl
                 // BAKE: store the clipped run un-tessellated (display-independent).
                 const qpts = try a.alloc(mvt.Point, run.points.len);
                 for (run.points, 0..) |p, i| qpts[i] = tile.quantizeF(p);
-                try surf.storeComplexRun(style, color, info.width_px, run.arc0, qpts);
+                try surf.storeComplexRun(line_style, color, info.width_px, run.arc0, qpts);
             } else {
                 // LIVE / CLI render: walk the period at this surface's display scale.
                 try walkComplexRun(a, run.points, run.arc0, info, color, ss, emit_symbols, surf);
@@ -3714,7 +3714,7 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
                     ox = (std.fmt.parseFloat(f64, it.next() orelse "0") catch 0) * TEXT_BODY_MM;
                     oy = (std.fmt.parseFloat(f64, it.next() orelse "0") catch 0) * TEXT_BODY_MM;
                 }
-                const style = rs.TextStyle{
+                const ts = rs.TextStyle{
                     .color = propStr(f.properties, "color_token"),
                     .font_size = propF64(f.properties, "font_size_px") orelse 12,
                     .halign = propStr(f.properties, "halign"),
@@ -3723,7 +3723,7 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
                     .offset_y = oy,
                     .group = propInt(f.properties, "tgrp", 0),
                 };
-                try surf.drawText(propStr(f.properties, "text"), &style, f.parts[0][0]);
+                try surf.drawText(propStr(f.properties, "text"), &ts, f.parts[0][0]);
             }
         }
     }

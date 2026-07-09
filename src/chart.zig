@@ -28,7 +28,7 @@ const tile = @import("tiles").tile;
 const render = @import("render");
 const sprite = @import("sprite");
 const embedded_assets = @import("catalog"); // S-101 portrayal assets (renderView store)
-const assets = @import("assets"); // displayDenomZ (the physical display-scale formula)
+const style = @import("style"); // displayDenomZ (the physical display-scale formula)
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
 // makes many small, short-lived allocations (tile cache, cell dupes, index
@@ -860,7 +860,7 @@ pub fn cellCoverageFromArchive(a: std.mem.Allocator, archive: []const u8) !?scen
 /// thread-local, and these two globals are already populated so nobody writes them).
 pub fn warmup() void {
     catalogue.warmUp();
-    var ls_srcs = std.ArrayList(assets.LineStyleSrc).empty;
+    var ls_srcs = std.ArrayList(style.LineStyleSrc).empty;
     defer ls_srcs.deinit(gpa);
     for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
     scene.registerLinestylesXml(gpa, ls_srcs.items);
@@ -1283,7 +1283,7 @@ pub const Chart = struct {
         // Complex-linestyle table (idempotent): without it MARSYS51/cable/
         // pipeline styles degrade to generic dashed strokes. gpa-backed: the
         // registry outlives this render (shared with any later bake).
-        var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+        var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
         defer ls_srcs.deinit(gpa);
         for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
         scene.registerLinestylesXml(gpa, ls_srcs.items);
@@ -1358,7 +1358,7 @@ pub const Chart = struct {
         const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
         defer store.deinit();
 
-        var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+        var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
         defer ls_srcs.deinit(gpa);
         for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
         scene.registerLinestylesXml(gpa, ls_srcs.items);
@@ -1727,7 +1727,7 @@ pub fn renderFeature(
     defer store.deinit();
 
     // Complex-linestyle table (idempotent), same as renderView.
-    var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+    var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
     defer ls_srcs.deinit(gpa);
     for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
     scene.registerLinestylesXml(gpa, ls_srcs.items);
@@ -1804,7 +1804,7 @@ pub fn renderCellView(
     defer store.deinit();
 
     // Complex-linestyle table (idempotent), same as renderView / renderFeature.
-    var ls_srcs = std.ArrayList(@import("assets").LineStyleSrc).empty;
+    var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
     defer ls_srcs.deinit(gpa);
     for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
     scene.registerLinestylesXml(gpa, ls_srcs.items);

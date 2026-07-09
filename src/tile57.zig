@@ -50,9 +50,9 @@ pub const style = struct {
 };
 
 // ---- portrayal asset + style generation ----------------------------------
-pub const assets = @import("assets"); // colortables / linestyles / style / manifest
+pub const assets = @import("style"); // colortables / line styles / style.json
 pub const sprite = @import("sprite"); // S-101 sprite + area-fill pattern atlases
-pub const chartstyle = @import("assets").chartstyle; // mariner-driven MapLibre style patching
+pub const chartstyle = @import("style").chartstyle; // mariner-driven MapLibre style patching
 
 // ---- tiling / encoding ---------------------------------------------------
 pub const mvt = @import("tiles").mvt; // Mapbox Vector Tile encode/decode

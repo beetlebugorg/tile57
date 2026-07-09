@@ -4,7 +4,7 @@
 //! SCAMIN) evaluated at the scene zoom.
 //!
 //! Tile surfaces (MVT/MLT) never resolve: they serialize tokens/names verbatim
-//! and the MapLibre client resolves live (assets/colortables.json + the
+//! and the MapLibre client resolves live (the color tables + the
 //! chartstyle expressions). The resolver mirrors those exact semantics so the
 //! two styling paths can't silently drift; each gate cites the expression it
 //! mirrors.
@@ -12,7 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
-const chartstyle = @import("assets").chartstyle;
+const chartstyle = @import("style").chartstyle;
 
 pub const MarinerSettings = chartstyle.MarinerSettings;
 
@@ -24,8 +24,8 @@ pub const PaletteId = enum(u2) { day, dusk, night };
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
 /// Token -> RGB for all three palettes, parsed once from colorProfile.xml —
-/// the same source assets.colorTablesJson serializes for the MapLibre client
-/// (parse mirrored from src/assets/assets.zig; keep in sync). Token keys are
+/// the same source style.colorTablesJson serializes for the MapLibre client
+/// (parse mirrored from src/style/style.zig; keep in sync). Token keys are
 /// slices INTO `xml`, so the xml must outlive the Colors (the embedded
 /// catalogue profile is static, so this is free in practice).
 pub const Colors = struct {
@@ -57,7 +57,7 @@ pub const Colors = struct {
 
 // Read the decimal byte inside the first <tag>NNN</tag> within `s` — the
 // <red>/<green>/<blue> children of an <item>'s <srgb> block (unambiguous: the
-// sibling <cie> block carries <x>/<y>/<L>). Mirrors assets.zig tagByte.
+// sibling <cie> block carries <x>/<y>/<L>). Mirrors style.zig tagByte.
 fn tagByte(s: []const u8, comptime tag: []const u8) ?u8 {
     const open = "<" ++ tag ++ ">";
     const i = std.mem.indexOf(u8, s, open) orelse return null;
@@ -117,11 +117,11 @@ pub fn categoryVisible(cat: ?i64, class: []const u8, symbol_name: ?[]const u8, m
 }
 
 /// 1:N scale denominator of the whole world in one 256px tile at z0 — the
-/// constant the style's SCAMIN gate divides by (assets/style.zig SCAMIN_GATE).
+/// constant the style's SCAMIN gate divides by (style/maplibre.zig SCAMIN_GATE).
 pub const DENOM_Z0 = 279541132.0;
 
 /// SCAMIN gate at a (fractional) display zoom — mirrors the style expression
-/// `zoom >= log2(DENOM_Z0 / scamin)` (assets/style.zig SCAMIN_GATE). A feature
+/// `zoom >= log2(DENOM_Z0 / scamin)` (style/maplibre.zig SCAMIN_GATE). A feature
 /// without SCAMIN (null) always shows.
 pub fn scaminVisible(scamin: ?i64, zoom: f64) bool {
     const s = scamin orelse return true;
@@ -134,7 +134,7 @@ pub fn scaminVisible(scamin: ?i64, zoom: f64) bool {
 /// i.e. zoom > log2(DENOM_Z0 / oscl). `oscl` is the baked X2 gate denominator
 /// (bake_enc.overscaleGateDenom = cscl/OVERSCALE_FACTOR), so this fires from X2 and
 /// NEVER before 1x compilation scale. The style clause is a strict `>` (oscl >
-/// DENOM); oscl 0 (unknown) never shows. Mirrors assets/style.zig writeOsclClause.
+/// DENOM); oscl 0 (unknown) never shows. Mirrors style/maplibre.zig writeOsclClause.
 pub fn osclVisible(oscl: i64, zoom: f64) bool {
     if (oscl <= 0) return false;
     return zoom > std.math.log2(DENOM_Z0 / @as(f64, @floatFromInt(oscl)));

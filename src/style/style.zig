@@ -1,39 +1,39 @@
-//! assets — offline portrayal-asset generation for the chart bundle. Mirrors the
-//! Go oracle's internal/engine/assets (EmitS101): the rendering half of the
-//! tile/style contract, emitted from the same S-101 catalogue that drives the
-//! tiles so the two can't drift. Mirrors the Go oracle's bundle assets.
+//! style — MapLibre style generation for the chart tiles: color tables, line
+//! styles, and the style.json layer set, plus the S-52 mariner expression
+//! builders. The style and the tiles come from the same S-101 catalogue, so the
+//! two stay in sync.
 //!
 //! Pure Zig (no libc/fs): callers read the catalogue bytes and pass them in, the
-//! same shape as s100/catalogue.zig. RGB lives ONLY in colortables.json; the
-//! tiles stay colour *tokens*.
+//! same shape as s100/catalogue.zig. RGB lives only in the color tables; the
+//! tiles carry color *tokens*.
 //!
-//! Implemented now: colortables.json (token -> hex, per day/dusk/night palette),
-//! the MapLibre style.json layer set (style.zig), and manifest.json (pins
-//! schema_version; couples tiles <-> portrayal). TODO, tracked in
-//! next: linestyles.json, sprite/pattern atlases (SVG raster),
-//! and glyphs (SDF) — to light up the symbol/text/pattern layers.
+//!   * color tables — token -> hex, one per day/dusk/night palette
+//!   * the MapLibre style.json layer set (maplibre.zig)
+//!   * line styles and the S-52 mariner expression builders (chartstyle.zig)
 
 const std = @import("std");
 
-/// The tile-vocabulary version both halves of a bundle are stamped with: the MVT
-/// layer/property set in scene.zig and the style/colortables that render it.
-/// Bump on ANY change to layer names or feature property keys. tile57/2 = the
-/// 6-source-layer schema (the `_scamin` twins folded into their base; SCAMIN is a
-/// per-feature `scamin` property the style gates band-independently).
+/// The tile-vocabulary version both the tiles and the style are stamped with:
+/// the MVT layer/property set in scene.zig and the style/color tables that
+/// render it. Bump on any change to layer names or feature property keys.
+/// tile57/2 = the 6-source-layer schema (the `_scamin` twins folded into their
+/// base; SCAMIN is a per-feature `scamin` property the style gates
+/// band-independently).
 pub const SCHEMA_VERSION = "tile57/2";
 
-// MapLibre style.json generation lives in style.zig.
-pub const StyleOpts = @import("style.zig").StyleOpts;
-pub const styleJson = @import("style.zig").styleJson;
-pub const displayDenom = @import("style.zig").displayDenom;
-pub const displayDenomZ = @import("style.zig").displayDenomZ;
-pub const scaminGateK = @import("style.zig").scaminGateK;
-pub const buildFromTemplate = @import("style.zig").buildFromTemplate;
-pub const buildFromTemplateScamin = @import("style.zig").buildFromTemplateScamin;
-pub const styleDiff = @import("style.zig").styleDiff;
+// MapLibre style.json generation lives in maplibre.zig.
+pub const StyleOpts = @import("maplibre.zig").StyleOpts;
+pub const styleJson = @import("maplibre.zig").styleJson;
+pub const displayDenom = @import("maplibre.zig").displayDenom;
+pub const displayDenomZ = @import("maplibre.zig").displayDenomZ;
+pub const scaminGateK = @import("maplibre.zig").scaminGateK;
+pub const buildFromTemplate = @import("maplibre.zig").buildFromTemplate;
+pub const buildFromTemplateScamin = @import("maplibre.zig").buildFromTemplateScamin;
+pub const styleDiff = @import("maplibre.zig").styleDiff;
 
-/// The S-52 mariner expression builders (MapLibre style patching) — folded
-/// in: assets is its only sibling and every consumer wants both.
+/// The S-52 mariner settings model and expression builders (MapLibre style
+/// patching). Every consumer of this module wants both these and the color
+/// tables, so they live together.
 pub const chartstyle = @import("chartstyle.zig");
 
 // ---- colortables.json ----------------------------------------------------
@@ -545,5 +545,5 @@ test "manifestJson: pins schema_version and couples tiles to portrayal" {
 
 test {
     _ = chartstyle;
-    _ = @import("style.zig"); // run style.zig's styleJson / buildFromTemplate tests too
+    _ = @import("maplibre.zig"); // run the style.json builder tests too
 }

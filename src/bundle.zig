@@ -2,7 +2,7 @@
 //! emission (colortables / linestyles / sprite / patterns / sprite-mln) built from
 //! the embedded catalogue (or an on-disk PortrayalCatalog dir). Moved out of the
 //! `tile57` CLI so the CLI is a thin wrapper and any consumer (the C ABI, a Go/JS
-//! binding, another UI) can build the same assets. Alongside the asset emitters it
+//! binding, another UI) can build the same style. Alongside the asset emitters it
 //! holds the per-cell composite: the ownership partition + the on-demand tile
 //! compositor (composeTile / ComposeSource) that serves a live map from per-cell
 //! archives. Pure-Zig + libc (the sprite atlas builder needs nanosvg/stb).
@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const engine = @import("engine");
-const assets = @import("assets");
+const style = @import("style");
 const sprite = @import("sprite");
 const embedded_assets = @import("catalog"); // S-101 portrayal assets embedded into the binary
 
@@ -43,8 +43,8 @@ fn embeddedFills(a: std.mem.Allocator) ![]sprite.AreaFillSrc {
 }
 
 // Embedded LineStyles/*.xml as line-style sources (id = file stem).
-pub fn embeddedLinestyles(a: std.mem.Allocator) ![]assets.LineStyleSrc {
-    const out = try a.alloc(assets.LineStyleSrc, embedded_assets.linestyles.len);
+pub fn embeddedLinestyles(a: std.mem.Allocator) ![]style.LineStyleSrc {
+    const out = try a.alloc(style.LineStyleSrc, embedded_assets.linestyles.len);
     for (embedded_assets.linestyles, 0..) |e, i| out[i] = .{ .id = e.name, .xml = e.bytes };
     return out;
 }
@@ -54,10 +54,10 @@ pub fn embeddedLinestyles(a: std.mem.Allocator) ![]assets.LineStyleSrc {
 // real dash runs + embedded symbols instead of a generic dashed stroke. Mirrors Go
 // lsInfoFromCatalog; mm geometry is converted at the PresLib feature scale. Best
 // effort — a malformed/short style is simply skipped. `gpa` outlives the bake.
-pub fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const assets.LineStyleSrc) void {
+pub fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const style.LineStyleSrc) void {
     const px = engine.scene.LINESTYLE_PX_PER_MM;
     for (srcs) |s| {
-        const parsed = assets.parseLineStyle(gpa, s.xml) catch continue;
+        const parsed = style.parseLineStyle(gpa, s.xml) catch continue;
         const period = parsed.interval_length * px;
         if (period < 0.5) continue; // no interval to tile (pure-symbol style)
         var runs = std.ArrayList([2]f64).empty;
@@ -113,7 +113,7 @@ pub fn colorTablesBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u
         const xml_path = try std.fs.path.join(a, &.{ catalog_dir, COLOR_PROFILE_REL });
         break :blk try std.Io.Dir.cwd().readFileAlloc(io, xml_path, a, .unlimited);
     };
-    return assets.colorTablesJson(a, xml);
+    return style.colorTablesJson(a, xml);
 }
 
 pub fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
@@ -126,12 +126,12 @@ pub fn emitColorTables(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8
 // patterns + placed symbols). Returns the bytes (arena owned). Shared by the
 // assets + bundle paths. Mirrors the Go oracle's EmitS101 linestyles step.
 pub fn linestylesBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]u8 {
-    if (catalog_dir.len == 0) return assets.linestylesJson(a, try embeddedLinestyles(a));
+    if (catalog_dir.len == 0) return style.linestylesJson(a, try embeddedLinestyles(a));
     const ls_dir_path = try std.fs.path.join(a, &.{ catalog_dir, LINESTYLES_REL });
     var dir = try std.Io.Dir.cwd().openDir(io, ls_dir_path, .{ .iterate = true });
     defer dir.close(io);
 
-    var srcs = std.ArrayList(assets.LineStyleSrc).empty;
+    var srcs = std.ArrayList(style.LineStyleSrc).empty;
     var walker = try dir.walk(a);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
@@ -142,7 +142,7 @@ pub fn linestylesBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8
         const id = std.fs.path.stem(std.fs.path.basename(path));
         try srcs.append(a, .{ .id = id, .xml = xml });
     }
-    return assets.linestylesJson(a, srcs.items);
+    return style.linestylesJson(a, srcs.items);
 }
 
 pub fn emitLinestyles(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, out_path: []const u8) ![]u8 {
