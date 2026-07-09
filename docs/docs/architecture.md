@@ -65,20 +65,19 @@ kitty graphics protocol). One engine, pluggable outputs — see
 Bakes encode **MLT** ([MapLibre Tile](https://github.com/maplibre/maplibre-tile-spec))
 by default; MapLibre GL JS ≥ 5.12 decodes it natively via the vector source
 `encoding` option, and the generated styles carry that hint. Pass
-`--format mvt` (CLI) / `tile57_bake_opts.format` (C ABI) to bake Mapbox Vector
-Tiles for consumers without an MLT decoder. Live cell-backed charts open
-generating MVT for compatibility; hosts opt in to MLT with
-`tile57_chart_set_tile_format`.
+`--format mvt` (CLI) to bake Mapbox Vector Tiles for consumers without an MLT
+decoder. `tile57_chart_info.tile_type` reports which encoding a chart's tiles
+use, so a host hints its renderer correctly.
 
-### Band handoff (`smax`)
+### Band handoff (coverage-clipped ownership)
 
 Overlapping cells of different compilation scales are resolved per tile to the
-best band. At a band's floor zoom — where a finer band hands over to the
-coarser one — the coarser band's features are *carried down* into the finer
-band's tiles, tagged with an `smax` denominator quantized onto the archive's
-SCAMIN ladder. The style (and the pixel resolver) hides a carried copy the
-moment the display gets finer than `1:smax`, so band boundaries hand off
-without holes or double-draws.
+best band. Rather than *carry* a coarser cell's features down into a finer band's
+tiles (the old `smax`-tagged carry-down), the compositor clips each cell to the
+**ownership partition**: at every tile the finer cell's M_COVR coverage wins the
+ground it holds, and a coarser cell renders only where no finer cell covers it.
+Band boundaries hand off without holes or double-draws, and there is no
+per-feature handoff tag for the style to gate.
 
 ### Overscale indication (`oscl`)
 
@@ -111,24 +110,26 @@ libc/Lua) and target-agnostic:
 imported by the pure test build. The C ABI (`src/capi.zig`) is a thin shim over
 the same Zig API as the `tile57` module.
 
-## The layering: Chart / bake / style
+## The layering: chart / compose / style
 
-The public surface composes the packages into three high-level entry points:
+The public surface composes the packages into high-level entry points:
 
 - **`Chart`** — open a chart from a path (`openPath`), from bytes (`openBytes`), or
-  as a multi-cell ENC_ROOT (`openCells` / `openCellsStreaming`), then `tile(z, x, y)`. This is the live
-  tile-generation path. It also reads a pre-baked **PMTiles** archive — the caller
-  can't tell the difference. The same handle renders finished views:
-  `renderView` (PNG or PDF, per its output parameter) and `renderAscii`
-  (`tile57_chart_render_view` / `tile57_chart_render_pdf` in the C ABI).
-- **`bakeArchive`** (`scene/bake_enc.zig`) — bake a whole ENC_ROOT to one PMTiles
-  archive offline, band-streamed.
+  as a multi-cell ENC_ROOT (`openCells` / `openCellsStreaming`), then render and
+  inspect it: `renderView` (PNG or PDF), `renderSurfaceView` (world-space GPU
+  callbacks), `queryPoint` (the cursor pick), and the metadata getters. It reads a
+  pre-baked **PMTiles** archive or portrays a live cell — the caller can't tell the
+  difference. (`tile57_chart_render_view` / `tile57_chart_render_pdf` /
+  `tile57_chart_render_surface_cb` / `tile57_chart_query` in the C ABI.)
+- **Tile production** — bake each cell to its own PMTiles at its compilation scale
+  (`tile57_bake_cell_bytes`), then a runtime **compositor** stitches the overlapping
+  cells for any `(z, x, y)` tile on demand through an ownership partition
+  (`tile57_compose_open` / `tile57_compose_serve`). `bakeArchive`
+  (`scene/bake_enc.zig`) is the offline alternative — a whole ENC_ROOT to one
+  band-streamed PMTiles archive.
 - **`style.build`** (`assets/chartstyle.zig`) + **`assets`** / **`sprite`** —
-  generate the MapLibre style and the portrayal assets it references.
-
-The same three are exposed across the C ABI (`tile57_chart_*`,
-`tile57_bake_pmtiles` / `tile57_bake_bundle`, `tile57_build_style`, and
-`tile57_bake_assets` for the portrayal assets).
+  generate the MapLibre style and the portrayal assets it references
+  (`tile57_build_style` / `tile57_bake_assets` in the C ABI).
 
 ## The memory design
 
@@ -149,28 +150,27 @@ tile57 is built to hold only its working set:
   coarsest), so peak memory tracks the largest single band rather than the whole
   archive.
 - **Tile cache.** Generated/decoded tiles are memoized per chart (keyed
-  `z<<48 | x<<24 | y`); `clearCache` / `tile57_chart_clear_cache` drops it to
-  bound long-running hosts.
+  `z<<48 | x<<24 | y`) and released with the chart, so a long-running host bounds
+  memory by closing charts it no longer renders.
 
-## The offline chart bundle
+## The live-composite bake
 
-One `bake` command (`tile57 bake <cell.000 | ENC_ROOT> -o out/`) emits a
-self-contained, relocatable directory in which the tiles and the portrayal that
-renders them travel together:
+One `bake` command (`tile57 bake <cell.000 | ENC_ROOT> -o out/`) writes the
+live-composite structure — per-cell tiles plus the ownership partition a runtime
+compositor serves them from:
 
 ```
 out/
-  manifest.json             pins schema_version, couples the two halves
-  tiles/chart.pmtiles       the DATA half — semantic colour tokens, palette-independent
-  assets/colortables.json   the PORTRAYAL half — token -> hex per day/dusk/night (the only RGB)
-  assets/linestyles.json    complex line-style metadata
-  assets/sprite-mln*.{json,png}  the symbol + pattern atlases
-  assets/style-{day,dusk,night}.json  the MapLibre style layers, colours pre-resolved
+  tiles/US5MD1MC.pmtiles    one PMTiles per cell, baked at its compilation scale
+  tiles/US4MD81M.pmtiles       (M_COVR coverage embedded in each archive's metadata)
+  partition.tpart           the ownership partition: which cell renders which ground
 ```
 
-This works because the tiles carry S-52 colour **tokens**, never RGB. Both halves
-are emitted from the *same* S-101 catalogue, so they cannot drift, and the
-manifest stamps both with a `schema_version` (`tile57/1` — the
-[tile-schema](./tile-schema.md) vocabulary) that a renderer checks before loading.
+There is no merged archive: any `(z, x, y)` tile is composed from the overlapping
+cells on demand (`tile57_compose_serve`), so re-baking one cell doesn't rewrite a
+whole district. The portrayal assets are generated separately (`tile57 assets` /
+`style`); the tiles carry S-52 colour **tokens**, never RGB, and both halves come
+from the *same* S-101 catalogue, so they cannot drift. The tile-schema vocabulary
+(`tile57/1`) is the contract a renderer checks.
 
 See the [**Tile Schema**](./tile-schema.md) for the vector-tile layer contract.

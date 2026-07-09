@@ -86,10 +86,11 @@ bounded. Caveats:
 - **First-view latency.** The first tile over a fresh area parses + portrays its
   1–4 cells (tens of ms), then they're cached. Opening the whole NOAA catalogue
   also pays a one-time index scan (a few seconds, parsing every cell header).
-- **Offline bake.** For smooth panning everywhere, bake the ENC_ROOT once to a
-  cached PMTiles archive (`tile57 bake`, or `bakeArchive` /
-  `tile57_bake_pmtiles`) and open that instead. The whole catalogue is a
-  multi-minute one-time bake; a region is far quicker.
+- **Pre-bake for smooth panning.** For low first-view latency everywhere, bake the
+  ENC_ROOT once with `tile57 bake` (per-cell tiles + an ownership partition) and
+  serve tiles from the compositor; `bakeArchive` bakes an offline PMTiles archive
+  instead. The whole catalogue is a multi-minute one-time bake; a region is far
+  quicker.
 - **Low zoom is style-gated.** The generated style's vector-source `minzoom` is
   the bake's tile floor (default 8), and MapLibre never requests tiles below a
   source's minzoom — nothing draws below it regardless of the data.

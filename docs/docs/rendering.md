@@ -115,7 +115,8 @@ tile57 png ... --safety 5 --safety-depth 5 --feet --palette night \
 
 ### From C (and therefore Go, Python, C++, …)
 
-Two calls in `include/tile57.h`, mirroring `tile57_chart_tile`:
+Two calls in `include/tile57.h` (same allocate-`*out` / free-with-`tile57_free`
+convention as the rest of the ABI):
 
 ```c
 tile57_chart *c = tile57_chart_open("/path/to/ENC_ROOT");

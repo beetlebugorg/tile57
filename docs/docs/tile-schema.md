@@ -11,11 +11,10 @@ MapLibre style depends on this schema, so the names are a contract. Do not
 rename a layer or a field without updating the style generator
 (`src/assets/style.zig`) to match **and bumping the schema version**.
 
-This vocabulary is versioned as **`tile57/1`**. A
-[chart bundle](./architecture.md#the-offline-chart-bundle) stamps both halves —
-the tiles and the portrayal assets — with that `schema_version` in its
-`manifest.json`, so a renderer can refuse a bundle whose schema it doesn't speak.
-Any change to a layer name or field key bumps it.
+This vocabulary is versioned as **`tile57/1`**. The tiles and the portrayal
+assets are generated from the same S-101 catalogue and stamped with that
+`schema_version`, so a renderer can refuse a schema it doesn't speak. Any change
+to a layer name or field key bumps it.
 
 Every tile uses an extent of **4096** and a buffer of **64**.
 
