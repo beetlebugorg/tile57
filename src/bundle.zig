@@ -333,11 +333,11 @@ const DEBUG_PALETTE = [_][]const u8{
 /// NO portrayed content, for eyeballing the composite quilt. `band` < 0 emits the band
 /// GOVERNING each zoom (the natural view); 0..5 (berthing..overview) emits only that
 /// band's own map, at every zoom. Composes the single paths — loadCells + toPlaneCells
-/// + geo.plane partition + the mvt/tile/pmtiles primitives — and STREAMS tiles (one
+/// + geometry.plane partition + the mvt/tile/pmtiles primitives — and STREAMS tiles (one
 /// tier + one zoom resident) so it scales to the whole corpus. Returns the cell count;
 /// `out_path` is a single `.pmtiles` file.
 pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const u8, out_path: []const u8, minzoom: u8, maxzoom_arg: u8, band: i8) !usize {
-    const geo = engine.geo;
+    const geometry = engine.geometry;
     const maxzoom = @min(maxzoom_arg, @as(u8, 16));
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -373,8 +373,8 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
         // One band's own map: build its tier once, emit across every zoom.
         const bandv: engine.bake_enc.Band = @enumFromInt(@as(u8, @intCast(@min(band, @as(i8, 5)))));
         const tier = engine.bake_enc.bandZooms(bandv).min;
-        const faces = try geo.plane.ownedAtTierIndexed(gpa, cells, tier);
-        defer geo.plane.freeOwned(gpa, faces);
+        const faces = try geometry.plane.ownedAtTierIndexed(gpa, cells, tier);
+        defer geometry.plane.freeOwned(gpa, faces);
         var z: u8 = minzoom;
         while (z <= maxzoom) : (z += 1) {
             _ = zoom_arena.reset(.retain_capacity);
@@ -385,14 +385,14 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
         // a time (coarse→fine as z rises), so the finest tier is only built if reached.
         const floors = try distinctFloorsDesc(a, cells);
         var cur_tier: i16 = -1;
-        var cur_faces: []geo.plane.OwnedCell = &.{};
-        defer if (cur_tier >= 0) geo.plane.freeOwned(gpa, cur_faces);
+        var cur_faces: []geometry.plane.OwnedCell = &.{};
+        defer if (cur_tier >= 0) geometry.plane.freeOwned(gpa, cur_faces);
         var z: u8 = minzoom;
         while (z <= maxzoom) : (z += 1) {
             const t = governingTier(floors, z);
             if (cur_tier != @as(i16, t)) {
-                if (cur_tier >= 0) geo.plane.freeOwned(gpa, cur_faces);
-                cur_faces = try geo.plane.ownedAtTierIndexed(gpa, cells, t);
+                if (cur_tier >= 0) geometry.plane.freeOwned(gpa, cur_faces);
+                cur_faces = try geometry.plane.ownedAtTierIndexed(gpa, cells, t);
                 cur_tier = t;
             }
             _ = zoom_arena.reset(.retain_capacity);
@@ -425,7 +425,7 @@ fn deg7(d: f64) i32 {
 }
 
 // Distinct band floors, DESCENDING (finest floor first) — the tier ladder.
-fn distinctFloorsDesc(a: std.mem.Allocator, cells: []const engine.geo.plane.Cell) ![]u8 {
+fn distinctFloorsDesc(a: std.mem.Allocator, cells: []const engine.geometry.plane.Cell) ![]u8 {
     var seen = std.AutoHashMap(u8, void).init(a);
     for (cells) |c| try seen.put(c.band_floor, {});
     const out = try a.alloc(u8, seen.count());
@@ -443,12 +443,12 @@ fn governingTier(floors_desc: []const u8, z: u8) u8 {
     return floors_desc[floors_desc.len - 1];
 }
 
-/// The s57-coverage → geo.plane.Cell adapter: widen each cell's M_COVR to integer
+/// The s57-coverage → geometry.plane.Cell adapter: widen each cell's M_COVR to integer
 /// points, set the band floor (bandOf), and assign the deterministic DSID order (same
 /// tie-break as the bake) across the whole set. Arena-allocated in `a`. THE single
 /// conversion path; the partition-debug bake and the compositor both use it.
-fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]engine.geo.plane.Cell {
-    const geo = engine.geo;
+fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]engine.geometry.plane.Cell {
+    const geometry = engine.geometry;
     const n = loaded.len;
     const rank = try a.alloc(usize, n);
     for (rank, 0..) |*v, i| v.* = i;
@@ -460,13 +460,13 @@ fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]engine.geo.p
     const order = try a.alloc(u64, n);
     for (rank, 0..) |ci, r| order[ci] = r;
 
-    const cells = try a.alloc(geo.plane.Cell, n);
+    const cells = try a.alloc(geometry.plane.Cell, n);
     for (loaded, 0..) |lc, i| {
-        const out = try a.alloc(geo.plane.Poly, lc.coverage.len);
+        const out = try a.alloc(geometry.plane.Poly, lc.coverage.len);
         for (lc.coverage, 0..) |feat, fi| {
-            const rings = try a.alloc([]const geo.plane.Pt, feat.len);
+            const rings = try a.alloc([]const geometry.plane.Pt, feat.len);
             for (feat, 0..) |ring, ri| {
-                const pts = try a.alloc(geo.plane.Pt, ring.len);
+                const pts = try a.alloc(geometry.plane.Pt, ring.len);
                 for (ring, 0..) |p, pi| pts[pi] = .{ .x = p.lon_e7, .y = p.lat_e7 };
                 rings[ri] = pts;
             }
@@ -486,7 +486,7 @@ fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]engine.geo.p
 /// (layer "partition"). `sa` is a per-zoom arena the caller resets, so only one zoom's
 /// tiles are resident. Reuses tile.project/clipPolygon + scene.orientAreaRings (the MVT
 /// winding authority) + mvt.encode.
-fn emitFacesZoom(sw: *engine.pmtiles.StreamWriter, sa: std.mem.Allocator, faces: []const engine.geo.plane.OwnedCell, loaded: []const LoadedCov, z: u8, tier: u8) !void {
+fn emitFacesZoom(sw: *engine.pmtiles.StreamWriter, sa: std.mem.Allocator, faces: []const engine.geometry.plane.OwnedCell, loaded: []const LoadedCov, z: u8, tier: u8) !void {
     const mvt = engine.mvt;
     const tile = engine.tile;
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
@@ -596,7 +596,7 @@ const N_COMPOSE_LAYERS = engine.scene.VECTOR_LAYERS.len;
 // The tile-index cover (nw..se) of an owner face's lon/lat bbox at zoom `scale = 1<<z`. The
 // on-demand composeTile culls candidate tiles through this exact box.
 const TileBBox = struct { tx0: u32, tx1: u32, ty0: u32, ty1: u32 };
-fn faceTileBBox(face: engine.geo.plane.OwnedCell, scale: f64) TileBBox {
+fn faceTileBBox(face: engine.geometry.plane.OwnedCell, scale: f64) TileBBox {
     const tile = engine.tile;
     var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
     for (face.owned) |ring| for (ring) |p| {
@@ -624,7 +624,7 @@ fn tileWidthE7(z: u8) i64 {
 
 // The (z,tx,ty) box expanded by the render BUFFER, in integer lon/lat — the region a verbatim
 // passthrough must fully own (tile AND its buffer) before it fires.
-fn tileClassifyBox(z: u8, tx: u32, ty: u32) engine.geo.plane.Box {
+fn tileClassifyBox(z: u8, tx: u32, ty: u32) engine.geometry.plane.Box {
     const tile = engine.tile;
     const tb = tile.tileBoundsLonLat(z, tx, ty); // [min_lon, min_lat, max_lon, max_lat]
     const lon0: i64 = @intFromFloat(@round(tb[0] * 1e7));
@@ -641,7 +641,7 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) engine.geo.plane.Box {
 // ancestor), clip its features to the owner's projected owned face, per-layer concat in
 // VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
 // the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
-fn composeSeamTile(ta: std.mem.Allocator, part: *const engine.geo.partition.Partition, map: *const engine.geo.partition.BandMap, readers: []const *engine.pmtiles.Reader, slots: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
+fn composeSeamTile(ta: std.mem.Allocator, part: *const engine.geometry.partition.Partition, map: *const engine.geometry.partition.BandMap, readers: []const *engine.pmtiles.Reader, slots: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
     const mvt = engine.mvt;
     const compose = engine.scene.compose;
     var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
@@ -674,7 +674,7 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const engine.geo.partition.Part
 /// server wants — the HTTP layer gzips on the wire). gpa-owned; null if no cell owns this tile. This
 /// is the runtime compositor: with the partition loaded once, serving a tile is a classify plus
 /// either one memcpy/decompress or one decode/clip/encode, not a whole-district pass.
-pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Partition, readers: []const *engine.pmtiles.Reader, z: u8, tx: u32, ty: u32, gzip: bool) !TileResult {
+pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geometry.partition.Partition, readers: []const *engine.pmtiles.Reader, z: u8, tx: u32, ty: u32, gzip: bool) !TileResult {
     const compose = engine.scene.compose;
     const map = part.mapForZoom(z) orelse return .{ .tile = null, .owned = false };
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
@@ -698,7 +698,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Par
         const bb = faceTileBBox(face, scale);
         if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
 
-        var grid = try engine.geo.plane.EdgeGrid.init(ta, face.owned, tileWidthE7(z));
+        var grid = try engine.geometry.plane.EdgeGrid.init(ta, face.owned, tileWidthE7(z));
         defer grid.deinit();
         switch (grid.classify(tileClassifyBox(z, tx, ty))) {
             .full => continue, // owns none of this tile
@@ -739,7 +739,7 @@ pub const ComposeSource = struct {
     arena: std.heap.ArenaAllocator, // owns the readers/maps arrays + adapted cells (borrowed by part)
     maps: []const []align(std.heap.page_size_min) const u8,
     readers: []const *engine.pmtiles.Reader,
-    part: engine.geo.partition.Partition,
+    part: engine.geometry.partition.Partition,
     minz: u8,
     maxz: u8,
     loop_max: u8, // deepest zoom the sources can serve (native windows + one fill-up overscale zoom)
@@ -754,7 +754,7 @@ pub const ComposeSource = struct {
     /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can
     /// load to skip the owned-face build.
     pub fn serializePartition(self: *ComposeSource, gpa: std.mem.Allocator) ![]u8 {
-        return engine.geo.partition.serialize(gpa, &self.part);
+        return engine.geometry.partition.serialize(gpa, &self.part);
     }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
@@ -855,12 +855,12 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
 
     var loaded = false;
     if (load_partition) |bytes| {
-        if (engine.geo.partition.deserialize(gpa, bytes, cells)) |p| {
+        if (engine.geometry.partition.deserialize(gpa, bytes, cells)) |p| {
             src.part = p;
             loaded = true;
         } else |err| std.debug.print("  partition sidecar unusable ({s}); building\n", .{@errorName(err)});
     }
-    if (!loaded) src.part = try engine.geo.partition.build(gpa, cells);
+    if (!loaded) src.part = try engine.geometry.partition.build(gpa, cells);
     built_part = true;
 
     const fill_max = @min(maxz + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);

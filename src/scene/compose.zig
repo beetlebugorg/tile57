@@ -14,9 +14,9 @@
 const std = @import("std");
 const mvt = @import("tiles").mvt;
 const tile = @import("tiles").tile;
-const geo = @import("geo");
-const boolean = geo.boolean;
-const plane = geo.plane;
+const geometry = @import("geometry");
+const boolean = geometry.boolean;
+const plane = geometry.plane;
 
 const Pt = boolean.Pt;
 

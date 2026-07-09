@@ -23,7 +23,7 @@ const scene = @import("scene.zig");
 const pmtiles = @import("tiles").pmtiles;
 const tile = @import("tiles").tile;
 const style = @import("style"); // displayDenomZ: the physical display-scale formula
-const geometry = @import("geo"); // Martinez boolean for the coverage-clipped composite
+const geometry = @import("geometry"); // Martinez boolean for the coverage-clipped composite
 
 /// A parsed + portrayed cell ready to bake. `portrayal` is the per-feature S-101
 /// instruction stream (null = bake with the classify() fallback); `bounds` is

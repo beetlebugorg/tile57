@@ -28,6 +28,6 @@ pub const s101_instructions = root.s101_instructions;
 pub const s101_adapter = root.s101_adapter;
 pub const catalogue = root.catalogue;
 pub const bake_enc = root.bake_enc;
-pub const geo = @import("geo"); // integer geometry: boolean, plane, partition
+pub const geometry = @import("geometry"); // integer geometry: boolean, plane, partition
 
 pub const portray = @import("portray");

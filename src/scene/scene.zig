@@ -18,7 +18,7 @@ const mvt = @import("tiles").mvt;
 const mlt = @import("tiles").mlt;
 const render = @import("render");
 const style = @import("style");
-const geometry = @import("geo"); // Martinez boolean; `geo` is a common param name here
+const geometry = @import("geometry"); // Martinez boolean; `geo` is a common param name here
 const rs = render.surface;
 
 /// The banded multi-cell ENC_ROOT -> PMTiles baker (folded in: it is the

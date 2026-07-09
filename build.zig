@@ -207,10 +207,10 @@ pub fn build(b: *std.Build) void {
     }.f;
     addFont(b, render_mod);
 
-    // Integer computational geometry (src/geo/): the Martinez polygon boolean +
+    // Integer computational geometry (src/geometry/): the Martinez polygon boolean +
     // the coverage-clipped best-available partition. Pure (std-only); the scene
     // engine + baker use it for the cross-band composite.
-    const geo_mod = b.addModule("geo", .{ .root_source_file = b.path("src/geo/geo.zig") });
+    const geometry_mod = b.addModule("geometry", .{ .root_source_file = b.path("src/geometry/geometry.zig") });
 
     // The tile engine (src/scene/): S-57 -> tile-surface generation plus the
     // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
@@ -222,7 +222,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s101", .module = s101_mod },
             .{ .name = "tiles", .module = tiles_mod },
             .{ .name = "render", .module = render_mod },
-            .{ .name = "geo", .module = geo_mod },
+            .{ .name = "geometry", .module = geometry_mod },
         },
     });
 
@@ -281,7 +281,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "style", .module = style_mod },
-        .{ .name = "geo", .module = geo_mod },
+        .{ .name = "geometry", .module = geometry_mod },
     };
 
     // Full engine surface (the pure root.zig packages + the embedded-Lua `portray`
@@ -565,24 +565,16 @@ pub fn build(b: *std.Build) void {
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "style", .module = style_mod },
-        .{ .name = "geo", .module = geo_mod },
+        .{ .name = "geometry", .module = geometry_mod },
     });
     _ = addPkgTest(b, test_step, "src/style/style.zig", target, optimize, &.{});
-    // Geometry core for the cross-band composition redesign (pure, std-only).
-    _ = addPkgTest(b, test_step, "src/geo/geo.zig", target, optimize, &.{});
-    // De-risk probe for the per-cell composite ownership partition: runs the E7
-    // partition on a real ENC district (slivers / perf / float-oracle agreement).
-    // Its own step so it is isolated from `zig build test`; needs only s57+geo.
-    const partition_probe_step = b.step("partition-probe", "Run the ownership-partition de-risk probe on a real ENC district");
-    _ = addPkgTest(b, partition_probe_step, "src/scene/partition_adapt.zig", target, optimize, &.{
-        .{ .name = "s57", .module = s57_mod },
-        .{ .name = "geo", .module = geo_mod },
-    });
-    // Compose core (clip-to-face): pure over mvt + geo. Its own step for fast iteration,
+    // Geometry core for the cross-band composition (pure, std-only).
+    _ = addPkgTest(b, test_step, "src/geometry/geometry.zig", target, optimize, &.{});
+    // Compose core (clip-to-face): pure over mvt + geometry. Its own step for fast iteration,
     // and part of the main suite.
     const compose_deps = [_]std.Build.Module.Import{
         .{ .name = "tiles", .module = tiles_mod },
-        .{ .name = "geo", .module = geo_mod },
+        .{ .name = "geometry", .module = geometry_mod },
     };
     const compose_step = b.step("compose-test", "Run the compose-core (clip-to-face) tests");
     _ = addPkgTest(b, compose_step, "src/scene/compose.zig", target, optimize, &compose_deps);
