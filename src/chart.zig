@@ -597,6 +597,11 @@ pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) 
 /// so the composite stitcher rebuilds the ownership partition from the baked archives
 /// without re-parsing the .000. Read it back with `cellCoverageFromArchive`.
 pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
+    // Populate the read-only portrayal globals (feature catalogue + complex-linestyle table)
+    // before portraying: without them, complex lines fall back to plain geometry and their S-52
+    // linestyle is dropped from the tile. Idempotent; in the parallel batch path bakeCellsParallel
+    // has already warmed up before spawning workers, so this is a no-op there (and race-free).
+    warmup();
     var cf = try readCellFiles(cell_path);
     defer cf.deinit();
 
