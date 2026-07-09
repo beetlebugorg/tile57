@@ -986,7 +986,7 @@ export fn tile57_style_diff(
     const new_style = style.buildFromTemplateScamin(gpa, tmpl, &nm, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
     defer gpa.free(new_style);
 
-    const ops = style.styleDiff(gpa, old_style, new_style) catch return 0;
+    const ops = style.diff(gpa, old_style, new_style) catch return 0;
     out.* = ops.ptr;
     out_len.* = ops.len;
     return 1;
@@ -1020,7 +1020,7 @@ export fn tile57_style_template(
     const xml = embeddedColorProfileXml() orelse return 0;
     const cts = style.colorTablesJson(gpa, xml) catch return 0;
     defer gpa.free(cts);
-    var opts = style.StyleOpts{
+    var opts = style.Options{
         .scheme = switch (scheme) {
             1 => "dusk",
             2 => "night",
@@ -1034,7 +1034,7 @@ export fn tile57_style_template(
     opts.minzoom = minzoom;
     if (maxzoom != 0) opts.maxzoom = maxzoom;
     if (tile_encoding == TILE_TYPE_MLT) opts.encoding = "mlt";
-    const style_json = style.styleJson(gpa, opts) catch return 0;
+    const style_json = style.json(gpa, opts) catch return 0;
     out.* = style_json.ptr;
     out_len.* = style_json.len;
     return 1;

@@ -15,7 +15,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var colortables: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var scheme: []const u8 = "day";
-    var opts = style.StyleOpts{ .scheme = "day", .colortables_json = "" };
+    var opts = style.Options{ .scheme = "day", .colortables_json = "" };
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
@@ -50,7 +50,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         try std.Io.Dir.cwd().readFileAlloc(io, ctf, a, .unlimited)
     else
         try colorTablesBytes(io, a, resolveCatalogDir(catalog));
-    const style_json = try style.styleJson(a, opts);
+    const style_json = try style.json(a, opts);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = style_json });
     std.debug.print("wrote {s} ({s}, {d} bytes)\n", .{ out_path, scheme, style_json.len });
 }

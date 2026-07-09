@@ -22,14 +22,14 @@ const std = @import("std");
 pub const SCHEMA_VERSION = "tile57/2";
 
 // MapLibre style.json generation lives in maplibre.zig.
-pub const StyleOpts = @import("maplibre.zig").StyleOpts;
-pub const styleJson = @import("maplibre.zig").styleJson;
+pub const Options = @import("maplibre.zig").Options;
+pub const json = @import("maplibre.zig").json;
 pub const displayDenom = @import("maplibre.zig").displayDenom;
 pub const displayDenomZ = @import("maplibre.zig").displayDenomZ;
 pub const scaminGateK = @import("maplibre.zig").scaminGateK;
 pub const buildFromTemplate = @import("maplibre.zig").buildFromTemplate;
 pub const buildFromTemplateScamin = @import("maplibre.zig").buildFromTemplateScamin;
-pub const styleDiff = @import("maplibre.zig").styleDiff;
+pub const diff = @import("maplibre.zig").diff;
 
 /// The S-52 mariner settings model and expression builders (MapLibre style
 /// patching). Every consumer of this module wants both these and the color

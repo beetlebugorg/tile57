@@ -90,13 +90,13 @@ pub const MarinerSettings = struct {
 
     // -- SCAMIN gating override (host ?ignoreScamin debug toggle) — NOT an S-52
     // display setting; a render-time transport flag the C ABI carries through to
-    // the style builder. When true, styleJson drops SCAMIN scale-gating so every
+    // the style builder. When true, the style drops SCAMIN scale-gating so every
     // feature shows in-band regardless of its 1:N min-display-scale. Default off.
     ignore_scamin: bool = false,
 
-    // -- scamin-layers.md: gate SCAMIN with a live client-driven filter instead of
-    // per-value bucket layers — NOT an S-52 display setting; a render-time transport
-    // flag the C ABI carries to the style builder. When true, styleJson emits one
+    // -- gate SCAMIN with a live client-driven filter instead of per-value bucket
+    // layers — NOT an S-52 display setting; a render-time transport flag the C ABI
+    // carries to the style builder. When true, the style emits one
     // *_scamin layer per render-type (no minzoom buckets) and the client rewrites the
     // SCAMIN clause on boundary crossings. Default off = per-value buckets.
     scamin_filter_gate: bool = false,
