@@ -14,7 +14,7 @@
 //! Surface:
 //!   - High-level engine: `Chart` (open → render/inspect), `bakeArchive`, `style.build`
 //!   - Portrayal assets:  `assets` (colortables, linestyles, sprite/pattern)
-//!   - Style patching:    `chartstyle`
+//!   - Style patching:    `mariner`
 //!   - Tiling:            `mvt`, `tile`, `pmtiles`, `bake_enc`, `scene`
 //!   - Raw formats:       `formats.{iso8211, s57, s101}`
 
@@ -46,13 +46,13 @@ pub const freeBytes = chart.freeBytes;
 /// baked in; the old template-patch pass is retired) — see assets.buildFromTemplate.
 pub const style = struct {
     pub const build = assets.buildFromTemplate;
-    pub const Mariner = chartstyle.MarinerSettings;
+    pub const Mariner = mariner.Settings;
 };
 
 // ---- portrayal asset + style generation ----------------------------------
 pub const assets = @import("style"); // colortables / line styles / style.json
 pub const sprite = @import("sprite"); // S-101 sprite + area-fill pattern atlases
-pub const chartstyle = @import("style").chartstyle; // mariner-driven MapLibre style patching
+pub const mariner = @import("style").mariner; // mariner-driven MapLibre style patching
 
 // ---- tiling / encoding ---------------------------------------------------
 pub const mvt = @import("tiles").mvt; // Mapbox Vector Tile encode/decode

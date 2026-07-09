@@ -8,7 +8,7 @@ const std = @import("std");
 const chart = @import("chart.zig");
 const s57 = @import("s57");
 const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
-const chartstyle = @import("style").chartstyle;
+const mariner = @import("style").mariner;
 const style = @import("style");
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk
@@ -450,7 +450,7 @@ export fn tile57_chart_render_view(
 ) callconv(.c) c_int {
     const c = handle orelse return -1;
     if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
-    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const palette: RenderPalette = switch (settings.scheme) {
         .day => .day,
         .dusk => .dusk,
@@ -554,7 +554,7 @@ export fn tile57_chart_render_pdf(
 ) callconv(.c) c_int {
     const c = handle orelse return -1;
     if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
-    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const palette: RenderPalette = switch (settings.scheme) {
         .day => .day,
         .dusk => .dusk,
@@ -590,7 +590,7 @@ export fn tile57_chart_render_view_cb(
     const c = handle orelse return -1;
     const cb = canvas orelse return -2;
     if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
-    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const palette: RenderPalette = switch (settings.scheme) {
         .day => .day,
         .dusk => .dusk,
@@ -626,7 +626,7 @@ export fn tile57_chart_render_surface_cb(
     const c = handle orelse return -1;
     const sfc = surface orelse return -2;
     if (width == 0 or height == 0 or width > 16384 or height > 16384) return -2;
-    const settings: chartstyle.MarinerSettings = if (m) |p| marinerFromC(p) else .{};
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const palette: RenderPalette = switch (settings.scheme) {
         .day => .day,
         .dusk => .dusk,
@@ -856,11 +856,11 @@ fn dateViewSlice(buf: *const [9]u8) []const u8 {
     return buf[0..@min(n, 8)];
 }
 
-// Translate the extern CMariner into the internal chartstyle.MarinerSettings the
+// Translate the extern CMariner into the internal mariner.Settings the
 // style builders take. The returned value borrows `cm`'s date_view and
 // viewing_groups_off storage, so `cm` (and its viewing_groups_off array) must
 // outlive every use of the result — true within a single ABI call.
-fn marinerFromC(cm: *const CMariner) chartstyle.MarinerSettings {
+fn marinerFromC(cm: *const CMariner) mariner.Settings {
     return .{
         .scheme = switch (cm.scheme) {
             1 => .dusk,
@@ -940,7 +940,7 @@ export fn tile57_build_style(
     defer if (scamin_buf.len > 0) gpa.free(scamin_buf);
     const now_unix: i64 = @intCast(time(null));
     // Single style builder: regenerate the full style with the mariner baked in
-    // (chartstyle.buildStyle's template-patch pass is retired). buildFromTemplate lifts
+    // (mariner.buildStyle's template-patch pass is retired). buildFromTemplate lifts
     // the source config out of the passed template and drives the one styleJson.
     const style_json = style.buildFromTemplateScamin(gpa, tmpl, &m, cts, bands, now_unix, scamin_buf, scamin_lat) catch return 0;
     out.* = style_json.ptr;
@@ -1042,7 +1042,7 @@ export fn tile57_style_template(
 
 /// Fill `cm` with the canonical default mariner settings. date_view = "".
 export fn tile57_mariner_defaults(cm: *CMariner) callconv(.c) void {
-    const d = chartstyle.MarinerSettings{};
+    const d = mariner.Settings{};
     cm.* = .{
         .scheme = @intCast(@intFromEnum(d.scheme)),
         .shallow_contour = d.shallow_contour,

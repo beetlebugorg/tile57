@@ -1258,7 +1258,7 @@ pub const Chart = struct {
     /// labels + declutter over the whole canvas. Returns PNG bytes (gpa-owned;
     /// free with freeBytes). Cell-backed sources only; a baked PMTiles source
     /// has no portrayal to render from (bundle-sourced rendering is future work).
-    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, output: render.pixel.Output, cb_table: ?*const render.cb_canvas.CCanvas) ![]u8 {
+    pub fn renderView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, output: render.pixel.Output, cb_table: ?*const render.cb_canvas.CCanvas) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1336,7 +1336,7 @@ pub const Chart = struct {
     /// tiles, emitting a WORLD-SPACE tagged stream to the C surface callback
     /// (see render/vector.zig). Live for both a baked bundle (.reader tile
     /// replay) and a live cell (.cell portrayal). No bytes are produced.
-    pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, cb: *const render.vector.CSurface) !void {
+    pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1461,7 +1461,7 @@ pub const Chart = struct {
     /// one Unicode character per terminal cell (cols x rows), optional
     /// ANSI-256 color. Returns UTF-8 bytes, one '\n'-terminated row per grid
     /// row (gpa-owned; free with freeBytes). Same backends as renderView.
-    pub fn renderAscii(self: *Chart, lon: f64, lat: f64, zoom: f64, cols: u32, rows: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.MarinerSettings, ansi: bool) ![]u8 {
+    pub fn renderAscii(self: *Chart, lon: f64, lat: f64, zoom: f64, cols: u32, rows: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, ansi: bool) ![]u8 {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1701,7 +1701,7 @@ pub fn renderFeature(
     w: u32,
     h: u32,
     palette: render.resolve.PaletteId,
-    settings: *const render.resolve.MarinerSettings,
+    settings: *const render.resolve.Settings,
     bg: []const u8,
     output: render.pixel.Output,
 ) ![]u8 {
@@ -1778,7 +1778,7 @@ pub fn renderCellView(
     w: u32,
     h: u32,
     palette: render.resolve.PaletteId,
-    settings: *const render.resolve.MarinerSettings,
+    settings: *const render.resolve.Settings,
     output: render.pixel.Output,
     highlight: ?Highlight,
 ) ![]u8 {

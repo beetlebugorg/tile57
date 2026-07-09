@@ -1,7 +1,7 @@
 //! style-parity — the NATIVE oracle for the wasm style engine.
 //!
 //! It embeds the SAME template + colortables as bindings/wasm/style_wasm.zig and
-//! drives the SAME `chartstyle.buildStyle` through the SAME shared settings
+//! drives the SAME `the mariner builders` through the SAME shared settings
 //! parser — only the compilation target differs (native vs wasm32). So a diff of
 //! this tool's output against the wasm/JS output for identical settings + now_unix
 //! is a true byte-for-byte parity check of the engine across the two backends.
@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const style = @import("style");
-const chartstyle = @import("style").chartstyle;
+const mariner = @import("style").mariner;
 const settings = @import("settings");
 
 const template_json = @embedFile("template_json");

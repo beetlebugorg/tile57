@@ -5,16 +5,16 @@
 //!
 //! Tile surfaces (MVT/MLT) never resolve: they serialize tokens/names verbatim
 //! and the MapLibre client resolves live (the color tables + the
-//! chartstyle expressions). The resolver mirrors those exact semantics so the
+//! mariner expressions). The resolver mirrors those exact semantics so the
 //! two styling paths can't silently drift; each gate cites the expression it
 //! mirrors.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
-const chartstyle = @import("style").chartstyle;
+const mariner = @import("style").mariner;
 
-pub const MarinerSettings = chartstyle.MarinerSettings;
+pub const Settings = mariner.Settings;
 
 // ---- colors ---------------------------------------------------------------
 
@@ -96,13 +96,13 @@ fn collectItems(a: Allocator, block: []const u8, map: *std.StringHashMapUnmanage
 
 // ---- display gates ----------------------------------------------------------
 
-/// S-52 §10.3.4 display-category gate — mirrors chartstyle.categoryFilter:
+/// S-52 §10.3.4 display-category gate — mirrors mariner.categoryFilter:
 /// the effective category is the feature's `cat` (0 base / 1 standard /
 /// 2 other; null defaults to standard, like the style's coalesce), except
 /// ISODGR01 which rides the isolated-dangers-shallow toggle instead of its
 /// baked category. M_QUAL is the data-quality overlay: shown iff the overlay
 /// is on (then regardless of category), hidden otherwise.
-pub fn categoryVisible(cat: ?i64, class: []const u8, symbol_name: ?[]const u8, m: *const MarinerSettings) bool {
+pub fn categoryVisible(cat: ?i64, class: []const u8, symbol_name: ?[]const u8, m: *const Settings) bool {
     if (std.mem.eql(u8, class, "M_QUAL")) return m.data_quality;
     var c = cat orelse 1;
     if (symbol_name) |sn| {
@@ -141,7 +141,7 @@ pub fn osclVisible(oscl: i64, zoom: f64) bool {
 }
 
 /// Viewing-group gate (S-52 §14.5) — the deny-list model of
-/// chartstyle.MarinerSettings.viewing_groups_off (the host's viewingGroupsOff model):
+/// mariner.Settings.viewing_groups_off (the host's viewingGroupsOff model):
 /// a feature with no viewing group (vg 0) always shows; otherwise it hides iff
 /// its group is in the mariner's off-list. Any group not listed defaults ON.
 pub fn viewingGroupVisible(vg: i64, off: ?[]const i32) bool {
@@ -153,10 +153,10 @@ pub fn viewingGroupVisible(vg: i64, off: ?[]const i32) bool {
     return true;
 }
 
-/// S-52 §14.5 text-group gate — mirrors chartstyle.textGroupFilter: important
+/// S-52 §14.5 text-group gate — mirrors mariner.textGroupFilter: important
 /// text (group 11) is always on; 21/26/29 ride text_names; 23 rides
 /// show_light_descriptions; everything else rides text_other.
-pub fn textGroupVisible(group: i64, m: *const MarinerSettings) bool {
+pub fn textGroupVisible(group: i64, m: *const Settings) bool {
     if (group == 11) return true;
     if (group == 21 or group == 26 or group == 29) return m.text_names;
     if (group == 23) return m.show_light_descriptions;
@@ -166,7 +166,7 @@ pub fn textGroupVisible(group: i64, m: *const MarinerSettings) bool {
 /// Combined per-feature gate for pixel surfaces: display category + viewing
 /// group + SCAMIN at the scene zoom. `symbol_name` is the symbol about to be
 /// drawn (null for fills/lines/text) — only consulted for the ISODGR01 case.
-pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64, m: *const MarinerSettings) bool {
+pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64, m: *const Settings) bool {
     if (!categoryVisible(meta.cat, meta.class, symbol_name, m)) return false;
     if (!viewingGroupVisible(meta.vg, m.viewing_groups_off)) return false;
     if (!m.ignore_scamin and !scaminVisible(meta.scamin, zoom)) return false;
@@ -178,7 +178,7 @@ pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64,
         if (!m.show_overscale or m.ignore_scamin) return false;
         if (!osclVisible(meta.oscl, zoom)) return false;
     }
-    // S-52 display-variant passes (mirrors chartstyle.boundaryFilter /
+    // S-52 display-variant passes (mirrors mariner.boundaryFilter /
     // pointStyleFilter): a feature portrayed twice carries bnd 1/0 (symbolized/
     // plain boundary) or pts 0/1 (paper/simplified points); show the common
     // pass (2) + the mariner's active style — otherwise both passes double-draw.
@@ -218,22 +218,22 @@ test "Colors: token -> RGB per palette, unknown -> null" {
     try std.testing.expectEqual(@as(?Rgb, null), c.get(.day, "NOSUCH"));
 }
 
-test "categoryVisible mirrors chartstyle.categoryFilter" {
-    const def = MarinerSettings{}; // base+standard on, other off, no overlays
+test "categoryVisible mirrors mariner.categoryFilter" {
+    const def = Settings{}; // base+standard on, other off, no overlays
     try std.testing.expect(categoryVisible(0, "DEPARE", null, &def));
     try std.testing.expect(categoryVisible(1, "DEPARE", null, &def));
     try std.testing.expect(!categoryVisible(2, "DEPARE", null, &def));
     try std.testing.expect(categoryVisible(null, "DEPARE", null, &def)); // null -> standard
     // M_QUAL: data-quality overlay only.
     try std.testing.expect(!categoryVisible(0, "M_QUAL", null, &def));
-    const dq = MarinerSettings{ .data_quality = true };
+    const dq = Settings{ .data_quality = true };
     try std.testing.expect(categoryVisible(2, "M_QUAL", null, &dq)); // shown regardless of cat
     // ISODGR01 rides its own toggle: off -> cat 0 (base on -> visible);
     // base ALSO off -> hidden; toggle on -> cat 1 (standard).
     try std.testing.expect(categoryVisible(2, "UWTROC", "ISODGR01", &def));
-    const no_base = MarinerSettings{ .display_base = false };
+    const no_base = Settings{ .display_base = false };
     try std.testing.expect(!categoryVisible(2, "UWTROC", "ISODGR01", &no_base));
-    const iso = MarinerSettings{ .display_base = false, .show_isolated_dangers_shallow = true };
+    const iso = Settings{ .display_base = false, .show_isolated_dangers_shallow = true };
     try std.testing.expect(categoryVisible(2, "UWTROC", "ISODGR01", &iso));
 }
 
@@ -267,15 +267,15 @@ test "osclVisible: the X2 hatch never fires at/below 1x, fires past 2x" {
 }
 
 test "visible: the overscale hatch honours show_overscale + the oscl gate" {
-    const m = MarinerSettings{};
+    const m = Settings{};
     // Baked X2 gate denom for a 1:260000 cell (cscl/OVERSCALE_FACTOR = 130000).
     // z_2x ~= log2(279541132/130000) ~= 11.07 — grossly overscale past there.
     const hatch = rs.FeatureMeta{ .cat = 0, .oscl = 130000, .overscale = true };
     try std.testing.expect(!visible(&hatch, null, 10.5, &m)); // < 2x: no hatch
     try std.testing.expect(visible(&hatch, null, 12.0, &m)); // grossly overscale: hatch shows
-    const off = MarinerSettings{ .show_overscale = false };
+    const off = Settings{ .show_overscale = false };
     try std.testing.expect(!visible(&hatch, null, 12.0, &off));
-    const ign = MarinerSettings{ .ignore_scamin = true };
+    const ign = Settings{ .ignore_scamin = true };
     try std.testing.expect(!visible(&hatch, null, 12.0, &ign)); // debug view: no hatch
     // An ordinary fill carrying the oscl TAG (not the hatch) is never oscl-gated.
     const fill = rs.FeatureMeta{ .cat = 0, .oscl = 130000 };
@@ -292,10 +292,10 @@ test "viewingGroupVisible: deny-list, vg 0 always shows" {
 }
 
 test "visible combines gates + honours ignore_scamin" {
-    const m = MarinerSettings{};
+    const m = Settings{};
     const meta = rs.FeatureMeta{ .cat = 1, .vg = 0, .scamin = 30000, .class = "BOYLAT" };
     try std.testing.expect(!visible(&meta, "BOYLAT01", 12.0, &m)); // SCAMIN gates it
     try std.testing.expect(visible(&meta, "BOYLAT01", 14.0, &m));
-    const ig = MarinerSettings{ .ignore_scamin = true };
+    const ig = Settings{ .ignore_scamin = true };
     try std.testing.expect(visible(&meta, "BOYLAT01", 12.0, &ig));
 }

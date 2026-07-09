@@ -78,7 +78,7 @@ test "golden PNG: depth-area fill + coastline stroke through the pixel path" {
     const streams = try portray.portrayCell(a, &cell, "");
 
     var colors = try render.resolve.Colors.init(a, colorprofile_registry.entries[0].bytes);
-    const settings = render.resolve.MarinerSettings{};
+    const settings = render.resolve.Settings{};
     var ps = render.pixel.PixelSurface.init(a, &colors, .day, &settings, @floatFromInt(z), 256, tile.EXTENT);
 
     const cells = [_]scene.CellRef{.{ .cell = &cell, .portrayal = streams, .geo = geo }};

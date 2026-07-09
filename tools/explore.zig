@@ -709,7 +709,7 @@ fn exStreamCell(
     out: *OutBuf,
     first: *bool,
     palette: render.resolve.PaletteId,
-    m: *const render.resolve.MarinerSettings,
+    m: *const render.resolve.Settings,
 ) !void {
     const ca = ca_arena.allocator();
     const portrayal: ?[]const ?[]const u8 = engine.portray.portrayCell(ca, cell, rules) catch null;
@@ -838,7 +838,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     // (chart.renderFeature); the --tui LIVE CELL MAP instead frames the selection
     // over the real chart (chart.renderCellView — see exTuiMap).
     const palette: render.resolve.PaletteId = .day;
-    var m = render.resolve.MarinerSettings{ .display_other = true };
+    var m = render.resolve.Settings{ .display_other = true };
     m.scheme = .day;
 
     // explore inspects one or more source cells. `dir` stays open for the whole run
@@ -994,7 +994,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 // ISOLATED — only this feature's portrayal (chart.renderFeature, only_fi = fi)
 // on a solid background, NOT a map crop of the surrounding scene. Any failure
 // prints a short note instead of an image (graceful degradation), never an error.
-fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, row: ExRow, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
+fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, row: ExRow, palette: render.resolve.PaletteId, m: *const render.resolve.Settings) !void {
     const tv = row.thumb orelse {
         try out.appendSlice(a, "  resolved render: (no renderable geometry)\n");
         return;
@@ -1393,7 +1393,7 @@ fn exLoadCell(
 // + alt-screen scaffolding as `tile57 ascii --tui`; dependency-free. The map is
 // transmit-once-per-view + place, deleted each frame — the same cached-region
 // pattern as the ascii kitty TUI, so it never scrolls the layout.
-fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, source: []const u8) !void {
+fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, palette: render.resolve.PaletteId, m: *const render.resolve.Settings, source: []const u8) !void {
     // The interactive TUI is POSIX-only: std.posix.termios is `void` on Windows,
     // so gate the whole raw-mode body out at comptime (same idiom as common.zig's
     // terminalSize). The non-interactive `explore` paths stay cross-platform.
@@ -1820,7 +1820,7 @@ fn exMapGeom(right_w: usize, left_w: usize, term_rows: usize, text_rows: usize, 
 // cursor) is the SAME escape shape as the console `--kitty` path. The image stays
 // strictly within the body rows (footer clear) so its cursor-advance can't scroll
 // the text away. Any failure clears the image and leaves the text intact.
-fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, view: MapView, highlight: ?chart.Highlight, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, geom: MapGeom) void {
+fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, view: MapView, highlight: ?chart.Highlight, palette: render.resolve.PaletteId, m: *const render.resolve.Settings, geom: MapGeom) void {
     const clear = struct {
         fn f(io_: std.Io, out: std.Io.File, s: *ThumbState) void {
             out.writeStreamingAll(io_, render.kitty.delete_all) catch {};

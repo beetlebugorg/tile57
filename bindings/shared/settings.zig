@@ -1,18 +1,18 @@
-//! settings — parse a mariner-settings JSON blob into `chartstyle.MarinerSettings`.
+//! settings — parse a mariner-settings JSON blob into `mariner.Settings`.
 //!
 //! Shared by the wasm entry point (bindings/wasm/style_wasm.zig) and the native
 //! parity harness (bindings/parity/parity.zig) so the two CANNOT drift: a parity
 //! diff then exercises the identical settings->buildStyle path on both targets.
 //!
-//! Schema: a JSON object whose keys mirror the MarinerSettings field names. Enums
+//! Schema: a JSON object whose keys mirror the Settings field names. Enums
 //! are their string forms ("day"/"dusk"/"night", "meters"/"feet",
 //! "symbolized"/"plain"). Any absent or malformed field keeps its canonical
 //! default, so a partial (or empty, or invalid) blob still yields a usable style.
 
 const std = @import("std");
-const chartstyle = @import("style").chartstyle;
+const mariner = @import("style").mariner;
 
-pub const MarinerSettings = chartstyle.MarinerSettings;
+pub const Settings = mariner.Settings;
 
 fn asF64(v: std.json.Value) ?f64 {
     return switch (v) {
@@ -38,10 +38,10 @@ fn getStr(o: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Parse `json` into MarinerSettings. `a` must outlive the returned settings AND
+/// Parse `json` into Settings. `a` must outlive the returned settings AND
 /// the subsequent buildStyle call (a pinned `date_view` string is duped into it).
-pub fn parse(a: std.mem.Allocator, json: []const u8) MarinerSettings {
-    var m = MarinerSettings{};
+pub fn parse(a: std.mem.Allocator, json: []const u8) Settings {
+    var m = Settings{};
     if (json.len == 0) return m;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}) catch return m;
     if (parsed != .object) return m;
@@ -92,7 +92,7 @@ pub fn parse(a: std.mem.Allocator, json: []const u8) MarinerSettings {
 
 test "parse: empty / invalid -> all defaults" {
     const a = std.testing.allocator;
-    const d = MarinerSettings{};
+    const d = Settings{};
     {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -117,9 +117,9 @@ test "parse: fields + enums + partial override" {
         \\ "safety_contour":12.5,"deep_contour":40,"four_shade_water":false,
         \\ "display_other":true,"date_view":"20240115"}
     );
-    try std.testing.expectEqual(chartstyle.Scheme.night, m.scheme);
-    try std.testing.expectEqual(chartstyle.DepthUnit.feet, m.depth_unit);
-    try std.testing.expectEqual(chartstyle.BoundaryStyle.plain, m.boundary_style);
+    try std.testing.expectEqual(mariner.Scheme.night, m.scheme);
+    try std.testing.expectEqual(mariner.DepthUnit.feet, m.depth_unit);
+    try std.testing.expectEqual(mariner.BoundaryStyle.plain, m.boundary_style);
     try std.testing.expectEqual(@as(f64, 12.5), m.safety_contour);
     try std.testing.expectEqual(@as(f64, 40), m.deep_contour);
     try std.testing.expectEqual(false, m.four_shade_water);

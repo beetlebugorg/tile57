@@ -140,7 +140,7 @@ pub const VectorSurface = struct {
     a: Allocator,
     colors: *const resolve.Colors,
     palette: resolve.PaletteId,
-    settings: *const resolve.MarinerSettings,
+    settings: *const resolve.Settings,
     cb: *const CSurface,
     store: ?sym.SymbolStore = null,
     fnt: ?fontmod.Font = null,
@@ -175,7 +175,7 @@ pub const VectorSurface = struct {
         .size_scale = sizeScale,
     };
 
-    pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.MarinerSettings, cb: *const CSurface) VectorSurface {
+    pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, cb: *const CSurface) VectorSurface {
         return .{
             .a = a,
             .colors = colors,
@@ -334,7 +334,7 @@ pub const VectorSurface = struct {
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, GATE_ZOOM, self.settings)) return;
         // The style path gates INFORM01 information callouts behind
-        // show_inform_callouts (chartstyle.zig); the live Surface path bypasses
+        // show_inform_callouts (mariner.zig); the live Surface path bypasses
         // the style, so mirror that toggle here.
         if (!self.settings.show_inform_callouts and std.mem.eql(u8, name, "INFORM01")) return;
         var eff = name;

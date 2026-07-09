@@ -44,7 +44,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     var size_scale: f64 = 1.0; // physical-size multiplier (S-52 mm -> true mm)
     var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
     // Mariner settings (defaults match the app: other ON for spot soundings).
-    var m = render.resolve.MarinerSettings{ .display_other = true };
+    var m = render.resolve.Settings{ .display_other = true };
     var f = Flags{ .args = args, .i = if (tile_mode) 5 else 2 };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {

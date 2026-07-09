@@ -1,5 +1,5 @@
 //! style_wasm — a tiny `wasm32-freestanding` entry point around the pure-Zig
-//! `chartstyle.buildStyle`, so a browser / Node front-end can turn S-52 "mariner
+//! `the mariner builders`, so a browser / Node front-end can turn S-52 "mariner
 //! settings" into a concrete MapLibre style.json entirely client-side.
 //!
 //! The MapLibre style *template* and the S-52 *colortables* are @embedFile'd at
@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const style = @import("style");
-const chartstyle = @import("style").chartstyle;
+const mariner = @import("style").mariner;
 const settings = @import("settings");
 
 // Base MapLibre style template + S-52 colortables, embedded at build time.

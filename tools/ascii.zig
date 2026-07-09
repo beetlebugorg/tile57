@@ -90,7 +90,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else chart.Chart.openPath(path, rules, false) catch return usageErr("cannot open source");
     defer c.deinit();
 
-    var m = render.resolve.MarinerSettings{ .display_other = true };
+    var m = render.resolve.Settings{ .display_other = true };
     m.scheme = switch (palette) {
         .day => .day,
         .dusk => .dusk,
@@ -121,7 +121,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 // ctrl-c) quits. cbreak-style input (no echo/canonical, OPOST kept so \n still
 // carriage-returns), alternate screen + hidden cursor, terminal re-measured
 // every frame so a resize just repaints.
-fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat0: f64, zoom0: f64, palette: render.resolve.PaletteId, m: *render.resolve.MarinerSettings, ansi: bool, kitty: bool) !void {
+fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat0: f64, zoom0: f64, palette: render.resolve.PaletteId, m: *render.resolve.Settings, ansi: bool, kitty: bool) !void {
     // The interactive TUI is POSIX-only: std.posix.termios is `void` on Windows,
     // so gate the whole raw-mode body out at comptime (same idiom as common.zig's
     // terminalSize). The non-interactive `ascii` render paths stay cross-platform.

@@ -106,7 +106,7 @@ pub const AsciiSurface = struct {
     a: Allocator,
     colors: *const resolve.Colors,
     palette: resolve.PaletteId,
-    settings: *const resolve.MarinerSettings,
+    settings: *const resolve.Settings,
     /// Fractional display zoom the gates evaluate at.
     zoom: f64,
     /// Output size in characters.
@@ -141,7 +141,7 @@ pub const AsciiSurface = struct {
     /// `a` should be a scratch arena, like PixelSurface: buffered ops live
     /// until endScene. `px_per_tile` is the view driver's usual
     /// 256 * 2^(zoom - round(zoom)) — one character column plays one CSS px.
-    pub fn initView(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.MarinerSettings, zoom: f64, cols: u32, rows: u32, px_per_tile: f32, tile_extent: u32) AsciiSurface {
+    pub fn initView(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, zoom: f64, cols: u32, rows: u32, px_per_tile: f32, tile_extent: u32) AsciiSurface {
         return .{
             .a = a,
             .colors = colors,
@@ -577,7 +577,7 @@ test "AsciiSurface: fills shade by token, strokes pick slope chars, glyphs and l
     const a = arena.allocator();
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{};
+    const settings = resolve.Settings{};
     // 32x16 chars = a 32x32 px canvas; tile extent 32 makes tile units = px.
     var as = AsciiSurface.initView(a, &colors, .day, &settings, 14.0, 32, 16, 32, 32);
     const surf = as.asSurface();
@@ -635,7 +635,7 @@ test "labels declutter: highest priority claims the cells, overlap is dropped" {
     const a = arena.allocator();
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{};
+    const settings = resolve.Settings{};
     var as = AsciiSurface.initView(a, &colors, .day, &settings, 14.0, 32, 16, 32, 32);
     const surf = as.asSurface();
 
@@ -667,7 +667,7 @@ test "ANSI mode: tokens quantize to xterm-256, rows reset, plain mode stays esca
     try std.testing.expectEqual(@as(u8, 243), ansi256(.{ .r = 128, .g = 128, .b = 128 }));
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{};
+    const settings = resolve.Settings{};
     var as = AsciiSurface.initView(a, &colors, .day, &settings, 14.0, 8, 4, 8, 8);
     as.ansi = true;
     const surf = as.asSurface();

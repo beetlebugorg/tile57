@@ -44,7 +44,7 @@ const SYMBOL_SCALE: f64 = @import("render").sndfrm.SYMBOL_SCALE;
 // so the generated style can show soundings in feet when the mariner picks that unit —
 // a recreational-chartplotter convenience, not ECDIS behaviour. The feet value runs
 // through the same SNDFRM04 glyph composition as metres, so it keeps one decimal place
-// for shallow soundings (the depth-contour feet label, chartstyle.contourLabelField,
+// for shallow soundings (the depth-contour feet label, mariner.contourLabelField,
 // rounds to whole feet — contour valdco values are whole metres).
 const M_TO_FT: f64 = @import("render").sndfrm.M_TO_FT;
 

@@ -12,14 +12,14 @@
 
 const std = @import("std");
 const Stringify = std.json.Stringify;
-const chartstyle = @import("chartstyle.zig");
+const mariner = @import("mariner.zig");
 
 const FALLBACK = "#ff00ff";
 const FONT = .{"Noto Sans Regular"};
 
 // ---- MapLibre expressions, as comptime tuples ----------------------------
 // SEABED01 depth shading, the danger-symbol swap, and the sounding bold/faint split
-// are mariner-dependent and now resolve through the chartstyle builders (one style
+// are mariner-dependent and now resolve through the mariner builders (one style
 // builder); only the mariner-INDEPENDENT layout exprs remain comptime tuples here.
 
 // The static (no-manifest) SCAMIN/oscl gate is now expressed as K / 2^zoom —
@@ -182,9 +182,9 @@ pub const Options = struct {
     // baked in — the bundle + tile57_style_template path; the client gates live).
     // Non-null = the full style with the mariner's display filters + depth shading /
     // sounding-split / danger-swap baked in (the C-ABI tile57_build_style path).
-    // Colour + layout always resolve through the chartstyle builders (default mariner
-    // when null), so there is ONE style builder — chartstyle.buildStyle is retired.
-    mariner: ?chartstyle.MarinerSettings = null,
+    // Colour + layout always resolve through the mariner builders (default mariner
+    // when null), so there is ONE style builder — the mariner builders is retired.
+    mariner: ?mariner.Settings = null,
     enabled_bands: ?[]const i32 = null, // mariner NOAA-band filter (null = all bands)
     now_unix: i64 = 0, // host wall-clock (epoch s) for the date filter's "today"
     // §2 ?ignoreScamin host debug toggle: when true, disable SCAMIN scale-gating
@@ -213,7 +213,7 @@ pub const Options = struct {
 
 // Precomputed, mariner-aware style expressions shared by every layer of one
 // json call — the single style builder. Colours / depth shading / icon images
-// resolve ONCE through the chartstyle builders (so chartstyle.buildStyle's patch pass
+// resolve ONCE through the mariner builders
 // is retired); `common`/`text_group` are the S-52 display filters, empty/null in
 // template mode (opts.mariner == null) so a template renders without baked gating.
 const SCtx = struct {
@@ -834,28 +834,28 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
     const scamin_buckets: []const Bucket = &.{gate};
 
     // The single style builder: resolve every mariner-aware colour / icon / display
-    // filter ONCE through the chartstyle builders (retiring chartstyle.buildStyle's
+    // filter ONCE through the mariner builders
     // template-patch pass). scheme always comes from opts.scheme (the bundle emits one
     // style per scheme); a null opts.mariner is a TEMPLATE — default mariner for the
     // colour/layout exprs, but NO display filters baked in (the client gates live).
-    const scheme_e: chartstyle.Scheme = if (std.mem.eql(u8, opts.scheme, "night"))
+    const scheme_e: mariner.Scheme = if (std.mem.eql(u8, opts.scheme, "night"))
         .night
     else if (std.mem.eql(u8, opts.scheme, "dusk")) .dusk else .day;
-    var m: chartstyle.MarinerSettings = opts.mariner orelse .{};
+    var m: mariner.Settings = opts.mariner orelse .{};
     m.scheme = scheme_e;
     const filters_on = opts.mariner != null;
-    const b = chartstyle.B{ .a = ba };
+    const b = mariner.B{ .a = ba };
     const s = SCtx{
-        .fill_color = try chartstyle.areasFillColor(b, &palette, &m),
-        .line_color = try chartstyle.lineColor(b, &palette),
-        .text_color = try chartstyle.textColor(b, m.scheme, &palette),
-        .halo = chartstyle.textHaloColor(b, m.scheme),
-        .contour_color = try chartstyle.contourLabelColor(b, m.scheme, &palette),
-        .sound_img = try chartstyle.soundingsIconImage(b, &m),
-        .point_img = try chartstyle.pointSymbolImage(b, &m),
-        .contour_field = try chartstyle.contourLabelField(b, &m),
-        .common = if (filters_on) try chartstyle.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
-        .text_group = if (filters_on) try chartstyle.textGroupFilter(b, &m) else null,
+        .fill_color = try mariner.areasFillColor(b, &palette, &m),
+        .line_color = try mariner.lineColor(b, &palette),
+        .text_color = try mariner.textColor(b, m.scheme, &palette),
+        .halo = mariner.textHaloColor(b, m.scheme),
+        .contour_color = try mariner.contourLabelColor(b, m.scheme, &palette),
+        .sound_img = try mariner.soundingsIconImage(b, &m),
+        .point_img = try mariner.pointSymbolImage(b, &m),
+        .contour_field = try mariner.contourLabelField(b, &m),
+        .common = if (filters_on) try mariner.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
+        .text_group = if (filters_on) try mariner.textGroupFilter(b, &m) else null,
         .size_scale = opts.size_scale,
         // Overscale gate mode follows the SCAMIN gating mode: the filter-gate
         // literal when the live client drives it (same injected DENOM), else the
@@ -1009,7 +1009,7 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
 }
 
 /// Build a full MapLibre style from a base template + mariner settings — the single
-/// builder behind the C-ABI / WASM / parity callers (replaces chartstyle.buildStyle's
+/// builder behind the C-ABI / WASM / parity callers (replaces the mariner builders's
 /// template-patch pass). The passed template carries ONLY the host's source config
 /// (sprite / glyphs / chart tiles+zoom); this lifts that out and regenerates every
 /// layer via json with the mariner baked in. Signature mirrors the retired
@@ -1018,7 +1018,7 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
 pub fn buildFromTemplate(
     alloc: std.mem.Allocator,
     template_json: []const u8,
-    m: *const chartstyle.MarinerSettings,
+    m: *const mariner.Settings,
     colortables_json: []const u8,
     enabled_bands: ?[]const i32,
     now_unix: i64,
@@ -1037,7 +1037,7 @@ pub fn buildFromTemplate(
 pub fn buildFromTemplateScamin(
     alloc: std.mem.Allocator,
     template_json: []const u8,
-    m: *const chartstyle.MarinerSettings,
+    m: *const mariner.Settings,
     colortables_json: []const u8,
     enabled_bands: ?[]const i32,
     now_unix: i64,
@@ -1409,7 +1409,7 @@ test "json: size_scale wraps icon/line/text sizes in a multiplier" {
 }
 
 // ---- single-builder (buildFromTemplate) tests — ported from the retired
-//      chartstyle.buildStyle tests, now exercising the one json path. -------
+//      the mariner builders tests, now exercising the one json path. -------
 const cs_template =
     \\{"version":8,"sources":{"chart":{"type":"vector","url":"pmtiles://x"}},"sprite":"x","glyphs":"x","layers":[]}
 ;
@@ -1419,7 +1419,7 @@ const cs_ct =
 
 test "buildFromTemplate: defaults bake SEABED fill + category/M_QUAL filter (single-pass)" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "DEPMD") != null); // SEABED01 band
@@ -1431,7 +1431,7 @@ test "buildFromTemplate: defaults bake SEABED fill + category/M_QUAL filter (sin
 
 test "buildFromTemplate: night scheme -> neutral ink + dark halo" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{ .scheme = .night };
+    const m = mariner.Settings{ .scheme = .night };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "#aab7bf") != null);
@@ -1440,7 +1440,7 @@ test "buildFromTemplate: night scheme -> neutral ink + dark halo" {
 
 test "buildFromTemplate: feet depth unit -> contour label uses M_TO_FT" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{ .depth_unit = .feet };
+    const m = mariner.Settings{ .depth_unit = .feet };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "3.280839895") != null);
@@ -1461,7 +1461,7 @@ test "buildFromTemplate: feet picks the sounding feet glyph variant; metres does
 
 test "buildFromTemplate: enabled bands add a band filter" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     const bands = [_]i32{ 2, 3 };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, &bands, 1700000000);
     defer a.free(out);
@@ -1470,18 +1470,18 @@ test "buildFromTemplate: enabled bands add a band filter" {
 
 test "buildFromTemplate: date resolution (pinned + today + off)" {
     const a = std.testing.allocator;
-    const m1 = chartstyle.MarinerSettings{ .date_view = "20240115" };
+    const m1 = mariner.Settings{ .date_view = "20240115" };
     const o1 = try buildFromTemplate(a, cs_template, &m1, cs_ct, null, 1700000000);
     defer a.free(o1);
     try std.testing.expect(std.mem.indexOf(u8, o1, "20240115") != null);
     try std.testing.expect(std.mem.indexOf(u8, o1, "0115") != null);
 
-    const m2 = chartstyle.MarinerSettings{};
+    const m2 = mariner.Settings{};
     const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
     defer a.free(o2);
     try std.testing.expect(std.mem.indexOf(u8, o2, "20231114") != null);
 
-    const m3 = chartstyle.MarinerSettings{ .date_dependent = false };
+    const m3 = mariner.Settings{ .date_dependent = false };
     const o3 = try buildFromTemplate(a, cs_template, &m3, cs_ct, null, 1700000000);
     defer a.free(o3);
     try std.testing.expect(std.mem.indexOf(u8, o3, "date_recurring") == null);
@@ -1492,7 +1492,7 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
     // A non-empty off-set hides the listed groups -> the style references the `vg`
     // property and the off ids, negated (deny-list).
     const off = [_]i32{ 26070, 27070 };
-    const m = chartstyle.MarinerSettings{ .viewing_groups_off = &off };
+    const m = mariner.Settings{ .viewing_groups_off = &off };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"vg\"") != null);
@@ -1500,13 +1500,13 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
     // The filter is a deny-list: ["!",["in",...]] so the off groups are EXCLUDED.
     try std.testing.expect(std.mem.indexOf(u8, out, "\"in\"") != null);
     // null off-set -> no vg filter at all.
-    const m2 = chartstyle.MarinerSettings{};
+    const m2 = mariner.Settings{};
     const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
     defer a.free(o2);
     try std.testing.expect(std.mem.indexOf(u8, o2, "\"vg\"") == null);
     // empty off-set -> also no filter (show all).
     const empty = [_]i32{};
-    const m3 = chartstyle.MarinerSettings{ .viewing_groups_off = &empty };
+    const m3 = mariner.Settings{ .viewing_groups_off = &empty };
     const o3 = try buildFromTemplate(a, cs_template, &m3, cs_ct, null, 1700000000);
     defer a.free(o3);
     try std.testing.expect(std.mem.indexOf(u8, o3, "\"vg\"") == null);
@@ -1514,7 +1514,7 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
 
 test "buildFromTemplateScamin: a manifest no longer buckets — the merged zoom-gate rides every layer" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     // No manifest -> the static K/2^zoom SCAMIN zoom-gate, no #sm buckets.
     const plain = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(plain);
@@ -1746,7 +1746,7 @@ test "diff: a differing layer-id set -> rebuild" {
 
 test "diff: same mariner -> [] (no ops)" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     const s1 = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(s1);
     const s2 = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
@@ -1758,8 +1758,8 @@ test "diff: same mariner -> [] (no ops)" {
 
 test "diff: display_other flip emits only setFilter ops" {
     const a = std.testing.allocator;
-    const base = chartstyle.MarinerSettings{};
-    const other = chartstyle.MarinerSettings{ .display_other = true };
+    const base = mariner.Settings{};
+    const other = mariner.Settings{ .display_other = true };
     const s1 = try buildFromTemplate(a, cs_template, &base, cs_ct, null, 1700000000);
     defer a.free(s1);
     const s2 = try buildFromTemplate(a, cs_template, &other, cs_ct, null, 1700000000);
@@ -1774,8 +1774,8 @@ test "diff: display_other flip emits only setFilter ops" {
 
 test "diff: day vs night emits setPaintProperty colour ops, no filter change" {
     const a = std.testing.allocator;
-    const day = chartstyle.MarinerSettings{ .scheme = .day };
-    const night = chartstyle.MarinerSettings{ .scheme = .night };
+    const day = mariner.Settings{ .scheme = .day };
+    const night = mariner.Settings{ .scheme = .night };
     const s1 = try buildFromTemplate(a, cs_template, &day, cs_ct, null, 1700000000);
     defer a.free(s1);
     const s2 = try buildFromTemplate(a, cs_template, &night, cs_ct, null, 1700000000);

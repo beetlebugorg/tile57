@@ -86,7 +86,7 @@ pub const PixelSurface = struct {
     a: Allocator,
     colors: *const resolve.Colors,
     palette: resolve.PaletteId,
-    settings: *const resolve.MarinerSettings,
+    settings: *const resolve.Settings,
     /// Fractional display zoom the gates evaluate at.
     zoom: f64,
     /// Output size in pixels; a tile render is square (w == h == px_per_tile),
@@ -138,13 +138,13 @@ pub const PixelSurface = struct {
     /// `a` should be the same scratch arena the engine allocates geometry
     /// from — buffered ops live until endScene, exactly like the tile
     /// surface's feature lists.
-    pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.MarinerSettings, zoom: f64, size_px: u32, tile_extent: u32) PixelSurface {
+    pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, zoom: f64, size_px: u32, tile_extent: u32) PixelSurface {
         return initView(a, colors, palette, settings, zoom, size_px, size_px, @floatFromInt(size_px), tile_extent);
     }
 
     /// A multi-tile view scene: w x h output px, each source tile occupying
     /// px_per_tile px (fractional zoom = a non-power-of-two px_per_tile).
-    pub fn initView(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.MarinerSettings, zoom: f64, w_px: u32, h_px: u32, px_per_tile: f32, tile_extent: u32) PixelSurface {
+    pub fn initView(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, zoom: f64, w_px: u32, h_px: u32, px_per_tile: f32, tile_extent: u32) PixelSurface {
         return .{
             .a = a,
             .colors = colors,
@@ -257,7 +257,7 @@ pub const PixelSurface = struct {
         try self.push(.line, .{ .stroke = .{ .lines = canvas_lines, .width = w, .dash = d, .color = self.resolveColor(token) } });
         // Depth-contour label: the value in the mariner's unit, placed at the
         // midpoint of the longest segment (v1 horizontal placement; collision
-        // culls the rest). Value formatting mirrors chartstyle.contourLabelField:
+        // culls the rest). Value formatting mirrors mariner.contourLabelField:
         // metres round, feet floor-to-tenth (a depth errs SHALLOW).
         if (valdco) |v| {
             var longest: f32 = 0;
@@ -296,7 +296,7 @@ pub const PixelSurface = struct {
         const store = self.store orelse return;
         // Re-gate with the symbol name: ISODGR01 rides its own toggle.
         if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
-        // Live danger swap (mirrors chartstyle.pointSymbolImage): a danger lying
+        // Live danger swap (mirrors mariner.pointSymbolImage): a danger lying
         // DEEPER than the mariner's safety contour draws the subdued DANGER02.
         var eff = name;
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
@@ -617,7 +617,7 @@ test "PixelSurface: resolves tokens, gates SCAMIN, sorts by draw_prio" {
     const a = arena.allocator();
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{};
+    const settings = resolve.Settings{};
     var ps = PixelSurface.init(a, &colors, .day, &settings, 14.0, 64, 64);
     const surf = ps.asSurface();
 
@@ -662,7 +662,7 @@ test "PixelSurface: unknown token falls back magenta, dashed maps to [4w,3w]" {
     const a = arena.allocator();
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{};
+    const settings = resolve.Settings{};
     var ps = PixelSurface.init(a, &colors, .day, &settings, 14.0, 64, 4096);
     const surf = ps.asSurface();
 
@@ -718,7 +718,7 @@ test "drawSymbol: pivot/scale/rotate transform, even-odd fill, danger swap, soun
     };
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{ .display_other = true };
+    const settings = resolve.Settings{ .display_other = true };
     var ps = PixelSurface.init(a, &colors, .day, &settings, 14.0, 256, 256);
     ps.store = .{ .ptr = &fake, .vtable = &Fake.vt };
     const surf = ps.asSurface();
@@ -764,7 +764,7 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     const a = arena.allocator();
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{};
+    const settings = resolve.Settings{};
     var ps = PixelSurface.init(a, &colors, .day, &settings, 14.0, 256, 256);
     const surf = ps.asSurface();
 
@@ -788,7 +788,7 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     try surf.drawText("Overlap", &style, .{ .x = 102, .y = 101 });
     try surf.endFeature();
     // A light description with the toggle OFF: gated before buffering.
-    const no_lights = resolve.MarinerSettings{ .show_light_descriptions = false };
+    const no_lights = resolve.Settings{ .show_light_descriptions = false };
     var ps2 = PixelSurface.init(a, &colors, .day, &no_lights, 14.0, 256, 256);
     const lstyle = rs.TextStyle{ .color = "CHBLK", .font_size = 11, .halign = "left", .valign = "bottom", .offset_x = 0, .offset_y = 0, .group = 23 };
     try ps2.asSurface().beginFeature(&hi);
@@ -834,7 +834,7 @@ test "drawHighlight: reticle straddles the anchor, bbox adds a dashed box, hi-vi
     };
 
     var colors = try resolve.Colors.init(a, test_profile);
-    const settings = resolve.MarinerSettings{};
+    const settings = resolve.Settings{};
     var ps = PixelSurface.init(a, &colors, .day, &settings, 14.0, 400, 400);
 
     // POINT: reticle only (no dashed box). Both halo + core passes straddle the

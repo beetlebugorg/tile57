@@ -9,7 +9,7 @@
 //!
 //!   * color tables — token -> hex, one per day/dusk/night palette
 //!   * the MapLibre style.json layer set (maplibre.zig)
-//!   * line styles and the S-52 mariner expression builders (chartstyle.zig)
+//!   * line styles and the S-52 mariner expression builders (mariner.zig)
 
 const std = @import("std");
 
@@ -31,10 +31,10 @@ pub const buildFromTemplate = @import("maplibre.zig").buildFromTemplate;
 pub const buildFromTemplateScamin = @import("maplibre.zig").buildFromTemplateScamin;
 pub const diff = @import("maplibre.zig").diff;
 
-/// The S-52 mariner settings model and expression builders (MapLibre style
-/// patching). Every consumer of this module wants both these and the color
-/// tables, so they live together.
-pub const chartstyle = @import("chartstyle.zig");
+/// The S-52 mariner display settings model (`mariner.Settings`) and the builders
+/// that encode those settings as MapLibre expressions. maplibre.zig calls these
+/// for the mariner-driven parts of the style.
+pub const mariner = @import("mariner.zig");
 
 // ---- colortables.json ----------------------------------------------------
 
@@ -544,6 +544,6 @@ test "manifestJson: pins schema_version and couples tiles to portrayal" {
 }
 
 test {
-    _ = chartstyle;
+    _ = mariner;
     _ = @import("maplibre.zig"); // run the style.json builder tests too
 }

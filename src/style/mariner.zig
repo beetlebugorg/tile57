@@ -1,22 +1,18 @@
-//! chartstyle — MapLibre chart-style generation, client-side. A faithful 1:1 Zig
-//! port of the C++ chartstyle/ module (chart_style.cpp + mariner.hpp), which is
-//! itself a port of the Go web client's s52-style.mjs builders.
+//! mariner — the S-52 mariner display settings and the builders that turn those
+//! settings into MapLibre expressions. This is the settings model, not a style
+//! generator: maplibre.zig assembles the full style.json and calls these builders
+//! for the mariner-driven parts.
 //!
-//! It PATCHES the mariner-driven parts of a MapLibre style template rather than
-//! regenerating the whole style: SEABED01 depth shading, the sounding bold/faint
-//! split (SNDFRM04), the danger-symbol safety swap (OBSTRN06/WRECKS05), contour
-//! label units (SAFCON01), the per-scheme recolour (background/fills/lines/text +
-//! halos/contour labels), and the client-side display filters AND-ed onto every
-//! `source:"chart"` layer (category + M_QUAL, band, boundary/point style, INFORM01/
-//! CHDATD01 callout toggles, date validity, meta-bounds, text groups).
+//! The settings drive SEABED01 depth shading, the sounding bold/faint split
+//! (SNDFRM04), the danger-symbol safety swap (OBSTRN06/WRECKS05), contour label
+//! units (SAFCON01), the per-scheme recolour (background/fills/lines/text + halos/
+//! contour labels), and the display filters AND-ed onto every `source:"chart"`
+//! layer (category + M_QUAL, band, boundary/point style, INFORM01/CHDATD01 callout
+//! toggles, date validity, meta-bounds, text groups).
 //!
-//! Pure Zig (no libc): the host reads the template + colortables bytes and passes
-//! them in; the C ABI wrapper lives in capi.zig. std.json.Value uses an
-//! insertion-ordered ObjectMap, so the patched style keeps the template's key
-//! order (the C++/nlohmann build alphabetises keys via std::map — semantically
-//! identical, just a different serialisation). Colour `match` arms ARE emitted in
-//! sorted-token order to mirror nlohmann's palette iteration, so they're byte-equal
-//! to the C++ output. See ../../../chartstyle/src/chart_style.cpp for the oracle.
+//! Pure Zig (no libc): the host passes in the template + colortables bytes; the C
+//! ABI wrapper lives in capi.zig. Colour `match` arms are emitted in sorted-token
+//! order so the output is byte-stable across builds.
 
 const std = @import("std");
 
@@ -27,15 +23,15 @@ const ObjectMap = std.json.ObjectMap;
 const M_TO_FT: f64 = 3.280839895;
 const FALLBACK = "#ff00ff";
 
-// ---- public model (mirrors chartstyle/include/chartstyle/mariner.hpp) -------
+// ---- public model --------------------------------------------------------
 
 pub const Scheme = enum(c_int) { day = 0, dusk = 1, night = 2 };
 pub const DepthUnit = enum(c_int) { meters = 0, feet = 1 };
 pub const BoundaryStyle = enum(c_int) { symbolized = 0, plain = 1 }; // S-52 §8.6.1
 
-/// The S-52 mariner display options. Defaults match mariner.hpp (the Go web
-/// client's defaults).
-pub const MarinerSettings = struct {
+/// The S-52 mariner display options. Defaults match the recreational web
+/// client's defaults.
+pub const Settings = struct {
     // -- colour scheme (S-52 day/dusk/night palette) --
     scheme: Scheme = .day,
 
@@ -239,7 +235,7 @@ pub fn contourLabelColor(b: B, scheme: Scheme, palette: *const ObjectMap) !Value
 
 // DRVAL1/DRVAL2 vs the mariner's contours -> a depth colour token. Deepest band
 // first (first match in a `case` wins). `>= X && > X` on both bounds per spec.
-pub fn seabedTokenExpr(b: B, m: *const MarinerSettings) !Value {
+pub fn seabedTokenExpr(b: B, m: *const Settings) !Value {
     const d1 = try b.coalesce(try b.get("drval1"), b.int(-1));
     const d2 = try b.coalesce(try b.get("drval2"), b.int(0));
     const band = struct {
@@ -275,7 +271,7 @@ pub fn seabedTokenExpr(b: B, m: *const MarinerSettings) !Value {
 
 // Fill colour for the `areas` layer: depth areas (carry drval1) shade live via
 // SEABED01; everything else uses its baked colour token.
-pub fn areasFillColor(b: B, palette: *const ObjectMap, m: *const MarinerSettings) !Value {
+pub fn areasFillColor(b: B, palette: *const ObjectMap, m: *const Settings) !Value {
     return b.arr(&.{
         b.s("case"),
         try b.arr(&.{ b.s("has"), b.s("drval1") }),
@@ -291,7 +287,7 @@ pub fn areasFillColor(b: B, palette: *const ObjectMap, m: *const MarinerSettings
 // metres); when the mariner selects feet, the displayed digits come from the baked
 // whole-feet glyph variant (sym_s_ft/sym_g_ft) instead — a recreational unit option,
 // not ECDIS (see scene.appendSoundingProps), mirroring contourLabelField.
-pub fn soundingsIconImage(b: B, m: *const MarinerSettings) !Value {
+pub fn soundingsIconImage(b: B, m: *const Settings) !Value {
     const ss = if (m.depth_unit == .feet) "sym_s_ft" else "sym_s";
     const sg = if (m.depth_unit == .feet) "sym_g_ft" else "sym_g";
     const depthLE = try b.arr(&.{ b.s("<="), try b.coalesce(try b.get("depth"), b.int(0)), try b.flt(m.safety_depth) });
@@ -305,7 +301,7 @@ pub fn soundingsIconImage(b: B, m: *const MarinerSettings) !Value {
 
 // OBSTRN06/WRECKS05: a danger symbol deeper than the live safety contour swaps to
 // the less-prominent DANGER02 (sym_deep). pivot_center draws the "ctr:" variant.
-pub fn pointSymbolImage(b: B, m: *const MarinerSettings) !Value {
+pub fn pointSymbolImage(b: B, m: *const Settings) !Value {
     const name = try b.arr(&.{
         b.s("case"),
         try b.arr(&.{
@@ -329,7 +325,7 @@ pub fn pointSymbolImage(b: B, m: *const MarinerSettings) !Value {
 // up. A 2 m contour reads "6" ft (6.56 truncated), not "6.5" or "7": a depth always
 // errs shallow (toward the surface), the safe direction, matching SNDFRM04's whole-feet
 // truncation.
-pub fn contourLabelField(b: B, m: *const MarinerSettings) !Value {
+pub fn contourLabelField(b: B, m: *const Settings) !Value {
     const v = if (m.depth_unit == .feet)
         try b.arr(&.{ b.s("floor"), try b.arr(&.{ b.s("*"), try b.get("valdco"), try b.flt(M_TO_FT) }) })
     else
@@ -345,7 +341,7 @@ pub fn contourLabelField(b: B, m: *const MarinerSettings) !Value {
 // ---- client-side display filters -------------------------------------------
 
 // Display category (S-52 §10.3.4) + M_QUAL data-quality overlay.
-pub fn categoryFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn categoryFilter(b: B, m: *const Settings) !Value {
     var en = Array.init(b.a);
     if (m.display_base) try en.append(b.int(0));
     if (m.display_standard) try en.append(b.int(1));
@@ -372,7 +368,7 @@ pub fn bandFilter(b: B, enabled: []const i32) !Value {
 }
 
 // Boundary symbolization (S-52 §8.6.1): show common (2) + the active style.
-pub fn boundaryFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn boundaryFilter(b: B, m: *const Settings) !Value {
     const rank: i64 = if (m.boundary_style == .plain) 0 else 1;
     return b.arr(&.{
         b.s("in"),
@@ -382,7 +378,7 @@ pub fn boundaryFilter(b: B, m: *const MarinerSettings) !Value {
 }
 
 // Point-symbol style (S-52 §11.2.2): show common (2) + the active style.
-pub fn pointStyleFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn pointStyleFilter(b: B, m: *const Settings) !Value {
     const rank: i64 = if (m.simplified_points) 1 else 0;
     return b.arr(&.{
         b.s("in"),
@@ -392,7 +388,7 @@ pub fn pointStyleFilter(b: B, m: *const MarinerSettings) !Value {
 }
 
 // S-52 §14.5 text-group selection. Important text (11) is always on.
-pub fn textGroupFilter(b: B, m: *const MarinerSettings) !Value {
+pub fn textGroupFilter(b: B, m: *const Settings) !Value {
     const g = try b.coalesce(try b.get("tgrp"), b.int(-1));
     const namedSet = struct {
         fn make(bb: B) !Value {
@@ -422,7 +418,7 @@ pub fn textGroupFilter(b: B, m: *const MarinerSettings) !Value {
 // (unbanded — always shown) OR its `vg` is NOT in the off-set, so any group the
 // host didn't list stays visible. Byte-identical to the host's s52-style.mjs
 // expression, so whichever backend builds the style produces the same filter.
-pub fn viewingGroupFilter(b: B, m: *const MarinerSettings) !?Value {
+pub fn viewingGroupFilter(b: B, m: *const Settings) !?Value {
     const off = m.viewing_groups_off orelse return null;
     if (off.len == 0) return null;
     var en = Array.init(b.a);
@@ -485,7 +481,7 @@ pub fn dateFilter(b: B, today_str: []const u8) !Value {
 
 // The viewing date "YYYYMMDD": the mariner's pinned date if set, else `now_unix`
 // (Unix epoch seconds, supplied by the host) rendered as a UTC calendar date.
-pub fn viewingDate(b: B, m: *const MarinerSettings, now_unix: i64) ![]const u8 {
+pub fn viewingDate(b: B, m: *const Settings, now_unix: i64) ![]const u8 {
     if (m.date_view.len == 8) {
         var digits = true;
         for (m.date_view) |c| digits = digits and (c >= '0' and c <= '9');
@@ -507,7 +503,7 @@ pub fn viewingDate(b: B, m: *const MarinerSettings, now_unix: i64) ![]const u8 {
 // so it is NOT included here. Used by the single-pass style builder (style.zig) to
 // compose each layer's filter inline — the consolidation that retired buildStyle's
 // template-patch pass. Allocated in `a` (caller's arena).
-pub fn commonChartFilters(a: std.mem.Allocator, m: *const MarinerSettings, enabled_bands: ?[]const i32, now_unix: i64) ![]Value {
+pub fn commonChartFilters(a: std.mem.Allocator, m: *const Settings, enabled_bands: ?[]const i32, now_unix: i64) ![]Value {
     const b = B{ .a = a };
     var clauses = Array.init(a);
     try clauses.append(try categoryFilter(b, m));
