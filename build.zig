@@ -378,6 +378,8 @@ pub fn build(b: *std.Build) void {
     addPkgs(tile57_mod, &pure_pkgs);
     tile57_mod.addImport("portray", portray_mod);
     tile57_mod.addImport("sprite", sprite_mod); // sprite/pattern atlas generation
+    tile57_mod.addImport("coverage", coverage_mod); // per-cell coverage sidecar
+    tile57_mod.addImport("compose", compose_mod); // the runtime compositor
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -394,6 +396,7 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("sprite", sprite_mod); // C ABI: sprite/pattern atlas generation
     lib_mod.addImport("bundle", bundle_mod); // C ABI: portrayal-asset emitters + debug bake
     lib_mod.addImport("compose", compose_mod); // C ABI: tile57_compose_* (the runtime compositor)
+    lib_mod.addImport("coverage", coverage_mod); // the tile57 public root re-exports it
     // The full engine surface as a NAMED import (not a root.zig file-import), so the
     // single root.zig file isn't claimed by both lib_mod and engine_full (which bundle
     // pulls in) — Zig requires each file to belong to exactly one module per artifact.
