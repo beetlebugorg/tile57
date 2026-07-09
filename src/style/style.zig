@@ -406,53 +406,6 @@ pub fn linestylesJson(alloc: std.mem.Allocator, srcs: []const LineStyleSrc) ![]u
     return out.toOwnedSlice(alloc);
 }
 
-// ---- manifest.json -------------------------------------------------------
-
-/// Inputs for the bundle manifest. Relative paths only (the bundle is
-/// relocatable). bbox is [west, south, east, north]; anchor is [lon, lat].
-pub const Manifest = struct {
-    generator: []const u8,
-    created: []const u8 = "", // ISO 8601; Zig has no wall clock, so passed in
-    catalogue_version: []const u8 = "",
-    tiles_rel: []const u8,
-    colortables_rel: []const u8,
-    minzoom: u8,
-    maxzoom: u8,
-    bbox: [4]f64,
-    anchor: [2]f64,
-    cells: []const []const u8,
-    styles: ?Styles = null, // per-palette style.json paths, if emitted
-
-    pub const Styles = struct { day: []const u8, dusk: []const u8, night: []const u8 };
-};
-
-/// Emit the bundle manifest.json. Loaded first by a renderer, which refuses a
-/// bundle whose schema_version it doesn't speak — turning tile/style coupling
-/// into a checked invariant. Returns allocator-owned bytes.
-pub fn manifestJson(alloc: std.mem.Allocator, m: Manifest) ![]u8 {
-    // The manifest is plain data: describe it as a value and let std.json emit it.
-    // indent_2 keeps it human-readable; emit_null_optional_fields drops "styles"
-    // (the one optional) when absent.
-    return std.json.Stringify.valueAlloc(alloc, .{
-        .bundle_version = 1,
-        .schema_version = SCHEMA_VERSION,
-        .generator = m.generator,
-        .created = m.created,
-        .catalogue_version = m.catalogue_version,
-        .data = .{
-            .tiles = m.tiles_rel,
-            .minzoom = m.minzoom,
-            .maxzoom = m.maxzoom,
-            .bbox = m.bbox,
-            .anchor = m.anchor,
-            .cells = m.cells,
-        },
-        .portrayal = .{
-            .colortables = m.colortables_rel,
-            .styles = m.styles,
-        },
-    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
-}
 
 // ---- tests ---------------------------------------------------------------
 
@@ -513,34 +466,6 @@ test "linestylesJson: dash pattern + placed symbols, sorted ids, skips no-interv
         "  \"ACHARE51\": { \"period_px\": 122.080, \"dash\": [0.000, 7.559, 22.677, 38.552, 22.677, 7.559, 22.677, 0.378], \"color_token\": \"CHMGD\", \"width_px\": 1.209, \"symbols\": [{ \"o\": 18.898, \"n\": \"EMAREMG1\", \"r\": 0.000 }] }\n" ++
         "}\n";
     try std.testing.expectEqualStrings(expected, out);
-}
-
-test "manifestJson: pins schema_version and couples tiles to portrayal" {
-    const out = try manifestJson(std.testing.allocator, .{
-        .generator = "tile57 0.1.0",
-        .created = "2026-06-27T00:00:00Z",
-        .catalogue_version = "S-101 PC 1.4.0",
-        .tiles_rel = "tiles/chart.pmtiles",
-        .colortables_rel = "assets/colortables.json",
-        .minzoom = 8,
-        .maxzoom = 16,
-        .bbox = .{ -76.55, 38.90, -76.40, 39.02 },
-        .anchor = .{ -76.475, 38.96 },
-        .cells = &.{ "US5MD1MC", "US4MD81M" },
-    });
-    defer std.testing.allocator.free(out);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
-    defer parsed.deinit();
-    const o = parsed.value.object;
-    try std.testing.expectEqualStrings("tile57/2", o.get("schema_version").?.string);
-    const data = o.get("data").?.object;
-    try std.testing.expectEqualStrings("tiles/chart.pmtiles", data.get("tiles").?.string);
-    try std.testing.expectEqual(@as(usize, 2), data.get("cells").?.array.items.len);
-    try std.testing.expectEqualStrings("US5MD1MC", data.get("cells").?.array.items[0].string);
-    const portrayal = o.get("portrayal").?.object;
-    try std.testing.expectEqualStrings("assets/colortables.json", portrayal.get("colortables").?.string);
-    // "styles" is omitted when not provided (emit_null_optional_fields = false)
-    try std.testing.expect(portrayal.get("styles") == null);
 }
 
 test {

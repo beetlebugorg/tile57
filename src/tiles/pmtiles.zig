@@ -367,7 +367,8 @@ fn findEntry(dir: []const Entry, tid: u64) ?usize {
 
 // ---- writer -------------------------------------------------------------
 
-pub const InputTile = struct { z: u8, x: u32, y: u32, mvt: []const u8 };
+// A whole-tile input for the batch `write` below (test-only; the live path is StreamWriter).
+const InputTile = struct { z: u8, x: u32, y: u32, mvt: []const u8 };
 
 pub const WriteOptions = struct {
     metadata_json: []const u8 = "{}",
@@ -546,8 +547,10 @@ pub const StreamWriter = struct {
     }
 };
 
-/// Build a PMTiles archive from MVT tiles (gzipped + deduped). Caller owns it.
-pub fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8 {
+// Build a PMTiles archive from a whole set of MVT tiles in one call (gzipped +
+// deduped). The live baker streams via StreamWriter instead; this stays as a
+// self-contained round-trip fixture for the reader tests below.
+fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();

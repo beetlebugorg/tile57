@@ -345,29 +345,6 @@ pub const CellPortrayal = struct {
     simplified: ?[]const ?[]const u8 = null,
 };
 
-/// Portray only the features whose index is set in `mask` (indexed by
-/// cell.features index): the default pass plus the SimplifiedSymbols variant
-/// over the masked POINT features. Used by the scamin-standalone bake pre-pass
-/// to portray just the deduped cross-cell winners — a small fraction of the
-/// cell — without paying for a whole-cell portrayal twice. The whole cell is
-/// still ADAPTED first (cheap, pure Zig) so cross-feature context (topmark
-/// platforms etc.) matches the full-cell pass exactly; only the rule
-/// evaluation is subset. Returned arrays are indexed by cell.features index.
-pub fn portrayCellSubset(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8, mask: []const bool) !CellPortrayal {
-    const adapted = try adapter.adaptCell(arena, cell);
-    var subset = std.ArrayList(adapter.Adapted).empty;
-    var points = std.ArrayList(adapter.Adapted).empty;
-    for (adapted) |ad| {
-        if (ad.feature_index >= mask.len or !mask[ad.feature_index]) continue;
-        try subset.append(arena, ad);
-        if (std.mem.eql(u8, ad.primitive, "Point")) try points.append(arena, ad);
-    }
-    var cp = CellPortrayal{ .base = try runAdapted(arena, cell, subset.items, rules_dir, .{}) };
-    if (points.items.len > 0)
-        cp.simplified = runAdapted(arena, cell, points.items, rules_dir, .{ .simplified_symbols = true }) catch null;
-    return cp;
-}
-
 /// Portray a cell three ways so the client can toggle boundary style (areas) and
 /// point-symbol style (points) live: the default pass, a PlainBoundaries pass over
 /// only the area features, and a SimplifiedSymbols pass over only the point

@@ -460,10 +460,3 @@ fn readMetaJson(a: std.mem.Allocator, r: *pmtiles.Reader) ?[]const u8 {
         else => null,
     };
 }
-
-// The "scamin" ladder from an archive's metadata JSON, or empty if absent/unparseable.
-fn parseScamin(a: std.mem.Allocator, meta: []const u8) []const u32 {
-    const Dto = struct { scamin: []const u32 = &.{} };
-    const v = std.json.parseFromSliceLeaky(Dto, a, meta, .{ .ignore_unknown_fields = true }) catch return &.{};
-    return v.scamin;
-}

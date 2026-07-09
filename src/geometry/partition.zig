@@ -66,12 +66,6 @@ pub const Partition = struct {
         return null;
     }
 
-    /// Faces owned at band index `i` (0 = finest band) — for the renderer/compositor
-    /// to iterate every owner at a band.
-    pub fn facesForBand(self: *const Partition, i: usize) []const plane.OwnedCell {
-        return self.maps[i].faces;
-    }
-
     /// The cell index that owns (x,y) at zoom `z`, or null — a true gap in this
     /// band's map (the ground is owned by a coarser band). Coordinates are integers
     /// (degrees × 10⁷). On-border results are even-odd-ambiguous; sample off edges.
