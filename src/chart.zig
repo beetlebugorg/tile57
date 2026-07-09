@@ -781,12 +781,28 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
         const rel_noext = entry.path[0 .. entry.path.len - ".000".len];
         const out_rel = std.fmt.allocPrint(a, "{s}.pmtiles", .{rel_noext}) catch continue;
         const out_path = std.fs.path.join(a, &.{ out_dir, out_rel }) catch continue;
+        // Incremental: skip a cell whose mirrored archive already exists and is at least as new as
+        // its source .000 — so re-baking a provider (e.g. after adding a district) only bakes what
+        // changed. A re-downloaded cell rewrites the .000 → its mtime advances → we re-bake it.
+        if (fileModNs(io, out_path)) |out_ns| {
+            if (fileModNs(io, in_path)) |in_ns| {
+                if (out_ns >= in_ns) continue;
+            }
+        }
         if (std.fs.path.dirname(out_path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
         in_paths.append(a, in_path) catch continue;
         out_paths.append(a, out_path) catch continue;
     }
     if (in_paths.items.len == 0) return 0;
     return bakeCellsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx);
+}
+
+/// The file's modification time in nanoseconds, or null if it doesn't exist / can't be statted.
+fn fileModNs(io: std.Io, path: []const u8) ?i96 {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    const st = f.stat(io) catch return null;
+    return st.mtime.nanoseconds;
 }
 
 /// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null
