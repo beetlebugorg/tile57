@@ -4,7 +4,7 @@
 //! two stay in sync.
 //!
 //! Pure Zig (no libc/fs): callers read the catalogue bytes and pass them in, the
-//! same shape as s100/catalogue.zig. RGB lives only in the color tables; the
+//! same shape as s101/catalogue.zig. RGB lives only in the color tables; the
 //! tiles carry color *tokens*.
 //!
 //!   * color tables — token -> hex, one per day/dusk/night palette

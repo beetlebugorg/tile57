@@ -6,7 +6,7 @@
 //! can serialize them for clients that re-style without re-baking; pixel
 //! surfaces resolve them through a shared lowering layer.
 //!
-//! Rule: surfaces must NOT import s57, s100, or portray. If a surface needs a
+//! Rule: surfaces must NOT import s57, s101, or portray. If a surface needs a
 //! fact the calls don't carry, that's an engine bug — extend the contract.
 //!
 //! Mirrors the original Go RenderSurface interface (internal/s52render).
@@ -74,7 +74,7 @@ pub const TextStyle = struct {
 
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
 /// beginFeature / endFeature. All pick data is pre-computed by the engine so
-/// surfaces need not import s57/s100.
+/// surfaces need not import s57/s101.
 pub const FeatureMeta = struct {
     draw_prio: i64 = 0,
     plane: i64 = 0, // S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar

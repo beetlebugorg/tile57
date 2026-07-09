@@ -16,7 +16,7 @@
 //! Buffering exists for the same reason as pixel.zig: the engine emits
 //! features in CELL order, but a grid must be WRITTEN in S-52 priority order.
 //!
-//! Rule (surface.zig): no s57/s100/portray imports — everything a character
+//! Rule (surface.zig): no s57/s101/portray imports — everything a character
 //! needs is already on the call.
 
 const std = @import("std");

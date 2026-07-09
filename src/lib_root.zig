@@ -13,7 +13,7 @@ pub const engine = @import("engine");
 pub const api = @import("tile57.zig"); // the public Zig API (Chart/bake/style)
 pub const capi = @import("capi.zig");
 pub const portray = @import("portray");
-pub const catalogue = @import("s100").catalogue;
+pub const catalogue = @import("s101").catalogue;
 pub const bundle = @import("bundle"); // the chart-bundle pipeline (tile57_bake_bundle rides on capi)
 
 comptime {

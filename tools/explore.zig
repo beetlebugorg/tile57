@@ -95,7 +95,7 @@ const ExRow = struct {
     s101: []const u8, // S-101 feature-class name ("Light") or ""
     attrs: []const ExAttr,
     raw: ?[]const u8, // level 2: raw instruction stream
-    parsed: ?engine.s101_instr.Portrayal, // level 2: parsed
+    parsed: ?engine.s101_instructions.Portrayal, // level 2: parsed
     resolved: ?ExLevel3, // level 3
     thumb: ?ExThumb, // --kitty: where to render this feature's thumbnail (null = no geometry)
 };
@@ -422,7 +422,7 @@ fn exBuildRow(a: std.mem.Allocator, cell: *engine.s57.Cell, cell_name: []const u
     }
 
     const raw: ?[]const u8 = if (portrayal) |p| (if (fi < p.len) p[fi] else null) else null;
-    const parsed: ?engine.s101_instr.Portrayal = if (raw) |s| (engine.s101_instr.parse(a, s) catch null) else null;
+    const parsed: ?engine.s101_instructions.Portrayal = if (raw) |s| (engine.s101_instructions.parse(a, s) catch null) else null;
 
     const resolved: ?ExLevel3 = if (ctx) |c| try exFoldResolved(a, f, class, c) else null;
     const thumb: ?ExThumb = if (F.kitty) exThumbView(a, cell, f) else null;

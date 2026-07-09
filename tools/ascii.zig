@@ -274,7 +274,7 @@ fn runAsciiTui(io: std.Io, a: std.mem.Allocator, c: *chart.Chart, lon0: f64, lat
 //   2. S-101 portrayal — the ';'-separated Key:Value instruction stream the Lua
 //                       rules emit (portray.portrayCell), RAW and PARSED into
 //                       symbols / lines / fills / texts / aug figures
-//                       (s101_instr.parse).
+//                       (s101.instructions.parse).
 //   3. Resolved calls — what the portrayal BECOMES after geometry resolution:
 //                       the Surface vtable calls, captured by the recording
 //                       InspectSurface (render/inspect.zig) driven through

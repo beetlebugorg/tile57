@@ -29,9 +29,9 @@ pub const compose = @import("compose.zig"); // per-cell-composite clip-to-owned-
 
 /// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile.
 pub const TileFormat = enum { mvt, mlt };
-const s101 = @import("s100").s101_instr;
-const catalogue = @import("s100").catalogue;
-const s101_adapt = @import("s100").s101_adapt;
+const instructions = @import("s101").instructions;
+const catalogue = @import("s101").catalogue;
+const adapter = @import("s101").adapter;
 
 // S-52 symbol scale the Go baker emits for every point symbol / sounding. The
 // style's icon-size = scale / ATLAS_PPU (0.08), so this renders symbols at
@@ -220,7 +220,7 @@ fn quaposSolidClass(objl: u16) bool {
 }
 
 /// True if the S-57 comma-separated list value `csv` contains any of `targets`.
-/// (Mirrors s101_adapt.hasListVal; S-57 list attributes are comma-joined.)
+/// (Mirrors adapter.hasListVal; S-57 list attributes are comma-joined.)
 fn listHasAny(csv: []const u8, targets: []const i64) bool {
     var it = std.mem.splitScalar(u8, csv, ',');
     while (it.next()) |p| {
@@ -1505,11 +1505,11 @@ fn variantDiffers(base: []const u8, variant: ?[]const u8) bool {
 /// processFeatureParsed, splitting into two passes only when a variant differs
 /// (S-52 boundary §8.6.1 / point-symbol §11.2.2 axes -> the bnd/pts tags).
 fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
-    const base = try s101.parse(a, instr);
+    const base = try instructions.parse(a, instr);
     if (f.prim == 1) {
         if (variantDiffers(instr, simplified)) {
             try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 0, z, x, y, tb, box, opts, surf);
-            const sp2 = try s101.parse(a, simplified.?);
+            const sp2 = try instructions.parse(a, simplified.?);
             try processFeatureParsed(a, cell, f, fi, geo, geo_world, sp2, 2, 1, z, x, y, tb, box, opts, surf);
         } else {
             try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, opts, surf);
@@ -1518,7 +1518,7 @@ fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, 
     }
     if (f.prim == 3 and variantDiffers(instr, plain)) {
         try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 1, 2, z, x, y, tb, box, opts, surf);
-        const pl = try s101.parse(a, plain.?);
+        const pl = try instructions.parse(a, plain.?);
         try processFeatureParsed(a, cell, f, fi, geo, geo_world, pl, 0, 2, z, x, y, tb, box, opts, surf);
         return;
     }
@@ -1551,10 +1551,10 @@ fn bearingToScreen(deg: f64) [2]f64 {
 /// (bake_enc.bandZooms(.approach).min = 11). Partial sector arcs are unaffected.
 const RING_MIN_ZOOM: u8 = 11;
 
-fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, box: tile.Box, surf: rs.Surface) !void {
+fn emitAugFigures(a: Allocator, figs: []const instructions.AugFigure, anchor: s57.LonLat, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, box: tile.Box, surf: rs.Surface) !void {
     if (figs.len == 0) return;
     const world_px = 256.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
-    const pxmm = s101.PX_PER_MM;
+    const pxmm = instructions.PX_PER_MM;
     for (figs) |fig| {
         const alon = if (fig.has_anchor) fig.anchor_lon else anchor.lon();
         const alat = if (fig.has_anchor) fig.anchor_lat else anchor.lat();
@@ -1630,7 +1630,7 @@ fn appendDepthVals(a: Allocator, props: *std.ArrayList(mvt.Prop), f: s57.Feature
 /// every primitive with the pass's meta (draw_prio/cat/vg/scamin/bnd/pts + pick
 /// attrs). The engine work happens here — geometry assembly, projection, tile
 /// clipping/simplification, anchoring — so surfaces only ever see draw calls.
-fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: instructions.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const scamin = effScamin(f, opts);
     const s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "";
     const cell_name = if (opts.pick_attrs) cell.name else "";
@@ -2062,7 +2062,7 @@ fn syminsFormatSubstitute(a: Allocator, f: s57.Feature, format: []const u8, name
 /// Parse a SYMINS TX()/TE() instruction into a Text. The Text model carries the
 /// label string, colour and viewing group; the S-52 justification / offset / font /
 /// halo fields are dropped (tracked OpText findings), matching the current text path.
-fn syminsText(a: Allocator, f: s57.Feature, op: []const u8, params: []const u8) !?s101.Text {
+fn syminsText(a: Allocator, f: s57.Feature, op: []const u8, params: []const u8) !?instructions.Text {
     const args = try syminsSplitArgs(a, params);
     var text: []const u8 = "";
     var color_idx: usize = undefined;
@@ -2093,20 +2093,20 @@ fn syminsText(a: Allocator, f: s57.Feature, op: []const u8, params: []const u8) 
     var color = std.mem.trim(u8, syminsArgAt(args, color_idx), " \t");
     if (color.len == 0) color = "CHBLK";
     const group = std.fmt.parseInt(i64, std.mem.trim(u8, syminsArgAt(args, display_idx), " \t"), 10) catch 0;
-    return s101.Text{ .text = text, .color = color, .group = group };
+    return instructions.Text{ .text = text, .color = color, .group = group };
 }
 
 /// Build an S-101 Portrayal from a NEWOBJ's SYMINS attribute, or null when there is
 /// no usable SYMINS (caller then falls back to the default new-object symbology).
 /// Geometry/anchoring/clipping is handled by processFeatureParsed exactly like a rule stream.
-fn buildSyminsPortrayal(a: Allocator, f: s57.Feature) !?s101.Portrayal {
+fn buildSyminsPortrayal(a: Allocator, f: s57.Feature) !?instructions.Portrayal {
     const raw0 = f.attr(SYMINS_ATTR) orelse return null;
     const raw = std.mem.trim(u8, raw0, " ");
     if (raw.len == 0) return null;
 
-    var points = std.ArrayList(s101.Point).empty;
-    var texts = std.ArrayList(s101.Text).empty;
-    var lines = std.ArrayList(s101.Line).empty;
+    var points = std.ArrayList(instructions.Point).empty;
+    var texts = std.ArrayList(instructions.Text).empty;
+    var lines = std.ArrayList(instructions.Line).empty;
     var patterns = std.ArrayList([]const u8).empty;
     var fill_token: ?[]const u8 = null;
 
@@ -2146,7 +2146,7 @@ fn buildSyminsPortrayal(a: Allocator, f: s57.Feature) !?s101.Portrayal {
     }
     if (points.items.len == 0 and texts.items.len == 0 and lines.items.len == 0 and
         patterns.items.len == 0 and fill_token == null) return null;
-    return s101.Portrayal{
+    return instructions.Portrayal{
         .fill_token = fill_token,
         .patterns = patterns.items,
         .lines = lines.items,
@@ -2415,7 +2415,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// limit: stroke each ring with the MARSYS51 complex linestyle — the dashed "—A——B—"
 /// pattern carrying the EMMARS01 (IALA-A) and EMMARS02 (IALA-B) letter symbols — or
 /// NAVARE51 when ORIENT marks a direction of buoyage. The S-101 catalogue routes
-/// M_NSYS to nothing (s101_adapt excludes it so this rule owns it), so without this
+/// M_NSYS to nothing (the S-101 adapter excludes it so this rule owns it), so without this
 /// the boundary draws nothing. DrawingPriority 12. NOTE: the ORIENT-only DIRBOY
 /// direction-of-buoyage arrow (DIRBOY01/A1/B1, CentreOnArea) is not yet ported —
 /// absent on the reference data; the A/B boundary line is the visible feature.
@@ -2909,7 +2909,7 @@ fn appendCellFeatures(
             try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, fopts, surf);
             continue;
         }
-        if (f.objl != s57.OBJL_TOPMAR and s101_adapt.resolveClass(f) == null) {
+        if (f.objl != s57.OBJL_TOPMAR and adapter.resolveClass(f) == null) {
             if (!fopts.suppress_points) try emitCentredSymbol(a, cell.*, f, fi, geo, "QUESMRK1", 6, 1, z, x, y, tb, fopts, surf);
             continue;
         }

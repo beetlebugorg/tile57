@@ -162,8 +162,8 @@ pub fn build(b: *std.Build) void {
     // libc/Lua) and target-agnostic: they omit target/optimize so the same module
     // objects compile under both the glibc test/lib build and the static-musl
     // baker build, inheriting each consumer's target.
-    // DAG: iso8211 <- s57 <- s100; tiles (leaf) <- render <- scene.
-    // The embedded catalogue JSON rides on s100 (catalogue.zig @embedFile's it).
+    // DAG: iso8211 <- s57 <- s101; tiles (leaf) <- render <- scene.
+    // The embedded catalogue JSON rides on s101 (catalogue.zig @embedFile's it).
     //
     // ISO/IEC 8211 container reader (src/iso8211/): the bottom layer, a pure
     // std-only leaf. Its own module so a consumer can decode 8211 records
@@ -175,11 +175,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/s57/s57.zig"),
         .imports = &.{.{ .name = "iso8211", .module = iso8211_mod }},
     });
-    const s100_mod = b.addModule("s100", .{
-        .root_source_file = b.path("src/s100/s100.zig"),
+    const s101_mod = b.addModule("s101", .{
+        .root_source_file = b.path("src/s101/s101.zig"),
         .imports = &.{.{ .name = "s57", .module = s57_mod }},
     });
-    addCatalogueJson(b, s100_mod);
+    addCatalogueJson(b, s101_mod);
 
     // Tile encoding + addressing (src/tiles/): MVT + MLT encoders, gzip, the
     // PMTiles container, and web-mercator tile math. One pure leaf module
@@ -192,7 +192,7 @@ pub fn build(b: *std.Build) void {
     // surface, the resolver (colors at palette, display gates), and the pixel
     // machinery (Canvas primitive seam, RasterCanvas, PNG encoder, PixelSurface).
     // One pure module; imports tiles (TilePoint alias) + style (settings model)
-    // only — never s57/s100/portray. NOTE: declared before style_mod exists,
+    // only — never s57/s101/portray. NOTE: declared before style_mod exists,
     // so that edge is attached right after style_mod below.
     const render_mod = b.addModule("render", .{
         .root_source_file = b.path("src/render/render.zig"),
@@ -219,7 +219,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/scene/scene.zig"),
         .imports = &.{
             .{ .name = "s57", .module = s57_mod },
-            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "s101", .module = s101_mod },
             .{ .name = "tiles", .module = tiles_mod },
             .{ .name = "render", .module = render_mod },
             .{ .name = "geo", .module = geo_mod },
@@ -238,7 +238,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
         .imports = &.{
             .{ .name = "s57", .module = s57_mod },
-            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "s101", .module = s101_mod },
         },
     });
     addLua(b, portray_mod, lua_posix);
@@ -276,7 +276,7 @@ pub fn build(b: *std.Build) void {
     // (portray is libc, wired separately into the lib + baker only.)
     const pure_pkgs = [_]std.Build.Module.Import{
         .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "s101", .module = s101_mod },
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
@@ -423,7 +423,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true, // portray (embedded Lua)
         .imports = &.{
             .{ .name = "s57", .module = s57_mod },
-            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "s101", .module = s101_mod },
             .{ .name = "tiles", .module = tiles_mod },
             .{ .name = "scene", .module = scene_mod },
             .{ .name = "render", .module = render_mod },
@@ -553,15 +553,15 @@ pub fn build(b: *std.Build) void {
     _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{
         .{ .name = "iso8211", .module = iso8211_mod },
     });
-    const s100_test = addPkgTest(b, test_step, "src/s100/s100.zig", target, optimize, &.{
+    const s101_test = addPkgTest(b, test_step, "src/s101/s101.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
     });
-    addCatalogueJson(b, s100_test); // catalogue.zig @embedFile's the JSON
+    addCatalogueJson(b, s101_test); // catalogue.zig @embedFile's the JSON
     const tiles_test = addPkgTest(b, test_step, "src/tiles/tiles.zig", target, optimize, &.{});
     addMvtFixture(b, tiles_test); // pmtiles.zig's round-trip test embeds it
     _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "s101", .module = s101_mod },
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "style", .module = style_mod },
@@ -653,7 +653,7 @@ pub fn build(b: *std.Build) void {
     _ = addPkgTest(b, test_step, "src/render/inspect_view_test.zig", target, optimize, &.{
         .{ .name = "portray", .module = portray_mod },
         .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "s101", .module = s101_mod },
         .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "tiles", .module = tiles_mod },

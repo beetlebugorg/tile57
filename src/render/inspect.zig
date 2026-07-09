@@ -8,7 +8,7 @@
 //! It is the mirror image of noop.zig (which discards every call) and ascii.zig
 //! (which resolves each call to a character): here the recording IS the output.
 //!
-//! Same rule as every surface (surface.zig): no s57 / s100 / portray imports.
+//! Same rule as every surface (surface.zig): no s57 / s101 / portray imports.
 //! The FeatureMeta the engine hands beginFeature already carries the S-57 class
 //! acronym + the acronym→value pick blob, and the draw calls carry color tokens /
 //! symbol names verbatim — everything the record needs is on the contract.

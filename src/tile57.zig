@@ -16,7 +16,7 @@
 //!   - Portrayal assets:  `assets` (colortables, linestyles, sprite/pattern)
 //!   - Style patching:    `chartstyle`
 //!   - Tiling:            `mvt`, `tile`, `pmtiles`, `bake_enc`, `scene`
-//!   - Raw formats:       `formats.{iso8211, s57, s100}`
+//!   - Raw formats:       `formats.{iso8211, s57, s101}`
 
 const std = @import("std");
 
@@ -65,7 +65,7 @@ pub const scene = @import("scene"); // S-57 feature → MVT tile
 pub const formats = struct {
     pub const iso8211 = @import("s57").iso8211; // ISO/IEC 8211 records
     pub const s57 = @import("s57"); // S-57 ENC cell parser + geometry
-    pub const s100 = @import("s100"); // S-100/S-101 catalogue + adaptation
+    pub const s101 = @import("s101"); // S-101 catalogue + adaptation + instructions
 };
 
 test {
