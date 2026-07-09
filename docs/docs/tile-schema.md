@@ -9,7 +9,7 @@ sidebar_position: 7
 tile57's vector tiles use a fixed set of layers and fields. The generated
 MapLibre style depends on this schema, so the names are a contract. Do not
 rename a layer or a field without updating the style generator
-(`src/assets/style.zig`) to match **and bumping the schema version**.
+(`src/style/maplibre.zig`) to match **and bumping the schema version**.
 
 This vocabulary is versioned as **`tile57/2`**. The tiles and the portrayal
 assets are generated from the same S-101 catalogue and stamped with that

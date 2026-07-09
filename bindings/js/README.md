@@ -4,7 +4,7 @@ Generate a [MapLibre GL](https://maplibre.org) `style.json` for nautical (S-57 /
 ENC) charts from **S-52 "mariner settings"** — colour scheme, depth units, safety
 contour, display category, and the rest — **entirely client-side**.
 
-Under the hood it runs the chartplotter **`tile57` chartstyle engine** (pure Zig)
+Under the hood it runs the chartplotter **`tile57` style engine** (pure Zig)
 compiled to a ~145 KB WebAssembly module. The same engine ships in the native
 `libtile57` C ABI (`tile57_build_style`) and the `tile57` CLI, so the style your
 front-end produces is **byte-for-byte identical** to the native build (see
@@ -18,7 +18,7 @@ sync.
  ┌──────────────────────────────────────────────┐
  │  WebAssembly (style-engine.wasm)              │
  │                                               │
- │  settings.parse ──► chartstyle.buildStyle ──┐ │
+ │  settings.parse ──► style.buildFromTemplate ─┐ │
  │     ▲                  ▲          ▲          │ │
  │  embedded           embedded   embedded      │ │
  │  template.json      colortables (S-52)       │ │
@@ -105,7 +105,7 @@ map.setStyle(style);
 - **`DEFAULT_SETTINGS`** — the canonical defaults, for seeding a settings UI.
 
 Full types are in [`index.d.ts`](./index.d.ts). The `MarinerSettings` fields
-mirror the Zig `MarinerSettings` struct and the C `tile57_mariner`.
+mirror the Zig `style.mariner.Settings` struct and the C `tile57_mariner`.
 
 ### Mariner settings
 
@@ -146,13 +146,13 @@ The wasm engine and the native build are the **same Zig source** compiled for tw
 targets. `bindings/scripts/parity-check.sh` generates a style with both for a
 range of settings (and a fixed `nowUnix`) and asserts they are **byte-identical**:
 
-- native: `zig-out/bin/style-parity` (`chartstyle.buildStyle`, host target)
-- wasm:   this package (`chartstyle.buildStyle`, `wasm32-freestanding`)
+- native: `zig-out/bin/style-parity` (`style.buildFromTemplate`, host target)
+- wasm:   this package (`style.buildFromTemplate`, `wasm32-freestanding`)
 
 > Note: the `tile57 style` CLI is **not** the right oracle — it generates the base
-> *template* (`assets.styleJson`), it does not apply mariner settings. The mariner
-> patcher is `chartstyle.buildStyle`, which both this module and the
-> `style-parity` oracle call, hence the dedicated parity tool.
+> *template* (`style.json`), it does not apply mariner settings. The builder that
+> bakes the mariner settings in is `style.buildFromTemplate`, which both this
+> module and the `style-parity` oracle call, hence the dedicated parity tool.
 
 ## Building from source
 

@@ -86,21 +86,24 @@ It is **high-performance and low-memory** by design:
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                    src/s57/iso8211.zig
+   │  ISO 8211 decode                    src/iso8211/
    ▼
 S-57 feature + geometry model            src/s57/
-   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/
+   │  adapt S-57 → S-101 features        src/s101/ (adapter)
    ▼
-portrayal instruction stream
+S-101 feature records
+   │  S-101 portrayal (embedded Lua)     src/portray/ + rules
+   ▼
+portrayal instruction stream             src/s101/ (instructions)
    │  scene generation                   src/scene/  (project + clip + draw calls)
    ▼
 render Surface ──► MVT / MLT tiles (src/tiles/)  +  MapLibre style.json + assets
              └───► PNG raster / vector PDF / terminal text (src/render/)
 ```
 
-The stages are separate Zig modules — `s57` (including its ISO 8211 decoder),
-`s100`, `tiles`, `render`, `scene`, `assets` — pure Zig with no libc; only the
-Lua portrayal (`portray`) and the sprite rasterizer (`sprite`) pull in C. See
+The stages are separate Zig modules — `iso8211`, `s57`, `s101`, `tiles`,
+`render`, `scene`, `style` — pure Zig with no libc; only the Lua portrayal
+(`portray`) and the sprite rasterizer (`sprite`) pull in C. See
 [the architecture docs](docs/docs/architecture.md).
 
 ## Use it from Zig

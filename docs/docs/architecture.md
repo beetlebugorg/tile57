@@ -15,19 +15,22 @@ A chart cell flows through these stages, all inside the engine:
 
 ```
 S-57 ENC cell (.000)
-   │  decode the binary container     src/s57/iso8211.zig
+   │  decode the binary container     src/iso8211/   (module: iso8211)
    ▼
 S-57 feature + geometry model         src/s57/       (module: s57)
+   │  adapt S-57 → S-101 features     src/s101/ adapter.zig
+   ▼
+S-101 feature + attribute records
    │  apply S-101 portrayal           src/portray/ + embedded Lua 5.4
    ▼                            (vendor/S-101_Portrayal-Catalogue)
 portrayal instruction stream
-   │  adapt to drawing primitives     src/s100/      (module: s100)
+   │  parse the instruction stream    src/s101/ instructions.zig
    ▼
 scene generation                      src/scene/  (project + clip + draw calls)
    ▼
 render Surface                        src/render/surface.zig
    ├─► tile surfaces:  MVT / MLT encode + PMTiles    src/tiles/
-   │        + MapLibre style.json + portrayal assets src/assets/, src/sprite/
+   │        + MapLibre style.json + portrayal assets src/style/, src/sprite/
    └─► pixel surfaces: PNG raster · vector PDF · terminal text (src/render/)
 ```
 
@@ -95,13 +98,14 @@ libc/Lua) and target-agnostic:
 
 | Module | Role |
 |--------|------|
-| `s57` | S-57 ENC cell parser + geometry model (includes the ISO/IEC 8211 decoder, `src/s57/iso8211.zig`) |
-| `s100` | S-100/S-101 catalogue + portrayal adaptation |
+| `iso8211` | the ISO/IEC 8211 container reader (the bottom layer; std-only) |
+| `s57` | S-57 ENC cell parser + geometry model (reads 8211 records through `iso8211`) |
+| `s101` | the S-101 catalogue, the S-57 → S-101 adapter, and the portrayal instruction stream |
 | `portray` | the embedded-Lua S-101 runner (links libc) |
 | `tiles` | MVT + MLT encoders, gzip, the PMTiles container, web-mercator tile math |
 | `render` | the Surface contract, the resolver (colours, display gates), and the pixel machinery (Canvas, PNG, PDF, ASCII) |
 | `scene` | S-57 → tile-surface scene generation + the banded ENC_ROOT baker (`bake_enc.zig`) |
-| `assets` | colortables / linestyles / style / manifest generation (includes `chartstyle.zig`, the mariner-driven style builder) |
+| `style` | color tables, line styles, and the MapLibre style.json layer set (includes `mariner.zig`, the S-52 mariner settings model) |
 | `sprite` | S-101 sprite + area-fill pattern atlases (SVG raster; links libc) |
 | `engine` | the pure packages re-exported as one import (the test root) |
 | `tile57` | the curated public surface (`src/tile57.zig`) |
@@ -127,7 +131,7 @@ The public surface composes the packages into high-level entry points:
   for any `(z, x, y)` tile on demand through an ownership partition
   (`tile57_compose_open` / `tile57_compose_serve`). The public Zig `bakeArchive`
   runs the same engine over a slice of cells to make one merged archive.
-- **`style.build`** (`assets/chartstyle.zig`) + **`assets`** / **`sprite`** —
+- **`style.build`** (`style/maplibre.zig`) + **`style`** / **`sprite`** —
   generate the MapLibre style and the portrayal assets it references
   (`tile57_build_style` / `tile57_bake_assets` in the C ABI).
 

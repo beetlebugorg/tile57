@@ -66,12 +66,15 @@ almost entirely with AI assistance. A few specific goals shape its design:
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                    src/s57/iso8211.zig
+   │  ISO 8211 decode                    src/iso8211/
    ▼
 S-57 feature + geometry model            src/s57/
-   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/
+   │  adapt S-57 → S-101 features        src/s101/ (adapter)
    ▼
-portrayal instruction stream
+S-101 feature records
+   │  S-101 portrayal (embedded Lua)     src/portray/ + rules
+   ▼
+portrayal instruction stream             src/s101/ (instructions)
    │  scene generation                   src/scene/  (project + clip + draw calls)
    ▼
 render Surface ──► MVT / MLT tiles + PMTiles (src/tiles/)  +  MapLibre style.json + assets
@@ -90,10 +93,9 @@ The engine is **high-performance and low-memory by design**:
 - **Band-streamed bakes.** Baking an ENC_ROOT to one PMTiles archive streams
   band-by-band (finest → coarsest, best-band dedup), so peak memory tracks the
   largest single band.
-- **Pure-Zig core.** The foundational format/encode modules (`s57` — including
-  its ISO 8211 decoder — `s100`, `tiles`, `render`, `scene`, `assets`) have no
-  libc; only the Lua portrayal (`portray`) and the sprite rasterizer (`sprite`)
-  pull in C.
+- **Pure-Zig core.** The foundational format/encode modules (`iso8211`, `s57`,
+  `s101`, `tiles`, `render`, `scene`, `style`) have no libc; only the Lua
+  portrayal (`portray`) and the sprite rasterizer (`sprite`) pull in C.
 
 ## Portrayal
 

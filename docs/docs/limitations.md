@@ -25,7 +25,7 @@ domain and not for navigation; this renderer adds its own gaps on top.
 ## Portrayal gaps
 
 - **Ignored portrayal-instruction keys.** The instruction translator
-  (`src/s100/s101_instr.zig`) lowers the drawing vocabulary the catalogue
+  (`src/s101/instructions.zig`) lowers the drawing vocabulary the catalogue
   actually leans on (point/line/text instructions, colour fills, area-fill and
   viewing-group references, `AugmentedRay` / `ArcByRadius` / `AugmentedPoint`
   construction — that is how light-sector legs and arcs render). A few keys are

@@ -94,11 +94,11 @@ const json = try tile57.style.build(/* … */);     // tile57.style.Mariner sett
 
 | Surface | What it does |
 |---------|--------------|
-| `tile57.style.build` (`assets.buildFromTemplate`) | build a MapLibre style from a template + mariner settings + colortables. |
-| `tile57.style.Mariner` | the S-52 mariner display options struct. |
-| `tile57.assets` | colortables / linestyles / style.json / manifest generation. |
+| `tile57.style.build` (`style.buildFromTemplate`) | build a MapLibre style from a template + mariner settings + colortables. |
+| `tile57.style.Mariner` | the S-52 mariner display options struct (`style.mariner.Settings`). |
+| `tile57.style` | color tables, line styles, and style.json generation. |
 | `tile57.sprite` | S-101 sprite + area-fill pattern atlases (SVG raster). |
-| `tile57.chartstyle` | the mariner-driven style-patching module. |
+| `tile57.style.mariner` | the S-52 mariner settings model and expression builders. |
 
 ## Tiling + encoding
 
@@ -120,7 +120,7 @@ The pure-Zig foundational parsers under `tile57.formats`:
 |--------|------|
 | `tile57.formats.iso8211` | ISO/IEC 8211 records |
 | `tile57.formats.s57` | S-57 ENC cell parser + geometry |
-| `tile57.formats.s100` | S-100/S-101 catalogue + adaptation |
+| `tile57.formats.s101` | the S-101 catalogue, adapter, and instruction stream |
 
 `tile57.version` is the package version string (`"0.1.0"`), matching
 `build.zig.zon` and `tile57_version()`.
