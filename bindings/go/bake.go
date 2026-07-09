@@ -5,13 +5,24 @@ package tile57
 /*
 #include <stdlib.h>
 #include "tile57.h"
+
+// Trampoline: the C progress callback calls back into this exported Go function.
+extern void tile57GoBakeProgress(void *ctx, uint32_t done, uint32_t total);
 */
 import "C"
 
 import (
 	"fmt"
+	"runtime/cgo"
 	"unsafe"
 )
+
+//export tile57GoBakeProgress
+func tile57GoBakeProgress(ctx unsafe.Pointer, done, total C.uint32_t) {
+	if fn, ok := cgo.Handle(uintptr(ctx)).Value().(func(int, int)); ok && fn != nil {
+		fn(int(done), int(total))
+	}
+}
 
 // BakeCell bakes ONE on-disk cell (a .000 path + its .001.. updates) to a PMTiles
 // archive over its NATIVE band zoom range and returns the bytes — the per-cell tile
@@ -37,6 +48,41 @@ func BakeCell(path string) ([]byte, error) {
 		return nil, fmt.Errorf("tile57: cell bake failed")
 	}
 }
+
+// BakeTree walks inDir for S-57 base cells (*.000) and bakes each IN PARALLEL to the SAME relative
+// path under outDir with a .pmtiles extension (+ an <out>.sha content-hash sidecar), creating
+// subdirs. A cell whose archive is already up to date (newer than its .000 and its update chain) is
+// skipped. The engine writes and frees each archive as it goes, so this never holds N archives in
+// memory (peak ~ workers). outDir is the caller's OWN cache — it owns the location + layout, so
+// distinct consumers don't clash. onProgress(done, total) fires per baked cell (may be called
+// concurrently from workers, so it must be safe for concurrent use). Returns the number baked.
+func BakeTree(inDir, outDir string, workers int, onProgress func(done, total int)) (int, error) {
+	if inDir == "" || outDir == "" {
+		return 0, fmt.Errorf("tile57: BakeTree needs input + output dirs: %w", ErrEmptyInput)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	cIn := C.CString(inDir)
+	defer C.free(unsafe.Pointer(cIn))
+	cOut := C.CString(outDir)
+	defer C.free(unsafe.Pointer(cOut))
+
+	var cb C.tile57_bake_progress
+	var ctx unsafe.Pointer
+	if onProgress != nil {
+		h := cgo.NewHandle(onProgress)
+		defer h.Delete()
+		cb = C.tile57_bake_progress(C.tile57GoBakeProgress)
+		ctx = unsafe.Pointer(h) //nolint:govet // cgo.Handle passed as the void* ctx, retrieved verbatim
+	}
+	rc := C.tile57_bake_tree(cIn, cOut, C.uint32_t(workers), cb, ctx)
+	if rc < 0 {
+		return 0, fmt.Errorf("tile57: bake tree failed")
+	}
+	return int(rc), nil
+}
+
 // PMTilesMetadata returns a PMTiles archive's metadata JSON blob (decompressed), or
 // nil if the archive carries none. A [BakeCell] archive embeds the cell's coverage
 // under a "coverage" key. The pmtiles bytes are read but not retained.
