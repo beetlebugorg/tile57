@@ -247,7 +247,7 @@ const DenomGate = union(enum) {
     zoom_k: f64,
 };
 
-// The overscale (oscl) clause — S-52 §10.1.10 (specs/overscale.md). The
+// The overscale (oscl) clause — S-52 §10.1.10. The
 // filter-gate form is EXACTLY
 //   [">", ["coalesce", ["get","oscl"], 0], DENOM]
 // ("the display is FINER than the cell's quantized compilation scale"), or its
@@ -320,12 +320,12 @@ const Bucket = struct {
     filter_gate: bool = false, // scamin-layers.md: the live client-driven SCAMIN clause (?scaminexact)
     cur_denom: f64 = 0, // filter_gate: the current-display-scale denominator literal (client-overwritten)
     suffix: []const u8 = "", // id suffix: "#oscl" (overscaled fill pass) / "" (plain)
-    // Overscale (oscl) clause role (S-52 §10.1.10, specs/overscale.md) — see OverscaleRole.
+    // Overscale (oscl) clause role (S-52 §10.1.10) — see OverscaleRole.
     oscl: OverscaleRole = .none,
 };
 
 // Overscale (oscl) clause role a fill/pattern layer plays in the AP(OVERSC01)
-// occlusion sandwich (S-52 §10.1.10, specs/overscale.md):
+// occlusion sandwich (S-52 §10.1.10):
 //   .none — no oscl clause (every layer outside the sandwich).
 //   .overscaled — [">", coalesce(oscl,0), DENOM]: this cell's data is displayed FINER
 //     than its compilation scale (the fills under the hatch + the hatch itself).
@@ -669,7 +669,7 @@ fn patternLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !vo
     try js.endObject();
 }
 
-// The AP(OVERSC01) overscale-indication layer (S-52 §10.1.10, specs/overscale.md):
+// The AP(OVERSC01) overscale-indication layer (S-52 §10.1.10):
 // every contributing cell's M_COVR coverage polygon (baked into `area_patterns`
 // as pattern OVERSC01, tagged `oscl`), shown only while the display is FINER than
 // the cell's quantized compilation scale (the oscl clause). Sandwiched between
@@ -936,7 +936,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     // the hatch) each bucket's fill splits around the AP(OVERSC01) overscale layer:
     // overscaled cells' fills (#oscl) UNDER the hatch, at-scale fills ABOVE it — so
     // finer opaque DEPARE/LNDARE occlude a coarser cell's hatch and it survives only
-    // on coarse-only patches (S-52 §10.1.10, specs/overscale.md). ignore_scamin (gate
+    // on coarse-only patches (S-52 §10.1.10). ignore_scamin (gate
     // off) or no sprite keeps a single plain fill layer per bucket.
     if (sprite_on) {
         for (scamin_buckets) |bkt| try fillLayer(js, &s, "areas", try bucketWithOverscale(ba, bkt, .overscaled));
@@ -1534,10 +1534,9 @@ test "buildFromTemplateScamin: a manifest no longer buckets — the merged zoom-
 // ---- smax removal -----------------------------------------------------------
 
 test "styleJson: no smax clause in any gating mode (band-handoff gate retired)" {
-    // The coverage-clipped composite owns cross-band occlusion geometrically
-    // (specs/cross-band-composition-redesign.md §3): no layer carries a
-    // band-handoff smax clause any more, in any gating mode — and the overscale
-    // gate survives ?ignoreScamin (decoupled per spec §5).
+    // The coverage-clipped composite owns cross-band occlusion geometrically, so
+    // no layer carries a band-handoff smax clause in any gating mode, and the
+    // overscale gate survives ?ignoreScamin (the two gates are decoupled).
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
@@ -1580,7 +1579,7 @@ test "styleJson: no smax clause in any gating mode (band-handoff gate retired)" 
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") != null);
 }
 
-// ---- overscale (oscl) gate tests (specs/overscale.md) -----------------------
+// ---- overscale (oscl) gate tests -------------------------------------------
 
 test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
     const a = std.testing.allocator;

@@ -245,7 +245,7 @@ test "scaminVisible mirrors the style SCAMIN_GATE" {
     try std.testing.expect(scaminVisible(0, 0)); // degenerate 0 -> always
 }
 
-test "osclVisible: the X2 hatch never fires at/below 1x, fires past 2x (specs/overscale.md v3)" {
+test "osclVisible: the X2 hatch never fires at/below 1x, fires past 2x" {
     // A 1:260000 cell bakes oscl = cscl / OVERSCALE_FACTOR (X2) = 130000 (see
     // bake_enc.overscaleGateDenom). The hatch (denom < oscl) must:
     //   - stay OFF at & below 1x compilation scale (denom >= 260000), and

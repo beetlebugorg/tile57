@@ -1,9 +1,8 @@
-//! S-57 -> S-101 portrayal attribute-coverage check
-//! (Tasks 2-3 of the conformance-testability brief; see
-//! specs/conformance-testability.md). Run it: `zig build s101-coverage`
+//! S-57 -> S-101 portrayal attribute-coverage check. Run it:
+//! `zig build s101-coverage`
 //! (append `-- --json out.json` / `-- --fail-on-new tools/s101_coverage_baseline.json`).
-//! The gate baseline lives at tools/s101_coverage_baseline.json (tracked; /specs/
-//! is gitignored). Regenerate it after an intended change with --write-baseline.
+//! The gate baseline lives at tools/s101_coverage_baseline.json (tracked).
+//! Regenerate it after an intended change with --write-baseline.
 //!
 //! 1. STATIC READ-SET (Task 2): scan the vendored S-101 Portrayal Catalogue Lua
 //!    rules and, per feature-class rule, collect every attribute the rule reads
@@ -96,8 +95,8 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
 // The coverage buckets above answer "is the attribute supplied?". These answer
 // "is the supplied VALUE valid S-101?". A slot is at-risk when the adapter
 // forwards a raw S-57 value that S-65 says must be remapped, dropped, or is off
-// the S-101 allowable list. Keyed by S-57 acronym/object (matching S-65 and
-// specs/s57-s101-conversion-gaps.md); translated to S-101 names at run time via
+// the S-101 allowable list. Keyed by S-57 acronym/object (matching S-65);
+// translated to S-101 names at run time via
 // the catalogue alias maps, so only attributes a rule ACTUALLY reads surface.
 
 const AttrNote = struct { acr: []const u8, note: []const u8 };

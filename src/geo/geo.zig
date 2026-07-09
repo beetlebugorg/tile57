@@ -1,13 +1,14 @@
-//! Integer computational geometry for cross-band chart composition — the geometry
-//! core, not yet wired to the baker, the live oracle, or the client:
+//! Integer computational geometry for chart composition. Pure (std-only), so the
+//! module self-tests via `zig build test`. The scene baker and the tile
+//! compositor use it to decide which cell owns each tile.
 //!
-//!   * `boolean` — a Martinez–Rueda–Feito polygon boolean (union / intersection /
-//!     difference / symmetric-difference) on integer coordinates, with
+//!   * `boolean`   — a Martinez–Rueda–Feito polygon boolean (union / intersection
+//!     / difference / symmetric-difference) on integer coordinates, with
 //!     overlap-edge typing and a deterministic total order, plus `unionAll`.
-//!   * `plane`   — the per-tier coverage partition (`ownedAtTier`), the FULL /
+//!   * `plane`     — the per-tier coverage partition (`ownedAtTier`), the FULL /
 //!     EMPTY / SEAM tile classifier (`EdgeGrid`), and `clipLineOutsidePolys`.
-//!
-//! Both are pure (std-only) so they self-test via `zig build test`.
+//!   * `partition` — the cell-ownership partition and its `.tpart` sidecar
+//!     (`serialize` / `deserialize` / `inputKey`).
 
 pub const boolean = @import("boolean.zig");
 pub const plane = @import("plane.zig");

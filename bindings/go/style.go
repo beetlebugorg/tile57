@@ -147,8 +147,8 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 // inputs of BuildStyle so the two styles are comparable. The result is "[]" when
 // nothing changed, one op per differing filter/paint/layout key, or
 // [{"op":"rebuild"}] when the host should fall back to a full setStyle. The host
-// applies each op with map.setFilter / setPaintProperty / setLayoutProperty (see
-// specs/style-diff.md); the raw JSON is returned so a server can forward it to the
+// applies each op with map.setFilter / setPaintProperty / setLayoutProperty;
+// the raw JSON is returned so a server can forward it to the
 // browser untouched.
 func StyleDiff(template []byte, from, to Mariner, colortables []byte, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
 	if len(template) == 0 {

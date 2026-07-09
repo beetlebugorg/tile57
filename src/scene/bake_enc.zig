@@ -221,9 +221,8 @@ fn ringsTouchRect(rings: []const []const s57.LonLat, w: f64, so: f64, e: f64, n:
 /// The finer-scale coverage to subtract from cell `cscl_self`'s fills in tile
 /// (z,x,y): the union of every strictly-finer cell's M_COVR (CATCOV=1), projected
 /// into the tile's i32 space and box-clipped, as a clean ring set. This is the
-/// coverage-clipped best-available composite's exact subtrahend
-/// (specs/cross-band-composition-redesign.md) — it replaces the point-sampled
-/// whole-tile suppress_whole with true geometry, so a coarse fill is cut exactly
+/// coverage-clipped best-available composite's exact subtrahend — it uses true
+/// geometry rather than a point-sampled whole-tile flag, so a coarse fill is cut exactly
 /// where a finer cell owns the ground (no seam double-draw) and kept everywhere
 /// else, including inside a finer no-data hole (no blank). null = nothing finer
 /// covers this tile (the cell is finest here → draw everything). Allocated in `a`
@@ -399,8 +398,8 @@ pub const OVERSCALE_FACTOR = 2;
 ///
 /// Baking the halved value (rather than the raw cscl quantized UP the SCAMIN
 /// ladder, the old behaviour) fixes the "fires early" defect: the zoom-derived
-/// clause `oscl > K/2^zoom` now flips EXACTLY at 2x and never before 1x
-/// (specs/overscale.md v3 defect 1). 0 when the compilation scale is unknown.
+/// clause `oscl > K/2^zoom` flips EXACTLY at 2x and never before 1x.
+/// Returns 0 when the compilation scale is unknown.
 pub fn overscaleGateDenom(cscl: i32) i64 {
     if (cscl <= 0) return 0;
     return @divTrunc(cscl, OVERSCALE_FACTOR);
@@ -748,7 +747,7 @@ const TileGenCtx = struct {
         // composite (coverClipForCell + subtractCoverage + coveredByFiner) does it
         // exactly per-feature. All that remains here is the overscale scale-boundary
         // scan: the finest compilation scale CONTRIBUTING to this tile.
-        // Scale-boundary overscale refinement (specs/overscale.md): the finest
+        // Scale-boundary overscale refinement: the finest
         // compilation scale CONTRIBUTING to this tile — over the quilting's own
         // participant list (any overlapping cell, reach-only riders excluded),
         // not point-sampled coverage. A cell hatches its OVERSC01 coverage only
@@ -1587,7 +1586,7 @@ test "fill-down bake: a coastal-only bay gets low-zoom tiles the overview extend
     try std.testing.expect(ov_t6[0] != bay_t6[0] or ov_t6[1] != bay_t6[1]);
 }
 
-test "overscale: a coarse cell occluded everywhere by finer coverage emits NO hatch (specs/overscale.md v3 defect 2)" {
+test "overscale: a coarse cell occluded everywhere by finer coverage emits NO hatch" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

@@ -1,9 +1,14 @@
-//! Direct S-57 -> MVT tile generation (M6c demo, BYPASSING S-101 portrayal).
+//! The tile engine: S-57 features plus their S-101 portrayal instructions become
+//! a tile Surface, then an MVT or MLT vector tile for a given (z, x, y).
 //!
-//! Generates a vector tile for (z,x,y) straight from an S-57 cell with a small
-//! hardcoded object-class -> S-52 color-token mapping, so the existing chart
-//! style renders it. This proves cell -> MVT -> MapLibre end to end before the
-//! S-101 Lua portrayal engine lands and replaces classify() with real rules.
+//! A cell's features carry S-101 portrayal instructions from the Lua rules (see
+//! the `portray` module). This module projects each feature's geometry to tile
+//! space, resolves its layer and draw properties, and serializes the result. A
+//! `classify()` fallback supplies a small object-class -> S-52 mapping for the
+//! few paths that run without portrayal instructions.
+//!
+//! This module also hosts the banded multi-cell ENC_ROOT baker (`bake_enc`),
+//! the engine's batch driver.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -22,10 +27,7 @@ pub const bake_enc = @import("bake_enc.zig");
 pub const coverage = @import("coverage.zig"); // per-cell coverage sidecar (in PMTiles metadata)
 pub const compose = @import("compose.zig"); // per-cell-composite clip-to-owned-face + face projection
 
-/// SCAMIN standalone (specs/scamin-standalone.md): cross-cell point-object
-/// matching + SCAMIN union + scale-window eligibility for the *_scamin point/
-/// text layers. Shared by the bake pre-pass and the live per-tile dedup.
-/// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile (optional).
+/// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile.
 pub const TileFormat = enum { mvt, mlt };
 const s101 = @import("s100").s101_instr;
 const catalogue = @import("s100").catalogue;
@@ -317,7 +319,7 @@ fn clipSimplifyPoly(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]con
     return if (ring.len >= 3) ring else clipped[0..0];
 }
 
-// Coverage-clipped best-available composite (specs/cross-band-composition-redesign.md):
+// Coverage-clipped best-available composite:
 // subtract the finer-scale coverage `clip` (already projected + box-clipped into this
 // tile's i32 space, a clean union) from a coarser cell's box-clipped area rings, so a
 // feature is emitted by exactly one cell — the finest whose M_COVR covers it. Replaces
@@ -602,7 +604,7 @@ pub const CellOpts = struct {
     /// and emitted as the AP(OVERSC01) overscale hatch's gate (hatch shows while
     /// the display denominator is FINER/smaller than oscl). See emitOverscaleHatch.
     oscl: i64 = 0,
-    /// Scale-boundary overscale (specs/overscale.md, S-52 §10.1.10.2): emit this
+    /// Scale-boundary overscale (S-52 §10.1.10.2): emit this
     /// cell's AP(OVERSC01) coverage hatch into the tile. Set only when BOTH (a) a
     /// strictly-finer-CSCL cell also contributes to the SAME tile — a scale
     /// boundary exists (else whole-view overscale, the HUD "overscale ×n" readout's
@@ -743,7 +745,7 @@ pub const TileSurface = struct {
         // The cell's quantized compilation scale: the style's overscale machinery
         // splits area fills into a below-the-hatch (overscaled) and an above-the-
         // hatch (at-scale) pass on this tag — so a finer cell's opaque fill
-        // occludes a coarser cell's OVERSC01 hatch (specs/overscale.md).
+        // occludes a coarser cell's OVERSC01 hatch.
         if (s.cur.oscl > 0) try props.append(s.a, .{ .key = "oscl", .value = .{ .int = s.cur.oscl } });
         try appendMeta(s.a, &props, s.cur);
         try s.areasL().append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
@@ -2513,7 +2515,7 @@ fn isCoverageFeature(f: s57.Feature) bool {
 /// CellOpts.oscl). The style shows it only while the display is grossly overscale
 /// (denominator FINER/smaller than oscl, i.e. X2+) and paints it ABOVE overscaled
 /// cells' fills but BELOW at-scale (finer) cells' fills — the occlusion trick that
-/// leaves the hatch only on coarse-only patches (specs/overscale.md).
+/// leaves the hatch only on coarse-only patches.
 fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
@@ -2852,8 +2854,8 @@ fn appendCellFeatures(
         if (!fopts.suppress_points and hasAdditionalInfo(f)) {
             try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, fopts, surf);
         }
-        // S-52 §10.1.10.2 overscale area at a chart scale boundary
-        // (specs/overscale.md): a cell's M_COVR (CATCOV=1) coverage polygon rides
+        // S-52 §10.1.10.2 overscale area at a chart scale boundary:
+        // a cell's M_COVR (CATCOV=1) coverage polygon rides
         // the tile as an AP(OVERSC01) hatch gated on `oscl` (X2) ONLY when
         // overscale_hatch is set — a strictly-finer-CSCL cell rides the tile (a
         // scale boundary) AND this cell wins the pure quilt somewhere (it is the
