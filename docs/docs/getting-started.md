@@ -6,8 +6,8 @@ sidebar_position: 3
 
 # Getting Started
 
-This guide bakes a chart with the `tile57` CLI and fetches a tile from the
-engine, from both Zig and C. It assumes you have finished
+This guide bakes a chart with the `tile57` CLI, then serves a composed tile and
+uses the engine from Zig and C. It assumes you have finished
 [Installation](./installation.md) (Zig 0.16, submodules, `zig build`).
 
 ## 1. Bake a chart with the CLI
@@ -19,12 +19,15 @@ the portrayal assets a renderer needs:
 zig build                          # builds zig-out/bin/tile57
 T=zig-out/bin/tile57
 
-# One command: a single cell OR a whole ENC_ROOT (band-streamed) ->
-# a self-contained bundle (tiles/chart.pmtiles + style + assets + manifest)
+# Bake a single cell OR a whole ENC_ROOT to the live-composite structure:
+# per-cell tiles/<STEM>.pmtiles (native band scale, M_COVR embedded) + partition.tpart
 $T bake CELL.000 -o out/
 $T bake /path/to/ENC_ROOT -o out/
 
-# Just the portrayal assets (from the embedded catalogue — no path needed)
+# Serve one composed tile on demand from that structure (the runtime compositor)
+$T compose-tile out/tiles 15 9371 12534 --load-partition out/partition.tpart -o tile.mlt
+
+# The portrayal assets a renderer needs (from the embedded catalogue — no path needed)
 $T assets     -o assets/   # colortables + linestyles + sprite + patterns
 $T sprite-mln -o assets/   # the MapLibre sprite sheet
 # (pass a /path/to/PortrayalCatalog to use an on-disk catalogue instead)
@@ -34,14 +37,15 @@ $T png CELL.000 --view -76.48,38.974,15 --size 1600x1200 -o chart.png
 $T pdf CELL.000 --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
 
 # Inspect / summarise
-$T inspect out/tiles/chart.pmtiles  # zoom range + tile counts
-$T cell    CELL.000             # summarise an S-57 cell
+$T inspect out/tiles/US5MD1MC.pmtiles  # zoom range + tile counts for one cell
+$T cell    CELL.000                    # summarise an S-57 cell
 $T version
 ```
 
-Run `tile57 help` for usage. The full subcommand list: `bake`, `assets`,
-`sprite`, `pattern`, `sprite-mln`, `style`, `png`, `pdf`, `ascii`, `cells`,
-`catalog`, `features`, `inspect`, `cell`, `objlcount`, `version`, `help`.
+Run `tile57 help` for usage. The full subcommand list: `bake`, `compose-tile`,
+`assets`, `sprite`, `pattern`, `sprite-mln`, `style`, `png`, `pdf`, `ascii`,
+`cells`, `catalog`, `features`, `inspect`, `cell`, `objlcount`, `version`,
+`help`.
 
 :::info Tiles are MLT by default
 Bakes encode [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec)
@@ -58,66 +62,70 @@ real S-52 pixels inline on kitty-graphics terminals like Ghostty or Kitty):
 $T ascii CELL.000 --view -76.48,38.974,13 --ansi --tui
 ```
 
-A **bundle** is a relocatable directory in which the tiles and the portrayal that
-renders them travel together:
+`tile57 bake` writes a **live-composite structure** — per-cell tiles plus an
+ownership partition — that a runtime compositor serves tiles from on demand:
 
 ```
 out/
-  manifest.json             pins schema_version, couples the two halves
-  tiles/chart.pmtiles       the DATA half — S-52 colour tokens, palette-independent
-  assets/colortables.json   token -> hex per day/dusk/night (the only RGB)
-  assets/style-{day,dusk,night}.json  MapLibre style layers, colours pre-resolved
+  tiles/US5MD1MC.pmtiles    one PMTiles per cell, baked at its compilation scale
+  tiles/US4MD81M.pmtiles       (M_COVR coverage embedded in each archive's metadata)
+  partition.tpart           the ownership partition: which cell renders which ground
 ```
 
-## 2. Fetch a tile from Zig
+There is no merged archive: any `(z, x, y)` tile is composed from the overlapping
+cells on demand, so a re-bake of one cell doesn't rewrite a whole district. The
+portrayal assets travel separately (`tile57 assets` / `style`); the tiles carry
+S-52 colour **tokens**, never RGB, so one set of tiles renders in any palette.
+
+## 2. Serve a tile from C
+
+The engine sits behind a thin C ABI ([`include/tile57.h`](../../include/tile57.h)).
+Open a compositor over the bake output and serve tiles by `(z, x, y)`:
+
+```c
+#include "tile57.h"
+
+/* Open a compositor over the `tile57 bake` output (list every cell archive). */
+const char *paths[] = { "out/tiles/US5MD1MC.pmtiles" };
+tile57_compose_source *src = tile57_compose_open(paths, 1, "out/partition.tpart");
+
+uint8_t *tile; size_t n;
+switch (tile57_compose_serve(src, z, x, y, &tile, &n)) {
+    case 1:  /* … render the decompressed MLT tile … */ tile57_free(tile, n); break;
+    case 2:  /* owned but empty — a cell's bake is still in flight */ break;
+    case 0:  /* not owned — open ocean; cache as blank */ break;
+    default: /* -1 error */ break;
+}
+tile57_compose_close(src);
+```
+
+Link against `libtile57.a`. The `partition.tpart` sidecar (NULL to skip) lets the
+compositor load the ownership partition instead of rebuilding it. To render a
+finished PNG/PDF, read metadata, or query the feature under a point, open a
+`tile57_chart` instead — `tile57_chart_open` (an on-disk ENC_ROOT or a `.000`),
+`tile57_chart_open_bytes` (one in-memory cell), or `tile57_chart_open_pmtiles`
+(a baked archive). See the [C API](./c-api.md).
+
+## 3. Use the engine from Zig
 
 Add tile57 as a dependency and `@import("tile57")`:
 
 ```zig
 const tile57 = @import("tile57");
 
-// Open a chart: a PMTiles archive, or a raw S-57 cell portrayed live.
-var chart = try tile57.Chart.openBytes(cell_bytes, .auto, null);
+// Open an on-disk ENC_ROOT (or a single .000) for rendering + inspection.
+var chart = try tile57.Chart.openPath("ENC_ROOT/", null, true);
 defer chart.deinit();
 
-if (try chart.tile(z, x, y)) |bytes| {   // decompressed tile bytes (or null if empty)
-    defer tile57.freeBytes(bytes);
-    // … hand the tile to your renderer …
-}
+const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
+// … render a view (chart.renderView), query features (chart.featuresJson),
+//   or read per-cell metadata (chart.cellsJson) …
 ```
 
-Tiles come back in the chart's tile encoding — a baked PMTiles archive serves
-its stored format (MLT by default), a live cell-backed chart opens generating
-MVT and opts in to MLT via `setTileFormat`; `tileType()` tells you which.
-
-`Chart.openPath` / `Chart.openCellsStreaming` open a whole ENC_ROOT;
-`tile57.bakeArchive` bakes one to a PMTiles archive; `tile57.assets`,
-`tile57.sprite`, and `tile57.style.build` generate the style + assets. See the
-[Zig API](./zig-api.md).
-
-## 3. Fetch a tile from C
-
-The same engine sits behind a thin C ABI ([`include/tile57.h`](../../include/tile57.h)):
-
-```c
-#include "tile57.h"
-
-tile57_chart *c = tile57_chart_open_bytes(data, len);   /* one in-memory S-57 cell */
-
-uint8_t *tile; size_t n;
-if (tile57_chart_tile(c, z, x, y, &tile, &n) == TILE57_TILE_OK) {
-    /* … render the decompressed tile bytes (MVT or MLT —
-       see tile57_chart_info.tile_type) … */
-    tile57_free(tile, n);
-}
-tile57_chart_close(c);
-```
-
-Link against `libtile57.a`. Three explicit openers cover the inputs:
-`tile57_chart_open_bytes` (one in-memory S-57 cell), `tile57_chart_open` (an
-on-disk ENC_ROOT directory or a single `.000`, streamed), and
-`tile57_chart_open_pmtiles` (a baked archive). See the [C API](./c-api.md) for the
-bake, style, and asset-generation entry points.
+The Zig `Chart` renders views, queries features, and reads metadata;
+`tile57.bakeArchive` bakes an ENC_ROOT to one band-streamed PMTiles archive
+offline. The runtime tile compositor (bake per cell, compose on demand) is
+exposed through the [C ABI](./c-api.md). See the [Zig API](./zig-api.md).
 
 ## ENC_ROOT and updates
 
