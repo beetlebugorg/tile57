@@ -7,7 +7,8 @@
 const std = @import("std");
 const chart = @import("chart.zig");
 const s57 = @import("s57");
-const bundle = @import("bundle"); // the whole chart-bundle pipeline (tiles + assets + manifest)
+const bundle = @import("bundle"); // portrayal-asset emitters + the partition debug bake
+const compose = @import("compose"); // the runtime tile compositor (tile57_compose_*)
 const mariner = @import("style").mariner;
 const style = @import("style");
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
@@ -163,7 +164,7 @@ export fn tile57_compose_open(
     paths: ?[*]const ?[*:0]const u8,
     n: usize,
     partition_path: ?[*:0]const u8,
-) callconv(.c) ?*bundle.ComposeSource {
+) callconv(.c) ?*compose.ComposeSource {
     const ps = paths orelse return null;
     if (n == 0) return null;
     const list = gpa.alloc([]const u8, n) catch return null;
@@ -186,7 +187,7 @@ export fn tile57_compose_open(
         } else |_| {}
     }
 
-    return (bundle.openComposeSourceFiles(io, gpa, list, load_bytes) catch return null) orelse return null;
+    return (compose.openComposeSourceFiles(io, gpa, list, load_bytes) catch return null) orelse return null;
 }
 
 /// Compose the tile (z,x,y) on demand, returning the RAW (decompressed) MLT in *out / *out_len (free
@@ -195,7 +196,7 @@ export fn tile57_compose_open(
 /// during a bake, an error state once bakes are done), 0 = not owned (true empty ocean, safe to
 /// cache), -1 = error. Byte-faithful to the batch compositor. See tile57.h.
 export fn tile57_compose_serve(
-    handle: ?*bundle.ComposeSource,
+    handle: ?*compose.ComposeSource,
     z: u8,
     x: u32,
     y: u32,
@@ -213,7 +214,7 @@ export fn tile57_compose_serve(
 }
 
 /// Fill `out` with the compositor's zoom range + union coverage bounds. See tile57.h.
-export fn tile57_compose_meta_get(handle: ?*bundle.ComposeSource, out: *CComposeMeta) callconv(.c) void {
+export fn tile57_compose_meta_get(handle: ?*compose.ComposeSource, out: *CComposeMeta) callconv(.c) void {
     const src = handle orelse return;
     out.* = .{
         .min_zoom = src.minz,
@@ -228,7 +229,7 @@ export fn tile57_compose_meta_get(handle: ?*bundle.ComposeSource, out: *CCompose
 
 /// Serialize the compositor's ownership partition to the file `path` (a sidecar a later
 /// tile57_compose_open can load to skip the build). 1=ok, -1=error. See tile57.h.
-export fn tile57_compose_save_partition(handle: ?*bundle.ComposeSource, path: ?[*:0]const u8) callconv(.c) c_int {
+export fn tile57_compose_save_partition(handle: ?*compose.ComposeSource, path: ?[*:0]const u8) callconv(.c) c_int {
     const src = handle orelse return -1;
     const p = spanOpt(path) orelse return -1;
     const bytes = src.serializePartition(gpa) catch return -1;
@@ -240,7 +241,7 @@ export fn tile57_compose_save_partition(handle: ?*bundle.ComposeSource, path: ?[
 }
 
 /// Release a compositor opened by tile57_compose_open (munmaps the archives, frees the partition).
-export fn tile57_compose_close(handle: ?*bundle.ComposeSource) callconv(.c) void {
+export fn tile57_compose_close(handle: ?*compose.ComposeSource) callconv(.c) void {
     if (handle) |src| src.deinit();
 }
 

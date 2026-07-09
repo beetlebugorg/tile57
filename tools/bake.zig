@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const chart = @import("chart"); // per-cell bake (bakeCellBytes) + freeBytes
-const bundle = @import("bundle"); // openComposeSourceFiles + serializePartition (the resident compositor)
+const compose = @import("compose"); // openComposeSourceFiles + serializePartition (the resident compositor)
 const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
@@ -115,7 +115,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Open the resident compositor over the per-cell archives (mmap'd) and serialize its ownership
     // partition to <out-dir>/partition.tpart — the sidecar a runtime open loads to skip the build.
-    const src = (bundle.openComposeSourceFiles(io, a, archive_paths.items, null) catch |err| {
+    const src = (compose.openComposeSourceFiles(io, a, archive_paths.items, null) catch |err| {
         std.debug.print("error: open compose source failed ({s})\n", .{@errorName(err)});
         return;
     }) orelse return usageErr("no coverage-carrying archives (nothing to compose)");

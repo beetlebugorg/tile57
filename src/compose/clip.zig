@@ -1,6 +1,6 @@
-//! Compose core (Stage 2 of the per-cell-composite bake): clip ONE cell's decoded tile
-//! features to the ground it OWNS, so the compositor can merge many cells' clipped tiles
-//! into one composed tile with no double-draw at a seam.
+//! The compositor's clip core: clip ONE cell's decoded tile features to the ground
+//! it OWNS, so the compositor can merge many cells' clipped tiles into one composed
+//! tile with no double-draw at a seam.
 //!
 //! `face` is the cell's owned rings (from `partition.ownedFace`) projected to THIS tile's
 //! pixel space, i64 — `projectFace` does that projection, mirroring EXACTLY the baker's

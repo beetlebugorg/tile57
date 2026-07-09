@@ -221,6 +221,20 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "s57", .module = s57_mod }},
     });
 
+    // The runtime tile compositor (src/compose/): serve any (z,x,y) on demand from
+    // N per-cell PMTiles archives + an ownership partition. Reads baked archives
+    // only — never parses S-57 or runs portrayal — so it depends solely on the
+    // tile / geometry / coverage leaves (s57 rides in for the LonLat point type).
+    const compose_mod = b.addModule("compose", .{
+        .root_source_file = b.path("src/compose/compose.zig"),
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "s57", .module = s57_mod },
+        },
+    });
+
     // The tile engine (src/scene/): S-57 -> tile-surface generation plus the
     // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
     // internal/engine/baker — folded in as the engine's batch driver).
@@ -336,6 +350,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "style", .module = style_mod },
             .{ .name = "sprite", .module = sprite_mod },
             .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "compose", .module = compose_mod }, // debug bake reuses LoadedCov/toPlaneCells
         },
     });
 
@@ -377,7 +392,8 @@ pub fn build(b: *std.Build) void {
     addPkgs(lib_mod, &pure_pkgs);
     lib_mod.addImport("portray", portray_mod);
     lib_mod.addImport("sprite", sprite_mod); // C ABI: sprite/pattern atlas generation
-    lib_mod.addImport("bundle", bundle_mod); // C ABI: the whole chart-bundle pipeline (bake_bundle)
+    lib_mod.addImport("bundle", bundle_mod); // C ABI: portrayal-asset emitters + debug bake
+    lib_mod.addImport("compose", compose_mod); // C ABI: tile57_compose_* (the runtime compositor)
     // The full engine surface as a NAMED import (not a root.zig file-import), so the
     // single root.zig file isn't claimed by both lib_mod and engine_full (which bundle
     // pulls in) — Zig requires each file to belong to exactly one module per artifact.
@@ -462,6 +478,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "sprite", .module = sprite_mod },
                 .{ .name = "catalog", .module = catalog_embed },
                 .{ .name = "bundle", .module = bundle_mod },
+                .{ .name = "compose", .module = compose_mod }, // compose-tile CLI
                 .{ .name = "render", .module = render_mod }, // renderpng pixel path
                 .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
             },
@@ -580,15 +597,17 @@ pub fn build(b: *std.Build) void {
     _ = addPkgTest(b, test_step, "src/style/style.zig", target, optimize, &.{});
     // Geometry core for the cross-band composition (pure, std-only).
     _ = addPkgTest(b, test_step, "src/geometry/geometry.zig", target, optimize, &.{});
-    // Compose core (clip-to-face): pure over mvt + geometry. Its own step for fast iteration,
-    // and part of the main suite.
+    // The runtime compositor + its clip core: pure over tiles + geometry + coverage.
+    // Its own step for fast iteration, and part of the main suite.
     const compose_deps = [_]std.Build.Module.Import{
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "geometry", .module = geometry_mod },
+        .{ .name = "coverage", .module = coverage_mod },
+        .{ .name = "s57", .module = s57_mod },
     };
-    const compose_step = b.step("compose-test", "Run the compose-core (clip-to-face) tests");
-    _ = addPkgTest(b, compose_step, "src/scene/compose.zig", target, optimize, &compose_deps);
-    _ = addPkgTest(b, test_step, "src/scene/compose.zig", target, optimize, &compose_deps);
+    const compose_step = b.step("compose-test", "Run the runtime compositor + clip-core tests");
+    _ = addPkgTest(b, compose_step, "src/compose/compose.zig", target, optimize, &compose_deps);
+    _ = addPkgTest(b, test_step, "src/compose/compose.zig", target, optimize, &compose_deps);
 
     // The chart-bundle module hosts the per-cell composite (composeTile / ComposeSource). Its full
     // dep set (engine + assets/sprite/catalog) needs libc, so create the test module directly

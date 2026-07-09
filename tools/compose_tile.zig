@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const engine = @import("engine");
-const bundle = @import("bundle");
+const compose = @import("compose");
 const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
@@ -86,7 +86,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Open the resident source (mmap archives + partition once) — the amortised cost.
     const open_t0 = nowNs();
-    const src = (bundle.openComposeSourceFiles(io, a, paths.items, load_bytes) catch |err| {
+    const src = (compose.openComposeSourceFiles(io, a, paths.items, load_bytes) catch |err| {
         std.debug.print("error: open compose source failed ({s})\n", .{@errorName(err)});
         return;
     }) orelse {
