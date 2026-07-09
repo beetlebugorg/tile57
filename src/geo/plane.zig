@@ -201,7 +201,15 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     defer subtr.deinit(gpa);
 
     for (order.items, 0..) |ci, k| {
-        // owned = cov \ (∪ finer cells whose bbox overlaps this one).
+        // owned = cov \ (∪ finer cells whose bbox overlaps this one). The union/diff
+        // intermediates run on the page allocator, not `gpa`: they are large,
+        // odd-sized, and freed within the iteration, and a pooling gpa parks each
+        // freed size class on its own freelist — across hundreds of cells those
+        // parked pages inflated the compose's peak RSS by whole GBs. Page-granular
+        // allocation returns them to the OS at each free (unionAll frees its running
+        // accumulator each step, `uni`/`diff` right after use), and the boolean ops
+        // are far too coarse to feel the per-page cost. Only the finished `owned`
+        // polygon is copied into `gpa` (retained, held by the partition).
         subtr.clearRetainingCapacity();
         for (0..k) |j| {
             if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(gpa, covs[j]);
@@ -209,9 +217,12 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         const owned = if (subtr.items.len == 0)
             try dupePolygonGpa(gpa, covs[k])
         else blk: {
-            const uni = try boolean.unionAll(gpa, subtr.items);
-            defer boolean.freePolygon(gpa, uni);
-            break :blk try boolean.compute(gpa, covs[k], uni, .diff);
+            const pa = std.heap.page_allocator;
+            const uni = try boolean.unionAll(pa, subtr.items);
+            defer boolean.freePolygon(pa, uni);
+            const diff = try boolean.compute(pa, covs[k], uni, .diff);
+            defer boolean.freePolygon(pa, diff);
+            break :blk try dupePolygonGpa(gpa, diff);
         };
         try out.append(gpa, .{ .index = ci, .owned = owned });
     }
