@@ -162,10 +162,18 @@ pub fn build(b: *std.Build) void {
     // libc/Lua) and target-agnostic: they omit target/optimize so the same module
     // objects compile under both the glibc test/lib build and the static-musl
     // baker build, inheriting each consumer's target.
-    // DAG: s57 (incl. iso8211) <- s100; tiles (leaf) <- render <- scene.
+    // DAG: iso8211 <- s57 <- s100; tiles (leaf) <- render <- scene.
     // The embedded catalogue JSON rides on s100 (catalogue.zig @embedFile's it).
+    //
+    // ISO/IEC 8211 container reader (src/iso8211/): the bottom layer, a pure
+    // std-only leaf. Its own module so a consumer can decode 8211 records
+    // without depending on any S-57 semantics.
+    const iso8211_mod = b.addModule("iso8211", .{
+        .root_source_file = b.path("src/iso8211/iso8211.zig"),
+    });
     const s57_mod = b.addModule("s57", .{
         .root_source_file = b.path("src/s57/s57.zig"),
+        .imports = &.{.{ .name = "iso8211", .module = iso8211_mod }},
     });
     const s100_mod = b.addModule("s100", .{
         .root_source_file = b.path("src/s100/s100.zig"),
@@ -541,7 +549,10 @@ pub fn build(b: *std.Build) void {
     sprite_test.link_libc = true;
     addSvgRaster(b, sprite_test);
 
-    _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/iso8211/iso8211.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{
+        .{ .name = "iso8211", .module = iso8211_mod },
+    });
     const s100_test = addPkgTest(b, test_step, "src/s100/s100.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
     });

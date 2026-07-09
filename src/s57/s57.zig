@@ -10,9 +10,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-/// The ISO/IEC 8211 record parser S-57 rides on (folded into this module —
-/// its only consumer). Re-exported for the CLI inspector + lib root.
-pub const iso8211 = @import("iso8211.zig");
+/// The ISO/IEC 8211 container reader S-57 rides on, re-exported for consumers
+/// that want the raw records. It is its own module (`@import("iso8211")`), so a
+/// caller can depend on the 8211 layer without pulling in S-57 semantics.
+pub const iso8211 = @import("iso8211");
 const iso = iso8211;
 
 // Geographic coordinate stored in S-57's native integer ×1e7 units (lon ±1.8e9,
