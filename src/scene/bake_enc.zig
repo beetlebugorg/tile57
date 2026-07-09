@@ -160,15 +160,10 @@ fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) b
     return coversAnyCtx(BackendCov{ .backends = backends }, idxs, lon, lat);
 }
 
-// Whether (date da, name na) orders strictly before (db, nb) in the equal-scale
-// clip order: newer DSID issue/update date first (YYYYMMDD compares lexically; a
-// dated cell orders before an undated one), then cell name ascending - total and
-// deterministic for distinct cells, so bake output is byte-stable. Public so the
-// ownership partition assigns the same tie-break winner as the bake.
-pub fn ordersBeforeKeys(da: []const u8, na: []const u8, db: []const u8, nb: []const u8) bool {
-    if (!std.mem.eql(u8, da, db)) return std.mem.lessThan(u8, db, da); // newer first
-    return std.mem.lessThan(u8, na, nb);
-}
+// The equal-scale clip-order tiebreak (newer date, then name) lives in
+// geometry.partition, so the baker and the ownership partition pick the same
+// winner. Re-exported here for this module's callers.
+pub const ordersBeforeKeys = geometry.partition.ordersBeforeKeys;
 
 fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
     return ordersBeforeKeys(ctx.date(a_idx), ctx.name(a_idx), ctx.date(b_idx), ctx.name(b_idx));

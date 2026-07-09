@@ -16,6 +16,16 @@ const std = @import("std");
 const plane = @import("plane.zig");
 const boolean = @import("boolean.zig");
 
+/// Whether (date da, name na) orders strictly before (db, nb) in the equal-scale
+/// clip order: newer DSID issue/update date first (YYYYMMDD compares lexically; a
+/// dated cell orders before an undated one), then cell name ascending — total and
+/// deterministic for distinct cells, so bake output is byte-stable. The baker and
+/// this partition use the same tie-break so they pick the same ownership winner.
+pub fn ordersBeforeKeys(da: []const u8, na: []const u8, db: []const u8, nb: []const u8) bool {
+    if (!std.mem.eql(u8, da, db)) return std.mem.lessThan(u8, db, da); // newer first
+    return std.mem.lessThan(u8, na, nb);
+}
+
 pub const BandMap = struct {
     /// The band floor (lowest zoom) this map is computed at.
     tier: u8,

@@ -212,6 +212,15 @@ pub fn build(b: *std.Build) void {
     // engine + baker use it for the cross-band composite.
     const geometry_mod = b.addModule("geometry", .{ .root_source_file = b.path("src/geometry/geometry.zig") });
 
+    // Per-cell M_COVR coverage sidecar (src/coverage/): CellCoverage plus the
+    // fromCell / encodeJson / decodeFromMetadata round-trip carried in PMTiles
+    // metadata. Pure over s57 (the LonLat point type) + std.json; the baker writes
+    // it and the compositor reads it.
+    const coverage_mod = b.addModule("coverage", .{
+        .root_source_file = b.path("src/coverage/coverage.zig"),
+        .imports = &.{.{ .name = "s57", .module = s57_mod }},
+    });
+
     // The tile engine (src/scene/): S-57 -> tile-surface generation plus the
     // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
     // internal/engine/baker — folded in as the engine's batch driver).
@@ -223,6 +232,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tiles", .module = tiles_mod },
             .{ .name = "render", .module = render_mod },
             .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
         },
     });
 
@@ -600,7 +610,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bundle_test_mod })).step);
     // Per-cell coverage sidecar (JSON round-trip carried in PMTiles metadata): pure
     // over s57 + std.json. Part of the main suite.
-    _ = addPkgTest(b, test_step, "src/scene/coverage.zig", target, optimize, &.{
+    _ = addPkgTest(b, test_step, "src/coverage/coverage.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
     });
     // The render module: Surface contract + noop lifecycle smoke test (pins
