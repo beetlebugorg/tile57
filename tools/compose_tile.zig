@@ -102,7 +102,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     const tile = try src.serve(a, z, tx, ty);
     const serve_ms = @as(f64, @floatFromInt(nowNs() - serve_t0)) / 1e6;
     if (tile) |t| {
-        std.debug.print("served z{d}/{d}/{d}: {d} bytes (gzipped MLT) in {d:.3} ms\n", .{ z, tx, ty, t.len, serve_ms });
+        std.debug.print("served z{d}/{d}/{d}: {d} bytes (raw MLT) in {d:.3} ms\n", .{ z, tx, ty, t.len, serve_ms });
         if (out) |op| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = op, .data = t }) catch |err|
             std.debug.print("  warn: could not write {s} ({s})\n", .{ op, @errorName(err) });
         a.free(t);

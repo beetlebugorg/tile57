@@ -130,6 +130,40 @@ int tile57_compose_files(const char *const *paths, size_t n, const char *out_pat
                          uint32_t *out_cells,
                          tile57_compose_progress on_progress, void *ctx);
 
+/* Runtime compositor — the on-demand counterpart of tile57_compose_files. Rather than pass over a
+ * whole district to produce one archive, it holds the per-cell PMTiles mmap'd and the ownership
+ * partition resident, so any tile can be composed for the cost of a classify + one decode/clip or a
+ * decompress. Open once, serve many, close. */
+typedef struct tile57_compose_source tile57_compose_source;
+
+/* Coverage/zoom summary filled by tile57_compose_meta. */
+typedef struct {
+    uint8_t min_zoom;
+    uint8_t max_zoom;   /* deepest zoom served (native windows + one fill-up overscale zoom) */
+    uint32_t cells;     /* coverage-carrying archives held */
+    double west, south, east, north; /* union coverage bounds, degrees */
+} tile57_compose_meta;
+
+/* Open a resident compositor over the `n` per-cell PMTiles at `paths` (each from
+ * tile57_bake_cell_bytes, on disk), mmap'd so the cell set is never fully resident. `partition_path`
+ * (NULL to skip) names a partition sidecar (from `tile57 compose --save-partition`) to load and skip
+ * the build; a missing/stale one falls back to building. Returns an opaque handle (free with
+ * tile57_compose_close), or NULL on error / no coverage-carrying archive. */
+tile57_compose_source *tile57_compose_open(const char *const *paths, size_t n,
+                                           const char *partition_path);
+
+/* Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out / *out_len (free with
+ * tile57_free) — what a live tile server hands its HTTP layer (which gzips on the wire). Returns 1
+ * served, 0 if no cell owns this tile, -1 on error. Byte-faithful to the batch compositor. */
+int tile57_compose_serve(tile57_compose_source *src, uint8_t z, uint32_t x, uint32_t y,
+                         uint8_t **out, size_t *out_len);
+
+/* Fill *out with the compositor's zoom range + union coverage bounds. */
+void tile57_compose_meta_get(tile57_compose_source *src, tile57_compose_meta *out);
+
+/* Release a compositor opened by tile57_compose_open (munmaps the archives, frees the partition). */
+void tile57_compose_close(tile57_compose_source *src);
+
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +
  * cscl + date/name under a "coverage" key, so the composite stitcher rebuilds the

@@ -1326,12 +1326,13 @@ fn composeZoom(
 }
 
 /// Compose ONE tile on demand from a resident partition + mmap'd per-cell `readers` (cell index ==
-/// reader index, exactly as composeInto aligns them), byte-identical to the tile the batch
-/// compositor writes for (z,tx,ty). Returns the gzipped MLT the archive stores — a verbatim owner
-/// blob (an mmap-slice copy, the common case) or a freshly composed seam tile — gpa-owned; null if
-/// no cell owns this tile. This is the runtime compositor: with the partition loaded once, serving a
-/// tile is a classify plus either one memcpy or one decode/clip/encode, not a whole-district pass.
-pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Partition, readers: []const *engine.pmtiles.Reader, z: u8, tx: u32, ty: u32) !?[]u8 {
+/// reader index, exactly as composeInto aligns them). `gzip` = true returns the gzipped MLT the
+/// batch archive stores (byte-identical to it — a verbatim owner blob copied verbatim, or a freshly
+/// composed seam tile re-gzipped); `gzip` = false returns the raw decompressed MLT (what a live tile
+/// server wants — the HTTP layer gzips on the wire). gpa-owned; null if no cell owns this tile. This
+/// is the runtime compositor: with the partition loaded once, serving a tile is a classify plus
+/// either one memcpy/decompress or one decode/clip/encode, not a whole-district pass.
+pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Partition, readers: []const *engine.pmtiles.Reader, z: u8, tx: u32, ty: u32, gzip: bool) !?[]u8 {
     const compose = engine.scene.compose;
     const map = part.mapForZoom(z) orelse return null;
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
@@ -1357,7 +1358,9 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Par
         switch (grid.classify(tileClassifyBox(z, tx, ty))) {
             .full => continue, // owns none of this tile
             .empty => { // owns the whole tile: verbatim blob if present, else fall through
-                if (try readers[ci].getCompressed(z, tx, ty)) |blob| return try gpa.dupe(u8, blob);
+                if (gzip) {
+                    if (try readers[ci].getCompressed(z, tx, ty)) |blob| return try gpa.dupe(u8, blob);
+                } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return try gpa.dupe(u8, raw);
             },
             .seam => {},
         }
@@ -1368,9 +1371,9 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Par
     }
     if (slots.items.len == 0) return null;
 
-    // gzip the composed MLT so the served bytes match what StreamWriter.add stores in the archive.
     const enc = (try composeSeamTile(ta, part, map, readers, slots.items, z, tx, ty)) orelse return null;
-    return try engine.pmtiles.StreamWriter.gzipTile(gpa, enc);
+    // gzip=true → match the archive's stored (gzipped) bytes; gzip=false → hand back the raw MLT.
+    return if (gzip) try engine.pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
 }
 
 /// A resident compositor: the per-cell archives held mmap'd and the ownership partition built once
@@ -1387,10 +1390,12 @@ pub const ComposeSource = struct {
     minz: u8,
     maxz: u8,
     loop_max: u8, // deepest zoom the sources can serve (native windows + one fill-up overscale zoom)
+    bounds: [4]f64, // union coverage [west, south, east, north] in degrees
 
-    /// Compose one tile → gzipped MLT (gpa-owned; null if no cell owns it), byte-identical to batch.
+    /// Compose one tile → raw (decompressed) MLT (gpa-owned; null if no cell owns it). This is what
+    /// a live tile server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
     pub fn serve(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !?[]u8 {
-        return composeTile(gpa, &self.part, self.readers, z, tx, ty);
+        return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
     }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
@@ -1410,7 +1415,7 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
     const pmtiles = engine.pmtiles;
     const scene = engine.scene;
     const src = try gpa.create(ComposeSource);
-    src.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .maps = &.{}, .readers = &.{}, .part = undefined, .minz = 0, .maxz = 0, .loop_max = 0 };
+    src.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .maps = &.{}, .readers = &.{}, .part = undefined, .minz = 0, .maxz = 0, .loop_max = 0, .bounds = .{ 0, 0, 0, 0 } };
     errdefer {
         src.arena.deinit();
         gpa.destroy(src);
@@ -1430,6 +1435,7 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
     }
     var minz: u8 = 255;
     var maxz: u8 = 0;
+    var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 }; // union coverage [w, s, e, n]
     for (paths) |path| {
         var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
         const st = f.stat(io) catch {
@@ -1467,12 +1473,17 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
         const bz = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cc.cscl));
         minz = @min(minz, bz.min);
         maxz = @max(maxz, bz.max);
-        try maps.append(a, map);
-        try readers.append(a, rp);
-        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = .{
+        const b = [4]f64{
             @as(f64, @floatFromInt(cc.bbox[0])) / 1e7, @as(f64, @floatFromInt(cc.bbox[1])) / 1e7,
             @as(f64, @floatFromInt(cc.bbox[2])) / 1e7, @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,
-        } });
+        };
+        ubox[0] = @min(ubox[0], b[0]);
+        ubox[1] = @min(ubox[1], b[1]);
+        ubox[2] = @max(ubox[2], b[2]);
+        ubox[3] = @max(ubox[3], b[3]);
+        try maps.append(a, map);
+        try readers.append(a, rp);
+        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = b });
     }
     if (readers.items.len == 0) {
         src.arena.deinit();
@@ -1499,6 +1510,7 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
     src.minz = minz;
     src.maxz = maxz;
     src.loop_max = @max(maxz, fill_max);
+    src.bounds = ubox;
     return src;
 }
 
@@ -2808,7 +2820,7 @@ fn verifyComposeTileMatchesBatch(gpa: std.mem.Allocator, arcs: []const []const u
             var ty = nw[1] -| 1;
             while (ty <= se[1] + 1) : (ty += 1) {
                 const want = try truth.getCompressed(z, tx, ty); // borrowed from truth's arena
-                const got = try composeTile(gpa, &part, readers, z, tx, ty);
+                const got = try composeTile(gpa, &part, readers, z, tx, ty, true); // gzip → archive-identical
                 defer if (got) |g| gpa.free(g);
                 if (want == null and got == null) continue;
                 if (want == null or got == null) return error.ComposeTileMismatch;

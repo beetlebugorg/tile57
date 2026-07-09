@@ -177,6 +177,104 @@ export fn tile57_compose_files(
     return if (nc > 0) 1 else 0;
 }
 
+/// Coverage/zoom summary of a resident compositor, filled by tile57_compose_meta.
+const CComposeMeta = extern struct {
+    min_zoom: u8,
+    max_zoom: u8, // deepest zoom that can be served (native windows + one fill-up overscale zoom)
+    cells: u32, // coverage-carrying archives held
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+};
+
+/// Read a partition sidecar file into a fresh gpa-owned buffer (or error). Used only during open.
+fn readSidecar(io: std.Io, path: []const u8) ![]u8 {
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+    const n: usize = @intCast(st.size);
+    const buf = try gpa.alloc(u8, n);
+    errdefer gpa.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    return buf;
+}
+
+/// Open a resident runtime compositor over the `n` per-cell PMTiles at `paths` (each from
+/// tile57_bake_cell_bytes, on disk), mmap'd so the cell set is never fully resident. `partition_path`
+/// (or NULL) names a partition sidecar (from `tile57 compose --save-partition`) to load and skip the
+/// build; a missing/stale one falls back to building. Returns an opaque handle (free with
+/// tile57_compose_close), or NULL on error / no coverage-carrying archive. See tile57.h.
+export fn tile57_compose_open(
+    paths: ?[*]const ?[*:0]const u8,
+    n: usize,
+    partition_path: ?[*:0]const u8,
+) callconv(.c) ?*bundle.ComposeSource {
+    const ps = paths orelse return null;
+    if (n == 0) return null;
+    const list = gpa.alloc([]const u8, n) catch return null;
+    defer gpa.free(list);
+    for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return null;
+
+    // The lib has no std.process.Init; stand up a threaded std.Io for the open-time file I/O
+    // (mmap survives it, and serve/close need no io).
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var load_bytes: ?[]const u8 = null;
+    var owned: ?[]u8 = null;
+    defer if (owned) |b| gpa.free(b);
+    if (spanOpt(partition_path)) |pp| {
+        if (readSidecar(io, pp)) |b| {
+            owned = b;
+            load_bytes = b;
+        } else |_| {}
+    }
+
+    return (bundle.openComposeSourceFiles(io, gpa, list, load_bytes) catch return null) orelse return null;
+}
+
+/// Compose the tile (z,x,y) on demand, returning the RAW (decompressed) MLT in *out / *out_len (free
+/// with tile57_free) — what a live tile server hands its HTTP layer. 1=served, 0=no cell owns this
+/// tile, -1=error. Byte-faithful to the batch compositor. See tile57.h.
+export fn tile57_compose_serve(
+    handle: ?*bundle.ComposeSource,
+    z: u8,
+    x: u32,
+    y: u32,
+    out: *[*]u8,
+    out_len: *usize,
+) callconv(.c) c_int {
+    const src = handle orelse return -1;
+    const tile = src.serve(gpa, z, x, y) catch return -1;
+    if (tile) |t| {
+        out.* = t.ptr;
+        out_len.* = t.len;
+        return 1;
+    }
+    return 0;
+}
+
+/// Fill `out` with the compositor's zoom range + union coverage bounds. See tile57.h.
+export fn tile57_compose_meta_get(handle: ?*bundle.ComposeSource, out: *CComposeMeta) callconv(.c) void {
+    const src = handle orelse return;
+    out.* = .{
+        .min_zoom = src.minz,
+        .max_zoom = src.loop_max,
+        .cells = @intCast(src.readers.len),
+        .west = src.bounds[0],
+        .south = src.bounds[1],
+        .east = src.bounds[2],
+        .north = src.bounds[3],
+    };
+}
+
+/// Release a compositor opened by tile57_compose_open (munmaps the archives, frees the partition).
+export fn tile57_compose_close(handle: ?*bundle.ComposeSource) callconv(.c) void {
+    if (handle) |src| src.deinit();
+}
+
 /// The metadata JSON blob of a PMTiles archive (e.g. the embedded per-cell "coverage"
 /// a single-cell bake carries), into *out / *out_len (free with tile57_free). 1=ok,
 /// 0=no metadata, -1=error. See tile57.h.
