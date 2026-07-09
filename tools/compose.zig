@@ -1,5 +1,5 @@
 //! `compose <cell.000 | ENC_ROOT | archive-dir> -o <out.pmtiles> [--rules DIR] [--keep-cells]
-//! [--from-archives]` — the
+//! [--from-archives] [--save-partition FILE] [--load-partition FILE]` — the
 //! per-cell composite bake, disk-to-disk. Bake each cell to its OWN native-scale PMTiles (with
 //! its M_COVR coverage embedded in the metadata), written to a temp file so only ONE cell's
 //! archive is ever resident; then stream them through the ownership partition into one merged
@@ -23,6 +23,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var rules: ?[]const u8 = null;
     var keep_cells = false; // retain the per-cell temp PMTiles (a reusable cache) instead of deleting
     var from_archives = false; // compose a dir of pre-baked archives (skip the bake)
+    var save_partition: ?[]const u8 = null; // write the built ownership partition to this sidecar
+    var load_partition: ?[]const u8 = null; // load the ownership partition from this sidecar (skip build)
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -34,6 +36,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             keep_cells = true;
         } else if (std.mem.eql(u8, arg, "--from-archives")) {
             from_archives = true; // <base> is a DIR of pre-baked *.cell.tmp / *.pmtiles — skip baking
+        } else if (std.mem.eql(u8, arg, "--save-partition")) {
+            save_partition = f.val(arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--load-partition")) {
+            load_partition = f.val(arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -116,7 +122,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // 3. Stream-compose the per-cell files into one PMTiles (mmap in, streamed out — the cell
     //    set is never all resident).
-    const nc = bundle.composeArchivesToFile(io, a, tmp_paths.items, out_path, null) catch |err| {
+    const nc = bundle.composeArchivesToFileOpt(io, a, tmp_paths.items, out_path, null, load_partition, save_partition) catch |err| {
         std.debug.print("error: compose failed ({s})\n", .{@errorName(err)});
         return;
     };

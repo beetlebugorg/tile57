@@ -849,7 +849,17 @@ fn uboxTileCount(ubox: [4]i32, z: u8) u64 {
 // Returns the framing to seal the archive, or null if no cell carried coverage or no tile
 // composed. Readers are BORROWED — kept alive by the caller; `readers` indexing aligns with the
 // partition (readers without coverage are filtered out here).
-fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers: []const *engine.pmtiles.Reader, progress: ?*ComposeProgress) !?Framing {
+/// How `composeInto` sources the ownership partition. Default = build it from the cells.
+pub const PartOpt = struct {
+    /// Borrowed sidecar bytes to try; used iff valid for these cells, else the partition is built.
+    load: ?[]const u8 = null,
+    /// When composeInto BUILDS (does not load) the partition, it sets `*save_out` to a fresh
+    /// gpa-owned serialization for the caller to persist (free with gpa.free). Left untouched when
+    /// the partition is loaded from `load`.
+    save_out: ?*?[]u8 = null,
+};
+
+fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers: []const *engine.pmtiles.Reader, progress: ?*ComposeProgress, popt: PartOpt) !?Framing {
     const geo = engine.geo;
     const scene = engine.scene;
 
@@ -899,8 +909,25 @@ fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers
     //    transient scratch to MBs.
     const cells = try toPlaneCells(a, shims.items);
     for (cells, kept.items) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
-    var part = try geo.partition.build(gpa, cells);
+
+    // The partition is a pure function of these cells. If the caller handed us a sidecar that
+    // still matches (its input_key binds it to this exact cell set), load it and skip the
+    // expensive owned-face build; otherwise build, and hand the caller the fresh bytes to persist.
+    var part: geo.partition.Partition = undefined;
+    var loaded = false;
+    if (popt.load) |bytes| {
+        if (geo.partition.deserialize(gpa, bytes, cells)) |p| {
+            part = p;
+            loaded = true;
+        } else |err| {
+            std.debug.print("  partition sidecar unusable ({s}); rebuilding\n", .{@errorName(err)});
+        }
+    }
+    if (!loaded) part = try geo.partition.build(gpa, cells);
     defer part.deinit();
+    if (!loaded) if (popt.save_out) |so| {
+        so.* = try geo.partition.serialize(gpa, &part);
+    };
 
     // 3. Output zoom span = union of the cells' native band windows, plus one fill-up zoom past
     //    the deepest band (overscale; deeper coarse-only zooms → client camera + overzoom).
@@ -987,7 +1014,7 @@ pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[
 
     var sw = pmtiles.StreamWriter.init(gpa);
     defer sw.deinit();
-    const fr = (try composeInto(gpa, &sw, readers.items, null)) orelse return null;
+    const fr = (try composeInto(gpa, &sw, readers.items, null, .{})) orelse return null;
     defer gpa.free(fr.meta);
     return try sw.finishBytes(writeOpts(fr));
 }
@@ -999,6 +1026,16 @@ pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[
 /// number of cells. Returns the count of cells that contributed, or 0 if none. This is the path
 /// a whole-district composite takes.
 pub fn composeArchivesToFile(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, out_path: []const u8, progress: ?*ComposeProgress) !usize {
+    return composeArchivesToFileOpt(io, gpa, paths, out_path, progress, null, null);
+}
+
+/// Like `composeArchivesToFile`, but precomputes the ownership partition to/from a sidecar:
+///   * `load_path` (if non-null and present + valid for this cell set) is loaded, skipping the
+///     partition build; a missing/stale/corrupt sidecar falls back to a build (with a warning).
+///   * `save_path` (if non-null) is written with the built partition, so a later run can `load` it.
+/// Point both at the same file for a self-refreshing cache: build+save on first run (or when the
+/// coverage changed), load on every run where it still matches.
+pub fn composeArchivesToFileOpt(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, out_path: []const u8, progress: ?*ComposeProgress, load_path: ?[]const u8, save_path: ?[]const u8) !usize {
     const pmtiles = engine.pmtiles;
     var ra = std.heap.ArenaAllocator.init(gpa);
     defer ra.deinit();
@@ -1049,12 +1086,37 @@ pub fn composeArchivesToFile(io: std.Io, gpa: std.mem.Allocator, paths: []const 
     var sw = pmtiles.StreamWriter.initFile(gpa, io, data_file);
     defer sw.deinit();
 
-    const fr = (try composeInto(gpa, &sw, readers.items, progress)) orelse {
+    // Read a partition sidecar if one was provided and is present (validity is verified inside
+    // composeInto against this exact cell set; a stale/corrupt one falls back to a build).
+    var load_bytes: ?[]const u8 = null;
+    if (load_path) |lp| load_from: {
+        var lf = std.Io.Dir.cwd().openFile(io, lp, .{}) catch break :load_from;
+        defer lf.close(io);
+        const st = lf.stat(io) catch break :load_from;
+        const n: usize = @intCast(st.size);
+        if (n == 0) break :load_from;
+        const buf = try raa.alloc(u8, n);
+        _ = lf.readPositionalAll(io, buf, 0) catch break :load_from;
+        load_bytes = buf;
+    }
+    var save_bytes: ?[]u8 = null;
+    defer if (save_bytes) |sb| gpa.free(sb);
+
+    const fr = (try composeInto(gpa, &sw, readers.items, progress, .{
+        .load = load_bytes,
+        .save_out = if (save_path != null) &save_bytes else null,
+    })) orelse {
         data_file.close(io);
         std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
         return 0;
     };
     defer gpa.free(fr.meta);
+
+    // Persist a freshly-built partition so a later run can load it (skipped when it was loaded).
+    if (save_path) |sp| if (save_bytes) |sb| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = sb }) catch |err|
+            std.debug.print("  warn: could not write partition sidecar {s} ({s})\n", .{ sp, @errorName(err) });
+    };
 
     const pre = try sw.prefix(raa, writeOpts(fr));
     var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
