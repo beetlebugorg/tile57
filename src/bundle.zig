@@ -850,7 +850,18 @@ fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers
 
     // 2. Adapt to plane.Cell (band floor via bandOf + the DSID ordersBeforeKeys tie-break) and
     //    materialise the per-band ownership partition. `part` borrows `cells` (arena-backed).
+    //    Each cell's partition participation is capped at its tile REACH — the deepest zoom
+    //    ownerTile can serve for it (native window, or the fill-up overscale window past it;
+    //    the archive header's max_zoom is folded in as a belt-and-braces upper bound). Beyond
+    //    that the cell owns ground it can never draw, so finer tiers skip it instead of paying
+    //    for its owned-face boolean — the output is identical (see plane.Cell.reach), and the
+    //    whole-district partition build drops from GBs of transient scratch to MBs.
     const cells = try toPlaneCells(a, shims.items);
+    for (cells, kept.items) |*c, rp| {
+        const nmax = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(c.cscl)).max;
+        const fill = @min(nmax + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);
+        c.reach = @max(@max(nmax, fill), rp.header.max_zoom);
+    }
     var part = try geo.partition.build(gpa, cells);
     defer part.deinit();
 

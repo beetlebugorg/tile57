@@ -45,6 +45,17 @@ pub const Cell = struct {
     /// from cell identity (issue/update date, then DSNM) so the newer survey wins
     /// a double-owned strip (spec Q4). Lower sorts finer (earlier in the walk).
     order: u64,
+    /// Highest zoom this cell can EMIT tiles at (native window + overscale fill-up);
+    /// the cell is excluded from tiers beyond it. Its face there is dead weight — it
+    /// renders nothing — and the exclusion is invisible to every renderable face:
+    /// reach is monotone (a coarser cell caps at least as low, in any cell set whose
+    /// reach comes from the band ladder), so capping drops a SUFFIX of the
+    /// finest→coarsest walk and no kept cell's subtrahend changes. What it buys: the
+    /// partition skips the expensive coarse-cell booleans at fine tiers (a
+    /// whole-district compose spent GBs subtracting hundreds of harbour coverages
+    /// from an overview cell that could never draw there). The default (255) never
+    /// excludes — pure-geometry callers keep the full pool per tier.
+    reach: u8 = 255,
     /// CATCOV=1 coverage features.
     cov1: []const Poly,
     /// CATCOV=2 explicit no-data features (subtracted, so a coarser band can fill).
@@ -78,16 +89,16 @@ fn finerLess(_: void, a: Cell, b: Cell) bool {
     return a.order < b.order;
 }
 
-/// The per-tier partition: for every cell eligible at `tier` (band_floor ≤ tier),
-/// walking finest→coarsest, `owned = coverage \ (∪ coverage of all finer eligible
-/// cells)`. The union of the returned `owned` regions equals the union of all
-/// eligible coverages, partitioned with no overlap (validated by the tests).
+/// The per-tier partition: for every cell eligible at `tier` (band_floor ≤ tier ≤
+/// reach), walking finest→coarsest, `owned = coverage \ (∪ coverage of all finer
+/// eligible cells)`. The union of the returned `owned` regions equals the union of
+/// all eligible coverages, partitioned with no overlap (validated by the tests).
 pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     // Eligible cells, in a total finest→coarsest, path-independent order.
     var order = std.ArrayList(usize).empty;
     defer order.deinit(gpa);
     for (cells, 0..) |c, i| {
-        if (c.band_floor <= tier) try order.append(gpa, i);
+        if (c.band_floor <= tier and tier <= c.reach) try order.append(gpa, i);
     }
     std.mem.sort(usize, order.items, cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
@@ -151,7 +162,7 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     var order = std.ArrayList(usize).empty;
     defer order.deinit(gpa);
     for (cells, 0..) |c, i| {
-        if (c.band_floor <= tier) try order.append(gpa, i);
+        if (c.band_floor <= tier and tier <= c.reach) try order.append(gpa, i);
     }
     std.mem.sort(usize, order.items, cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
@@ -541,6 +552,38 @@ test "ownedAtTier: below-floor fine cell drops out of the pool (no blank window)
     try testing.expectEqual(@as(i32, 100_000), cells[t10[0].index].cscl);
     try testing.expect(boolean.pointInEvenOdd(t10[0].owned, 50, 50));
     try testing.expect(boolean.pointInEvenOdd(t10[0].owned, 10, 10));
+}
+
+test "reach cap: a cell beyond its tile reach drops out of finer tiers only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Coarse [0,100]² can emit up to z10 (native max 9 + one fill-up); fine [40,60]²
+    // is unbounded. At tier 13 the coarse cell is out of the pool — the fine cell
+    // owns its box and NOTHING owns the surround; at tier 9 the coarse cell is back
+    // (fine below floor) and owns the whole basin.
+    const coarse_cov = try boxPoly(a, 0, 0, 100, 100);
+    const fine_cov = try boxPoly(a, 40, 40, 60, 60);
+    const cells = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .reach = 10, .cov1 = &.{coarse_cov} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 0, .cov1 = &.{fine_cov} },
+    };
+
+    for ([_]bool{ false, true }) |indexed| {
+        const t13 = if (indexed) try ownedAtTierIndexed(a, &cells, 13) else try ownedAtTier(a, &cells, 13);
+        try testing.expectEqual(@as(usize, 1), t13.len);
+        try testing.expectEqual(@as(usize, 1), t13[0].index); // only the fine cell
+        try testing.expect(boolean.pointInEvenOdd(t13[0].owned, 50, 50));
+        // The fine cell's face is its own coverage, unchanged by the exclusion —
+        // it never subtracted against the (coarser) capped cell.
+        try testing.expect(!boolean.pointInEvenOdd(t13[0].owned, 10, 10));
+
+        const t9 = if (indexed) try ownedAtTierIndexed(a, &cells, 9) else try ownedAtTier(a, &cells, 9);
+        try testing.expectEqual(@as(usize, 1), t9.len);
+        try testing.expectEqual(@as(usize, 0), t9[0].index); // coarse back in the pool
+        try testing.expect(boolean.pointInEvenOdd(t9[0].owned, 50, 50));
+    }
 }
 
 test "ownedAtTierIndexed matches ownedAtTier (owner-at-point, overlap + adjacency)" {
