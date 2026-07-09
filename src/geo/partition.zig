@@ -161,6 +161,14 @@ pub const LoadError = error{
 /// matched to the cells a loader holds. Coverage points are hashed as raw bytes;
 /// both shipped targets are little-endian, and a false mismatch only forces a
 /// (safe) rebuild.
+fn hashPolyPoints(h: *std.hash.Wyhash, poly: plane.Poly) void {
+    for (poly) |ring| {
+        const n: u32 = @intCast(ring.len);
+        h.update(std.mem.asBytes(&n));
+        h.update(std.mem.sliceAsBytes(ring)); // ring is []const Pt — real coordinate bytes
+    }
+}
+
 pub fn inputKey(cells: []const plane.Cell) u64 {
     var h = std.hash.Wyhash.init(0x5457_3537_5041_5254); // "TW57PART"
     for (cells) |c| {
@@ -168,9 +176,12 @@ pub fn inputKey(cells: []const plane.Cell) u64 {
         h.update(std.mem.asBytes(&c.band_floor));
         h.update(std.mem.asBytes(&c.order));
         h.update(std.mem.asBytes(&c.reach));
-        for (c.cov1) |ring| h.update(std.mem.sliceAsBytes(ring));
+        // cov1/cov2 are bags of polygons (each a set of rings). Descend to the POINTS and hash
+        // their bytes — never the ring slices' fat pointers, which are heap addresses that vary
+        // per process. Ring lengths go in too so a regrouping can't alias to the same digest.
+        for (c.cov1) |poly| hashPolyPoints(&h, poly);
         h.update(&[_]u8{0xff}); // cov1/cov2 boundary marker
-        for (c.cov2) |ring| h.update(std.mem.sliceAsBytes(ring));
+        for (c.cov2) |poly| hashPolyPoints(&h, poly);
         h.update(&[_]u8{0xfe}); // cell boundary marker
     }
     return h.final();
