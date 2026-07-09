@@ -548,10 +548,14 @@ pub fn bakePartitionDebug(io: std.Io, gpa: std.mem.Allocator, root_path: []const
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Single load + adapt paths.
+    // Single load + adapt paths. Reach-cap each cell exactly as the compositor does
+    // (band terms only — a native per-cell bake never exceeds its band window), so the
+    // debug quilt shows the partition the compositor actually composes with, not a
+    // hypothetical full pool.
     const loaded = loadCells(io, a, root_path);
     if (loaded.len == 0) return error.NoGeometry;
     const cells = try toPlaneCells(a, loaded);
+    for (cells) |*c| c.reach = bandReach(c.cscl);
 
     // Union bbox (E7) for the header, so a viewer opens on the data not the world.
     var ubox = [4]i32{ std.math.maxInt(i32), std.math.maxInt(i32), std.math.minInt(i32), std.math.minInt(i32) };
@@ -851,17 +855,15 @@ fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers
     // 2. Adapt to plane.Cell (band floor via bandOf + the DSID ordersBeforeKeys tie-break) and
     //    materialise the per-band ownership partition. `part` borrows `cells` (arena-backed).
     //    Each cell's partition participation is capped at its tile REACH — the deepest zoom
-    //    ownerTile can serve for it (native window, or the fill-up overscale window past it;
-    //    the archive header's max_zoom is folded in as a belt-and-braces upper bound). Beyond
-    //    that the cell owns ground it can never draw, so finer tiers skip it instead of paying
-    //    for its owned-face boolean — the output is identical (see plane.Cell.reach), and the
-    //    whole-district partition build drops from GBs of transient scratch to MBs.
+    //    ownerTile can serve for it: the band ladder (native window + fill-up overscale), with
+    //    the archive header's max_zoom folded in so a foreign archive carrying tiles past its
+    //    band window is never cut while it can still emit. Beyond reach the cell owns ground it
+    //    can never draw, so finer tiers skip it instead of paying for its owned-face boolean —
+    //    the output is identical (the builders cut only reach-suffixes of the ownership walk,
+    //    see plane.Cell.reach), and the whole-district partition build drops from GBs of
+    //    transient scratch to MBs.
     const cells = try toPlaneCells(a, shims.items);
-    for (cells, kept.items) |*c, rp| {
-        const nmax = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(c.cscl)).max;
-        const fill = @min(nmax + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);
-        c.reach = @max(@max(nmax, fill), rp.header.max_zoom);
-    }
+    for (cells, kept.items) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
     var part = try geo.partition.build(gpa, cells);
     defer part.deinit();
 
@@ -1208,6 +1210,14 @@ fn ownerTile(a: std.mem.Allocator, r: *engine.pmtiles.Reader, cscl: i32, z: u8, 
     const layers = try decodeTile(a, tt, anc);
     scaleUpTile(layers, shift, tx, ty);
     return layers;
+}
+
+// The deepest zoom a cell's band ladder can serve — its native window max, or the fill-up
+// overscale window just past it (`ownerTile`'s window, which FILLUP_CEIL can pull BELOW the
+// native max for the finest bands — hence the @max). The band terms of `plane.Cell.reach`.
+fn bandReach(cscl: i32) u8 {
+    const nmax = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cscl)).max;
+    return @max(nmax, @min(nmax + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL));
 }
 
 // Cheap existence mirror of `ownerTile` (directory probes only — no decompress, no decode):
@@ -2447,6 +2457,49 @@ test "composeArchives: a coarse owner overscales one fill-up zoom past its nativ
     try testing.expect(al.features.len >= 1);
     // The overscaled coastal fill covers the child tile interior.
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(tile.EXTENT, 2), @divTrunc(tile.EXTENT, 2)));
+}
+
+test "ownerHasTile mirrors ownerTile's null/non-null across the native + fill-up window" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tile = engine.tile;
+
+    // A coastal cell (native z9-11, fill-up to z12) with a single tile at its native max.
+    const z: u8 = 11;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+    const w = tile.lonLatToWorld(-76.3, 38.5);
+    const tx = worldAxisToTile(w[0], scale);
+    const ty = worldAxisToTile(w[1], scale);
+    const b = tile.tileBoundsLonLat(z, tx, ty);
+    const cscl: i32 = 300_000;
+    const arc = try synthCell(gpa, a, "COAST001", b[0], b[1], b[2], b[3], cscl, z, tx, ty);
+    defer gpa.free(arc);
+
+    var r = try engine.pmtiles.Reader.init(gpa, arc);
+    defer r.deinit();
+
+    // The tile-major compositor records a tile in its discovery pass iff the compose
+    // pass's decode would contribute; ONE disagreement changes the discovery map's
+    // insertion sequence and with it the whole zoom's output byte order. Pin the pair
+    // across every window boundary.
+    const cases = [_]struct { z: u8, x: u32, y: u32 }{
+        .{ .z = z, .x = tx, .y = ty }, // native hit
+        .{ .z = z, .x = tx + 5, .y = ty }, // native miss
+        .{ .z = z + 1, .x = tx * 2, .y = ty * 2 }, // fill-up: NW child of the ancestor
+        .{ .z = z + 1, .x = tx * 2 + 1, .y = ty * 2 + 1 }, // fill-up: SE child, same ancestor
+        .{ .z = z + 1, .x = (tx + 5) * 2, .y = ty * 2 }, // fill-up: no ancestor
+        .{ .z = z + 2, .x = tx * 4, .y = ty * 4 }, // past FILLUP_DZ: never reachable
+        .{ .z = z - 1, .x = tx / 2, .y = ty / 2 }, // below the baked window (no fill-down)
+    };
+    for (cases) |c| {
+        const decoded = try ownerTile(a, &r, cscl, c.z, c.x, c.y);
+        try testing.expectEqual(decoded != null, try ownerHasTile(&r, cscl, c.z, c.x, c.y));
+    }
+    // The sweep exercises both outcomes on both sides of the fill-up boundary.
+    try testing.expect(try ownerHasTile(&r, cscl, z + 1, tx * 2, ty * 2));
+    try testing.expect(!try ownerHasTile(&r, cscl, z + 2, tx * 4, ty * 4));
 }
 
 test "composeArchives: an interior tile is copied byte-identical from the per-cell bake" {

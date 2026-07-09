@@ -17,12 +17,11 @@
 //! round to the same integers before any boolean runs.
 //! All set algebra goes through `boolean` (Martinez, overlap-typed, deterministic).
 //!
-//! Phase 0 scope: this computes and validates the partition, the tile classifier
-//! (FULL / EMPTY / SEAM), and `clipLineOutsidePolys`. Nothing here is wired to the
-//! baker or the live oracle yet — that is a later phase. The S-57 adapter (filling
-//! `Cell` from an `s57.Cell`, the cscl≤0 / date-order tie-break decisions Q1/Q4)
-//! is also deferred; `Cell` is deliberately decoupled so this stays pure and
-//! unit-testable.
+//! Scope: this computes and validates the partition, the tile classifier
+//! (FULL / EMPTY / SEAM), and the coverage line clips. The S-57 adapter (filling
+//! `Cell` from an `s57.Cell`, incl. the cscl≤0 and date-order tie-break policy)
+//! lives with the consumers; `Cell` is deliberately decoupled so this stays pure
+//! and unit-testable.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -43,18 +42,19 @@ pub const Cell = struct {
     band_floor: u8,
     /// Deterministic tie-break among equal-cscl cells — the adapter fills this
     /// from cell identity (issue/update date, then DSNM) so the newer survey wins
-    /// a double-owned strip (spec Q4). Lower sorts finer (earlier in the walk).
+    /// a double-owned strip. Lower sorts finer (earlier in the walk).
     order: u64,
     /// Highest zoom this cell can EMIT tiles at (native window + overscale fill-up);
     /// the cell is excluded from tiers beyond it. Its face there is dead weight — it
-    /// renders nothing — and the exclusion is invisible to every renderable face:
-    /// reach is monotone (a coarser cell caps at least as low, in any cell set whose
-    /// reach comes from the band ladder), so capping drops a SUFFIX of the
-    /// finest→coarsest walk and no kept cell's subtrahend changes. What it buys: the
-    /// partition skips the expensive coarse-cell booleans at fine tiers (a
-    /// whole-district compose spent GBs subtracting hundreds of harbour coverages
-    /// from an overview cell that could never draw there). The default (255) never
-    /// excludes — pure-geometry callers keep the full pool per tier.
+    /// renders nothing there — and the exclusion is invisible to every renderable
+    /// face: the builders apply an EFFECTIVE reach (the max of the cell's own and
+    /// every coarser cell's, so exclusions always drop a suffix of the finest→
+    /// coarsest walk and no kept cell's subtrahend changes — see the reach cut in
+    /// `ownedAtTier`). What it buys: the partition skips the expensive coarse-cell
+    /// booleans at fine tiers (a whole-district compose spent GBs subtracting
+    /// hundreds of harbour coverages from an overview cell that could never draw
+    /// there). Must be a true upper bound on the cell's emit zoom; the default (255)
+    /// never excludes — pure-geometry callers keep the full pool per tier.
     reach: u8 = 255,
     /// CATCOV=1 coverage features.
     cov1: []const Poly,
@@ -89,6 +89,26 @@ fn finerLess(_: void, a: Cell, b: Cell) bool {
     return a.order < b.order;
 }
 
+/// The reach cap: shrink `order` (sorted finest→coarsest) to the cells whose
+/// EFFECTIVE reach covers `tier`. Removing a cell only grows the faces of cells
+/// AFTER it in the walk (their subtrahend shrinks), and a grown face is sound only
+/// if that cell cannot render at this tier either — so the cut must be a SUFFIX of
+/// the walk. Per-cell reach values need not be monotone in the sort key (a
+/// scale-less cell sorts finest yet gets a mid-band default; a foreign archive can
+/// carry tiles past its band window), so each cell's effective reach is the max of
+/// its own and every coarser cell's: the drop is a suffix by construction, and
+/// raising reach only KEEPS more cells, so nothing that could emit is ever cut.
+fn reachCut(cells: []const Cell, order: *std.ArrayList(usize), tier: u8) void {
+    var keep = order.items.len;
+    var eff: u8 = 0;
+    while (keep > 0) {
+        eff = @max(eff, cells[order.items[keep - 1]].reach);
+        if (tier <= eff) break;
+        keep -= 1;
+    }
+    order.shrinkRetainingCapacity(keep);
+}
+
 /// The per-tier partition: for every cell eligible at `tier` (band_floor ≤ tier ≤
 /// reach), walking finest→coarsest, `owned = coverage \ (∪ coverage of all finer
 /// eligible cells)`. The union of the returned `owned` regions equals the union of
@@ -98,13 +118,14 @@ pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     var order = std.ArrayList(usize).empty;
     defer order.deinit(gpa);
     for (cells, 0..) |c, i| {
-        if (c.band_floor <= tier and tier <= c.reach) try order.append(gpa, i);
+        if (c.band_floor <= tier) try order.append(gpa, i);
     }
     std.mem.sort(usize, order.items, cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
             return finerLess({}, cs[ia], cs[ib]);
         }
     }.lt);
+    reachCut(cells, &order, tier);
 
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
@@ -162,13 +183,14 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     var order = std.ArrayList(usize).empty;
     defer order.deinit(gpa);
     for (cells, 0..) |c, i| {
-        if (c.band_floor <= tier and tier <= c.reach) try order.append(gpa, i);
+        if (c.band_floor <= tier) try order.append(gpa, i);
     }
     std.mem.sort(usize, order.items, cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
             return finerLess({}, cs[ia], cs[ib]);
         }
     }.lt);
+    reachCut(cells, &order, tier);
 
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
@@ -189,14 +211,12 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         out.deinit(gpa);
     }
 
-    // Subtrahend pointer list, reused (cleared) each iteration. It only holds borrowed pointers
-    // into `covs`, so it stays tiny; `gpa` (not an arena) is deliberate below — the boolean
-    // intermediates MUST be freed as we go. `sa` caches every cell's coverage for the whole loop,
-    // so if the union/diff scratch lived there too it would never be reclaimed; a coarse cell
-    // unions hundreds of finer cells, and every cell's union piling up was the whole-district
-    // compose's memory blow-up (tens of GB). unionAll frees its running accumulator each step, so
-    // with `gpa` the union peaks at ~two polygons, and `uni` is freed right after the diff. Only
-    // the finished `owned` polygon is retained (in `gpa`, held by the partition).
+    // Subtrahend pointer list, reused (cleared) each iteration — it only holds borrowed
+    // pointers into `covs`, so it stays tiny. The boolean intermediates below deliberately
+    // do NOT live in `sa`: it caches every cell's coverage for the whole loop, so scratch
+    // parked there would never be reclaimed — a coarse cell unions hundreds of finer
+    // cells, and every cell's union piling up was a whole-district compose's memory
+    // blow-up (tens of GB).
     var subtr = std.ArrayList(Poly).empty;
     defer subtr.deinit(gpa);
 
@@ -594,6 +614,46 @@ test "reach cap: a cell beyond its tile reach drops out of finer tiers only" {
         try testing.expectEqual(@as(usize, 1), t9.len);
         try testing.expectEqual(@as(usize, 0), t9[0].index); // coarse back in the pool
         try testing.expect(boolean.pointInEvenOdd(t9[0].owned, 50, 50));
+    }
+}
+
+test "reach cap: non-monotone reach cuts only a suffix (effective reach keeps the finer cell)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Pathological input: the FINER cell has the LOWER reach (a scale-less cell that
+    // sorted finest but banded mid-ladder, or a foreign archive). Cutting it while the
+    // coarser cell stays would grow the coarse face over ground the finer cell used to
+    // mask — so the effective reach (max of own + all coarser) must keep it, and the
+    // partition must match the uncapped one exactly.
+    const coarse_cov = try boxPoly(a, 0, 0, 100, 100);
+    const fine_cov = try boxPoly(a, 40, 40, 60, 60);
+    const capped = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .reach = 255, .cov1 = &.{coarse_cov} },
+        .{ .cscl = 20_000, .band_floor = 9, .order = 0, .reach = 10, .cov1 = &.{fine_cov} },
+    };
+    const uncapped = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coarse_cov} },
+        .{ .cscl = 20_000, .band_floor = 9, .order = 0, .cov1 = &.{fine_cov} },
+    };
+
+    for ([_]bool{ false, true }) |indexed| {
+        const got = if (indexed) try ownedAtTierIndexed(a, &capped, 13) else try ownedAtTier(a, &capped, 13);
+        const want = if (indexed) try ownedAtTierIndexed(a, &uncapped, 13) else try ownedAtTier(a, &uncapped, 13);
+        try testing.expectEqual(want.len, got.len); // both cells kept
+        // Same owner at a probe point inside the fine box and one outside it.
+        for ([_][2]i64{ .{ 50, 50 }, .{ 10, 10 } }) |p| {
+            var want_owner: ?usize = null;
+            var got_owner: ?usize = null;
+            for (want) |oc| if (boolean.pointInEvenOdd(oc.owned, p[0], p[1])) {
+                want_owner = oc.index;
+            };
+            for (got) |oc| if (boolean.pointInEvenOdd(oc.owned, p[0], p[1])) {
+                got_owner = oc.index;
+            };
+            try testing.expectEqual(want_owner, got_owner);
+        }
     }
 }
 
