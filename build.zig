@@ -306,10 +306,10 @@ pub fn build(b: *std.Build) void {
     catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
     catalog_embed.addImport("colorprofile_registry", colorprofile_registry);
 
-    // The chart-bundle pipeline as a library module (bundle.bakeBundle): tiles +
-    // assets + manifest. Target-agnostic + libc (the sprite atlas builder), so the
-    // CLI baker AND libtile57.a (the C ABI, tile57_bake_bundle) build the SAME bundle
-    // over the shared singleton packages. See src/bundle.zig.
+    // The chart-bundle module: S-101 portrayal asset emission + the per-cell composite
+    // (ownership partition + on-demand compositor). Target-agnostic + libc (the sprite
+    // atlas builder), so the CLI baker AND libtile57.a share the SAME emitters over the
+    // shared singleton packages. See src/bundle.zig.
     const bundle_mod = b.createModule(.{
         .root_source_file = b.path("src/bundle.zig"),
         .link_libc = true,
@@ -577,7 +577,7 @@ pub fn build(b: *std.Build) void {
     _ = addPkgTest(b, compose_step, "src/scene/compose.zig", target, optimize, &compose_deps);
     _ = addPkgTest(b, test_step, "src/scene/compose.zig", target, optimize, &compose_deps);
 
-    // The chart-bundle module hosts the per-cell composite driver (composeArchives). Its full
+    // The chart-bundle module hosts the per-cell composite (composeTile / ComposeSource). Its full
     // dep set (engine + assets/sprite/catalog) needs libc, so create the test module directly
     // rather than via addPkgTest (which omits link_libc).
     const bundle_test_mod = b.createModule(.{

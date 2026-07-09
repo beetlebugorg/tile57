@@ -1,10 +1,10 @@
 //! tile57 — the offline S-57 -> PMTiles baker / inspector CLI.
 //!
 //! Subcommands:
-//!   bake <cell.000> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N] [update.001 ...]
-//!       Decode an S-57 base cell (applying any update files), portray it, and
-//!       pre-bake every web-mercator MVT tile covering the cell's bounds across
-//!       the requested zoom range into a clustered PMTiles archive.
+//!   bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]
+//!       Bake each cell to <out-dir>/tiles/<STEM>.pmtiles and write the ownership
+//!       partition to <out-dir>/partition.tpart — the live-composite structure a
+//!       runtime compositor serves tiles from on demand.
 //!   inspect <file.pmtiles> [z x y]
 //!       Parse a PMTiles archive (header + directory) and, if z/x/y is given,
 //!       read+gunzip+decode that tile and list its MVT layers.
@@ -23,7 +23,6 @@ const std = @import("std");
 const common = @import("common.zig");
 
 const bake = @import("bake.zig");
-const compose = @import("compose.zig");
 const compose_tile = @import("compose_tile.zig");
 const assets = @import("assets.zig");
 const sprite = @import("sprite.zig");
@@ -53,9 +52,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "bake")) {
         return bake.run(io, arena, args);
-    }
-    if (std.mem.eql(u8, sub, "compose")) {
-        return compose.run(io, arena, args);
     }
     if (std.mem.eql(u8, sub, "compose-tile")) {
         return compose_tile.run(io, arena, args);

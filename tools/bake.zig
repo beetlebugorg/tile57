@@ -1,67 +1,38 @@
+//! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]` — produce a
+//! LIVE-composite structure on disk. Bake each cell to its OWN native-scale PMTiles under
+//! `<out-dir>/tiles/` (with its M_COVR coverage embedded in the metadata), then open a resident
+//! compositor over them and write the ownership partition to `<out-dir>/partition.tpart`. There is
+//! NO merged archive: a runtime compositor (`ComposeSource` / the `compose-tile` command / the C
+//! ABI `tile57_compose_*`) serves any tile ON DEMAND from this structure, so the per-cell bakes stay
+//! dumb + cacheable and the partition holds all cross-cell ownership. Native scale only — deeper
+//! coarse zooms are left to the client camera + MapLibre overzoom.
+//!
+//! `--from-archives`: `<base>` is ALREADY a directory of per-cell archives (*.pmtiles / *.cell.tmp);
+//! skip the bake and only (re)build the partition sidecar into `<out-dir>/partition.tpart` over them
+//! — the fast re-partition loop over a tiles dir.
+
 const std = @import("std");
-const engine = @import("engine");
-const assets = @import("assets");
-const bundle = @import("bundle"); // chart-bundle pipeline (asset emitters etc.) — the lib owns it
+const chart = @import("chart"); // per-cell bake (bakeCellBytes) + freeBytes
+const bundle = @import("bundle"); // openComposeSourceFiles + serializePartition (the resident compositor)
 const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
 const resolveRulesDir = common.resolveRulesDir;
-const resolveCatalogDir = common.resolveCatalogDir;
-const VERSION = common.VERSION;
-const DEFAULT_MINZOOM = common.DEFAULT_MINZOOM;
-const DEFAULT_MAXZOOM = common.DEFAULT_MAXZOOM;
-const DEFAULT_LRU_BUDGET = common.DEFAULT_LRU_BUDGET;
-const DEFAULT_SUPER_DZ = common.DEFAULT_SUPER_DZ;
 
-/// `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--catalog DIR]
-///  [--minzoom N] [--maxzoom N] [--lru N] [--superdz N] [--created ISO8601]` —
-/// THE bake command. A single cell or a whole ENC_ROOT, streamed through the same
-/// lazy banded bake into a self-contained chart bundle: tiles/chart.pmtiles +
-/// assets/colortables.json + sprite-mln + style-{day,dusk,night}.json +
-/// manifest.json (pins schema_version, couples tiles to portrayal).
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var rules: ?[]const u8 = null;
-    var catalog: ?[]const u8 = null;
-    var created: []const u8 = "";
-    var minzoom: u8 = DEFAULT_MINZOOM;
-    var maxzoom: u8 = DEFAULT_MAXZOOM;
-    var lru: usize = DEFAULT_LRU_BUDGET; // lazy-bake tuning: parsed cells held resident
-    var super_dz: u8 = DEFAULT_SUPER_DZ; // lazy-bake tuning: spatial super-tile depth
-    var format: engine.scene.TileFormat = .mlt; // tile encoding: mlt (default) or mvt
-    var existing: []const u8 = ""; // cross-pack best-available: a peer pack's ENC_ROOT
-    var partition_debug = false; // emit the ownership-partition debug PMTiles instead of a bundle
-    var part_band: i8 = -1; // partition-debug: <0 = band governing each zoom; 0..5 = one band's map
+    var from_archives = false; // <base> is a dir of pre-baked archives — skip baking, only build the partition
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             out = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--existing")) {
-            existing = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--catalog")) {
-            catalog = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--created")) {
-            created = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--minzoom")) {
-            minzoom = f.int(u8, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--maxzoom")) {
-            maxzoom = f.int(u8, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--lru")) {
-            lru = f.int(usize, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--superdz")) {
-            super_dz = f.int(u8, arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--format")) {
-            const v = f.val(arg) orelse return;
-            format = if (std.mem.eql(u8, v, "mlt")) .mlt else if (std.mem.eql(u8, v, "mvt")) .mvt else return usageErr("--format must be mvt or mlt");
-        } else if (std.mem.eql(u8, arg, "--partition-debug")) {
-            partition_debug = true;
-        } else if (std.mem.eql(u8, arg, "--band")) {
-            const v = f.val(arg) orelse return;
-            part_band = bandArg(v) orelse return usageErr("--band must be a rank 0..5 or a name (berthing..overview)");
+        } else if (std.mem.eql(u8, arg, "--from-archives")) {
+            from_archives = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -70,59 +41,95 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             return usageErr("unexpected argument (cell updates are auto-discovered next to the .000)");
         }
     }
-
     const base_path = base orelse return usageErr("missing <cell.000 | ENC_ROOT> input");
     const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
-    if (minzoom > maxzoom) return usageErr("--minzoom must be <= --maxzoom");
-    if (maxzoom > 24) return usageErr("--maxzoom too large (max 24)");
-    if (lru < 1) return usageErr("--lru must be >= 1");
+    const rules_dir = resolveRulesDir(rules);
 
-    // Debug: emit the ownership partition (which cell owns which ground per band) as a
-    // single PMTiles with no portrayed content, for eyeballing the composite quilt.
-    if (partition_debug) {
-        // Full overview→approach range by default (z13+ shows harbor detail but the
-        // face-tile count grows ~4^z, so raise --maxzoom on demand).
-        const dbg_minz: u8 = if (minzoom == DEFAULT_MINZOOM) 0 else minzoom;
-        const dbg_maxz: u8 = if (maxzoom == DEFAULT_MAXZOOM) 12 else maxzoom;
-        const nc = bundle.bakePartitionDebug(io, a, base_path, out_dir, dbg_minz, dbg_maxz, part_band) catch |err| {
-            std.debug.print("error: partition-debug bake of {s} failed ({s})\n", .{ base_path, @errorName(err) });
-            return;
-        };
-        std.debug.print("partition-debug: {d} cell(s) -> {s} (z{d}-{d}, band {d}, layer \"partition\": cell/cscl/band/tier/oi/color)\n", .{ nc, out_dir, dbg_minz, dbg_maxz, part_band });
-        return;
+    // The per-cell archive paths that back the compositor.
+    var archive_paths = std.ArrayList([]const u8).empty;
+
+    if (from_archives) {
+        // <base> is a directory of pre-baked *.pmtiles / *.cell.tmp — read them in place.
+        var dir = std.Io.Dir.cwd().openDir(io, base_path, .{ .iterate = true }) catch return usageErr("cannot open archives dir");
+        defer dir.close(io);
+        var walker = dir.walk(a) catch return usageErr("cannot walk archives dir");
+        defer walker.deinit();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.path, ".cell.tmp") and !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
+            archive_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
+        }
+        if (archive_paths.items.len == 0) return usageErr("no *.pmtiles / *.cell.tmp archives found");
+        std.debug.print("re-partition: {d} pre-baked archives from {s}\n", .{ archive_paths.items.len, base_path });
+    } else {
+        // Bake each cell (dedup by stem — a boundary cell shared by two districts bakes once)
+        // to its own <out-dir>/tiles/<STEM>.pmtiles.
+        const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
+        try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
+
+        var cell_paths = std.ArrayList([]const u8).empty;
+        if (std.mem.endsWith(u8, base_path, ".000")) {
+            try cell_paths.append(a, base_path);
+        } else {
+            var dir = std.Io.Dir.cwd().openDir(io, base_path, .{ .iterate = true }) catch return usageErr("cannot open ENC_ROOT");
+            defer dir.close(io);
+            var seen = std.StringHashMap(void).init(a);
+            var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
+            defer walker.deinit();
+            while (walker.next(io) catch null) |entry| {
+                if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
+                const stem = std.fs.path.stem(std.fs.path.basename(entry.path));
+                if (seen.contains(stem)) continue;
+                seen.put(a.dupe(u8, stem) catch continue, {}) catch {};
+                cell_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
+            }
+        }
+        if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
+
+        for (cell_paths.items) |cp| {
+            const arc = (chart.bakeCellBytes(cp, rules_dir) catch |err| {
+                std.debug.print("  warn: bake of {s} failed ({s}); skipping\n", .{ cp, @errorName(err) });
+                continue;
+            }) orelse continue; // no M_COVR coverage — not a composable cell
+            defer chart.freeBytes(arc);
+            const stem = std.fs.path.stem(std.fs.path.basename(cp));
+            const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
+            const arc_path = std.fs.path.join(a, &.{ tiles_dir, name }) catch continue;
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = arc_path, .data = arc }) catch |err| {
+                std.debug.print("  warn: could not write {s} ({s})\n", .{ arc_path, @errorName(err) });
+                continue;
+            };
+            archive_paths.append(a, arc_path) catch {};
+            if (archive_paths.items.len % 25 == 0) std.debug.print("  baked {d}/{d} cells…\n", .{ archive_paths.items.len, cell_paths.items.len });
+        }
+        if (archive_paths.items.len == 0) return usageErr("no cells baked (no .000 with M_COVR found)");
     }
 
-    // The whole tiles + assets + manifest pipeline lives in the `bundle` lib module
-    // (bundle.bakeBundle) so any consumer (the C ABI, a Go/JS binding) emits the same
-    // package; the CLI just resolves args -> options and prints the summary.
-    const res = bundle.bakeBundle(io, a, .{
-        .input = base_path,
-        .out_dir = out_dir,
-        .rules_dir = resolveRulesDir(rules),
-        .catalog_dir = resolveCatalogDir(catalog),
-        .generator = VERSION,
-        .created = created,
-        .minzoom = minzoom,
-        .maxzoom = maxzoom,
-        .lru = lru,
-        .super_dz = super_dz,
-        .format = format,
-        .existing_input = existing,
-    }) catch |err| {
-        std.debug.print("error: cannot bake {s} ({s})\n", .{ base_path, @errorName(err) });
+    // Sort the archive paths so the ownership tie-break (which falls back to input order for
+    // archives carrying identical (date, name) keys) and the partition it produces are deterministic.
+    std.mem.sort([]const u8, archive_paths.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+
+    // Open the resident compositor over the per-cell archives (mmap'd) and serialize its ownership
+    // partition to <out-dir>/partition.tpart — the sidecar a runtime open loads to skip the build.
+    const src = (bundle.openComposeSourceFiles(io, a, archive_paths.items, null) catch |err| {
+        std.debug.print("error: open compose source failed ({s})\n", .{@errorName(err)});
+        return;
+    }) orelse return usageErr("no coverage-carrying archives (nothing to compose)");
+    defer src.deinit();
+
+    const part_bytes = src.serializePartition(a) catch |err| {
+        std.debug.print("error: partition serialization failed ({s})\n", .{@errorName(err)});
         return;
     };
+    const part_path = try std.fs.path.join(a, &.{ out_dir, "partition.tpart" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_path, .data = part_bytes });
 
     std.debug.print(
-        "bundled {d} cell(s) -> {s}/\n  tiles/chart.pmtiles + assets/colortables.json + sprite-mln + style-{{day,dusk,night}}.json + manifest.json (schema {s})\n",
-        .{ res.cell_count, out_dir, assets.SCHEMA_VERSION },
+        "live structure -> {s}/\n  {d} per-cell archive(s){s} + partition.tpart (serve z {d}..{d})\n",
+        .{ out_dir, src.readers.len, if (from_archives) " (in place)" else " under tiles/", src.minz, src.loop_max },
     );
-}
-
-// Parse a --band value: a rank 0..5, or a navigational-purpose name (finest→coarsest).
-fn bandArg(v: []const u8) ?i8 {
-    const names = [_][]const u8{ "berthing", "harbor", "approach", "coastal", "general", "overview" };
-    for (names, 0..) |nm, i| if (std.mem.eql(u8, v, nm)) return @intCast(i);
-    const n = std.fmt.parseInt(i8, v, 10) catch return null;
-    return if (n < 0 or n > 5) null else n;
 }

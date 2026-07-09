@@ -8,13 +8,13 @@
 //!
 //! This is the single source of truth; the C ABI (capi.zig / include/tile57.h)
 //! is a thin shim over these types. The engine uses a single thread-safe
-//! general-purpose allocator internally — `tile`/`bakeArchive` return bytes owned
-//! by it; free them with `freeBytes`.
+//! general-purpose allocator internally — the render / bake / JSON entry points
+//! return bytes owned by it; free them with `freeBytes`.
 //!
-//! Threading: a Chart is NOT internally synchronized — don't call `tile` on the
-//! same Chart from multiple threads concurrently (the tile cache + LRU mutate
-//! without a lock). Distinct charts are independent. `openCells`/`bakeArchive`
-//! parallelize internally over cores.
+//! Threading: a Chart is NOT internally synchronized — don't call its render /
+//! query methods on the same Chart from multiple threads concurrently. Distinct
+//! charts are independent. `openCells`/`bakeArchive` parallelize internally over
+//! cores.
 
 const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;
@@ -89,7 +89,7 @@ pub const CellBytes = extern struct {
 /// host holds only the working set's bytes — not the whole ENC_ROOT.
 pub const CellReadFn = *const fn (user: ?*anyopaque, index: usize, out: *CellBytes) callconv(.c) bool;
 
-/// Free bytes returned by `Chart.tile` / `bakeArchive` (page-allocator owned).
+/// Free bytes returned by the render / bake / JSON entry points (page-allocator owned).
 pub fn freeBytes(bytes: []u8) void {
     gpa.free(bytes);
 }
@@ -405,10 +405,6 @@ fn lazyFreeCell(lc: *LazyCell) void {
     if (lc.name.len > 0) gpa.free(@constCast(lc.name));
 }
 
-fn tileKey(z: u8, x: u32, y: u32) u64 {
-    return (@as(u64, z) << 48) | (@as(u64, x) << 24) | @as(u64, y);
-}
-
 // Resolve the S-101 rules dir: explicit arg, else TILE57_S101_RULES, else "" —
 // which uses the rules embedded in the binary (the Lua searcher in lua_shim.c),
 // so no on-disk catalogue is required. A non-empty path overrides the embedded
@@ -713,11 +709,9 @@ pub const Chart = struct {
     // Defaults ON; the C ABI open can turn it off for lean tiles. (No effect on a
     // PMTiles/reader backend — those tiles are already baked.)
     pick_attrs: bool = true,
-    // Encoding for LIVE-generated tiles (cell backends). Defaults to MVT so
-    // existing chart-handle consumers (MVT-only renderers) are unaffected; a host
-    // whose renderer decodes MLT opts in via setTileFormat. A PMTiles/reader
-    // backend ignores it — stored tiles serve verbatim in their baked encoding
-    // (see tileType).
+    // The tile encoding reported for a cell backend (via tileType); fixed at MVT.
+    // A PMTiles/reader backend ignores it — stored tiles serve verbatim in their
+    // baked encoding (see tileType).
     tile_format: scene.TileFormat = .mvt,
     // A live cell baked to an in-memory PMTiles (openCellBaked) is a .reader for
     // fast render, but still carries the source cell's real M_COVR coverage and
@@ -826,7 +820,6 @@ pub const Chart = struct {
     /// bytes on demand for the working set (freed on LRU eviction) — the caller hands
     /// over only a path and the engine holds only what tiles need. The chart owns the
     /// retained Io + Dir for its lifetime (freed in deinit). Errors if no cell parses.
-    /// TODO(chart-api): unify the enumeration with the baker's bakeRoot (parity-gated).
     pub fn openPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
         const threaded = try gpa.create(std.Io.Threaded);
         errdefer gpa.destroy(threaded);
@@ -935,9 +928,9 @@ pub const Chart = struct {
         };
     }
 
-    /// The encoding `tile` returns: a PMTiles backend reports its archive's stored
-    /// tile type (tiles serve verbatim); a cell backend reports its live
-    /// generation format (`tile_format`). Non-vector archive types (png/…) are
+    /// The tile encoding this chart's tiles carry: a PMTiles backend reports its
+    /// archive's stored tile type (tiles serve verbatim); a cell backend reports its
+    /// live generation format (`tile_format`). Non-vector archive types (png/…) are
     /// reported as-is.
     pub fn tileType(self: *Chart) pmtiles.TileType {
         return switch (self.backend) {
@@ -947,19 +940,6 @@ pub const Chart = struct {
                 .mlt => .mlt,
             },
         };
-    }
-
-    /// Select the encoding for LIVE-generated tiles (cell backends; no-op for a
-    /// baked PMTiles backend — its stored encoding is fixed). Drops the tile
-    /// cache so already-served coordinates regenerate in the new format.
-    pub fn setTileFormat(self: *Chart, fmt: scene.TileFormat) void {
-        switch (self.backend) {
-            .reader => return,
-            .cell, .cells => {},
-        }
-        if (self.tile_format == fmt) return;
-        self.tile_format = fmt;
-        self.clearCache();
     }
 
     /// Min/max zoom served (PMTiles: archive range; cell: 0..18).
@@ -1067,36 +1047,6 @@ pub const Chart = struct {
             },
             else => return null,
         }
-    }
-
-    /// Fetch tile (z,x,y) as decompressed vector-tile bytes in the chart's tile
-    /// encoding (`tileType`): a PMTiles backend serves the stored bytes verbatim
-    /// (MVT or MLT, whatever was baked); a cell backend generates in
-    /// `tile_format`. Returns null for an empty / absent tile, else
-    /// page-allocator-owned bytes (free with `freeBytes`). Cached per source, so
-    /// re-requests are cheap and deterministic.
-    pub fn tile(self: *Chart, z: u8, x: u32, y: u32) !?[]u8 {
-        const key = tileKey(z, x, y);
-        if (self.cache.get(key)) |cached| {
-            if (cached.len == 0) return null;
-            return try gpa.dupe(u8, cached);
-        }
-        // Baked tiles are the ONLY tile path: cell-backed charts exist for
-        // metadata/inspection (cellsJson/featuresJson/scamin/renderView on a
-        // single cell), never on-demand tile generation — bake first, serve
-        // the archive.
-        const bytes: []u8 = switch (self.backend) {
-            .reader => |*r| (r.getTile(gpa, z, x, y) catch return error.TileGen) orelse try gpa.alloc(u8, 0),
-            .cell, .cells => return error.TileGen,
-        };
-        if (self.cache.count() >= self.cache_max) {
-            var cit = self.cache.valueIterator();
-            while (cit.next()) |v| gpa.free(v.*);
-            self.cache.clearRetainingCapacity();
-        }
-        self.cache.put(key, bytes) catch {}; // best-effort; cache owns `bytes` on success
-        if (bytes.len == 0) return null;
-        return try gpa.dupe(u8, bytes);
     }
 
     /// Render a VIEW of the chart — centre + fractional zoom + pixel size —
@@ -1501,13 +1451,6 @@ pub const Chart = struct {
         if (n == 0) return null;
         try out.appendSlice(a, "]}");
         return try gpa.dupe(u8, out.items);
-    }
-
-    /// Drop the in-memory tile cache (bounds memory in long-running hosts).
-    pub fn clearCache(self: *Chart) void {
-        var it = self.cache.valueIterator();
-        while (it.next()) |v| gpa.free(v.*);
-        self.cache.clearRetainingCapacity();
     }
 
     /// The distinct SCAMIN denominators present in the source, ascending. The host
@@ -1935,7 +1878,7 @@ const BakeWork = struct {
                 portrayal_plain = cp.plain;
                 portrayal_simplified = cp.simplified;
             } else |_| {}
-            // Build the geometry cache for EVERY cell (as bakeRoot does — unconditional).
+            // Build the geometry cache for EVERY cell, unconditionally.
             // `build_geo` (cacheGeoForBand) gated it to the finer bands, but coarse cells are
             // exactly the ones that hurt without it: the geo cache both cheapens per-tile
             // reprojection AND lets buildLabelCache assemble each feature's parts to populate
@@ -1944,7 +1887,7 @@ const BakeWork = struct {
             geo = scene.buildGeoCache(p.allocator(), &cell) catch null;
             // Per-feature label-point (polylabel) cache — tile-invariant, so compute it ONCE
             // per cell (only for Text/centred-symbol features) instead of re-running the search
-            // for every tile a feature touches. Mirrors bakeRoot; arena outlives via c.arenas.
+            // for every tile a feature touches; the arena outlives the call via c.arenas.
             cell.label_cache = scene.buildLabelCache(p.allocator(), &cell, geo, portrayal) catch null;
         }
         // M_COVR coverage + scale for per-cell quilting (allocate into the cell's own
