@@ -178,16 +178,28 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         out.deinit(gpa);
     }
 
+    // Subtrahend pointer list, reused (cleared) each iteration. It only holds borrowed pointers
+    // into `covs`, so it stays tiny; `gpa` (not an arena) is deliberate below — the boolean
+    // intermediates MUST be freed as we go. `sa` caches every cell's coverage for the whole loop,
+    // so if the union/diff scratch lived there too it would never be reclaimed; a coarse cell
+    // unions hundreds of finer cells, and every cell's union piling up was the whole-district
+    // compose's memory blow-up (tens of GB). unionAll frees its running accumulator each step, so
+    // with `gpa` the union peaks at ~two polygons, and `uni` is freed right after the diff. Only
+    // the finished `owned` polygon is retained (in `gpa`, held by the partition).
+    var subtr = std.ArrayList(Poly).empty;
+    defer subtr.deinit(gpa);
+
     for (order.items, 0..) |ci, k| {
         // owned = cov \ (∪ finer cells whose bbox overlaps this one).
-        var subtr = std.ArrayList(Poly).empty;
+        subtr.clearRetainingCapacity();
         for (0..k) |j| {
-            if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(sa, covs[j]);
+            if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(gpa, covs[j]);
         }
         const owned = if (subtr.items.len == 0)
             try dupePolygonGpa(gpa, covs[k])
         else blk: {
-            const uni = try boolean.unionAll(sa, subtr.items);
+            const uni = try boolean.unionAll(gpa, subtr.items);
+            defer boolean.freePolygon(gpa, uni);
             break :blk try boolean.compute(gpa, covs[k], uni, .diff);
         };
         try out.append(gpa, .{ .index = ci, .owned = owned });
