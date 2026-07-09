@@ -37,37 +37,6 @@ export fn tile57_version() callconv(.c) [*:0]const u8 {
     return version_string;
 }
 
-// One ENC cell's bytes for the C ABI. Mirrors tile57_cell in tile57.h.
-const CellInput = extern struct {
-    base: [*]const u8,
-    base_len: usize,
-    updates: ?[*]const [*]const u8,
-    update_lens: ?[*]const usize,
-    update_count: usize,
-    // Source cell name (NUL-terminated, e.g. "US4MD81M") for the pick report's
-    // "source cell" badge. NULL/"" = omitted. Appended after the original fields so
-    // a host that zero-inits the struct gets the no-name (NULL) behaviour.
-    name: ?[*:0]const u8 = null,
-};
-
-// Convert the C CellInput[] into a Zig chart.CellInput[] (slices into the host's
-// borrowed buffers). Allocates the slice-of-slices into `a`; the engine copies
-// what it keeps, so the caller frees the conversion arrays after the call.
-fn toCellInputs(a: std.mem.Allocator, c_cells: []const CellInput) ?[]chart.CellInput {
-    const out = a.alloc(chart.CellInput, c_cells.len) catch return null;
-    for (c_cells, 0..) |cc, i| {
-        var ups: []const []const u8 = &.{};
-        if (cc.updates != null and cc.update_lens != null and cc.update_count > 0) {
-            const arr = a.alloc([]const u8, cc.update_count) catch return null;
-            var k: usize = 0;
-            while (k < cc.update_count) : (k += 1) arr[k] = cc.updates.?[k][0..cc.update_lens.?[k]];
-            ups = arr;
-        }
-        out[i] = .{ .base = cc.base[0..cc.base_len], .updates = ups, .name = spanOpt(cc.name) orelse "" };
-    }
-    return out;
-}
-
 /// Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
 /// same directory) — or a whole ENC_ROOT directory — via the STREAMING path-open: cell
 /// metadata (name/scale/M_COVR) is enumerated up front and tiles are baked lazily per
@@ -106,75 +75,6 @@ export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, out: *[*]u8, out_len: *us
         return 1;
     }
     return 0;
-}
-
-/// Combine N per-cell PMTiles archives (each from tile57_bake_cell_bytes, coverage
-/// embedded) into one merged PMTiles via the ownership partition. The archives are passed
-/// CONCATENATED in `blob` (total `blob_len` bytes), split by the `n` `lens`
-/// (sum(lens) == blob_len). Returns 1 with the composed archive in *out / *out_len (free
-/// with tile57_free), 0 if nothing composed, -1 on error. See tile57.h.
-export fn tile57_compose(
-    blob: ?[*]const u8,
-    blob_len: usize,
-    lens: ?[*]const usize,
-    n: usize,
-    out: *[*]u8,
-    out_len: *usize,
-) callconv(.c) c_int {
-    const b = blob orelse return -1;
-    const ls = lens orelse return -1;
-    if (n == 0) return 0;
-    const archives = gpa.alloc([]const u8, n) catch return -1;
-    defer gpa.free(archives);
-    var off: usize = 0;
-    for (0..n) |i| {
-        if (off + ls[i] > blob_len) return -1; // lengths overrun the blob
-        archives[i] = b[off .. off + ls[i]];
-        off += ls[i];
-    }
-    const composed = bundle.composeArchives(gpa, archives) catch return -1;
-    if (composed) |c| {
-        out.* = c.ptr;
-        out_len.* = c.len;
-        return 1;
-    }
-    return 0;
-}
-
-/// Streaming disk-to-disk composite: combine the `n` per-cell PMTiles at `paths` (each from
-/// tile57_bake_cell_bytes, written to disk) into one merged PMTiles at `out_path`. The per-cell
-/// files are mmap'd (never all resident) and the output is streamed, so a whole district
-/// composes in bounded memory. Writes the count of contributing cells to *out_cells if
-/// non-null. Returns 1 on success, 0 if nothing composed, -1 on error. See tile57.h.
-export fn tile57_compose_files(
-    paths: ?[*]const ?[*:0]const u8,
-    n: usize,
-    out_path: ?[*:0]const u8,
-    out_cells: ?*u32,
-    on_progress: ?*const fn (ctx: ?*anyopaque, zoom: u32, min_zoom: u32, max_zoom: u32, done: u64, total: u64) callconv(.c) void,
-    ctx: ?*anyopaque,
-) callconv(.c) c_int {
-    const ps = paths orelse return -1;
-    const op = spanOpt(out_path) orelse return -1;
-    if (n == 0) return 0;
-    const list = gpa.alloc([]const u8, n) catch return -1;
-    defer gpa.free(list);
-    for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return -1;
-
-    // Optional streaming progress: a stack-lived sink the compose walks the zoom ladder through.
-    var prog: bundle.ComposeProgress = undefined;
-    var pptr: ?*bundle.ComposeProgress = null;
-    if (on_progress) |cb| {
-        prog = .{ .cb = cb, .ctx = ctx };
-        pptr = &prog;
-    }
-
-    // The lib has no std.process.Init; stand up a threaded std.Io for the file I/O.
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const nc = bundle.composeArchivesToFile(threaded.io(), gpa, list, op, pptr) catch return -1;
-    if (out_cells) |p| p.* = @intCast(nc);
-    return if (nc > 0) 1 else 0;
 }
 
 /// Coverage/zoom summary of a resident compositor, filled by tile57_compose_meta.
@@ -304,13 +204,6 @@ export fn tile57_pmtiles_metadata(pmtiles_ptr: ?[*]const u8, len: usize, out: *[
     return 0;
 }
 
-/// Open a whole ENC_ROOT directory (or a single cell) as a lazily-baked chart — the
-/// `.cells` backend, for tile fetch / bake, not live render_surface_cb. See tile57.h.
-export fn tile57_charts_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
-    const p = spanOpt(path) orelse return null;
-    return Chart.openPath(p, null, true) catch null;
-}
-
 /// Populate the process-global read-only registries (S-100 catalogue + linestyles) on
 /// the calling thread. Call ONCE on the main thread before opening/baking cells from
 /// worker threads, so concurrent bake/render is race-free. See tile57.h.
@@ -436,116 +329,6 @@ export fn tile57_chart_coverage(handle: ?*Chart, cb: ?*const CCoverageCb) callco
     return 0;
 }
 
-// Progress callback for tile57_bake_pmtiles / tile57_bake_bundle (matches the header
-// typedef + chart.Progress + bake_enc.Progress).
-const BakeProgress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, total: usize, band_index: u8, band_count: u8, band_name: ?[*:0]const u8) callconv(.c) void;
-
-// Shared bake options. Mirrors tile57_bake_opts in tile57.h. catalog_dir/created
-// are read only by tile57_bake_bundle.
-const CBakeOpts = extern struct {
-    rules_dir: ?[*:0]const u8,
-    catalog_dir: ?[*:0]const u8,
-    created: ?[*:0]const u8,
-    minzoom: u8,
-    maxzoom: u8,
-    omit_pick_attrs: bool,
-    progress: BakeProgress,
-    progress_user: ?*anyopaque,
-    // Baked tile encoding: 0 = engine default (MLT), TILE57_TILE_TYPE_MVT,
-    // TILE57_TILE_TYPE_MLT. Appended for ABI-append-safety (a zero-initialised
-    // struct bakes the default).
-    format: u8,
-};
-
-// The passed opts or all-defaults (matching NULL opts = every field at its default).
-fn bakeOptsOr(opts: ?*const CBakeOpts) CBakeOpts {
-    return if (opts) |p| p.* else .{
-        .rules_dir = null,
-        .catalog_dir = null,
-        .created = null,
-        .minzoom = 0,
-        .maxzoom = 0,
-        .omit_pick_attrs = false,
-        .progress = null,
-        .progress_user = null,
-        .format = 0,
-    };
-}
-
-// tile57_bake_opts.format -> engine TileFormat (0 = default = MLT).
-fn bakeFormat(v: u8) @import("scene").TileFormat {
-    return if (v == TILE_TYPE_MVT) .mvt else .mlt;
-}
-
-/// Bake an ENC_ROOT into ONE PMTiles archive. See tile57.h. 1=ok, 0=empty, -1=error.
-export fn tile57_bake_pmtiles(
-    cells_ptr: [*]const CellInput,
-    count: usize,
-    opts: ?*const CBakeOpts,
-    out: *[*]u8,
-    out_len: *usize,
-) callconv(.c) c_int {
-    const o = bakeOptsOr(opts);
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const cells = toCellInputs(arena.allocator(), cells_ptr[0..count]) orelse return -1;
-    const archive = chart.bakeArchive(cells, spanOpt(o.rules_dir), o.minzoom, o.maxzoom, bakeFormat(o.format), !o.omit_pick_attrs, o.progress, o.progress_user, null) catch return -1;
-    if (archive) |a| {
-        out.* = a.ptr;
-        out_len.* = a.len;
-        return 1;
-    }
-    return 0;
-}
-
-// Manifest generator string for bake_bundle (matches the CLI's "tile57 0.1.0").
-const generator = "tile57 " ++ version_string;
-
-/// Bake a single cell.000 OR a whole ENC_ROOT directory (on-disk paths) into a
-/// self-contained chart bundle written under out_dir — the SAME package the
-/// `tile57 bake … -o out/` CLI emits (tiles/chart.pmtiles with scamin+vector_layers
-/// metadata + assets/{colortables,linestyles}.json + sprite-mln + per-scheme
-/// style-{day,dusk,night}.json + manifest.json). rules_dir/catalog_dir NULL or ""
-/// use the catalogue embedded in the library. created NULL/"" leaves the manifest
-/// "created" unset (else an ISO8601 stamp). progress may be NULL (the built-in
-/// console progress is used). out_cell_count / out_bbox (w,s,e,n) are optional.
-/// 1=ok, 0=nothing covered (no geometry), -1=error. See tile57.h.
-export fn tile57_bake_bundle(
-    input: [*:0]const u8,
-    out_dir: [*:0]const u8,
-    opts: ?*const CBakeOpts,
-    out_cell_count: ?*u32,
-    out_bbox: ?*[4]f64,
-) callconv(.c) c_int {
-    const o = bakeOptsOr(opts);
-    // The bundle pipeline does filesystem I/O (read ENC, write the bundle dir); the
-    // lib has no std.process.Init, so stand up a threaded std.Io for the call.
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    // Scratch arena: bakeBundle's allocations (paths, manifest, styles, cell names)
-    // are all consumed by the on-disk writes, so they're freed when this returns.
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const res = bundle.bakeBundle(io, arena.allocator(), .{
-        .input = std.mem.span(input),
-        .out_dir = std.mem.span(out_dir),
-        .rules_dir = spanOpt(o.rules_dir) orelse "",
-        .catalog_dir = spanOpt(o.catalog_dir) orelse "",
-        .generator = generator,
-        .created = spanOpt(o.created) orelse "",
-        .minzoom = o.minzoom,
-        .maxzoom = o.maxzoom,
-        .format = bakeFormat(o.format),
-        .pick_attrs = !o.omit_pick_attrs,
-        .progress = o.progress,
-        .progress_user = o.progress_user,
-    }) catch |err| return if (err == error.NoGeometry) 0 else -1;
-    if (out_cell_count) |p| p.* = @intCast(res.cell_count);
-    if (out_bbox) |p| p.* = res.bounds;
-    return 1;
-}
-
 /// Bake the ownership-partition DEBUG tiles from an ENC_ROOT (on-disk path) into a
 /// single PMTiles at out_path: the composited faces (which cell renders which ground
 /// at each band), tagged cell/cscl/band/tier/oi/color, NO portrayed content — for a
@@ -591,27 +374,6 @@ export fn tile57_chart_scamin(handle: ?*Chart, out: *[*]i32, out_len: *usize) ca
     out.* = @ptrCast(vals.ptr); // SCAMIN denominators fit in int32 (max ~2^31)
     out_len.* = vals.len;
     return 1;
-}
-
-/// Fetch tile (z,x,y) as decompressed vector-tile bytes in the chart's tile
-/// encoding (chart_info.tile_type: stored type for a PMTiles backend, the live
-/// generation format for a cell backend). 1=OK + out/out_len, 0=empty, -1=error.
-export fn tile57_chart_tile(
-    handle: ?*Chart,
-    z: u8,
-    x: u32,
-    y: u32,
-    out: *[*]u8,
-    out_len: *usize,
-) callconv(.c) c_int {
-    const s = handle orelse return -1;
-    const r = s.tile(z, x, y) catch return -1;
-    if (r) |bytes| {
-        out.* = bytes.ptr;
-        out_len.* = bytes.len;
-        return 1;
-    }
-    return 0;
 }
 
 /// Render a VIEW of the chart (centre + fractional zoom + pixel size) to PNG
@@ -828,20 +590,6 @@ export fn tile57_chart_render_surface_cb(
 export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {
     const p = ptr orelse return;
     chart.freeBytes(@as([*]u8, @ptrCast(p))[0..len]);
-}
-
-/// Drop the in-memory tile cache (bounds memory in long-running hosts).
-export fn tile57_chart_clear_cache(handle: ?*Chart) callconv(.c) void {
-    if (handle) |s| s.clearCache();
-}
-
-/// Select the encoding for LIVE-generated tiles on a cell-backed chart
-/// (0 = engine default (MLT), TILE57_TILE_TYPE_MVT, TILE57_TILE_TYPE_MLT).
-/// No-op for a baked PMTiles chart — its stored encoding is fixed. Changing the
-/// format drops the tile cache so served coordinates regenerate. The result is
-/// reported by chart_info.tile_type. See tile57.h.
-export fn tile57_chart_set_tile_format(handle: ?*Chart, fmt: u8) callconv(.c) void {
-    if (handle) |s| s.setTileFormat(bakeFormat(fmt));
 }
 
 // ---- portrayal asset generation (in-memory; mirrors tile57.h) --------------
