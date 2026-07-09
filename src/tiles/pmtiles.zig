@@ -283,6 +283,11 @@ pub const Reader = struct {
     header: Header,
     root: []Entry,
     arena: std.heap.ArenaAllocator,
+    // Deserialized leaf directories by leaf offset. A compositor probes a reader once
+    // per (tile, pass); re-deserializing the same leaf into the arena on EVERY probe
+    // grew it without bound on directory-heavy archives, so each leaf is decoded once
+    // and reused. Arena-backed (freed wholesale by deinit).
+    leaves: std.AutoHashMapUnmanaged(u64, []Entry) = .empty,
 
     pub fn init(gpa: Allocator, bytes: []const u8) !Reader {
         const header = try Header.parse(bytes);
@@ -314,10 +319,15 @@ pub const Reader = struct {
             const idx = findEntry(dir, tid) orelse return null;
             const e = dir[idx];
             if (e.run_length == 0) {
-                // leaf directory pointer
+                // leaf directory pointer — decoded once per distinct leaf, then cached
                 const a = r.arena.allocator();
-                const raw = try maybeDecompress(a, r.bytes[@intCast(r.header.leaf_dir_offset + e.offset)..][0..e.length], r.header.internal_compression);
-                dir = try deserializeDir(a, raw);
+                const gop = try r.leaves.getOrPut(a, e.offset);
+                if (!gop.found_existing) {
+                    errdefer _ = r.leaves.remove(e.offset);
+                    const raw = try maybeDecompress(a, r.bytes[@intCast(r.header.leaf_dir_offset + e.offset)..][0..e.length], r.header.internal_compression);
+                    gop.value_ptr.* = try deserializeDir(a, raw);
+                }
+                dir = gop.value_ptr.*;
                 continue;
             }
             if (tid < e.tile_id + e.run_length) {
@@ -732,6 +742,18 @@ test "large archive shards the root into leaf directories and still round-trips"
     }
     // An absent tile in the sharded archive still resolves to null.
     try std.testing.expect((try r.getTile(gpa, 15, 1, 1)) == null);
+
+    // Repeated probes reuse the cached leaf decodes — the arena must not grow once
+    // every touched leaf is resident. (A compositor probes a reader once per
+    // (tile, pass); re-deserializing a leaf per probe was unbounded growth.)
+    const probes = [_]u32{ 0, 4095, 4096, 12345, N - 1 };
+    for (probes) |i| _ = try r.getCompressed(15, i, 0);
+    const cap_before = r.arena.queryCapacity();
+    for (0..100) |_| {
+        for (probes) |i| _ = try r.getCompressed(15, i, 0);
+        _ = try r.getCompressed(15, 1, 1); // absent probes walk the directory too
+    }
+    try std.testing.expectEqual(cap_before, r.arena.queryCapacity());
 }
 
 test "header serialize/parse round-trip" {
