@@ -26,6 +26,39 @@ type BakeProgress struct {
 	BandName string
 }
 
+// ComposeProgress is one progress report from [ComposeFiles] as the streaming compose walks the
+// zoom ladder. Done/Total are opaque work weights (the deepest zoom dominates the total), so
+// Done/Total is a smooth 0..1 fraction; Zoom is the level currently composing, within
+// [MinZoom, MaxZoom] — enough for a host to show a bar + ETA and a "zoom N of M" line.
+type ComposeProgress struct {
+	Zoom    int
+	MinZoom int
+	MaxZoom int
+	Done    uint64
+	Total   uint64
+}
+
+// tile57GoComposeProgress is the C-callable progress callback libtile57 invokes during
+// tile57_compose_files. The host's Go progress func is carried across the seam as a cgo.Handle
+// pointed to by `user`. NULL user = no progress wanted.
+//
+//export tile57GoComposeProgress
+func tile57GoComposeProgress(user unsafe.Pointer, zoom, minZoom, maxZoom C.uint32_t, done, total C.uint64_t) {
+	if user == nil {
+		return
+	}
+	h := *(*cgo.Handle)(user)
+	if cb, ok := h.Value().(func(ComposeProgress)); ok && cb != nil {
+		cb(ComposeProgress{
+			Zoom:    int(zoom),
+			MinZoom: int(minZoom),
+			MaxZoom: int(maxZoom),
+			Done:    uint64(done),
+			Total:   uint64(total),
+		})
+	}
+}
+
 // tile57GoBakeProgress is the C-callable progress callback libtile57 invokes
 // during tile57_bake_pmtiles / tile57_bake_bundle. The host's Go progress func is
 // carried across the seam as a cgo.Handle, pointed to by `user`. NULL user = no

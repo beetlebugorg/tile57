@@ -806,6 +806,41 @@ const Framing = struct {
     cells: usize,
 };
 
+// A compose progress sink. The streaming compose invokes `cb` as it walks the zoom ladder:
+// `done`/`total` are union-bbox tile-count weights (each zoom weighted by the tiles it spans, so
+// the deepest zoom — ~3/4 of the work — dominates the bar), interpolated within a zoom by the
+// owner-face fraction, so a host renders a smooth bar + ETA and a "zoom N of M" line. Reporting is
+// pure observation and cannot affect the composed bytes. `ctx` is opaque host state.
+pub const ComposeProgress = struct {
+    cb: *const fn (ctx: ?*anyopaque, zoom: u32, min_zoom: u32, max_zoom: u32, done: u64, total: u64) callconv(.c) void,
+    ctx: ?*anyopaque = null,
+
+    // Set by composeInto as it walks the zoom loop; read by composeZoom to interpolate within one.
+    min_zoom: u32 = 0,
+    max_zoom: u32 = 0,
+    total: u64 = 1, // guarded ≥1 so a host's done/total never divides by zero
+    base: u64 = 0, // weight of the zooms already fully composed
+    zoom: u32 = 0,
+    zoom_weight: u64 = 0, // this zoom's tile-span weight
+
+    fn emit(self: *const ComposeProgress, done_in_zoom: u64) void {
+        self.cb(self.ctx, self.zoom, self.min_zoom, self.max_zoom, self.base + done_in_zoom, self.total);
+    }
+};
+
+// Tiles the union bbox `ubox` (E7 lon/lat) spans at zoom `z` — the per-zoom compose-work weight,
+// projected exactly as composeZoom projects a face's tile cover so the weights track real work.
+fn uboxTileCount(ubox: [4]i32, z: u8) u64 {
+    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+    const w_tl = engine.tile.lonLatToWorld(@as(f64, @floatFromInt(ubox[0])) / 1e7, @as(f64, @floatFromInt(ubox[3])) / 1e7);
+    const w_br = engine.tile.lonLatToWorld(@as(f64, @floatFromInt(ubox[2])) / 1e7, @as(f64, @floatFromInt(ubox[1])) / 1e7);
+    const tx0 = worldAxisToTile(w_tl[0], scale);
+    const tx1 = worldAxisToTile(w_br[0], scale);
+    const ty0 = worldAxisToTile(w_tl[1], scale);
+    const ty1 = worldAxisToTile(w_br[1], scale);
+    return (@as(u64, tx1 - tx0) + 1) * (@as(u64, ty1 - ty0) + 1);
+}
+
 // The shared compose core: recover each reader's embedded coverage + SCAMIN ladder, rebuild the
 // ownership partition (via the canonical toPlaneCells adapter), and stream every composed tile
 // into `sw` — one governing band per zoom (partition.mapForZoom), each owner's tiles clipped to
@@ -814,7 +849,7 @@ const Framing = struct {
 // Returns the framing to seal the archive, or null if no cell carried coverage or no tile
 // composed. Readers are BORROWED — kept alive by the caller; `readers` indexing aligns with the
 // partition (readers without coverage are filtered out here).
-fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers: []const *engine.pmtiles.Reader) !?Framing {
+fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers: []const *engine.pmtiles.Reader, progress: ?*ComposeProgress) !?Framing {
     const geo = engine.geo;
     const scene = engine.scene;
 
@@ -884,11 +919,30 @@ fn composeInto(gpa: std.mem.Allocator, sw: *engine.pmtiles.StreamWriter, readers
     //    composeZoom's per-tile scratch.
     var zoom_arena = std.heap.ArenaAllocator.init(gpa);
     defer zoom_arena.deinit();
+    // Weight each zoom by the tiles the union bbox spans there, so progress tracks where the time
+    // actually goes (the deepest zoom is ~3/4 of the work); composeZoom interpolates within a zoom
+    // by owner-face fraction. Weighting is derived only from ubox/zoom — it can't perturb output.
+    if (progress) |pg| {
+        var tw: u64 = 0;
+        var zz: u8 = minz;
+        while (zz <= loop_max) : (zz += 1) tw += uboxTileCount(ubox, zz);
+        pg.min_zoom = minz;
+        pg.max_zoom = loop_max;
+        pg.total = @max(1, tw);
+        pg.base = 0;
+    }
     var z: u8 = minz;
     while (z <= loop_max) : (z += 1) {
         _ = zoom_arena.reset(.retain_capacity);
-        try composeZoom(sw, gpa, zoom_arena.allocator(), &part, kept.items, z);
+        if (progress) |pg| {
+            pg.zoom = z;
+            pg.zoom_weight = uboxTileCount(ubox, z);
+            pg.emit(0);
+        }
+        try composeZoom(sw, gpa, zoom_arena.allocator(), &part, kept.items, z, progress);
+        if (progress) |pg| pg.base += pg.zoom_weight;
     }
+    if (progress) |pg| pg.cb(pg.ctx, loop_max, minz, loop_max, pg.total, pg.total);
     if (sw.num_addressed == 0) return null;
 
     // 5. Framing: VECTOR_LAYERS + union SCAMIN metadata (no single-cell coverage), bbox, center.
@@ -933,7 +987,7 @@ pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[
 
     var sw = pmtiles.StreamWriter.init(gpa);
     defer sw.deinit();
-    const fr = (try composeInto(gpa, &sw, readers.items)) orelse return null;
+    const fr = (try composeInto(gpa, &sw, readers.items, null)) orelse return null;
     defer gpa.free(fr.meta);
     return try sw.finishBytes(writeOpts(fr));
 }
@@ -944,7 +998,7 @@ pub fn composeArchives(gpa: std.mem.Allocator, archives: []const []const u8) !?[
 /// partition + one zoom's composed tiles + the touched-page working set — independent of the
 /// number of cells. Returns the count of cells that contributed, or 0 if none. This is the path
 /// a whole-district composite takes.
-pub fn composeArchivesToFile(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, out_path: []const u8) !usize {
+pub fn composeArchivesToFile(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, out_path: []const u8, progress: ?*ComposeProgress) !usize {
     const pmtiles = engine.pmtiles;
     var ra = std.heap.ArenaAllocator.init(gpa);
     defer ra.deinit();
@@ -995,7 +1049,7 @@ pub fn composeArchivesToFile(io: std.Io, gpa: std.mem.Allocator, paths: []const 
     var sw = pmtiles.StreamWriter.initFile(gpa, io, data_file);
     defer sw.deinit();
 
-    const fr = (try composeInto(gpa, &sw, readers.items)) orelse {
+    const fr = (try composeInto(gpa, &sw, readers.items, progress)) orelse {
         data_file.close(io);
         std.Io.Dir.cwd().deleteFile(io, data_tmp) catch {};
         return 0;
@@ -1041,6 +1095,7 @@ fn composeZoom(
     part: *const engine.geo.partition.Partition,
     readers: []const *engine.pmtiles.Reader,
     z: u8,
+    progress: ?*const ComposeProgress,
 ) !void {
     const mvt = engine.mvt;
     const tile = engine.tile;
@@ -1060,7 +1115,15 @@ fn composeZoom(
     var tile_scratch = std.heap.ArenaAllocator.init(gpa);
     defer tile_scratch.deinit();
 
+    // Report progress at the owner-face granularity, throttled to ≤~128 crossings per zoom
+    // (owner-face count ≈ cell count). slot is monotonic across skipped faces, so the bar only
+    // advances. Interpolated between this zoom's base weight and base+zoom_weight.
+    const prog_stride: usize = @max(1, map.faces.len >> 7);
     for (map.faces, 0..) |face, slot| {
+        if (progress) |pg| {
+            if (map.faces.len > 0 and slot % prog_stride == 0)
+                pg.emit(pg.zoom_weight * slot / map.faces.len);
+        }
         if (face.owned.len == 0) continue;
         const ci = face.index;
         const cscl = part.cells[ci].cscl;
@@ -2576,7 +2639,7 @@ test "composeArchivesToFile: streams a seam split disk-to-disk" {
         dir.deleteFile(io, po) catch {};
     }
 
-    const nc = try composeArchivesToFile(io, gpa, &.{ pa, pb }, po);
+    const nc = try composeArchivesToFile(io, gpa, &.{ pa, pb }, po, null);
     try testing.expectEqual(@as(usize, 2), nc);
 
     const bytes = try dir.readFileAlloc(io, po, a, .unlimited);
@@ -2594,4 +2657,71 @@ test "composeArchivesToFile: streams a seam split disk-to-disk" {
     const midy: i64 = @divTrunc(E, 2);
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(E, 4), midy));
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(@as(i64, E) * 3, 4), midy));
+}
+
+test "composeArchivesToFile: progress fires monotonically and reaches total" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tile = engine.tile;
+
+    // Two cells sharing a seam tile at z13 (as above) — enough to walk the zoom ladder and emit.
+    const z: u8 = 13;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+    const w = tile.lonLatToWorld(-76.48, 38.97);
+    const tx = worldAxisToTile(w[0], scale);
+    const ty = worldAxisToTile(w[1], scale);
+    const bnds = tile.tileBoundsLonLat(z, tx, ty);
+    const midlon = (bnds[0] + bnds[2]) / 2.0;
+    const dlat = (bnds[3] - bnds[1]) * 0.01;
+
+    const arc_a = try synthCell(gpa, a, "AAAAAAAA", bnds[0], bnds[1] + dlat, midlon, bnds[3] - dlat, 20_000, z, tx, ty);
+    defer gpa.free(arc_a);
+    const arc_b = try synthCell(gpa, a, "BBBBBBBB", midlon, bnds[1] + dlat, bnds[2], bnds[3] - dlat, 20_000, z, tx, ty);
+    defer gpa.free(arc_b);
+
+    const dir = std.Io.Dir.cwd();
+    const pa = ".zig-cache/compose_prog_a.pmtiles.tmp";
+    const pb = ".zig-cache/compose_prog_b.pmtiles.tmp";
+    const po = ".zig-cache/compose_prog_out.pmtiles.tmp";
+    try dir.writeFile(io, .{ .sub_path = pa, .data = arc_a });
+    try dir.writeFile(io, .{ .sub_path = pb, .data = arc_b });
+    defer {
+        dir.deleteFile(io, pa) catch {};
+        dir.deleteFile(io, pb) catch {};
+        dir.deleteFile(io, po) catch {};
+    }
+
+    const Rec = struct {
+        n: usize = 0,
+        last_done: u64 = 0,
+        max_done: u64 = 0,
+        total: u64 = 0,
+        monotonic: bool = true,
+        min_zoom: u32 = 999,
+        max_zoom: u32 = 0,
+        fn cb(ctx: ?*anyopaque, zoom: u32, min_zoom: u32, max_zoom: u32, done: u64, total: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.n += 1;
+            if (done < self.last_done) self.monotonic = false;
+            self.last_done = done;
+            if (done > self.max_done) self.max_done = done;
+            self.total = total;
+            self.min_zoom = min_zoom;
+            self.max_zoom = max_zoom;
+            _ = zoom;
+        }
+    };
+    var rec = Rec{};
+    var prog = ComposeProgress{ .cb = Rec.cb, .ctx = &rec };
+
+    const nc = try composeArchivesToFile(io, gpa, &.{ pa, pb }, po, &prog);
+    try testing.expectEqual(@as(usize, 2), nc);
+    try testing.expect(rec.n > 0); // the callback actually fired
+    try testing.expect(rec.monotonic); // done never went backwards
+    try testing.expect(rec.total > 0);
+    try testing.expectEqual(rec.total, rec.max_done); // the final emit closes the bar at 100%
+    try testing.expect(rec.max_zoom >= rec.min_zoom);
 }

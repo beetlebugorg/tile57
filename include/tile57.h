@@ -112,14 +112,23 @@ int tile57_compose(const uint8_t *blob, size_t blob_len,
                    const size_t *lens, size_t n,
                    uint8_t **out, size_t *out_len);
 
+/* Progress callback for tile57_compose_files, invoked as the streaming compose walks the zoom
+ * ladder. `done`/`total` are opaque work weights (the deepest zoom dominates the total), so
+ * `done`/`total` is a smooth 0..1 fraction; `zoom` is the level being composed, within
+ * [`min_zoom`, `max_zoom`]. A host renders done/total as a bar + ETA and "zoom N of M". `ctx` is
+ * the opaque pointer passed to tile57_compose_files. */
+typedef void (*tile57_compose_progress)(void *ctx, uint32_t zoom, uint32_t min_zoom,
+                                        uint32_t max_zoom, uint64_t done, uint64_t total);
+
 /* Streaming disk-to-disk composite: combine the `n` per-cell PMTiles at `paths` (each written
  * by tile57_bake_cell_bytes) into one merged PMTiles at `out_path`. The per-cell files are
  * mmap'd (never all resident) and the output is streamed, so a whole district composes in
  * bounded memory — prefer this over tile57_compose for large cell sets. Writes the count of
- * contributing cells to *out_cells if non-NULL. Returns 1 on success, 0 if nothing composed,
- * -1 on error. */
+ * contributing cells to *out_cells if non-NULL. `on_progress` (NULL to skip) is called with `ctx`
+ * as the compose advances. Returns 1 on success, 0 if nothing composed, -1 on error. */
 int tile57_compose_files(const char *const *paths, size_t n, const char *out_path,
-                         uint32_t *out_cells);
+                         uint32_t *out_cells,
+                         tile57_compose_progress on_progress, void *ctx);
 
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +

@@ -51,6 +51,18 @@ static int tile57_bake_bundle_cb(const char *input, const char *out_dir,
     };
     return tile57_bake_bundle(input, out_dir, &opts, out_cells, out_bbox);
 }
+
+// Forward declaration of the //export'd Go compose-progress callback (defined in
+// progress.go), so ComposeFiles can hand libtile57 a real C function pointer.
+void tile57GoComposeProgress(void *ctx, uint32_t zoom, uint32_t min_zoom,
+                             uint32_t max_zoom, uint64_t done, uint64_t total);
+
+// user != NULL → re-enter Go for compose progress; NULL → no progress.
+static int tile57_compose_files_cb(const char *const *paths, size_t n, const char *out_path,
+                                   uint32_t *out_cells, void *user) {
+    return tile57_compose_files(paths, n, out_path, out_cells,
+                                user ? tile57GoComposeProgress : (tile57_compose_progress)0, user);
+}
 */
 import "C"
 
@@ -237,8 +249,10 @@ func Compose(archives [][]byte) ([]byte, error) {
 // ComposeFiles streaming-composes the per-cell PMTiles at `paths` (each written by [BakeCell]
 // to disk) into one merged PMTiles at outPath. The per-cell files are mmap'd (never all
 // resident) and the output is streamed, so a whole district composes in bounded memory —
-// prefer this over [Compose] for large cell sets. Returns the number of contributing cells.
-func ComposeFiles(paths []string, outPath string) (int, error) {
+// prefer this over [Compose] for large cell sets. progress, if non-nil, is called with a
+// [ComposeProgress] as the compose walks the zoom ladder (Done/Total is a smooth fraction).
+// Returns the number of contributing cells.
+func ComposeFiles(paths []string, outPath string, progress func(ComposeProgress)) (int, error) {
 	if len(paths) == 0 {
 		return 0, fmt.Errorf("tile57: ComposeFiles needs at least one path: %w", ErrEmptyInput)
 	}
@@ -257,10 +271,17 @@ func ComposeFiles(paths []string, outPath string) (int, error) {
 	cOut := C.CString(outPath)
 	defer C.free(unsafe.Pointer(cOut))
 
+	var user unsafe.Pointer
+	if progress != nil {
+		h := cgo.NewHandle(progress)
+		defer h.Delete()
+		user = unsafe.Pointer(&h)
+	}
+
 	var cells C.uint32_t
-	rc := C.tile57_compose_files(
+	rc := C.tile57_compose_files_cb(
 		(**C.char)(unsafe.Pointer(&cpaths[0])), C.size_t(len(paths)),
-		cOut, &cells,
+		cOut, &cells, user,
 	)
 	switch rc {
 	case 1:

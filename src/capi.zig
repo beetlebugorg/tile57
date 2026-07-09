@@ -151,6 +151,8 @@ export fn tile57_compose_files(
     n: usize,
     out_path: ?[*:0]const u8,
     out_cells: ?*u32,
+    on_progress: ?*const fn (ctx: ?*anyopaque, zoom: u32, min_zoom: u32, max_zoom: u32, done: u64, total: u64) callconv(.c) void,
+    ctx: ?*anyopaque,
 ) callconv(.c) c_int {
     const ps = paths orelse return -1;
     const op = spanOpt(out_path) orelse return -1;
@@ -159,10 +161,18 @@ export fn tile57_compose_files(
     defer gpa.free(list);
     for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return -1;
 
+    // Optional streaming progress: a stack-lived sink the compose walks the zoom ladder through.
+    var prog: bundle.ComposeProgress = undefined;
+    var pptr: ?*bundle.ComposeProgress = null;
+    if (on_progress) |cb| {
+        prog = .{ .cb = cb, .ctx = ctx };
+        pptr = &prog;
+    }
+
     // The lib has no std.process.Init; stand up a threaded std.Io for the file I/O.
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const nc = bundle.composeArchivesToFile(threaded.io(), gpa, list, op) catch return -1;
+    const nc = bundle.composeArchivesToFile(threaded.io(), gpa, list, op, pptr) catch return -1;
     if (out_cells) |p| p.* = @intCast(nc);
     return if (nc > 0) 1 else 0;
 }

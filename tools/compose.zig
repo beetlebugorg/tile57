@@ -116,7 +116,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // 3. Stream-compose the per-cell files into one PMTiles (mmap in, streamed out — the cell
     //    set is never all resident).
-    const nc = bundle.composeArchivesToFile(io, a, tmp_paths.items, out_path) catch |err| {
+    const nc = bundle.composeArchivesToFile(io, a, tmp_paths.items, out_path, null) catch |err| {
         std.debug.print("error: compose failed ({s})\n", .{@errorName(err)});
         return;
     };
