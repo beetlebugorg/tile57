@@ -677,6 +677,70 @@ pub fn bakeCellsParallel(paths: []const []const u8, rules_dir: ?[]const u8, work
     for (threads[0..spawned]) |t| t.join();
 }
 
+// ---- parallel batch cell-bake TO FILES (the host-cache path) -------------------
+// Same parallel bake, but the engine WRITES each cell's PMTiles to a caller-provided path and
+// frees it right after — so a host never holds N archives (peak memory ~ the worker count). The
+// APP owns the cache: it names every out_path, so distinct library consumers don't clash. A
+// <out_path>.sha content-hash sidecar is written beside each archive for the host's cache token.
+
+const BakeFileCtx = struct {
+    next: std.atomic.Value(usize),
+    in_paths: []const []const u8,
+    out_paths: []const []const u8,
+    rules_dir: ?[]const u8,
+    io: std.Io,
+    ok: []bool,
+};
+
+fn bakeFileWorker(ctx: *BakeFileCtx) void {
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.in_paths.len) return;
+        const arc = (bakeCellBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse continue;
+        defer freeBytes(arc);
+        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ctx.out_paths[i], .data = arc }) catch continue;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(arc, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        var sha_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+        if (std.fmt.bufPrint(&sha_buf, "{s}.sha", .{ctx.out_paths[i]})) |sha_path| {
+            std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = sha_path, .data = &hex }) catch {};
+        } else |_| {}
+        ctx.ok[i] = true;
+    }
+}
+
+/// Bake each in_paths[i] in parallel (up to `workers` threads) and WRITE its PMTiles to
+/// out_paths[i] (plus an <out_path>.sha content-hash sidecar), freeing each archive right after
+/// the write — so the host never holds N archives (peak memory ~ the worker count). The app owns
+/// the cache and names every out_path. Race-free (warms up first; each bake is independent).
+/// Returns the number of cells written. `workers` is a MEMORY bound — keep it small.
+pub fn bakeCellsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize) usize {
+    std.debug.assert(out_paths.len == in_paths.len);
+    if (in_paths.len == 0) return 0;
+    warmup();
+    const ok = gpa.alloc(bool, in_paths.len) catch return 0;
+    defer gpa.free(ok);
+    @memset(ok, false);
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok };
+    var n = @min(@max(workers, 1), in_paths.len);
+    if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
+    if (n <= 1) {
+        bakeFileWorker(&ctx);
+    } else {
+        var threads: [MAX_BAKE_WORKERS]std.Thread = undefined;
+        var spawned: usize = 0;
+        while (spawned < n - 1) : (spawned += 1) threads[spawned] = std.Thread.spawn(.{}, bakeFileWorker, .{&ctx}) catch break;
+        bakeFileWorker(&ctx);
+        for (threads[0..spawned]) |t| t.join();
+    }
+    var count: usize = 0;
+    for (ok) |o| {
+        if (o) count += 1;
+    }
+    return count;
+}
+
 /// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null
 /// if the archive carries none. For a host to read the embedded scamin / coverage
 /// without a full open. This engine writes metadata uncompressed; gzip is handled for

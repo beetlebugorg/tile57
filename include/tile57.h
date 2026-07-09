@@ -221,6 +221,15 @@ int tile57_bake_cell_bytes(const char *path, uint8_t **out, size_t *out_len);
 int tile57_bake_cells(const char *const *paths, size_t n, uint32_t workers,
                       uint8_t **out_bytes, size_t *out_lens);
 
+/* Like tile57_bake_cells, but the engine WRITES each cell's PMTiles to out_paths[i] (plus an
+ * <out_path>.sha content-hash sidecar) and frees each archive right after — so the host never
+ * holds N archives in memory (peak ~ workers). The APP owns the cache and names every out path,
+ * so distinct library consumers each own their own chart library without clashing. in_paths[i] is
+ * the .000 to bake, out_paths[i] the file to write; both arrays length n. `workers` is a MEMORY
+ * bound — pass a small count. Returns the number of cells written, or -1 on bad args. */
+int tile57_bake_cells_to_files(const char *const *in_paths, const char *const *out_paths,
+                               size_t n, uint32_t workers);
+
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +
  * cscl + date/name under a "coverage" key, so the composite stitcher rebuilds the

@@ -111,6 +111,33 @@ export fn tile57_bake_cells(
     return baked;
 }
 
+/// Bake `n` cells to per-cell PMTiles files IN PARALLEL across up to `workers` threads, WRITING
+/// each to out_paths[i] (+ an <out_path>.sha content-hash sidecar) and freeing each archive right
+/// after — so the host never holds N archives in memory. The app owns the cache and names every
+/// out path. Returns the number written, or -1 on bad args. See tile57.h.
+export fn tile57_bake_cells_to_files(
+    in_paths: ?[*]const ?[*:0]const u8,
+    out_paths: ?[*]const ?[*:0]const u8,
+    n: usize,
+    workers: u32,
+) callconv(.c) c_int {
+    const ins = in_paths orelse return -1;
+    const outs = out_paths orelse return -1;
+    if (n == 0) return 0;
+    const ilist = gpa.alloc([]const u8, n) catch return -1;
+    defer gpa.free(ilist);
+    const olist = gpa.alloc([]const u8, n) catch return -1;
+    defer gpa.free(olist);
+    for (0..n) |i| {
+        ilist[i] = spanOpt(ins[i]) orelse return -1;
+        olist[i] = spanOpt(outs[i]) orelse return -1;
+    }
+    // Stand up a threaded std.Io for the workers' file writes (each writes a distinct path).
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    return @intCast(chart.bakeCellsToFiles(threaded.io(), ilist, olist, null, workers));
+}
+
 /// Coverage/zoom summary of a resident compositor, filled by tile57_compose_meta.
 const CComposeMeta = extern struct {
     min_zoom: u8,
