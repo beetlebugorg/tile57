@@ -1137,6 +1137,80 @@ pub fn composeArchivesToFileOpt(io: std.Io, gpa: std.mem.Allocator, paths: []con
     return fr.cells;
 }
 
+// The tile-index cover (nw..se) of an owner face's lon/lat bbox at zoom `scale = 1<<z`. Pass 1 and
+// the on-demand composeTile both cull candidate tiles through this exact box.
+const TileBBox = struct { tx0: u32, tx1: u32, ty0: u32, ty1: u32 };
+fn faceTileBBox(face: engine.geo.plane.OwnedCell, scale: f64) TileBBox {
+    const tile = engine.tile;
+    var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+    for (face.owned) |ring| for (ring) |p| {
+        const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
+        const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
+        fb[0] = @min(fb[0], lon);
+        fb[1] = @min(fb[1], lat);
+        fb[2] = @max(fb[2], lon);
+        fb[3] = @max(fb[3], lat);
+    };
+    const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // NW: min lon, max lat
+    const w_br = tile.lonLatToWorld(fb[2], fb[1]); // SE: max lon, min lat
+    return .{
+        .tx0 = worldAxisToTile(w_tl[0], scale),
+        .tx1 = worldAxisToTile(w_br[0], scale),
+        .ty0 = worldAxisToTile(w_tl[1], scale),
+        .ty1 = worldAxisToTile(w_br[1], scale),
+    };
+}
+
+// The classifier's owned-face grid cell width at zoom z, in integer lon/lat (deg × 1e7).
+fn tileWidthE7(z: u8) i64 {
+    return @max(1, @divFloor(@as(i64, 3_600_000_000), @as(i64, 1) << @intCast(z)));
+}
+
+// The (z,tx,ty) box expanded by the render BUFFER, in integer lon/lat — the region a verbatim
+// passthrough must fully own (tile AND its buffer) before it fires.
+fn tileClassifyBox(z: u8, tx: u32, ty: u32) engine.geo.plane.Box {
+    const tile = engine.tile;
+    const tb = tile.tileBoundsLonLat(z, tx, ty); // [min_lon, min_lat, max_lon, max_lat]
+    const lon0: i64 = @intFromFloat(@round(tb[0] * 1e7));
+    const lat0: i64 = @intFromFloat(@round(tb[1] * 1e7));
+    const lon1: i64 = @intFromFloat(@round(tb[2] * 1e7));
+    const lat1: i64 = @intFromFloat(@round(tb[3] * 1e7));
+    const bufx = @divTrunc((lon1 - lon0) * @as(i64, tile.BUFFER), @as(i64, tile.EXTENT));
+    const bufy = @divTrunc((lat1 - lat0) * @as(i64, tile.BUFFER), @as(i64, tile.EXTENT));
+    return .{ .min_x = lon0 - bufx, .min_y = lat0 - bufy, .max_x = lon1 + bufx, .max_y = lat1 + bufy };
+}
+
+// Compose one seam/overscale tile from its contributing owner slots (in face order) into raw MLT
+// bytes, or null if nothing survives the clip. Decode each owner's tile (native or overscaled
+// ancestor), clip its features to the owner's projected owned face, per-layer concat in
+// VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
+// the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
+fn composeSeamTile(ta: std.mem.Allocator, part: *const engine.geo.partition.Partition, map: *const engine.geo.partition.BandMap, readers: []const *engine.pmtiles.Reader, slots: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
+    const mvt = engine.mvt;
+    const compose = engine.scene.compose;
+    var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
+    for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
+    for (slots) |slot| {
+        const face = map.faces[slot];
+        const ci = face.index;
+        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty)) orelse continue;
+        const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
+        if (face_px.len == 0) continue;
+        for (layers) |layer| {
+            const li = layerIndex(layer.name) orelse continue;
+            for (layer.features) |feat| try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
+        }
+    }
+    var out_layers = std.ArrayList(engine.mvt.Layer).empty;
+    for (&buckets, 0..) |*bucket, li| {
+        if (bucket.items.len == 0) continue;
+        const feats = try orientPolys(ta, bucket.items);
+        try out_layers.append(ta, .{ .name = engine.scene.VECTOR_LAYERS[li], .features = feats });
+    }
+    if (out_layers.items.len == 0) return null;
+    return try engine.mlt.encode(ta, .{ .layers = out_layers.items });
+}
+
 /// Compose every tile of one zoom `z`, tile-major, so peak memory is ONE tile's working set
 /// rather than the whole zoom's. Pass 1 walks the governing band's owners face-major —
 /// exactly the order the compositor always used — streaming every fully-owned tile VERBATIM
@@ -1159,10 +1233,7 @@ fn composeZoom(
     z: u8,
     progress: ?*const ComposeProgress,
 ) !void {
-    const mvt = engine.mvt;
-    const tile = engine.tile;
-    const scene = engine.scene;
-    const compose = scene.compose;
+    const compose = engine.scene.compose;
 
     const map = part.mapForZoom(z) orelse return;
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
@@ -1191,46 +1262,23 @@ fn composeZoom(
         const cscl = part.cells[ci].cscl;
 
         // Tile cover of this owner's face bbox (lon/lat → world → tile index), nw..se.
-        var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
-        for (face.owned) |ring| for (ring) |p| {
-            const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
-            const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
-            fb[0] = @min(fb[0], lon);
-            fb[1] = @min(fb[1], lat);
-            fb[2] = @max(fb[2], lon);
-            fb[3] = @max(fb[3], lat);
-        };
-        const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // NW: min lon, max lat
-        const w_br = tile.lonLatToWorld(fb[2], fb[1]); // SE: max lon, min lat
-        const tx0 = worldAxisToTile(w_tl[0], scale);
-        const tx1 = worldAxisToTile(w_br[0], scale);
-        const ty0 = worldAxisToTile(w_tl[1], scale);
-        const ty1 = worldAxisToTile(w_br[1], scale);
+        const bb = faceTileBBox(face, scale);
 
         // FULL/EMPTY/SEAM classifier over this owner's owned face (integer lon/lat). A tile the
         // owner covers ENTIRELY (its buffer too, no seam crossing) is copied VERBATIM from the
         // per-cell bake — byte-identical, no decode/clip/re-encode; only seam tiles run the
         // geometry path. Bucket ≈ one tile wide. (classify's `covered` is the owned face, so its
         // labels are inverted from their names: center-inside → `.empty` = fully owned.)
-        const tile_w_e7: i64 = @max(1, @divFloor(@as(i64, 3_600_000_000), @as(i64, 1) << @intCast(z)));
-        var grid = try engine.geo.plane.EdgeGrid.init(sa, face.owned, tile_w_e7);
+        var grid = try engine.geo.plane.EdgeGrid.init(sa, face.owned, tileWidthE7(z));
         defer grid.deinit();
 
-        var tx = tx0;
-        while (tx <= tx1) : (tx += 1) {
-            var ty = ty0;
-            while (ty <= ty1) : (ty += 1) {
+        var tx = bb.tx0;
+        while (tx <= bb.tx1) : (tx += 1) {
+            var ty = bb.ty0;
+            while (ty <= bb.ty1) : (ty += 1) {
                 // Classify (z,tx,ty) against the owned face, the box expanded by the render
                 // BUFFER so a passthrough only fires when the owner owns the tile AND its buffer.
-                const tb = tile.tileBoundsLonLat(z, tx, ty); // [min_lon, min_lat, max_lon, max_lat]
-                const lon0: i64 = @intFromFloat(@round(tb[0] * 1e7));
-                const lat0: i64 = @intFromFloat(@round(tb[1] * 1e7));
-                const lon1: i64 = @intFromFloat(@round(tb[2] * 1e7));
-                const lat1: i64 = @intFromFloat(@round(tb[3] * 1e7));
-                const bufx = @divTrunc((lon1 - lon0) * @as(i64, tile.BUFFER), @as(i64, tile.EXTENT));
-                const bufy = @divTrunc((lat1 - lat0) * @as(i64, tile.BUFFER), @as(i64, tile.EXTENT));
-                const box = engine.geo.plane.Box{ .min_x = lon0 - bufx, .min_y = lat0 - bufy, .max_x = lon1 + bufx, .max_y = lat1 + bufy };
-                switch (grid.classify(box)) {
+                switch (grid.classify(tileClassifyBox(z, tx, ty))) {
                     .full => continue, // owner owns none of this tile (buffer included): skip
                     .empty => {
                         // Owner owns the whole tile: copy its native blob verbatim if present
@@ -1269,38 +1317,60 @@ fn composeZoom(
         const tx = kv.key_ptr.x;
         const ty = kv.key_ptr.y;
         _ = tile_scratch.reset(.retain_capacity);
-        const ta = tile_scratch.allocator();
-
-        var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
-        for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
-        for (kv.value_ptr.items) |slot| {
-            const face = map.faces[slot];
-            const ci = face.index;
-            // The cell's tile content at (z,tx,ty): its native tile, or — one fill-up zoom
-            // past its band — its deepest native ancestor scaled up (overscale).
-            const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty)) orelse continue;
-            // The owned face in THIS tile's pixel space (recomputed — caching every pending
-            // tile's projection is exactly the zoom-sized retention this pass removes).
-            const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
-            if (face_px.len == 0) continue;
-            for (layers) |layer| {
-                const li = layerIndex(layer.name) orelse continue;
-                for (layer.features) |feat| {
-                    try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
-                }
-            }
-        }
-
-        var layers = std.ArrayList(mvt.Layer).empty;
-        for (&buckets, 0..) |*bucket, li| {
-            if (bucket.items.len == 0) continue;
-            const feats = try orientPolys(ta, bucket.items);
-            try layers.append(ta, .{ .name = scene.VECTOR_LAYERS[li], .features = feats });
-        }
-        if (layers.items.len == 0) continue;
-        const enc = try engine.mlt.encode(ta, .{ .layers = layers.items });
+        // Decode + clip + orient + encode one tile in the per-tile scratch (shared with the
+        // on-demand composeTile — see composeSeamTile). Recomputing each owner's projected face
+        // here rather than caching pass 1's is the zoom-sized retention this two-pass split removes.
+        const enc = (try composeSeamTile(tile_scratch.allocator(), part, map, readers, kv.value_ptr.items, z, tx, ty)) orelse continue;
         try sw.add(z, tx, ty, enc);
     }
+}
+
+/// Compose ONE tile on demand from a resident partition + mmap'd per-cell `readers` (cell index ==
+/// reader index, exactly as composeInto aligns them), byte-identical to the tile the batch
+/// compositor writes for (z,tx,ty). Returns the gzipped MLT the archive stores — a verbatim owner
+/// blob (an mmap-slice copy, the common case) or a freshly composed seam tile — gpa-owned; null if
+/// no cell owns this tile. This is the runtime compositor: with the partition loaded once, serving a
+/// tile is a classify plus either one memcpy or one decode/clip/encode, not a whole-district pass.
+pub fn composeTile(gpa: std.mem.Allocator, part: *const engine.geo.partition.Partition, readers: []const *engine.pmtiles.Reader, z: u8, tx: u32, ty: u32) !?[]u8 {
+    const compose = engine.scene.compose;
+    const map = part.mapForZoom(z) orelse return null;
+    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ta = arena.allocator();
+
+    // Pass-1-equivalent for this one tile: walk owners in face order (the batch's tie order), cull
+    // by face bbox, classify. The FIRST owner that fully owns the tile (buffer included) and has a
+    // native blob wins the verbatim copy — faces are a disjoint partition, so that owner is unique.
+    // Every other contributing owner (seam, or fully-owned-but-no-native) is collected in face order.
+    var slots = std.ArrayList(u32).empty;
+    for (map.faces, 0..) |face, slot| {
+        if (face.owned.len == 0) continue;
+        const ci = face.index;
+        const cscl = part.cells[ci].cscl;
+        const bb = faceTileBBox(face, scale);
+        if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
+
+        var grid = try engine.geo.plane.EdgeGrid.init(ta, face.owned, tileWidthE7(z));
+        defer grid.deinit();
+        switch (grid.classify(tileClassifyBox(z, tx, ty))) {
+            .full => continue, // owns none of this tile
+            .empty => { // owns the whole tile: verbatim blob if present, else fall through
+                if (try readers[ci].getCompressed(z, tx, ty)) |blob| return try gpa.dupe(u8, blob);
+            },
+            .seam => {},
+        }
+        if (!(try ownerHasTile(readers[ci], cscl, z, tx, ty))) continue;
+        const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
+        if (face_px.len == 0) continue;
+        try slots.append(ta, @intCast(slot));
+    }
+    if (slots.items.len == 0) return null;
+
+    // gzip the composed MLT so the served bytes match what StreamWriter.add stores in the archive.
+    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, z, tx, ty)) orelse return null;
+    return try engine.pmtiles.StreamWriter.gzipTile(gpa, enc);
 }
 
 // The output-layer slot for a decoded layer name (one of scene.VECTOR_LAYERS), or null to drop.
@@ -2544,6 +2614,139 @@ test "composeArchives: two abutting cells split a shared tile at the seam, no do
     // (disjoint partition — the seam split the tile, it did not double-draw it).
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(E, 4), midy));
     try testing.expectEqual(@as(usize, 1), countContains(a, al.features, @divTrunc(@as(i64, E) * 3, 4), midy));
+}
+
+// Compose `arcs` two ways — the batch composeArchives (the byte-truth) and, tile by tile, the
+// on-demand composeTile over a rebuilt partition — and assert every tile across the coverage
+// window (empties included: null both ways) is byte-identical. Returns how many verbatim vs
+// freshly-composed seam tiles were exercised.
+const ComposeTileCounts = struct { checked: usize, verbatim: usize, seam: usize };
+fn verifyComposeTileMatchesBatch(gpa: std.mem.Allocator, arcs: []const []const u8) !ComposeTileCounts {
+    const pmtiles = engine.pmtiles;
+    const scene = engine.scene;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const composed = (try composeArchives(gpa, arcs)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(composed);
+    var truth = try pmtiles.Reader.init(gpa, composed);
+    defer truth.deinit();
+
+    // Per-cell readers, aligned cell index == reader index exactly as composeInto arranges them.
+    const readers = try a.alloc(*pmtiles.Reader, arcs.len);
+    for (arcs, 0..) |arc, i| {
+        readers[i] = try a.create(pmtiles.Reader);
+        readers[i].* = try pmtiles.Reader.init(gpa, arc);
+    }
+    defer for (readers) |rp| rp.deinit();
+
+    var shims = std.ArrayList(LoadedCov).empty;
+    var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+    var minz: u8 = 255;
+    var maxz: u8 = 0;
+    for (readers) |rp| {
+        const meta = readMetaJson(a, rp) orelse return error.TestUnexpectedResult;
+        const cc = (try scene.coverage.decodeFromMetadata(a, meta)) orelse return error.TestUnexpectedResult;
+        const b = [4]f64{
+            @as(f64, @floatFromInt(cc.bbox[0])) / 1e7, @as(f64, @floatFromInt(cc.bbox[1])) / 1e7,
+            @as(f64, @floatFromInt(cc.bbox[2])) / 1e7, @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,
+        };
+        ubox[0] = @min(ubox[0], b[0]);
+        ubox[1] = @min(ubox[1], b[1]);
+        ubox[2] = @max(ubox[2], b[2]);
+        ubox[3] = @max(ubox[3], b[3]);
+        const bz = engine.bake_enc.bandZooms(engine.bake_enc.bandOf(cc.cscl));
+        minz = @min(minz, bz.min);
+        maxz = @max(maxz, bz.max);
+        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = b });
+    }
+    const cells = try toPlaneCells(a, shims.items);
+    for (cells, readers) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
+    var part = try engine.geo.partition.build(gpa, cells);
+    defer part.deinit();
+
+    const fill_max = @min(maxz + engine.bake_enc.FILLUP_DZ, engine.bake_enc.FILLUP_CEIL);
+    const loop_max = @max(maxz, fill_max);
+
+    var counts = ComposeTileCounts{ .checked = 0, .verbatim = 0, .seam = 0 };
+    var z: u8 = minz;
+    while (z <= loop_max) : (z += 1) {
+        const nw = lonLatToTile(ubox[0], ubox[3], z); // min lon, max lat → min tx, min ty
+        const se = lonLatToTile(ubox[2], ubox[1], z);
+        var tx = nw[0] -| 1;
+        while (tx <= se[0] + 1) : (tx += 1) {
+            var ty = nw[1] -| 1;
+            while (ty <= se[1] + 1) : (ty += 1) {
+                const want = try truth.getCompressed(z, tx, ty); // borrowed from truth's arena
+                const got = try composeTile(gpa, &part, readers, z, tx, ty);
+                defer if (got) |g| gpa.free(g);
+                if (want == null and got == null) continue;
+                if (want == null or got == null) return error.ComposeTileMismatch;
+                try testing.expectEqualSlices(u8, want.?, got.?);
+                counts.checked += 1;
+                // A verbatim tile equals some owner's native blob byte-for-byte; a seam tile does not.
+                var is_verbatim = false;
+                for (readers) |rp| {
+                    if (try rp.getCompressed(z, tx, ty)) |nat| if (std.mem.eql(u8, got.?, nat)) {
+                        is_verbatim = true;
+                        break;
+                    };
+                }
+                if (is_verbatim) counts.verbatim += 1 else counts.seam += 1;
+            }
+        }
+    }
+    return counts;
+}
+
+test "composeTile: on-demand tiles are byte-identical to the batch-composed archive" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tile = engine.tile;
+
+    // Scenario 1 — a single cell that fully owns its tile (coverage overflows the tile on every
+    // side, so the owner owns the tile AND its render buffer): composeTile serves the VERBATIM blob.
+    {
+        const z: u8 = 14;
+        const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+        const w = tile.lonLatToWorld(-76.5, 39.0);
+        const tx = worldAxisToTile(w[0], scale);
+        const ty = worldAxisToTile(w[1], scale);
+        const tb = tile.tileBoundsLonLat(z, tx, ty);
+        const dlon = tb[2] - tb[0];
+        const dlat = tb[3] - tb[1];
+        const arc = try synthCell(gpa, a, "INTERIOR", tb[0] - dlon, tb[1] - dlat, tb[2] + dlon, tb[3] + dlat, 20_000, z, tx, ty);
+        defer gpa.free(arc);
+        const c = try verifyComposeTileMatchesBatch(gpa, &.{arc});
+        try testing.expect(c.checked > 0);
+        try testing.expect(c.verbatim > 0); // full owner → verbatim passthrough
+    }
+
+    // Scenario 2 — two abutting cells split one z13 tile at the mid-line: SEAM recomposition.
+    {
+        const z: u8 = 13;
+        const scale: f64 = @floatFromInt(@as(u64, 1) << z);
+        const w = tile.lonLatToWorld(-76.48, 38.97);
+        const tx = worldAxisToTile(w[0], scale);
+        const ty = worldAxisToTile(w[1], scale);
+        const bnds = tile.tileBoundsLonLat(z, tx, ty);
+        const lon0 = bnds[0];
+        const lat0 = bnds[1];
+        const lon1 = bnds[2];
+        const lat1 = bnds[3];
+        const midlon = (lon0 + lon1) / 2.0;
+        const dlat = (lat1 - lat0) * 0.01;
+        const arc_a = try synthCell(gpa, a, "AAAAAAAA", lon0, lat0 + dlat, midlon, lat1 - dlat, 20_000, z, tx, ty);
+        defer gpa.free(arc_a);
+        const arc_b = try synthCell(gpa, a, "BBBBBBBB", midlon, lat0 + dlat, lon1, lat1 - dlat, 20_000, z, tx, ty);
+        defer gpa.free(arc_b);
+        const c = try verifyComposeTileMatchesBatch(gpa, &.{ arc_a, arc_b });
+        try testing.expect(c.checked > 0);
+        try testing.expect(c.seam > 0); // shared tile → seam recomposition
+    }
 }
 
 test "composeArchives: a coarse owner overscales one fill-up zoom past its native band" {
