@@ -164,41 +164,6 @@ func (s *Source) Info() ChartInfo {
 	}
 }
 
-// SetTileFormat selects the encoding for LIVE-generated tiles on a cell-backed
-// source (FormatDefault = the engine default, MLT). Cell-backed sources open
-// generating MVT, so an MLT-capable host opts in here. No-op for a baked PMTiles
-// source (its stored encoding is fixed). Changing the format drops the tile cache.
-func (s *Source) SetTileFormat(f TileFormat) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr != nil {
-		C.tile57_chart_set_tile_format(s.ptr, C.uint8_t(f))
-	}
-}
-
-// Tile fetches tile (z, x, y) as decompressed vector-tile bytes in the source's
-// tile encoding (see [ChartInfo.TileType] / [Meta.TileType]; stored bytes verbatim
-// for a PMTiles source, the live generation format for a cell source). (nil, nil)
-// means a blank tile (valid but empty) — the TileSource "no tile here" convention.
-func (s *Source) Tile(z uint8, x, y uint32) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return nil, ErrSourceClosed
-	}
-	var out *C.uint8_t
-	var outLen C.size_t
-	st := C.tile57_chart_tile(s.ptr, C.uint8_t(z), C.uint32_t(x), C.uint32_t(y), &out, &outLen)
-	switch st {
-	case C.TILE57_TILE_OK:
-		return tileBytes(out, outLen), nil
-	case C.TILE57_TILE_EMPTY:
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("tile57: tile %d/%d/%d generation error (status %d)", z, x, y, int(st))
-	}
-}
-
 // Meta reports the source's display metadata (zoom range, bounds, SCAMIN manifest).
 // tile57 serves decompressed MVT, so Gzipped is always false. Bounds fall back to the
 // world extent when libtile57 reports them as degenerate/near-global. The SCAMIN
@@ -251,15 +216,6 @@ func (s *Source) scaminLocked() []uint32 {
 		s.scamin = res
 	}
 	return s.scamin
-}
-
-// ClearCache drops the in-memory tile cache to bound memory in long-running hosts.
-func (s *Source) ClearCache() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr != nil {
-		C.tile57_chart_clear_cache(s.ptr)
-	}
 }
 
 // Close releases the source and all cached tiles. It is idempotent. Per the ABI's
