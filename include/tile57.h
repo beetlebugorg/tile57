@@ -210,6 +210,17 @@ void tile57_chart_close(tile57_chart *chart);
  * -1=error. */
 int tile57_bake_cell_bytes(const char *path, uint8_t **out, size_t *out_len);
 
+/* Bake `n` cells (each a .000 path; its .001.. updates auto-read) to per-cell PMTiles bytes IN
+ * PARALLEL across up to `workers` threads. The engine returns BYTES only — it never writes an
+ * output directory; the host writes each archive into the cache it manages. out_bytes[i] /
+ * out_lens[i] receive cell i's archive (free each with tile57_free) or NULL/0 when that cell
+ * produced nothing. Both arrays are caller-allocated, length n. `workers` is a MEMORY bound —
+ * each concurrent bake holds a whole cell's parse+portray+raster working set, so pass a small
+ * count (not a core count). Warms up the process globals internally, so concurrent baking is
+ * race-free. Returns the number of cells that produced bytes, or -1 on bad args. */
+int tile57_bake_cells(const char *const *paths, size_t n, uint32_t workers,
+                      uint8_t **out_bytes, size_t *out_lens);
+
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out / *out_len
  * (free with tile57_free). A single-cell bake embeds that cell's M_COVR coverage +
  * cscl + date/name under a "coverage" key, so the composite stitcher rebuilds the

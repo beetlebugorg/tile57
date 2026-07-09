@@ -77,6 +77,40 @@ export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, out: *[*]u8, out_len: *us
     return 0;
 }
 
+/// Bake `n` cells to per-cell PMTiles bytes IN PARALLEL across up to `workers` threads. The engine
+/// returns BYTES only (never writes an output dir); out_bytes[i]/out_lens[i] get cell i's archive
+/// (free each with tile57_free) or NULL/0 when it produced nothing. `workers` is a MEMORY bound —
+/// keep it small. Returns the number of cells baked, or -1 on bad args. See tile57.h.
+export fn tile57_bake_cells(
+    paths: ?[*]const ?[*:0]const u8,
+    n: usize,
+    workers: u32,
+    out_bytes: [*c][*c]u8,
+    out_lens: [*c]usize,
+) callconv(.c) c_int {
+    const ps = paths orelse return -1;
+    if (out_bytes == null or out_lens == null) return -1;
+    if (n == 0) return 0;
+    const list = gpa.alloc([]const u8, n) catch return -1;
+    defer gpa.free(list);
+    for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return -1;
+    const results = gpa.alloc(?[]u8, n) catch return -1;
+    defer gpa.free(results);
+    chart.bakeCellsParallel(list, null, workers, results);
+    var baked: c_int = 0;
+    for (0..n) |i| {
+        if (results[i]) |b| {
+            out_bytes[i] = b.ptr;
+            out_lens[i] = b.len;
+            baked += 1;
+        } else {
+            out_bytes[i] = null;
+            out_lens[i] = 0;
+        }
+    }
+    return baked;
+}
+
 /// Coverage/zoom summary of a resident compositor, filled by tile57_compose_meta.
 const CComposeMeta = extern struct {
     min_zoom: u8,

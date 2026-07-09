@@ -622,6 +622,54 @@ pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     return bakeArchive(&cell_in, resolveRulesDir(rules_dir), zr.min, zr.max, .mlt, true, null, null, coverage_json);
 }
 
+// ---- parallel batch cell-bake -------------------------------------------------
+// Bake many cells to their own per-cell PMTiles concurrently. The engine returns BYTES only — it
+// never touches an output directory; the host writes each archive into the cache it manages. Each
+// concurrent bake holds a whole cell's parse + portray + raster working set, so `workers` is a
+// MEMORY bound (keep it small), not a core count.
+
+// MAX_BAKE_WORKERS is a hard ceiling on batch-bake threads; the host normally passes far fewer.
+const MAX_BAKE_WORKERS = 32;
+
+const BakeCtx = struct {
+    next: std.atomic.Value(usize),
+    paths: []const []const u8,
+    rules_dir: ?[]const u8,
+    out: []?[]u8,
+};
+
+fn bakeCellWorker(ctx: *BakeCtx) void {
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.paths.len) return;
+        ctx.out[i] = bakeCellBytes(ctx.paths[i], ctx.rules_dir) catch null;
+    }
+}
+
+/// Bake each cell in `paths` (a .000 path; its .001.. updates auto-read) to its own native-scale
+/// PMTiles bytes IN PARALLEL across up to `workers` threads, writing cell i's archive to out[i]
+/// (caller owns it — free each with freeBytes) or leaving it null when that cell produced nothing
+/// or failed. out.len must equal paths.len. Race-free: warms up the process globals first, then
+/// each bakeCellBytes is independent (thread-safe allocator, thread-local portrayal context).
+/// `workers` is clamped to [1, min(paths.len, MAX_BAKE_WORKERS)] and is a MEMORY bound.
+pub fn bakeCellsParallel(paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, out: []?[]u8) void {
+    std.debug.assert(out.len == paths.len);
+    for (out) |*o| o.* = null;
+    if (paths.len == 0) return;
+    warmup(); // idempotent — populate the read-only globals before any worker touches them
+    var ctx = BakeCtx{ .next = std.atomic.Value(usize).init(0), .paths = paths, .rules_dir = rules_dir, .out = out };
+    var n = @min(@max(workers, 1), paths.len);
+    if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
+    if (n <= 1) return bakeCellWorker(&ctx);
+    var threads: [MAX_BAKE_WORKERS]std.Thread = undefined;
+    var spawned: usize = 0;
+    while (spawned < n - 1) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, bakeCellWorker, .{&ctx}) catch break;
+    }
+    bakeCellWorker(&ctx); // this thread participates too
+    for (threads[0..spawned]) |t| t.join();
+}
+
 /// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null
 /// if the archive carries none. For a host to read the embedded scamin / coverage
 /// without a full open. This engine writes metadata uncompressed; gzip is handled for
