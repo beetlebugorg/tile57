@@ -8,21 +8,31 @@ sidebar_position: 5
 
 `libtile57.a` exposes the whole engine behind a thin C ABI —
 [`include/tile57.h`](../../include/tile57.h), prefix `tile57_`. It is a shim over
-the [Zig API](./zig-api.md); the two stay in lock-step. Open a **chart**, serve
-vector tiles by `(z, x, y)` — MapLibre Tiles (MLT, the default bake format) or
-Mapbox Vector Tiles (MVT) — render finished PNG/PDF views, and (offline) bake
-archives + bundles, build a MapLibre style, and generate portrayal assets.
+the [Zig API](./zig-api.md); the two stay in lock-step.
+
+Two handles cover the surface:
+
+- A **`tile57_chart`** is the metadata + render handle. Open a cell (or a baked
+  PMTiles) and read its bounds, scale, coverage, cells, and features; query the
+  feature under a point; or render a finished PNG / PDF / callback surface.
+- A **`tile57_compose_source`** is the runtime **compositor**. Tiles are made one
+  way: bake each ENC cell to its own PMTiles, then compose them on demand by
+  `(z, x, y)` through the ownership partition. The composed bytes are MapLibre
+  Tiles (MLT, the default) or Mapbox Vector Tiles (MVT).
+
+The header is organized into seven sections — version, chart open + metadata,
+cell baking, live composing, render surface, style + assets, and util/catalogue/
+debug — mirrored below.
 
 :::warning Lifetime + threading
-A `tile57_chart` is **not** internally synchronized — use one thread per chart.
-It must also outlive every consumer still holding it: if a long-lived renderer
-captures the chart, close it only once nothing can still call
-`tile57_chart_tile`. `tile57_chart_tile` allocates `*out`; free it with
-`tile57_free` (same length). Input bytes are copied, so the caller may free them
-right after the call.
+Neither handle is internally synchronized — use one thread per handle. Each must
+also outlive every consumer still holding it: if a long-lived renderer or
+compositor captures it, close it only once nothing can still call into it. Calls
+that return bytes allocate `*out`; free it with `tile57_free` (same length).
+Input bytes are copied, so the caller may free them right after the call.
 :::
 
-## Open a chart + fetch tiles
+## Open a chart + read metadata
 
 ```c
 #include "tile57.h"
@@ -32,11 +42,20 @@ const char *tile57_version(void);   /* "0.1.0" */
 /* Opaque chart handle. */
 typedef struct tile57_chart tile57_chart;
 
-/* Open an on-disk ENC_ROOT directory (or a single .000 file) as a streaming
- * chart: cells are enumerated + peeked at open, then their bytes are read on
- * demand (working set only). Rules are the library's embedded catalogue.
- * NULL on failure. */
+/* Open an on-disk ENC_ROOT directory (or a single .000 file, with its .001..
+ * update chain). The cell is baked to an in-memory PMTiles and served through the
+ * reader render path, with real M_COVR coverage + compilation scale attached.
+ * Rules are the library's embedded catalogue. NULL on failure. */
 tile57_chart *tile57_chart_open(const char *path);
+
+/* Open a cell for METADATA ONLY — bbox, native_scale, M_COVR coverage — via a
+ * cheap parse with no tile bake (a chart-database / header scan). Do NOT render
+ * this handle. NULL on failure. */
+tile57_chart *tile57_chart_open_header(const char *path);
+
+/* Open a cell baking only [minzoom, maxzoom] — a narrow native band fast for
+ * first paint, then re-open the full range in the background (progressive load). */
+tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t maxzoom);
 
 /* Open one in-memory ENC cell (base .000 bytes) as a resident chart. Bytes are
  * copied. NULL on failure. */
@@ -45,61 +64,117 @@ tile57_chart *tile57_chart_open_bytes(const uint8_t *base, size_t len);
 /* Open a baked PMTiles bundle from a file path. NULL on failure. */
 tile57_chart *tile57_chart_open_pmtiles(const char *path);
 
-/* Tile encodings served by tile57_chart_tile / produced by the bakes. */
+/* Vector-tile encodings the engine produces (reported in chart_info.tile_type;
+ * the compositor serves MLT). */
 typedef enum {
     TILE57_TILE_TYPE_MVT = 1, /* Mapbox Vector Tile */
-    TILE57_TILE_TYPE_MLT = 2, /* MapLibre Tile (the default bake format) */
+    TILE57_TILE_TYPE_MLT = 2, /* MapLibre Tile (the default) */
 } tile57_tile_type;
 
 /* Fixed chart metadata, for a host that frames its own camera. Bounds/anchor
  * validity are flagged (false -> those fields are 0). tile_type is the encoding
- * tile57_chart_tile returns: a PMTiles-backed chart reports its archive's stored
- * type; a cell-backed chart reports its live generation format. */
+ * for this chart's tiles (PMTiles: the archive's stored type; a cell: the engine
+ * default). native_scale is the compilation scale 1:N (0 if unknown). */
 typedef struct {
     uint8_t  min_zoom, max_zoom;
     uint32_t bands;                                 /* bitmask: bit r = band rank r present */
     bool     has_bounds; double west, south, east, north;
     bool     has_anchor; double anchor_lat, anchor_lon, anchor_zoom;
     uint8_t  tile_type;                             /* tile57_tile_type */
+    int32_t  native_scale;
 } tile57_chart_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_chart_info *out);
-
-typedef enum {
-    TILE57_TILE_OK = 1,     /* *out / *out_len set; free with tile57_free */
-    TILE57_TILE_EMPTY = 0,  /* valid tile, no features */
-    TILE57_TILE_ERROR = -1,
-} tile57_tile_status;
-
-/* Fetch tile (z, x, y) as decompressed vector-tile bytes, VERBATIM in the
- * chart's tile encoding (chart_info.tile_type — there is no transcode layer;
- * hosts hint the encoding to the renderer instead, e.g. the MapLibre vector
- * source `encoding` option). Cached per chart. */
-tile57_tile_status tile57_chart_tile(tile57_chart *chart, uint8_t z, uint32_t x, uint32_t y,
-                                     uint8_t **out, size_t *out_len);
-
-/* Select the encoding for LIVE-generated tiles on a cell-backed chart: 0 =
- * engine default (mlt), TILE57_TILE_TYPE_MVT, TILE57_TILE_TYPE_MLT. Cell-backed
- * charts OPEN generating MVT (existing MVT-only embedders are unaffected); a
- * host whose renderer decodes MLT opts in here. No-op for a baked PMTiles chart.
- * Changing the format drops the tile cache. */
-void tile57_chart_set_tile_format(tile57_chart *chart, uint8_t format);
-
-/* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
- * colortables, …), passing the same length. The universal free. */
-void tile57_free(void *ptr, size_t len);
-
-void tile57_chart_clear_cache(tile57_chart *chart);
-void tile57_chart_close(tile57_chart *chart);
 
 /* The distinct SCAMIN denominators present in the chart (ascending). On success
  * returns 1 with *out pointing at *out_len int32 values, 0 if none, -1 on error.
  * Free with tile57_free((uint8_t*)*out, *out_len * sizeof(int32_t)). */
 int tile57_chart_scamin(tile57_chart *chart, int32_t **out, size_t *out_len);
+
+/* Release a chart and all cached tiles. */
+void tile57_chart_close(tile57_chart *chart);
 ```
 
 An ENC_ROOT cell is a base `.000` plus its sequential `.001`, `.002` … update
 files; `tile57_chart_open` walks the directory (`CATALOG.031`, else a `*.000`
 scan), applies each cell's updates, and overlays the cells by scale band.
+
+## Bake cells, then compose tiles
+
+Tile production is a two-step composite model. First bake each ENC cell to its
+own PMTiles at that cell's compilation scale; the per-cell archive embeds the
+cell's M_COVR coverage in its metadata. Then open a **compositor** over the
+archives and serve any `(z, x, y)` tile on demand — the compositor stitches the
+overlapping cells through an ownership partition, handling cross-band zoom.
+
+```c
+/* Bake ONE cell (+ its .001.. updates, read from disk) to PMTiles bytes over its
+ * native band zoom range. Returned in *out/*out_len (free with tile57_free) —
+ * persist the per-cell archive, then feed it to tile57_compose_open. The metadata
+ * embeds the cell's coverage (read via tile57_pmtiles_metadata). 1 = ok, 0 =
+ * nothing baked, -1 = error. */
+int tile57_bake_cell_bytes(const char *path, uint8_t **out, size_t *out_len);
+
+/* Read a PMTiles archive's metadata JSON blob (decompressed) into *out/*out_len.
+ * A single-cell bake embeds that cell's coverage + cscl + date/name under a
+ * "coverage" key, so the compositor rebuilds the partition without re-parsing the
+ * .000. 1 = ok, 0 = no metadata, -1 = error. */
+int tile57_pmtiles_metadata(const uint8_t *pmtiles, size_t len,
+                            uint8_t **out, size_t *out_len);
+```
+
+Every baked feature carries the pick-report properties `class` (object-class
+acronym), `cell` (source cell stem), and `s57` (the full S-57 attribute set as a
+JSON object) — what `tile57_chart_query` and a host inspector read back.
+
+The compositor holds the per-cell archives mmap'd and the ownership partition
+resident, so a tile costs a classify plus one decode/clip or a decompress. Open
+once, serve many, close.
+
+```c
+/* Opaque runtime-compositor handle. */
+typedef struct tile57_compose_source tile57_compose_source;
+
+/* Coverage/zoom summary filled by tile57_compose_meta_get. */
+typedef struct {
+    uint8_t min_zoom;
+    uint8_t max_zoom;                 /* deepest zoom served (native + one overscale zoom) */
+    uint32_t cells;                   /* coverage-carrying archives held */
+    double west, south, east, north;  /* union coverage bounds, degrees */
+} tile57_compose_meta;
+
+/* Open a resident compositor over the `n` per-cell PMTiles at `paths` (each from
+ * tile57_bake_cell_bytes, on disk), mmap'd so the cell set is never fully
+ * resident. partition_path (NULL to skip) names a sidecar — written by
+ * tile57_compose_save_partition (the `tile57 bake` CLI emits partition.tpart) — to
+ * load and skip the build; a missing/stale one falls back to building. NULL on
+ * error / no coverage-carrying archive. */
+tile57_compose_source *tile57_compose_open(const char *const *paths, size_t n,
+                                           const char *partition_path);
+
+/* Compose tile (z,x,y) on demand into RAW (decompressed) MLT in *out/*out_len — what
+ * a live tile server hands its HTTP layer (which gzips on the wire). Returns:
+ *   1  served (bytes in *out/*out_len),
+ *   2  OWNED but empty — a cell owns this ground but produced nothing (transient
+ *      while its bake is still running; an error state once bakes are done),
+ *   0  not owned — true empty ocean (safe to cache),
+ *  -1  error. */
+int tile57_compose_serve(tile57_compose_source *src, uint8_t z, uint32_t x, uint32_t y,
+                         uint8_t **out, size_t *out_len);
+
+/* Fill *out with the compositor's zoom range + union coverage bounds. */
+void tile57_compose_meta_get(tile57_compose_source *src, tile57_compose_meta *out);
+
+/* Serialize the ownership partition to `path` (a sidecar a later
+ * tile57_compose_open loads to skip the build). 1 = ok, -1 = error. */
+int tile57_compose_save_partition(tile57_compose_source *src, const char *path);
+
+/* Release a compositor (munmaps the archives, frees the partition). */
+void tile57_compose_close(tile57_compose_source *src);
+```
+
+The `tile57 bake <cell.000 | ENC_ROOT> -o out/` CLI produces this structure
+directly: `out/tiles/<STEM>.pmtiles` per cell plus `out/partition.tpart`. A host
+opens the compositor over `out/tiles/*.pmtiles` with that sidecar.
 
 ## Render a finished view (PNG / PDF)
 
@@ -166,6 +241,11 @@ typedef struct {
                          tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
     void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len,
                          const tile57_world_rings *rings);
+    /* Optional. Text as a UTF-8 string for a host SDF glyph atlas (tile57_bake_glyph_sdf),
+     * instead of tessellated outlines. */
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
+                          float ox_px, float oy_px, const char *text, size_t text_len,
+                          float size_px, tile57_rgba color, tile57_rgba halo);
 } tile57_surface_cb;
 
 /* Portray the view once and drive the callbacks. 0 ok, -1 bad handle,
@@ -183,6 +263,11 @@ those two fields NULL, the same features arrive as vector outlines instead.
 
 tile57 also declutters overlapping text for you before it makes the calls (symbols
 and soundings always draw, per S-52), so you don't repeat that work.
+
+There is a pixel-space twin, `tile57_chart_render_view_cb` with a `tile57_canvas_cb`
+vtable, that emits the SAME portrayal as resolved paint-order draw calls in canvas
+pixels — for a host that wants the engine's own paint pipeline without the PNG
+encode.
 
 ## Inspect a chart: cells, features, catalogues
 
@@ -240,78 +325,17 @@ int tile57_chart_query(tile57_chart *chart, double lon, double lat, double zoom,
                        const tile57_query_cb *cb);
 ```
 
-The class and cell come through for any chart. The attribute JSON is filled in
-only when the chart was baked with pick attributes — `tile57_bake_bundle` /
-`tile57_bake_pmtiles` include them by default (set `omit_pick_attrs` to leave them
-out for leaner tiles). Without them, `s57` is an empty string.
-
-## Bake an ENC_ROOT to PMTiles
-
-Bake in-memory cells into one PMTiles archive, zoom-banded per cell by
-compilation scale, so the result opens cheaply (`tile57_chart_open_pmtiles`)
-instead of holding every cell live. One cell = a base `.000` plus its sequential
-update files.
-
-```c
-/* One ENC cell for tile57_bake_pmtiles. `name` (the source cell stem, e.g.
- * "US4MD81M") is emitted as the `cell` pick-report property; NULL/"" omits it. */
-typedef struct {
-    const uint8_t *base;  size_t base_len;
-    const uint8_t *const *updates;  const size_t *update_lens;  size_t update_count;
-    const char *name;
-} tile57_cell;
-
-/* Progress callback. stage 0 = loading/portraying cells, stage 1 = baking tiles.
- * band_index/band_count/band_name locate the current navigational band. */
-typedef void (*tile57_bake_progress)(void *user, uint8_t stage, size_t done, size_t total,
-                                     uint8_t band_index, uint8_t band_count,
-                                     const char *band_name);
-
-/* Shared bake options. Pass NULL for all defaults (embedded rules/catalogue, no
- * band clamp, pick attrs included, no progress). catalog_dir/created apply to
- * tile57_bake_bundle only. */
-typedef struct {
-    const char *rules_dir;      /* NULL = embedded portrayal rules */
-    const char *catalog_dir;    /* NULL = embedded S-101 catalogue (bundle only) */
-    const char *created;        /* NULL = manifest "created" unset (bundle only) */
-    uint8_t minzoom, maxzoom;   /* 0/0 = no band clamp */
-    bool omit_pick_attrs;
-    tile57_bake_progress progress;
-    void *progress_user;
-    uint8_t format;             /* baked tile encoding: 0 = default (mlt),
-                                 * TILE57_TILE_TYPE_MVT, TILE57_TILE_TYPE_MLT.
-                                 * Honored by both bake calls. */
-} tile57_bake_opts;
-
-/* 1 with the archive in *out/*out_len (free with tile57_free), 0 if nothing
- * covered, -1 on error. */
-int tile57_bake_pmtiles(const tile57_cell *cells, size_t count,
-                        const tile57_bake_opts *opts,
-                        uint8_t **out, size_t *out_len);
-```
-
-## Bake a chart bundle
-
-`tile57_bake_bundle` bakes a single cell `.000` **or** a whole ENC_ROOT directory
-(`input`, an on-disk path) into a self-contained chart bundle under `out_dir` —
-the same package the `tile57 bake … -o out/` CLI emits: `tiles/chart.pmtiles`,
-`assets/{colortables,linestyles}.json` + sprite/pattern atlases, per-scheme
-`assets/style-{day,dusk,night}.json`, and `manifest.json`. `out_cell_count` /
-`out_bbox` (w,s,e,n) are optional. Returns 1 on success, 0 if nothing was covered,
--1 on error.
-
-```c
-int tile57_bake_bundle(const char *input, const char *out_dir,
-                       const tile57_bake_opts *opts,
-                       uint32_t *out_cell_count, double *out_bbox);
-```
+The class and cell come through for any chart; the attribute JSON is filled in
+from the `s57` pick property baked into the tiles (empty if a chart was baked
+without pick attributes).
 
 ## Generate portrayal assets
 
-`tile57_bake_assets` produces all portrayal assets in memory (the same files
-`tile57_bake_bundle` writes to disk) from the library's embedded catalogue
-(`catalog_dir` NULL/"") or an on-disk `PortrayalCatalog`. Every non-NULL buffer is
-owned by the library; release the whole struct with `tile57_assets_free`.
+`tile57_bake_assets` produces all portrayal assets in memory — colour tables,
+line styles, and the sprite / area-fill pattern atlases — from the library's
+embedded catalogue (`catalog_dir` NULL/"") or an on-disk `PortrayalCatalog`.
+Every non-NULL buffer is owned by the library; release the whole struct with
+`tile57_assets_free`.
 
 ```c
 typedef struct {
@@ -331,10 +355,13 @@ into one PNG, each cell centered on its symbol's pivot, plus a JSON index of
 `{name: {x, y, width, height, pixelRatio}}`. A GPU host loads this atlas once and
 draws point symbols and area patterns as textured quads by name — the atlas the
 [host-surface `draw_sprite`/`draw_pattern` callbacks](#render-to-a-host-surface-vector-callbacks)
-hand back. Free it with `tile57_assets_free` as above.
+hand back. `tile57_bake_glyph_sdf` is its text counterpart: an RGBA
+signed-distance-field atlas of the label font, for a host that draws text as SDF
+quads. Free either with `tile57_assets_free` as above.
 
 ```c
 int tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out);   /* 1 = ok, 0 = error */
+int tile57_bake_glyph_sdf(tile57_assets *out);                             /* 1 = ok, 0 = error */
 ```
 
 ## Build a MapLibre style
@@ -342,7 +369,7 @@ int tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out);   /* 1 
 `tile57_build_style` turns a MapLibre style template + the mariner's S-52 display
 options + the S-52 colortables into a concrete style JSON, client-side. The
 template + colortables come from the built-in `tile57_style_template` /
-`tile57_colortables_default` (or the bundle's assets); the host fills
+`tile57_colortables_default` (or the generated assets); the host fills
 `tile57_mariner` from its UI.
 
 ```c
@@ -350,7 +377,7 @@ typedef enum { TILE57_SCHEME_DAY=0, TILE57_SCHEME_DUSK=1, TILE57_SCHEME_NIGHT=2 
 typedef enum { TILE57_DEPTH_METERS=0, TILE57_DEPTH_FEET=1 } tile57_depth_unit;
 typedef enum { TILE57_BOUNDARY_SYMBOLIZED=0, TILE57_BOUNDARY_PLAIN=1 } tile57_boundary_style;
 
-typedef struct {
+typedef struct tile57_mariner {
     tile57_scheme scheme;
     double shallow_contour, safety_contour, deep_contour, safety_depth;
     bool four_shade_water;
@@ -418,6 +445,20 @@ int tile57_style_template(tile57_scheme scheme, const char *source_tiles,
                           uint32_t minzoom, uint32_t maxzoom,
                           uint8_t tile_encoding,
                           uint8_t **out, size_t *out_len);
+```
+
+## Util: warmup + free
+
+```c
+/* Populate the process-global read-only registries (feature catalogue +
+ * complex-linestyle table) on the calling thread. Call ONCE on your main thread
+ * before opening or baking cells from worker threads, so concurrent bake/render is
+ * race-free. Idempotent. */
+void tile57_warmup(void);
+
+/* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
+ * colortables, …), passing the same length. The universal free. */
+void tile57_free(void *ptr, size_t len);
 ```
 
 ## Diagnostics header
