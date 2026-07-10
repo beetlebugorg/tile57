@@ -577,77 +577,6 @@ fn readCellFiles(path: []const u8) !CellFiles {
     return .{ .base = base, .updates = try updates.toOwnedSlice(gpa) };
 }
 
-/// Open a SINGLE .000 cell (+ updates) for its METADATA ONLY — bbox, compilation
-/// scale, and M_COVR coverage — via a cheap parse (no portrayal, no geometry cache,
-/// no tile bake). For the host's header/scan pass, where nothing renders. The
-/// resulting `.cell` chart must NOT be render_surface'd (it has no portrayal).
-pub fn openCellHeader(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
-    _ = rules_dir;
-    var cf = try readCellFiles(path);
-    defer cf.deinit();
-    // Propagate the specific parse error (BadLeader / UnknownRUIN / …) so the C
-    // caller reads the exact reason the cell is invalid, not a generic code.
-    const cell = try s57.parseCellWithUpdates(gpa, cf.base, cf.updates);
-    var cb = CellBackend{ .cell = cell, .cscl = s57.peekScale(gpa, cf.base) orelse 0 };
-    const pa = gpa.create(std.heap.ArenaAllocator) catch {
-        freeCellBackend(&cb);
-        return error.OutOfMemory;
-    };
-    pa.* = std.heap.ArenaAllocator.init(gpa);
-    cb.portray_arena = pa;
-    cb.coverage = cb.cell.mcovrCoverage(pa.allocator());
-    const src = gpa.create(Chart) catch {
-        freeCellBackend(&cb);
-        return error.OutOfMemory;
-    };
-    src.* = .{ .backend = .{ .cell = cb }, .cache = std.AutoHashMap(u64, []u8).init(gpa), .pick_attrs = pick_attrs };
-    return src;
-}
-
-/// Open a SINGLE .000 cell (+ updates) by BAKING it to an in-memory PMTiles across
-/// [minzoom, maxzoom] and serving it via the fast `.reader` path — a live cell
-/// re-portrayed per view is orders of magnitude slower. The baked tiles carry no
-/// M_COVR / CSCL, so the source cell's real coverage + compilation scale are captured
-/// and attached (coverage()/nativeScale()). A host can bake a narrow band quickly
-/// then re-open the full range in the background (progressive load).
-pub fn openCellBaked(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool, minzoom: u8, maxzoom: u8) !*Chart {
-    var cf = try readCellFiles(path);
-    defer cf.deinit();
-    const cscl = s57.peekScale(gpa, cf.base) orelse 0;
-    var cov_arena = try gpa.create(std.heap.ArenaAllocator);
-    cov_arena.* = std.heap.ArenaAllocator.init(gpa);
-    errdefer {
-        cov_arena.deinit();
-        gpa.destroy(cov_arena);
-    }
-    var coverage: []const []const []const s57.LonLat = &.{};
-    if (s57.parseCellWithUpdates(gpa, cf.base, cf.updates)) |parsed| {
-        var cell = parsed;
-        coverage = cell.mcovrCoverage(cov_arena.allocator()); // assembled into cov_arena
-        cell.deinit();
-    } else |_| {}
-
-    const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
-    const archive = (bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, pick_attrs, null, null, null) catch null) orelse return error.InvalidCell;
-    defer gpa.free(archive);
-    const src = try Chart.openBytes(archive, .pmtiles, rules_dir);
-    // Replace any coverage the archive metadata attached (this parse is fresher).
-    if (src.coverage_arena) |ca| {
-        ca.deinit();
-        gpa.destroy(ca);
-        src.cell_cov = null;
-    }
-    src.cscl_override = cscl;
-    src.coverage_override = coverage;
-    src.coverage_arena = cov_arena;
-    return src;
-}
-
-/// Bake the full zoom range (the default single-cell open).
-pub fn openCellPath(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
-    return openCellBaked(path, rules_dir, pick_attrs, 0, 18);
-}
-
 /// Bake a SINGLE .000 cell (+ updates) to a PMTiles archive over its NATIVE band's
 /// zoom range (`bandZooms(bandOf(cscl))`) and nothing else — the composite model bakes
 /// each cell at its own compilation scale; the stitcher combines them and handles any
@@ -666,8 +595,8 @@ pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     var cf = try readCellFiles(cell_path);
     defer cf.deinit();
 
-    // Capture coverage for the embedded sidecar (one cheap parse, as openCellBaked
-    // does). The stem is the ownership tie-break name — matches the coverage loader.
+    // Capture coverage for the embedded sidecar (one cheap parse). The stem is the
+    // ownership tie-break name — matches the coverage loader.
     var cov_arena = std.heap.ArenaAllocator.init(gpa);
     defer cov_arena.deinit();
     var coverage_json: ?[]const u8 = null;
@@ -980,17 +909,12 @@ pub const Chart = struct {
     // A PMTiles/reader backend ignores it — stored tiles serve verbatim in their
     // baked encoding (see tileType).
     tile_format: scene.TileFormat = .mvt,
-    // A live cell baked to an in-memory PMTiles (openCellBaked) is a .reader for
-    // fast render, but still carries the source cell's real M_COVR coverage and
-    // compilation scale (the baked tiles don't). These override coverage()/
-    // nativeScale(); coverage_arena owns the copied polygons (freed in deinit).
-    coverage_override: []const []const []const s57.LonLat = &.{},
-    coverage_arena: ?*std.heap.ArenaAllocator = null,
-    cscl_override: i32 = 0,
     // The per-cell coverage decoded from the opened archive's metadata (name, date,
-    // cscl, bbox, M_COVR rings) — what a compositor borrows to place this chart in
-    // the ownership partition. Storage lives in coverage_arena.
+    // cscl, bbox, M_COVR rings) — read back by coverage()/nativeScale(), and what a
+    // compositor borrows to place this chart in the ownership partition. Storage
+    // lives in coverage_arena (freed in deinit).
     cell_cov: ?cell_coverage.CellCoverage = null,
+    coverage_arena: ?*std.heap.ArenaAllocator = null,
     // A path-opened archive is mmap'd rather than copied (never fully resident);
     // released in deinit. Bytes-opened archives use `data` instead.
     data_map: ?[]align(std.heap.page_size_min) const u8 = null,
@@ -1185,7 +1109,6 @@ pub const Chart = struct {
     /// gaps to coarser cells. A live cell parses it; a per-cell baked PMTiles
     /// surfaces the copy embedded in its archive metadata. Null when absent.
     pub fn coverage(self: *const Chart) ?[]const []const []const s57.LonLat {
-        if (self.coverage_override.len > 0) return self.coverage_override;
         if (self.cell_cov) |cc| {
             if (cc.cov1.len > 0) return cc.cov1;
         }
@@ -1200,7 +1123,6 @@ pub const Chart = struct {
     /// baked PMTiles reads the copy in its archive metadata. 0 = unknown (derive from
     /// the zoom band instead).
     pub fn nativeScale(self: *const Chart) i32 {
-        if (self.cscl_override != 0) return self.cscl_override;
         if (self.cell_cov) |cc| {
             if (cc.cscl != 0) return cc.cscl;
         }

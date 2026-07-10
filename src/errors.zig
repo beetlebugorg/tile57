@@ -39,6 +39,7 @@ pub fn describe(e: anyerror) []const u8 {
         error.ModifyMissingFeature => "update references a missing feature record",
         error.UnknownRUIN => "unknown record update instruction (RUIN)",
         error.BadFeatureRecord => "malformed feature record",
+        error.TileGen => "tile generation failed",
         else => @errorName(e),
     };
 }
