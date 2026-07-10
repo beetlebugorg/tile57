@@ -6,17 +6,14 @@
 const std = @import("std");
 const s57 = @import("s57");
 
-const EARTH_CIRCUM_M: f64 = 40075016.686;
-
-// Worst-case reach of a light's sector legs/arcs (emitAugFigures) as a fraction of a
-// tile — these are drawn at a fixed DISPLAY size (radius/length in mm), so the reach
-// is ~constant in tile units at every zoom (offset_tiles = mm * PX_PER_MM / 512, the
-// 512-CSS-px tile the figures are sized against). Used to widen the LIGHTS
-// spatial-cull margin so an arc isn't dropped on the tiles it crosses (S-52 legs
-// ~25 mm / arcs ~20 mm ≈ 0.2 tile; 1.0 is generous headroom).
-// GROUND-length legs (directional lights: nmi2metres(nominal range), LightSectored.lua)
-// exceed this by far at fine zooms — lightReachTiles is the honest per-zoom bound.
-pub const LIGHT_AUG_REACH_TILES: f64 = 1.0;
+// The reach bounds live in the tiles leaf (tiles.tile) so the runtime
+// compositor — a dependency leaf without the scene — applies the SAME ring
+// when it pulls a cell's figures into neighbouring tiles. Re-exported here
+// for the baker/emitter callers. GROUND-length legs (directional lights:
+// nmi2metres(nominal range), LightSectored.lua) exceed the mm bound by far
+// at fine zooms — lightReachTiles is the honest per-zoom bound.
+pub const LIGHT_AUG_REACH_TILES = @import("tiles").tile.LIGHT_AUG_REACH_TILES;
+pub const lightReachTiles = @import("tiles").tile.lightReachTiles;
 
 /// How far a cell's constructed sector figures (emitAugFigures) can reach beyond
 /// their feature anchors, summarised per cell so tile addressing (bake_enc
@@ -30,18 +27,6 @@ pub const LightReach = struct {
     /// length — directional-light legs); 0 = display-mm figures only.
     range_m: f64 = 0,
 };
-
-/// Worst-case tile-unit reach of sector figures at zoom z, latitude `lat`:
-/// display-mm figures reach a ~constant LIGHT_AUG_REACH_TILES, ground-length legs
-/// reach range_m metres = range_m·2^z/(cosφ·C) tiles (the emitAugFigures
-/// projection: len_px = range_m/(cosφ·EARTH_CIRCUM_M)·worldPx). Never below the
-/// mm bound — a cell with figures always reaches at least the display-sized ones.
-pub fn lightReachTiles(range_m: f64, z: u8, lat: f64) f64 {
-    if (range_m <= 0) return LIGHT_AUG_REACH_TILES;
-    const cos_lat = @max(@cos(lat * std.math.pi / 180.0), 1e-6);
-    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
-    return @max(LIGHT_AUG_REACH_TILES, range_m * scale / (cos_lat * EARTH_CIRCUM_M));
-}
 
 // The nth comma-separated field of an instruction argument ("" past the end).
 fn instrCsv(s: []const u8, n: usize) []const u8 {

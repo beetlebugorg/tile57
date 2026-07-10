@@ -714,8 +714,11 @@ pub const VECTOR_LAYERS = mvt.VECTOR_LAYERS;
 /// (vector_layers + scamin splice). `scamin` empty -> omit the field. `coverage_json`,
 /// when non-null, is a per-cell coverage object (see `coverage.encodeJson`) spliced
 /// under a "coverage" key — a single-cell composite bake carries its own M_COVR there.
+/// `light_reach_json` (see `coverage.encodeLightReachJson`), when non-null, is the
+/// cell's sector-figure reach summary spliced under a "light_reach" key so the
+/// compositor can widen its tile addressing without re-portraying the cell.
 /// Caller owns the returned bytes (allocated in `a`).
-pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u8) ![]const u8 {
+pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u8, light_reach_json: ?[]const u8) ![]const u8 {
     var b = std.ArrayList(u8).empty;
     try b.appendSlice(a, "{\"name\":\"chartplotter\",\"format\":\"pbf\",\"vector_layers\":[");
     for (VECTOR_LAYERS, 0..) |name, i| {
@@ -737,6 +740,10 @@ pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u
     if (coverage_json) |cj| {
         try b.appendSlice(a, ",\"coverage\":");
         try b.appendSlice(a, cj);
+    }
+    if (light_reach_json) |lj| {
+        try b.appendSlice(a, ",\"light_reach\":");
+        try b.appendSlice(a, lj);
     }
     try b.append(a, '}');
     return b.toOwnedSlice(a);

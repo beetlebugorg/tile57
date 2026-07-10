@@ -2316,6 +2316,11 @@ pub fn bakeArchive(
 
     var loaded: usize = 0;
     var band_ord: u8 = 0;
+    // Union sector-figure reach across the baked cells — published as the
+    // archive's "light_reach" metadata so the compositor widens its tile
+    // addressing by the same ring the baker did (null = no figures anywhere).
+    var lr_union: ?[4]f64 = null;
+    var lr_range_m: f64 = 0;
     for (bake_enc.bands_fine_to_coarse) |band| {
         const idxs = band_idx[@intFromEnum(band)].items;
         const floor: bake_enc.FloorMode = if (coarsest_pop == band) .extend_min else .defer_down;
@@ -2382,6 +2387,17 @@ pub fn bakeArchive(
             if (be.cscl > 0) {
                 const q = bake_enc.overscaleGateDenom(be.cscl);
                 if (q > 0) scamin_set.put(@intCast(q), {}) catch {};
+            }
+            // Fold the sector-figure reach for the archive's "light_reach" key
+            // (union bbox, max ground leg) while the backends are alive.
+            if (be.light_bbox) |lb| {
+                if (lr_union) |*u| {
+                    u[0] = @min(u[0], lb[0]);
+                    u[1] = @min(u[1], lb[1]);
+                    u[2] = @max(u[2], lb[2]);
+                    u[3] = @max(u[3], lb[3]);
+                } else lr_union = lb;
+                lr_range_m = @max(lr_range_m, be.light_range_m);
             }
         }
         if (has_work) {
@@ -2452,7 +2468,10 @@ pub fn bakeArchive(
         while (it.next()) |k| try scamin_vals.append(gpa, k.*);
         std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
     }
-    const meta = try scene.metadataJson(gpa, scamin_vals.items, coverage_json);
+    var light_reach_json: ?[]const u8 = null;
+    defer if (light_reach_json) |lj| gpa.free(lj);
+    if (lr_union) |u| light_reach_json = scene.coverage.encodeLightReachJson(gpa, .{ .bbox = u, .range_m = lr_range_m }) catch null;
+    const meta = try scene.metadataJson(gpa, scamin_vals.items, coverage_json, light_reach_json);
     defer gpa.free(meta);
     return try sw.finishBytes(.{
         .metadata_json = meta,

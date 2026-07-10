@@ -60,6 +60,14 @@ pub const Cell = struct {
     cov1: []const Poly,
     /// CATCOV=2 explicit no-data features (subtracted, so a coarser band can fill).
     cov2: []const Poly = &.{},
+    /// Sector-figure reach (the archive's "light_reach" metadata): union bbox
+    /// [w,s,e,n] in DEGREES of the cell's figure-constructing light anchors, and
+    /// the max ground-length directional leg in metres. The compositor consults
+    /// the cell in tiles this ring touches even when it owns no ground there, so
+    /// legs/arcs don't amputate at the tile boundary. null = no figures. Carried
+    /// beside the partition inputs (never serialized — it rides the live cells).
+    light_bbox: ?[4]f64 = null,
+    light_range_m: f64 = 0,
 };
 
 /// A cell's owned region at a tier: `index` into the caller's cell slice and the

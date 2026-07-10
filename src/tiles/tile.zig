@@ -85,6 +85,33 @@ pub fn tileBoundsLonLat(z: u8, tx: u32, ty: u32) [4]f64 {
     return .{ lon0, lat0, lon1, lat1 };
 }
 
+// ---- light sector-figure reach --------------------------------------------
+// A LIGHTS feature's constructed sector legs/arcs are FIXED display-size
+// figures around the light (plus ground-length directional legs), so they can
+// cross into tiles the light's cell owns no ground in. Both the baker's tile
+// addressing (bake_enc buildTileMap) and the runtime compositor's reach ring
+// (compose.composeTile) widen by the same bound so the figures survive there.
+
+const EARTH_CIRCUM_M: f64 = 40075016.686;
+
+/// Worst-case reach of a light's display-mm sector figures as a fraction of a
+/// tile — ~constant at every zoom (offset_tiles = mm * PX_PER_MM / 512, the
+/// 512-CSS-px tile the figures are sized against; S-52 legs ~25 mm / arcs
+/// ~20 mm ≈ 0.2 tile; 1.0 is generous headroom).
+pub const LIGHT_AUG_REACH_TILES: f64 = 1.0;
+
+/// Worst-case tile-unit reach of sector figures at zoom z, latitude `lat`:
+/// display-mm figures reach a ~constant LIGHT_AUG_REACH_TILES, ground-length
+/// legs (directional lights) reach range_m metres = range_m·2^z/(cosφ·C) tiles.
+/// Never below the mm bound — a cell with figures always reaches at least the
+/// display-sized ones.
+pub fn lightReachTiles(range_m: f64, z: u8, lat: f64) f64 {
+    if (range_m <= 0) return LIGHT_AUG_REACH_TILES;
+    const cos_lat = @max(@cos(lat * std.math.pi / 180.0), 1e-6);
+    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+    return @max(LIGHT_AUG_REACH_TILES, range_m * scale / (cos_lat * EARTH_CIRCUM_M));
+}
+
 /// Inclusive tile box used for clipping (extent +/- buffer).
 pub const Box = struct {
     min: i32,

@@ -31,6 +31,7 @@ pub const LoadedCov = struct {
     cscl: i32, // compilation scale (1:N)
     coverage: []const []const []const s57.LonLat, // M_COVR(CATCOV=1) rings
     bounds: [4]f64, // [w,s,e,n] over the coverage
+    light_reach: ?coverage.LightReach = null, // sector-figure reach ("light_reach" metadata)
 };
 
 pub fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]geometry.plane.Cell {
@@ -62,6 +63,8 @@ pub fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]geometry
             .band_floor = band.bandZooms(band.bandOf(lc.cscl)).min,
             .order = order[i],
             .cov1 = out,
+            .light_bbox = if (lc.light_reach) |lr| lr.bbox else null,
+            .light_range_m = if (lc.light_reach) |lr| lr.range_m else 0,
         };
     }
     return cells;
@@ -136,7 +139,7 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) geometry.plane.Box {
 // ancestor), clip its features to the owner's projected owned face, per-layer concat in
 // VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
 // the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
-fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, map: *const geometry.partition.BandMap, readers: []const *pmtiles.Reader, slots: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
+fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, map: *const geometry.partition.BandMap, readers: []const *pmtiles.Reader, slots: []const u32, reach_cells: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
     const compose = clip;
     var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
     for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
@@ -149,6 +152,23 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
             for (layer.features) |feat| try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
+        }
+    }
+    // Reach-ring cells: no owned ground in this tile, but their light sector
+    // figures sweep in (the bake addressed the tile for exactly that reach).
+    // Contribute ONLY the constructed LIGHTS figures, whole — the same
+    // clipFeatureToFace exception, minus a face. Everything else in the tile
+    // (ground the cell doesn't own here) stays with its owners.
+    for (reach_cells) |ci| {
+        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty)) orelse continue;
+        for (layers) |layer| {
+            const li = layerIndex(layer.name) orelse continue;
+            for (layer.features) |feat| {
+                if (feat.geom_type != .linestring or !compose.isLightFigure(feat)) continue;
+                const parts = try ta.alloc([]const mvt.Point, feat.parts.len);
+                for (feat.parts, 0..) |p, i| parts[i] = try ta.dupe(mvt.Point, p);
+                try buckets[li].append(ta, .{ .geom_type = .linestring, .parts = parts, .properties = feat.properties });
+            }
         }
     }
     var out_layers = std.ArrayList(mvt.Layer).empty;
@@ -178,13 +198,15 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     const ta = arena.allocator();
 
     // Pass-1-equivalent for this one tile: walk owners in face order (the batch's tie order), cull
-    // by face bbox, classify. The FIRST owner that fully owns the tile (buffer included) and has a
-    // native blob wins the verbatim copy — faces are a disjoint partition, so that owner is unique.
+    // by face bbox, classify. An owner that fully owns the tile (buffer included) is the verbatim
+    // candidate — faces are a disjoint partition, so that owner is unique — but the copy is
+    // deferred until the reach scan below proves no neighbouring cell's sector figures sweep in.
     // Every other contributing owner (seam, or fully-owned-but-no-native) is collected in face order.
     // `owned` = at least one cell's coverage face covers this tile (the partition says it SHOULD
     // render here) — so a caller can tell a transient/erroneous empty from true empty ocean.
     var owned = false;
     var slots = std.ArrayList(u32).empty;
+    var verbatim: ?usize = null; // cell index of the unique tile+buffer-owning cell
     for (map.faces, 0..) |face, slot| {
         if (face.owned.len == 0) continue;
         const ci = face.index;
@@ -194,24 +216,63 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
 
         var grid = try geometry.plane.EdgeGrid.init(ta, face.owned, tileWidthE7(z));
         defer grid.deinit();
-        switch (grid.classify(tileClassifyBox(z, tx, ty))) {
-            .full => continue, // owns none of this tile
-            .empty => { // owns the whole tile: verbatim blob if present, else fall through
-                owned = true;
-                if (want_gzip) {
-                    if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .tile = try gpa.dupe(u8, blob), .owned = true };
-                } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .tile = try gpa.dupe(u8, raw), .owned = true };
-            },
-            .seam => owned = true,
-        }
+        const cls = grid.classify(tileClassifyBox(z, tx, ty));
+        if (cls == .full) continue; // owns none of this tile
+        owned = true;
         if (!(try ownerHasTile(readers[ci], cscl, z, tx, ty))) continue;
+        if (cls == .empty) { // owns the whole tile: its face projection can't be empty
+            verbatim = ci;
+            try slots.append(ta, @intCast(slot));
+            continue;
+        }
         const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
         if (face_px.len == 0) continue;
         try slots.append(ta, @intCast(slot));
     }
-    if (slots.items.len == 0) return .{ .tile = null, .owned = owned };
 
-    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, z, tx, ty)) orelse return .{ .tile = null, .owned = owned };
+    // Reach ring (spec §2.3, the cross-TILE half): a cell owning ground at this
+    // tier — just none in this tile — can still have light sector figures
+    // sweeping in, and the bake addressed this tile for exactly that reach
+    // (buildTileMap's lightReachTiles ring around the cell's light_bbox). Apply
+    // the SAME ring here: consult each such cell's archive and let
+    // composeSeamTile take only its constructed LIGHTS figures, whole.
+    // Without this the figures amputate exactly at the composed-tile boundary.
+    var reach = std.ArrayList(u32).empty;
+    {
+        var contributed = try ta.alloc(bool, part.cells.len);
+        @memset(contributed, false);
+        for (slots.items) |slot| contributed[map.faces[slot].index] = true;
+        var seen = try ta.alloc(bool, part.cells.len);
+        @memset(seen, false);
+        for (map.faces) |face| {
+            if (face.owned.len == 0) continue;
+            const ci = face.index;
+            if (contributed[ci] or seen[ci]) continue;
+            seen[ci] = true;
+            const c = part.cells[ci];
+            const lb = c.light_bbox orelse continue;
+            const r = tile.lightReachTiles(c.light_range_m, z, (lb[1] + lb[3]) * 0.5);
+            const w_tl = tile.lonLatToWorld(lb[0], lb[3]);
+            const w_br = tile.lonLatToWorld(lb[2], lb[1]);
+            const fx: f64 = @floatFromInt(tx);
+            const fy: f64 = @floatFromInt(ty);
+            if (fx + 1.0 <= w_tl[0] * scale - r or fx >= w_br[0] * scale + r or
+                fy + 1.0 <= w_tl[1] * scale - r or fy >= w_br[1] * scale + r) continue;
+            if (!(try ownerHasTile(readers[ci], c.cscl, z, tx, ty))) continue;
+            try reach.append(ta, @intCast(ci));
+        }
+    }
+
+    // Verbatim fast path: only when no reach cell contributes (else the figures
+    // must merge, so the tile seam-composes; content-identical for the owner).
+    if (reach.items.len == 0) if (verbatim) |ci| {
+        if (want_gzip) {
+            if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .tile = try gpa.dupe(u8, blob), .owned = true };
+        } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .tile = try gpa.dupe(u8, raw), .owned = true };
+    };
+    if (slots.items.len == 0 and reach.items.len == 0) return .{ .tile = null, .owned = owned };
+
+    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, reach.items, z, tx, ty)) orelse return .{ .tile = null, .owned = owned };
     // want_gzip → match the archive's stored (gzipped) bytes; else hand back the raw MLT.
     const bytes = if (want_gzip) try pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
     return .{ .tile = bytes, .owned = true };
@@ -323,7 +384,7 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
         };
         try maps.append(a, map);
         try readers.append(a, rp);
-        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = covDegBounds(cc) });
+        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = covDegBounds(cc), .light_reach = cc.light_reach });
     }
     if (readers.items.len == 0) {
         src.arena.deinit();
@@ -359,7 +420,7 @@ pub fn openComposeSourceCharts(gpa: std.mem.Allocator, archives: []const ChartAr
     for (archives) |ar| {
         if (ar.cov.cov1.len == 0) continue;
         try readers.append(a, ar.reader);
-        try shims.append(a, .{ .name = ar.cov.name, .date = ar.cov.date, .cscl = ar.cov.cscl, .coverage = ar.cov.cov1, .bounds = covDegBounds(ar.cov) });
+        try shims.append(a, .{ .name = ar.cov.name, .date = ar.cov.date, .cscl = ar.cov.cscl, .coverage = ar.cov.cov1, .bounds = covDegBounds(ar.cov), .light_reach = ar.cov.light_reach });
     }
     if (readers.items.len == 0) {
         src.arena.deinit();

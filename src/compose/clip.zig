@@ -32,9 +32,10 @@ fn narrowRing(a: std.mem.Allocator, ring: []const Pt) ![]mvt.Point {
     return out;
 }
 
-// A linestring carrying class=LIGHTS is a constructed sector figure (LIGHTS is a
-// point class; its only line output is emitAugFigures legs/arcs).
-fn isLightFigure(feat: mvt.DecodedFeature) bool {
+/// A linestring carrying class=LIGHTS is a constructed sector figure (LIGHTS is a
+/// point class; its only line output is emitAugFigures legs/arcs). Public so the
+/// compositor's reach-ring pass can pick figures out of a neighbouring cell's tile.
+pub fn isLightFigure(feat: mvt.DecodedFeature) bool {
     for (feat.properties) |p| {
         if (std.mem.eql(u8, p.key, "class")) {
             return switch (p.value) {

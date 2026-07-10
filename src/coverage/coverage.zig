@@ -29,7 +29,28 @@ pub const CellCoverage = struct {
     bbox: [4]i32, // [w, s, e, n] integer lon/lat (lon_e7/lat_e7)
     cov1: []const []const []const s57.LonLat, // M_COVR CATCOV=1: [feature][ring][point]
     cov2: []const []const []const s57.LonLat = &.{}, // reserved (CATCOV=2 no-data)
+    // Sector-figure reach (the metadata's sibling "light_reach" key, null when the
+    // cell constructs no figures) — decodeFromMetadata fills it so the compositor
+    // can widen tile addressing without re-portraying the cell.
+    light_reach: ?LightReach = null,
 };
+
+/// Sector-figure reach summary carried beside "coverage" in the per-cell archive
+/// metadata (key "light_reach", written only when the cell's portrayal constructs
+/// light sector figures): the union bbox of the figure-bearing anchors plus the
+/// max ground-length directional-leg span. The compositor widens its tile
+/// addressing with the SAME ring the baker used (tiles.tile.lightReachTiles), so
+/// legs/arcs survive into neighbouring tiles the cell owns no ground in.
+pub const LightReach = struct {
+    bbox: [4]f64, // [w, s, e, n] degrees — union of figure-bearing anchors
+    range_m: f64 = 0, // max ground-length leg (directional lights), metres
+};
+
+/// Serialize a light-reach summary to the JSON object embedded under the
+/// metadata's "light_reach" key. Caller owns the returned bytes.
+pub fn encodeLightReachJson(a: std.mem.Allocator, lr: LightReach) ![]u8 {
+    return std.json.Stringify.valueAlloc(a, lr, .{});
+}
 
 /// Build a CellCoverage from a parsed cell. `name` is the caller's identity string
 /// (the file basename stem, matching the coverage loader / ownership oracle) and
@@ -83,7 +104,7 @@ const Dto = struct {
 
 // The metadata object as far as this module cares: everything else (name, format,
 // vector_layers, scamin) is skipped via ignore_unknown_fields.
-const Envelope = struct { coverage: ?Dto = null };
+const Envelope = struct { coverage: ?Dto = null, light_reach: ?LightReach = null };
 
 /// Serialize `cov` to the JSON object embedded under the metadata's "coverage" key.
 /// Caller owns the returned bytes (allocated in `a`).
@@ -115,6 +136,7 @@ pub fn decodeFromMetadata(a: std.mem.Allocator, metadata_json: []const u8) !?Cel
         .bbox = dto.bbox,
         .cov1 = try fromWire(a, dto.cov1),
         .cov2 = try fromWire(a, dto.cov2),
+        .light_reach = parsed.value.light_reach, // POD — safe past parsed.deinit()
     };
 }
 
