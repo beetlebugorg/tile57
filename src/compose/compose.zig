@@ -4,10 +4,11 @@
 //! baking: it reads already-baked archives and never parses S-57 or runs
 //! portrayal, so it depends only on the tile/geometry/coverage leaves.
 //!
-//!   ComposeSource          — resident compositor over mmap'd archives + a partition
-//!   composeTile            — compose one tile (the stateless core ComposeSource uses)
-//!   openComposeSourceFiles — open archives from disk, load or build the partition
-//!   clip                   — the per-face clip-to-owned-geometry core (submodule)
+//!   ComposeSource           — resident compositor over mmap'd archives + a partition
+//!   composeTile             — compose one tile (the stateless core ComposeSource uses)
+//!   openComposeSourceFiles  — open archives from disk, load or build the partition
+//!   openComposeSourceCharts — same, borrowing already-open charts' readers + coverage
+//!   clip                    — the per-face clip-to-owned-geometry core (submodule)
 
 const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;
@@ -232,6 +233,9 @@ pub const ComposeSource = struct {
     arena: std.heap.ArenaAllocator, // owns the readers/maps arrays + adapted cells (borrowed by part)
     maps: []const []align(std.heap.page_size_min) const u8,
     readers: []const *pmtiles.Reader,
+    // A files-open owns its readers + mmaps (deinit closes them); a charts-open
+    // borrows them from the charts, which must outlive this source.
+    owns_archives: bool = true,
     part: geometry.partition.Partition,
     minz: u8,
     maxz: u8,
@@ -252,8 +256,10 @@ pub const ComposeSource = struct {
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
         self.part.deinit();
-        for (self.readers) |rp| rp.deinit();
-        for (self.maps) |m| std.posix.munmap(m);
+        if (self.owns_archives) {
+            for (self.readers) |rp| rp.deinit();
+            for (self.maps) |m| std.posix.munmap(m);
+        }
         self.arena.deinit();
         gpa.destroy(self);
     }
@@ -277,15 +283,10 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
     var readers = std.ArrayList(*pmtiles.Reader).empty;
     var maps = std.ArrayList([]align(std.heap.page_size_min) const u8).empty;
     var shims = std.ArrayList(LoadedCov).empty;
-    var built_part = false;
     errdefer {
         for (readers.items) |rp| rp.deinit();
         for (maps.items) |m| std.posix.munmap(m);
-        if (built_part) src.part.deinit();
     }
-    var minz: u8 = 255;
-    var maxz: u8 = 0;
-    var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 }; // union coverage [w, s, e, n]
     for (paths) |path| {
         var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
         const st = f.stat(io) catch {
@@ -320,29 +321,91 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
             std.posix.munmap(map);
             continue;
         };
-        const bz = band.bandZooms(band.bandOf(cc.cscl));
-        minz = @min(minz, bz.min);
-        maxz = @max(maxz, bz.max);
-        const b = [4]f64{
-            @as(f64, @floatFromInt(cc.bbox[0])) / 1e7, @as(f64, @floatFromInt(cc.bbox[1])) / 1e7,
-            @as(f64, @floatFromInt(cc.bbox[2])) / 1e7, @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,
-        };
-        ubox[0] = @min(ubox[0], b[0]);
-        ubox[1] = @min(ubox[1], b[1]);
-        ubox[2] = @max(ubox[2], b[2]);
-        ubox[3] = @max(ubox[3], b[3]);
         try maps.append(a, map);
         try readers.append(a, rp);
-        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = b });
+        try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = covDegBounds(cc) });
     }
     if (readers.items.len == 0) {
         src.arena.deinit();
         gpa.destroy(src);
         return null;
     }
+    return try finishOpen(gpa, src, readers.items, maps.items, shims.items, load_partition, true);
+}
 
-    const cells = try toPlaneCells(a, shims.items);
-    for (cells, readers.items) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
+/// One already-open per-cell archive for a compositor to compose over: the archive's
+/// PMTiles reader plus the per-cell coverage embedded in its metadata. The compositor
+/// BORROWS both — whatever owns them (a chart handle) must outlive the source.
+pub const ChartArchive = struct {
+    reader: *pmtiles.Reader,
+    cov: coverage.CellCoverage,
+};
+
+/// Open a resident ComposeSource over already-open charts' archives. Nothing is
+/// opened or mmap'd here and deinit closes none of it: every archive is borrowed,
+/// so the charts must OUTLIVE this source. Archives without coverage rings are
+/// skipped (they can own no ground); returns null if none carries coverage.
+/// `load_partition` as in openComposeSourceFiles.
+pub fn openComposeSourceCharts(gpa: std.mem.Allocator, archives: []const ChartArchive, load_partition: ?[]const u8) !?*ComposeSource {
+    const src = try gpa.create(ComposeSource);
+    src.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .maps = &.{}, .readers = &.{}, .part = undefined, .minz = 0, .maxz = 0, .loop_max = 0, .bounds = .{ 0, 0, 0, 0 } };
+    errdefer {
+        src.arena.deinit();
+        gpa.destroy(src);
+    }
+    const a = src.arena.allocator();
+    var readers = std.ArrayList(*pmtiles.Reader).empty;
+    var shims = std.ArrayList(LoadedCov).empty;
+    for (archives) |ar| {
+        if (ar.cov.cov1.len == 0) continue;
+        try readers.append(a, ar.reader);
+        try shims.append(a, .{ .name = ar.cov.name, .date = ar.cov.date, .cscl = ar.cov.cscl, .coverage = ar.cov.cov1, .bounds = covDegBounds(ar.cov) });
+    }
+    if (readers.items.len == 0) {
+        src.arena.deinit();
+        gpa.destroy(src);
+        return null;
+    }
+    return try finishOpen(gpa, src, readers.items, &.{}, shims.items, load_partition, false);
+}
+
+// The coverage bbox (integer lon/lat e7) as degree bounds [w, s, e, n].
+fn covDegBounds(cc: coverage.CellCoverage) [4]f64 {
+    return .{
+        @as(f64, @floatFromInt(cc.bbox[0])) / 1e7, @as(f64, @floatFromInt(cc.bbox[1])) / 1e7,
+        @as(f64, @floatFromInt(cc.bbox[2])) / 1e7, @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,
+    };
+}
+
+// Shared open tail over aligned (readers, shims): build (or load) the ownership
+// partition, derive the zoom range + union bounds, and finish `src`. The arrays
+// already live in src.arena; on error the caller's errdefer tears down whatever
+// it owns per `owns_archives`.
+fn finishOpen(
+    gpa: std.mem.Allocator,
+    src: *ComposeSource,
+    readers: []const *pmtiles.Reader,
+    maps: []const []align(std.heap.page_size_min) const u8,
+    shims: []const LoadedCov,
+    load_partition: ?[]const u8,
+    owns_archives: bool,
+) !*ComposeSource {
+    const a = src.arena.allocator();
+    var minz: u8 = 255;
+    var maxz: u8 = 0;
+    var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 }; // union coverage [w, s, e, n]
+    for (shims) |sh| {
+        const bz = band.bandZooms(band.bandOf(sh.cscl));
+        minz = @min(minz, bz.min);
+        maxz = @max(maxz, bz.max);
+        ubox[0] = @min(ubox[0], sh.bounds[0]);
+        ubox[1] = @min(ubox[1], sh.bounds[1]);
+        ubox[2] = @max(ubox[2], sh.bounds[2]);
+        ubox[3] = @max(ubox[3], sh.bounds[3]);
+    }
+
+    const cells = try toPlaneCells(a, shims);
+    for (cells, readers) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
 
     var loaded = false;
     if (load_partition) |bytes| {
@@ -352,11 +415,11 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
         } else |err| std.debug.print("  partition sidecar unusable ({s}); building\n", .{@errorName(err)});
     }
     if (!loaded) src.part = try geometry.partition.build(gpa, cells);
-    built_part = true;
 
     const fill_max = @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
-    src.maps = maps.items;
-    src.readers = readers.items;
+    src.maps = maps;
+    src.readers = readers;
+    src.owns_archives = owns_archives;
     src.minz = minz;
     src.maxz = maxz;
     src.loop_max = @max(maxz, fill_max);

@@ -459,9 +459,30 @@ fn attachEmbeddedCoverage(src: *Chart) void {
     };
     const cov = (cell_coverage.decodeFromMetadata(a, json) catch null) orelse return drop(cov_arena);
     if (cov.cscl == 0 and cov.cov1.len == 0) return drop(cov_arena);
-    src.cscl_override = cov.cscl;
-    src.coverage_override = cov.cov1;
+    src.cell_cov = cov;
     src.coverage_arena = cov_arena;
+}
+
+/// Open a baked PMTiles archive from a file path, mmap'd rather than copied — a
+/// whole chart library can be open without being resident (the page cache holds the
+/// working set). The mapping is released in deinit; the file must stay in place for
+/// the chart's lifetime.
+pub fn openPmtilesPath(io: std.Io, path: []const u8) !*Chart {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.NotFound;
+    defer f.close(io);
+    const st = f.stat(io) catch return error.IoFailed;
+    const len: usize = @intCast(st.size);
+    if (len == 0) return error.InvalidArchive;
+    const map = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0) catch return error.IoFailed;
+    errdefer std.posix.munmap(map);
+    var reader = pmtiles.Reader.init(gpa, map) catch return error.InvalidArchive;
+    const src = gpa.create(Chart) catch {
+        reader.deinit();
+        return error.OutOfMemory;
+    };
+    src.* = .{ .backend = .{ .reader = reader }, .data_map = map, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    attachEmbeddedCoverage(src);
+    return src;
 }
 
 // Parse (+ apply updates) + portray one cell into a CellBackend. Reads the bytes
@@ -614,6 +635,7 @@ pub fn openCellBaked(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool,
     if (src.coverage_arena) |ca| {
         ca.deinit();
         gpa.destroy(ca);
+        src.cell_cov = null;
     }
     src.cscl_override = cscl;
     src.coverage_override = coverage;
@@ -965,6 +987,13 @@ pub const Chart = struct {
     coverage_override: []const []const []const s57.LonLat = &.{},
     coverage_arena: ?*std.heap.ArenaAllocator = null,
     cscl_override: i32 = 0,
+    // The per-cell coverage decoded from the opened archive's metadata (name, date,
+    // cscl, bbox, M_COVR rings) — what a compositor borrows to place this chart in
+    // the ownership partition. Storage lives in coverage_arena.
+    cell_cov: ?cell_coverage.CellCoverage = null,
+    // A path-opened archive is mmap'd rather than copied (never fully resident);
+    // released in deinit. Bytes-opened archives use `data` instead.
+    data_map: ?[]align(std.heap.page_size_min) const u8 = null,
 
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
@@ -1135,6 +1164,7 @@ pub const Chart = struct {
         while (it.next()) |v| gpa.free(v.*);
         self.cache.deinit();
         if (self.data) |d| gpa.free(d);
+        if (self.data_map) |m| std.posix.munmap(m);
         if (self.coverage_arena) |ca| {
             ca.deinit();
             gpa.destroy(ca);
@@ -1156,6 +1186,9 @@ pub const Chart = struct {
     /// surfaces the copy embedded in its archive metadata. Null when absent.
     pub fn coverage(self: *const Chart) ?[]const []const []const s57.LonLat {
         if (self.coverage_override.len > 0) return self.coverage_override;
+        if (self.cell_cov) |cc| {
+            if (cc.cov1.len > 0) return cc.cov1;
+        }
         return switch (self.backend) {
             .cell => |*c| if (c.coverage.len > 0) c.coverage else null,
             else => null,
@@ -1168,10 +1201,31 @@ pub const Chart = struct {
     /// the zoom band instead).
     pub fn nativeScale(self: *const Chart) i32 {
         if (self.cscl_override != 0) return self.cscl_override;
+        if (self.cell_cov) |cc| {
+            if (cc.cscl != 0) return cc.cscl;
+        }
         return switch (self.backend) {
             .cell => |*c| c.cscl,
             else => 0,
         };
+    }
+
+    /// The chart's PMTiles reader, for a compositor to borrow (null unless this is an
+    /// archive-backed chart). The reader lives inside the chart: the chart must outlive
+    /// every borrower, and a borrower's reads must not run concurrently with this
+    /// chart's own render/query calls (no internal lock).
+    pub fn pmtilesReader(self: *Chart) ?*pmtiles.Reader {
+        return switch (self.backend) {
+            .reader => |*r| r,
+            else => null,
+        };
+    }
+
+    /// The per-cell coverage embedded in the opened archive's metadata (name, date,
+    /// cscl, bbox, M_COVR rings), or null if the archive carries none. Borrows the
+    /// chart's storage.
+    pub fn cellCoverage(self: *const Chart) ?cell_coverage.CellCoverage {
+        return self.cell_cov;
     }
 
     /// The tile encoding this chart's tiles carry: a PMTiles backend reports its
