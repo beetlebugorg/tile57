@@ -16,15 +16,15 @@ real-world navigation.** See [Known limitations](./limitations.md).
 
 :::
 
-**tile57** is a nautical chart engine. It reads IHO **S-57** ENC cells — the
-electronic navigational charts published by NOAA and other hydrographic
-offices — converts their features to the newer **S-101** data model, and runs
-the official IHO **S-101 Portrayal Catalogue** in embedded Lua to decide how
-each feature is drawn, producing **S-101 symbology** (the successor to S-52).
-The conversion is an interim step, and a best-effort one — S-57 has no perfect
-S-101 translation (see [Known limitations](./limitations.md)); the goal is
-S-101 throughout, reading native S-101 cells directly as hydrographic offices
-publish them.
+**tile57** is a nautical chart engine. It reads IHO **S-57** ENC cells — each
+cell is one electronic navigational chart, compiled for one scale; NOAA and
+other hydrographic offices publish thousands — converts each chart's features
+to the newer **S-101** data model, and runs the official IHO **S-101
+Portrayal Catalogue** in embedded Lua to decide how each feature is drawn,
+producing **S-101 symbology** (the successor to S-52). The conversion is an
+interim step, and a best-effort one — S-57 has no perfect S-101 translation
+(see [Known limitations](./limitations.md)); the goal is S-101 throughout,
+reading native S-101 charts directly as hydrographic offices publish them.
 
 The primary output is **vector tiles**, fetched by `(z, x, y)`:
 [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec) (MLT, the
@@ -80,24 +80,25 @@ render Surface ──► MVT / MLT tiles + PMTiles (src/tiles/)  +  MapLibre sty
              └───► PNG raster / vector PDF / terminal text (src/render/)
 ```
 
-This is the flow for one cell. The organizing principle is **bake, then
-compose**: each source cell bakes once to its own PMTiles archive, and every
+This is the flow for one chart. The organizing principle is **bake, then
+compose**: each source chart bakes once to its own PMTiles archive, and every
 output — a served tile, a PNG, a query — is produced from baked archives, with
-multi-cell charts stitched on demand by the
+overlapping charts stitched into one on demand by the
 [runtime compositor](./architecture.md).
 
 ## The memory model
 
 The engine holds only its working set:
 
-- **Lazy, per-cell reads.** A multi-cell ENC_ROOT is indexed cheaply (band +
-  bbox); a **streaming** open reads a cell's bytes only when a metadata or
+- **Lazy, per-chart reads.** A multi-chart ENC_ROOT is indexed cheaply (band
+  + bbox); a **streaming** open reads a chart's bytes only when a metadata or
   feature query needs them (and frees them on eviction), so a host holds only
   the working set — not the whole catalogue.
-- **Per-cell bakes, composed on demand.** Each cell bakes to its own PMTiles at
-  its compilation scale, so a bake holds one cell at a time; the runtime
-  compositor mmaps the archives and stitches the cells by `(z, x, y)` on demand
-  through an ownership partition, so serving never loads the cell set either.
+- **Per-chart bakes, composed on demand.** Each chart bakes to its own
+  PMTiles at its compilation scale, so a bake holds one chart at a time; the
+  runtime compositor mmaps the archives and stitches the charts by `(z, x, y)`
+  on demand through an ownership partition, so serving never loads the chart
+  set either.
 - **Pure-Zig core.** The foundational format/encode modules (`iso8211`, `s57`,
   `s101`, `tiles`, `render`, `scene`, `style`) have no libc; only the Lua
   portrayal (`portray`) and the sprite rasterizer (`sprite`) pull in C.
@@ -112,7 +113,7 @@ hex, so a renderer can switch palette without regenerating tiles.
 ## Where to go next
 
 - [**Installation**](./installation.md) — Zig 0.16, submodules, `zig build`.
-- [**Getting Started**](./getting-started.md) — bake cells and fetch a tile
+- [**Getting Started**](./getting-started.md) — bake charts and fetch a tile
   from Zig or C.
 - [**Zig API**](./zig-api.md) — the `@import("tile57")` surface.
 - [**C API**](./c-api.md) — the `tile57_*` C ABI (`include/tile57.h`).

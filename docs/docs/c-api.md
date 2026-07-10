@@ -13,22 +13,23 @@ the [Zig API](./zig-api.md); the two stay in lock-step.
 The pipeline is three stages, and the header (and this page) is organised the
 same way:
 
-- **Bake** — ENC source data in, per-cell PMTiles out. Each cell bakes to its
-  own archive at its own compilation scale, with its M_COVR coverage + scale
-  embedded in the archive metadata. The bake section also carries the raw-source
-  readers (cell inventory, feature extraction, exchange-set catalogue).
+- **Bake** — ENC source data in, per-chart PMTiles out. Each chart bakes to
+  its own archive at its own compilation scale, with its M_COVR coverage +
+  scale embedded in the archive metadata. The bake section also carries the
+  raw-source readers (chart inventory, feature extraction, exchange-set
+  catalogue).
 - **Render** — a **`tile57`** chart handle opens ONE baked archive and answers
   for it with NO composition: metadata (info / SCAMIN / coverage), its stored
   tiles verbatim (`tile57_tile` — the primitive for writing your own
   compositor), the S-52 cursor pick, and view outputs (`tile57_png` / `_pdf` /
   `_canvas` / `_surface`).
 - **Compose** — a **`tile57_compose`** handle stitches MANY open charts through
-  the cell-ownership partition and offers the SAME output set, composed:
+  the ownership partition and offers the SAME output set, composed:
   `tile57_compose_tile` (what a live tile server hands its HTTP layer — the
   bytes are MapLibre Tiles), `_png`, `_pdf`, `_canvas`, `_surface`, `_query`.
 
-Everything is **bake, then compose** (or bake, then render): source cells bake
-once to per-cell archives; every output is produced from baked archives.
+Everything is **bake, then compose** (or bake, then render): source charts
+bake once to per-chart archives; every output is produced from baked archives.
 
 Style + portrayal-asset generation rounds out the surface: the mariner's S-52
 display options become a concrete MapLibre style JSON plus the colortables and
@@ -82,14 +83,15 @@ return bytes allocate `*out`; free it with `tile57_free(ptr)`. Input
 bytes are copied, so the caller may free them right after the call.
 :::
 
-## Bake: ENC cells → per-cell archives
+## Bake: ENC charts → per-chart archives
 
-Tile production is a two-step composite model. First bake each ENC cell to its
-own PMTiles at that cell's compilation scale; the per-cell archive embeds the
-cell's M_COVR coverage, compilation scale, and identity in its metadata. Then
-open a **compositor** over the archives (as charts) and serve any `(z, x, y)`
-tile on demand — the compositor stitches the overlapping cells through an
-ownership partition, handling cross-band zoom.
+Tile production is a two-step composite model. First bake each chart to its
+own PMTiles at its compilation scale; the archive embeds the chart's M_COVR
+coverage, compilation scale, and identity in its metadata. Then open a
+**compositor** over the archives and serve any `(z, x, y)` tile on demand —
+the compositor stitches the overlapping charts through an ownership partition,
+handling cross-band zoom. (The bake and enc APIs keep S-57's own word for a
+chart — a *cell*: `tile57_bake_cell_bytes`, `tile57_enc_cells`.)
 
 ```c
 /* Bake ONE cell (+ its .001.. updates, read from disk) to PMTiles bytes over its
@@ -125,11 +127,11 @@ tile57_status tile57_pmtiles_metadata(const uint8_t *pmtiles, size_t len,
 ```
 
 Every baked feature carries the pick-report properties `class` (object-class
-acronym), `cell` (source cell stem), and `s57` (the full S-57 attribute set as a
+acronym), `cell` (source chart stem), and `s57` (the full S-57 attribute set as a
 JSON object) — what `tile57_query` and a host inspector read back.
 
 The `tile57 bake <cell.000 | ENC_ROOT> -o out/` CLI produces this structure
-directly: `out/tiles/<STEM>.pmtiles` per cell plus `out/partition.tpart`.
+directly: `out/tiles/<STEM>.pmtiles` per chart plus `out/partition.tpart`.
 
 ### Read raw S-57 source data
 
@@ -234,7 +236,7 @@ The S-52 cursor pick. Given a lon/lat and the current view `zoom`, tile57 replay
 the tile at that zoom and reports every feature the point falls in — an area you
 are inside, or a line or point symbol within a small radius. Each hit calls you
 back with the S-57 object-class acronym, the attribute JSON (acronym to value),
-and the source cell name. This is what a chart application shows when you tap a
+and the source chart name. This is what a chart application shows when you tap a
 feature to see what it is.
 
 Passing the view zoom matters: the query reports the features actually DISPLAYED
@@ -362,12 +364,12 @@ encode. Both callback forms have composed twins (`tile57_compose_canvas` /
 
 ## Compose: many charts, one chart
 
-The compositor builds (or loads) the cell-ownership partition over its charts'
+The compositor builds (or loads) the ownership partition over its charts'
 embedded coverage, then offers the SAME output set as a single chart, composed:
 any tile on demand for the cost of a classify plus one decompress or one
 decode/clip, plus the composed view outputs and the composed cursor pick. It
 **borrows** the charts — their mmap'd archives and decoded coverage — so the
-cell set is never fully resident and the charts must outlive the compositor.
+chart set is never fully resident and the charts must outlive the compositor.
 Open once, serve many, close.
 
 ```c
@@ -467,7 +469,7 @@ void tile57_assets_free(tile57_assets *out);
 
 `tile57_bake_sprite_mln` is a focused variant that fills only the `sprite_json` /
 `sprite_png` fields with a MapLibre **sprite-mln** atlas: every S-101 symbol packed
-into one PNG, each cell centered on its symbol's pivot, plus a JSON index of
+into one PNG, each atlas cell centered on its symbol's pivot, plus a JSON index of
 `{name: {x, y, width, height, pixelRatio}}`. A GPU host loads this atlas once and
 draws point symbols and area patterns as textured quads by name — the atlas the
 [host-surface `draw_sprite`/`draw_pattern` callbacks](#render-to-a-host-surface-vector-callbacks)

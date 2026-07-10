@@ -1,13 +1,13 @@
 # The Rendering Engine
 
 tile57 contains a full **native S-52 rendering engine**: it draws a finished
-chart — raster PNG or vector PDF — straight from ENC cells, with no MapLibre,
+chart — raster PNG or vector PDF — straight from ENC charts, with no MapLibre,
 browser, or GPU involved. This page explains how it works, how to use it, and
 how to extend it.
 
 ## The one-paragraph version
 
-Charts are turned into **draw calls**. The *scene generator* reads cells, runs
+Charts are turned into **draw calls**. The *scene generator* reads charts, runs
 the official S-101 portrayal rules, and calls methods like `fillArea("DEPVS",
 rings)` or `drawSymbol("BOYLAT13", point)` on a **Surface**. What happens next
 depends on which Surface is listening: the tile surface *serializes* those
@@ -20,7 +20,7 @@ print. One engine, pluggable outputs.
 
 ```
              ┌──────────────────────────────────────────────┐
- ENC cells ─►│  scene generator (src/scene/)                │
+ ENC chart ─►│  scene generator (src/scene/)                │
              │  parse → S-101 portrayal (embedded Lua) →    │
              │  project → clip → draw calls, per tile/view  │
              └───────────────────┬──────────────────────────┘
@@ -88,7 +88,7 @@ archive can't re-run Lua per user), and papers over it with swappable
 properties the style toggles at runtime. The pixel path evaluates the
 mariner's display gates — palette, display category, SCAMIN, viewing groups,
 text groups, size scale — live at render time for any source. Rendering a
-live cell (the CLI on a `.000`, or `Chart.openBytes` in Zig) goes further:
+live chart (the CLI on a `.000`, or `Chart.openBytes` in Zig) goes further:
 the S-101 rules themselves run with the mariner's *actual* safety contour,
 boundary style, and point-symbol style — what you see is what the rules
 decided for *your* settings, the ECDIS-faithful path. Rendering a baked
@@ -100,16 +100,16 @@ swappable parts re-evaluate.
 ### From the command line
 
 ```sh
-# One tile of a cell, as a 512px PNG
+# One tile of a chart, as a 512px PNG
 tile57 png US5MD1MC.000 14 4712 6280 -o tile.png --size 512
 
-# A view (any centre, fractional zoom, any size) from a single cell
+# A view (any centre, fractional zoom, any size) from a single chart
 tile57 png US5MD1MC.000 --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.png
 
 # The same view as a vector PDF with selectable text
 tile57 pdf US5MD1MC.000 --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.pdf
 
-# From a baked PMTiles bundle instead of source cells (tile replay)
+# From a baked PMTiles bundle instead of the source chart (tile replay)
 tile57 png chart.pmtiles --view -76.48,38.974,15.1 --size 1024x768 -o out.png
 
 # Mariner settings

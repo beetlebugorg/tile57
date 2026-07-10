@@ -12,15 +12,15 @@ uses the engine from Zig and C. It assumes you have finished
 
 ## 1. Bake a chart with the CLI
 
-The `tile57` binary is the offline tool. It bakes ENC cells to PMTiles and emits
+The `tile57` binary is the offline tool. It bakes ENC charts to PMTiles and emits
 the portrayal assets a renderer needs:
 
 ```sh
 zig build                          # builds zig-out/bin/tile57
 T=zig-out/bin/tile57
 
-# Bake a single cell OR a whole ENC_ROOT to the live-composite structure:
-# per-cell tiles/<STEM>.pmtiles (native band scale, M_COVR embedded) + partition.tpart
+# Bake a single chart OR a whole ENC_ROOT to the live-composite structure:
+# per-chart tiles/<STEM>.pmtiles (native band scale, M_COVR embedded) + partition.tpart
 $T bake CELL.000 -o out/
 $T bake /path/to/ENC_ROOT -o out/
 
@@ -37,15 +37,16 @@ $T png CELL.000 --view -76.48,38.974,15 --size 1600x1200 -o chart.png
 $T pdf CELL.000 --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
 
 # Inspect / summarise
-$T inspect out/tiles/US5MD1MC.pmtiles  # zoom range + tile counts for one cell
-$T cell    CELL.000                    # summarise an S-57 cell
+$T inspect out/tiles/US5MD1MC.pmtiles  # zoom range + tile counts for one chart
+$T cell    CELL.000                    # summarise an S-57 chart
 $T version
 ```
 
 Run `tile57 help` for usage. The full subcommand list: `bake`, `compose-tile`,
 `assets`, `sprite`, `pattern`, `sprite-mln`, `style`, `png`, `pdf`, `ascii`,
 `explore`, `cells`, `catalog`, `features`, `inspect`, `cell`, `objlcount`,
-`version`, `help`.
+`version`, `help`. (S-57's own word for a chart is *cell* — the `cell` /
+`cells` commands keep it.)
 
 :::info Tiles are MLT by default
 Bakes encode [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec)
@@ -62,18 +63,19 @@ real S-52 pixels inline on kitty-graphics terminals like Ghostty or Kitty):
 $T ascii CELL.000 --view -76.48,38.974,13 --ansi --tui
 ```
 
-`tile57 bake` writes a **live-composite structure** — per-cell tiles plus an
+`tile57 bake` writes a **live-composite structure** — per-chart tiles plus an
 ownership partition — that a runtime compositor serves tiles from on demand:
 
 ```
 out/
-  tiles/US5MD1MC.pmtiles    one PMTiles per cell, baked at its compilation scale
+  tiles/US5MD1MC.pmtiles    one PMTiles per chart, baked at its compilation scale
   tiles/US4MD81M.pmtiles       (M_COVR coverage embedded in each archive's metadata)
-  partition.tpart           the ownership partition: which cell renders which ground
+  partition.tpart           the ownership partition: which chart renders which ground
 ```
 
 There is no merged archive: any `(z, x, y)` tile is composed from the overlapping
-cells on demand, so a re-bake of one cell doesn't rewrite the whole ENC_ROOT. The
+charts on demand, so a re-bake of one chart doesn't rewrite the whole
+ENC_ROOT. The
 portrayal assets travel separately (`tile57 assets` / `style`); the tiles carry
 S-52 colour **tokens**, never RGB, so one set of tiles renders in any palette.
 
@@ -97,7 +99,7 @@ tile57_compose_open(&chart, 1, "out/partition.tpart", &src, &err);
 uint8_t *tile; size_t n; bool owned;
 if (tile57_compose_tile(src, z, x, y, &tile, &n, &owned, &err) == TILE57_OK) {
     if (tile)       { /* … serve the decompressed MLT tile … */ tile57_free(tile); }
-    else if (owned) { /* owned but empty — a cell's bake is still in flight */ }
+    else if (owned) { /* owned but empty — a chart's bake is still in flight */ }
     else            { /* not owned — open ocean; cache as blank */ }
 }
 tile57_compose_close(src);   /* the compositor borrows its charts… */
@@ -109,7 +111,7 @@ compositor load the ownership partition instead of rebuilding it. The chart and
 the compositor offer the same outputs — `tile57_png(chart, …)` renders one chart
 alone; `tile57_compose_png(src, …)` renders the composed set; `tile57_tile`
 hands back one chart's stored tiles verbatim for anyone writing their own
-compositor. Raw S-57 reading (cell inventory, feature extraction) is
+compositor. Raw S-57 reading (chart inventory, feature extraction) is
 handle-free via `tile57_enc_*`. See the [C API](./c-api.md).
 
 ## 3. Use the engine from Zig
@@ -138,10 +140,10 @@ package. See the [Zig API](./zig-api.md).
 
 ## ENC_ROOT and updates
 
-Open an ENC_ROOT (many cells, each with its sequential `.001`, `.002` … updates)
+Open an ENC_ROOT (many charts, each with its sequential `.001`, `.002` … updates)
 with `Chart.openPath` (Zig) or scan it with `tile57_enc_cells` (C) — a single
-call that walks a whole on-disk catalogue, applying each cell's updates. Baking
-(`tile57 bake` / `tile57_bake_tree`) turns it into the per-cell archives the
+call that walks a whole on-disk catalogue, applying each chart's updates. Baking
+(`tile57 bake` / `tile57_bake_tree`) turns it into the per-chart archives the
 compositor serves.
 
 See the [**Architecture**](./architecture.md) page for how the engine fits

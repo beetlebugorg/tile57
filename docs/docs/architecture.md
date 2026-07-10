@@ -6,12 +6,13 @@ sidebar_position: 6
 
 # Architecture
 
-This page explains how tile57 turns an S-57 chart cell into vector tiles, how the
-codebase is layered, and the memory design that keeps it small.
+This page explains how tile57 turns an S-57 chart — an ENC *cell*, in the
+spec's vocabulary — into vector tiles, how the codebase is layered, and the
+memory design that keeps it small.
 
 ## The pipeline
 
-A chart cell flows through these stages, all inside the engine:
+A chart flows through these stages, all inside the engine:
 
 ```
 S-57 ENC cell (.000)
@@ -34,7 +35,7 @@ render Surface                        src/render/surface.zig
    └─► pixel surfaces: PNG raster · vector PDF · terminal text (src/render/)
 ```
 
-1. **Decode (ISO 8211).** S-57 cells use the ISO 8211 binary container format;
+1. **Decode (ISO 8211).** S-57 charts use the ISO 8211 binary container format;
    the decoder reads its raw records and fields.
 2. **Build the S-57 model.** Features (depth areas, buoys, coastlines, …), their
    attributes, and their geometry (assembled from the vector topology) become a
@@ -74,21 +75,22 @@ host hints its renderer correctly.
 
 ### Band handoff (coverage-clipped ownership)
 
-Overlapping cells of different compilation scales are resolved per tile to the
-best band. Rather than *carry* a coarser cell's features down into a finer band's
-tiles (the old `smax`-tagged carry-down), the compositor clips each cell to the
-**ownership partition**: at every tile the finer cell's M_COVR coverage wins the
-ground it holds, and a coarser cell renders only where no finer cell covers it.
+Overlapping charts of different compilation scales are resolved per tile to
+the best band. Rather than *carry* a coarser chart's features down into a finer
+band's tiles (the old `smax`-tagged carry-down), the compositor clips each
+chart to the **ownership partition**: at every tile the finer chart's M_COVR
+coverage wins the ground it holds, and a coarser chart renders only where no
+finer chart covers it.
 Band boundaries hand off without holes or double-draws, and there is no
 per-feature handoff tag for the style to gate.
 
 ### Overscale indication (`oscl`)
 
-Per S-52 §10.1.10, every contributing cell's coverage polygon is baked as an
-`OVERSC01` vertical-line hatch tagged `oscl` = the cell's compilation-scale
+Per S-52 §10.1.10, every contributing chart's coverage polygon is baked as an
+`OVERSC01` vertical-line hatch tagged `oscl` = the chart's compilation-scale
 denominator. The hatch shows only while the display is *finer* than `1:oscl`,
 and the style sandwiches it between the overscaled and at-scale fill passes so
-finer opaque data occludes a coarser cell's hatch. The `show_overscale`
+finer opaque data occludes a coarser chart's hatch. The `show_overscale`
 mariner toggle (default on) drives its visibility.
 
 ## The Zig modules
@@ -99,7 +101,7 @@ libc/Lua) and target-agnostic:
 | Module | Role |
 |--------|------|
 | `iso8211` | the ISO/IEC 8211 container reader (the bottom layer; std-only) |
-| `s57` | S-57 ENC cell parser + geometry model (reads 8211 records through `iso8211`) |
+| `s57` | the S-57 chart parser + geometry model (reads 8211 records through `iso8211`) |
 | `s101` | the S-101 catalogue, the S-57 → S-101 adapter, and the portrayal instruction stream |
 | `portray` | the embedded-Lua S-101 runner (links libc) |
 | `tiles` | MVT + MLT encoders, gzip, the PMTiles container, web-mercator tile math |
@@ -124,7 +126,7 @@ the same Zig API as the `tile57` module.
 The public surface composes the packages into high-level entry points:
 
 - **`Chart`** — ONE open chart, no composition. Open a baked **PMTiles** archive
-  (`openPmtilesPath`, mmap'd; `openBytes`) or a live cell (`openBytes` on `.000`
+  (`openPmtilesPath`, mmap'd; `openBytes`) or a live chart (`openBytes` on `.000`
   bytes), then take its outputs: view renders (`renderView` — PNG, PDF, or a
   callback canvas; `renderSurfaceView` — world-space GPU callbacks), the cursor
   pick (`queryPoint`), the metadata getters, and — for an archive — its stored
@@ -133,13 +135,13 @@ The public surface composes the packages into high-level entry points:
   `tile57_query`. A streaming ENC_ROOT open (`openPath` / `openCells` /
   `openCellsStreaming`) is the metadata + extraction view of raw source data
   (the C `tile57_enc_*` readers); it serves no tiles or renders.
-- **Tile production** — bake each cell to its own PMTiles at its compilation scale
+- **Tile production** — bake each chart to its own PMTiles at its compilation scale
   (`tile57_bake_cell_bytes`, which runs the banded bake engine `scene/bake_enc.zig`
-  on a single cell), then a runtime **compositor** stitches the overlapping cells
+  on a single chart), then a runtime **compositor** stitches the overlapping charts
   through an ownership partition and offers the SAME outputs as a chart, composed:
   `tile57_compose_tile` for any `(z, x, y)` on demand, `tile57_compose_png` /
   `_pdf` / `_canvas` / `_surface` / `_query` for composed views and the composed
-  pick. Baking is strictly per-cell: one cell, one archive.
+  pick. Baking is strictly per-chart: one chart, one archive.
 - **`style.build`** (`style/maplibre.zig`) + **`style`** / **`sprite`** —
   generate the MapLibre style and the portrayal assets it references
   (`tile57_style_build` / `tile57_bake_assets` in the C ABI).
@@ -148,22 +150,24 @@ The public surface composes the packages into high-level entry points:
 
 tile57 is built to hold only its working set:
 
-- **Lazy per-cell reads.** An ENC_ROOT is opened by scanning each cell's header
-  for a cheap spatial index (band + bbox). A cell's bytes are read and parsed
+- **Lazy per-chart reads.** An ENC_ROOT is opened by scanning each chart's
+  header for a cheap spatial index (band + bbox). A chart's bytes are read and
+  parsed
   only when a metadata or feature query needs them, then released under an LRU
   bound.
-- **Ownership, not overlays.** Overlapping cells of different compilation scales
-  are resolved by the precomputed ownership partition — each tile's ground
-  belongs to exactly one cell per band, so composing never loads every
-  overlapping cell.
+- **Ownership, not overlays.** Overlapping charts of different compilation
+  scales are resolved by the precomputed ownership partition — each tile's
+  ground belongs to exactly one chart per band, so composing never loads every
+  overlapping chart.
 - **Streaming open.** `openCellsStreaming` (and its on-disk driver `openPath`,
-  which backs the C `tile57_enc_*` readers) take per-cell metadata (bbox + scale)
-  plus a reader; a cell's bytes are read only on demand and freed on eviction. A
+  which backs the C `tile57_enc_*` readers) take per-chart metadata (bbox +
+  scale) plus a reader; a chart's bytes are read only on demand and freed on
+  eviction. A
   host then holds only the working set's bytes, not the whole catalogue — the
   right choice for a large ENC_ROOT.
-- **Per-cell bakes.** Each cell bakes independently at its own compilation scale,
-  so a bake holds a single cell's parsed data at a time — memory doesn't grow with
-  the size of the catalogue.
+- **Per-chart bakes.** Each chart bakes independently at its own compilation
+  scale, so a bake holds a single chart's parsed data at a time — memory
+  doesn't grow with the size of the catalogue.
 - **Tile cache.** Generated/decoded tiles are memoized per chart (keyed
   `z<<48 | x<<24 | y`) and released with the chart, so a long-running host bounds
   memory by closing charts it no longer renders.
@@ -171,19 +175,19 @@ tile57 is built to hold only its working set:
 ## The live-composite bake
 
 One `bake` command (`tile57 bake <cell.000 | ENC_ROOT> -o out/`) writes the
-live-composite structure — per-cell tiles plus the ownership partition a runtime
+live-composite structure — per-chart tiles plus the ownership partition a runtime
 compositor serves them from:
 
 ```
 out/
-  tiles/US5MD1MC.pmtiles    one PMTiles per cell, baked at its compilation scale
+  tiles/US5MD1MC.pmtiles    one PMTiles per chart, baked at its compilation scale
   tiles/US4MD81M.pmtiles       (M_COVR coverage embedded in each archive's metadata)
-  partition.tpart           the ownership partition: which cell renders which ground
+  partition.tpart           the ownership partition: which chart renders which ground
 ```
 
 There is no merged archive: any `(z, x, y)` tile is composed from the overlapping
-cells on demand (`tile57_compose_tile`), so re-baking one cell doesn't rewrite the
-whole ENC_ROOT. The portrayal assets are generated separately (`tile57 assets` /
+charts on demand (`tile57_compose_tile`), so re-baking one chart doesn't
+rewrite the whole ENC_ROOT. The portrayal assets are generated separately (`tile57 assets` /
 `style`); the tiles carry S-52 colour **tokens**, never RGB, and both halves come
 from the *same* S-101 catalogue, so they cannot drift. The tile-schema vocabulary
 (`tile57/2`) is the contract a renderer checks.

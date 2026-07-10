@@ -20,7 +20,7 @@ Every tile uses an extent of **4096** and a buffer of **64**.
 
 :::note Live path coverage
 Whether the tiles come from a pre-baked PMTiles archive or are generated live from
-a raw S-57 cell, the schema is the same. The live path (`src/scene/`)
+a raw S-57 chart, the schema is the same. The live path (`src/scene/`)
 emits `areas`, `area_patterns`, `lines`, `point_symbols`, `soundings`, and
 `text`. Features carrying SCAMIN (attr 133) keep it as the per-feature `scamin`
 property, and every feature has a `draw_prio` for S-52 fill ordering. DEPCNT lines
@@ -38,9 +38,9 @@ regenerating tiles.
 
 ## Zoom levels and navigational bands
 
-A nautical chart is not one map at one scale. NOAA compiles each ENC cell for a
+A nautical chart is not one map at one scale. NOAA compiles each chart (an ENC *cell*) for a
 **navigational purpose** — from a wide overview to a close-in berthing plan — and
-the right cell to show depends on how far you are zoomed in. Each cell carries a
+the right chart to show depends on how far you are zoomed in. Each chart carries a
 compilation scale (`CSCL`, a `1:N` denominator) that maps to a band, and each band
 covers the Web-Mercator zoom range that matches its scale:
 
@@ -69,7 +69,7 @@ regardless of layer:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `class` | string | S-57 object-class acronym. |
-| `cell` | string | Source cell stem. |
+| `cell` | string | Source chart stem. |
 | `s57` | string | The feature's full S-57 attribute set as a JSON object (the pick report). |
 | `draw_prio` | int | S-52 draw priority (fill/stroke ordering). |
 | `cat` | int | Display category (base / standard / other gating). |
@@ -87,7 +87,7 @@ Filled polygons, such as depth areas and land.
 | --- | --- | --- |
 | `color_token` | string | Fill color name. |
 | `drval1`, `drval2` | number | Depth-range min/max for depth areas (DEPARE/DRGARE). |
-| `oscl` | int | Overscale denominator, present when the cell shows finer than its compilation scale. |
+| `oscl` | int | Overscale denominator, present when the chart shows finer than its compilation scale. |
 
 ### area_patterns
 
