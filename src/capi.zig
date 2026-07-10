@@ -703,7 +703,7 @@ export fn tile57_compose_open(
 /// no bytes; *out_owned (NULL to ignore) then distinguishes true empty ocean (false,
 /// safe to cache) from owned-but-empty (true — transient during a bake, suspect
 /// after). Byte-faithful to the batch compositor. See tile57.h.
-export fn tile57_compose_serve(
+export fn tile57_compose_tile(
     handle: ?*compose.ComposeSource,
     z: u8,
     x: u32,

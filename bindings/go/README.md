@@ -41,7 +41,7 @@ n, err := tile57.BakeTree("/enc/ENC_ROOT", "/out", 4, nil)
 // Open the compositor over the baked archives + partition, and serve tiles.
 src, _ := tile57.OpenCompose([]string{"/out/tiles/US5MD1MC.pmtiles"}, "/out/partition.tpart")
 defer src.Close()
-body, owned, _ := src.Serve(13, 2359, 3139) // owned=false, body=nil => open ocean
+body, owned, _ := src.Tile(13, 2359, 3139) // owned=false, body=nil => open ocean
 
 // Or open one baked archive as a chart (bounds, scale, coverage, SCAMIN).
 chart, _ := tile57.Open("/out/tiles/US5MD1MC.pmtiles")

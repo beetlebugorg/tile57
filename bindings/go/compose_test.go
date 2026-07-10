@@ -36,9 +36,9 @@ func TestComposeSingleCell(t *testing.T) {
 		t.Fatalf("compose cells = %d, want 1", m.Cells)
 	}
 	cx, cy := lonLatToTile((m.West+m.East)/2, (m.South+m.North)/2, m.MinZoom)
-	tile, owned, err := src.Serve(m.MinZoom, cx, cy)
+	tile, owned, err := src.Tile(m.MinZoom, cx, cy)
 	if err != nil {
-		t.Fatalf("Serve: %v", err)
+		t.Fatalf("Tile: %v", err)
 	}
 	if len(tile) == 0 || !owned {
 		t.Fatalf("centre tile z%d/%d/%d: %d bytes owned=%v, want content", m.MinZoom, cx, cy, len(tile), owned)
@@ -57,9 +57,9 @@ func TestComposeSingleCell(t *testing.T) {
 		t.Fatalf("OpenCompose: %v", err)
 	}
 	defer src2.Close()
-	tile2, owned2, err := src2.Serve(m.MinZoom, cx, cy)
+	tile2, owned2, err := src2.Tile(m.MinZoom, cx, cy)
 	if err != nil {
-		t.Fatalf("Serve(sidecar): %v", err)
+		t.Fatalf("Tile(sidecar): %v", err)
 	}
 	if !owned2 || len(tile2) != len(tile) {
 		t.Fatalf("sidecar-loaded serve differs: %d bytes owned=%v (want %d bytes)", len(tile2), owned2, len(tile))
@@ -114,7 +114,7 @@ func TestOpenComposeServe(t *testing.T) {
 		z = m.MaxZoom
 	}
 	cx, cy := lonLatToTile((m.West+m.East)/2, (m.South+m.North)/2, z)
-	tile, owned, err := src.Serve(z, cx, cy)
+	tile, owned, err := src.Tile(z, cx, cy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestOpenComposeServe(t *testing.T) {
 	}
 
 	// A tile far outside coverage must be blank (nil) AND not owned (true empty ocean), not an error.
-	blank, blankOwned, err := src.Serve(z, 0, 0)
+	blank, blankOwned, err := src.Tile(z, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

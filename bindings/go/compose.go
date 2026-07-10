@@ -15,9 +15,9 @@ import (
 )
 
 // ComposeSource is a resident runtime compositor over open charts: the ownership
-// partition loaded once, so Serve composes any tile on demand. It BORROWS its
+// partition loaded once, so Tile composes any tile on demand. It BORROWS its
 // charts — they must outlive it — except charts opened for it by [OpenCompose],
-// which it owns and closes. Serve is serialised by an internal mutex (the
+// which it owns and closes. Tile is serialised by an internal mutex (the
 // compositor reads through the charts, which are not thread-safe).
 type ComposeSource struct {
 	mu    sync.Mutex
@@ -104,22 +104,22 @@ func OpenCompose(paths []string, partitionPath string) (*ComposeSource, error) {
 	return cs, nil
 }
 
-// Serve composes the tile (z,x,y) on demand, returning raw (decompressed) MLT bytes plus `owned` —
-// whether the ownership partition says a cell SHOULD render here. body!=nil → served (owned). body
+// Tile composes the tile (z,x,y) on demand, returning raw (decompressed) MLT bytes plus `owned` —
+// whether the ownership partition says a cell SHOULD render here. body!=nil → composed (owned). body
 // ==nil && owned → a cell owns this ground but produced nothing (transient while its per-cell bake
 // runs; an error state once bakes are done). body==nil && !owned → true empty ocean (safe to cache).
 // Thread-safe (serialised).
-func (c *ComposeSource) Serve(z uint8, x, y uint32) (body []byte, owned bool, err error) {
+func (c *ComposeSource) Tile(z uint8, x, y uint32) (body []byte, owned bool, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.ptr == nil {
-		return nil, false, fmt.Errorf("tile57: Serve on a closed ComposeSource")
+		return nil, false, fmt.Errorf("tile57: Tile on a closed ComposeSource")
 	}
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cowned C.bool
 	var cerr C.tile57_error
-	if st := C.tile57_compose_serve(c.ptr, C.uint8_t(z), C.uint32_t(x), C.uint32_t(y), &out, &outLen, &cowned, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_compose_tile(c.ptr, C.uint8_t(z), C.uint32_t(x), C.uint32_t(y), &out, &outLen, &cowned, &cerr); st != C.TILE57_OK {
 		return nil, false, statusError(st, &cerr)
 	}
 	if out == nil {

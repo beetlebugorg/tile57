@@ -565,7 +565,7 @@ tile57_status tile57_compose_open(tile57 *const *charts, size_t n,
  *   owned = true:  a cell owns this ground but produced nothing — transient
  *                  while its per-cell bake is still running; suspect once
  *                  bakes are done. */
-tile57_status tile57_compose_serve(tile57_compose *c, uint8_t z, uint32_t x, uint32_t y,
+tile57_status tile57_compose_tile(tile57_compose *c, uint8_t z, uint32_t x, uint32_t y,
                                    uint8_t **out, size_t *out_len, bool *out_owned,
                                    tile57_error *err);
 

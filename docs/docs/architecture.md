@@ -134,7 +134,7 @@ The public surface composes the packages into high-level entry points:
   (`tile57_bake_cell_bytes`, which runs the banded bake engine `scene/bake_enc.zig`
   on a single cell), then a runtime **compositor** stitches the overlapping cells
   for any `(z, x, y)` tile on demand through an ownership partition
-  (`tile57_compose_open` / `tile57_compose_serve`). The public Zig `bakeArchive`
+  (`tile57_compose_open` / `tile57_compose_tile`). The public Zig `bakeArchive`
   runs the same engine over a slice of cells to make one merged archive.
 - **`style.build`** (`style/maplibre.zig`) + **`style`** / **`sprite`** —
   generate the MapLibre style and the portrayal assets it references
@@ -178,7 +178,7 @@ out/
 ```
 
 There is no merged archive: any `(z, x, y)` tile is composed from the overlapping
-cells on demand (`tile57_compose_serve`), so re-baking one cell doesn't rewrite a
+cells on demand (`tile57_compose_tile`), so re-baking one cell doesn't rewrite a
 whole district. The portrayal assets are generated separately (`tile57 assets` /
 `style`); the tiles carry S-52 colour **tokens**, never RGB, and both halves come
 from the *same* S-101 catalogue, so they cannot drift. The tile-schema vocabulary

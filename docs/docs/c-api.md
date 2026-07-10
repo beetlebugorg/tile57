@@ -377,7 +377,7 @@ tile57_status tile57_compose_open(tile57 *const *charts, size_t n,
  *   owned=false: no cell owns this ground — true empty ocean, safe to cache;
  *   owned=true:  a cell owns this ground but produced nothing — transient while
  *                its per-cell bake is running, suspect once bakes are done. */
-tile57_status tile57_compose_serve(tile57_compose *c, uint8_t z, uint32_t x, uint32_t y,
+tile57_status tile57_compose_tile(tile57_compose *c, uint8_t z, uint32_t x, uint32_t y,
                                    uint8_t **out, size_t *out_len, bool *out_owned,
                                    tile57_error *err);
 
@@ -401,7 +401,7 @@ tile57_open("tiles/US5MD1MD.pmtiles", &charts[1], NULL);
 tile57_compose *cmp = NULL;
 tile57_compose_open(charts, 2, "partition.tpart", &cmp, NULL);
 uint8_t *tile; size_t n; bool owned;
-tile57_compose_serve(cmp, 13, 2359, 3139, &tile, &n, &owned, NULL);
+tile57_compose_tile(cmp, 13, 2359, 3139, &tile, &n, &owned, NULL);
 ```
 
 ## Generate portrayal assets
