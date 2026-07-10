@@ -37,10 +37,14 @@ domain and not for navigation; this renderer adds its own gaps on top.
   S-52 display length; the mariner's *full-length sector line* variant (legs
   drawn to the light's nominal range) is not emitted, so the
   `show_full_sector_lines` setting currently has nothing to act on.
-- **Sector figures stop at the cell's tile span.** Legs and arcs are
-  tessellated per tile, and only tiles covering the source cell's bounding box
-  are generated for that cell — a fixed-display-size arc near a cell edge is
-  chopped where the neighbouring tile isn't baked from that cell.
+- **Sector figures can stop at a tile boundary beyond the owning cell.** The
+  compositor keeps a light's sector legs and arcs WHOLE across ownership seams
+  (they are fixed-size decorations anchored at the light, exempt from face
+  clipping). The remaining gap: a figure reaching into a tile where the owning
+  cell holds no ground at all is absent there — the compositor never consults
+  that cell for the tile — so a figure within roughly one tile of the cell's
+  owned ground can cut at that tile's edge (directional ground-length legs can
+  reach further).
 - **Single-primitive rules vs. non-conformant geometry.** Some S-101 rules
   handle only one primitive (e.g. RecommendedTrack is Curve-only); a cell that
   encodes the feature with another primitive (an area-encoded recommended

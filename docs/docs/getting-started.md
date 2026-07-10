@@ -73,7 +73,7 @@ out/
 ```
 
 There is no merged archive: any `(z, x, y)` tile is composed from the overlapping
-cells on demand, so a re-bake of one cell doesn't rewrite a whole district. The
+cells on demand, so a re-bake of one cell doesn't rewrite the whole ENC_ROOT. The
 portrayal assets travel separately (`tile57 assets` / `style`); the tiles carry
 S-52 colour **tokens**, never RGB, so one set of tiles renders in any palette.
 

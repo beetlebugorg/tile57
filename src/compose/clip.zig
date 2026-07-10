@@ -32,10 +32,25 @@ fn narrowRing(a: std.mem.Allocator, ring: []const Pt) ![]mvt.Point {
     return out;
 }
 
+// A linestring carrying class=LIGHTS is a constructed sector figure (LIGHTS is a
+// point class; its only line output is emitAugFigures legs/arcs).
+fn isLightFigure(feat: mvt.DecodedFeature) bool {
+    for (feat.properties) |p| {
+        if (std.mem.eql(u8, p.key, "class")) {
+            return switch (p.value) {
+                .string => |v| std.mem.eql(u8, v, "LIGHTS"),
+                else => false,
+            };
+        }
+    }
+    return false;
+}
+
 /// Clip `feat` (tile-pixel space) to `face` (the cell's owned rings, tile-pixel space) and
 /// append the surviving feature(s) to `out`, or nothing if the feature is entirely outside
 /// the face. Geometry is freshly allocated in `a`; `properties` are borrowed from `feat`.
-/// `face` must be a simple even-odd ring-set (as `partition.ownedFace` emits).
+/// `face` must be a simple even-odd ring-set (as `partition.ownedFace` emits). One
+/// exception to face ownership: LIGHTS sector figures are kept whole (see isLightFigure).
 pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature), feat: mvt.DecodedFeature, face: []const []const Pt) !void {
     switch (feat.geom_type) {
         .polygon => {
@@ -48,6 +63,17 @@ pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature),
             try out.append(a, .{ .geom_type = .polygon, .parts = parts, .properties = feat.properties });
         },
         .linestring => {
+            // A LIGHTS line is always a constructed sector figure (legs/arcs around
+            // the light — LIGHTS itself is a point class): a fixed-size decoration
+            // anchored at the light, not ground. Clipping it to the owned face
+            // amputates the figure at the seam, so keep it WHOLE — it draws over
+            // neighbouring ground exactly as a single-chart render would.
+            if (isLightFigure(feat)) {
+                const parts = try a.alloc([]const mvt.Point, feat.parts.len);
+                for (feat.parts, 0..) |part, i| parts[i] = try a.dupe(mvt.Point, part);
+                try out.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = feat.properties });
+                return;
+            }
             var parts = std.ArrayList([]const mvt.Point).empty;
             for (feat.parts) |part| {
                 const runs = try plane.clipLineInsidePolys(a, try widenRing(a, part), face);

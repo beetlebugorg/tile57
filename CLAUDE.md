@@ -11,11 +11,26 @@ output is produced from baked archives. Sections, in order: Version, Errors,
 Bake, Render (the chart), Compose, Style, Util. The header, the Zig public
 root, and the docs all follow that same section order.
 
-**Handles are nouns; the chart is the namesake.** `tile57` is one open baked
-archive (the sqlite3 pattern: the library's name is its central handle).
-Further handles extend the prefix: `tile57_compose`. Handle lifecycle verbs
-attach to the handle name: `tile57_open` / `tile57_open_bytes` /
-`tile57_close`; `tile57_compose_open` / `tile57_compose_close`.
+**Three kinds of prefix, and only three.**
+
+1. *The chart is the bare namespace.* `tile57` is one open baked archive (the
+   sqlite3 pattern: the library's name is its central handle), so functions on
+   it carry no extra prefix: `tile57_open` / `tile57_close` /
+   `tile57_get_info` / `tile57_tile` / `tile57_png` / `tile57_query`. This is
+   why there is no `render_` prefix — the header's Render section IS the chart
+   handle, and its outputs are named bare.
+2. *Every other handle namespaces under its noun* and mirrors the chart's
+   shape: `tile57_compose_open` / `_close` / `_tile` / `_png` / `_query` on
+   `tile57_compose`.
+3. *Handle-free families lead with their section token, then what the call
+   acts on or yields* — the token's part of speech follows the section, so the
+   name reads naturally after it. `tile57_bake_*` is a verb family
+   (`bake_cell_bytes`, `bake_tree` — "bake the X"); `tile57_enc_*` is a domain
+   family (the raw S-57 source readers — ENC is the ONE vocabulary for raw
+   source data, never s57_/source_/scan_ variants); `tile57_style_*` is a
+   product family (`style_build` / `style_diff` / `style_template`, never
+   `build_style` — "the style's build/diff/template"). Never bury the family
+   token mid-name.
 
 **Outputs are named by what you get, never by how it's produced or served.**
 `tile`, `png`, `pdf`, `canvas`, `surface`, `query` — not serve/render/build/
@@ -24,12 +39,6 @@ mirror exactly: `tile57_png` ↔ `tile57_compose_png`, `tile57_tile` ↔
 `tile57_compose_tile`, and so on. The compositor is "many charts in, one chart
 out"; keep that symmetry when adding an output — it goes on both handles or
 has a stated reason not to.
-
-**Families are noun-first prefixes.** `tile57_style_build` / `_style_diff` /
-`_style_template` (never `build_style`); `tile57_bake_*` for the import
-pipeline; `tile57_enc_*` for the handle-free raw S-57 source readers. ENC is
-the ONE vocabulary for raw source data (enc_root, tile57_enc_cells) — never
-s57_/source_/scan_ variants of the same idea.
 
 **The status model is universal.** Every call that can fail returns
 `tile57_status` (never a bare int, count, or bool) and takes an optional

@@ -184,8 +184,8 @@ out/
 ```
 
 There is no merged archive: any `(z, x, y)` tile is composed from the overlapping
-cells on demand (`tile57_compose_tile`), so re-baking one cell doesn't rewrite a
-whole district. The portrayal assets are generated separately (`tile57 assets` /
+cells on demand (`tile57_compose_tile`), so re-baking one cell doesn't rewrite the
+whole ENC_ROOT. The portrayal assets are generated separately (`tile57 assets` /
 `style`); the tiles carry S-52 colour **tokens**, never RGB, and both halves come
 from the *same* S-101 catalogue, so they cannot drift. The tile-schema vocabulary
 (`tile57/2`) is the contract a renderer checks.
