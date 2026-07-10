@@ -2,8 +2,8 @@
 
 <p align="center">
   <b>⚓ An S-57/S-101 chart engine: vector tiles, S-52 styles, PNG and PDF.</b><br>
-  tile57 turns IHO S-57 ENC cells into Mapbox Vector Tiles with a matching MapLibre S-52
-  style, or renders finished charts directly to PNG and PDF — one Zig library with a
+  tile57 turns IHO S-57 ENC cells into vector tiles (MLT or MVT) with a matching MapLibre
+  S-52 style, or renders finished charts directly to PNG and PDF — one Zig library with a
   C ABI, compiled natively or to WASM.
 </p>
 
