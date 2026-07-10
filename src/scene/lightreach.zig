@@ -10,9 +10,10 @@ const EARTH_CIRCUM_M: f64 = 40075016.686;
 
 // Worst-case reach of a light's sector legs/arcs (emitAugFigures) as a fraction of a
 // tile — these are drawn at a fixed DISPLAY size (radius/length in mm), so the reach
-// is ~constant in tile units at every zoom (offset_tiles = mm * PX_PER_MM / 256).
-// Used to widen the LIGHTS spatial-cull margin so an arc isn't dropped on the tiles it
-// crosses (S-52 legs ~25 mm / arcs ~20 mm ≈ 0.8 tile; 1.0 leaves headroom).
+// is ~constant in tile units at every zoom (offset_tiles = mm * PX_PER_MM / 512, the
+// 512-CSS-px tile the figures are sized against). Used to widen the LIGHTS
+// spatial-cull margin so an arc isn't dropped on the tiles it crosses (S-52 legs
+// ~25 mm / arcs ~20 mm ≈ 0.2 tile; 1.0 is generous headroom).
 // GROUND-length legs (directional lights: nmi2metres(nominal range), LightSectored.lua)
 // exceed this by far at fine zooms — lightReachTiles is the honest per-zoom bound.
 pub const LIGHT_AUG_REACH_TILES: f64 = 1.0;

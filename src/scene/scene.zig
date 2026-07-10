@@ -1310,7 +1310,13 @@ const RING_MIN_ZOOM: u8 = 11;
 
 fn emitAugFigures(a: Allocator, figs: []const instructions.AugFigure, anchor: s57.LonLat, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, box: tile.Box, surf: rs.Surface) !void {
     if (figs.len == 0) return;
-    const world_px = 256.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+    // One tile renders as 512 CSS px (the engine's physical-scale model — style
+    // scaminGateK's M_PER_PX_Z0 is the 512-tile metres-per-CSS-px, and MapLibre
+    // lays vector tiles out at 512 logical px), so a display-mm length converts
+    // to a tile fraction against a 512·2^z world. The old 256-unit MVT world drew
+    // every figure at exactly 2x its catalogue size (20 mm sector arcs read
+    // 40 mm on the map). Ground-metre legs are a world-fraction ratio either way.
+    const world_px = 512.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
     const pxmm = instructions.PX_PER_MM;
     for (figs) |fig| {
         const alon = if (fig.has_anchor) fig.anchor_lon else anchor.lon();
