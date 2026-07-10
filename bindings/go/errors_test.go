@@ -12,8 +12,16 @@ import (
 // scraping the message string.
 func TestSentinelErrors(t *testing.T) {
 	// ErrEmptyInput: empty input.
-	if _, err := OpenChartBytes(nil); !errors.Is(err, ErrEmptyInput) {
-		t.Errorf("OpenChartBytes(nil): want ErrEmptyInput, got %v", err)
+	if _, err := OpenBytes(nil); !errors.Is(err, ErrEmptyInput) {
+		t.Errorf("OpenBytes(nil): want ErrEmptyInput, got %v", err)
+	}
+	// Category sentinels ride the C status: a missing file is ErrIO, garbage
+	// archive bytes are ErrParse.
+	if _, err := Open("testdata/definitely-missing.pmtiles"); !errors.Is(err, ErrIO) {
+		t.Errorf("Open(missing): want ErrIO, got %v", err)
+	}
+	if _, err := OpenBytes([]byte("not a pmtiles archive")); !errors.Is(err, ErrParse) {
+		t.Errorf("OpenBytes(garbage): want ErrParse, got %v", err)
 	}
 	if _, err := Open(""); !errors.Is(err, ErrEmptyInput) {
 		t.Errorf("Open(\"\"): want ErrEmptyInput, got %v", err)

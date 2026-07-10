@@ -29,4 +29,5 @@ var (
 	ErrNoMem       = errors.New("tile57: out of memory")
 	ErrUnsupported = errors.New("tile57: unsupported input")
 	ErrRender      = errors.New("tile57: render failed")
+	ErrInternal    = errors.New("tile57: internal error")
 )

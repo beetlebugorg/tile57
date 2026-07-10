@@ -3,16 +3,11 @@
 package tile57
 
 import (
-	"os"
 	"testing"
 )
 
 func TestSourceScamin(t *testing.T) {
-	data, err := os.ReadFile(testCell)
-	if err != nil {
-		t.Skipf("no test cell: %v", err)
-	}
-	src, err := OpenChartBytes(data)
+	src, err := OpenBytes(bakeTestCell(t))
 	if err != nil {
 		t.Fatal(err)
 	}

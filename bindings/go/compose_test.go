@@ -12,6 +12,62 @@ import (
 
 // lonLatToTile lives in tile57_test.go (same package).
 
+// The whole pipeline over the in-repo fixture: bake the cell, open it as a chart,
+// compose over the chart (borrowed), serve the coverage-centre tile, and round-trip
+// the partition sidecar through a path-based (owning) open.
+func TestComposeSingleCell(t *testing.T) {
+	pm := bakeTestCell(t)
+	path := filepath.Join(t.TempDir(), "US5MD1MC.pmtiles")
+	if err := os.WriteFile(path, pm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	chart, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer chart.Close()
+
+	src, err := OpenComposeCharts([]*Source{chart}, "")
+	if err != nil {
+		t.Fatalf("OpenComposeCharts: %v", err)
+	}
+	m := src.Meta()
+	if m.Cells != 1 {
+		t.Fatalf("compose cells = %d, want 1", m.Cells)
+	}
+	cx, cy := lonLatToTile((m.West+m.East)/2, (m.South+m.North)/2, m.MinZoom)
+	tile, owned, err := src.Serve(m.MinZoom, cx, cy)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if len(tile) == 0 || !owned {
+		t.Fatalf("centre tile z%d/%d/%d: %d bytes owned=%v, want content", m.MinZoom, cx, cy, len(tile), owned)
+	}
+	part := filepath.Join(t.TempDir(), "partition.tpart")
+	if err := src.SavePartition(part); err != nil {
+		t.Fatalf("SavePartition: %v", err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Path-based open owns its charts and loads the sidecar.
+	src2, err := OpenCompose([]string{path}, part)
+	if err != nil {
+		t.Fatalf("OpenCompose: %v", err)
+	}
+	defer src2.Close()
+	tile2, owned2, err := src2.Serve(m.MinZoom, cx, cy)
+	if err != nil {
+		t.Fatalf("Serve(sidecar): %v", err)
+	}
+	if !owned2 || len(tile2) != len(tile) {
+		t.Fatalf("sidecar-loaded serve differs: %d bytes owned=%v (want %d bytes)", len(tile2), owned2, len(tile))
+	}
+	t.Logf("compose z%d..%d served %d bytes at z%d/%d/%d (sidecar round-trip ok)",
+		m.MinZoom, m.MaxZoom, len(tile), m.MinZoom, cx, cy)
+}
+
 // Set TILE57_COMPOSE_TESTDIR to a dir of per-cell *.cell.tmp/*.pmtiles archives (e.g. from
 // `tile57 compose <ENC_ROOT> -o out.pmtiles --keep-cells`), optionally TILE57_COMPOSE_PARTITION to
 // a sidecar (`--save-partition`). Skips when unset — no machine paths baked into the test.

@@ -43,24 +43,31 @@ src, _ := tile57.OpenCompose([]string{"/out/tiles/US5MD1MC.pmtiles"}, "/out/part
 defer src.Close()
 body, owned, _ := src.Serve(13, 2359, 3139) // owned=false, body=nil => open ocean
 
-// Or open one cell/archive for metadata (cells, features, SCAMIN, bounds).
-chart, _ := tile57.Open("/enc/ENC_ROOT")
+// Or open one baked archive as a chart (bounds, scale, coverage, SCAMIN).
+chart, _ := tile57.Open("/out/tiles/US5MD1MC.pmtiles")
 defer chart.Close()
-cells, _ := chart.Cells()
+info := chart.Info()     // zoom range, bounds, embedded 1:N scale
 scamin := chart.Scamin() // []uint32, ascending
+
+// Raw S-57 reading is handle-free (cell inventory, feature extraction).
+cells, _ := tile57.Cells("/enc/ENC_ROOT")
+water, _ := tile57.Features("/enc/ENC_ROOT/US5MD1MC/US5MD1MC.000", "DEPARE", "DRGARE")
 ```
 
 ## Surface
 
-- **Charts (metadata + query)** — `Open` (path, streaming), `OpenChartBytes` (one
-  in-memory cell), `OpenPMTiles` (a baked archive); `Source.Info`, `Meta`, `Cells`,
-  `Features`, `Scamin`, `Close`.
+- **Charts (a baked archive: metadata + query)** — `Open` (path, mmap'd),
+  `OpenBytes`; `Source.Info`, `Meta`, `Scamin`, `Coverage`, `Close`.
+- **S-57 source readers (handle-free)** — `Cells` (per-cell metadata of a .000 or
+  ENC_ROOT), `Features` / `FeaturesBytes` (GeoJSON extraction), `CatalogEntries`
+  (CATALOG.031 decode).
 - **Bake** — `BakeCell` (one cell → PMTiles bytes), `BakeTree` (an ENC_ROOT → per-cell
-  archives + `partition.tpart`), `BakeAssets` (portrayal assets in memory).
-- **Compose** — `OpenCompose` (archives + partition); `ComposeSource.Serve` (a tile,
-  with an ownership flag), `Meta`, `SavePartition`, `Close`.
+  archives), `BakeAssets` (portrayal assets in memory).
+- **Compose** — `OpenCompose` (paths; owns its charts) / `OpenComposeCharts`
+  (borrows yours); `ComposeSource.Serve` (a tile, with an ownership flag), `Meta`,
+  `SavePartition`, `Close`.
 - **Style** — `ColortablesDefault`, `Style`, `BuildStyle`, `StyleDiff`,
-  `MarinerDefaults`, `CatalogEntries`.
+  `MarinerDefaults`.
 
 `libtile57` is not internally synchronized; every `Source` method is mutex-guarded,
 so a `Source` is safe for concurrent use.
