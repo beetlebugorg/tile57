@@ -29,6 +29,7 @@ const render = @import("render");
 const sprite = @import("sprite");
 const embedded_assets = @import("catalog"); // S-101 portrayal assets (renderView store)
 const style = @import("style"); // displayDenomZ (the physical display-scale formula)
+const cell_coverage = @import("coverage"); // per-cell M_COVR coverage embedded in archive metadata
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
 // makes many small, short-lived allocations (tile cache, cell dupes, index
@@ -429,7 +430,38 @@ fn openPmtiles(copy: []u8) ?*Chart {
         return null;
     };
     src.* = .{ .backend = .{ .reader = reader }, .data = copy, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    attachEmbeddedCoverage(src);
     return src;
+}
+
+// A per-cell bake embeds the source cell's M_COVR coverage + compilation scale in
+// the archive's metadata JSON; surface them on the opened chart so coverage() and
+// nativeScale() answer for a baked archive exactly as they did for the live cell.
+// Best-effort: an archive without (or with unparseable) coverage attaches nothing.
+fn attachEmbeddedCoverage(src: *Chart) void {
+    const rd = &src.backend.reader;
+    const h = rd.header;
+    if (h.metadata_length == 0) return;
+    const raw = rd.bytes[@intCast(h.metadata_offset)..][0..@intCast(h.metadata_length)];
+    const cov_arena = gpa.create(std.heap.ArenaAllocator) catch return;
+    cov_arena.* = std.heap.ArenaAllocator.init(gpa);
+    const a = cov_arena.allocator();
+    const drop = struct {
+        fn f(ar: *std.heap.ArenaAllocator) void {
+            ar.deinit();
+            gpa.destroy(ar);
+        }
+    }.f;
+    const json: []const u8 = switch (h.internal_compression) {
+        .none => raw,
+        .gzip => gzip.decompress(a, raw) catch return drop(cov_arena),
+        else => return drop(cov_arena),
+    };
+    const cov = (cell_coverage.decodeFromMetadata(a, json) catch null) orelse return drop(cov_arena);
+    if (cov.cscl == 0 and cov.cov1.len == 0) return drop(cov_arena);
+    src.cscl_override = cov.cscl;
+    src.coverage_override = cov.cov1;
+    src.coverage_arena = cov_arena;
 }
 
 // Parse (+ apply updates) + portray one cell into a CellBackend. Reads the bytes
@@ -578,6 +610,11 @@ pub fn openCellBaked(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool,
     const archive = (bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, pick_attrs, null, null, null) catch null) orelse return error.InvalidCell;
     defer gpa.free(archive);
     const src = try Chart.openBytes(archive, .pmtiles, rules_dir);
+    // Replace any coverage the archive metadata attached (this parse is fresher).
+    if (src.coverage_arena) |ca| {
+        ca.deinit();
+        gpa.destroy(ca);
+    }
     src.cscl_override = cscl;
     src.coverage_override = coverage;
     src.coverage_arena = cov_arena;
@@ -763,8 +800,10 @@ pub fn bakeCellsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []c
 /// plus an <out>.sha sidecar. Output subdirs are created as needed. `in_dir` is the source ENC data;
 /// `out_dir` is the caller's own cache (it owns the location + names, so consumers don't clash). The
 /// engine writes + frees each archive, so the host never holds N in memory. `progress` fires per
-/// cell (serialised) for an import progress bar. Returns the count baked.
-pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) usize {
+/// cell (serialised) for an import progress bar. INCREMENTAL: a cell whose mirrored archive is
+/// already at least as new as its whole input (.000 + update chain) is skipped, so a re-run over an
+/// unchanged tree bakes nothing. Returns the count baked THIS run; errors if `in_dir` is unreadable.
+pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) !usize {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -772,9 +811,9 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
     var in_paths = std.ArrayList([]const u8).empty;
     var out_paths = std.ArrayList([]const u8).empty;
 
-    var dir = std.Io.Dir.cwd().openDir(io, in_dir, .{ .iterate = true }) catch return 0;
+    var dir = try std.Io.Dir.cwd().openDir(io, in_dir, .{ .iterate = true });
     defer dir.close(io);
-    var walker = dir.walk(a) catch return 0;
+    var walker = try dir.walk(a);
     defer walker.deinit();
     while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
@@ -1113,8 +1152,8 @@ pub const Chart = struct {
 
     /// The cell's M_COVR(CATCOV=1) data-coverage polygons (polygon -> rings ->
     /// lon/lat points), for the host to report as chart coverage so OpenCPN quilts
-    /// gaps to coarser cells. Only the live-cell backend has it (a baked PMTiles
-    /// carries no coverage polygon); null otherwise.
+    /// gaps to coarser cells. A live cell parses it; a per-cell baked PMTiles
+    /// surfaces the copy embedded in its archive metadata. Null when absent.
     pub fn coverage(self: *const Chart) ?[]const []const []const s57.LonLat {
         if (self.coverage_override.len > 0) return self.coverage_override;
         return switch (self.backend) {
@@ -1123,9 +1162,10 @@ pub const Chart = struct {
         };
     }
 
-    /// The cell's compilation scale (DSPM CSCL, 1:N) — the live-cell chart's native
-    /// scale, so the host doesn't derive an over-detailed one from the 0..18 zoom
-    /// range. 0 (unknown) for a PMTiles chart (derive from the zoom band instead).
+    /// The cell's compilation scale (DSPM CSCL, 1:N), so the host doesn't derive an
+    /// over-detailed one from the 0..18 zoom range. A live cell parses it; a per-cell
+    /// baked PMTiles reads the copy in its archive metadata. 0 = unknown (derive from
+    /// the zoom band instead).
     pub fn nativeScale(self: *const Chart) i32 {
         if (self.cscl_override != 0) return self.cscl_override;
         return switch (self.backend) {

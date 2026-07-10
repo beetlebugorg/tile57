@@ -230,7 +230,7 @@ export fn tile57_bake_tree(
     // Stand up a threaded std.Io for the tree walk + the workers' file writes.
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    return @intCast(chart.bakeTree(threaded.io(), in_d, out_d, null, workers, progress, progress_ctx));
+    return @intCast(chart.bakeTree(threaded.io(), in_d, out_d, null, workers, progress, progress_ctx) catch return -1);
 }
 
 /// Coverage/zoom summary of a resident compositor, filled by tile57_compose_meta.
