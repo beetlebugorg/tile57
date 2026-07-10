@@ -22,6 +22,21 @@ See the warning on the [introduction](./intro.md). NOAA ENC charts are U.S. publ
 domain and not for navigation; this renderer adds its own gaps on top.
 :::
 
+## S-57 → S-101 conversion
+
+tile57's input is S-57 but its portrayal rules are S-101, so every cell passes
+through an S-57 → S-101 adapter (`src/s101/adapter.zig`) before the rules run.
+S-57 has no perfect S-101 translation; the adapter follows the IHO S-65
+conversion guidance, and the result is **best effort**:
+
+- **Missing S-101 content stays missing.** S-101 attributes and features with
+  no S-57 source are never invented; rules that test them take their fallback
+  branch.
+- **Unconvertible objects fall back or drop.** An S-57 object class with no
+  S-101 equivalent portrays as the S-52 question mark (QUESMRK1) — or, where
+  the S-65 guidance says the object is simply not carried into S-101 (e.g. an
+  area-geometry recommended track), it is dropped.
+
 ## Portrayal gaps
 
 - **Ignored portrayal-instruction keys.** The instruction translator
@@ -38,9 +53,9 @@ domain and not for navigation; this renderer adds its own gaps on top.
   drawn to the light's nominal range) is not emitted, so the
   `show_full_sector_lines` setting currently has nothing to act on.
 - **Sector figures can stop at a tile boundary beyond the owning cell.** The
-  compositor keeps a light's sector legs and arcs WHOLE across ownership seams
-  (they are fixed-size decorations anchored at the light, exempt from face
-  clipping). The remaining gap: a figure reaching into a tile where the owning
+  compositor keeps a light's sector legs and arcs WHOLE across ownership
+  boundaries (they are fixed-size decorations anchored at the light, exempt
+  from face clipping). The remaining gap: a figure reaching into a tile where the owning
   cell holds no ground at all is absent there — the compositor never consults
   that cell for the tile — so a figure within roughly one tile of the cell's
   owned ground can cut at that tile's edge (directional ground-length legs can

@@ -48,7 +48,7 @@ render Surface                        src/render/surface.zig
    primitives: filled polygons, stroked lines, symbols, patterns, soundings, text.
 5. **Generate the scene.** Each primitive is projected to web-mercator tile
    coordinates, clipped (extent 4096, buffer 64), and emitted as *draw calls* on a
-   **Surface** — the backend seam described below.
+   **Surface** — the backend contract described below.
 
 ### The Surface contract
 

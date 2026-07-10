@@ -104,7 +104,8 @@ library), and `tile57.CellReadFn` (the reader callback). Multi-cell input for
 
 The runtime compositor stitches per-cell archives into one seamless chart: any
 `(z, x, y)` tile on demand through the ownership partition (cells never
-double-draw at a seam), and the same view outputs as a single chart, composed.
+double-draw where they meet), and the same view outputs as a single chart,
+composed.
 
 ```zig
 // Open the compositor over the archives + partition, then compose tiles.
@@ -134,7 +135,7 @@ var src = (try tile57.compose.openComposeSourceCharts(gpa, &archives, null)).?;
 | `ComposeSource.tile(gpa, z, x, y)` | compose one tile on demand (raw MLT + the ownership flag). |
 | `tile57.compose.renderView(src, ...)` | the composed view render — PNG, PDF, or a callback canvas. |
 | `tile57.compose.renderSurfaceView(src, ...)` | the composed world-space surface stream. |
-| `tile57.compose.queryPoint(src, lon, lat, zoom, cb)` | the composed cursor pick (seams included). |
+| `tile57.compose.queryPoint(src, lon, lat, zoom, cb)` | the composed cursor pick, across cell boundaries. |
 | `tile57.compose.composeTile(...)` | the stateless core `ComposeSource.tile` uses. |
 | `tile57.partition` | the ownership partition and its `.tpart` sidecar (serialize / deserialize). |
 
