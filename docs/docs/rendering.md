@@ -98,12 +98,11 @@ rules decided for *your* settings — the ECDIS-faithful path.
 # One tile of a cell, as a 512px PNG
 tile57 png US5MD1MC.000 14 4712 6280 -o tile.png --size 512
 
-# A view (any centre, fractional zoom, any size) from a whole ENC_ROOT —
-# cells are selected and quilted per band automatically
-tile57 png ~/charts/ENC_ROOT --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.png
+# A view (any centre, fractional zoom, any size) from a single cell
+tile57 png US5MD1MC.000 --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.png
 
 # The same view as a vector PDF with selectable text
-tile57 pdf ~/charts/ENC_ROOT --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.pdf
+tile57 pdf US5MD1MC.000 --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.pdf
 
 # From a baked PMTiles bundle instead of source cells (tile replay)
 tile57 png chart.pmtiles --view -76.48,38.974,15.1 --size 1024x768 -o out.png
@@ -119,7 +118,8 @@ Two calls in `include/tile57.h` (same allocate-`*out` / free-with-`tile57_free`
 convention as the rest of the ABI):
 
 ```c
-tile57_chart *c = tile57_chart_open("/path/to/ENC_ROOT");
+tile57 *c = NULL;
+tile57_open("US5MD1MC.pmtiles", &c, NULL);   /* a baked archive */
 
 tile57_mariner m;
 tile57_mariner_defaults(&m);
@@ -127,12 +127,12 @@ m.safety_contour = 5.0;
 m.scheme = TILE57_SCHEME_NIGHT;
 
 uint8_t *png; size_t len;
-tile57_chart_render_view(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &png, &len);
+tile57_render_view(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &png, &len, NULL);
 /* ... write/display png ... */
 tile57_free(png, len);
 
 uint8_t *pdf; size_t plen;
-tile57_chart_render_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen);
+tile57_render_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen, NULL);
 ```
 
 `m.size_scale` calibrates physical size (so 1 S-52 millimetre is a true

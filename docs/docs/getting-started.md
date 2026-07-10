@@ -85,26 +85,31 @@ Open a compositor over the bake output and serve tiles by `(z, x, y)`:
 ```c
 #include "tile57.h"
 
-/* Open a compositor over the `tile57 bake` output (list every cell archive). */
-const char *paths[] = { "out/tiles/US5MD1MC.pmtiles" };
-tile57_compose_source *src = tile57_compose_open(paths, 1, "out/partition.tpart");
-
-uint8_t *tile; size_t n;
-switch (tile57_compose_serve(src, z, x, y, &tile, &n)) {
-    case 1:  /* … render the decompressed MLT tile … */ tile57_free(tile, n); break;
-    case 2:  /* owned but empty — a cell's bake is still in flight */ break;
-    case 0:  /* not owned — open ocean; cache as blank */ break;
-    default: /* -1 error */ break;
+/* Open each baked archive as a chart, then a compositor over the charts. */
+tile57 *chart = NULL;
+tile57_error err;
+if (tile57_open("out/tiles/US5MD1MC.pmtiles", &chart, &err) != TILE57_OK) {
+    fprintf(stderr, "%s\n", err.message);
 }
-tile57_compose_close(src);
+tile57_compose *src = NULL;
+tile57_compose_open(&chart, 1, "out/partition.tpart", &src, &err);
+
+uint8_t *tile; size_t n; bool owned;
+if (tile57_compose_serve(src, z, x, y, &tile, &n, &owned, &err) == TILE57_OK) {
+    if (tile)       { /* … serve the decompressed MLT tile … */ tile57_free(tile, n); }
+    else if (owned) { /* owned but empty — a cell's bake is still in flight */ }
+    else            { /* not owned — open ocean; cache as blank */ }
+}
+tile57_compose_close(src);   /* the compositor borrows its charts… */
+tile57_close(chart);         /* …so close them after it */
 ```
 
 Link against `libtile57.a`. The `partition.tpart` sidecar (NULL to skip) lets the
-compositor load the ownership partition instead of rebuilding it. To render a
-finished PNG/PDF, read metadata, or query the feature under a point, open a
-`tile57_chart` instead — `tile57_chart_open` (an on-disk ENC_ROOT or a `.000`),
-`tile57_chart_open_bytes` (one in-memory cell), or `tile57_chart_open_pmtiles`
-(a baked archive). See the [C API](./c-api.md).
+compositor load the ownership partition instead of rebuilding it. The same
+`tile57` chart handle renders finished PNGs/PDFs, reads metadata (bounds, scale,
+coverage, SCAMIN), and answers the cursor pick; raw S-57 reading (cell
+inventory, feature extraction) is handle-free via `tile57_s57_*`. See the
+[C API](./c-api.md).
 
 ## 3. Use the engine from Zig
 
@@ -129,9 +134,10 @@ production (bake each cell, then compose on demand) is exposed through the
 ## ENC_ROOT and updates
 
 Open an ENC_ROOT (many cells, each with its sequential `.001`, `.002` … updates)
-with `Chart.openPath` / `tile57_chart_open` — a single call that streams a whole
-on-disk catalogue, reading each cell's bytes on demand. The engine parses, applies
-the updates, and serves the best-available scale band per tile.
+with `Chart.openPath` (Zig) or scan it with `tile57_s57_cells` (C) — a single
+call that walks a whole on-disk catalogue, applying each cell's updates. Baking
+(`tile57 bake` / `tile57_bake_tree`) turns it into the per-cell archives the
+compositor serves.
 
 See the [**Architecture**](./architecture.md) page for how the engine fits
 together.

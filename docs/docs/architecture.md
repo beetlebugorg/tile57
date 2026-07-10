@@ -69,7 +69,7 @@ Bakes encode **MLT** ([MapLibre Tile](https://github.com/maplibre/maplibre-tile-
 by default; MapLibre GL JS ≥ 5.12 decodes it natively via the vector source
 `encoding` option, and the generated styles carry that hint. The engine can also
 encode Mapbox Vector Tiles for consumers without an MLT decoder.
-`tile57_chart_info.tile_type` reports which encoding a chart's tiles use, so a
+`tile57_info.tile_type` reports which encoding a chart's tiles use, so a
 host hints its renderer correctly.
 
 ### Band handoff (coverage-clipped ownership)
@@ -128,8 +128,8 @@ The public surface composes the packages into high-level entry points:
   inspect it: `renderView` (PNG or PDF), `renderSurfaceView` (world-space GPU
   callbacks), `queryPoint` (the cursor pick), and the metadata getters. It reads a
   pre-baked **PMTiles** archive or portrays a live cell — the caller can't tell the
-  difference. (`tile57_chart_render_view` / `tile57_chart_render_pdf` /
-  `tile57_chart_render_surface_cb` / `tile57_chart_query` in the C ABI.)
+  difference. (`tile57_render_view` / `tile57_render_pdf` /
+  `tile57_render_surface_cb` / `tile57_query` in the C ABI.)
 - **Tile production** — bake each cell to its own PMTiles at its compilation scale
   (`tile57_bake_cell_bytes`, which runs the banded bake engine `scene/bake_enc.zig`
   on a single cell), then a runtime **compositor** stitches the overlapping cells
@@ -151,10 +151,11 @@ tile57 is built to hold only its working set:
   ms); after that it is cached.
 - **Best-available band per tile.** Overlapping cells of different compilation
   scales are resolved per tile to the best band, not all overlaid blindly.
-- **Streaming open.** `openCellsStreaming` (and its on-disk driver `openPath` /
-  `tile57_chart_open`) take per-cell metadata (bbox + scale) plus a reader; a cell's
-  bytes are read only on demand and freed on eviction. A host then holds only the
-  working set's bytes, not the whole catalogue — the right choice for a large ENC_ROOT.
+- **Streaming open.** `openCellsStreaming` (and its on-disk driver `openPath`,
+  which backs the C `tile57_s57_*` readers) take per-cell metadata (bbox + scale)
+  plus a reader; a cell's bytes are read only on demand and freed on eviction. A
+  host then holds only the working set's bytes, not the whole catalogue — the
+  right choice for a large ENC_ROOT.
 - **Per-cell bakes.** Each cell bakes independently at its own compilation scale,
   so a bake holds a single cell's parsed data at a time — memory doesn't grow with
   the size of the catalogue. (The multi-cell `bakeArchive` streams band-by-band,
