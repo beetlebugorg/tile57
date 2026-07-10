@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;
+const mlt = @import("tiles").mlt;
 const gzip = @import("tiles").gzip;
 const s57 = @import("s57");
 const scene = @import("scene");
@@ -30,6 +31,7 @@ const sprite = @import("sprite");
 const embedded_assets = @import("catalog"); // S-101 portrayal assets (renderView store)
 const style = @import("style"); // displayDenomZ (the physical display-scale formula)
 const cell_coverage = @import("coverage"); // per-cell M_COVR coverage embedded in archive metadata
+const compose_mod = @import("compose"); // the runtime compositor (compose-backed view renders)
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
 // makes many small, short-lived allocations (tile cache, cell dupes, index
@@ -818,6 +820,133 @@ fn newestInputNs(io: std.Io, in_path: []const u8) ?i96 {
     return newest;
 }
 
+// Build the embedded-catalogue symbol + area-fill store for a view render (in `a`;
+// deinit when done) and register the complex-linestyle table (idempotent,
+// gpa-backed — the registry outlives the render, shared with any later bake).
+fn viewSymbolStore(a: std.mem.Allocator, palette: render.resolve.PaletteId) !*sprite.CatalogStore {
+    const css_name = switch (palette) {
+        .day => "daySvgStyle",
+        .dusk => "duskSvgStyle",
+        .night => "nightSvgStyle",
+    };
+    var css_data: []const u8 = "";
+    for (embedded_assets.css) |e| {
+        if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
+    }
+    const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+    for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+    const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+    for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+    const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+
+    var ls_srcs = std.ArrayList(style.LineStyleSrc).empty;
+    defer ls_srcs.deinit(gpa);
+    for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
+    scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
+    return store;
+}
+
+// ---- compose-backed view renders --------------------------------------------
+//
+// The compositor is the tile source; these are its VIEW backends: compose every
+// covering tile on demand (seams stitched through the ownership partition) and
+// replay it through the native S-52 pixel path — the same scene Chart.renderView
+// replays from a single archive, but across the whole composed set.
+
+/// Render a VIEW over a runtime compositor to PNG / PDF / a callback canvas
+/// (per `output`; bytes are gpa-owned, freeBytes — empty for the callback
+/// output). The mariner's live-swappable settings evaluate at render time.
+pub fn renderComposeView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, output: render.pixel.Output, cb_table: ?*const render.cb_canvas.CCanvas) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const store = try viewSymbolStore(a, palette);
+    defer store.deinit();
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, tile.EXTENT);
+    ps.store = store.asStore();
+    ps.output = output;
+    ps.cb = cb_table;
+
+    var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    const surf = ps.asSurface();
+    try surf.beginScene(vt.z);
+    while (vt.next()) |t| {
+        const res = src.tile(a, t.z, t.x, t.y) catch continue;
+        const bytes = res.tile orelse continue;
+        const layers = mlt.decode(a, bytes) catch continue; // the compositor serves raw MLT
+        ps.setOrigin(t.origin_x, t.origin_y);
+        scene.replayTile(a, surf, layers) catch return error.TileGen;
+    }
+    return surf.endScene(gpa) catch error.TileGen;
+}
+
+/// renderComposeView's GPU-vector twin: the SAME composed view emitted as a
+/// WORLD-SPACE tagged stream to the C surface callback (see render/vector.zig).
+pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const store = try viewSymbolStore(a, palette);
+    defer store.deinit();
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
+    vs.store = store.asStore();
+    vs.view_zoom = zoom; // scale at which labels/symbols declutter
+
+    var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    const surf = vs.asSurface();
+    try surf.beginScene(vt.z);
+    while (vt.next()) |t| {
+        const res = src.tile(a, t.z, t.x, t.y) catch continue;
+        const bytes = res.tile orelse continue;
+        const layers = mlt.decode(a, bytes) catch continue;
+        vs.setTile(t.z, t.x, t.y);
+        scene.replayTile(a, surf, layers) catch continue;
+    }
+    _ = try surf.endScene(a);
+}
+
+/// Cursor object-query over a runtime compositor (the S-52 §10.8 pick across the
+/// whole composed set — seams included): replay the composed tile covering
+/// (lon,lat) at the view zoom through a QuerySurface and report each feature the
+/// point falls in via `cb`.
+pub fn composeQueryPoint(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, cb: *const render.query.QueryCb) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Query the tile at the VIEW zoom, clamped into the served range: its features
+    // are already SCAMIN-bucketed to what's displayed and the pick radius (tile
+    // units) maps to a constant on-screen distance.
+    const zc = std.math.clamp(@round(zoom), @as(f64, @floatFromInt(src.minz)), @as(f64, @floatFromInt(src.loop_max)));
+    const z: u8 = @intFromFloat(zc);
+    const world = tile.lonLatToWorld(lon, lat);
+    const n = std.math.exp2(@as(f64, @floatFromInt(z)));
+    const tx: u32 = @intFromFloat(@floor(world[0] * n));
+    const ty: u32 = @intFromFloat(@floor(world[1] * n));
+    const local = tile.project(lon, lat, z, tx, ty, tile.EXTENT);
+    var qs = render.query.QuerySurface{
+        .qx = @floatFromInt(local.x),
+        .qy = @floatFromInt(local.y),
+        .radius = 96.0, // ~6 px at native tile scale
+        .view_zoom = zoom, // raw view zoom for the SCAMIN cull
+        .cb = cb,
+    };
+    const surf = qs.asSurface();
+    try surf.beginScene(z);
+    const res = src.tile(a, z, tx, ty) catch return;
+    const bytes = res.tile orelse return;
+    const layers = mlt.decode(a, bytes) catch return;
+    scene.replayTile(a, surf, layers) catch return;
+    _ = surf.endScene(a) catch {};
+}
+
 /// The metadata JSON blob of a PMTiles archive (decompressed), duped into `a`, or null
 /// if the archive carries none. For a host to read the embedded scamin / coverage
 /// without a full open. This engine writes metadata uncompressed; gzip is handled for
@@ -1282,29 +1411,8 @@ pub const Chart = struct {
         const a = arena.allocator();
 
         var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
-        const css_name = switch (palette) {
-            .day => "daySvgStyle",
-            .dusk => "duskSvgStyle",
-            .night => "nightSvgStyle",
-        };
-        var css_data: []const u8 = "";
-        for (embedded_assets.css) |e| {
-            if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
-        }
-        const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
-        for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
-        const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
-        for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
-        const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+        const store = try viewSymbolStore(a, palette);
         defer store.deinit();
-
-        // Complex-linestyle table (idempotent): without it MARSYS51/cable/
-        // pipeline styles degrade to generic dashed strokes. gpa-backed: the
-        // registry outlives this render (shared with any later bake).
-        var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
-        defer ls_srcs.deinit(gpa);
-        for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-        scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 
         // Continuous scaling between integer zooms; the host applies physical
         // calibration / @2x via settings.size_scale.
@@ -1360,26 +1468,8 @@ pub const Chart = struct {
         const a = arena.allocator();
 
         var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
-        const css_name = switch (palette) {
-            .day => "daySvgStyle",
-            .dusk => "duskSvgStyle",
-            .night => "nightSvgStyle",
-        };
-        var css_data: []const u8 = "";
-        for (embedded_assets.css) |e| {
-            if (std.mem.eql(u8, e.name, css_name)) css_data = e.bytes;
-        }
-        const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
-        for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
-        const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
-        for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
-        const store = try sprite.CatalogStore.init(a, sym_srcs, fill_srcs, css_data);
+        const store = try viewSymbolStore(a, palette);
         defer store.deinit();
-
-        var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
-        defer ls_srcs.deinit(gpa);
-        for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-        scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
         var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);

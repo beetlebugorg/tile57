@@ -5,7 +5,10 @@
  * those archives on demand, renders finished charts to pixels / PDF / a callback
  * surface, and generates the matching S-52 MapLibre style + portrayal assets.
  *
- * The pipeline is three stages, and the header is organised the same way:
+ * Everything is BAKE, THEN COMPOSE (or bake, then render): source cells bake
+ * once to per-cell archives; every output — a tile, a PNG, a PDF, a callback
+ * stream — is produced from baked archives. The header is organised the same
+ * way:
  *
  *   3. BAKE     ENC source data in, per-cell PMTiles out. Each cell bakes to its
  *               own archive at its own compilation scale, with its M_COVR
@@ -14,14 +17,16 @@
  *               (cell inventory, feature extraction, exchange-set catalogue).
  *
  *   4. RENDER   a `tile57` chart handle opens ONE baked archive (mmap'd from a
- *               path, or copied from bytes) and answers for it: metadata
- *               (info / scamin / coverage), the cursor pick (query), and full
- *               view renders (PNG / PDF / callback canvas / world-space
- *               surface).
+ *               path, or copied from bytes) and answers for it with NO
+ *               composition: metadata (info / scamin / coverage), its stored
+ *               tiles verbatim (tile57_tile — the primitive for writing your
+ *               own compositor), the cursor pick (query), and view outputs
+ *               (png / pdf / canvas / surface).
  *
- *   5. COMPOSE  a `tile57_compose` handle stitches MANY open charts into one
- *               seamless tile pyramid on demand, via the cell-ownership
- *               partition — what a live tile server hands its HTTP layer.
+ *   5. COMPOSE  a `tile57_compose` handle stitches MANY open charts through the
+ *               cell-ownership partition and offers the SAME output set,
+ *               composed: tile (what a live tile server hands its HTTP layer),
+ *               png, pdf, canvas, surface, query.
  *
  * Section 6 (style + portrayal assets) turns the mariner's S-52 display options
  * into a concrete MapLibre style JSON plus the colortables / sprite / pattern /
@@ -253,21 +258,22 @@ tile57_status tile57_bake_partition_debug(const char *enc_root, const char *out_
  * 4. Render
  *
  * A `tile57` is a chart: ONE baked PMTiles archive, opened for metadata and
- * rendering. Open it from a path (mmap'd — a whole chart library can be open
- * without being resident) or from bytes (copied). It reports the archive's
- * zoom range / bounds / tile encoding, the coverage + compilation scale the
- * bake embedded, and the live SCAMIN manifest; it answers the S-52 cursor
- * pick; and it renders any VIEW (centre + fractional zoom + pixel size) as a
- * finished PNG, a vector PDF, resolved pixel-space draw calls, or a
- * world-space semantically-tagged stream.
+ * output — with NO composition (the compositor, section 5, offers the same
+ * outputs across many charts). Open it from a path (mmap'd — a whole chart
+ * library can be open without being resident) or from bytes (copied). It
+ * reports the archive's zoom range / bounds / tile encoding, the coverage +
+ * compilation scale the bake embedded, and the live SCAMIN manifest; hands
+ * back its stored tiles verbatim (the primitive an embedder's own compositor
+ * consumes); answers the S-52 cursor pick; and renders any VIEW (centre +
+ * fractional zoom + pixel size) as a finished PNG, a vector PDF, resolved
+ * pixel-space draw calls, or a world-space semantically-tagged stream.
  *
- * Rendering REPLAYS the archive's baked tiles through the native S-52 pixel
- * path: one whole scene across every covering tile, labels decluttered over
- * the full canvas (no tile seams), symbols replayed as vectors from the
- * catalogue. The mariner's live-swappable settings — colour scheme, safety
- * contour danger/sounding swaps, category/SCAMIN/text gates, size scale —
- * re-evaluate at render time; the rest of the portrayal context was fixed at
- * bake time.
+ * Rendering REPLAYS baked tiles through the native S-52 pixel path: one whole
+ * scene across every covering tile, labels decluttered over the full canvas
+ * (no tile seams), symbols replayed as vectors from the catalogue. The
+ * mariner's live-swappable settings — colour scheme, safety contour
+ * danger/sounding swaps, category/SCAMIN/text gates, size scale — re-evaluate
+ * at render time; the rest of the portrayal context was fixed at bake time.
  * ======================================================================== */
 
 /* Opaque chart handle: one open baked archive. */
@@ -327,6 +333,14 @@ typedef struct {
 } tile57_coverage_cb;
 tile57_status tile57_coverage(tile57 *chart, const tile57_coverage_cb *cb,
                               tile57_error *err);
+
+/* The chart's own stored tile at (z,x,y), decompressed (MLT or MVT per
+ * tile57_info.tile_type), with NO composition — the per-archive primitive for
+ * an embedder writing its own compositor. TILE57_OK with the bytes in *out /
+ * *out_len (free with tile57_free); NULL/0 when the archive has no tile
+ * there. */
+tile57_status tile57_tile(tile57 *chart, uint8_t z, uint32_t x, uint32_t y,
+                          uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* Cursor object-query (S-52 §10.8 pick): feature() is invoked once per feature
  * the point (lon,lat) falls in — area point-in-polygon, line/point within a
@@ -401,18 +415,18 @@ void tile57_mariner_defaults(tile57_mariner *m);
  * TILE57_ERR_BADARG. */
 
 /* The view as a PNG, in *out / *out_len (free with tile57_free). */
-tile57_status tile57_render_view(tile57 *chart, double lon, double lat, double zoom,
-                                 uint32_t width, uint32_t height,
-                                 const tile57_mariner *m,
-                                 uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_png(tile57 *chart, double lon, double lat, double zoom,
+                         uint32_t width, uint32_t height,
+                         const tile57_mariner *m,
+                         uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* The view as a deterministic single-page vector PDF (1 px = 1 pt, 72 dpi;
  * vector fills + native strokes + glyph-outline text), in *out / *out_len
  * (free with tile57_free). */
-tile57_status tile57_render_pdf(tile57 *chart, double lon, double lat, double zoom,
-                                uint32_t width, uint32_t height,
-                                const tile57_mariner *m,
-                                uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_pdf(tile57 *chart, double lon, double lat, double zoom,
+                         uint32_t width, uint32_t height,
+                         const tile57_mariner *m,
+                         uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* ---- callback Canvas: the pixel-space callback twin ------------------------
  * The same view painted through a table of C function pointers instead of
@@ -444,10 +458,10 @@ typedef struct {
     void (*draw_glyphs) (void *ctx, const tile57_rings *outline, tile57_rgba color,
                          tile57_rgba halo, float halo_px);
 } tile57_canvas_cb;
-tile57_status tile57_render_view_cb(tile57 *chart, double lon, double lat, double zoom,
-                                    uint32_t width, uint32_t height,
-                                    const tile57_mariner *m,
-                                    const tile57_canvas_cb *canvas, tile57_error *err);
+tile57_status tile57_canvas(tile57 *chart, double lon, double lat, double zoom,
+                            uint32_t width, uint32_t height,
+                            const tile57_mariner *m,
+                            const tile57_canvas_cb *canvas, tile57_error *err);
 
 /* ---- world-space Surface callback: the GPU vector twin ---------------------
  * The same view emitted as a WORLD-SPACE, semantically TAGGED stream rather
@@ -511,10 +525,10 @@ typedef struct {
     void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, tile57_rgba color, tile57_rgba halo);
 } tile57_surface_cb;
 
-tile57_status tile57_render_surface_cb(tile57 *chart, double lon, double lat, double zoom,
-                                       uint32_t width, uint32_t height,
-                                       const tile57_mariner *m,
-                                       const tile57_surface_cb *surface, tile57_error *err);
+tile57_status tile57_surface(tile57 *chart, double lon, double lat, double zoom,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
 
 /* Release a chart and all cached tiles. Must not be called while any borrower
  * (a compositor, a renderer thread) may still read from it. */
@@ -523,11 +537,13 @@ void tile57_close(tile57 *chart);
 /* ======================================================================== *
  * 5. Compose
  *
- * The runtime compositor: MANY open charts in, one seamless tile pyramid out.
- * It builds (or loads) the cell-ownership partition over the charts' embedded
- * coverage, then composes any (z, x, y) on demand for the cost of a classify
- * plus one decompress or one decode/clip — what a live tile server hands its
- * HTTP layer. Open once, serve many, close.
+ * The runtime compositor: MANY open charts in, one seamless chart out. It
+ * builds (or loads) the cell-ownership partition over the charts' embedded
+ * coverage, then offers the SAME output set as a single chart, composed:
+ * any (z, x, y) tile on demand for the cost of a classify plus one decompress
+ * or one decode/clip (what a live tile server hands its HTTP layer), plus the
+ * composed view outputs (png / pdf / canvas / surface) and the composed cursor
+ * pick (query). Open once, serve many, close.
  *
  * The compositor BORROWS its charts (their mmap'd archives and decoded
  * coverage): every chart must outlive the compositor, and while it serves, do
@@ -568,6 +584,33 @@ tile57_status tile57_compose_open(tile57 *const *charts, size_t n,
 tile57_status tile57_compose_tile(tile57_compose *c, uint8_t z, uint32_t x, uint32_t y,
                                    uint8_t **out, size_t *out_len, bool *out_owned,
                                    tile57_error *err);
+
+/* The composed view outputs — tile57_png / tile57_pdf / tile57_canvas /
+ * tile57_surface across the WHOLE composed set: every covering tile is
+ * composed on demand (seams stitched through the ownership partition) and
+ * replayed through the native S-52 pixel path. Same parameters, limits, and
+ * ownership as the single-chart forms in section 4. */
+tile57_status tile57_compose_png(tile57_compose *c, double lon, double lat, double zoom,
+                                 uint32_t width, uint32_t height,
+                                 const tile57_mariner *m,
+                                 uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_compose_pdf(tile57_compose *c, double lon, double lat, double zoom,
+                                 uint32_t width, uint32_t height,
+                                 const tile57_mariner *m,
+                                 uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_compose_canvas(tile57_compose *c, double lon, double lat, double zoom,
+                                    uint32_t width, uint32_t height,
+                                    const tile57_mariner *m,
+                                    const tile57_canvas_cb *canvas, tile57_error *err);
+tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, double zoom,
+                                     uint32_t width, uint32_t height,
+                                     const tile57_mariner *m,
+                                     const tile57_surface_cb *surface, tile57_error *err);
+
+/* The composed cursor pick (S-52 §10.8, seams included): tile57_query across
+ * the whole composed set. */
+tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, double zoom,
+                                   const tile57_query_cb *cb, tile57_error *err);
 
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_meta_get(tile57_compose *c, tile57_compose_meta *out);

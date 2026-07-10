@@ -491,6 +491,19 @@ export fn tile57_coverage(handle: ?*Chart, cb: ?*const CCoverageCb, err: ?*CErro
     return OK;
 }
 
+/// The chart's own stored tile at (z,x,y), decompressed (MLT or MVT per
+/// tile57_info.tile_type), with NO composition — the per-archive primitive an
+/// embedder's own compositor consumes. NULL/0 out when the archive has no tile
+/// there. See tile57.h.
+export fn tile57_tile(handle: ?*Chart, z: u8, x: u32, y: u32, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const rd = c.pmtilesReader() orelse return failWith(err, .badarg, "chart is not archive-backed");
+    const bytes = (rd.getTile(gpa, z, x, y) catch |e| return fail(err, e)) orelse return OK;
+    setBytes(o, n, bytes);
+    return OK;
+}
+
 const CQueryCb = @import("render").query.QueryCb;
 
 /// Cursor object-query at (lon,lat) for the view `zoom` (web-mercator): invokes
@@ -517,11 +530,12 @@ fn paletteOf(settings: *const mariner.Settings) RenderPalette {
 const MAX_RENDER_PX = 16384;
 const bad_size = "width/height must be 1..16384";
 
-/// Render a VIEW of the chart (centre + fractional zoom + pixel size) to PNG:
-/// the archive's baked tiles replayed through the native S-52 pixel path — one
-/// scene across every covering tile, labels decluttered over the whole canvas.
+/// Render a VIEW of this ONE chart (centre + fractional zoom + pixel size) to
+/// PNG: the archive's baked tiles replayed through the native S-52 pixel path —
+/// one scene across every covering tile, labels decluttered over the whole
+/// canvas. No composition (see tile57_compose_png for the composed twin).
 /// `m` NULL = defaults. See tile57.h.
-export fn tile57_render_view(
+export fn tile57_png(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -543,9 +557,9 @@ export fn tile57_render_view(
     return OK;
 }
 
-/// tile57_render_view's vector twin: the SAME scene as a deterministic single-page
-/// PDF (1 px = 1 pt, 72 dpi; vector fills, native strokes, glyph-outline text).
-export fn tile57_render_pdf(
+/// tile57_png's vector twin: the SAME scene as a deterministic single-page PDF
+/// (1 px = 1 pt, 72 dpi; vector fills, native strokes, glyph-outline text).
+export fn tile57_pdf(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -569,10 +583,10 @@ export fn tile57_render_pdf(
 
 const CbCanvas = @import("render").cb_canvas.CCanvas;
 
-/// tile57_render_view's callback twin: the SAME view painted through the C
-/// callback table `canvas` (see tile57.h) instead of rasterising. Geometry in
-/// canvas PIXEL space (y down), paint order, palette-resolved colours.
-export fn tile57_render_view_cb(
+/// tile57_png's callback twin: the SAME view painted through the C callback
+/// table `canvas` (see tile57.h) instead of rasterising. Geometry in canvas
+/// PIXEL space (y down), paint order, palette-resolved colours.
+export fn tile57_canvas(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -599,7 +613,7 @@ const CSurface = @import("render").vector.CSurface;
 /// (areas/lines in web-mercator [0,1]; symbols/text as a world anchor + local
 /// reference-px outline; per-feature class + SCAMIN) to the C surface callback
 /// `surface` (see tile57.h). Pan/zoom re-portray nothing on the host.
-export fn tile57_render_surface_cb(
+export fn tile57_surface(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -719,6 +733,112 @@ export fn tile57_compose_tile(
     const res = src.tile(gpa, z, x, y) catch |e| return fail(err, e);
     if (out_owned) |p| p.* = res.owned;
     if (res.tile) |t| setBytes(o, n, t);
+    return OK;
+}
+
+/// Render a VIEW over the compositor to PNG — the composed twin of tile57_png:
+/// every covering tile is composed on demand (seams stitched through the
+/// ownership partition) and replayed through the native S-52 pixel path. See
+/// tile57.h.
+export fn tile57_compose_png(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .png, null) catch |e| return fail(err, e);
+    setBytes(o, n, bytes);
+    return OK;
+}
+
+/// tile57_compose_png's vector twin: the SAME composed scene as a deterministic
+/// single-page PDF. See tile57.h.
+export fn tile57_compose_pdf(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*?[*]u8,
+    out_len: ?*usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .pdf, null) catch |e| return fail(err, e);
+    setBytes(o, n, bytes);
+    return OK;
+}
+
+/// tile57_compose_png's callback twin: the SAME composed view painted through the
+/// C callback table `canvas` (pixel space, paint order). See tile57.h.
+export fn tile57_compose_canvas(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    canvas: ?*const CbCanvas,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    const cb = canvas orelse return failWith(err, .badarg, "canvas must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .callback, cb) catch |e| return fail(err, e);
+    chart.freeBytes(bytes); // the callback path returns an empty buffer
+    return OK;
+}
+
+/// The composed GPU vector twin: the SAME composed view emitted as a WORLD-SPACE
+/// tagged stream to the C surface callback (see tile57.h). See tile57_surface for
+/// the single-chart form.
+export fn tile57_compose_surface(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    chart.renderComposeSurfaceView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// Cursor object-query over the composed set (the S-52 pick, seams included):
+/// invokes cb->feature once per displayed feature the point falls in. See
+/// tile57.h.
+export fn tile57_compose_query(handle: ?*compose.ComposeSource, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
+    chart.composeQueryPoint(src, lon, lat, zoom, cbp) catch |e| return fail(err, e);
     return OK;
 }
 

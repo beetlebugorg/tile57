@@ -469,6 +469,7 @@ pub fn build(b: *std.Build) void {
     });
     chart_mod.addImport("style", style_mod); // linestyle XML analysis
     chart_mod.addImport("coverage", coverage_mod); // embedded-coverage attach on PMTiles opens
+    chart_mod.addImport("compose", compose_mod); // compose-backed view renders
 
     const bake_target = if (target.result.os.tag == .linux and target.result.abi != .musl)
         b.resolveTargetQuery(.{ .cpu_arch = target.result.cpu.arch, .os_tag = .linux, .abi = .musl })
