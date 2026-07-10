@@ -461,7 +461,6 @@ pub const TileSurface = struct {
         .endScene = endScene,
         // Bake path: store complex runs un-tessellated (no size_scale set — bake is
         // native; replay re-walks the period display-scaled).
-        .store_complex_run = storeComplexRun,
     };
 
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
@@ -555,22 +554,6 @@ pub const TileSurface = struct {
         if (valdco) |v| try props.append(s.a, .{ .key = "valdco", .value = .{ .double = v } });
         try appendMeta(s.a, &props, s.cur);
         try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = lines, .properties = props.items });
-    }
-
-    /// Store one clipped complex-linestyle run un-tessellated (display-independent
-    /// bake): a `lines` feature tagged with `ls_style`/`ls_arc0` so replayTile
-    /// re-looks-up the linestyle.Info and re-walks the period display-scaled at render time.
-    fn storeComplexRun(ctx: *anyopaque, line_style: []const u8, color: rs.ColorToken, width_px: f64, arc0: f64, run: []const rs.TilePoint) anyerror!void {
-        const s = sp(ctx);
-        var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(s.a, .{ .key = "color_token", .value = .{ .string = color } });
-        try props.append(s.a, .{ .key = "width_px", .value = .{ .double = width_px } });
-        try props.append(s.a, .{ .key = "ls_style", .value = .{ .string = line_style } });
-        try props.append(s.a, .{ .key = "ls_arc0", .value = .{ .double = arc0 } });
-        try appendMeta(s.a, &props, s.cur);
-        const parts = try s.a.alloc([]const mvt.Point, 1);
-        parts[0] = run;
-        try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {

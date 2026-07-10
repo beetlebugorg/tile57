@@ -19,7 +19,6 @@ const errors = @import("errors"); // the engine error taxonomy + describe()
 // the style C ABI generates colortables + a base style template with no on-disk
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
 const colorprofile_registry = @import("colorprofile_registry");
-const catalog_embed = @import("catalog"); // embedded S-101 assets (linestyles for the style template)
 
 // smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the live
 // tile/chart path makes many small, short-lived allocations; page_allocator
@@ -1287,15 +1286,6 @@ export fn tile57_style_template(
     opts.minzoom = minzoom;
     if (maxzoom != 0) opts.maxzoom = maxzoom;
     if (tile_encoding == TILE_TYPE_MLT) opts.encoding = "mlt";
-    // Analysed complex linestyles from the embedded catalogue: the template gains
-    // the ls_style decoration layers + the "tile57:linestyles" metadata carrier
-    // (tile57_style_build rebuilds them from that carrier on every mariner change).
-    var ls_srcs = std.ArrayList(style.LineStyleSrc).empty;
-    defer ls_srcs.deinit(gpa);
-    for (catalog_embed.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-    const ls_json: ?[]u8 = style.linestylesJson(gpa, ls_srcs.items) catch null;
-    defer if (ls_json) |b| gpa.free(b);
-    opts.linestyles_json = ls_json;
     const style_json = style.json(gpa, opts) catch |e| return fail(err, e);
     return exportOut(err, o, n, style_json);
 }
