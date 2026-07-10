@@ -330,15 +330,6 @@ fn coveredByFiner(cover_clip: []const []const mvt.Point, lon: f64, lat: f64, z: 
 }
 
 // Clip a line + simplify each kept run (drop runs that collapse below 2 vertices).
-fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]const []const mvt.Point {
-    const sub = try tile.clipLine(a, proj, box);
-    var out = std.ArrayList([]const mvt.Point).empty;
-    for (sub) |run| {
-        const s = try tile.simplifyRing(a, run);
-        if (s.len >= 2) try out.append(a, s);
-    }
-    return out.items;
-}
 
 
 fn geomBounds(g: []const s57.LonLat) [4]f64 {
@@ -1596,15 +1587,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         else
             "dashed";
         const dash: rs.Dash = if (std.mem.eql(u8, dash_str, "solid")) .solid else .dashed;
-        for (stroke_proj) |proj| {
-            const sub = try clipSimplifyLine(a, proj, box);
-            if (sub.len == 0) continue;
-            const seg_parts = try a.alloc([]const mvt.Point, sub.len);
-            for (sub, 0..) |seg, i| seg_parts[i] = seg;
-            try surf.beginFeature(&fmeta);
-            try surf.strokeLine(ln.color, ln.width, dash, seg_parts, valdco);
-            try surf.endFeature();
-        }
+        try linestyle.drawPlainLine(a, stroke_proj, ln.color, ln.width, dash, box, &fmeta, valdco, surf);
     };
 
     if (!opts.suppress_points and p.texts.len > 0) {
@@ -1690,7 +1673,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        var sub = try clipSimplifyLine(a, proj, box);
+        var sub = try tile.clipSimplifyLine(a, proj, box);
         if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -1757,7 +1740,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try clipSimplifyLine(a, proj, box);
+        const sub = try tile.clipSimplifyLine(a, proj, box);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -1794,7 +1777,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        var sub = try clipSimplifyLine(a, proj, box);
+        var sub = try tile.clipSimplifyLine(a, proj, box);
         if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -2257,7 +2240,7 @@ fn appendCellFeatures(
             if (!overlaps(geomBounds(gp), tb)) continue;
             const proj = try a.alloc(mvt.Point, gp.len);
             for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-            var sub = try clipSimplifyLine(a, proj, box);
+            var sub = try tile.clipSimplifyLine(a, proj, box);
             if (fopts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);

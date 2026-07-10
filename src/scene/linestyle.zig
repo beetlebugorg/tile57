@@ -217,3 +217,15 @@ pub fn drawComplexLine(a: Allocator, parts: []const []s57.LonLat, info: Info, li
     }
     try surf.endFeature();
 }
+
+/// Draw a plain (solid or dashed) line: clip + simplify each projected run for
+/// this tile and stroke it. The symbolised-line counterpart is drawComplexLine.
+pub fn drawPlainLine(a: Allocator, stroke_proj: []const []const mvt.Point, color: []const u8, width: f64, dash: rs.Dash, box: tile.Box, fmeta: *const rs.FeatureMeta, valdco: ?f64, surf: rs.Surface) !void {
+    for (stroke_proj) |proj| {
+        const sub = try tile.clipSimplifyLine(a, proj, box);
+        if (sub.len == 0) continue;
+        try surf.beginFeature(fmeta);
+        try surf.strokeLine(color, width, dash, sub, valdco);
+        try surf.endFeature();
+    }
+}

@@ -211,6 +211,18 @@ pub fn clipLine(a: Allocator, line: []const mvt.Point, b: Box) ![][]mvt.Point {
     return parts.items;
 }
 
+/// Clip a projected line to a tile box and simplify each surviving run (dropping
+/// runs shorter than 2 points). The common "clip a line for this tile" composite.
+pub fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: Box) ![]const []const mvt.Point {
+    const sub = try clipLine(a, proj, box);
+    var out = std.ArrayList([]const mvt.Point).empty;
+    for (sub) |run| {
+        const s = try simplifyRing(a, run);
+        if (s.len >= 2) try out.append(a, s);
+    }
+    return out.items;
+}
+
 fn eqPt(a: mvt.Point, b: mvt.Point) bool {
     return a.x == b.x and a.y == b.y;
 }
