@@ -26,8 +26,10 @@ domain and not for navigation; this renderer adds its own gaps on top.
 
 tile57's input is S-57 but its portrayal rules are S-101, so every cell passes
 through an S-57 → S-101 adapter (`src/s101/adapter.zig`) before the rules run.
-S-57 has no perfect S-101 translation; the adapter follows the IHO S-65
-conversion guidance, and the result is **best effort**:
+The adapter is an interim solution — the goal is S-101 throughout, reading
+native S-101 cells directly as hydrographic offices publish them. S-57 has no
+perfect S-101 translation; the adapter follows the IHO S-65 conversion
+guidance, and the result is **best effort**:
 
 - **Missing S-101 content stays missing.** S-101 attributes and features with
   no S-57 source are never invented; rules that test them take their fallback

@@ -20,9 +20,11 @@ real-world navigation.** See [Known limitations](./limitations.md).
 electronic navigational charts published by NOAA and other hydrographic
 offices — converts their features to the newer **S-101** data model, and runs
 the official IHO **S-101 Portrayal Catalogue** in embedded Lua to decide how
-each feature is drawn, producing standard **S-52** chart symbology. S-57 has
-no perfect S-101 translation, so the conversion is best effort — see
-[Known limitations](./limitations.md).
+each feature is drawn, producing **S-101 symbology** (the successor to S-52).
+The conversion is an interim step, and a best-effort one — S-57 has no perfect
+S-101 translation (see [Known limitations](./limitations.md)); the goal is
+S-101 throughout, reading native S-101 cells directly as hydrographic offices
+publish them.
 
 The primary output is **vector tiles**, fetched by `(z, x, y)`:
 [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec) (MLT, the
