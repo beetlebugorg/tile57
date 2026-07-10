@@ -1,7 +1,7 @@
 ---
 id: limitations
 title: Known Limitations
-sidebar_position: 8
+sidebar_position: 9
 ---
 
 # Known Limitations

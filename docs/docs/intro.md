@@ -115,6 +115,7 @@ hex, so a renderer can switch palette without regenerating tiles.
 - [**Installation**](./installation.md) — Zig 0.16, submodules, `zig build`.
 - [**Getting Started**](./getting-started.md) — bake charts and fetch a tile
   from Zig or C.
+- [**The CLI**](./cli.md) — `tile57` bake / render / inspect commands.
 - [**Zig API**](./zig-api.md) — the `@import("tile57")` surface.
 - [**C API**](./c-api.md) — the `tile57_*` C ABI (`include/tile57.h`).
 - [**Architecture**](./architecture.md) — the pipeline and the Zig packages.

@@ -1,7 +1,7 @@
 ---
 id: tile-schema
 title: Tile Schema
-sidebar_position: 7
+sidebar_position: 8
 ---
 
 # Tile Schema

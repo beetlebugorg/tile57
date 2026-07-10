@@ -42,11 +42,8 @@ $T cell    CELL.000                    # summarise an S-57 chart
 $T version
 ```
 
-Run `tile57 help` for usage. The full subcommand list: `bake`, `compose-tile`,
-`assets`, `sprite`, `pattern`, `sprite-mln`, `style`, `png`, `pdf`, `ascii`,
-`explore`, `cells`, `catalog`, `features`, `inspect`, `cell`, `objlcount`,
-`version`, `help`. (S-57's own word for a chart is *cell* — the `cell` /
-`cells` commands keep it.)
+Run `tile57 help` for usage, or see [**The CLI**](./cli.md) for the full
+command reference.
 
 :::info Tiles are MLT by default
 Bakes encode [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec)
