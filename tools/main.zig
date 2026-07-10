@@ -29,6 +29,7 @@ const sprite = @import("sprite.zig");
 const pattern = @import("pattern.zig");
 const sprite_mln = @import("sprite_mln.zig");
 const style = @import("style.zig");
+const tiledump = @import("tiledump.zig");
 const render = @import("render.zig");
 const ascii = @import("ascii.zig");
 const explore = @import("explore.zig");
@@ -75,6 +76,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "style")) {
         return style.run(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "tiledump")) {
+        return tiledump.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "png") or std.mem.eql(u8, sub, "renderpng")) {
