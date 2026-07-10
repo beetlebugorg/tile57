@@ -18,4 +18,5 @@ test {
     _ = boolean;
     _ = plane;
     _ = partition;
+    _ = @import("boolean_repro_test.zig");
 }

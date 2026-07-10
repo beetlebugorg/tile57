@@ -305,7 +305,6 @@ const Sweeper = struct {
         const it = findIntersection(le1.p, le1.other.p, le2.p, le2.other.p);
         if (it.n == 0) return 0;
         if (it.n == 1 and (le1.p.eql(le2.p) or le1.other.p.eql(le2.other.p))) return 0; // shared endpoint only
-        if (it.n == 2 and le1.subject == le2.subject) return 0; // overlap within one operand: even-odd cancels, ignore
 
         if (it.n == 1) {
             if (!le1.p.eql(it.p0) and !le1.other.p.eql(it.p0)) try self.divideSegment(le1, it.p0, gpa);
@@ -347,12 +346,19 @@ const Sweeper = struct {
         }
 
         if (n == 2 or (n == 3 and ev[2] != null)) {
-            // Segments are equal, or share their left endpoint: one carries the
-            // transition, the other contributes nothing.
-            le1.edge_type = .non_contributing;
-            le2.edge_type = if (le1.in_out == le2.in_out) .same_transition else .different_transition;
+            // Segments are equal, or share their left endpoint. Across the two
+            // operands one carries the transition and the other contributes
+            // nothing. Within ONE operand there is no transition to type: both
+            // stay normal, and because the overlap was subdivided into exactly
+            // coincident pieces, the doubled pieces cancel in the result's mod-2
+            // edge reduction (even-odd: a doubled edge is no boundary).
             if (n == 3) try self.divideSegment(ev[2].?.other, ev[1].?.p, gpa);
-            return 2; // typed → recompute
+            if (le1.subject != le2.subject) {
+                le1.edge_type = .non_contributing;
+                le2.edge_type = if (le1.in_out == le2.in_out) .same_transition else .different_transition;
+                return 2; // typed → recompute
+            }
+            return 3;
         }
         if (n == 3) {
             // Share the right endpoint: split the longer-left segment; the now
@@ -393,13 +399,14 @@ const Sweeper = struct {
 /// Compute `subject op clip`. Result is a freshly allocated ring-set (open
 /// rings, even-odd fill); free with `freePolygon`.
 ///
-/// Precondition: each operand is a *simple* polygon — its own rings do not
-/// overlap in area (holes are allowed as properly-nested reverse rings). Two
-/// coincident edges are fine when they come from *different* operands (the seam
-/// case, typed once), but three coincident edges — which require one operand to
-/// overlap itself — are not resolved. Build operands from overlapping coverage
-/// rings with `unionAll`, whose pairwise fold guarantees this. Coincident and
-/// shared edges across the two operands are the designed-for common case.
+/// Each operand is an even-odd ring-set. Rings of one operand may cross, touch,
+/// or share collinear runs with each other (a baked MVT polygon's rings all run
+/// along the same tile clip edge — the case that broke the pre-subdivision
+/// design): same-operand overlaps are subdivided into exactly coincident pieces
+/// which cancel mod 2 in the result reduction, same-operand crossings are
+/// subdivided like any crossing. Coincident edges across the two operands are
+/// the designed-for seam case, typed once. `unionAll` remains the way to fold
+/// many mutually-overlapping coverages into one region whose rings are clean.
 pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -416,8 +423,15 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
     defer sw.status.deinit(gpa);
     defer sw.processed.deinit(gpa);
 
-    for (subject) |ring| try addRing(&sw, ring, true, gpa);
-    for (clip) |ring| try addRing(&sw, ring, false, gpa);
+    // Each operand's edge multiset is reduced modulo 2 BEFORE the sweep: rings
+    // of one operand may share collinear runs (a baked MVT polygon's rings all
+    // running along one tile clip edge), and a doubled coincident edge flips
+    // even-odd membership twice — no boundary. Cancelling those here preserves
+    // the operand's region exactly and guarantees the sweep never sees more
+    // than one subject plus one clip edge coincident, which is the pair case
+    // its overlap typing resolves.
+    try addOperand(&sw, subject, true, gpa);
+    try addOperand(&sw, clip, false, gpa);
 
     while (sw.queue.pop()) |se| {
         try sw.processed.append(gpa, se);
@@ -454,12 +468,26 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
     return connectEdges(gpa, sw.processed.items);
 }
 
-fn addRing(sw: *Sweeper, ring: []const Pt, subject: bool, gpa: Allocator) !void {
-    if (ring.len < 3) return;
-    var j = ring.len - 1;
-    for (ring, 0..) |p, i| {
-        try sw.addEdge(ring[j], p, subject, gpa);
-        j = i;
+/// Add one operand's rings to the sweep with its self-overlapping collinear
+/// runs cancelled (reduceEdges). Survivors are added in reduceEdges' sorted
+/// order so event ids — the deterministic tie-break — are a function of
+/// geometry alone.
+fn addOperand(sw: *Sweeper, rings: Polygon, subject: bool, gpa: Allocator) !void {
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    var raw = std.ArrayList(HEdge).empty;
+    for (rings) |ring| {
+        if (ring.len < 3) continue;
+        var j = ring.len - 1;
+        for (ring, 0..) |p, i| {
+            if (!ring[j].eql(p)) try raw.append(sa, .{ .a = ring[j], .b = p });
+            j = i;
+        }
+    }
+    for (try reduceEdges(sa, raw.items)) |e| {
+        try sw.addEdge(e.a, e.b, subject, gpa);
     }
 }
 
@@ -488,6 +516,138 @@ fn canonEdge(a: Pt, b: Pt) EdgeKey {
     return .{ .ax = b.x, .ay = b.y, .bx = a.x, .by = a.y };
 }
 
+/// The line through an edge, canonicalised so every collinear edge shares one
+/// key: direction reduced by gcd with a fixed sign, plus the line's offset.
+const LineKey = struct { dx: i64, dy: i64, c: i128 };
+
+fn lineKeyOf(a: Pt, b: Pt) LineKey {
+    var dx: i64 = b.x - a.x;
+    var dy: i64 = b.y - a.y;
+    const g: i64 = @intCast(std.math.gcd(@abs(dx), @abs(dy)));
+    dx = @divExact(dx, g);
+    dy = @divExact(dy, g);
+    if (dx < 0 or (dx == 0 and dy < 0)) {
+        dx = -dx;
+        dy = -dy;
+    }
+    // c = d × a is constant along the line for the canonical d.
+    const c: i128 = @as(i128, dx) * a.y - @as(i128, dy) * a.x;
+    return .{ .dx = dx, .dy = dy, .c = c };
+}
+
+/// Split every edge of a collinear group at every group endpoint interior to
+/// it, so partially-overlapping collinear edges become exactly coincident
+/// pieces the mod-2 reduction can cancel. The sweep subdivides edges pairwise
+/// as it discovers them, but a bundle of 3+ coincident edges (two rings of one
+/// operand sharing a tile-edge run with the other operand) can finish the sweep
+/// subdivided inconsistently; this pass makes the reduction see one common
+/// subdivision. All split points are existing endpoints — exact, no rounding.
+fn splitCollinearGroup(sa: Allocator, group: []const HEdge, out: *std.ArrayList(HEdge)) !void {
+    // Parametrise along the canonical direction: t = d · p (monotonic, exact,
+    // and on one line a parameter identifies its point uniquely).
+    const Cut = struct { t: i128, p: Pt };
+    var cuts = std.ArrayList(Cut).empty;
+    const k = lineKeyOf(group[0].a, group[0].b);
+    for (group) |e| {
+        for ([_]Pt{ e.a, e.b }) |p| {
+            try cuts.append(sa, .{ .t = @as(i128, k.dx) * p.x + @as(i128, k.dy) * p.y, .p = p });
+        }
+    }
+    std.mem.sort(Cut, cuts.items, {}, struct {
+        fn lt(_: void, x: Cut, y: Cut) bool {
+            return x.t < y.t;
+        }
+    }.lt);
+    for (group) |e| {
+        var ta = @as(i128, k.dx) * e.a.x + @as(i128, k.dy) * e.a.y;
+        var tb = @as(i128, k.dx) * e.b.x + @as(i128, k.dy) * e.b.y;
+        var pa = e.a;
+        var pb = e.b;
+        if (ta > tb) {
+            std.mem.swap(i128, &ta, &tb);
+            std.mem.swap(Pt, &pa, &pb);
+        }
+        var prev = pa;
+        var prev_t = ta;
+        for (cuts.items) |cut| {
+            if (cut.t <= prev_t) continue;
+            if (cut.t >= tb) break;
+            try out.append(sa, .{ .a = prev, .b = cut.p });
+            prev = cut.p;
+            prev_t = cut.t;
+        }
+        try out.append(sa, .{ .a = prev, .b = pb });
+    }
+}
+
+/// Reduce an edge multiset to its even-odd boundary: group collinear edges,
+/// split each group to one common subdivision (splitCollinearGroup), and cancel
+/// exactly coincident pieces modulo 2 — a doubled edge flips membership twice
+/// and is no boundary. Output is deterministically sorted (a function of the
+/// input SET alone). The non-overlapping common case stays cheap: one key sort,
+/// no splitting. Result is allocated in `sa`.
+fn reduceEdges(sa: Allocator, raw: []const HEdge) ![]HEdge {
+    const keys = try sa.alloc(LineKey, raw.len);
+    for (raw, 0..) |e, i| keys[i] = lineKeyOf(e.a, e.b);
+    const idx = try sa.alloc(usize, raw.len);
+    for (idx, 0..) |*v, i| v.* = i;
+    const Ctx = struct { keys: []const LineKey, raw: []const HEdge };
+    std.mem.sort(usize, idx, Ctx{ .keys = keys, .raw = raw }, struct {
+        fn lt(ctx: Ctx, x: usize, y: usize) bool {
+            const a = ctx.keys[x];
+            const b = ctx.keys[y];
+            if (a.dx != b.dx) return a.dx < b.dx;
+            if (a.dy != b.dy) return a.dy < b.dy;
+            if (a.c != b.c) return a.c < b.c;
+            const ea = canonEdge(ctx.raw[x].a, ctx.raw[x].b);
+            const eb = canonEdge(ctx.raw[y].a, ctx.raw[y].b);
+            if (ea.ax != eb.ax) return ea.ax < eb.ax;
+            if (ea.ay != eb.ay) return ea.ay < eb.ay;
+            if (ea.bx != eb.bx) return ea.bx < eb.bx;
+            return ea.by < eb.by;
+        }
+    }.lt);
+
+    var out = std.ArrayList(HEdge).empty;
+    var grp = std.ArrayList(HEdge).empty;
+    var pieces = std.ArrayList(HEdge).empty;
+    var i: usize = 0;
+    while (i < idx.len) {
+        var j = i + 1;
+        while (j < idx.len and std.meta.eql(keys[idx[i]], keys[idx[j]])) j += 1;
+        if (j - i == 1) {
+            try out.append(sa, raw[idx[i]]);
+            i = j;
+            continue;
+        }
+        grp.clearRetainingCapacity();
+        for (idx[i..j]) |ri| try grp.append(sa, raw[ri]);
+        pieces.clearRetainingCapacity();
+        try splitCollinearGroup(sa, grp.items, &pieces);
+        // Cancel coincident pieces mod 2: sort canonically, keep odd-count runs.
+        std.mem.sort(HEdge, pieces.items, {}, struct {
+            fn lt(_: void, x: HEdge, y: HEdge) bool {
+                const ea = canonEdge(x.a, x.b);
+                const eb = canonEdge(y.a, y.b);
+                if (ea.ax != eb.ax) return ea.ax < eb.ax;
+                if (ea.ay != eb.ay) return ea.ay < eb.ay;
+                if (ea.bx != eb.bx) return ea.bx < eb.bx;
+                return ea.by < eb.by;
+            }
+        }.lt);
+        var p: usize = 0;
+        while (p < pieces.items.len) {
+            var q = p + 1;
+            const kp = canonEdge(pieces.items[p].a, pieces.items[p].b);
+            while (q < pieces.items.len and std.meta.eql(kp, canonEdge(pieces.items[q].a, pieces.items[q].b))) q += 1;
+            if ((q - p) % 2 == 1) try out.append(sa, pieces.items[p]);
+            p = q;
+        }
+        i = j;
+    }
+    return out.items;
+}
+
 const HEdge = struct { a: Pt, b: Pt, used: bool = false };
 
 fn connectEdges(gpa: Allocator, all: []const *SweepEvent) ![][]Pt {
@@ -495,35 +655,20 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent) ![][]Pt {
     defer scratch.deinit();
     const sa = scratch.allocator();
 
-    // (1) Reduce result edges modulo 2.
-    var parity = std.AutoHashMap(EdgeKey, void).init(sa);
+    // (1) Collect the result edges and reduce them to the even-odd boundary:
+    // reduceEdges splits collinear bundles to one common subdivision and cancels
+    // coincident pieces modulo 2 (the doubled edges an even-odd operand
+    // contributes at a shared seam). Its deterministically sorted output also
+    // fixes the trace order (ring order / start vertex) as a function of
+    // geometry alone — the byte-stability the bake==live contract needs.
+    var raw = std.ArrayList(HEdge).empty;
     for (all) |e| {
         if (!(e.left and e.in_result)) continue;
         if (e.p.eql(e.other.p)) continue;
-        const key = canonEdge(e.p, e.other.p);
-        if (parity.contains(key)) {
-            _ = parity.remove(key);
-        } else {
-            try parity.put(key, {});
-        }
+        try raw.append(sa, .{ .a = e.p, .b = e.other.p });
     }
-
     var edges = std.ArrayList(HEdge).empty;
-    var it = parity.keyIterator();
-    while (it.next()) |k| {
-        try edges.append(sa, .{ .a = .{ .x = k.ax, .y = k.ay }, .b = .{ .x = k.bx, .y = k.by } });
-    }
-    // Sort so the trace order (and hence ring order / start vertex) is a function
-    // of geometry alone, not of hash-map iteration — the byte-stability the
-    // bake==live contract needs.
-    std.mem.sort(HEdge, edges.items, {}, struct {
-        fn lt(_: void, x: HEdge, y: HEdge) bool {
-            if (x.a.x != y.a.x) return x.a.x < y.a.x;
-            if (x.a.y != y.a.y) return x.a.y < y.a.y;
-            if (x.b.x != y.b.x) return x.b.x < y.b.x;
-            return x.b.y < y.b.y;
-        }
-    }.lt);
+    try edges.appendSlice(sa, try reduceEdges(sa, raw.items));
 
     var adj = std.AutoHashMap(Pt, std.ArrayList(usize)).init(sa);
     for (edges.items, 0..) |e, idx| {
@@ -895,6 +1040,55 @@ test "fuzz: even-odd(result) == even-odd(A) op even-odd(B), A/B cleaned via unio
                     if (want != got) {
                         std.debug.print("MISMATCH trial={} op={} at ({},{}): want={} got={}\n", .{ trial, op, qx, qy, want, got });
                         std.debug.print("  A={any}\n  B={any}\n  R={any}\n", .{ A, B, r });
+                        return error.BooleanMismatch;
+                    }
+                }
+            }
+        }
+        _ = arena_state.reset(.retain_capacity);
+    }
+}
+
+test "fuzz: raw even-odd operands — self-overlapping rings within one operand" {
+    // Operands are the boxes THEMSELVES (no unionAll cleaning): rings of one
+    // operand may overlap in area, cross, and share collinear runs — the shape a
+    // baked MVT polygon presents when several of its rings run along one tile
+    // clip edge. Even-odd oracle: a point is inside an operand iff it is in an
+    // odd number of that operand's boxes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0xDEADFA11);
+    const rnd = prng.random();
+    const grid: i64 = 64;
+    const ops = [_]Op{ .unite, .intersect, .diff, .sym_diff };
+
+    var trial: usize = 0;
+    while (trial < 1500) : (trial += 1) {
+        const bagA = randBoxBag(rnd, grid);
+        const bagB = randBoxBag(rnd, grid);
+        var backA: [3][1][]const Pt = undefined;
+        var backB: [3][1][]const Pt = undefined;
+        const psA = bagA.polys(&backA);
+        const psB = bagB.polys(&backB);
+        // Flatten each bag's rings into ONE even-odd operand, uncleaned.
+        var ringsA = std.ArrayList([]const Pt).empty;
+        for (psA[0..bagA.n]) |p| try ringsA.appendSlice(a, p);
+        var ringsB = std.ArrayList([]const Pt).empty;
+        for (psB[0..bagB.n]) |p| try ringsB.appendSlice(a, p);
+        for (ops) |op| {
+            const r = try compute(a, ringsA.items, ringsB.items, op);
+            var qy: i64 = -9 * grid;
+            while (qy <= 12 * grid) : (qy += 17) {
+                var qx: i64 = -9 * grid;
+                while (qx <= 12 * grid) : (qx += 17) {
+                    if (pointOnEdge(ringsA.items, qx, qy) or pointOnEdge(ringsB.items, qx, qy) or pointOnEdge(r, qx, qy)) continue;
+                    const want = combine(op, pointInEvenOdd(ringsA.items, qx, qy), pointInEvenOdd(ringsB.items, qx, qy));
+                    const got = pointInEvenOdd(r, qx, qy);
+                    if (want != got) {
+                        std.debug.print("RAW MISMATCH trial={} op={} at ({},{}): want={} got={}\n", .{ trial, op, qx, qy, want, got });
+                        std.debug.print("  A={any}\n  B={any}\n  R={any}\n", .{ ringsA.items, ringsB.items, r });
                         return error.BooleanMismatch;
                     }
                 }
