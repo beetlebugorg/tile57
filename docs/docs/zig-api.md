@@ -6,7 +6,7 @@ sidebar_position: 4
 
 # Zig API
 
-The engine is a Zig package named **`tile57`** (v0.1.0, requires Zig 0.16).
+The engine is a Zig package named **`tile57`** (v0.2.0, requires Zig 0.16).
 Add it as a dependency and `@import("tile57")` for the curated public surface
 (`src/tile57.zig`). The [C ABI](./c-api.md) is a thin shim over this same
 API.
@@ -26,8 +26,9 @@ and read metadata:
 ```zig
 const tile57 = @import("tile57");
 
-// A PMTiles archive, or a raw S-57 cell portrayed live (auto-sniffed).
-var chart = try tile57.Chart.openBytes(cell_bytes, .auto, null);
+// A baked archive, mmap'd (never fully resident). openBytes takes a PMTiles
+// archive or a raw S-57 cell portrayed live (auto-sniffed).
+var chart = try tile57.Chart.openPmtilesPath(io, "US5MD1MC.pmtiles");
 defer chart.deinit();
 
 const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
@@ -42,6 +43,7 @@ The Zig `Chart` does not itself serve `(z, x, y)` tiles — the runtime composit
 
 | Method | Purpose |
 |--------|---------|
+| `openPmtilesPath(io, path)` | open a baked PMTiles archive from a path, mmap'd. |
 | `openBytes(bytes, format, rules_dir)` | open one chart from bytes (PMTiles or S-57 cell). |
 | `openPath(path, rules_dir, pick_attrs)` | open an on-disk ENC_ROOT dir (or a single `.000`) as a streaming chart. |
 | `openCells(cells, rules_dir, pick_attrs)` | open a multi-cell ENC_ROOT from bytes (each cell's `.001…` updates applied). |
@@ -51,12 +53,13 @@ The Zig `Chart` does not itself serve `(z, x, y)` tiles — the runtime composit
 | `renderAscii(lon, lat, zoom, cols, rows, palette, settings, ansi)` | the same view as a terminal text grid. |
 | `queryPoint(lon, lat, zoom, cb)` | the S-52 cursor pick — features under a point at the view zoom. |
 | `cellsJson()` / `featuresJson(classes)` | per-cell metadata / GeoJSON feature query (the `cells` / `features` CLI). |
-| `coverage()` | the M_COVR data-coverage rings (a live cell only). |
+| `coverage()` | the M_COVR data-coverage rings (a live cell, or the copy a per-cell bake embeds in its archive metadata). |
 | `bounds() -> ?[4]f64` | geographic extent `[w, s, e, n]`, if known. |
 | `anchor()` | a good initial camera (lat, lon, zoom) on real data. |
 | `bands() -> u32` | bitmask of navigational bands present. |
 | `zoomRange()` | the min/max zoom the chart serves. |
-| `nativeScale() -> i32` | the compilation scale 1:N (a live cell; 0 if unknown). |
+| `nativeScale() -> i32` | the compilation scale 1:N (a live cell or an archive's embedded metadata; 0 if unknown). |
+| `pmtilesReader()` / `cellCoverage()` | the archive reader + decoded per-cell coverage a compositor borrows. |
 | `scamin() -> ![]u32` | the distinct SCAMIN denominators present (the live SCAMIN manifest). |
 | `tileType()` | the tile encoding the chart's tiles use (MVT/MLT). |
 | `format() -> Format` | the resolved backend (after `.auto`). |
@@ -82,12 +85,24 @@ never double-draw at a seam.
 
 ```zig
 // Bake an ENC_ROOT: each cell -> <out>/tiles/<STEM>.pmtiles + <out>/partition.tpart.
-const n = tile57.bake.tree(io, "/enc/ENC_ROOT", "/out", null, 4, null, null);
+// Incremental: an archive already newer than its whole input is skipped.
+const n = try tile57.bake.tree(io, "/enc/ENC_ROOT", "/out", null, 4, null, null);
 
-// Open the compositor over the archives + partition, then serve tiles.
+// Open the compositor over the archives + partition, then compose tiles.
 var src = (try tile57.compose.openComposeSourceFiles(io, gpa, paths, "/out/partition.tpart")).?;
 defer src.deinit();
-const result = try src.serve(gpa, 13, 2359, 3139); // result.tile: ?[]u8, result.owned: bool
+const result = try src.tile(gpa, 13, 2359, 3139); // result.tile: ?[]u8, result.owned: bool
+```
+
+A host that already holds open charts composes over them instead — the
+compositor borrows each chart's mmap'd reader + decoded coverage, so the charts
+must outlive it:
+
+```zig
+const archives = [_]tile57.compose.ChartArchive{
+    .{ .reader = chart.pmtilesReader().?, .cov = chart.cellCoverage().? },
+};
+var src = (try tile57.compose.openComposeSourceCharts(gpa, &archives, null)).?;
 ```
 
 | Surface | What it does |
@@ -97,7 +112,8 @@ const result = try src.serve(gpa, 13, 2359, 3139); // result.tile: ?[]u8, result
 | `tile57.bake.archive(...)` | the offline path: merge a slice of cells into one archive. |
 | `tile57.bake.Progress` | the optional progress-callback type. |
 | `tile57.compose.openComposeSourceFiles(...)` | open a `ComposeSource` over on-disk archives + a partition. |
-| `tile57.compose.composeTile(...)` | compose one tile (the stateless core `serve` uses). |
+| `tile57.compose.openComposeSourceCharts(...)` | the same over borrowed `ChartArchive`s (already-open charts). |
+| `tile57.compose.composeTile(...)` | compose one tile (the stateless core `ComposeSource.tile` uses). |
 | `tile57.partition` | the ownership partition and its `.tpart` sidecar (serialize / deserialize). |
 
 ## Style + portrayal assets
@@ -136,5 +152,5 @@ The pure-Zig foundational parsers under `tile57.formats`:
 | `tile57.formats.s57` | S-57 ENC cell parser + geometry |
 | `tile57.formats.s101` | the S-101 catalogue, adapter, and instruction stream |
 
-`tile57.version` is the package version string (`"0.1.0"`), matching
+`tile57.version` is the package version string (`"0.2.0"`), matching
 `build.zig.zon` and `tile57_version()`.

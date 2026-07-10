@@ -26,7 +26,7 @@
 const std = @import("std");
 
 /// Library version (matches build.zig.zon and tile57_version()).
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 // ---- Chart: open a chart, then render / query / inspect --------------------
 const chart = @import("chart.zig");
@@ -61,8 +61,9 @@ pub const bake = struct {
 };
 
 // ---- Compose: per-cell archives + a partition -> tiles on demand -----------
-/// The runtime compositor: `ComposeSource` over mmap'd archives + a partition,
-/// `composeTile` for one tile, `openComposeSourceFiles` to open from disk.
+/// The runtime compositor: `ComposeSource` over per-cell archives + a partition
+/// (`ComposeSource.tile` composes one tile on demand), `openComposeSourceFiles` to
+/// open from disk, `openComposeSourceCharts` to borrow already-open charts.
 pub const compose = @import("compose");
 /// The ownership partition and its `.tpart` sidecar (serialize / deserialize).
 pub const partition = @import("geometry").partition;

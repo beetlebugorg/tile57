@@ -716,7 +716,7 @@ export fn tile57_compose_tile(
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     if (out_owned) |p| p.* = false;
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
-    const res = src.serve(gpa, z, x, y) catch |e| return fail(err, e);
+    const res = src.tile(gpa, z, x, y) catch |e| return fail(err, e);
     if (out_owned) |p| p.* = res.owned;
     if (res.tile) |t| setBytes(o, n, t);
     return OK;

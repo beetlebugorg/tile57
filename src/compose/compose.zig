@@ -245,7 +245,7 @@ pub const ComposeSource = struct {
     /// Compose one tile → raw (decompressed) MLT + the ownership flag (gpa-owned bytes; null when
     /// nothing rendered — `owned` then says whether a cell SHOULD have). This is what a live tile
     /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
-    pub fn serve(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileResult {
+    pub fn tile(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileResult {
         return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
     }
     /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can

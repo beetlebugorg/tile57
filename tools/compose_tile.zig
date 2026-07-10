@@ -99,7 +99,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Serve the requested tile.
     const serve_t0 = nowNs();
-    const res = try src.serve(a, z, tx, ty);
+    const res = try src.tile(a, z, tx, ty);
     const tile = res.tile;
     const serve_ms = @as(f64, @floatFromInt(nowNs() - serve_t0)) / 1e6;
     if (tile) |t| {
@@ -121,7 +121,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             while (dy < bench) : (dy += 1) {
                 const bx = (tx + dx) -| half;
                 const by = (ty + dy) -| half;
-                const tl = (src.serve(a, z, bx, by) catch continue).tile;
+                const tl = (src.tile(a, z, bx, by) catch continue).tile;
                 if (tl) |t| {
                     served += 1;
                     bytes += t.len;
