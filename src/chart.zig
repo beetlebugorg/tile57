@@ -863,7 +863,7 @@ pub fn warmup() void {
     var ls_srcs = std.ArrayList(style.LineStyleSrc).empty;
     defer ls_srcs.deinit(gpa);
     for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-    scene.registerLinestylesXml(gpa, ls_srcs.items);
+    scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 }
 
 // Parallel open worker: peek each cell's band + bbox and copy its bytes.
@@ -1286,7 +1286,7 @@ pub const Chart = struct {
         var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
         defer ls_srcs.deinit(gpa);
         for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-        scene.registerLinestylesXml(gpa, ls_srcs.items);
+        scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 
         // Continuous scaling between integer zooms; the host applies physical
         // calibration / @2x via settings.size_scale.
@@ -1361,7 +1361,7 @@ pub const Chart = struct {
         var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
         defer ls_srcs.deinit(gpa);
         for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-        scene.registerLinestylesXml(gpa, ls_srcs.items);
+        scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
         var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
@@ -1730,7 +1730,7 @@ pub fn renderFeature(
     var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
     defer ls_srcs.deinit(gpa);
     for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-    scene.registerLinestylesXml(gpa, ls_srcs.items);
+    scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 
     // Always show the previewed feature regardless of its SCAMIN at the framing zoom.
     var s = settings.*;
@@ -1807,7 +1807,7 @@ pub fn renderCellView(
     var ls_srcs = std.ArrayList(@import("style").LineStyleSrc).empty;
     defer ls_srcs.deinit(gpa);
     for (embedded_assets.linestyles) |e| ls_srcs.append(gpa, .{ .id = e.name, .xml = e.bytes }) catch {};
-    scene.registerLinestylesXml(gpa, ls_srcs.items);
+    scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
     var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, tile.EXTENT);

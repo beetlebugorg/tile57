@@ -49,13 +49,13 @@ pub fn embeddedLinestyles(a: std.mem.Allocator) ![]style.LineStyleSrc {
     return out;
 }
 
-// Build the complex-line tessellation table (id -> LsInfo) from `srcs` and register
+// Build the complex-line tessellation table (id -> linestyle.Info) from `srcs` and register
 // it with scene before baking, so a named (symbolised) linestyle is drawn as its
 // real dash runs + embedded symbols instead of a generic dashed stroke. Mirrors Go
 // lsInfoFromCatalog; mm geometry is converted at the PresLib feature scale. Best
 // effort — a malformed/short style is simply skipped. `gpa` outlives the bake.
 pub fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const style.LineStyleSrc) void {
-    const px = engine.scene.LINESTYLE_PX_PER_MM;
+    const px = engine.scene.linestyle.LINESTYLE_PX_PER_MM;
     for (srcs) |s| {
         const parsed = style.parseLineStyle(gpa, s.xml) catch continue;
         const period = parsed.interval_length * px;
@@ -66,11 +66,11 @@ pub fn registerLinestyles(gpa: std.mem.Allocator, srcs: []const style.LineStyleS
             const hi = (d.start + d.length) * px;
             if (hi - lo > 1e-6) runs.append(gpa, .{ lo, hi }) catch {};
         }
-        var syms = std.ArrayList(engine.scene.LsSym).empty;
+        var syms = std.ArrayList(engine.scene.linestyle.Symbol).empty;
         for (parsed.symbols) |sym| syms.append(gpa, .{ .name = sym.reference, .offset_px = sym.position * px }) catch {};
         var width = parsed.pen_width * px;
         if (width < 0.6) width = 0.9; // S-52 minimum pen
-        engine.scene.registerLinestyle(gpa, s.id, .{
+        engine.scene.linestyle.registerLinestyle(gpa, s.id, .{
             .period_px = period,
             .on_runs = runs.items,
             .symbols = syms.items,

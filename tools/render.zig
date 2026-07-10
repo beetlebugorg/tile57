@@ -184,7 +184,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     // Complex-linestyle table (idempotent; arena-backed — this run only).
     const ls_srcs = try a.alloc(style.LineStyleSrc, catalog_embed.linestyles.len);
     for (catalog_embed.linestyles, 0..) |e, li| ls_srcs[li] = .{ .id = e.name, .xml = e.bytes };
-    engine.scene.registerLinestylesXml(a, ls_srcs);
+    engine.scene.linestyle.registerLinestylesXml(a, ls_srcs);
 
     const bytes = if (from_bundle) blk: {
         // Bundle-sourced replay: decode each covering baked tile and re-emit
