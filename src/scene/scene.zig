@@ -2116,6 +2116,17 @@ fn appendCellFeatures(
         if (subband_min_denom > 0) {
             if (effScamin(f, opts)) |sc| {
                 if (@as(f64, @floatFromInt(sc)) < subband_min_denom) continue;
+            } else if (f.objl == 75) {
+                // LIGHTS is the one class whose SCAMIN-less features do NOT ride
+                // sub-band: producers leave SCAMIN off most fine-band lights (cell
+                // selection is the intended gate — an ECDIS at this scale would
+                // never load the cell), and a light's portrayal is all fixed
+                // display-size construction — flare, characteristic text, 20/25 mm
+                // sector legs and arcs — which reads as a continent-sized doodle
+                // on a fill-up tile. The true small-scale lights arrive from the
+                // overview/general cells, SCAMIN-carrying. Ground features
+                // (land/coast/depth) keep riding.
+                continue;
             }
         }
         var ml = mlon;
