@@ -29,7 +29,7 @@
  * maplibre-gl >= 5.12 decodes them natively via the vector source `encoding`
  * option. The ABI is renderer-agnostic.
  *
- * Errors: every fallible call returns a tile57_status (TILE57_OK = 0) and takes
+ * Errors: every call that can fail returns a tile57_status (TILE57_OK = 0) and takes
  *   an optional caller-owned tile57_error* it fills on failure — see section 2.
  *   Out-parameters are always defined on return: the result on TILE57_OK,
  *   NULL/0 otherwise. "Nothing produced" is NOT a failure — a call that finds
@@ -79,7 +79,7 @@ const char *tile57_version(void);
 /* ======================================================================== *
  * 2. Errors
  *
- * A fallible call returns a tile57_status; TILE57_OK (0) is success and every
+ * A call that can fail returns a tile57_status; TILE57_OK (0) is success and every
  * other value is a failure with a coarse cause. Results come back through
  * out-parameters, which are always defined on return (NULL/0 on failure).
  *

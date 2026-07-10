@@ -1,6 +1,6 @@
 //! C ABI for libtile57.a — a thin shim over the Zig engine API (chart.zig).
 //!
-//! Contract: POD across the seam. Every fallible export returns a tile57_status
+//! Contract: POD across the seam. Every export that can fail returns a tile57_status
 //! (0 = OK), takes an optional caller-owned tile57_error* it fills on failure,
 //! and defines its out-parameters on every return (result on OK, NULL/0
 //! otherwise). Zig errors, slices and optionals stay inside chart.zig. Public

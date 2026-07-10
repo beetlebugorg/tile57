@@ -1,4 +1,4 @@
-//! The engine's error taxonomy. Every fallible engine entry point returns one of
+//! The engine's error taxonomy. Every engine entry point that can fail returns one of
 //! these; the C ABI maps each to a tile57_status (see capi.zig) and carries
 //! describe() as the per-call tile57_error.message. Keep this set, the C
 //! tile57_status enum, and capi's statusOf in sync.

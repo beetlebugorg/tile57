@@ -31,7 +31,7 @@ sprite / pattern / glyph atlases it references.
 
 ## Errors
 
-Every fallible call returns a `tile57_status` — `TILE57_OK` (0) or a coarse
+Every call that can fail returns a `tile57_status` — `TILE57_OK` (0) or a coarse
 cause — and takes an optional caller-owned `tile57_error*` it fills with the
 status plus a specific message on failure (a stack local is fine; nothing to
 free). Results come back through out-parameters, which are always defined on
