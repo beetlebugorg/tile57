@@ -506,6 +506,7 @@ pub const TileSurface = struct {
             .s57 = meta.s57_json,
             .cell = meta.cell_name,
             .band = meta.band,
+            .masked = meta.masked,
             .date_start = meta.date_start,
             .date_end = meta.date_end,
             .bnd = meta.bnd,
@@ -770,6 +771,7 @@ const Meta = struct {
     // (unknown cell name, or pick attributes disabled). From s57.Cell.name.
     cell: []const u8 = "",
     band: u8 = 0, // NOAA band rank (0 finest … 5 coarsest)
+    masked: bool = false, // S-52 §8.6.2 suppressed boundary piece (meta-bounds view only)
     date_start: []const u8 = "",
     date_end: []const u8 = "",
     // S-52 boundary symbolization (§8.6.1) and point-symbol style (§11.2.2) tags
@@ -1001,6 +1003,9 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     // unvarying feature's tile footprint unchanged.
     if (m.bnd != 2) try props.append(a, .{ .key = "bnd", .value = .{ .int = m.bnd } });
     if (m.pts != 2) try props.append(a, .{ .key = "pts", .value = .{ .int = m.pts } });
+    // §8.6.2-suppressed boundary piece — present only on the meta-bounds extras,
+    // so every normally-drawn feature's tile footprint is unchanged.
+    if (m.masked) try props.append(a, .{ .key = "masked", .value = .{ .int = 1 } });
     // Date-dependent display (S-52 §10.4.1.1): recurring iff a "--" month-day prefix,
     // stripped so the client compares MMDD (recurring) / YYYYMMDD (fixed).
     if (m.date_start.len > 0 or m.date_end.len > 0) {
@@ -1709,11 +1714,11 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     // producer flags the M_NSYS edges that coincide with the cell limit (MASK/USAG),
     // so the system boundary strokes only where a REAL division runs — not along
     // every cell junction of a uniform IALA region. The fill is unaffected.
-    const geo_parts = if (cell.needsDrawableBoundary(f))
+    const masked_boundary = cell.needsDrawableBoundary(f);
+    const geo_parts = if (masked_boundary)
         cell.drawableLineParts(a, f) catch return
     else
         featureParts(a, cell, geo, fi, f) catch return;
-    if (geo_parts.len == 0) return;
 
     const fmeta = rs.FeatureMeta{
         .draw_prio = 12,
@@ -1728,6 +1733,11 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     // IALA A/B system boundary (MARSYS51). Both stroke in CHGRD.
     const boundary: []const u8 = if (f.attr(s57.ATTR_ORIENT) != null) "NAVARE51" else "MARSYS51";
 
+    // The masked complement (cell-limit stretches) rides along tagged, for the
+    // meta-bounds view; the standard display filters the class out anyway.
+    if (masked_boundary) try emitMaskedBoundary(a, cell, f, fmeta, z, x, y, tb, box, opts, surf);
+    if (geo_parts.len == 0) return;
+
     // Best-available: cut the covered stretches before tessellating/stroking.
     const nav_parts = if (opts.cover_clip) |cc| clipGeoPartsOutsideCover(a, geo_parts, cc, z, x, y) else geo_parts;
 
@@ -1739,6 +1749,33 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     // No registered linestyle (live/host path, no table): a plain dashed CHGRD ring.
     try surf.beginFeature(&fmeta);
     for (nav_parts) |gp| {
+        if (gp.len < 2) continue;
+        if (!overlaps(geomBounds(gp), tb)) continue;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+        const sub = try tile.clipSimplifyLine(a, proj, box);
+        if (sub.len == 0) continue;
+        const parts = try a.alloc([]const mvt.Point, sub.len);
+        for (sub, 0..) |s, i| parts[i] = s;
+        try surf.strokeLine("CHGRD", 1, .dashed, parts, null);
+    }
+    try surf.endFeature();
+}
+
+/// The §8.6.2-masked complement of a boundary, baked as a `masked`-tagged plain
+/// dashed line so the meta-bounds inspection view can OUTLINE the meta object —
+/// a whole-cell M_NSYS has its entire boundary flagged as the cell limit, and
+/// masking alone leaves the toggle nothing to show. The standard display never
+/// renders it (the meta classes are filtered out unless meta-bounds is on), and
+/// the tag keeps the masked pieces letter-free in the styled view too.
+fn emitMaskedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, base: rs.FeatureMeta, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+    const masked_parts = cell.maskedLineParts(a, f) catch return;
+    if (masked_parts.len == 0) return;
+    var fmeta = base;
+    fmeta.masked = true;
+    const parts_cov = if (opts.cover_clip) |cc| clipGeoPartsOutsideCover(a, masked_parts, cc, z, x, y) else masked_parts;
+    try surf.beginFeature(&fmeta);
+    for (parts_cov) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);

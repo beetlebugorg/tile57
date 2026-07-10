@@ -104,6 +104,13 @@ fn collectItems(a: Allocator, block: []const u8, map: *std.StringHashMapUnmanage
 /// is on (then regardless of category), hidden otherwise.
 pub fn categoryVisible(cat: ?i64, class: []const u8, symbol_name: ?[]const u8, m: *const Settings) bool {
     if (std.mem.eql(u8, class, "M_QUAL")) return m.data_quality;
+    // Meta-object boundaries (mirrors mariner.commonChartFilters): hidden unless
+    // the meta-bounds inspection view is on; when on, category still applies.
+    if (!m.show_meta_bounds) {
+        for ([_][]const u8{ "M_NPUB", "M_NSYS", "M_COVR", "M_CSCL" }) |mc| {
+            if (std.mem.eql(u8, class, mc)) return false;
+        }
+    }
     var c = cat orelse 1;
     if (symbol_name) |sn| {
         if (std.mem.eql(u8, sn, "ISODGR01")) c = if (m.show_isolated_dangers_shallow) 1 else 0;
