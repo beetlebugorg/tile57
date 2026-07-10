@@ -435,6 +435,12 @@ fn lineLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     try lineLayer(js, s, sl, "dotted", FILT_DOTTED, .{ 1, 2 }, bkt);
 }
 
+// Linestyle-embedded symbols draw at the engine's SYMBOL_SCALE (0.028346…, see
+// scene/linestyle.zig drawComplexLine), not the 0.08 point-symbol default the
+// sprite atlas is sized for — icon-size is their ratio so the style-driven
+// symbols match the tessellated ones exactly.
+const LS_ICON_SIZE: f64 = 0.02834627777338028 / 0.08;
+
 // One decorated layer set for one analysed complex linestyle: a line layer whose
 // line-dasharray is the pattern's on/off runs in line-width units, and (sprite
 // permitting) a line-placed symbol layer per embedded symbol, spaced one period
@@ -497,7 +503,7 @@ fn linestyleLayers(js: *Stringify, s: *const SCtx, ls: std.json.Value, bkt: Buck
             try js.objectField("icon-image");
             try js.write(name_v.string);
             try js.objectField("icon-size");
-            try writeScaled(js, ICON_SIZE, s.size_scale);
+            try writeScaled(js, LS_ICON_SIZE, s.size_scale);
             try js.objectField("icon-rotation-alignment");
             try js.write("map");
             try js.objectField("icon-allow-overlap");
