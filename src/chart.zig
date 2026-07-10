@@ -3,8 +3,8 @@
 //! cells) and it serves decompressed Mapbox Vector Tiles by (z, x, y). Multi-cell
 //! ENC_ROOT sources index cells cheaply and parse + portray them lazily per
 //! requested tile (LRU-bounded), so a host can open the whole NOAA catalogue
-//! instantly and pay only for the cells under the current view. `bakeArchive`
-//! bakes an ENC_ROOT into one band-streamed PMTiles archive.
+//! instantly and pay only for the cells under the current view. Baking is
+//! strictly per-cell: each cell to its own PMTiles archive.
 //!
 //! This is the single source of truth; the C ABI (capi.zig / include/tile57.h)
 //! is a thin shim over these types. The engine uses a single thread-safe
@@ -13,8 +13,8 @@
 //!
 //! Threading: a Chart is NOT internally synchronized — don't call its render /
 //! query methods on the same Chart from multiple threads concurrently. Distinct
-//! charts are independent. `openCells`/`bakeArchive` parallelize internally over
-//! cores.
+//! charts are independent. `openCells`/`bakeCellsParallel` parallelize
+//! internally over cores.
 
 const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;

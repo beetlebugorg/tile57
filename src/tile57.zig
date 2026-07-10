@@ -48,14 +48,12 @@ pub const warmup = chart.warmup;
 
 // ---- Bake: cells -> per-cell PMTiles archives ------------------------------
 /// Bake each cell to its own PMTiles at its compilation scale — the input the
-/// compositor serves from. `archive` is the alternative offline path that merges
-/// a slice of cells into one band-streamed archive.
+/// compositor serves from. Strictly one cell, one archive.
 pub const bake = struct {
     pub const cellBytes = chart.bakeCellBytes; // one cell + updates -> PMTiles bytes
     pub const cellsParallel = chart.bakeCellsParallel; // N cells -> N archives, threaded
     pub const cellsToFiles = chart.bakeCellsToFiles; // N cells -> files under a dir
     pub const tree = chart.bakeTree; // walk an ENC_ROOT, bake each cell to a mirrored path
-    pub const archive = chart.bakeArchive; // offline: merge a slice of cells into one archive
     pub const pmtilesMetadata = chart.pmtilesMetadata; // read an archive's TileJSON metadata
     pub const Progress = chart.BakeProgress;
 };
@@ -108,7 +106,7 @@ pub const pmtiles = @import("tiles").pmtiles; // PMTiles read/write
 pub const gzip = @import("tiles").gzip; // gzip (tile payloads, PMTiles internals)
 pub const band = @import("tiles").band; // compilation-scale -> zoom-range mapping
 pub const scene = @import("scene"); // S-57 + portrayal -> tile surface
-pub const bake_enc = @import("scene").bake_enc; // the banded multi-cell baker
+pub const bake_enc = @import("scene").bake_enc; // the banded cell baker
 
 // ---- Render surfaces -------------------------------------------------------
 /// The Surface/Canvas rendering path: PNG raster, vector PDF, ASCII, and the

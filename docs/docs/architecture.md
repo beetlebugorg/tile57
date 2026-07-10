@@ -139,8 +139,7 @@ The public surface composes the packages into high-level entry points:
   through an ownership partition and offers the SAME outputs as a chart, composed:
   `tile57_compose_tile` for any `(z, x, y)` on demand, `tile57_compose_png` /
   `_pdf` / `_canvas` / `_surface` / `_query` for composed views and the composed
-  pick. The public Zig `bakeArchive` runs the same engine over a slice of cells to
-  make one merged archive.
+  pick. Baking is strictly per-cell: one cell, one archive.
 - **`style.build`** (`style/maplibre.zig`) + **`style`** / **`sprite`** —
   generate the MapLibre style and the portrayal assets it references
   (`tile57_style_build` / `tile57_bake_assets` in the C ABI).
@@ -164,8 +163,7 @@ tile57 is built to hold only its working set:
   right choice for a large ENC_ROOT.
 - **Per-cell bakes.** Each cell bakes independently at its own compilation scale,
   so a bake holds a single cell's parsed data at a time — memory doesn't grow with
-  the size of the catalogue. (The multi-cell `bakeArchive` streams band-by-band,
-  finest → coarsest, so its peak memory tracks the largest single band.)
+  the size of the catalogue.
 - **Tile cache.** Generated/decoded tiles are memoized per chart (keyed
   `z<<48 | x<<24 | y`) and released with the chart, so a long-running host bounds
   memory by closing charts it no longer renders.

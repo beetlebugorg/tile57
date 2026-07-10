@@ -36,7 +36,6 @@ const n = try tile57.bake.tree(io, "/enc/ENC_ROOT", "/out", null, 4, null, null)
 | `tile57.bake.cellBytes(path, rules)` | bake one cell (+ updates) to PMTiles bytes. |
 | `tile57.bake.cellsParallel(...)` / `bake.cellsToFiles(...)` | bake many cells in parallel, to memory / to files. |
 | `tile57.bake.tree(io, in, out, ...)` | walk an ENC_ROOT, bake each cell to a mirrored path (incremental). |
-| `tile57.bake.archive(...)` | the offline path: merge a slice of cells into one archive. |
 | `tile57.bake.pmtilesMetadata(a, bytes)` | read an archive's metadata JSON (embedded coverage + scamin). |
 | `tile57.bake.Progress` | the optional progress-callback type. |
 
@@ -114,7 +113,7 @@ defer src.deinit();
 const result = try src.tile(gpa, 13, 2359, 3139); // result.tile: ?[]u8, result.owned: bool
 
 // The composed view outputs live beside the Chart ones:
-const png = try tile57.renderComposeView(src, lon, lat, 13.5, 1600, 1200, .day, &settings, .png, null);
+const png = try tile57.compose.renderView(src, lon, lat, 13.5, 1600, 1200, .day, &settings, .png, null);
 ```
 
 A host that already holds open charts composes over them instead — the
@@ -133,9 +132,9 @@ var src = (try tile57.compose.openComposeSourceCharts(gpa, &archives, null)).?;
 | `tile57.compose.openComposeSourceFiles(...)` | open a `ComposeSource` over on-disk archives + a partition. |
 | `tile57.compose.openComposeSourceCharts(...)` | the same over borrowed `ChartArchive`s (already-open charts). |
 | `ComposeSource.tile(gpa, z, x, y)` | compose one tile on demand (raw MLT + the ownership flag). |
-| `tile57.renderComposeView(src, ...)` | the composed view render — PNG, PDF, or a callback canvas. |
-| `tile57.renderComposeSurfaceView(src, ...)` | the composed world-space surface stream. |
-| `tile57.composeQueryPoint(src, lon, lat, zoom, cb)` | the composed cursor pick (seams included). |
+| `tile57.compose.renderView(src, ...)` | the composed view render — PNG, PDF, or a callback canvas. |
+| `tile57.compose.renderSurfaceView(src, ...)` | the composed world-space surface stream. |
+| `tile57.compose.queryPoint(src, lon, lat, zoom, cb)` | the composed cursor pick (seams included). |
 | `tile57.compose.composeTile(...)` | the stateless core `ComposeSource.tile` uses. |
 | `tile57.partition` | the ownership partition and its `.tpart` sidecar (serialize / deserialize). |
 
