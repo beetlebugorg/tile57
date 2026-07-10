@@ -54,8 +54,9 @@
  *   call those charts' own methods from other threads. Distinct handles are
  *   independent.
  *
- * Memory: calls that return bytes allocate *out; release it with tile57_free,
- *   passing the same length. All pointers are POD across the seam.
+ * Memory: calls that return bytes allocate *out; release it with
+ *   tile57_free(ptr) — buffers are length-prefixed at allocation, so the
+ *   pointer is all it needs. All pointers are POD across the seam.
  *
  * The S-101 portrayal self-test / bring-up entry points live in a separate
  * header, tile57_diag.h (developer tooling, not part of the embedding API).
@@ -317,7 +318,7 @@ void tile57_get_info(tile57 *chart, tile57_info *out);
  * native fractional-minzoom bucket layer per value (features honour their 1:N
  * min-display-scale at zero per-zoom cost). TILE57_OK with *out pointing at
  * *out_len int32 values, or NULL/0 when the chart has none. Free *out with
- * tile57_free((uint8_t*)*out, *out_len * sizeof(int32_t)). */
+ * tile57_free. */
 tile57_status tile57_scamin(tile57 *chart, int32_t **out, size_t *out_len,
                             tile57_error *err);
 
@@ -758,8 +759,9 @@ tile57_status tile57_style_template(tile57_scheme scheme, const char *source_til
 void tile57_warmup(void);
 
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
- * colortables, atlases, …), passing the same length. The universal free. */
-void tile57_free(void *ptr, size_t len);
+ * colortables, …). Buffers are length-prefixed at allocation, so the pointer is
+ * all it needs — the universal free. */
+void tile57_free(void *ptr);
 
 #ifdef __cplusplus
 }

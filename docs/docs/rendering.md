@@ -135,7 +135,7 @@ m.scheme = TILE57_SCHEME_NIGHT;
 uint8_t *png; size_t len;
 tile57_png(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &png, &len, NULL);
 /* ... write/display png ... */
-tile57_free(png, len);
+tile57_free(png);
 
 uint8_t *pdf; size_t plen;
 tile57_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen, NULL);

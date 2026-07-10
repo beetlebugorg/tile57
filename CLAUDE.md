@@ -41,8 +41,9 @@ flags come back through optional out-pointers (NULL to ignore), not return
 values. Say "call that can fail" in docs, not "fallible".
 
 **Memory has one rule.** Calls that return bytes allocate `*out`; the caller
-releases with `tile57_free(ptr, len)` — the same length. POD across the seam:
-no Zig errors, slices, or optionals cross the ABI.
+releases with `tile57_free(ptr)` — buffers are length-prefixed at allocation,
+so the pointer is all it needs. POD across the seam: no Zig errors, slices, or
+optionals cross the ABI.
 
 **Ownership and borrowing are explicit.** The compositor BORROWS its charts
 (charts outlive it; close the compositor first). A path-opened chart mmaps its

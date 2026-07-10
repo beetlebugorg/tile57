@@ -78,7 +78,7 @@ No handle is internally synchronized — use one thread per handle. Each must
 also outlive every borrower still holding it: a compositor borrows its charts
 (close the compositor first, then the charts), and a path-opened chart mmaps
 its file, so the file must stay in place while the chart is open. Calls that
-return bytes allocate `*out`; free it with `tile57_free` (same length). Input
+return bytes allocate `*out`; free it with `tile57_free(ptr)`. Input
 bytes are copied, so the caller may free them right after the call.
 :::
 
@@ -574,8 +574,8 @@ tile57_status tile57_style_template(tile57_scheme scheme, const char *source_til
 void tile57_warmup(void);
 
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
- * colortables, …), passing the same length. The universal free. */
-void tile57_free(void *ptr, size_t len);
+ * colortables, …) — length-prefixed, so the pointer is all it needs. */
+void tile57_free(void *ptr);
 ```
 
 ## Diagnostics header

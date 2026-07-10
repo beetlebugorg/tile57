@@ -230,7 +230,7 @@ func (s *Source) scaminLocked() []uint32 {
 		for i, v := range vals {
 			res[i] = uint32(v)
 		}
-		C.tile57_free(unsafe.Pointer(out), n*C.size_t(unsafe.Sizeof(C.int32_t(0))))
+		C.tile57_free(unsafe.Pointer(out))
 		s.scamin = res
 	}
 	return s.scamin
@@ -259,7 +259,7 @@ func tileBytes(p *C.uint8_t, n C.size_t) []byte {
 	if n > 0 {
 		b = C.GoBytes(unsafe.Pointer(p), C.int(n))
 	}
-	C.tile57_free(unsafe.Pointer(p), n)
+	C.tile57_free(unsafe.Pointer(p))
 	return b
 }
 

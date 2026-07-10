@@ -96,7 +96,7 @@ tile57_compose_open(&chart, 1, "out/partition.tpart", &src, &err);
 
 uint8_t *tile; size_t n; bool owned;
 if (tile57_compose_tile(src, z, x, y, &tile, &n, &owned, &err) == TILE57_OK) {
-    if (tile)       { /* … serve the decompressed MLT tile … */ tile57_free(tile, n); }
+    if (tile)       { /* … serve the decompressed MLT tile … */ tile57_free(tile); }
     else if (owned) { /* owned but empty — a cell's bake is still in flight */ }
     else            { /* not owned — open ocean; cache as blank */ }
 }

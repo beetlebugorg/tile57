@@ -127,9 +127,30 @@ fn bytesOut(out: ?*?[*]u8, out_len: ?*usize) error{BadArg}!struct { *?[*]u8, *us
     return .{ o, n };
 }
 
-fn setBytes(o: *?[*]u8, n: *usize, bytes: []u8) void {
-    o.* = bytes.ptr;
+// ---- export allocations ------------------------------------------------------
+// Every buffer handed across the ABI is length-prefixed: a 16-byte header (the
+// total allocation size in its first usize) sits before the returned pointer, so
+// tile57_free needs only the pointer — the classic malloc shape — and the payload
+// stays 16-aligned.
+const EXPORT_HDR: usize = 16;
+
+fn exportAlloc(len: usize) ?[*]u8 {
+    const total = EXPORT_HDR + len;
+    const raw = gpa.alignedAlloc(u8, .@"16", total) catch return null;
+    std.mem.writeInt(usize, raw[0..@sizeOf(usize)], total, .little);
+    return raw.ptr + EXPORT_HDR;
+}
+
+// Hand an engine-owned buffer across the ABI through (out, out_len): copy it into
+// an export allocation and free the engine buffer. Returns OK, or NOMEM with the
+// outs left NULL/0.
+fn exportOut(err: ?*CError, o: *?[*]u8, n: *usize, bytes: []u8) c_int {
+    defer chart.freeBytes(bytes);
+    const p = exportAlloc(bytes.len) orelse return failWith(err, .nomem, "out of memory");
+    @memcpy(p[0..bytes.len], bytes);
+    o.* = p;
     n.* = bytes.len;
+    return OK;
 }
 
 const bad_out = "out/out_len must not be null";
@@ -167,8 +188,7 @@ export fn tile57_enc_cells(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize
     const c = Chart.openPath(p, null, false) catch |e| return failCtx(err, e, p);
     defer c.deinit();
     const bytes = (c.cellsJson() catch |e| return fail(err, e)) orelse return OK;
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 /// The features of the S-57 data at `path` (one cell or a whole ENC_ROOT) for the
@@ -182,8 +202,7 @@ export fn tile57_enc_features(path: ?[*:0]const u8, classes: ?[*:0]const u8, out
     const c = Chart.openPath(p, null, false) catch |e| return failCtx(err, e, p);
     defer c.deinit();
     const bytes = (c.featuresJson(cls) catch |e| return fail(err, e)) orelse return OK;
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 /// tile57_enc_features over in-memory base-cell bytes (no update chain). See tile57.h.
@@ -196,8 +215,7 @@ export fn tile57_enc_features_bytes(base: ?[*]const u8, len: usize, classes: ?[*
     const c = Chart.openCells(&cells, null, false) catch |e| return fail(err, e);
     defer c.deinit();
     const bytes = (c.featuresJson(cls) catch |e| return fail(err, e)) orelse return OK;
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 /// Decode a CATALOG.031 exchange-set catalogue into a JSON array of its CATD
@@ -215,8 +233,7 @@ export fn tile57_enc_catalog(catalog_031: ?[*]const u8, len: usize, out: ?*?[*]u
     var buf = std.ArrayList(u8).empty;
     catalogJson(a, &buf, entries) catch |e| return fail(err, e);
     const bytes = gpa.dupe(u8, buf.items) catch |e| return fail(err, e);
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 fn catalogJson(a: std.mem.Allocator, buf: *std.ArrayList(u8), entries: []const s57.CatalogEntry) !void {
@@ -254,7 +271,7 @@ export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
     const archive = chart.bakeCellBytes(p, null) catch |e| return failCtx(err, e, p);
-    if (archive) |a| setBytes(o, n, a);
+    if (archive) |a| return exportOut(err, o, n, a);
     return OK;
 }
 
@@ -287,12 +304,27 @@ export fn tile57_bake_cells(
     defer gpa.free(results);
     chart.bakeCellsParallel(list, null, workers, results);
     var baked: usize = 0;
+    var oom = false;
     for (0..n) |i| {
-        if (results[i]) |b| {
-            ob[i] = b.ptr;
-            ol[i] = b.len;
-            baked += 1;
+        const b = results[i] orelse continue;
+        defer chart.freeBytes(b);
+        if (oom) continue;
+        const p = exportAlloc(b.len) orelse {
+            oom = true;
+            continue;
+        };
+        @memcpy(p[0..b.len], b);
+        ob[i] = p;
+        ol[i] = b.len;
+        baked += 1;
+    }
+    if (oom) {
+        for (0..n) |i| {
+            if (ob[i]) |p| tile57_free(p);
+            ob[i] = null;
+            ol[i] = 0;
         }
+        return failWith(err, .nomem, "out of memory");
     }
     if (out_baked) |p| p.* = baked;
     return OK;
@@ -331,7 +363,7 @@ export fn tile57_pmtiles_metadata(pmtiles_ptr: ?[*]const u8, len: usize, out: ?*
     const p = pmtiles_ptr orelse return failWith(err, .badarg, "pmtiles must not be null");
     if (len == 0) return failWith(err, .badarg, "len must not be zero");
     const meta = chart.pmtilesMetadata(gpa, p[0..len]) catch |e| return fail(err, e);
-    if (meta) |m| setBytes(o, n, m);
+    if (meta) |m| return exportOut(err, o, n, m);
     return OK;
 }
 
@@ -444,7 +476,7 @@ export fn tile57_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
 
 /// The distinct SCAMIN denominators present in the chart (ascending, from the
 /// archive metadata); NULL/0 out when there are none. Free *out with
-/// tile57_free((uint8_t*)*out, *out_len * sizeof(int32_t)). See tile57.h.
+/// tile57_free. See tile57.h.
 export fn tile57_scamin(handle: ?*Chart, out: ?*?[*]i32, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o = out orelse return failWith(err, .badarg, bad_out);
     const n = out_len orelse return failWith(err, .badarg, bad_out);
@@ -452,11 +484,12 @@ export fn tile57_scamin(handle: ?*Chart, out: ?*?[*]i32, out_len: ?*usize, err: 
     n.* = 0;
     const s = handle orelse return failWith(err, .badarg, "chart must not be null");
     const vals = s.scamin() catch |e| return fail(err, e);
-    if (vals.len == 0) {
-        chart.freeBytes(@as([*]u8, @ptrCast(vals.ptr))[0 .. vals.len * @sizeOf(u32)]);
-        return OK;
-    }
-    o.* = @ptrCast(vals.ptr); // SCAMIN denominators fit in int32 (engine caps them)
+    defer chart.freeBytes(std.mem.sliceAsBytes(vals));
+    if (vals.len == 0) return OK;
+    // SCAMIN denominators fit in int32 (the engine caps them).
+    const p = exportAlloc(vals.len * @sizeOf(i32)) orelse return failWith(err, .nomem, "out of memory");
+    @memcpy(p[0 .. vals.len * @sizeOf(u32)], std.mem.sliceAsBytes(vals));
+    o.* = @ptrCast(@alignCast(p));
     n.* = vals.len;
     return OK;
 }
@@ -500,8 +533,7 @@ export fn tile57_tile(handle: ?*Chart, z: u8, x: u32, y: u32, out: ?*?[*]u8, out
     const c = handle orelse return failWith(err, .badarg, "chart must not be null");
     const rd = c.pmtilesReader() orelse return failWith(err, .badarg, "chart is not archive-backed");
     const bytes = (rd.getTile(gpa, z, x, y) catch |e| return fail(err, e)) orelse return OK;
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 const CQueryCb = @import("render").query.QueryCb;
@@ -553,8 +585,7 @@ export fn tile57_png(
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const bytes = c.renderView(lon, lat, zoom, width, height, paletteOf(&settings), &settings, .png, null) catch |e| return fail(err, e);
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 /// tile57_png's vector twin: the SAME scene as a deterministic single-page PDF
@@ -577,8 +608,7 @@ export fn tile57_pdf(
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const bytes = c.renderView(lon, lat, zoom, width, height, paletteOf(&settings), &settings, .pdf, null) catch |e| return fail(err, e);
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 const CbCanvas = @import("render").cb_canvas.CCanvas;
@@ -732,7 +762,7 @@ export fn tile57_compose_tile(
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
     const res = src.tile(gpa, z, x, y) catch |e| return fail(err, e);
     if (out_owned) |p| p.* = res.owned;
-    if (res.tile) |t| setBytes(o, n, t);
+    if (res.tile) |t| return exportOut(err, o, n, t);
     return OK;
 }
 
@@ -758,8 +788,7 @@ export fn tile57_compose_png(
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .png, null) catch |e| return fail(err, e);
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 /// tile57_compose_png's vector twin: the SAME composed scene as a deterministic
@@ -782,8 +811,7 @@ export fn tile57_compose_pdf(
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const bytes = chart.renderComposeView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, .pdf, null) catch |e| return fail(err, e);
-    setBytes(o, n, bytes);
-    return OK;
+    return exportOut(err, o, n, bytes);
 }
 
 /// tile57_compose_png's callback twin: the SAME composed view painted through the
@@ -893,8 +921,7 @@ export fn tile57_colortables_default(out: ?*?[*]u8, out_len: ?*usize, err: ?*CEr
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const xml = embeddedColorProfileXml() orelse return failWith(err, .internal, "embedded colour profile missing");
     const json = style.colorTablesJson(gpa, xml) catch |e| return fail(err, e);
-    setBytes(o, n, json);
-    return OK;
+    return exportOut(err, o, n, json);
 }
 
 // All portrayal assets in memory. Mirrors tile57_assets in tile57.h; each non-null
@@ -1177,8 +1204,7 @@ export fn tile57_style_build(
     defer if (scamin_buf.len > 0) gpa.free(scamin_buf);
     const now_unix: i64 = @intCast(time(null));
     const style_json = style.buildFromTemplateScamin(gpa, tmpl, &m, cts, bands, now_unix, scamin_buf, scamin_lat) catch |e| return fail(err, e);
-    setBytes(o, n, style_json);
-    return OK;
+    return exportOut(err, o, n, style_json);
 }
 
 /// Compute the minimal MapLibre style-mutation ops turning the style for `old_m`
@@ -1222,8 +1248,7 @@ export fn tile57_style_diff(
     defer gpa.free(new_style);
 
     const ops = style.diff(gpa, old_style, new_style) catch |e| return fail(err, e);
-    setBytes(o, n, ops);
-    return OK;
+    return exportOut(err, o, n, ops);
 }
 
 /// Generate the base MapLibre style template from the catalogue baked into the
@@ -1262,8 +1287,7 @@ export fn tile57_style_template(
     if (maxzoom != 0) opts.maxzoom = maxzoom;
     if (tile_encoding == TILE_TYPE_MLT) opts.encoding = "mlt";
     const style_json = style.json(gpa, opts) catch |e| return fail(err, e);
-    setBytes(o, n, style_json);
-    return OK;
+    return exportOut(err, o, n, style_json);
 }
 
 /// Fill `cm` with the canonical default mariner settings. date_view = "".
@@ -1314,9 +1338,12 @@ export fn tile57_warmup() callconv(.c) void {
     chart.warmup();
 }
 
-/// Free any engine-returned buffer (tiles, style, scamin array, colortables, …),
-/// passing the same length. The universal free. See tile57.h.
-export fn tile57_free(ptr: ?*anyopaque, len: usize) callconv(.c) void {
+/// Free any engine-returned buffer (tiles, style, the scamin array, colortables,
+/// …). Buffers are length-prefixed at allocation, so the pointer is all it
+/// needs — the universal free. See tile57.h.
+export fn tile57_free(ptr: ?*anyopaque) callconv(.c) void {
     const p = ptr orelse return;
-    chart.freeBytes(@as([*]u8, @ptrCast(p))[0..len]);
+    const base: [*]align(16) u8 = @alignCast(@as([*]u8, @ptrCast(p)) - EXPORT_HDR);
+    const total = std.mem.readInt(usize, base[0..@sizeOf(usize)], .little);
+    gpa.free(base[0..total]);
 }
