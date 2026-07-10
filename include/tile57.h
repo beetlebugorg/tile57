@@ -76,11 +76,12 @@ const char *tile57_version(void);
 typedef struct tile57_chart tile57_chart;
 
 /* Open ONE S-57 cell (a .000 file, with its .001.. update chain auto-read from the
- * same directory) by BAKING it to an in-memory PMTiles and serving the fast reader
- * render path (tile57_chart_render_surface_cb), with the cell's real M_COVR coverage
- * (tile57_chart_coverage) and compilation scale (chart_info.native_scale) attached.
- * The bake costs ~1-2s; a host rendering per view should run it off-thread. See the
- * header/zoom variants for a cheap scan pass + progressive load. NULL/fail -> NULL. */
+ * same directory) OR a whole ENC_ROOT directory, via the STREAMING path: each cell's
+ * metadata (name, compilation scale, M_COVR coverage) is enumerated up front and
+ * tiles are baked lazily, per requested tile — there is no upfront full-cell bake.
+ * This backend exposes the per-cell list (tile57_chart_cells) and the render/query
+ * surface. See the header/zoom variants for a metadata-only scan or a progressive
+ * narrow-band open. NULL/fail -> NULL. */
 tile57_chart *tile57_chart_open(const char *path);
 
 /* Open ONE cell for METADATA ONLY — bbox, native_scale, and M_COVR coverage — via a

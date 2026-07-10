@@ -908,7 +908,10 @@ fn scaminBuf(scamin: ?[*]const i32, scamin_count: usize) ![]u32 {
     const p = scamin orelse return &.{};
     if (scamin_count == 0) return &.{};
     const buf = try gpa.alloc(u32, scamin_count);
-    for (p[0..scamin_count], 0..) |v, i| buf[i] = @intCast(v);
+    // SCAMIN is a 1:N denominator (> 0); a negative is garbage from the host. Clamp
+    // to 0 ("no scale gate") rather than let a safety-checked @intCast abort the
+    // whole process across the ABI.
+    for (p[0..scamin_count], 0..) |v, i| buf[i] = if (v < 0) 0 else @intCast(v);
     return buf;
 }
 

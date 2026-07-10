@@ -43,9 +43,10 @@ const char *tile57_version(void);   /* "0.1.0" */
 typedef struct tile57_chart tile57_chart;
 
 /* Open an on-disk ENC_ROOT directory (or a single .000 file, with its .001..
- * update chain). The cell is baked to an in-memory PMTiles and served through the
- * reader render path, with real M_COVR coverage + compilation scale attached.
- * Rules are the library's embedded catalogue. NULL on failure. */
+ * update chain) via the streaming path: each cell's metadata (name, compilation
+ * scale, M_COVR coverage) is read up front and tiles are baked lazily per request,
+ * with no upfront full-cell bake. Rules are the library's embedded catalogue.
+ * NULL on failure. */
 tile57_chart *tile57_chart_open(const char *path);
 
 /* Open a cell for METADATA ONLY — bbox, native_scale, M_COVR coverage — via a
