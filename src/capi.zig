@@ -11,6 +11,7 @@ const bundle = @import("bundle"); // portrayal-asset emitters + the partition de
 const compose = @import("compose"); // the runtime tile compositor (tile57_compose_*)
 const mariner = @import("style").mariner;
 const style = @import("style");
+const errors = @import("errors"); // the engine error taxonomy + describe()
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
@@ -33,6 +34,100 @@ fn spanOpt(s: ?[*:0]const u8) ?[]const u8 {
     return if (s) |p| std.mem.span(p) else null;
 }
 
+// ---- error model (mirrors tile57_status / tile57_error in tile57.h) ---------
+
+// Keep in sync with the tile57_status enum in tile57.h.
+const Status = enum(c_int) { ok = 0, badarg, io, parse, nomem, unsupported, render };
+
+// Mirrors tile57_error in tile57.h: a caller-owned status + fixed message buffer.
+const ERROR_MSG_MAX = 256;
+const CError = extern struct { status: c_int, message: [ERROR_MSG_MAX]u8 };
+
+const OK: c_int = @intFromEnum(Status.ok);
+
+// Map an engine error (errors.Error) to a tile57_status. std IO errors that can
+// surface directly from file ops map to .io; anything unrecognised is .io.
+fn statusOf(e: anyerror) Status {
+    return switch (e) {
+        error.OutOfMemory => .nomem,
+        error.Unsupported => .unsupported,
+        error.RenderFailed => .render,
+        error.InvalidCell, error.InvalidArchive, error.InvalidPartition => .parse,
+        // Specific S-57 / ISO 8211 parse failures, propagated so the message
+        // carries the exact reason (e.g. "BadLeader", "UnknownRUIN").
+        error.ShortLeader,
+        error.BadLeader,
+        error.BadAsciiInt,
+        error.BadAsciiDigit,
+        error.MissingFieldTerminator,
+        error.FieldOutOfBounds,
+        error.ModifyMissingSpatial,
+        error.ModifyMissingFeature,
+        error.UnknownRUIN,
+        error.BadFeatureRecord,
+        => .parse,
+        error.NotFound, error.IoFailed => .io,
+        error.FileNotFound, error.AccessDenied, error.NotDir, error.IsDir => .io,
+        else => .io,
+    };
+}
+
+// Fill an optional caller-provided tile57_error (NULL to ignore) with a status +
+// message; the message is copied, truncated to fit, and NUL-terminated.
+fn setError(err: ?*CError, status: Status, msg: []const u8) void {
+    const dst = err orelse return;
+    dst.status = @intFromEnum(status);
+    const n = @min(msg.len, ERROR_MSG_MAX - 1);
+    @memcpy(dst.message[0..n], msg[0..n]);
+    dst.message[n] = 0;
+}
+
+// Report a Zig error: set `err` (if any) with the mapped status + describe()
+// message, and return the status code.
+fn fail(err: ?*CError, e: anyerror) c_int {
+    const s = statusOf(e);
+    setError(err, s, errors.describe(e));
+    return @intFromEnum(s);
+}
+
+// Like fail, but prefix the message with a context string (e.g. the file path):
+// "US5MD1MC.000: malformed ISO 8211 leader". Truncated to fit.
+fn failCtx(err: ?*CError, e: anyerror, context: []const u8) c_int {
+    const s = statusOf(e);
+    if (err) |dst| {
+        dst.status = @intFromEnum(s);
+        const msg = std.fmt.bufPrint(dst.message[0 .. ERROR_MSG_MAX - 1], "{s}: {s}", .{ context, errors.describe(e) }) catch blk: {
+            // Context + reason overflowed the buffer; keep the reason alone.
+            const r = errors.describe(e);
+            const n = @min(r.len, ERROR_MSG_MAX - 1);
+            @memcpy(dst.message[0..n], r[0..n]);
+            break :blk dst.message[0..n];
+        };
+        dst.message[msg.len] = 0;
+    }
+    return @intFromEnum(s);
+}
+
+// Report a specific status with a literal message.
+fn failWith(err: ?*CError, status: Status, msg: []const u8) c_int {
+    setError(err, status, msg);
+    return @intFromEnum(status);
+}
+
+/// Return a static, human-readable string for a tile57_status.
+export fn tile57_status_str(status: c_int) callconv(.c) [*:0]const u8 {
+    return switch (status) {
+        @intFromEnum(Status.ok) => "ok",
+        @intFromEnum(Status.badarg) => "invalid argument",
+        @intFromEnum(Status.io) => "I/O error",
+        @intFromEnum(Status.parse) => "malformed input",
+        @intFromEnum(Status.nomem) => "out of memory",
+        @intFromEnum(Status.unsupported) => "unsupported input",
+        @intFromEnum(Status.render) => "render failed",
+        else => "unknown error",
+    };
+}
+
 /// Return the library version string ("0.1.0").
 export fn tile57_version() callconv(.c) [*:0]const u8 {
     return version_string;
@@ -43,25 +138,31 @@ export fn tile57_version() callconv(.c) [*:0]const u8 {
 /// metadata (name/scale/M_COVR) is enumerated up front and tiles are baked lazily per
 /// request. Unlike a bake-to-reader open, this backend exposes the per-cell list
 /// (tile57_chart_cells) — a header/metadata scan needs no tile bake. See tile57.h.
-export fn tile57_chart_open(path: ?[*:0]const u8) callconv(.c) ?*Chart {
-    const p = spanOpt(path) orelse return null;
-    return chart.Chart.openPath(p, null, true) catch null;
+export fn tile57_chart_open(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    o.* = chart.Chart.openPath(p, null, true) catch |e| return failCtx(err, e, p);
+    return OK;
 }
 
 /// Open ONE cell for METADATA ONLY (bbox + native scale + M_COVR coverage): a cheap
 /// parse, no tile bake — for a host's header/scan pass. Do NOT render_surface this
 /// handle (no portrayal). See tile57.h.
-export fn tile57_chart_open_header(path: ?[*:0]const u8) callconv(.c) ?*Chart {
-    const p = spanOpt(path) orelse return null;
-    return chart.openCellHeader(p, null, true) catch null;
+export fn tile57_chart_open_header(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    o.* = chart.openCellHeader(p, null, true) catch |e| return failCtx(err, e, p);
+    return OK;
 }
 
 /// Open ONE cell by baking only [minzoom, maxzoom] to an in-memory PMTiles — a host
 /// bakes a narrow band fast for first paint, then re-opens the full range in the
 /// background (progressive load). Renders via the fast reader path. See tile57.h.
-export fn tile57_chart_open_zoom(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8) callconv(.c) ?*Chart {
-    const p = spanOpt(path) orelse return null;
-    return chart.openCellBaked(p, null, true, minzoom, maxzoom) catch null;
+export fn tile57_chart_open_zoom(path: ?[*:0]const u8, minzoom: u8, maxzoom: u8, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    o.* = chart.openCellBaked(p, null, true, minzoom, maxzoom) catch |e| return failCtx(err, e, p);
+    return OK;
 }
 
 /// Bake ONE cell (+ its updates, read from disk) to PMTiles bytes over its NATIVE band
@@ -164,12 +265,15 @@ export fn tile57_compose_open(
     paths: ?[*]const ?[*:0]const u8,
     n: usize,
     partition_path: ?[*:0]const u8,
-) callconv(.c) ?*compose.ComposeSource {
-    const ps = paths orelse return null;
-    if (n == 0) return null;
-    const list = gpa.alloc([]const u8, n) catch return null;
+    out: ?*?*compose.ComposeSource,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    const ps = paths orelse return failWith(err, .badarg, "paths must not be null");
+    if (n == 0) return failWith(err, .badarg, "n must not be zero");
+    const list = gpa.alloc([]const u8, n) catch |e| return fail(err, e);
     defer gpa.free(list);
-    for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return null;
+    for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return failWith(err, .badarg, "a path in paths is null");
 
     // The lib has no std.process.Init; stand up a threaded std.Io for the open-time file I/O
     // (mmap survives it, and serve/close need no io).
@@ -187,7 +291,9 @@ export fn tile57_compose_open(
         } else |_| {}
     }
 
-    return (compose.openComposeSourceFiles(io, gpa, list, load_bytes) catch return null) orelse return null;
+    o.* = (compose.openComposeSourceFiles(io, gpa, list, load_bytes) catch |e| return fail(err, e)) orelse
+        return failWith(err, .parse, "no coverage-carrying archive in paths");
+    return OK;
 }
 
 /// Compose the tile (z,x,y) on demand, returning the RAW (decompressed) MLT in *out / *out_len (free
@@ -267,24 +373,29 @@ export fn tile57_warmup() callconv(.c) void {
 }
 
 /// Open one in-memory ENC cell (base .000 bytes) as a resident chart. See tile57.h.
-export fn tile57_chart_open_bytes(base: [*]const u8, len: usize) callconv(.c) ?*Chart {
-    if (len == 0) return null;
-    const cells = [_]chart.CellInput{.{ .base = base[0..len] }};
-    return Chart.openCells(&cells, null, true) catch null;
+export fn tile57_chart_open_bytes(base: ?[*]const u8, len: usize, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    const b = base orelse return failWith(err, .badarg, "base must not be null");
+    if (len == 0) return failWith(err, .badarg, "len must not be zero");
+    const cells = [_]chart.CellInput{.{ .base = b[0..len] }};
+    o.* = Chart.openCells(&cells, null, true) catch |e| return fail(err, e);
+    return OK;
 }
 
 /// Open a baked PMTiles bundle from a file path. See tile57.h.
-export fn tile57_chart_open_pmtiles(path: ?[*:0]const u8) callconv(.c) ?*Chart {
-    const p = spanOpt(path) orelse return null;
+export fn tile57_chart_open_pmtiles(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const dir_path = std.fs.path.dirname(p) orelse ".";
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch |e| return failCtx(err, e, p);
     defer dir.close(io);
-    const bytes = dir.readFileAlloc(io, std.fs.path.basename(p), gpa, .unlimited) catch return null;
+    const bytes = dir.readFileAlloc(io, std.fs.path.basename(p), gpa, .unlimited) catch |e| return failCtx(err, e, p);
     defer gpa.free(bytes);
-    return Chart.openBytes(bytes, .pmtiles, null) catch null;
+    o.* = Chart.openBytes(bytes, .pmtiles, null) catch |e| return failCtx(err, e, p);
+    return OK;
 }
 
 // Fixed-size chart metadata (mirrors tile57_chart_info in tile57.h): folds the old

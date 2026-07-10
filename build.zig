@@ -221,6 +221,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "s57", .module = s57_mod }},
     });
 
+    // The engine error taxonomy (src/errors.zig): the error set the C ABI maps to
+    // tile57_status, plus describe() for the per-call message. Pure std-only leaf.
+    const errors_mod = b.addModule("errors", .{ .root_source_file = b.path("src/errors.zig") });
+
     // The runtime tile compositor (src/compose/): serve any (z,x,y) on demand from
     // N per-cell PMTiles archives + an ownership partition. Reads baked archives
     // only — never parses S-57 or runs portrayal — so it depends solely on the
@@ -380,6 +384,7 @@ pub fn build(b: *std.Build) void {
     tile57_mod.addImport("sprite", sprite_mod); // sprite/pattern atlas generation
     tile57_mod.addImport("coverage", coverage_mod); // per-cell coverage sidecar
     tile57_mod.addImport("compose", compose_mod); // the runtime compositor
+    tile57_mod.addImport("errors", errors_mod); // the error taxonomy
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -397,6 +402,7 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("bundle", bundle_mod); // C ABI: portrayal-asset emitters + debug bake
     lib_mod.addImport("compose", compose_mod); // C ABI: tile57_compose_* (the runtime compositor)
     lib_mod.addImport("coverage", coverage_mod); // the tile57 public root re-exports it
+    lib_mod.addImport("errors", errors_mod); // C ABI: error taxonomy -> tile57_status
     // The full engine surface as a NAMED import (not a root.zig file-import), so the
     // single root.zig file isn't claimed by both lib_mod and engine_full (which bundle
     // pulls in) — Zig requires each file to belong to exactly one module per artifact.
@@ -598,6 +604,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "geometry", .module = geometry_mod },
     });
     _ = addPkgTest(b, test_step, "src/style/style.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/errors.zig", target, optimize, &.{});
     // Geometry core for the cross-band composition (pure, std-only).
     _ = addPkgTest(b, test_step, "src/geometry/geometry.zig", target, optimize, &.{});
     // The runtime compositor + its clip core: pure over tiles + geometry + coverage.

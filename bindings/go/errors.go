@@ -19,4 +19,14 @@ var (
 	// ErrEmptyInput is returned when a call is handed no usable input — no cells,
 	// empty bytes, an empty style template, or empty asset inputs.
 	ErrEmptyInput = errors.New("tile57: empty input")
+
+	// Category sentinels matching the C tile57_status codes. A call that fails
+	// wraps the matching sentinel with %w (the message stays specific — often
+	// "path: reason"), so a host can branch with errors.Is(err, ErrParse) etc.
+	ErrBadArg      = errors.New("tile57: invalid argument")
+	ErrIO          = errors.New("tile57: I/O error")
+	ErrParse       = errors.New("tile57: malformed input")
+	ErrNoMem       = errors.New("tile57: out of memory")
+	ErrUnsupported = errors.New("tile57: unsupported input")
+	ErrRender      = errors.New("tile57: render failed")
 )

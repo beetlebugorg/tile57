@@ -52,9 +52,15 @@ func OpenCompose(paths []string, partitionPath string) (*ComposeSource, error) {
 	if partitionPath != "" {
 		cpart = ar.str(partitionPath)
 	}
-	ptr := C.tile57_compose_open(cpaths, C.size_t(len(paths)), cpart)
-	if ptr == nil {
-		return nil, fmt.Errorf("tile57: OpenCompose found no coverage or failed to open: %w", ErrNoCoverage)
+	var ptr *C.tile57_compose_source
+	var cerr C.tile57_error
+	if st := C.tile57_compose_open(cpaths, C.size_t(len(paths)), cpart, &ptr, &cerr); st != C.TILE57_OK {
+		// No coverage-carrying archive is reported as TILE57_ERR_PARSE; surface it
+		// as ErrNoCoverage so a host can branch, keeping the specific message.
+		if st == C.TILE57_ERR_PARSE {
+			return nil, fmt.Errorf("%s: %w", C.GoString(&cerr.message[0]), ErrNoCoverage)
+		}
+		return nil, statusError(st, &cerr)
 	}
 	return &ComposeSource{ptr: ptr}, nil
 }

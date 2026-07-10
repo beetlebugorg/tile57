@@ -532,18 +532,20 @@ pub fn openCellHeader(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool
     _ = rules_dir;
     var cf = try readCellFiles(path);
     defer cf.deinit();
-    const cell = s57.parseCellWithUpdates(gpa, cf.base, cf.updates) catch return error.OpenFailed;
+    // Propagate the specific parse error (BadLeader / UnknownRUIN / …) so the C
+    // caller reads the exact reason the cell is invalid, not a generic code.
+    const cell = try s57.parseCellWithUpdates(gpa, cf.base, cf.updates);
     var cb = CellBackend{ .cell = cell, .cscl = s57.peekScale(gpa, cf.base) orelse 0 };
     const pa = gpa.create(std.heap.ArenaAllocator) catch {
         freeCellBackend(&cb);
-        return error.OpenFailed;
+        return error.OutOfMemory;
     };
     pa.* = std.heap.ArenaAllocator.init(gpa);
     cb.portray_arena = pa;
     cb.coverage = cb.cell.mcovrCoverage(pa.allocator());
     const src = gpa.create(Chart) catch {
         freeCellBackend(&cb);
-        return error.OpenFailed;
+        return error.OutOfMemory;
     };
     src.* = .{ .backend = .{ .cell = cb }, .cache = std.AutoHashMap(u64, []u8).init(gpa), .pick_attrs = pick_attrs };
     return src;
@@ -573,7 +575,7 @@ pub fn openCellBaked(path: []const u8, rules_dir: ?[]const u8, pick_attrs: bool,
     } else |_| {}
 
     const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
-    const archive = (bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, pick_attrs, null, null, null) catch null) orelse return error.OpenFailed;
+    const archive = (bakeArchive(&cell_in, resolveRulesDir(rules_dir), minzoom, maxzoom, .mlt, pick_attrs, null, null, null) catch null) orelse return error.InvalidCell;
     defer gpa.free(archive);
     const src = try Chart.openBytes(archive, .pmtiles, rules_dir);
     src.cscl_override = cscl;
@@ -932,23 +934,23 @@ pub const Chart = struct {
         if (fmt == .pmtiles or fmt == .auto) {
             const copy = try gpa.dupe(u8, bytes);
             if (openPmtiles(copy)) |src| return src; // openPmtiles freed `copy` on failure
-            if (fmt == .pmtiles) return error.OpenFailed;
+            if (fmt == .pmtiles) return error.InvalidArchive;
         }
-        return openCell(bytes, rules_dir) orelse error.OpenFailed;
+        return openCell(bytes, rules_dir) orelse error.InvalidCell;
     }
 
     /// Open an ENC_ROOT as a multi-cell source: cells are indexed cheaply (band +
     /// bbox) in parallel and parsed/portrayed lazily per tile. All bytes are
     /// copied. Errors if no cell's header parses.
     pub fn openCells(cells_in: []const CellInput, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
-        if (cells_in.len == 0) return error.OpenFailed;
+        if (cells_in.len == 0) return error.NotFound;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
         errdefer gpa.free(dir_copy);
 
-        const tmp = gpa.alloc(LazyCell, cells_in.len) catch return error.OpenFailed;
+        const tmp = try gpa.alloc(LazyCell, cells_in.len);
         defer gpa.free(tmp);
-        const ok = gpa.alloc(bool, cells_in.len) catch return error.OpenFailed;
+        const ok = try gpa.alloc(bool, cells_in.len);
         defer gpa.free(ok);
         @memset(ok, false);
 
@@ -959,11 +961,11 @@ pub const Chart = struct {
         for (ok) |k| {
             if (k) valid += 1;
         }
-        if (valid == 0) return error.OpenFailed;
+        if (valid == 0) return error.InvalidCell; // cells provided, but none parsed
 
         const cells = gpa.alloc(LazyCell, valid) catch {
             for (tmp, ok) |*lc, k| if (k) lazyFreeCell(lc);
-            return error.OpenFailed;
+            return error.OutOfMemory;
         };
         var j: usize = 0;
         for (tmp, ok) |lc, k| if (k) {
@@ -974,7 +976,7 @@ pub const Chart = struct {
         const src = gpa.create(Chart) catch {
             for (cells) |*lc| lazyFreeCell(lc);
             gpa.free(cells);
-            return error.OpenFailed;
+            return error.OutOfMemory;
         };
         src.* = .{
             .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy } },
@@ -990,11 +992,11 @@ pub const Chart = struct {
     /// needs them and freed on LRU eviction, so the host holds the working set's
     /// bytes — not the whole ENC_ROOT. No bytes are read at open. Errors if empty.
     pub fn openCellsStreaming(metas: []const CellMeta, reader: CellReadFn, user: ?*anyopaque, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
-        if (metas.len == 0) return error.OpenFailed;
+        if (metas.len == 0) return error.NotFound;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
         errdefer gpa.free(dir_copy);
-        const cells = gpa.alloc(LazyCell, metas.len) catch return error.OpenFailed;
+        const cells = try gpa.alloc(LazyCell, metas.len);
         for (metas, 0..) |m, i| {
             cells[i] = .{
                 .base = &.{},

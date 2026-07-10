@@ -33,6 +33,39 @@ import (
 // Version returns the libtile57 version string (e.g. "0.1.0").
 func Version() string { return C.GoString(C.tile57_version()) }
 
+// statusError turns a non-OK tile57_status (with the optional tile57_error the
+// call filled) into a Go error that wraps the matching category sentinel, so a
+// host can branch with errors.Is while the message stays specific (often
+// "path: reason"). Returns nil for TILE57_OK.
+func statusError(st C.tile57_status, cerr *C.tile57_error) error {
+	if st == C.TILE57_OK {
+		return nil
+	}
+	msg := ""
+	if cerr != nil {
+		msg = C.GoString(&cerr.message[0])
+	}
+	if msg == "" {
+		msg = C.GoString(C.tile57_status_str(st))
+	}
+	var sentinel error
+	switch st {
+	case C.TILE57_ERR_BADARG:
+		sentinel = ErrBadArg
+	case C.TILE57_ERR_PARSE:
+		sentinel = ErrParse
+	case C.TILE57_ERR_NOMEM:
+		sentinel = ErrNoMem
+	case C.TILE57_ERR_UNSUPPORTED:
+		sentinel = ErrUnsupported
+	case C.TILE57_ERR_RENDER:
+		sentinel = ErrRender
+	default:
+		sentinel = ErrIO
+	}
+	return fmt.Errorf("%s (%w)", msg, sentinel)
+}
+
 // TileFormat is a tile encoding (tile57_tile_type / tile57_bake_opts.format).
 // The zero value means "the engine default" (MLT) in bake options.
 type TileFormat uint8
@@ -99,9 +132,10 @@ func Open(path string) (*Source, error) {
 	}
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
-	ptr := C.tile57_chart_open(cPath)
-	if ptr == nil {
-		return nil, fmt.Errorf("tile57: failed to open chart at %q", path)
+	var ptr *C.tile57_chart
+	var cerr C.tile57_error
+	if st := C.tile57_chart_open(cPath, &ptr, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
 	}
 	return &Source{ptr: ptr}, nil
 }
@@ -112,9 +146,10 @@ func OpenChartBytes(base []byte) (*Source, error) {
 	if len(base) == 0 {
 		return nil, fmt.Errorf("tile57: empty cell bytes: %w", ErrEmptyInput)
 	}
-	ptr := C.tile57_chart_open_bytes((*C.uint8_t)(unsafe.Pointer(&base[0])), C.size_t(len(base)))
-	if ptr == nil {
-		return nil, fmt.Errorf("tile57: failed to open cell (%d bytes)", len(base))
+	var ptr *C.tile57_chart
+	var cerr C.tile57_error
+	if st := C.tile57_chart_open_bytes((*C.uint8_t)(unsafe.Pointer(&base[0])), C.size_t(len(base)), &ptr, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
 	}
 	return &Source{ptr: ptr}, nil
 }
@@ -126,9 +161,10 @@ func OpenPMTiles(path string) (*Source, error) {
 	}
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
-	ptr := C.tile57_chart_open_pmtiles(cPath)
-	if ptr == nil {
-		return nil, fmt.Errorf("tile57: failed to open pmtiles at %q", path)
+	var ptr *C.tile57_chart
+	var cerr C.tile57_error
+	if st := C.tile57_chart_open_pmtiles(cPath, &ptr, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
 	}
 	return &Source{ptr: ptr}, nil
 }

@@ -64,6 +64,42 @@ extern "C" {
 const char *tile57_version(void);
 
 /* ======================================================================== *
+ * Errors
+ *
+ * A fallible call returns a tile57_status; TILE57_OK (0) is success and every
+ * other value is a failure with a coarse cause. Results (handles, byte buffers)
+ * come back through out-parameters. "Nothing produced" is NOT a failure — the
+ * call returns TILE57_OK with a NULL/zero out (e.g. a cell that bakes no tiles,
+ * or composing open ocean).
+ *
+ * tile57_status_str() gives a static, human-readable string for a status (the
+ * strerror pattern). Where the specific cause is worth carrying — which path,
+ * which errno — the call also takes an optional tile57_error*: pass NULL to
+ * ignore it, or a caller-owned struct (a stack local is fine) the call fills with
+ * the status + a message on failure and leaves untouched on success. There is no
+ * allocation and nothing to free.
+ * ======================================================================== */
+
+typedef enum {
+    TILE57_OK = 0,          /* success */
+    TILE57_ERR_BADARG,      /* a NULL or out-of-range argument */
+    TILE57_ERR_IO,          /* a file/directory could not be opened, read, or written */
+    TILE57_ERR_PARSE,       /* malformed input (S-57 cell, PMTiles, partition, JSON) */
+    TILE57_ERR_NOMEM,       /* an allocation failed */
+    TILE57_ERR_UNSUPPORTED, /* valid but unsupported input */
+    TILE57_ERR_RENDER,      /* tile generation or rendering failed */
+} tile57_status;
+
+/* A static, human-readable string for a status. Never NULL, never freed. */
+const char *tile57_status_str(tile57_status status);
+
+#define TILE57_ERROR_MSG_MAX 256
+typedef struct {
+    tile57_status status;
+    char message[TILE57_ERROR_MSG_MAX]; /* NUL-terminated; "" when no detail */
+} tile57_error;
+
+/* ======================================================================== *
  * 2. Chart: open + metadata
  *
  * A tile57_chart is the metadata + render handle: open a cell (or a baked
@@ -81,25 +117,25 @@ typedef struct tile57_chart tile57_chart;
  * tiles are baked lazily, per requested tile — there is no upfront full-cell bake.
  * This backend exposes the per-cell list (tile57_chart_cells) and the render/query
  * surface. See the header/zoom variants for a metadata-only scan or a progressive
- * narrow-band open. NULL/fail -> NULL. */
-tile57_chart *tile57_chart_open(const char *path);
+ * narrow-band open. TILE57_OK with *out set; else a tile57_status (err filled if non-NULL). */
+tile57_status tile57_chart_open(const char *path, tile57_chart **out, tile57_error *err);
 
 /* Open ONE cell for METADATA ONLY — bbox, native_scale, and M_COVR coverage — via a
  * cheap parse with NO tile bake, for a host's chart-database/header scan. Do NOT
- * render_surface this handle (it has no portrayal). NULL/failure -> NULL. */
-tile57_chart *tile57_chart_open_header(const char *path);
+ * render_surface this handle (it has no portrayal). TILE57_OK with *out set; else a tile57_status (err filled if non-NULL). */
+tile57_status tile57_chart_open_header(const char *path, tile57_chart **out, tile57_error *err);
 
 /* Open ONE cell baking only [minzoom, maxzoom] to an in-memory PMTiles: bake a narrow
  * native band fast for first paint, then re-open the full range in the background
- * (progressive load). Renders via the fast reader path. NULL/failure -> NULL. */
-tile57_chart *tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t maxzoom);
+ * (progressive load). Renders via the fast reader path. TILE57_OK with *out set; else a tile57_status (err filled if non-NULL). */
+tile57_status tile57_chart_open_zoom(const char *path, uint8_t minzoom, uint8_t maxzoom, tile57_chart **out, tile57_error *err);
 
 /* Open one in-memory ENC cell (base .000 bytes) as a resident chart. Bytes are copied.
- * NULL/failure -> NULL. */
-tile57_chart *tile57_chart_open_bytes(const uint8_t *base, size_t len);
+ * TILE57_OK with *out set; else a tile57_status (err filled if non-NULL). */
+tile57_status tile57_chart_open_bytes(const uint8_t *base, size_t len, tile57_chart **out, tile57_error *err);
 
-/* Open a baked PMTiles bundle from a file path. NULL/failure -> NULL. */
-tile57_chart *tile57_chart_open_pmtiles(const char *path);
+/* Open a baked PMTiles bundle from a file path. TILE57_OK with *out set; else a tile57_status (err filled if non-NULL). */
+tile57_status tile57_chart_open_pmtiles(const char *path, tile57_chart **out, tile57_error *err);
 
 /* Vector-tile encodings the engine produces (reported in tile57_chart_info.tile_type;
  * the compositor serves MLT). */
@@ -265,11 +301,12 @@ typedef struct {
  * tile57_bake_cell_bytes, on disk), mmap'd so the cell set is never fully resident.
  * `partition_path` (NULL to skip) names a partition sidecar — written by
  * tile57_compose_save_partition (the `tile57 bake` CLI emits one as partition.tpart) —
- * to load and skip the build; a missing/stale one falls back to building. Returns an
- * opaque handle (free with tile57_compose_close), or NULL on error / no
- * coverage-carrying archive. */
-tile57_compose_source *tile57_compose_open(const char *const *paths, size_t n,
-                                           const char *partition_path);
+ * to load and skip the build; a missing/stale one falls back to building. On
+ * TILE57_OK *out is the handle (free with tile57_compose_close); no
+ * coverage-carrying archive is TILE57_ERR_PARSE. */
+tile57_status tile57_compose_open(const char *const *paths, size_t n,
+                                 const char *partition_path,
+                                 tile57_compose_source **out, tile57_error *err);
 
 /* Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out / *out_len (free with
  * tile57_free) — what a live tile server hands its HTTP layer (which gzips on the wire). Returns:
