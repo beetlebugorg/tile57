@@ -2,10 +2,16 @@
 //! composed tile ON DEMAND from a resident ownership partition + mmap'd per-cell archives (the
 //! runtime-compositor path), byte-identical to the batch. `--bench N` then serves an N×N tile block
 //! around (x,y) to report per-tile serving latency, amortising the one-time open.
+//!
+//! `compose-tile <archive-dir> --scan Z0[..Z1] [--load-partition FILE]` — compose EVERY tile in the
+//! source bounds at those zooms and report each tile whose clip left an open ring walk (the
+//! geometry boolean's wedge-artifact diagnostic): on correct booleans the count is always zero, so
+//! any hit names a broken tile exactly. The artifact sweep to run after touching the boolean.
 
 const std = @import("std");
 const engine = @import("engine");
 const compose = @import("compose");
+const geometry = @import("geometry");
 const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
@@ -25,6 +31,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var out: ?[]const u8 = null;
     var load_partition: ?[]const u8 = null;
     var bench: u32 = 0;
+    var scan: ?[]const u8 = null;
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -34,6 +41,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             load_partition = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--bench")) {
             bench = f.int(u32, arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--scan")) {
+            scan = f.val(arg) orelse return;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (dir_path == null) {
@@ -47,9 +56,22 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else return usageErr("unexpected argument");
     }
     const dir = dir_path orelse return usageErr("missing <archive-dir>");
-    const z = std.fmt.parseInt(u8, zs orelse return usageErr("missing z"), 10) catch return usageErr("bad z");
-    const tx = std.fmt.parseInt(u32, xs orelse return usageErr("missing x"), 10) catch return usageErr("bad x");
-    const ty = std.fmt.parseInt(u32, ys orelse return usageErr("missing y"), 10) catch return usageErr("bad y");
+    // --scan Z0[..Z1] needs no positional tile address.
+    var scan_z0: u8 = 0;
+    var scan_z1: u8 = 0;
+    if (scan) |sv| {
+        if (std.mem.indexOf(u8, sv, "..")) |dots| {
+            scan_z0 = std.fmt.parseInt(u8, sv[0..dots], 10) catch return usageErr("bad --scan zoom");
+            scan_z1 = std.fmt.parseInt(u8, sv[dots + 2 ..], 10) catch return usageErr("bad --scan zoom");
+        } else {
+            scan_z0 = std.fmt.parseInt(u8, sv, 10) catch return usageErr("bad --scan zoom");
+            scan_z1 = scan_z0;
+        }
+        if (scan_z1 < scan_z0) return usageErr("bad --scan zoom range");
+    }
+    const z = if (scan != null) 0 else std.fmt.parseInt(u8, zs orelse return usageErr("missing z"), 10) catch return usageErr("bad z");
+    const tx = if (scan != null) 0 else std.fmt.parseInt(u32, xs orelse return usageErr("missing x"), 10) catch return usageErr("bad x");
+    const ty = if (scan != null) 0 else std.fmt.parseInt(u32, ys orelse return usageErr("missing y"), 10) catch return usageErr("bad y");
 
     // Enumerate the per-cell archives (sorted, like `compose --from-archives`).
     var paths = std.ArrayList([]const u8).empty;
@@ -96,6 +118,49 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer src.deinit();
     const open_ms = @as(f64, @floatFromInt(nowNs() - open_t0)) / 1e6;
     std.debug.print("opened {d} cell(s), partition {s}, in {d:.1} ms (serve z {d}..{d})\n", .{ src.readers.len, if (load_bytes != null) "loaded" else "built", open_ms, src.minz, src.loop_max });
+
+    // Artifact sweep: compose every in-bounds tile at the scan zooms and report
+    // each one whose clip dead-ended a ring walk (open chain ⇒ chord artifact).
+    if (scan != null) {
+        var arena_state = std.heap.ArenaAllocator.init(a);
+        defer arena_state.deinit();
+        var bad_tiles: usize = 0;
+        var total: usize = 0;
+        var sz = scan_z0;
+        while (sz <= scan_z1) : (sz += 1) {
+            const scale: f64 = @floatFromInt(@as(u32, 1) << @intCast(sz));
+            const tl = engine.tile.lonLatToWorld(src.bounds[0], src.bounds[3]);
+            const br = engine.tile.lonLatToWorld(src.bounds[2], src.bounds[1]);
+            const x0 = compose.worldAxisToTile(tl[0], scale);
+            const x1 = compose.worldAxisToTile(br[0], scale);
+            const y0 = compose.worldAxisToTile(tl[1], scale);
+            const y1 = compose.worldAxisToTile(br[1], scale);
+            var zx = x0;
+            while (zx <= x1) : (zx += 1) {
+                var zy = y0;
+                while (zy <= y1) : (zy += 1) {
+                    const before = geometry.boolean.open_chain_walks;
+                    const big_before = geometry.boolean.large_open_chains;
+                    const aa = arena_state.allocator();
+                    const r = src.tile(aa, sz, zx, zy) catch |err| {
+                        std.debug.print("z{d}/{d}/{d}: ERROR {s}\n", .{ sz, zx, zy, @errorName(err) });
+                        continue;
+                    };
+                    if (r.tile != null) total += 1;
+                    const chains = geometry.boolean.open_chain_walks - before;
+                    const big = geometry.boolean.large_open_chains - big_before;
+                    if (chains > 0) {
+                        bad_tiles += 1;
+                        std.debug.print("z{d}/{d}/{d}: {d} open chain(s), {d} large\n", .{ sz, zx, zy, chains, big });
+                    }
+                    _ = arena_state.reset(.retain_capacity);
+                }
+            }
+            std.debug.print("scan z{d} done ({d} composed so far, {d} bad)\n", .{ sz, total, bad_tiles });
+        }
+        std.debug.print("scan complete: {d} tiles composed, {d} with open chains\n", .{ total, bad_tiles });
+        return;
+    }
 
     // Serve the requested tile.
     const serve_t0 = nowNs();

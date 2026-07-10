@@ -490,6 +490,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "catalog", .module = catalog_embed },
                 .{ .name = "bundle", .module = bundle_mod },
                 .{ .name = "compose", .module = compose_mod }, // compose-tile CLI
+                .{ .name = "geometry", .module = geometry_mod }, // compose-tile --scan reads the boolean diagnostics
                 .{ .name = "render", .module = render_mod }, // renderpng pixel path
                 .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
             },
