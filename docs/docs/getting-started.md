@@ -105,11 +105,12 @@ tile57_close(chart);         /* …so close them after it */
 ```
 
 Link against `libtile57.a`. The `partition.tpart` sidecar (NULL to skip) lets the
-compositor load the ownership partition instead of rebuilding it. The same
-`tile57` chart handle renders finished PNGs/PDFs, reads metadata (bounds, scale,
-coverage, SCAMIN), and answers the cursor pick; raw S-57 reading (cell
-inventory, feature extraction) is handle-free via `tile57_enc_*`. See the
-[C API](./c-api.md).
+compositor load the ownership partition instead of rebuilding it. The chart and
+the compositor offer the same outputs — `tile57_png(chart, …)` renders one chart
+alone; `tile57_compose_png(src, …)` renders the composed set; `tile57_tile`
+hands back one chart's stored tiles verbatim for anyone writing their own
+compositor. Raw S-57 reading (cell inventory, feature extraction) is
+handle-free via `tile57_enc_*`. See the [C API](./c-api.md).
 
 ## 3. Use the engine from Zig
 
@@ -118,18 +119,22 @@ Add tile57 as a dependency and `@import("tile57")`:
 ```zig
 const tile57 = @import("tile57");
 
-// Open an on-disk ENC_ROOT (or a single .000) for rendering + inspection.
-var chart = try tile57.Chart.openPath("ENC_ROOT/", null, true);
+// Open one baked archive as a chart (mmap'd): metadata, pick, view renders.
+var chart = try tile57.Chart.openPmtilesPath(io, "out/tiles/US5MD1MC.pmtiles");
 defer chart.deinit();
-
 const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
-// … render a view (chart.renderView), query features (chart.featuresJson),
-//   or read per-cell metadata (chart.cellsJson) …
+
+// Or compose the whole bake output and take any output from it.
+var src = (try tile57.compose.openComposeSourceFiles(io, gpa, paths, "out/partition.tpart")).?;
+defer src.deinit();
+const result = try src.tile(gpa, 15, 9371, 12534);          // one composed tile
+const png = try tile57.compose.renderView(src, -76.48, 38.974, 13.5,
+    1600, 1200, .day, &settings, .png, null);               // one composed view
 ```
 
-The Zig `Chart` renders views, queries features, and reads metadata. Tile
-production (bake each cell, then compose on demand) is exposed through the
-[C ABI](./c-api.md). See the [Zig API](./zig-api.md).
+Baking (`tile57.bake.tree`), raw S-57 reading (`Chart.openPath` +
+`cellsJson`/`featuresJson`), and the style builders are all in the same
+package. See the [Zig API](./zig-api.md).
 
 ## ENC_ROOT and updates
 

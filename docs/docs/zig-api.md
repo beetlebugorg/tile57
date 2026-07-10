@@ -8,8 +8,10 @@ sidebar_position: 4
 
 The engine is a Zig package named **`tile57`** (v0.2.0, requires Zig 0.16).
 Add it as a dependency and `@import("tile57")` for the curated public surface
-(`src/tile57.zig`). The [C ABI](./c-api.md) is a thin shim over this same
-API.
+(`src/tile57.zig`). The [C ABI](./c-api.md) is a thin shim over this same API,
+and both share the same shape: **bake, then compose** (or bake, then render) —
+source cells bake once to per-cell archives, and every output is produced from
+baked archives.
 
 :::note
 Add it as a **path dependency** on a local clone (submodules initialised) —
@@ -18,80 +20,101 @@ Add it as a **path dependency** on a local clone (submodules initialised) —
 [Installation](./installation.md).
 :::
 
-## The high-level engine: `Chart`
+## Bake
 
-Open a **chart** from bytes, a path, or cells, then render views, query features,
-and read metadata:
+Bake each ENC cell to its own PMTiles at its compilation scale — the input the
+compositor serves from. Free any returned bytes with `tile57.freeBytes`.
+
+```zig
+// Bake an ENC_ROOT: each cell -> <out>/tiles/<STEM>.pmtiles + <out>/partition.tpart.
+// Incremental: an archive already newer than its whole input is skipped.
+const n = try tile57.bake.tree(io, "/enc/ENC_ROOT", "/out", null, 4, null, null);
+```
+
+| Surface | What it does |
+|---------|--------------|
+| `tile57.bake.cellBytes(path, rules)` | bake one cell (+ updates) to PMTiles bytes. |
+| `tile57.bake.cellsParallel(...)` / `bake.cellsToFiles(...)` | bake many cells in parallel, to memory / to files. |
+| `tile57.bake.tree(io, in, out, ...)` | walk an ENC_ROOT, bake each cell to a mirrored path (incremental). |
+| `tile57.bake.archive(...)` | the offline path: merge a slice of cells into one archive. |
+| `tile57.bake.pmtilesMetadata(a, bytes)` | read an archive's metadata JSON (embedded coverage + scamin). |
+| `tile57.bake.Progress` | the optional progress-callback type. |
+
+Reading raw S-57 source data (a cell inventory, GeoJSON feature extraction)
+goes through a streaming `Chart` — see `openPath` below.
+
+## Render: the `Chart`
+
+A `Chart` is one open chart: metadata, feature extraction, the S-52 cursor
+pick, and view renders — with no composition. Tiles across many charts come
+from the compositor (next section).
 
 ```zig
 const tile57 = @import("tile57");
 
-// A baked archive, mmap'd (never fully resident). openBytes takes a PMTiles
-// archive or a raw S-57 cell portrayed live (auto-sniffed).
+// A baked archive, mmap'd (never fully resident).
 var chart = try tile57.Chart.openPmtilesPath(io, "US5MD1MC.pmtiles");
 defer chart.deinit();
 
 const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
-// … chart.renderView(…) / chart.queryPoint(…) / chart.featuresJson(…) …
+// … chart.renderView(…) / chart.queryPoint(…) …
 ```
 
-The Zig `Chart` does not itself serve `(z, x, y)` tiles — the runtime compositor
-(bake each cell, then compose on demand) is exposed through the [C ABI](./c-api.md).
-`tile57.bakeArchive` bakes a whole ENC_ROOT to one PMTiles archive offline.
+What a chart can do depends on how it was opened:
+
+| Open | Backend | Serves |
+|------|---------|--------|
+| `openPmtilesPath(io, path)` | baked archive, mmap'd | metadata (embedded coverage + scale), query, view renders (tile replay), raw tiles via `pmtilesReader()`. |
+| `openBytes(bytes, .pmtiles, …)` | baked archive, copied | the same, from memory. |
+| `openBytes(cell_bytes, .auto, rules_dir)` | ONE live S-57 cell, fully portrayed | metadata, query, view renders with the S-101 rules evaluated live. |
+| `openPath(path, rules_dir, pick_attrs)` | streaming ENC_ROOT (or a single `.000`) | metadata + extraction ONLY: `cellsJson`, `featuresJson`, `scamin`, bounds. Cells are enumerated up front and parsed on demand, so a whole catalogue opens instantly. No view renders, no tiles. |
+| `openCells(cells, …)` / `openCellsStreaming(metas, reader, …)` | the same, from in-memory cells / a host reader callback | as `openPath`. |
 
 `Chart` methods:
 
 | Method | Purpose |
 |--------|---------|
-| `openPmtilesPath(io, path)` | open a baked PMTiles archive from a path, mmap'd. |
-| `openBytes(bytes, format, rules_dir)` | open one chart from bytes (PMTiles or S-57 cell). |
-| `openPath(path, rules_dir, pick_attrs)` | open an on-disk ENC_ROOT dir (or a single `.000`) as a streaming chart. |
-| `openCells(cells, rules_dir, pick_attrs)` | open a multi-cell ENC_ROOT from bytes (each cell's `.001…` updates applied). |
-| `openCellsStreaming(metas, reader, user, rules_dir, pick_attrs)` | low-memory ENC_ROOT: read each cell's bytes on demand, free on eviction. |
-| `renderView(lon, lat, zoom, w, h, palette, settings, output)` | render a view through the native S-52 pixel path — PNG or PDF. |
+| `renderView(lon, lat, zoom, w, h, palette, settings, output, cb)` | render a view through the native S-52 pixel path — PNG, PDF, or a callback canvas. |
 | `renderSurfaceView(lon, lat, zoom, w, h, palette, settings, cb)` | drive world-space surface callbacks (the GPU vector twin). |
 | `renderAscii(lon, lat, zoom, cols, rows, palette, settings, ansi)` | the same view as a terminal text grid. |
 | `queryPoint(lon, lat, zoom, cb)` | the S-52 cursor pick — features under a point at the view zoom. |
-| `cellsJson()` / `featuresJson(classes)` | per-cell metadata / GeoJSON feature query (the `cells` / `features` CLI). |
+| `cellsJson()` / `featuresJson(classes)` | per-cell metadata / GeoJSON feature extraction (the `cells` / `features` CLI). |
 | `coverage()` | the M_COVR data-coverage rings (a live cell, or the copy a per-cell bake embeds in its archive metadata). |
 | `bounds() -> ?[4]f64` | geographic extent `[w, s, e, n]`, if known. |
 | `anchor()` | a good initial camera (lat, lon, zoom) on real data. |
 | `bands() -> u32` | bitmask of navigational bands present. |
-| `zoomRange()` | the min/max zoom the chart serves. |
+| `zoomRange()` | the min/max zoom the chart covers. |
 | `nativeScale() -> i32` | the compilation scale 1:N (a live cell or an archive's embedded metadata; 0 if unknown). |
-| `pmtilesReader()` / `cellCoverage()` | the archive reader + decoded per-cell coverage a compositor borrows. |
 | `scamin() -> ![]u32` | the distinct SCAMIN denominators present (the live SCAMIN manifest). |
 | `tileType()` | the tile encoding the chart's tiles use (MVT/MLT). |
 | `format() -> Format` | the resolved backend (after `.auto`). |
+| `pmtilesReader()` / `cellCoverage()` | the archive reader (raw per-archive tiles — the primitive for writing your own compositor) + the decoded per-cell coverage; what the built-in compositor borrows. |
 | `deinit()` | release the chart and its cached tiles. |
 
 `tile57.Format` is `.auto` / `.pmtiles` / `.s57_cell`. `rules_dir` is the S-101
 portrayal rules directory for live S-57 cells; `null` (or `""`) uses the rules
 embedded in the binary (or `TILE57_S101_RULES` if set), so no on-disk catalogue
-is required; a path overrides with an on-disk catalogue. Free any bytes returned
-by the render / bake entry points with `tile57.freeBytes`.
+is required; a path overrides with an on-disk catalogue.
 
 The streaming open uses the extern types `tile57.CellMeta` (bbox + `cscl`),
 `tile57.CellBytes` (the cell's base + updates, ownership transferred to the
 library), and `tile57.CellReadFn` (the reader callback). Multi-cell input for
 `openCells` is `tile57.CellInput`.
 
-## Bake + compose
+## Compose
 
-Baking and compositing are separate steps. `tile57.bake` writes each cell to its
-own PMTiles at its compilation scale; `tile57.compose` stitches those archives
-into one tile for any `(z, x, y)` on demand, using an ownership partition so cells
-never double-draw at a seam.
+The runtime compositor stitches per-cell archives into one seamless chart: any
+`(z, x, y)` tile on demand through the ownership partition (cells never
+double-draw at a seam), and the same view outputs as a single chart, composed.
 
 ```zig
-// Bake an ENC_ROOT: each cell -> <out>/tiles/<STEM>.pmtiles + <out>/partition.tpart.
-// Incremental: an archive already newer than its whole input is skipped.
-const n = try tile57.bake.tree(io, "/enc/ENC_ROOT", "/out", null, 4, null, null);
-
 // Open the compositor over the archives + partition, then compose tiles.
 var src = (try tile57.compose.openComposeSourceFiles(io, gpa, paths, "/out/partition.tpart")).?;
 defer src.deinit();
 const result = try src.tile(gpa, 13, 2359, 3139); // result.tile: ?[]u8, result.owned: bool
+
+// The composed view outputs live beside the Chart ones:
+const png = try tile57.renderComposeView(src, lon, lat, 13.5, 1600, 1200, .day, &settings, .png, null);
 ```
 
 A host that already holds open charts composes over them instead — the
@@ -107,13 +130,13 @@ var src = (try tile57.compose.openComposeSourceCharts(gpa, &archives, null)).?;
 
 | Surface | What it does |
 |---------|--------------|
-| `tile57.bake.cellBytes(path, rules)` | bake one cell (+ updates) to PMTiles bytes. |
-| `tile57.bake.cellsToFiles(...)` / `bake.tree(...)` | bake many cells / a whole ENC_ROOT to files. |
-| `tile57.bake.archive(...)` | the offline path: merge a slice of cells into one archive. |
-| `tile57.bake.Progress` | the optional progress-callback type. |
 | `tile57.compose.openComposeSourceFiles(...)` | open a `ComposeSource` over on-disk archives + a partition. |
 | `tile57.compose.openComposeSourceCharts(...)` | the same over borrowed `ChartArchive`s (already-open charts). |
-| `tile57.compose.composeTile(...)` | compose one tile (the stateless core `ComposeSource.tile` uses). |
+| `ComposeSource.tile(gpa, z, x, y)` | compose one tile on demand (raw MLT + the ownership flag). |
+| `tile57.renderComposeView(src, ...)` | the composed view render — PNG, PDF, or a callback canvas. |
+| `tile57.renderComposeSurfaceView(src, ...)` | the composed world-space surface stream. |
+| `tile57.composeQueryPoint(src, lon, lat, zoom, cb)` | the composed cursor pick (seams included). |
+| `tile57.compose.composeTile(...)` | the stateless core `ComposeSource.tile` uses. |
 | `tile57.partition` | the ownership partition and its `.tpart` sidecar (serialize / deserialize). |
 
 ## Style + portrayal assets
@@ -136,11 +159,13 @@ The mid-level packages, for callers that compose their own pipeline:
 
 | Module | Role |
 |--------|------|
-| `tile57.mvt` | Mapbox Vector Tile encode/decode |
+| `tile57.mvt` / `tile57.mlt` | Mapbox Vector Tile / MapLibre Tile encode/decode |
 | `tile57.tile` | web-mercator tiling + clipping |
 | `tile57.pmtiles` | PMTiles read/write |
+| `tile57.band` | compilation-scale → zoom-range mapping |
 | `tile57.bake_enc` | banded multi-cell ENC_ROOT → PMTiles |
 | `tile57.scene` | S-57 feature → tile-surface scene generation |
+| `tile57.render` | the Surface/Canvas rendering path (PNG, PDF, ASCII, callbacks) |
 
 ## Raw formats (advanced)
 
@@ -152,5 +177,6 @@ The pure-Zig foundational parsers under `tile57.formats`:
 | `tile57.formats.s57` | S-57 ENC cell parser + geometry |
 | `tile57.formats.s101` | the S-101 catalogue, adapter, and instruction stream |
 
-`tile57.version` is the package version string (`"0.2.0"`), matching
-`build.zig.zon` and `tile57_version()`.
+`tile57.coverage` is the per-cell M_COVR coverage sidecar (carried in an
+archive's PMTiles metadata). `tile57.version` is the package version string
+(`"0.2.0"`), matching `build.zig.zon` and `tile57_version()`.

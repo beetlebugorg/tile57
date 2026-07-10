@@ -84,14 +84,14 @@ render Surface ──► MVT / MLT tiles + PMTiles (src/tiles/)  +  MapLibre sty
 
 The engine holds only its working set:
 
-- **Lazy, per-cell work.** A multi-cell ENC_ROOT is indexed cheaply (band +
-  bbox); cells are parsed and portrayed only when a requested tile needs them,
-  then held under an LRU bound. A **streaming** open reads a cell's bytes on
-  demand (and frees them on eviction), so a host holds only the working set — not
-  the whole catalogue.
-- **Per-cell bakes.** Each cell bakes to its own PMTiles at its compilation scale,
-  so a bake holds one cell at a time; the runtime compositor stitches the cells by
-  `(z, x, y)` on demand through an ownership partition.
+- **Lazy, per-cell reads.** A multi-cell ENC_ROOT is indexed cheaply (band +
+  bbox); a **streaming** open reads a cell's bytes only when a metadata or
+  feature query needs them (and frees them on eviction), so a host holds only
+  the working set — not the whole catalogue.
+- **Per-cell bakes, composed on demand.** Each cell bakes to its own PMTiles at
+  its compilation scale, so a bake holds one cell at a time; the runtime
+  compositor mmaps the archives and stitches the cells by `(z, x, y)` on demand
+  through an ownership partition, so serving never loads the cell set either.
 - **Pure-Zig core.** The foundational format/encode modules (`iso8211`, `s57`,
   `s101`, `tiles`, `render`, `scene`, `style`) have no libc; only the Lua
   portrayal (`portray`) and the sprite rasterizer (`sprite`) pull in C.

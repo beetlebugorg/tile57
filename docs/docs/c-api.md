@@ -18,12 +18,17 @@ same way:
   embedded in the archive metadata. The bake section also carries the raw-source
   readers (cell inventory, feature extraction, exchange-set catalogue).
 - **Render** — a **`tile57`** chart handle opens ONE baked archive and answers
-  for it: metadata (info / SCAMIN / coverage), the S-52 cursor pick, and full
-  view renders (PNG / PDF / callback canvas / world-space surface).
-- **Compose** — a **`tile57_compose`** handle stitches MANY open charts into one
-  seamless tile pyramid on demand through the cell-ownership partition — what a
-  live tile server hands its HTTP layer. The composed bytes are MapLibre Tiles
-  (MLT).
+  for it with NO composition: metadata (info / SCAMIN / coverage), its stored
+  tiles verbatim (`tile57_tile` — the primitive for writing your own
+  compositor), the S-52 cursor pick, and view outputs (`tile57_png` / `_pdf` /
+  `_canvas` / `_surface`).
+- **Compose** — a **`tile57_compose`** handle stitches MANY open charts through
+  the cell-ownership partition and offers the SAME output set, composed:
+  `tile57_compose_tile` (what a live tile server hands its HTTP layer — the
+  bytes are MapLibre Tiles), `_png`, `_pdf`, `_canvas`, `_surface`, `_query`.
+
+Everything is **bake, then compose** (or bake, then render): source cells bake
+once to per-cell archives; every output is produced from baked archives.
 
 Style + portrayal-asset generation rounds out the surface: the mariner's S-52
 display options become a concrete MapLibre style JSON plus the colortables and
@@ -161,8 +166,9 @@ The CLI mirrors these as `tile57 cells`, `tile57 features`, and
 ## Render: the `tile57` chart handle
 
 A `tile57` is a chart: ONE baked PMTiles archive, opened for metadata and
-rendering. Open it from a path (mmap'd — a whole chart library can be open
-without being resident) or from bytes (copied).
+output — with no composition (the compositor below offers the same outputs
+across many charts). Open it from a path (mmap'd — a whole chart library can
+be open without being resident) or from bytes (copied).
 
 ```c
 const char *tile57_version(void);   /* "0.2.0" */
@@ -211,6 +217,13 @@ typedef struct {
 tile57_status tile57_coverage(tile57 *chart, const tile57_coverage_cb *cb,
                               tile57_error *err);
 
+/* The chart's own stored tile at (z,x,y), decompressed (MLT or MVT per
+ * tile57_info.tile_type), with NO composition — the per-archive primitive for
+ * an embedder writing its own compositor. NULL/0 when the archive has no tile
+ * there. */
+tile57_status tile57_tile(tile57 *chart, uint8_t z, uint32_t x, uint32_t y,
+                          uint8_t **out, size_t *out_len, tile57_error *err);
+
 /* Release a chart and all cached tiles (not while a compositor still holds it). */
 void tile57_close(tile57 *chart);
 ```
@@ -248,7 +261,7 @@ The class and cell come through for any chart; the attribute JSON is filled in
 from the `s57` pick property baked into the tiles (empty if a chart was baked
 without pick attributes).
 
-### Render a finished view (PNG / PDF)
+### Render a finished view (PNG / PDF), one chart
 
 The [native S-52 rendering engine](./rendering.md) draws a view of the chart —
 centre + fractional zoom + pixel size — by replaying the archive's baked tiles
@@ -264,18 +277,22 @@ with the [style builders](#build-a-maplibre-style) below.
 
 ```c
 /* PNG raster in *out/*out_len (free with tile57_free). */
-tile57_status tile57_render_view(tile57 *chart, double lon, double lat, double zoom,
-                                 uint32_t width, uint32_t height,
-                                 const tile57_mariner *m,
-                                 uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_png(tile57 *chart, double lon, double lat, double zoom,
+                         uint32_t width, uint32_t height,
+                         const tile57_mariner *m,
+                         uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* Its vector twin: the SAME scene as a deterministic single-page PDF
  * (1 px = 1 pt, 72 dpi; vector fills + glyph-outline text). */
-tile57_status tile57_render_pdf(tile57 *chart, double lon, double lat, double zoom,
-                                uint32_t width, uint32_t height,
-                                const tile57_mariner *m,
-                                uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_pdf(tile57 *chart, double lon, double lat, double zoom,
+                         uint32_t width, uint32_t height,
+                         const tile57_mariner *m,
+                         uint8_t **out, size_t *out_len, tile57_error *err);
 ```
+
+The composed twins — `tile57_compose_png` / `tile57_compose_pdf`, same
+parameters over a `tile57_compose` — render the same view across the WHOLE
+composed set (see below).
 
 ### Render to a host surface (vector callbacks)
 
@@ -284,8 +301,9 @@ of draw calls in world space. A GPU host tessellates that stream once, then pans
 and zooms by transforming the vertices each frame, so symbols and text stay a
 constant size on screen and no re-portrayal is needed while the view moves.
 
-You fill in a `tile57_surface_cb` vtable and pass it to
-`tile57_render_surface_cb`. Area and line geometry come in web-mercator world
+You fill in a `tile57_surface_cb` vtable and pass it to `tile57_surface` (or
+`tile57_compose_surface` for the composed set). Area and line geometry come in
+web-mercator world
 coordinates (the range 0 to 1, with y pointing down). Point symbols, soundings, and
 text come as a world anchor plus a small outline in reference pixels, so you can
 draw them at a fixed size on screen. Every call carries the feature's SCAMIN, so you
@@ -321,10 +339,10 @@ typedef struct {
 } tile57_surface_cb;
 
 /* Portray the view once and drive the callbacks. */
-tile57_status tile57_render_surface_cb(tile57 *chart, double lon, double lat, double zoom,
-                                       uint32_t width, uint32_t height,
-                                       const tile57_mariner *m,
-                                       const tile57_surface_cb *surface, tile57_error *err);
+tile57_status tile57_surface(tile57 *chart, double lon, double lat, double zoom,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
 ```
 
 Set `draw_sprite` and `draw_pattern` once you have the sprite atlas loaded (see
@@ -336,18 +354,21 @@ those two fields NULL, the same features arrive as vector outlines instead.
 tile57 also declutters overlapping text for you before it makes the calls (symbols
 and soundings always draw, per S-52), so you don't repeat that work.
 
-There is a pixel-space twin, `tile57_render_view_cb` with a `tile57_canvas_cb`
-vtable, that emits the SAME portrayal as resolved paint-order draw calls in canvas
+There is a pixel-space twin, `tile57_canvas` with a `tile57_canvas_cb` vtable,
+that emits the SAME portrayal as resolved paint-order draw calls in canvas
 pixels — for a host that wants the engine's own paint pipeline without the PNG
-encode.
+encode. Both callback forms have composed twins (`tile57_compose_canvas` /
+`tile57_compose_surface`).
 
-## Compose: many charts, one tile pyramid
+## Compose: many charts, one chart
 
 The compositor builds (or loads) the cell-ownership partition over its charts'
-embedded coverage, then composes any tile for the cost of a classify plus one
-decompress or one decode/clip. It **borrows** the charts — their mmap'd archives
-and decoded coverage — so the cell set is never fully resident and the charts
-must outlive the compositor. Open once, serve many, close.
+embedded coverage, then offers the SAME output set as a single chart, composed:
+any tile on demand for the cost of a classify plus one decompress or one
+decode/clip, plus the composed view outputs and the composed cursor pick. It
+**borrows** the charts — their mmap'd archives and decoded coverage — so the
+cell set is never fully resident and the charts must outlive the compositor.
+Open once, serve many, close.
 
 ```c
 /* Opaque runtime-compositor handle. */
@@ -380,6 +401,25 @@ tile57_status tile57_compose_open(tile57 *const *charts, size_t n,
 tile57_status tile57_compose_tile(tile57_compose *c, uint8_t z, uint32_t x, uint32_t y,
                                    uint8_t **out, size_t *out_len, bool *out_owned,
                                    tile57_error *err);
+
+/* The composed view outputs and pick — the section-4 calls across the WHOLE
+ * composed set: every covering tile is composed on demand (seams stitched
+ * through the ownership partition) and replayed through the S-52 pixel path.
+ * Same parameters, limits, and ownership as the single-chart forms. */
+tile57_status tile57_compose_png(tile57_compose *c, double lon, double lat, double zoom,
+                                 uint32_t width, uint32_t height, const tile57_mariner *m,
+                                 uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_compose_pdf(tile57_compose *c, double lon, double lat, double zoom,
+                                 uint32_t width, uint32_t height, const tile57_mariner *m,
+                                 uint8_t **out, size_t *out_len, tile57_error *err);
+tile57_status tile57_compose_canvas(tile57_compose *c, double lon, double lat, double zoom,
+                                    uint32_t width, uint32_t height, const tile57_mariner *m,
+                                    const tile57_canvas_cb *canvas, tile57_error *err);
+tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, double zoom,
+                                     uint32_t width, uint32_t height, const tile57_mariner *m,
+                                     const tile57_surface_cb *surface, tile57_error *err);
+tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, double zoom,
+                                   const tile57_query_cb *cb, tile57_error *err);
 
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_meta_get(tile57_compose *c, tile57_compose_meta *out);

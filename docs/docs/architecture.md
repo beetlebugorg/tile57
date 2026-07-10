@@ -123,19 +123,24 @@ the same Zig API as the `tile57` module.
 
 The public surface composes the packages into high-level entry points:
 
-- **`Chart`** — open a chart from a path (`openPath`), from bytes (`openBytes`), or
-  as a multi-cell ENC_ROOT (`openCells` / `openCellsStreaming`), then render and
-  inspect it: `renderView` (PNG or PDF), `renderSurfaceView` (world-space GPU
-  callbacks), `queryPoint` (the cursor pick), and the metadata getters. It reads a
-  pre-baked **PMTiles** archive or portrays a live cell — the caller can't tell the
-  difference. (`tile57_render_view` / `tile57_render_pdf` /
-  `tile57_render_surface_cb` / `tile57_query` in the C ABI.)
+- **`Chart`** — ONE open chart, no composition. Open a baked **PMTiles** archive
+  (`openPmtilesPath`, mmap'd; `openBytes`) or a live cell (`openBytes` on `.000`
+  bytes), then take its outputs: view renders (`renderView` — PNG, PDF, or a
+  callback canvas; `renderSurfaceView` — world-space GPU callbacks), the cursor
+  pick (`queryPoint`), the metadata getters, and — for an archive — its stored
+  tiles verbatim through `pmtilesReader()`. In the C ABI: `tile57_tile` /
+  `tile57_png` / `tile57_pdf` / `tile57_canvas` / `tile57_surface` /
+  `tile57_query`. A streaming ENC_ROOT open (`openPath` / `openCells` /
+  `openCellsStreaming`) is the metadata + extraction view of raw source data
+  (the C `tile57_enc_*` readers); it serves no tiles or renders.
 - **Tile production** — bake each cell to its own PMTiles at its compilation scale
   (`tile57_bake_cell_bytes`, which runs the banded bake engine `scene/bake_enc.zig`
   on a single cell), then a runtime **compositor** stitches the overlapping cells
-  for any `(z, x, y)` tile on demand through an ownership partition
-  (`tile57_compose_open` / `tile57_compose_tile`). The public Zig `bakeArchive`
-  runs the same engine over a slice of cells to make one merged archive.
+  through an ownership partition and offers the SAME outputs as a chart, composed:
+  `tile57_compose_tile` for any `(z, x, y)` on demand, `tile57_compose_png` /
+  `_pdf` / `_canvas` / `_surface` / `_query` for composed views and the composed
+  pick. The public Zig `bakeArchive` runs the same engine over a slice of cells to
+  make one merged archive.
 - **`style.build`** (`style/maplibre.zig`) + **`style`** / **`sprite`** —
   generate the MapLibre style and the portrayal assets it references
   (`tile57_style_build` / `tile57_bake_assets` in the C ABI).
@@ -144,13 +149,14 @@ The public surface composes the packages into high-level entry points:
 
 tile57 is built to hold only its working set:
 
-- **Lazy per-cell.** An ENC_ROOT is opened by scanning each cell's header for a
-  cheap spatial index (band + bbox). A cell is parsed and portrayed only when a
-  requested tile needs it; recently used cells are held in an LRU and evicted
-  under bound. The first tile over a fresh area pays a parse/portray cost (tens of
-  ms); after that it is cached.
-- **Best-available band per tile.** Overlapping cells of different compilation
-  scales are resolved per tile to the best band, not all overlaid blindly.
+- **Lazy per-cell reads.** An ENC_ROOT is opened by scanning each cell's header
+  for a cheap spatial index (band + bbox). A cell's bytes are read and parsed
+  only when a metadata or feature query needs them, then released under an LRU
+  bound.
+- **Ownership, not overlays.** Overlapping cells of different compilation scales
+  are resolved by the precomputed ownership partition — each tile's ground
+  belongs to exactly one cell per band, so composing never loads every
+  overlapping cell.
 - **Streaming open.** `openCellsStreaming` (and its on-disk driver `openPath`,
   which backs the C `tile57_enc_*` readers) take per-cell metadata (bbox + scale)
   plus a reader; a cell's bytes are read only on demand and freed on eviction. A

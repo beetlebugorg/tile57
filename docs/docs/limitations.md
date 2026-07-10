@@ -78,18 +78,17 @@ has its own short list of deliberate gaps — see
 ## ENC_ROOT loading
 
 Opening an ENC_ROOT (`Chart.openPath` / `openCellsStreaming`) builds a cheap
-spatial index (band + bbox per cell) and generates tiles **on demand**, parsing +
-portraying only the cells a requested tile needs (best-available scale band per
-tile, recent cells held in an LRU). The catalogue opens in seconds; memory stays
-bounded. Caveats:
+spatial index (band + bbox per cell) and reads a cell's bytes only when a
+metadata or feature query needs them — the catalogue opens in seconds and
+memory stays bounded. It serves metadata and extraction only: tiles and views
+always come from a bake (bake each cell once, then compose on demand).
+Caveats:
 
-- **First-view latency.** The first tile over a fresh area parses + portrays its
-  1–4 cells (tens of ms), then they're cached. Opening the whole NOAA catalogue
-  also pays a one-time index scan (a few seconds, parsing every cell header).
-- **Pre-bake for smooth panning.** For low first-view latency everywhere, bake the
-  ENC_ROOT once with `tile57 bake` (per-cell tiles + an ownership partition) and
-  serve tiles from the compositor. The whole catalogue is a multi-minute one-time
-  bake; a region is far quicker.
+- **Baking is the import step.** The whole NOAA catalogue is a multi-minute
+  one-time bake (`tile57 bake` / `tile57_bake_tree`); a region is far quicker,
+  and re-runs are incremental — only cells whose source changed re-bake.
+- **Index-scan cost.** Opening the whole catalogue as a streaming chart pays a
+  one-time index scan (a few seconds, parsing every cell header).
 - **Low zoom is style-gated.** The generated style's vector-source `minzoom` is
   the bake's tile floor (default 8), and MapLibre never requests tiles below a
   source's minzoom — nothing draws below it regardless of the data.

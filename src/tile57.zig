@@ -60,11 +60,31 @@ pub const bake = struct {
     pub const Progress = chart.BakeProgress;
 };
 
-// ---- Compose: per-cell archives + a partition -> tiles on demand -----------
-/// The runtime compositor: `ComposeSource` over per-cell archives + a partition
-/// (`ComposeSource.tile` composes one tile on demand), `openComposeSourceFiles` to
-/// open from disk, `openComposeSourceCharts` to borrow already-open charts.
-pub const compose = @import("compose");
+// ---- Compose: per-cell archives + a partition -> any output on demand ------
+/// The runtime compositor: a `ComposeSource` over per-cell archives + a
+/// partition offers the SAME outputs as a Chart, composed — `ComposeSource.tile`
+/// for one tile, `renderView` / `renderSurfaceView` / `queryPoint` for composed
+/// views and the composed pick. (The view calls are implemented beside Chart —
+/// the underlying `compose` module is a dependency leaf without the render
+/// path — and surfaced here under the compose name they belong to.)
+pub const compose = struct {
+    const mod = @import("compose");
+    pub const ComposeSource = mod.ComposeSource;
+    pub const ChartArchive = mod.ChartArchive;
+    pub const TileResult = mod.TileResult;
+    pub const LoadedCov = mod.LoadedCov;
+    pub const openComposeSourceFiles = mod.openComposeSourceFiles;
+    pub const openComposeSourceCharts = mod.openComposeSourceCharts;
+    pub const composeTile = mod.composeTile;
+    pub const toPlaneCells = mod.toPlaneCells;
+    pub const clip = mod.clip;
+    /// The composed view render — PNG, PDF, or a callback canvas.
+    pub const renderView = chart.renderComposeView;
+    /// The composed world-space surface stream (the GPU vector twin).
+    pub const renderSurfaceView = chart.renderComposeSurfaceView;
+    /// The composed cursor pick (S-52 §10.8, seams included).
+    pub const queryPoint = chart.composeQueryPoint;
+};
 /// The ownership partition and its `.tpart` sidecar (serialize / deserialize).
 pub const partition = @import("geometry").partition;
 /// The integer computational geometry the compositor and baker share.
