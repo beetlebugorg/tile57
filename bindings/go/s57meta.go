@@ -45,7 +45,7 @@ func Cells(path string) ([]CellInfo, error) {
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cerr C.tile57_error
-	if st := C.tile57_s57_cells(cPath, &out, &outLen, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_enc_cells(cPath, &out, &outLen, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	if out == nil {
@@ -88,7 +88,7 @@ func CatalogEntries(catalog []byte) ([]CatalogEntry, error) {
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cerr C.tile57_error
-	if st := C.tile57_s57_catalog((*C.uint8_t)(unsafe.Pointer(&catalog[0])), C.size_t(len(catalog)), &out, &outLen, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_enc_catalog((*C.uint8_t)(unsafe.Pointer(&catalog[0])), C.size_t(len(catalog)), &out, &outLen, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	if out == nil {
@@ -140,7 +140,7 @@ func Features(path string, classes ...string) ([]Feature, error) {
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cerr C.tile57_error
-	if st := C.tile57_s57_features(cPath, cs, &out, &outLen, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_enc_features(cPath, cs, &out, &outLen, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	return decodeFeatures(out, outLen)
@@ -160,7 +160,7 @@ func FeaturesBytes(base []byte, classes ...string) ([]Feature, error) {
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cerr C.tile57_error
-	if st := C.tile57_s57_features_bytes((*C.uint8_t)(unsafe.Pointer(&base[0])), C.size_t(len(base)), cs, &out, &outLen, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_enc_features_bytes((*C.uint8_t)(unsafe.Pointer(&base[0])), C.size_t(len(base)), cs, &out, &outLen, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	return decodeFeatures(out, outLen)

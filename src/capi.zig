@@ -161,7 +161,7 @@ export fn tile57_version() callconv(.c) [*:0]const u8 {
 /// The per-cell metadata of the S-57 data at `path` (one .000 or a whole ENC_ROOT)
 /// as a JSON array — name/scale/edition/update/issueDate/agency/bbox per cell,
 /// DSID fields reflecting the applied update chain. See tile57.h.
-export fn tile57_s57_cells(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+export fn tile57_enc_cells(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
     const c = Chart.openPath(p, null, false) catch |e| return failCtx(err, e, p);
@@ -175,7 +175,7 @@ export fn tile57_s57_cells(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize
 /// comma-separated object-class acronyms `classes`, as a GeoJSON FeatureCollection
 /// (lon/lat geometry; properties = {"class", ...full S-57 attribute map}). Parsed
 /// without portrayal. NULL/0 out when nothing matched. See tile57.h.
-export fn tile57_s57_features(path: ?[*:0]const u8, classes: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+export fn tile57_enc_features(path: ?[*:0]const u8, classes: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
     const cls = spanOpt(classes) orelse return failWith(err, .badarg, "classes must not be null");
@@ -186,8 +186,8 @@ export fn tile57_s57_features(path: ?[*:0]const u8, classes: ?[*:0]const u8, out
     return OK;
 }
 
-/// tile57_s57_features over in-memory base-cell bytes (no update chain). See tile57.h.
-export fn tile57_s57_features_bytes(base: ?[*]const u8, len: usize, classes: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+/// tile57_enc_features over in-memory base-cell bytes (no update chain). See tile57.h.
+export fn tile57_enc_features_bytes(base: ?[*]const u8, len: usize, classes: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const b = base orelse return failWith(err, .badarg, "base must not be null");
     if (len == 0) return failWith(err, .badarg, "len must not be zero");
@@ -203,7 +203,7 @@ export fn tile57_s57_features_bytes(base: ?[*]const u8, len: usize, classes: ?[*
 /// Decode a CATALOG.031 exchange-set catalogue into a JSON array of its CATD
 /// entries: [{"file","longName","impl","bbox"?}, ...]. NULL/0 out when the file
 /// holds no CATD records. See tile57.h.
-export fn tile57_s57_catalog(catalog_031: ?[*]const u8, len: usize, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+export fn tile57_enc_catalog(catalog_031: ?[*]const u8, len: usize, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const cat = catalog_031 orelse return failWith(err, .badarg, "catalog_031 must not be null");
     if (len == 0) return failWith(err, .badarg, "len must not be zero");

@@ -108,7 +108,7 @@ Link against `libtile57.a`. The `partition.tpart` sidecar (NULL to skip) lets th
 compositor load the ownership partition instead of rebuilding it. The same
 `tile57` chart handle renders finished PNGs/PDFs, reads metadata (bounds, scale,
 coverage, SCAMIN), and answers the cursor pick; raw S-57 reading (cell
-inventory, feature extraction) is handle-free via `tile57_s57_*`. See the
+inventory, feature extraction) is handle-free via `tile57_enc_*`. See the
 [C API](./c-api.md).
 
 ## 3. Use the engine from Zig
@@ -134,7 +134,7 @@ production (bake each cell, then compose on demand) is exposed through the
 ## ENC_ROOT and updates
 
 Open an ENC_ROOT (many cells, each with its sequential `.001`, `.002` … updates)
-with `Chart.openPath` (Zig) or scan it with `tile57_s57_cells` (C) — a single
+with `Chart.openPath` (Zig) or scan it with `tile57_enc_cells` (C) — a single
 call that walks a whole on-disk catalogue, applying each cell's updates. Baking
 (`tile57 bake` / `tile57_bake_tree`) turns it into the per-cell archives the
 compositor serves.

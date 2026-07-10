@@ -145,7 +145,7 @@ typedef struct {
  * agency are DSID EDTN/UPDN/ISDT/AGEN after the update chain is applied;
  * `bbox` is omitted when none parses. For a host's chart-database scan.
  * TILE57_OK with the JSON in *out / *out_len (free with tile57_free). */
-tile57_status tile57_s57_cells(const char *path, uint8_t **out, size_t *out_len,
+tile57_status tile57_enc_cells(const char *path, uint8_t **out, size_t *out_len,
                                tile57_error *err);
 
 /* The features of the S-57 data at `path` (one cell or a whole ENC_ROOT) for
@@ -157,13 +157,13 @@ tile57_status tile57_s57_cells(const char *path, uint8_t **out, size_t *out_len,
  * extraction walks every cell — the caller owns that cost. TILE57_OK with the
  * JSON in *out / *out_len (free with tile57_free); NULL/0 when nothing
  * matched. */
-tile57_status tile57_s57_features(const char *path, const char *classes,
+tile57_status tile57_enc_features(const char *path, const char *classes,
                                   uint8_t **out, size_t *out_len,
                                   tile57_error *err);
 
-/* tile57_s57_features over in-memory base-cell bytes (a .000 read from a zip
+/* tile57_enc_features over in-memory base-cell bytes (a .000 read from a zip
  * member, say) instead of a path. No update chain is applied. */
-tile57_status tile57_s57_features_bytes(const uint8_t *base, size_t len,
+tile57_status tile57_enc_features_bytes(const uint8_t *base, size_t len,
                                         const char *classes,
                                         uint8_t **out, size_t *out_len,
                                         tile57_error *err);
@@ -177,7 +177,7 @@ tile57_status tile57_s57_features_bytes(const uint8_t *base, size_t len,
  * `bbox` is omitted when SLAT/WLON/NLAT/ELON are not all present (aux files).
  * TILE57_OK with the JSON in *out / *out_len (free with tile57_free); NULL/0
  * when the file holds no CATD records. */
-tile57_status tile57_s57_catalog(const uint8_t *catalog_031, size_t len,
+tile57_status tile57_enc_catalog(const uint8_t *catalog_031, size_t len,
                                  uint8_t **out, size_t *out_len,
                                  tile57_error *err);
 

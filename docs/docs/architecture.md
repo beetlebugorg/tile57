@@ -152,7 +152,7 @@ tile57 is built to hold only its working set:
 - **Best-available band per tile.** Overlapping cells of different compilation
   scales are resolved per tile to the best band, not all overlaid blindly.
 - **Streaming open.** `openCellsStreaming` (and its on-disk driver `openPath`,
-  which backs the C `tile57_s57_*` readers) take per-cell metadata (bbox + scale)
+  which backs the C `tile57_enc_*` readers) take per-cell metadata (bbox + scale)
   plus a reader; a cell's bytes are read only on demand and freed on eviction. A
   host then holds only the working set's bytes, not the whole catalogue — the
   right choice for a large ENC_ROOT.

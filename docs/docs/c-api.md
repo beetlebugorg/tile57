@@ -135,23 +135,23 @@ a host's import UI:
 /* Per-cell metadata of the S-57 data at `path` (one .000, updates applied, or a
  * whole ENC_ROOT) as a JSON array: [{"name","scale","edition","update",
  * "issueDate","agency","bbox"}, ...] — a host's chart-database scan. */
-tile57_status tile57_s57_cells(const char *path, uint8_t **out, size_t *out_len,
+tile57_status tile57_enc_cells(const char *path, uint8_t **out, size_t *out_len,
                                tile57_error *err);
 
 /* Features for comma-separated object-class acronyms (e.g. "DEPARE,DRGARE") as
  * a GeoJSON FeatureCollection: lon/lat geometry, properties = {"class", plus the
  * full S-57 acronym->value attribute map}. NULL/0 when nothing matched. */
-tile57_status tile57_s57_features(const char *path, const char *classes,
+tile57_status tile57_enc_features(const char *path, const char *classes,
                                   uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* The same over in-memory base-cell bytes (a .000 from a zip member, say). */
-tile57_status tile57_s57_features_bytes(const uint8_t *base, size_t len,
+tile57_status tile57_enc_features_bytes(const uint8_t *base, size_t len,
                                         const char *classes,
                                         uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* Decode a CATALOG.031 exchange-set catalogue into a JSON array of its CATD
  * entries — file path, longName (chart title), impl (BIN/ASC/TXT), bbox. */
-tile57_status tile57_s57_catalog(const uint8_t *catalog_031, size_t len,
+tile57_status tile57_enc_catalog(const uint8_t *catalog_031, size_t len,
                                  uint8_t **out, size_t *out_len, tile57_error *err);
 ```
 
