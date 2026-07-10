@@ -1692,7 +1692,14 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// absent on the reference data; the A/B boundary line is the visible feature.
 fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     if (opts.suppress_lines) return;
-    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
+    // S-52 §8.6.2 boundary masking, mirrored from the portrayal stroke path: the
+    // producer flags the M_NSYS edges that coincide with the cell limit (MASK/USAG),
+    // so the system boundary strokes only where a REAL division runs — not along
+    // every cell junction of a uniform IALA region. The fill is unaffected.
+    const geo_parts = if (cell.needsDrawableBoundary(f))
+        cell.drawableLineParts(a, f) catch return
+    else
+        featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
     const fmeta = rs.FeatureMeta{
@@ -1743,7 +1750,12 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, color: []const u8, width: f64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     if (f.prim != 2 and f.prim != 3) return;
     if (opts.suppress_lines) return; // coarse band over finer M_COVR (centre): drop the stroke
-    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
+    // Same S-52 §8.6.2 boundary masking as the portrayal stroke path (see
+    // emitNavSystemFallback): masked cell-limit edges don't stroke.
+    const geo_parts = if (cell.needsDrawableBoundary(f))
+        cell.drawableLineParts(a, f) catch return
+    else
+        featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
     const fmeta = rs.FeatureMeta{
