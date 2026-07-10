@@ -613,10 +613,13 @@ pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
         coverage_json = scene.coverage.encodeJson(cov_arena.allocator(), cc) catch null;
     } else |_| {}
 
-    // Native scale only: the cell's band window, no fill-down / overscale.
+    // The cell's band window, plus the extend_min fill DOWN to z0: sub-band tiles
+    // (scamin-thinned by the scene cull) let the compositor pull this cell up into
+    // coarser zooms where nothing coarser covers — a harbor-only region still
+    // shows land and coast at z4. No overscale above the window.
     const zr = bake_enc.bandZooms(bake_enc.bandOf(cscl));
     const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
-    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), zr.min, zr.max, .mlt, true, null, null, coverage_json);
+    return bakeArchive(&cell_in, resolveRulesDir(rules_dir), 0, zr.max, .mlt, true, null, null, coverage_json);
 }
 
 // ---- parallel batch cell-bake -------------------------------------------------

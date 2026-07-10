@@ -2095,10 +2095,29 @@ fn appendCellFeatures(
     // LIGHTS cull margin: display-mm sector figures reach ~1 tile at every zoom;
     // ground-length legs (directional lights) reach their honest per-zoom span.
     const light_reach = lightReachTiles(opts.light_range_m, z, (tb[1] + tb[3]) * 0.5);
+    // Sub-band SCAMIN cull: below the cell's native band floor this is a fill-up
+    // tile (the compositor pulls finer data into coarser zooms where nothing
+    // coarser covers), and a feature whose (floored) SCAMIN cannot display
+    // anywhere in this tile is dead weight — cull it so the z4 copy of a harbor
+    // cell carries land/coast/majors, not every sounding. The threshold is the
+    // tile's most permissive display denominator (its highest-|lat| edge) with
+    // one zoom of slack, so the cull stays strictly looser than any client
+    // gate-latitude choice; SCAMIN-less features always pass.
+    const subband_floor = @import("tiles").band.bandZooms(@import("tiles").band.bandOf(cell.params.cscl)).min;
+    const subband_min_denom: f64 = if (z < subband_floor) blk: {
+        const max_abs_lat = @max(@abs(tb[1]), @abs(tb[3]));
+        const k = @import("style").scaminGateK(max_abs_lat);
+        break :blk k / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z))) / 2.0;
+    } else 0;
     for (cell.features, 0..) |f, fi| {
         // Isolated single-feature render (explore --kitty thumbnail): draw only
         // the requested feature, skip the rest of the cell.
         if (opts.only_fi) |only| if (fi != only) continue;
+        if (subband_min_denom > 0) {
+            if (effScamin(f, opts)) |sc| {
+                if (@as(f64, @floatFromInt(sc)) < subband_min_denom) continue;
+            }
+        }
         var ml = mlon;
         var mt = mlat;
         if (f.objl == 75) {

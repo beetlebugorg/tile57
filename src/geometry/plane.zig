@@ -127,6 +127,24 @@ pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     }.lt);
     reachCut(cells, &order, tier);
 
+    // Fill-up gap-fillers: FINER cells (band_floor > tier) own ground at this
+    // coarser tier only where NO eligible cell covers — appended after every
+    // eligible cell, so they can never take ground from the band's own cells
+    // (position in `order` is priority: each cell's face is its coverage minus
+    // every earlier cell's). Among the fillers the COARSEST wins (closest to
+    // this tier's display scale), equal scales by the usual tie-break. So a
+    // harbor-only region still has an owner at z4, scamin-thinned by the bake.
+    const n_eligible = order.items.len;
+    for (cells, 0..) |c, i| {
+        if (c.band_floor > tier) try order.append(gpa, i);
+    }
+    std.mem.sort(usize, order.items[n_eligible..], cells, struct {
+        fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
+            if (cs[ia].cscl != cs[ib].cscl) return cs[ia].cscl > cs[ib].cscl; // coarsest first
+            return cs[ia].order < cs[ib].order;
+        }
+    }.lt);
+
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -140,14 +158,20 @@ pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     // Accumulated coverage of all finer eligible cells processed so far.
     var covered: [][]Pt = try sa.alloc([]Pt, 0);
 
-    for (order.items) |i| {
+    for (order.items, 0..) |i, k| {
         const cov = try cellCoverage(sa, cells[i]);
         // owned = cov \ covered, allocated in gpa (the kept result).
         const owned = if (covered.len == 0)
             try dupePolygonGpa(gpa, cov)
         else
             try boolean.compute(gpa, cov, covered, .diff);
-        try out.append(gpa, .{ .index = i, .owned = owned });
+        // A gap-filler fully covered by the eligible cells owns nothing here —
+        // drop its empty face so a nested finer cell adds no face at all.
+        if (k >= n_eligible and owned.len == 0) {
+            boolean.freePolygon(gpa, owned);
+        } else {
+            try out.append(gpa, .{ .index = i, .owned = owned });
+        }
 
         // covered ∪= cov (scratch).
         const merged = try boolean.compute(sa, covered, cov, .unite);
@@ -191,6 +215,24 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         }
     }.lt);
     reachCut(cells, &order, tier);
+
+    // Fill-up gap-fillers: FINER cells (band_floor > tier) own ground at this
+    // coarser tier only where NO eligible cell covers — appended after every
+    // eligible cell, so they can never take ground from the band's own cells
+    // (position in `order` is priority: each cell's face is its coverage minus
+    // every earlier cell's). Among the fillers the COARSEST wins (closest to
+    // this tier's display scale), equal scales by the usual tie-break. So a
+    // harbor-only region still has an owner at z4, scamin-thinned by the bake.
+    const n_eligible = order.items.len;
+    for (cells, 0..) |c, i| {
+        if (c.band_floor > tier) try order.append(gpa, i);
+    }
+    std.mem.sort(usize, order.items[n_eligible..], cells, struct {
+        fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
+            if (cs[ia].cscl != cs[ib].cscl) return cs[ia].cscl > cs[ib].cscl; // coarsest first
+            return cs[ia].order < cs[ib].order;
+        }
+    }.lt);
 
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
@@ -244,6 +286,12 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
             defer boolean.freePolygon(pa, diff);
             break :blk try dupePolygonGpa(gpa, diff);
         };
+        // A gap-filler fully covered by the eligible cells owns nothing here —
+        // drop its empty face so a nested finer cell adds no face at all.
+        if (k >= n_eligible and owned.len == 0) {
+            boolean.freePolygon(gpa, owned);
+            continue;
+        }
         try out.append(gpa, .{ .index = ci, .owned = owned });
     }
     return out.toOwnedSlice(gpa);
@@ -734,13 +782,23 @@ test "fuzz: partition == per-point finest-eligible-covering, zero overlap, zero 
         while (qy <= 11 * grid) : (qy += 19) {
             var qx: i64 = -7 * grid;
             while (qx <= 11 * grid) : (qx += 19) {
-                // Reference: finest (smallest cscl) eligible cell whose bbox covers.
+                // Reference: finest (smallest cscl) eligible cell whose bbox covers;
+                // where none covers, the COARSEST (largest cscl) finer cell fills up.
                 var best: ?usize = null;
                 for (cells.items, 0..) |c, i| {
                     if (c.band_floor > tier) continue;
                     const bb = bboxes.items[i];
                     if (qx >= bb[0] and qx <= bb[2] and qy >= bb[1] and qy <= bb[3]) {
                         if (best == null or c.cscl < cells.items[best.?].cscl) best = i;
+                    }
+                }
+                if (best == null) {
+                    for (cells.items, 0..) |c, i| {
+                        if (c.band_floor <= tier) continue;
+                        const bb = bboxes.items[i];
+                        if (qx >= bb[0] and qx <= bb[2] and qy >= bb[1] and qy <= bb[3]) {
+                            if (best == null or c.cscl > cells.items[best.?].cscl) best = i;
+                        }
                     }
                 }
                 // Skip points on any bbox edge (even-odd ambiguity).

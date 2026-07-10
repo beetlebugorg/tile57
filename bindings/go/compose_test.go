@@ -35,13 +35,20 @@ func TestComposeSingleCell(t *testing.T) {
 	if m.Cells != 1 {
 		t.Fatalf("compose cells = %d, want 1", m.Cells)
 	}
-	cx, cy := lonLatToTile((m.West+m.East)/2, (m.South+m.North)/2, m.MinZoom)
-	tile, owned, err := src.Tile(m.MinZoom, cx, cy)
+	// The fill-up bake serves from z0, but a single harbour cell is sub-pixel at
+	// world zooms (its low-zoom tiles are legitimately empty) — probe a zoom
+	// where the cell has real extent.
+	z := uint8(10)
+	if z < m.MinZoom {
+		z = m.MinZoom
+	}
+	cx, cy := lonLatToTile((m.West+m.East)/2, (m.South+m.North)/2, z)
+	tile, owned, err := src.Tile(z, cx, cy)
 	if err != nil {
 		t.Fatalf("Tile: %v", err)
 	}
 	if len(tile) == 0 || !owned {
-		t.Fatalf("centre tile z%d/%d/%d: %d bytes owned=%v, want content", m.MinZoom, cx, cy, len(tile), owned)
+		t.Fatalf("centre tile z%d/%d/%d: %d bytes owned=%v, want content", z, cx, cy, len(tile), owned)
 	}
 	part := filepath.Join(t.TempDir(), "partition.tpart")
 	if err := src.SavePartition(part); err != nil {
@@ -57,7 +64,7 @@ func TestComposeSingleCell(t *testing.T) {
 		t.Fatalf("OpenCompose: %v", err)
 	}
 	defer src2.Close()
-	tile2, owned2, err := src2.Tile(m.MinZoom, cx, cy)
+	tile2, owned2, err := src2.Tile(z, cx, cy)
 	if err != nil {
 		t.Fatalf("Tile(sidecar): %v", err)
 	}
@@ -65,7 +72,7 @@ func TestComposeSingleCell(t *testing.T) {
 		t.Fatalf("sidecar-loaded serve differs: %d bytes owned=%v (want %d bytes)", len(tile2), owned2, len(tile))
 	}
 	t.Logf("compose z%d..%d served %d bytes at z%d/%d/%d (sidecar round-trip ok)",
-		m.MinZoom, m.MaxZoom, len(tile), m.MinZoom, cx, cy)
+		m.MinZoom, m.MaxZoom, len(tile), z, cx, cy)
 }
 
 // Set TILE57_COMPOSE_TESTDIR to a dir of per-cell *.cell.tmp/*.pmtiles archives (e.g. from

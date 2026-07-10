@@ -394,6 +394,9 @@ fn finishOpen(
     var minz: u8 = 255;
     var maxz: u8 = 0;
     var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 }; // union coverage [w, s, e, n]
+    // The floor is what the archives actually carry (a fill-up bake starts at z0;
+    // an archive baked before fill-up starts at its band floor), not the band model.
+    for (readers) |rp| minz = @min(minz, rp.header.min_zoom);
     for (shims) |sh| {
         const bz = band.bandZooms(band.bandOf(sh.cscl));
         minz = @min(minz, bz.min);

@@ -1490,15 +1490,26 @@ test "fill-down bake: a coastal-only bay gets low-zoom tiles the overview extend
     // band the extend_min fill rides), but it does not cover the bay. Without
     // fill-down the bay has no tiles below coastal's window (z<9): the reported
     // district-pack z6–z8 hole.
+    // Two features: a SCAMIN-gated buoy (hidden below its display scale — the
+    // sub-band cull drops it from fill-down tiles, where the client gate would
+    // hide it anyway) and a SCAMIN-less one (land/coast in real cells) that
+    // keeps the low-zoom tiles populated.
     const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
-    const feats = [_]s57.Feature{.{
+    const feats = [_]s57.Feature{ .{
         .rcnm = 0,
         .rcid = 1,
         .prim = 1,
         .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &scamin_attr,
-    }};
+    }, .{
+        .rcnm = 0,
+        .rcid = 2,
+        .prim = 1,
+        .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &.{},
+    } };
     var bay_cell = try testCell(gpa, 0.35, 0.35, 200_000, &feats);
     defer bay_cell.deinit();
     var ov_cell = try testCell(gpa, 10.5, 10.5, 3_000_000, &feats);
@@ -1513,7 +1524,7 @@ test "fill-down bake: a coastal-only bay gets low-zoom tiles the overview extend
     const cover = [_][]const []const s57.LonLat{&rings};
     const bay_bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
     const ov_bounds = [4]f64{ 10.2, 10.2, 10.8, 10.8 };
-    const streams = [_]?[]const u8{"DrawingPriority:7;PointInstruction:BOYLAT01"};
+    const streams = [_]?[]const u8{ "DrawingPriority:7;PointInstruction:BOYLAT01", "DrawingPriority:7;PointInstruction:BOYLAT01" };
     const scamins = [_]u32{260_000};
 
     var bay = Backend{ .cell = bay_cell, .portrayal = &streams, .bounds = bay_bounds, .cscl = 200_000, .coverage = &cover, .scamins = &scamins };

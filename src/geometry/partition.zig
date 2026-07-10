@@ -150,7 +150,7 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
 // which is what makes an incremental recompose safe when coverage is unchanged.
 
 pub const MAGIC = [4]u8{ 'T', '5', '7', 'P' };
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2; // 2: fill-up gap-filler faces (finer cells own uncovered ground at coarse tiers)
 
 pub const LoadError = error{
     BadMagic,
@@ -357,6 +357,38 @@ test "partition band-stack: tiers descending, mapForZoom + ownerAt resolve per b
     try testing.expect(!boolean.pointInEvenOdd(cf, 50, 50)); // ...but NOT the harbor hole
     try testing.expect(part.ownedFace(1, 10) == null); // harbor below its floor: owns nothing
     try testing.expect(part.ownedFace(99, 14) == null); // out of range
+}
+
+test "fill-up: finer cells own coarse-tier ground only where nothing coarser covers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A coastal cell [0,100]² (floor 9) and two finer cells: a harbor [40,60]²
+    // (floor 13) inside the coastal coverage, and a harbor [200,220]² (floor 13)
+    // over ground NOTHING coarser covers.
+    const coastal = try boxPoly(a, 0, 0, 100, 100);
+    const harbor_in = try boxPoly(a, 40, 40, 60, 60);
+    const harbor_out = try boxPoly(a, 200, 200, 220, 220);
+    const cells = [_]plane.Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coastal} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 0, .cov1 = &.{harbor_in} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 1, .cov1 = &.{harbor_out} },
+    };
+
+    var part = try build(testing.allocator, &cells);
+    defer part.deinit();
+
+    // z4 → the coarsest map (tier 9). The coastal cell keeps every point it
+    // covers — the nested harbor is a gap-filler and takes NOTHING from it —
+    // while the uncovered harbor owns its own ground instead of a blank.
+    try testing.expectEqual(@as(?usize, 0), part.ownerAt(4, 50, 50));
+    try testing.expectEqual(@as(?usize, 0), part.ownerAt(4, 10, 10));
+    try testing.expectEqual(@as(?usize, 2), part.ownerAt(4, 210, 210));
+    try testing.expectEqual(@as(?usize, null), part.ownerAt(4, 400, 400));
+
+    // At the harbor band the nested harbor owns its box as before.
+    try testing.expectEqual(@as(?usize, 1), part.ownerAt(14, 50, 50));
 }
 
 test "partition serialize/deserialize round-trips exactly" {
