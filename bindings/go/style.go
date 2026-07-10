@@ -138,7 +138,7 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cerr C.tile57_error
-	if st := C.tile57_build_style(tmplPtr, tmplLen, &cm, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_style_build(tmplPtr, tmplLen, &cm, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	return tileBytes(out, outLen), nil

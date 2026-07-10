@@ -6,7 +6,7 @@ contour, display category, and the rest — **entirely client-side**.
 
 Under the hood it runs the chartplotter **`tile57` style engine** (pure Zig)
 compiled to a ~145 KB WebAssembly module. The same engine ships in the native
-`libtile57` C ABI (`tile57_build_style`) and the `tile57` CLI, so the style your
+`libtile57` C ABI (`tile57_style_build`) and the `tile57` CLI, so the style your
 front-end produces is **byte-for-byte identical** to the native build (see
 [Parity](#parity)). No server round-trip, no second implementation to keep in
 sync.

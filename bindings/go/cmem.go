@@ -48,7 +48,7 @@ func (a *cArena) str(s string) *C.char {
 
 // int32Array copies a Go []int32 into a malloc'd C int32_t array, returning the
 // base pointer + count (NULL/0 for an empty slice). Used for the enabled-bands and
-// SCAMIN-manifest inputs to tile57_build_style.
+// SCAMIN-manifest inputs to tile57_style_build.
 func (a *cArena) int32Array(v []int32) (*C.int32_t, C.size_t) {
 	n := len(v)
 	if n == 0 {

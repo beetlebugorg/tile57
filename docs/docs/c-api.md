@@ -443,7 +443,7 @@ tile57_status tile57_bake_glyph_sdf(tile57_assets *out, tile57_error *err);
 
 ## Build a MapLibre style
 
-`tile57_build_style` turns a MapLibre style template + the mariner's S-52 display
+`tile57_style_build` turns a MapLibre style template + the mariner's S-52 display
 options + the S-52 colortables into a concrete style JSON, client-side. The
 template + colortables come from the built-in `tile57_style_template` /
 `tile57_colortables_default` (or the generated assets); the host fills
@@ -482,7 +482,7 @@ void tile57_mariner_defaults(tile57_mariner *m);   /* canonical defaults, date_v
  * array. scamin: the distinct SCAMIN denominators present in the source (e.g.
  * from tile57_scamin) — when non-NULL the `_scamin` layers split into per-value
  * native-minzoom buckets; scamin_lat is the representative latitude. */
-tile57_status tile57_build_style(const char *template_json, size_t template_len,
+tile57_status tile57_style_build(const char *template_json, size_t template_len,
                                  const tile57_mariner *m,
                                  const char *colortables_json, size_t colortables_len,
                                  const int32_t *enabled_bands, size_t enabled_band_count,
@@ -490,7 +490,7 @@ tile57_status tile57_build_style(const char *template_json, size_t template_len,
                                  uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* Minimal MapLibre style-mutation ops to turn the style for `old_m` into the style
- * for `new_m` (same inputs as tile57_build_style) — for flicker-free mariner
+ * for `new_m` (same inputs as tile57_style_build) — for flicker-free mariner
  * toggles. Writes a JSON op array to *out/*out_len (free with tile57_free). */
 tile57_status tile57_style_diff(const char *template_json, size_t template_len,
                                 const tile57_mariner *old_m, const tile57_mariner *new_m,

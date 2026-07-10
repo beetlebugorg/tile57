@@ -583,7 +583,7 @@ void tile57_compose_close(tile57_compose *c);
 /* ======================================================================== *
  * 6. Style + portrayal assets
  *
- * tile57 ships tile generation AND style generation together. tile57_build_style
+ * tile57 ships tile generation AND style generation together. tile57_style_build
  * turns a MapLibre style template + the mariner's S-52 display options + the S-52
  * colortables into a concrete style JSON, client-side; tile57_bake_assets produces
  * the colour tables, line styles, and sprite / pattern / glyph atlases the style
@@ -593,7 +593,7 @@ void tile57_compose_close(tile57_compose *c);
 /* ---- portrayal assets ---------------------------------------------------- */
 
 /* All portrayal assets in memory, from the library's embedded catalogue
- * (catalog_dir NULL/"") or an on-disk one. Pairs with tile57_build_style + the
+ * (catalog_dir NULL/"") or an on-disk one. Pairs with tile57_style_build + the
  * composed tiles for a complete renderable chart. Free with
  * tile57_assets_free. */
 typedef struct {
@@ -619,7 +619,7 @@ void tile57_assets_free(tile57_assets *out);
 
 /* ---- chart-style generation ---------------------------------------------
  *
- * tile57_build_style patches the mariner-driven parts of the template (depth
+ * tile57_style_build patches the mariner-driven parts of the template (depth
  * shading, sounding/danger symbol swaps, contour-label units, the per-scheme
  * recolour) and AND-s the display filters (category, band, boundary/point style,
  * date validity, text groups, …) onto every source:"chart" layer. The template +
@@ -630,7 +630,7 @@ void tile57_assets_free(tile57_assets *out);
  * host can generate a complete style with no on-disk catalogue or template file:
  *   tile57_colortables_default(&ct,&ctn,NULL);
  *   tile57_style_template(scheme, "http://host/{z}/{x}/{y}", NULL,NULL,0,0,0, &t,&tn,NULL);
- *   tile57_build_style(t,tn, &m, ct,ctn, bands,nb, scamin,nsm,lat, &style,&sn,NULL);
+ *   tile57_style_build(t,tn, &m, ct,ctn, bands,nb, scamin,nsm,lat, &style,&sn,NULL);
  * Free each buffer with tile57_free. */
 
 /* Build a MapLibre style JSON from a template + mariner settings + S-52 colortables.
@@ -645,7 +645,7 @@ void tile57_assets_free(tile57_assets *out);
  * scamin_lat: representative latitude (degrees) for the bucket minzooms (the SCAMIN
  *   display cutoff is latitude-dependent); use the source's center latitude.
  * TILE57_OK with the style JSON in *out / *out_len (free with tile57_free). */
-tile57_status tile57_build_style(const char *template_json, size_t template_len,
+tile57_status tile57_style_build(const char *template_json, size_t template_len,
                                  const tile57_mariner *m,
                                  const char *colortables_json, size_t colortables_len,
                                  const int32_t *enabled_bands, size_t enabled_band_count,
@@ -654,7 +654,7 @@ tile57_status tile57_build_style(const char *template_json, size_t template_len,
 
 /* Compute the minimal MapLibre style-mutation ops to turn the style for `old_m`
  * into the style for `new_m` — same template/colortables/bands/scamin inputs as
- * tile57_build_style, so the two styles are comparable. For a flicker-free mariner
+ * tile57_style_build, so the two styles are comparable. For a flicker-free mariner
  * toggle the host applies each op in place (map.setFilter / setPaintProperty /
  * setLayoutProperty) instead of re-setStyle-ing, leaving overlays and sources
  * untouched. The output is a JSON array; each element is one mutation:
@@ -682,7 +682,7 @@ tile57_status tile57_colortables_default(uint8_t **out, size_t *out_len,
 
 /* Base MapLibre style template (layers + chart `sources` + sprite/glyph URLs) from
  * the catalogue baked into the library — no template file needed. The source lives
- * in the template; the per-change mariner patch (tile57_build_style) takes none.
+ * in the template; the per-change mariner patch (tile57_style_build) takes none.
  *   scheme:       a tile57_scheme (selects the per-scheme palette).
  *   source_tiles: the chart {z}/{x}/{y} tiles URL (NULL -> a default pmtiles:// source).
  *   sprite,glyphs:base URLs that enable the symbol / text layers (NULL omits them).
@@ -694,7 +694,7 @@ tile57_status tile57_colortables_default(uint8_t **out, size_t *out_len,
  *            tile57_info.tile_type). TILE57_TILE_TYPE_MLT emits "encoding":"mlt" on
  *            the source so maplibre-gl >= 5.12 decodes MLT natively; 0 /
  *            TILE57_TILE_TYPE_MVT emits nothing (the MapLibre default). The hint
- *            survives tile57_build_style / tile57_style_diff.
+ *            survives tile57_style_build / tile57_style_diff.
  * TILE57_OK with *out / *out_len set (free with tile57_free). */
 tile57_status tile57_style_template(tile57_scheme scheme, const char *source_tiles,
                                     const char *sprite, const char *glyphs,

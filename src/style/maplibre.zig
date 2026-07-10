@@ -181,7 +181,7 @@ pub const Options = struct {
     // S-52 mariner display options. null = a TEMPLATE (no client display filters
     // baked in — the bundle + tile57_style_template path; the client gates live).
     // Non-null = the full style with the mariner's display filters + depth shading /
-    // sounding-split / danger-swap baked in (the C-ABI tile57_build_style path).
+    // sounding-split / danger-swap baked in (the C-ABI tile57_style_build path).
     // Colour + layout always resolve through the mariner builders (default mariner
     // when null), so there is ONE style builder — the mariner builders is retired.
     mariner: ?mariner.Settings = null,
@@ -1031,7 +1031,7 @@ pub fn buildFromTemplate(
 /// Same as buildFromTemplate but threading a SCAMIN manifest (the distinct
 /// denominators present + a representative latitude), so the RUNTIME style gets the
 /// SAME per-value native-minzoom bucket layers the offline bundle does (host
-/// host-canonical-backend.md §"Still needed" #1 — the `tile57_build_style` runtime
+/// host-canonical-backend.md §"Still needed" #1 — the `tile57_style_build` runtime
 /// path otherwise leaves every `_scamin` layer ungated). Empty `scamin` == the
 /// plain buildFromTemplate behaviour.
 pub fn buildFromTemplateScamin(
@@ -1082,7 +1082,7 @@ pub fn buildFromTemplateScamin(
                         if (t == .array and t.array.items.len > 0 and t.array.items[0] == .string)
                             opts.source_tiles = t.array.items[0].string;
                     }
-                    if (c.get("encoding")) |e| { // MLT hint rides the rebuild (tile57_build_style / style_diff)
+                    if (c.get("encoding")) |e| { // MLT hint rides the rebuild (tile57_style_build / style_diff)
                         if (e == .string) opts.encoding = e.string;
                     }
                     if (c.get("minzoom")) |z| {

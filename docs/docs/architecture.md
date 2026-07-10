@@ -138,7 +138,7 @@ The public surface composes the packages into high-level entry points:
   runs the same engine over a slice of cells to make one merged archive.
 - **`style.build`** (`style/maplibre.zig`) + **`style`** / **`sprite`** —
   generate the MapLibre style and the portrayal assets it references
-  (`tile57_build_style` / `tile57_bake_assets` in the C ABI).
+  (`tile57_style_build` / `tile57_bake_assets` in the C ABI).
 
 ## The memory design
 

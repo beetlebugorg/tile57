@@ -26,7 +26,7 @@ const colorprofile_registry = @import("colorprofile_registry");
 const gpa = std.heap.smp_allocator;
 const Chart = chart.Chart;
 
-// Wall-clock time for "today" date resolution in tile57_build_style. Zig 0.16
+// Wall-clock time for "today" date resolution in tile57_style_build. Zig 0.16
 // keeps the clock behind Io; the lib links libc, so call time(3) directly.
 extern fn time(tloc: ?*c_long) callconv(.c) c_long;
 
@@ -768,7 +768,7 @@ fn embeddedColorProfileXml() ?[]const u8 {
 }
 
 /// S-52 colortables.json from the colour profile baked into the library — no
-/// on-disk catalogue needed. Pair with tile57_style_template / tile57_build_style.
+/// on-disk catalogue needed. Pair with tile57_style_template / tile57_style_build.
 export fn tile57_colortables_default(out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const xml = embeddedColorProfileXml() orelse return failWith(err, .internal, "embedded colour profile missing");
@@ -950,7 +950,7 @@ const CMariner = extern struct {
     size_scale: f64,
     // S-52 §14.5 fine-grained viewing-group control: a DENY-LIST of the raw `vg`
     // ids the mariner turned OFF (NULL/len 0 -> every group shown). Appended at the
-    // end for ABI-append-safety. The pointee must outlive the tile57_build_style call.
+    // end for ABI-append-safety. The pointee must outlive the tile57_style_build call.
     viewing_groups_off: [*c]const i32,
     viewing_groups_off_len: u32,
     // Gate SCAMIN with a live client filter instead of per-value bucket layers
@@ -1028,7 +1028,7 @@ fn scaminBuf(scamin: ?[*]const i32, scamin_count: usize) ![]u32 {
 
 /// Build a MapLibre style JSON from a template + mariner settings + colortables.
 /// See tile57.h.
-export fn tile57_build_style(
+export fn tile57_style_build(
     template_json: ?[*]const u8,
     template_len: usize,
     cm: ?*const CMariner,
@@ -1062,7 +1062,7 @@ export fn tile57_build_style(
 }
 
 /// Compute the minimal MapLibre style-mutation ops turning the style for `old_m`
-/// into the style for `new_m` (same inputs as tile57_build_style, so the styles are
+/// into the style for `new_m` (same inputs as tile57_style_build, so the styles are
 /// comparable): a JSON op array — "[]" when nothing changed, [{"op":"rebuild"}]
 /// when the layer SET differs (host falls back to setStyle). See tile57.h.
 export fn tile57_style_diff(
@@ -1108,7 +1108,7 @@ export fn tile57_style_diff(
 
 /// Generate the base MapLibre style template from the catalogue baked into the
 /// library — the chart `sources` block, sprite/glyph URLs and the layer set;
-/// mariner settings are then applied on top with tile57_build_style. See tile57.h
+/// mariner settings are then applied on top with tile57_style_build. See tile57.h
 /// for the parameter semantics (minzoom emitted verbatim; tile_encoding MLT emits
 /// "encoding":"mlt" on the source).
 export fn tile57_style_template(

@@ -39,7 +39,7 @@ func TestStyle(t *testing.T) {
 }
 
 // TestIgnoreScamin verifies the ?ignoreScamin toggle disables SCAMIN scale-gating
-// through the full C ABI: tile57_build_style carries no SCAMIN manifest, so the
+// through the full C ABI: tile57_style_build carries no SCAMIN manifest, so the
 // gated style uses the per-feature zoom-gate fallback ("log2"); IgnoreScamin drops
 // it so every feature shows in-band.
 func TestIgnoreScamin(t *testing.T) {
