@@ -134,7 +134,16 @@ fn segBelow(e1: *SweepEvent, e2: *SweepEvent) bool {
     if (a1 != 0 or a2 != 0) {
         // Not collinear.
         if (e1.p.eql(e2.p)) return e1.below(e2.other.p); // share left endpoint
-        if (queueBefore(e2, e1)) return e2.above(e1.p); // e2 inserted first
+        // A T-touch: one edge's left endpoint lies exactly ON the other segment
+        // (a subject vertex on a coincident seam edge is the common case). The
+        // on-segment point says nothing about order — decide by where the
+        // touching edge HEADS, else the toucher sorts below the touched edge
+        // and inherits its sweep flags from the wrong neighbour.
+        if (a1 == 0) return e1.below(e2.other.p); // e2 starts on e1
+        if (queueBefore(e2, e1)) {
+            if (signedArea(e2.p, e2.other.p, e1.p) == 0) return e2.above(e1.other.p); // e1 starts on e2
+            return e2.above(e1.p); // e2 inserted first
+        }
         return e1.below(e2.p);
     }
     // Collinear: subject below clip, then stable id — consistent with queueBefore.
