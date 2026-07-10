@@ -413,7 +413,7 @@ typedef struct {
      * (tile57_bake_assets sprite_png/json), world anchor, rotation (deg), and the
      * symbol's un-rotated half-extent in reference px. Draw the atlas cell as a
      * quad of that half-size, centred on the anchor. NULL => symbols tessellate
-     * via draw_symbol instead. Must be the LAST field (ABI-appended). */
+     * via draw_symbol instead. (ABI-appended after the original vtable.) */
     void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
     /* Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
      * prefix) + the fill rings (world). Tile the cell across the polygon at a
