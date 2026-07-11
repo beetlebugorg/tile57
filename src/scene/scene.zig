@@ -64,7 +64,6 @@ const SYMBOL_SCALE: f64 = @import("render").sndfrm.SYMBOL_SCALE;
 // rounds to whole feet — contour valdco values are whole metres).
 const M_TO_FT: f64 = @import("render").sndfrm.M_TO_FT;
 
-
 // S-57 attribute code for SCAMIN (the minimum display scale 1:N, S-57 Appendix A
 // attr 133 / S-52 §8.4). Features carrying it are routed to a dedicated *_scamin
 // MVT layer so the style can drop them below their 1:N scale; the value travels on
@@ -330,7 +329,6 @@ fn coveredByFiner(cover_clip: []const []const mvt.Point, lon: f64, lat: f64, z: 
 }
 
 // Clip a line + simplify each kept run (drop runs that collapse below 2 vertices).
-
 
 fn geomBounds(g: []const s57.LonLat) [4]f64 {
     var b = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
@@ -2435,7 +2433,6 @@ test "listHasAny splits S-57 comma lists and matches any target" {
     try std.testing.expect(!listHasAny("", &.{18}));
 }
 
-
 fn findProp(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
     for (props) |pr| if (std.mem.eql(u8, pr.key, key)) return pr.value;
     return null;
@@ -2449,8 +2446,6 @@ test "featureScamin reads s57 attr 133" {
     const without = s57.Feature{ .rcnm = 0, .rcid = 3, .prim = 1, .objl = 14 };
     try std.testing.expectEqual(@as(?i64, null), featureScamin(without));
 }
-
-
 
 test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/scamin" {
     const gpa = std.testing.allocator;

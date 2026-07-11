@@ -268,7 +268,6 @@ fn readParseCell(io: std.Io, dir: std.Io.Dir, bpath: []const u8) ?engine.s57.Cel
     return engine.s57.parseCellWithUpdates(gpa, base, ups.items) catch null;
 }
 
-
 /// THE eager cell-coverage loader: walk an ENC_ROOT, parse each cell once (base +
 /// updates via readParseCell), and capture its M_COVR coverage + bbox + cscl + name
 /// + date. One entry per stem (a boundary cell shared by two districts loads once).

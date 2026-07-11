@@ -352,8 +352,7 @@ pub const VectorSurface = struct {
         // scaled by size_scale (scene.walkComplexRun), so the brick must scale to
         // match — otherwise bricks would be native-sized at display-scaled spacing.
         const dev: f64 = self.refDev();
-        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null)
-        else try self.emitSymbol(s, at, rot_deg, scale);
+        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null) else try self.emitSymbol(s, at, rot_deg, scale);
     }
 
     /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
@@ -423,8 +422,7 @@ pub const VectorSurface = struct {
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), null)
-            else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), null) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
         }
     }
 

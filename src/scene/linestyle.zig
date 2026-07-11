@@ -55,7 +55,6 @@ pub fn lookup(id: []const u8) ?Info {
     return g_linestyles.get(id);
 }
 
-
 /// Populate the complex-linestyle table from S-101 LineStyles XML sources
 /// (id = file stem). IDEMPOTENT — a populated table is left untouched, so
 /// every scene entry point (bake, lib renderView, CLI render) can call it

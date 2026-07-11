@@ -406,7 +406,6 @@ pub fn linestylesJson(alloc: std.mem.Allocator, srcs: []const LineStyleSrc) ![]u
     return out.toOwnedSlice(alloc);
 }
 
-
 // ---- tests ---------------------------------------------------------------
 
 test "colorTablesJson: sorted tokens, lowercase hex, all three palettes" {
