@@ -1623,6 +1623,52 @@ pub const Chart = struct {
         _ = try surf.endScene(a);
     }
 
+    /// Portray a SINGLE tile (z, x, y) to a CSurface — the per-tile twin of
+    /// renderSurfaceView. Emits the same WORLD-SPACE tagged draw calls, but for
+    /// exactly one tile instead of every tile under a view, so a host can portray +
+    /// tessellate each tile ONCE, cache the geometry, and compose tiles itself
+    /// (the MapLibre model). Decluttering is per-tile (labels resolve within the
+    /// tile), so a host that wants cross-tile label suppression must still do a
+    /// separate view-level text pass. `view_zoom` is the tile's own zoom.
+    pub fn renderSurfaceTile(self: *Chart, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const colors = try self.viewColorsRef();
+        const store = try self.viewStoreFor(palette);
+
+        var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
+        vs.store = store.asStore();
+        vs.view_zoom = @floatFromInt(z);   // declutter at the tile's native zoom
+        const surf = vs.asSurface();
+
+        try surf.beginScene(z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                if (self.viewTileLayers(rd, z, x, y)) |layers| {
+                    vs.setTile(z, x, y);
+                    scene.replayTile(a, surf, layers) catch {};
+                }
+            },
+            .cell => |*cb2| {
+                const one = [_]scene.CellRef{.{
+                    .cell = &cb2.cell,
+                    .portrayal = cb2.portrayal,
+                    .portrayal_plain = cb2.portrayal_plain,
+                    .portrayal_simplified = cb2.portrayal_simplified,
+                    .geo = cb2.geo,
+                    .geo_world = cb2.geo_world,
+                    .feat_bbox = cb2.feat_bbox,
+                }};
+                vs.setTile(z, x, y);
+                scene.appendTile(surf, a, &one, z, x, y, self.pick_attrs) catch {};
+            },
+            .cells => return error.Unsupported,
+        }
+        _ = try surf.endScene(a);
+    }
+
     /// Cursor object-query: replay the finest tile covering (lon,lat) through a
     /// QuerySurface and report each feature the point falls in (class + S-57
     /// attribute JSON + source cell) via `cb`. Used for the S-52 §10.8 pick.

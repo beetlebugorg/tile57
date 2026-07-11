@@ -663,6 +663,26 @@ export fn tile57_chart_surface(
     return OK;
 }
 
+/// Portray ONE tile (z, x, y) to a surface — the per-tile twin of
+/// tile57_chart_surface. Same WORLD-SPACE tagged draw calls, for a single tile, so
+/// a host can portray+tessellate each tile once, cache it, and compose the view
+/// from cached tiles (the MapLibre model). Decluttering is per-tile. See tile57.h.
+export fn tile57_chart_tile_surface(
+    handle: ?*Chart,
+    z: u8,
+    x: u32,
+    y: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    c.renderSurfaceTile(z, x, y, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
 /// Release a chart and all cached tiles. Must not be called while any borrower
 /// (a compositor, a renderer) may still read from it. See tile57.h.
 export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {

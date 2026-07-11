@@ -532,6 +532,18 @@ tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, 
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
 
+/* Portray ONE tile (z, x, y) through the SAME S-52 portrayal and the SAME
+ * tile57_surface_cb, but for a single tile instead of a whole view. Lets a host
+ * portray + tessellate each tile ONCE, cache the geometry keyed by (chart, z, x, y),
+ * and compose the view from cached tiles (re-portray only newly-visible tiles) —
+ * the MapLibre tile model, reusing tile57's portrayal. World coordinates and SCAMIN
+ * tags are identical to tile57_chart_surface, so the same callbacks/shaders apply.
+ * Decluttering is PER-TILE (labels resolve within the tile); a host wanting
+ * cross-tile label suppression keeps a separate view-level text pass. */
+tile57_status tile57_chart_tile_surface(tile57_chart *chart, uint8_t z, uint32_t x, uint32_t y,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
+
 /* Release a chart and all cached tiles. Must not be called while any borrower
  * (a compositor, a renderer thread) may still read from it. */
 void tile57_chart_close(tile57_chart *chart);
