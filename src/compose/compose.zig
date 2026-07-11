@@ -17,6 +17,7 @@ const mlt = @import("tiles").mlt;
 const gzip = @import("tiles").gzip;
 const tile = @import("tiles").tile;
 const band = @import("tiles").band;
+const filemap = @import("tiles").filemap;
 const geometry = @import("geometry");
 const coverage = @import("coverage");
 const s57 = @import("s57");
@@ -319,7 +320,7 @@ pub const ComposeSource = struct {
         self.part.deinit();
         if (self.owns_archives) {
             for (self.readers) |rp| rp.deinit();
-            for (self.maps) |m| std.posix.munmap(m);
+            for (self.maps) |m| filemap.unmap(m);
         }
         self.arena.deinit();
         gpa.destroy(self);
@@ -353,7 +354,7 @@ fn openSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8
     var shims = std.ArrayList(LoadedCov).empty;
     errdefer {
         for (readers.items) |rp| rp.deinit();
-        for (maps.items) |m| std.posix.munmap(m);
+        for (maps.items) |m| filemap.unmap(m);
     }
     for (paths) |path| {
         var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
@@ -366,27 +367,27 @@ fn openSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8
             f.close(io);
             continue;
         }
-        const map = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0) catch {
+        const map = filemap.mapReadonly(f.handle, len) catch {
             f.close(io);
             continue;
         };
         f.close(io);
         const rp = a.create(pmtiles.Reader) catch {
-            std.posix.munmap(map);
+            filemap.unmap(map);
             continue;
         };
         rp.* = pmtiles.Reader.init(gpa, map) catch {
-            std.posix.munmap(map);
+            filemap.unmap(map);
             continue;
         };
         const meta = readMetaJson(a, rp) orelse {
             rp.deinit();
-            std.posix.munmap(map);
+            filemap.unmap(map);
             continue;
         };
         const cc = (coverage.decodeFromMetadata(a, meta) catch null) orelse {
             rp.deinit();
-            std.posix.munmap(map);
+            filemap.unmap(map);
             continue;
         };
         try maps.append(a, map);

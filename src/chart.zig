@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;
+const filemap = @import("tiles").filemap;
 const mlt = @import("tiles").mlt;
 const tiles_mvt = @import("tiles").mvt;
 const gzip = @import("tiles").gzip;
@@ -476,8 +477,8 @@ pub fn openPmtilesPath(io: std.Io, path: []const u8) !*Chart {
     const st = f.stat(io) catch return error.IoFailed;
     const len: usize = @intCast(st.size);
     if (len == 0) return error.InvalidArchive;
-    const map = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0) catch return error.IoFailed;
-    errdefer std.posix.munmap(map);
+    const map = filemap.mapReadonly(f.handle, len) catch return error.IoFailed;
+    errdefer filemap.unmap(map);
     var reader = pmtiles.Reader.init(gpa, map) catch return error.InvalidArchive;
     const src = gpa.create(Chart) catch {
         reader.deinit();
@@ -1328,7 +1329,7 @@ pub const Chart = struct {
         while (it.next()) |v| gpa.free(v.*);
         self.cache.deinit();
         if (self.data) |d| gpa.free(d);
-        if (self.data_map) |m| std.posix.munmap(m);
+        if (self.data_map) |m| filemap.unmap(m);
         if (self.coverage_arena) |ca| {
             ca.deinit();
             gpa.destroy(ca);
@@ -1590,7 +1591,7 @@ pub const Chart = struct {
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
         var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
         vs.store = store.asStore();
-        vs.view_zoom = zoom;   // scale at which labels/symbols declutter
+        vs.view_zoom = zoom; // scale at which labels/symbols declutter
         const surf = vs.asSurface();
 
         var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
@@ -1640,7 +1641,7 @@ pub const Chart = struct {
 
         var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
         vs.store = store.asStore();
-        vs.view_zoom = @floatFromInt(z);   // declutter at the tile's native zoom
+        vs.view_zoom = @floatFromInt(z); // declutter at the tile's native zoom
         const surf = vs.asSurface();
 
         try surf.beginScene(z);
