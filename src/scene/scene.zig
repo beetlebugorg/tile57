@@ -791,31 +791,6 @@ const Meta = struct {
 // modifier, or 12 by default), halign/valign (the resolved TextAlign values the
 // style's TEXT_ANCHOR keys on), and the §14.5 text group. Halo + offset are
 // separate findings (still on the OpText halo / LocalOffset rows).
-/// Case-insensitive last occurrence of `needle` in `haystack`.
-fn lastIndexOfCI(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or needle.len > haystack.len) return null;
-    var i: usize = haystack.len - needle.len + 1;
-    while (i > 0) {
-        i -= 1;
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
-
-/// Reduce a buoy/lighted-buoy name label to its chart designation. The S-101 buoy
-/// rules tag the feature "by <OBJNAM>" (EncodeString 'by %s'); NOAA OBJNAM is the full
-/// descriptive name ("Chesapeake Channel Lighted Buoy 78A") but a chart shows only the
-/// trailing designation ("78A"), which also de-clutters a channel of buoys whose long
-/// prefix repeats. The "by " prefix marks these name labels; all other text (depth
-/// labels, light elevations, …) has no such prefix and passes through unchanged. The
-/// designation is whatever follows the LAST buoy/beacon type-word; "Light"/"Lt" are
-/// deliberately excluded so a named light keeps its name, and a name with no type-word
-/// keeps its stripped form (e.g. a bare "22").
-///
-/// An extracted designation is QUOTED ("78A") like the paper chart: an aid's
-/// designation in quotes cannot be misread as a sounding or a depth — the
-/// chart convention exists for exactly that reason. Unshortened text passes
-/// through borrowed; a quoted designation allocates from `a`.
 // SBDARE nature-of-surface labels arrive from the (pristine, vendored) S-101
 // rule as INT1 abbreviations ("S", "M", "Cy" …, space-joined for multiple
 // surfaces). A screen has no chart-margin legend to decode them against, so
@@ -853,25 +828,15 @@ fn expandSeabedText(a: Allocator, class: []const u8, text: []const u8) ![]const 
     return out.toOwnedSlice(a);
 }
 
-fn shortenName(a: Allocator, text: []const u8) ![]const u8 {
-    // "by " = buoy names, "bn " = beacon names (EncodeString prefixes in the
-    // buoy/beacon rules); both reduce to the designation.
-    const tagged = std.mem.startsWith(u8, text, "by ") or std.mem.startsWith(u8, text, "bn ");
-    if (!tagged) return text;
-    const name = std.mem.trim(u8, text[3..], " ");
-    const keywords = [_][]const u8{ "Daybeacon", "Daymark", "Buoy", "Beacon" };
-    var best_end: ?usize = null;
-    for (keywords) |kw| {
-        if (lastIndexOfCI(name, kw)) |idx| {
-            const end = idx + kw.len;
-            if (best_end == null or end > best_end.?) best_end = end;
-        }
-    }
-    if (best_end) |end| {
-        const rest = std.mem.trim(u8, name[end..], " ");
-        if (rest.len > 0) return std.fmt.allocPrint(a, "\"{s}\"", .{rest});
-    }
-    return name;
+/// Strip the "by "/"bn " aid-name tag the S-101 buoy/beacon rules add (EncodeString
+/// 'by %s' / 'bn %s') and show the FULL name. Previously this reduced the name to its
+/// trailing chart designation ("Chesapeake Channel Lighted Buoy 78A" -> "78A"); that
+/// shortening was removed so aid names read in full. Untagged text (depth labels, light
+/// elevations, place names) passes through unchanged. Returns a borrowed slice.
+fn stripNameTag(text: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, text, "by ") or std.mem.startsWith(u8, text, "bn "))
+        return std.mem.trim(u8, text[3..], " ");
+    return text;
 }
 
 /// Serialize a text label's props in the tile schema order. `text` arrives already
@@ -1478,7 +1443,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                     .group = t.group,
                 };
                 try surf.beginFeature(&fmeta);
-                try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &ts, pt);
+                try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, pt);
                 try surf.endFeature();
             }
         }
@@ -1606,7 +1571,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                         .group = t.group,
                     };
                     try surf.beginFeature(&fmeta);
-                    try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &ts, cpt);
+                    try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, cpt);
                     try surf.endFeature();
                 }
             }
@@ -2449,26 +2414,17 @@ test "appendTextProps: halo (CHWHT/1) gated on font_size >= 10, matching the ora
     }
 }
 
-test "shortenName: buoy/light names reduce to the QUOTED chart designation" {
-    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_s.deinit();
-    const al = arena_s.allocator();
-    // Verbose NOAA OBJNAM tagged "by <name>" by the S-101 buoy rules -> the
-    // designation IN QUOTES (paper-chart convention: not misread as a sounding).
-    try std.testing.expectEqualStrings("\"78A\"", try shortenName(al, "by Chesapeake Channel Lighted Buoy 78A"));
-    try std.testing.expectEqualStrings("\"CR\"", try shortenName(al, "by Chesapeake Channel Lighted Buoy CR"));
-    try std.testing.expectEqualStrings("\"3\"", try shortenName(al, "by Tangier Sound Daybeacon 3"));
-    try std.testing.expectEqualStrings("\"2CR\"", try shortenName(al, "by Lighted Whistle Buoy 2CR"));
-    // No type-word -> the stripped name (already short), unquoted.
-    try std.testing.expectEqualStrings("22", try shortenName(al, "by 22"));
-    // No "by " prefix -> passthrough (depth label, light elevation, place name).
-    try std.testing.expectEqualStrings(" 4.6m", try shortenName(al, " 4.6m"));
-    try std.testing.expectEqualStrings("Herring Bay", try shortenName(al, "Herring Bay"));
-    // "Light"/"Lt" are NOT split words -> a named light keeps its name (defensive; such
-    // labels don't carry the "by " buoy prefix anyway).
-    try std.testing.expectEqualStrings("Thomas Point Light", try shortenName(al, "by Thomas Point Light"));
-    // Beacon names ("bn " prefix) reduce the same way.
-    try std.testing.expectEqualStrings("\"2\"", try shortenName(al, "bn Turn Rock Daybeacon 2"));
+test "stripNameTag: strips the by/bn aid-name tag, keeps the full name" {
+    // The S-101 buoy/beacon rules tag OBJNAM "by <name>"/"bn <name>"; the tag is
+    // stripped and the FULL name shown (the designation-shortening was removed).
+    try std.testing.expectEqualStrings("Chesapeake Channel Lighted Buoy 78A", stripNameTag("by Chesapeake Channel Lighted Buoy 78A"));
+    try std.testing.expectEqualStrings("Tangier Sound Daybeacon 3", stripNameTag("by Tangier Sound Daybeacon 3"));
+    try std.testing.expectEqualStrings("Turn Rock Daybeacon 2", stripNameTag("bn Turn Rock Daybeacon 2"));
+    try std.testing.expectEqualStrings("22", stripNameTag("by 22"));
+    // No "by "/"bn " prefix -> passthrough (depth label, light elevation, place name).
+    try std.testing.expectEqualStrings(" 4.6m", stripNameTag(" 4.6m"));
+    try std.testing.expectEqualStrings("Herring Bay", stripNameTag("Herring Bay"));
+    try std.testing.expectEqualStrings("Thomas Point Light", stripNameTag("by Thomas Point Light"));
 }
 
 test "listHasAny splits S-57 comma lists and matches any target" {
