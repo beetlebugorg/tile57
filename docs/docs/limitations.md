@@ -98,7 +98,7 @@ has its own short list of deliberate gaps — see
 
 ## ENC_ROOT loading
 
-Opening an ENC_ROOT (`Chart.openPath` / `openCellsStreaming`) builds a cheap
+Opening an ENC_ROOT (`Chart.openPath` / `openChartsStreaming`) builds a cheap
 spatial index (band + bbox per chart) and reads a chart's bytes only when a
 metadata or feature query needs them — the catalogue opens in seconds and
 memory stays bounded. It serves metadata and extraction only: tiles and views

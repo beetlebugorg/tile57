@@ -130,13 +130,13 @@ The public surface composes the packages into high-level entry points:
   bytes), then take its outputs: view renders (`renderView` — PNG, PDF, or a
   callback canvas; `renderSurfaceView` — world-space GPU callbacks), the cursor
   pick (`queryPoint`), the metadata getters, and — for an archive — its stored
-  tiles verbatim through `pmtilesReader()`. In the C ABI: `tile57_tile` /
-  `tile57_png` / `tile57_pdf` / `tile57_canvas` / `tile57_surface` /
-  `tile57_query`. A streaming ENC_ROOT open (`openPath` / `openCells` /
-  `openCellsStreaming`) is the metadata + extraction view of raw source data
+  tiles verbatim through `pmtilesReader()`. In the C ABI: `tile57_chart_tile` /
+  `tile57_chart_png` / `tile57_chart_pdf` / `tile57_chart_canvas` / `tile57_chart_surface` /
+  `tile57_chart_query`. A streaming ENC_ROOT open (`openPath` / `openCharts` /
+  `openChartsStreaming`) is the metadata + extraction view of raw source data
   (the C `tile57_enc_*` readers); it serves no tiles or renders.
 - **Tile production** — bake each chart to its own PMTiles at its compilation scale
-  (`tile57_bake_cell_bytes`, which runs the banded bake engine `scene/bake_enc.zig`
+  (`tile57_bake_chart_bytes`, which runs the banded bake engine `scene/bake_enc.zig`
   on a single chart), then a runtime **compositor** stitches the overlapping charts
   through an ownership partition and offers the SAME outputs as a chart, composed:
   `tile57_compose_tile` for any `(z, x, y)` on demand, `tile57_compose_png` /
@@ -159,7 +159,7 @@ tile57 is built to hold only its working set:
   scales are resolved by the precomputed ownership partition — each tile's
   ground belongs to exactly one chart per band, so composing never loads every
   overlapping chart.
-- **Streaming open.** `openCellsStreaming` (and its on-disk driver `openPath`,
+- **Streaming open.** `openChartsStreaming` (and its on-disk driver `openPath`,
   which backs the C `tile57_enc_*` readers) take per-chart metadata (bbox +
   scale) plus a reader; a chart's bytes are read only on demand and freed on
   eviction. A

@@ -124,8 +124,8 @@ for a view (same allocate-`*out` / free-with-`tile57_free` convention as the
 rest of the ABI):
 
 ```c
-tile57 *c = NULL;
-tile57_open("US5MD1MC.pmtiles", &c, NULL);   /* a baked archive */
+tile57_chart *c = NULL;
+tile57_chart_open("US5MD1MC.pmtiles", &c, NULL);   /* a baked archive */
 
 tile57_mariner m;
 tile57_mariner_defaults(&m);
@@ -133,12 +133,12 @@ m.safety_contour = 5.0;
 m.scheme = TILE57_SCHEME_NIGHT;
 
 uint8_t *png; size_t len;
-tile57_png(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &png, &len, NULL);
+tile57_chart_png(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &png, &len, NULL);
 /* ... write/display png ... */
 tile57_free(png);
 
 uint8_t *pdf; size_t plen;
-tile57_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen, NULL);
+tile57_chart_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen, NULL);
 ```
 
 That renders ONE chart, no composition. A view across a whole chart library
@@ -171,9 +171,9 @@ how MVT and MLT are done (`TileSurface` in `src/scene/scene.zig`), and how a
 GeoJSON debug dump or a GPU display list would be done.
 
 **From the C ABI:** both interfaces are exposed as callback tables.
-`tile57_canvas` drives a `tile57_canvas_cb` — C function pointers receiving
+`tile57_chart_canvas` drives a `tile57_canvas_cb` — C function pointers receiving
 resolved, flattened paths, patterns, and glyph outlines in pixel space, in
-paint order (the Canvas seat). `tile57_surface` drives a `tile57_surface_cb` —
+paint order (the Canvas seat). `tile57_chart_surface` drives a `tile57_surface_cb` —
 the world-space, semantically tagged stream (per-feature class + SCAMIN, world
 anchors, reference-pixel outlines) a GPU host tessellates once and transforms
 per frame (the Surface seat). Both have composed twins on the compositor

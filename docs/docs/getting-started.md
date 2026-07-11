@@ -85,9 +85,9 @@ Open a compositor over the bake output and serve tiles by `(z, x, y)`:
 #include "tile57.h"
 
 /* Open each baked archive as a chart, then a compositor over the charts. */
-tile57 *chart = NULL;
+tile57_chart *chart = NULL;
 tile57_error err;
-if (tile57_open("out/tiles/US5MD1MC.pmtiles", &chart, &err) != TILE57_OK) {
+if (tile57_chart_open("out/tiles/US5MD1MC.pmtiles", &chart, &err) != TILE57_OK) {
     fprintf(stderr, "%s\n", err.message);
 }
 tile57_compose *src = NULL;
@@ -100,13 +100,13 @@ if (tile57_compose_tile(src, z, x, y, &tile, &n, &owned, &err) == TILE57_OK) {
     else            { /* not owned — open ocean; cache as blank */ }
 }
 tile57_compose_close(src);   /* the compositor borrows its charts… */
-tile57_close(chart);         /* …so close them after it */
+tile57_chart_close(chart);         /* …so close them after it */
 ```
 
 Link against `libtile57.a`. The `partition.tpart` sidecar (NULL to skip) lets the
 compositor load the ownership partition instead of rebuilding it. The chart and
-the compositor offer the same outputs — `tile57_png(chart, …)` renders one chart
-alone; `tile57_compose_png(src, …)` renders the composed set; `tile57_tile`
+the compositor offer the same outputs — `tile57_chart_png(chart, …)` renders one chart
+alone; `tile57_compose_png(src, …)` renders the composed set; `tile57_chart_tile`
 hands back one chart's stored tiles verbatim for anyone writing their own
 compositor. Raw S-57 reading (chart inventory, feature extraction) is
 handle-free via `tile57_enc_*`. See the [C API](./c-api.md).
@@ -124,7 +124,7 @@ defer chart.deinit();
 const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
 
 // Or compose the whole bake output and take any output from it.
-var src = (try tile57.compose.openComposeSourceFiles(io, gpa, paths, "out/partition.tpart")).?;
+var src = (try tile57.compose.ComposeSource.openFiles(io, gpa, paths, "out/partition.tpart")).?;
 defer src.deinit();
 const result = try src.tile(gpa, 15, 9371, 12534);          // one composed tile
 const png = try tile57.compose.renderView(src, -76.48, 38.974, 13.5,
@@ -132,13 +132,13 @@ const png = try tile57.compose.renderView(src, -76.48, 38.974, 13.5,
 ```
 
 Baking (`tile57.bake.tree`), raw S-57 reading (`Chart.openPath` +
-`cellsJson`/`featuresJson`), and the style builders are all in the same
+`chartsJson`/`featuresJson`), and the style builders are all in the same
 package. See the [Zig API](./zig-api.md).
 
 ## ENC_ROOT and updates
 
 Open an ENC_ROOT (many charts, each with its sequential `.001`, `.002` … updates)
-with `Chart.openPath` (Zig) or scan it with `tile57_enc_cells` (C) — a single
+with `Chart.openPath` (Zig) or scan it with `tile57_enc_charts` (C) — a single
 call that walks a whole on-disk catalogue, applying each chart's updates. Baking
 (`tile57 bake` / `tile57_bake_tree`) turns it into the per-chart archives the
 compositor serves.
