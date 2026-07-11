@@ -1735,7 +1735,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 
     // The masked complement (cell-limit stretches) rides along tagged, for the
     // meta-bounds view; the standard display filters the class out anyway.
-    if (masked_boundary) try emitMaskedBoundary(a, cell, f, fmeta, z, x, y, tb, box, opts, surf);
+    if (masked_boundary) try emitMaskedBoundary(a, cell, f, fmeta, z, x, y, tb, box, surf);
     if (geo_parts.len == 0) return;
 
     // Best-available: cut the covered stretches before tessellating/stroking.
@@ -1768,14 +1768,19 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// masking alone leaves the toggle nothing to show. The standard display never
 /// renders it (the meta classes are filtered out unless meta-bounds is on), and
 /// the tag keeps the masked pieces letter-free in the styled view too.
-fn emitMaskedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, base: rs.FeatureMeta, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+fn emitMaskedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, base: rs.FeatureMeta, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, surf: rs.Surface) !void {
     const masked_parts = cell.maskedLineParts(a, f) catch return;
     if (masked_parts.len == 0) return;
     var fmeta = base;
     fmeta.masked = true;
-    const parts_cov = if (opts.cover_clip) |cc| clipGeoPartsOutsideCover(a, masked_parts, cc, z, x, y) else masked_parts;
+    // NOT cover-clipped: this is the meta-bounds inspection outline of one chart's
+    // OWN extent, so it must trace that chart's whole boundary even where a finer
+    // chart owns the ground on top of it. Clipping it to the best-available cover
+    // (as the drawn portrayal is) carves the outline apart wherever a finer chart
+    // overlaps — a coarse chart's rectangle comes out in disjoint fragments. The
+    // inspection view wants every contributing chart's complete extent.
     try surf.beginFeature(&fmeta);
-    for (parts_cov) |gp| {
+    for (masked_parts) |gp| {
         if (gp.len < 2) continue;
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);

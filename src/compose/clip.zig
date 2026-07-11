@@ -47,6 +47,28 @@ pub fn isLightFigure(feat: mvt.DecodedFeature) bool {
     return false;
 }
 
+/// A `masked`-tagged linestring is the meta-bounds inspection outline of ONE chart's
+/// OWN extent (the §8.6.2-masked boundary complement — see scene.emitMaskedBoundary).
+/// It must trace that chart's whole coverage boundary, so it is NOT clipped to the
+/// owned face: clipping it there carves the outline apart wherever a finer chart owns
+/// the ground on top of it, so a coarse chart's rectangle comes out in disjoint
+/// fragments (the "missing edges" a meta-bounds inspection shows). Kept whole, like a
+/// LIGHTS sector figure — it draws over neighbouring ground exactly as the single-chart
+/// meta-bounds render would. The standard display filters the meta class out anyway.
+pub fn isMaskedBoundary(feat: mvt.DecodedFeature) bool {
+    for (feat.properties) |p| {
+        if (std.mem.eql(u8, p.key, "masked")) {
+            return switch (p.value) {
+                .int => |v| v != 0,
+                .uint => |v| v != 0,
+                .boolean => |v| v,
+                else => false,
+            };
+        }
+    }
+    return false;
+}
+
 /// Clip `feat` (tile-pixel space) to `face` (the cell's owned rings, tile-pixel space) and
 /// append the surviving feature(s) to `out`, or nothing if the feature is entirely outside
 /// the face. Geometry is freshly allocated in `a`; `properties` are borrowed from `feat`.
@@ -69,7 +91,7 @@ pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature),
             // anchored at the light, not ground. Clipping it to the owned face
             // amputates the figure at the seam, so keep it WHOLE — it draws over
             // neighbouring ground exactly as a single-chart render would.
-            if (isLightFigure(feat)) {
+            if (isLightFigure(feat) or isMaskedBoundary(feat)) {
                 const parts = try a.alloc([]const mvt.Point, feat.parts.len);
                 for (feat.parts, 0..) |part, i| parts[i] = try a.dupe(mvt.Point, part);
                 try out.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = feat.properties });
@@ -221,6 +243,30 @@ test "clipFeatureToFace: line clipped to the part inside the face" {
     const kept = out.items[0].parts[0];
     try testing.expectEqual(@as(i32, 1000), @min(kept[0].x, kept[kept.len - 1].x));
     try testing.expectEqual(@as(i32, 3000), @max(kept[0].x, kept[kept.len - 1].x));
+}
+
+test "clipFeatureToFace: a masked meta-bounds outline is kept whole, not clipped to the face" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The same horizontal line as above, but tagged masked=1 (a chart's own coverage
+    // outline): it must survive whole — the finer chart's face must NOT carve it, or
+    // the coarse chart's boundary comes out in fragments.
+    const line = try a.alloc(mvt.Point, 2);
+    line[0] = .{ .x = 0, .y = 2000 };
+    line[1] = .{ .x = 4096, .y = 2000 };
+    var feat = try decoded(a, .linestring, &.{line});
+    feat.properties = &.{.{ .key = "masked", .value = .{ .int = 1 } }};
+    const face = try boxFace(a, 1000, 1000, 3000, 3000);
+
+    var out = std.ArrayList(mvt.Feature).empty;
+    try clipFeatureToFace(a, &out, feat, face);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    const kept = out.items[0].parts[0];
+    try testing.expectEqual(@as(usize, 2), kept.len); // untouched: both original endpoints survive
+    try testing.expectEqual(@as(i32, 0), kept[0].x);
+    try testing.expectEqual(@as(i32, 4096), kept[1].x);
 }
 
 test "clipFeatureToFace: feature entirely outside the face is dropped" {
