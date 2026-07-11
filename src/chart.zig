@@ -19,6 +19,7 @@
 const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;
 const mlt = @import("tiles").mlt;
+const tiles_mvt = @import("tiles").mvt;
 const gzip = @import("tiles").gzip;
 const s57 = @import("s57");
 const scene = @import("scene");
@@ -1051,6 +1052,22 @@ pub const Chart = struct {
     // released in deinit. Bytes-opened archives use `data` instead.
     data_map: ?[]align(std.heap.page_size_min) const u8 = null,
 
+    // ---- view-render caches (reader backend) --------------------------------
+    // A view re-render replays mostly the SAME tiles (a pan reveals one strip, a
+    // zoom settle swaps one band), and profiling put ~35% of every re-render in
+    // gzip+MLT decode and another ~3% in re-building the palette and re-parsing
+    // the SVG symbol catalogue. All of it is immutable for an open handle, so it
+    // caches here: decoded tiles in a generation-evicted map (each entry owns its
+    // arena, so eviction frees exactly one tile), colors + per-palette symbol
+    // stores in one handle-lifetime arena. Same threading rule as the handle:
+    // NOT synchronized.
+    view_tiles: std.AutoHashMapUnmanaged(u64, *DecodedTile) = .empty,
+    view_gen: u64 = 0,
+    view_tiles_max: usize = 192, // > the ~96 tiles of one 2560px view: never evicts mid-render
+    view_arena: ?*std.heap.ArenaAllocator = null,
+    view_colors: ?*render.resolve.Colors = null,
+    view_stores: [3]?*sprite.CatalogStore = .{ null, null, null },
+
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
     /// (null = TILE57_S101_RULES env, else the vendored default). Bytes are copied.
@@ -1205,6 +1222,97 @@ pub const Chart = struct {
     }
 
     /// Release the source and all cached tiles.
+    const DecodedTile = struct {
+        arena: std.heap.ArenaAllocator,
+        layers: []tiles_mvt.DecodedLayer,
+        gen: u64,
+    };
+
+    fn viewTileKey(z: u8, x: u32, y: u32) u64 {
+        return (@as(u64, z) << 58) | (@as(u64, x) << 29) | @as(u64, y);
+    }
+
+    /// The decoded layers of stored tile (z,x,y) through the handle's decoded-tile
+    /// cache. Null when the archive has no tile there (not cached — the miss is a
+    /// directory binary-search, no decompression). Entries stay valid until this
+    /// handle either evicts them (never within one render; see view_tiles_max) or
+    /// closes.
+    fn viewTileLayers(self: *Chart, rd: *pmtiles.Reader, z: u8, x: u32, y: u32) ?[]tiles_mvt.DecodedLayer {
+        const key = viewTileKey(z, x, y);
+        self.view_gen += 1;
+        if (self.view_tiles.getPtr(key)) |ep| {
+            ep.*.gen = self.view_gen;
+            return ep.*.layers;
+        }
+        const e = gpa.create(DecodedTile) catch return null;
+        e.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .layers = &.{}, .gen = self.view_gen };
+        const ea = e.arena.allocator();
+        const is_mlt = rd.header.tile_type == .mlt;
+        const ok = blk: {
+            const bytes = (rd.getTile(ea, z, x, y) catch break :blk false) orelse break :blk false;
+            e.layers = (if (is_mlt) mlt.decode(ea, bytes) else tiles_mvt.decode(ea, bytes)) catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) {
+            e.arena.deinit();
+            gpa.destroy(e);
+            return null;
+        }
+        if (self.view_tiles.count() >= self.view_tiles_max) {
+            // Evict the least-recently-touched entry (linear scan; the map is small).
+            var oldest_key: u64 = 0;
+            var oldest_gen: u64 = std.math.maxInt(u64);
+            var it = self.view_tiles.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.*.gen < oldest_gen) {
+                    oldest_gen = kv.value_ptr.*.gen;
+                    oldest_key = kv.key_ptr.*;
+                }
+            }
+            if (self.view_tiles.fetchRemove(oldest_key)) |kv| {
+                kv.value.arena.deinit();
+                gpa.destroy(kv.value);
+            }
+        }
+        self.view_tiles.put(gpa, key, e) catch {
+            e.arena.deinit();
+            gpa.destroy(e);
+            return null;
+        };
+        return e.layers;
+    }
+
+    /// The handle-lifetime arena backing the cached palette + symbol stores.
+    fn viewArena(self: *Chart) !std.mem.Allocator {
+        if (self.view_arena == null) {
+            const va = try gpa.create(std.heap.ArenaAllocator);
+            va.* = std.heap.ArenaAllocator.init(gpa);
+            self.view_arena = va;
+        }
+        return self.view_arena.?.allocator();
+    }
+
+    /// The palette colour tables, parsed once per handle (all three palettes).
+    fn viewColorsRef(self: *Chart) !*render.resolve.Colors {
+        if (self.view_colors) |c| return c;
+        const va = try self.viewArena();
+        const c = try va.create(render.resolve.Colors);
+        c.* = try render.resolve.Colors.init(va, embedded_assets.colorprofile[0].bytes);
+        self.view_colors = c;
+        return c;
+    }
+
+    /// The palette's symbol store, built once per handle per palette (the SVG
+    /// catalogue parse dominated the old per-render setup).
+    fn viewStoreFor(self: *Chart, palette: render.resolve.PaletteId) !*sprite.CatalogStore {
+        const idx: usize = @intFromEnum(palette);
+        if (self.view_stores[idx]) |st| return st;
+        const va = try self.viewArena();
+        const st = try viewSymbolStore(va, palette);
+        self.view_stores[idx] = st;
+        return st;
+    }
+
     pub fn deinit(self: *Chart) void {
         switch (self.backend) {
             .reader => |*r| r.deinit(),
@@ -1224,6 +1332,18 @@ pub const Chart = struct {
         if (self.coverage_arena) |ca| {
             ca.deinit();
             gpa.destroy(ca);
+        }
+        {
+            var vit = self.view_tiles.valueIterator();
+            while (vit.next()) |v| {
+                v.*.arena.deinit();
+                gpa.destroy(v.*);
+            }
+            self.view_tiles.deinit(gpa);
+        }
+        if (self.view_arena) |va| {
+            va.deinit();
+            gpa.destroy(va);
         }
         gpa.destroy(self);
     }
@@ -1413,14 +1533,13 @@ pub const Chart = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
-        const store = try viewSymbolStore(a, palette);
-        defer store.deinit();
+        const colors = try self.viewColorsRef();
+        const store = try self.viewStoreFor(palette);
 
         // Continuous scaling between integer zooms; the host applies physical
         // calibration / @2x via settings.size_scale.
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-        var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, @import("tiles").tile.EXTENT);
+        var ps = render.pixel.PixelSurface.initView(a, colors, palette, settings, zoom, w, h, pt, @import("tiles").tile.EXTENT);
         ps.store = store.asStore();
         ps.output = output;
         ps.cb = cb_table;
@@ -1434,13 +1553,8 @@ pub const Chart = struct {
                 var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
                 const surf = ps.asSurface();
                 try surf.beginScene(vt.z);
-                const is_mlt = rd.header.tile_type == .mlt;
                 while (vt.next()) |t| {
-                    const bytes = (rd.getTile(a, t.z, t.x, t.y) catch continue) orelse continue;
-                    const layers = if (is_mlt)
-                        @import("tiles").mlt.decode(a, bytes) catch continue
-                    else
-                        @import("tiles").mvt.decode(a, bytes) catch continue;
+                    const layers = self.viewTileLayers(rd, t.z, t.x, t.y) orelse continue;
                     ps.setOrigin(t.origin_x, t.origin_y);
                     scene.replayTile(a, surf, layers) catch return error.TileGen;
                 }
@@ -1470,12 +1584,11 @@ pub const Chart = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
-        const store = try viewSymbolStore(a, palette);
-        defer store.deinit();
+        const colors = try self.viewColorsRef();
+        const store = try self.viewStoreFor(palette);
 
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-        var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
+        var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
         vs.store = store.asStore();
         vs.view_zoom = zoom;   // scale at which labels/symbols declutter
         const surf = vs.asSurface();
@@ -1484,13 +1597,8 @@ pub const Chart = struct {
         try surf.beginScene(vt.z);
         switch (self.backend) {
             .reader => |*rd| {
-                const is_mlt = rd.header.tile_type == .mlt;
                 while (vt.next()) |t| {
-                    const bytes = (rd.getTile(a, t.z, t.x, t.y) catch continue) orelse continue;
-                    const layers = if (is_mlt)
-                        @import("tiles").mlt.decode(a, bytes) catch continue
-                    else
-                        @import("tiles").mvt.decode(a, bytes) catch continue;
+                    const layers = self.viewTileLayers(rd, t.z, t.x, t.y) orelse continue;
                     vs.setTile(t.z, t.x, t.y);
                     scene.replayTile(a, surf, layers) catch continue;
                 }

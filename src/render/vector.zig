@@ -150,6 +150,10 @@ pub const VectorSurface = struct {
     tz: u8 = 0,
     tx: u32 = 0,
     ty: u32 = 0,
+    // 1/2^tz and 1/(2^tz·EXTENT), set by setTile — worldOf runs per VERTEX, and
+    // recomputing pow(2,tz) there was ~9% of a whole view render.
+    inv_n: f64 = 1.0,
+    inv_ne: f64 = 1.0,
 
     cur: rs.FeatureMeta = .{},
     cur_visible: bool = true,
@@ -194,6 +198,8 @@ pub const VectorSurface = struct {
         self.tz = z;
         self.tx = x;
         self.ty = y;
+        self.inv_n = 1.0 / std.math.exp2(@as(f64, @floatFromInt(z)));
+        self.inv_ne = self.inv_n / @as(f64, @floatFromInt(tile.EXTENT));
     }
 
     fn sp(ctx: *anyopaque) *VectorSurface {
@@ -222,13 +228,12 @@ pub const VectorSurface = struct {
         return sp(ctx).refDev();
     }
 
-    /// Tile-space point -> web-mercator world [0,1] (y down).
+    /// Tile-space point -> web-mercator world [0,1] (y down). Per-vertex hot
+    /// path: the tile factors are precomputed in setTile.
     fn worldOf(self: *const VectorSurface, p: rs.TilePoint) CWorldPt {
-        const n = std.math.pow(f64, 2.0, @floatFromInt(self.tz));
-        const e: f64 = @floatFromInt(tile.EXTENT);
         return .{
-            .x = (@as(f64, @floatFromInt(self.tx)) + @as(f64, @floatFromInt(p.x)) / e) / n,
-            .y = (@as(f64, @floatFromInt(self.ty)) + @as(f64, @floatFromInt(p.y)) / e) / n,
+            .x = @as(f64, @floatFromInt(self.tx)) * self.inv_n + @as(f64, @floatFromInt(p.x)) * self.inv_ne,
+            .y = @as(f64, @floatFromInt(self.ty)) * self.inv_n + @as(f64, @floatFromInt(p.y)) * self.inv_ne,
         };
     }
 
