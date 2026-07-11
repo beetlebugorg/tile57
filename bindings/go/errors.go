@@ -16,7 +16,7 @@ var (
 	// ErrSourceClosed is returned by Source methods invoked after Close.
 	ErrSourceClosed = errors.New("tile57: source closed")
 
-	// ErrEmptyInput is returned when a call is handed no usable input — no cells,
+	// ErrEmptyInput is returned when a call is handed no usable input — no charts,
 	// empty bytes, an empty style template, or empty asset inputs.
 	ErrEmptyInput = errors.New("tile57: empty input")
 

@@ -25,10 +25,11 @@ type ComposeSource struct {
 	owned []*Source // charts OpenCompose opened for us; closed on Close
 }
 
-// ComposeMeta is a ComposeSource's served zoom range + union coverage bounds (degrees).
+// ComposeMeta is a ComposeSource's served zoom range, coverage-carrying chart
+// count, and union coverage bounds (degrees).
 type ComposeMeta struct {
 	MinZoom, MaxZoom         uint8
-	Cells                    uint32
+	Charts                   uint32
 	West, South, East, North float64
 }
 
@@ -47,7 +48,7 @@ func OpenComposeCharts(charts []*Source, partitionPath string) (*ComposeSource, 
 	var ar cArena
 	defer ar.free()
 	// A C array of chart handles — pointer-free from Go's view (cgocheck-safe).
-	cc := (**C.tile57)(ar.track(C.malloc(C.size_t(len(charts)) * C.size_t(unsafe.Sizeof((*C.tile57)(nil))))))
+	cc := (**C.tile57_chart)(ar.track(C.malloc(C.size_t(len(charts)) * C.size_t(unsafe.Sizeof((*C.tile57_chart)(nil))))))
 	cv := unsafe.Slice(cc, len(charts))
 	for i, s := range charts {
 		if s == nil || s.ptr == nil {
@@ -72,9 +73,9 @@ func OpenComposeCharts(charts []*Source, partitionPath string) (*ComposeSource, 
 	return &ComposeSource{ptr: ptr}, nil
 }
 
-// OpenCompose opens a resident compositor over the per-cell PMTiles at paths (each
-// written by [BakeCell] / [BakeTree]): every path is opened as a chart (mmap'd, so
-// the cell set is never fully resident) and the compositor OWNS those charts —
+// OpenCompose opens a resident compositor over the per-chart PMTiles at paths
+// (each written by [BakeChart] / [BakeTree]): every path is opened as a chart
+// (mmap'd, so the chart set is never fully resident) and the compositor OWNS those charts —
 // Close releases them too. See [OpenComposeCharts] to compose over charts you
 // keep. partitionPath as in OpenComposeCharts.
 func OpenCompose(paths []string, partitionPath string) (*ComposeSource, error) {
@@ -105,9 +106,9 @@ func OpenCompose(paths []string, partitionPath string) (*ComposeSource, error) {
 }
 
 // Tile composes the tile (z,x,y) on demand, returning raw (decompressed) MLT bytes plus `owned` —
-// whether the ownership partition says a cell SHOULD render here. body!=nil → composed (owned). body
-// ==nil && owned → a cell owns this ground but produced nothing (transient while its per-cell bake
-// runs; an error state once bakes are done). body==nil && !owned → true empty ocean (safe to cache).
+// whether the ownership partition says a chart SHOULD render here. body!=nil → composed (owned).
+// body==nil && owned → a chart owns this ground but produced nothing (transient while its per-chart
+// bake runs; an error state once bakes are done). body==nil && !owned → true empty ocean (safe to cache).
 // Thread-safe (serialised).
 func (c *ComposeSource) Tile(z uint8, x, y uint32) (body []byte, owned bool, err error) {
 	c.mu.Lock()
@@ -136,11 +137,11 @@ func (c *ComposeSource) Meta() ComposeMeta {
 		return ComposeMeta{}
 	}
 	var m C.tile57_compose_meta
-	C.tile57_compose_meta_get(c.ptr, &m)
+	C.tile57_compose_get_meta(c.ptr, &m)
 	return ComposeMeta{
 		MinZoom: uint8(m.min_zoom),
 		MaxZoom: uint8(m.max_zoom),
-		Cells:   uint32(m.cells),
+		Charts:  uint32(m.charts),
 		West:    float64(m.west),
 		South:   float64(m.south),
 		East:    float64(m.east),

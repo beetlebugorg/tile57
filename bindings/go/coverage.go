@@ -10,9 +10,9 @@ package tile57
 extern void tile57GoCoverageRing(void *ctx, double *lonlat, size_t npts);
 
 // Build the callback table C-side so no C function pointer crosses into Go.
-static tile57_status t57CoverageGo(tile57 *chart, void *handle, tile57_error *err) {
+static tile57_status t57CoverageGo(tile57_chart *chart, void *handle, tile57_error *err) {
 	tile57_coverage_cb cb = {handle, (void (*)(void *, const double *, size_t))tile57GoCoverageRing};
-	return tile57_coverage(chart, &cb, err);
+	return tile57_chart_coverage(chart, &cb, err);
 }
 */
 import "C"
@@ -39,7 +39,7 @@ func tile57GoCoverageRing(ctx unsafe.Pointer, lonlat *C.double, npts C.size_t) {
 // Coverage returns the chart's M_COVR data-coverage polygons (one exterior ring
 // per polygon, lon/lat points) from the coverage the bake embedded in the archive
 // metadata — the real coverage a host reports so a quilt fills gaps to coarser
-// cells. Nil when the archive embeds none (a composed/foreign archive).
+// charts. Nil when the archive embeds none (a composed/foreign archive).
 func (s *Source) Coverage() ([][][2]float64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

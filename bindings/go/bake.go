@@ -24,15 +24,15 @@ func tile57GoBakeProgress(ctx unsafe.Pointer, done, total C.uint32_t) {
 	}
 }
 
-// BakeCell bakes ONE on-disk cell (a .000 path + its .001.. updates) to a PMTiles
-// archive over its NATIVE band zoom range and returns the bytes — the per-cell tile
+// BakeChart bakes ONE on-disk chart (a .000 path + its .001.. updates) to a PMTiles
+// archive over its NATIVE band zoom range and returns the bytes — the per-chart tile
 // store the compositor consumes (it handles any cross-band zoom expansion). The
-// archive metadata embeds that cell's own coverage (M_COVR + cscl + date/name);
+// archive metadata embeds that chart's own coverage (M_COVR + cscl + date/name);
 // read it back with [PMTilesMetadata], or open the archive with [OpenBytes]. A
-// cell that produces no tiles returns ErrNoCoverage.
-func BakeCell(path string) ([]byte, error) {
+// chart that produces no tiles returns ErrNoCoverage.
+func BakeChart(path string) ([]byte, error) {
 	if path == "" {
-		return nil, fmt.Errorf("tile57: BakeCell needs a cell path: %w", ErrEmptyInput)
+		return nil, fmt.Errorf("tile57: BakeChart needs a chart path: %w", ErrEmptyInput)
 	}
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
@@ -40,22 +40,22 @@ func BakeCell(path string) ([]byte, error) {
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cerr C.tile57_error
-	if st := C.tile57_bake_cell_bytes(cPath, &out, &outLen, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_bake_chart_bytes(cPath, &out, &outLen, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	if out == nil {
-		return nil, fmt.Errorf("tile57: cell bake produced no tiles: %w", ErrNoCoverage)
+		return nil, fmt.Errorf("tile57: chart bake produced no tiles: %w", ErrNoCoverage)
 	}
 	return tileBytes(out, outLen), nil
 }
 
-// BakeTree walks inDir for S-57 base cells (*.000) and bakes each IN PARALLEL to the SAME relative
+// BakeTree walks inDir for S-57 base charts (*.000) and bakes each IN PARALLEL to the SAME relative
 // path under outDir with a .pmtiles extension (+ an <out>.sha content-hash sidecar), creating
-// subdirs. INCREMENTAL: a cell whose archive is already up to date (newer than its .000 and its
+// subdirs. INCREMENTAL: a chart whose archive is already up to date (newer than its .000 and its
 // update chain) is skipped, so a re-run over an unchanged tree bakes nothing — 0 over a warm cache
 // is success. The engine writes and frees each archive as it goes, so this never holds N archives
 // in memory (peak ~ workers). outDir is the caller's OWN cache — it owns the location + layout, so
-// distinct consumers don't clash. onProgress(done, total) fires per baked cell (may be called
+// distinct consumers don't clash. onProgress(done, total) fires per baked chart (may be called
 // concurrently from workers, so it must be safe for concurrent use). Returns the number baked
 // THIS run.
 func BakeTree(inDir, outDir string, workers int, onProgress func(done, total int)) (int, error) {
@@ -87,7 +87,7 @@ func BakeTree(inDir, outDir string, workers int, onProgress func(done, total int
 }
 
 // PMTilesMetadata returns a PMTiles archive's metadata JSON blob (decompressed), or
-// nil if the archive carries none. A [BakeCell] archive embeds the cell's coverage
+// nil if the archive carries none. A [BakeChart] archive embeds the chart's coverage
 // under a "coverage" key. The pmtiles bytes are read but not retained.
 func PMTilesMetadata(pmtiles []byte) ([]byte, error) {
 	if len(pmtiles) == 0 {
@@ -123,8 +123,8 @@ const (
 )
 
 // BakePartitionDebug bakes the ownership-partition DEBUG tiles from an on-disk
-// ENC_ROOT into a single PMTiles at outPath — the composited faces (which cell renders
-// which ground at each band), one polygon per owning cell in a layer named "partition"
+// ENC_ROOT into a single PMTiles at outPath — the composited faces (which chart renders
+// which ground at each band), one polygon per owning chart in a layer named "partition"
 // with the properties cell/cscl/band/tier/oi/color, and NO portrayed chart content. It
 // is the raw material for a partition-debug UI: point a MapLibre style (using the
 // vector_layers metadata) at it and fill by the "color" property.
@@ -133,8 +133,8 @@ const (
 // [BandBerthing]…[BandOverview] emit that one band's own map at every zoom. minZoom and
 // maxZoom bound the tiles — the coarse bands are cheap, but harbor-level detail (maxZoom
 // >= 13) multiplies the tile count ~4× per zoom, so raise it deliberately. Returns the
-// cell count; nothing covered returns ErrNoCoverage (no file written).
-func BakePartitionDebug(encRoot, outPath string, minZoom, maxZoom uint8, band PartitionBand) (cellCount int, err error) {
+// chart count; nothing covered returns ErrNoCoverage (no file written).
+func BakePartitionDebug(encRoot, outPath string, minZoom, maxZoom uint8, band PartitionBand) (chartCount int, err error) {
 	if encRoot == "" || outPath == "" {
 		return 0, fmt.Errorf("tile57: BakePartitionDebug needs an ENC root and out path: %w", ErrEmptyInput)
 	}
@@ -143,13 +143,13 @@ func BakePartitionDebug(encRoot, outPath string, minZoom, maxZoom uint8, band Pa
 	cOut := C.CString(outPath)
 	defer C.free(unsafe.Pointer(cOut))
 
-	var cells C.uint32_t
+	var charts C.uint32_t
 	var cerr C.tile57_error
-	if st := C.tile57_bake_partition_debug(cRoot, cOut, C.uint8_t(minZoom), C.uint8_t(maxZoom), C.int8_t(band), &cells, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_bake_partition_debug(cRoot, cOut, C.uint8_t(minZoom), C.uint8_t(maxZoom), C.int8_t(band), &charts, &cerr); st != C.TILE57_OK {
 		return 0, statusError(st, &cerr)
 	}
-	if cells == 0 {
+	if charts == 0 {
 		return 0, fmt.Errorf("tile57: partition-debug bake covered nothing: %w", ErrNoCoverage)
 	}
-	return int(cells), nil
+	return int(charts), nil
 }

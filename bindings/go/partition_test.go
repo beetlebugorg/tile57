@@ -19,7 +19,7 @@ func TestBakePartitionDebug(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n == 0 {
-		t.Fatal("baked 0 cells")
+		t.Fatal("baked 0 charts")
 	}
 	fi, err := os.Stat(out)
 	if err != nil || fi.Size() == 0 {

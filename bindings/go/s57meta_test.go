@@ -11,14 +11,14 @@ import (
 // TestCells reads the testdata cell's DSID identity + coverage handle-free —
 // the metadata a host previously parsed from ISO-8211 itself.
 func TestCells(t *testing.T) {
-	cells, err := Cells(testCell)
+	charts, err := Charts(testCell)
 	if err != nil {
-		t.Fatalf("Cells: %v", err)
+		t.Fatalf("Charts: %v", err)
 	}
-	if len(cells) != 1 {
-		t.Fatalf("cells = %d, want 1", len(cells))
+	if len(charts) != 1 {
+		t.Fatalf("charts = %d, want 1", len(charts))
 	}
-	c := cells[0]
+	c := charts[0]
 	if c.Name != "US5MD1MC" {
 		t.Errorf("name = %q, want US5MD1MC", c.Name)
 	}

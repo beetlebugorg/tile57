@@ -32,8 +32,8 @@ func TestComposeSingleCell(t *testing.T) {
 		t.Fatalf("OpenComposeCharts: %v", err)
 	}
 	m := src.Meta()
-	if m.Cells != 1 {
-		t.Fatalf("compose cells = %d, want 1", m.Cells)
+	if m.Charts != 1 {
+		t.Fatalf("compose charts = %d, want 1", m.Charts)
 	}
 	// The fill-up bake serves from z0, but a single harbour cell is sub-pixel at
 	// world zooms (its low-zoom tiles are legitimately empty) — probe a zoom
@@ -108,10 +108,10 @@ func TestOpenComposeServe(t *testing.T) {
 	defer src.Close()
 
 	m := src.Meta()
-	t.Logf("compose: %d cells, z%d..%d, bounds [%.3f, %.3f, %.3f, %.3f]",
-		m.Cells, m.MinZoom, m.MaxZoom, m.West, m.South, m.East, m.North)
-	if m.Cells == 0 {
-		t.Fatal("no coverage-carrying cells")
+	t.Logf("compose: %d charts, z%d..%d, bounds [%.3f, %.3f, %.3f, %.3f]",
+		m.Charts, m.MinZoom, m.MaxZoom, m.West, m.South, m.East, m.North)
+	if m.Charts == 0 {
+		t.Fatal("no coverage-carrying charts")
 	}
 
 	// Serve the tile at the coverage centre, a few zooms into the range — the centre of real

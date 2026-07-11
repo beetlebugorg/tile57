@@ -50,7 +50,7 @@ info := chart.Info()     // zoom range, bounds, embedded 1:N scale
 scamin := chart.Scamin() // []uint32, ascending
 
 // Raw S-57 reading is handle-free (cell inventory, feature extraction).
-cells, _ := tile57.Cells("/enc/ENC_ROOT")
+charts, _ := tile57.Charts("/enc/ENC_ROOT")
 water, _ := tile57.Features("/enc/ENC_ROOT/US5MD1MC/US5MD1MC.000", "DEPARE", "DRGARE")
 ```
 
@@ -58,10 +58,10 @@ water, _ := tile57.Features("/enc/ENC_ROOT/US5MD1MC/US5MD1MC.000", "DEPARE", "DR
 
 - **Charts (a baked archive: metadata + query)** — `Open` (path, mmap'd),
   `OpenBytes`; `Source.Info`, `Meta`, `Scamin`, `Coverage`, `Close`.
-- **S-57 source readers (handle-free)** — `Cells` (per-cell metadata of a .000 or
+- **S-57 source readers (handle-free)** — `Charts` (per-chart metadata of a .000 or
   ENC_ROOT), `Features` / `FeaturesBytes` (GeoJSON extraction), `CatalogEntries`
   (CATALOG.031 decode).
-- **Bake** — `BakeCell` (one cell → PMTiles bytes), `BakeTree` (an ENC_ROOT → per-cell
+- **Bake** — `BakeChart` (one chart → PMTiles bytes), `BakeTree` (an ENC_ROOT → per-chart
   archives), `BakeAssets` (portrayal assets in memory).
 - **Compose** — `OpenCompose` (paths; owns its charts) / `OpenComposeCharts`
   (borrows yours); `ComposeSource.Serve` (a tile, with an ownership flag), `Meta`,

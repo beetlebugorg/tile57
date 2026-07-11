@@ -16,9 +16,9 @@ func TestBakeCellEmbedsCoverage(t *testing.T) {
 		t.Skipf("no test cell %s: %v", testCell, err)
 	}
 
-	pm, err := BakeCell(testCell)
+	pm, err := BakeChart(testCell)
 	if err != nil {
-		t.Fatalf("BakeCell: %v", err)
+		t.Fatalf("BakeChart: %v", err)
 	}
 	if len(pm) < 7 || string(pm[:7]) != "PMTiles" {
 		t.Fatalf("not a PMTiles archive (got %d bytes)", len(pm))

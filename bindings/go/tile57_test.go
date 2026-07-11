@@ -34,9 +34,9 @@ func bakeTestCell(t *testing.T) []byte {
 	if _, err := os.Stat(testCell); err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	pm, err := BakeCell(testCell)
+	pm, err := BakeChart(testCell)
 	if err != nil {
-		t.Fatalf("BakeCell: %v", err)
+		t.Fatalf("BakeChart: %v", err)
 	}
 	return pm
 }

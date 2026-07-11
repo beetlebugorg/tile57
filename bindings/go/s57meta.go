@@ -2,7 +2,7 @@
 
 package tile57
 
-// Raw S-57 access, handle-free: per-cell metadata, GeoJSON feature extraction,
+// Raw S-57 access, handle-free: per-chart metadata, GeoJSON feature extraction,
 // and exchange-set catalogue decode — everything a host previously parsed from
 // S-57/ISO-8211 itself. With these, a host's S-57 knowledge shrinks to file
 // staging conventions (.000/.NNN, ENC_ROOT/, CATALOG.031 as opaque bytes).
@@ -20,10 +20,10 @@ import (
 	"unsafe"
 )
 
-// CellInfo is one cell's identity + coverage, as recorded in its DSID/DSPM
+// ChartRecord is one chart's identity + coverage, as recorded in its DSID/DSPM
 // after the applied update chain.
-type CellInfo struct {
-	Name      string     `json:"name"`      // cell stem, e.g. "US5MD1MC"
+type ChartRecord struct {
+	Name      string     `json:"name"`      // chart stem, e.g. "US5MD1MC"
 	Scale     int        `json:"scale"`     // DSPM CSCL (1:N)
 	Edition   string     `json:"edition"`   // DSID EDTN
 	Update    string     `json:"update"`    // DSID UPDN (last applied update)
@@ -33,10 +33,10 @@ type CellInfo struct {
 	HasBBox   bool       `json:"-"`
 }
 
-// Cells returns the per-cell metadata of the S-57 data at path — one .000 file
+// Charts returns the per-chart metadata of the S-57 data at path — one .000 file
 // (with its update chain applied) or a whole ENC_ROOT directory — for a host's
 // chart-database scan.
-func Cells(path string) ([]CellInfo, error) {
+func Charts(path string) ([]ChartRecord, error) {
 	if path == "" {
 		return nil, fmt.Errorf("tile57: empty path: %w", ErrEmptyInput)
 	}
@@ -45,7 +45,7 @@ func Cells(path string) ([]CellInfo, error) {
 	var out *C.uint8_t
 	var outLen C.size_t
 	var cerr C.tile57_error
-	if st := C.tile57_enc_cells(cPath, &out, &outLen, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_enc_charts(cPath, &out, &outLen, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	if out == nil {
@@ -53,15 +53,15 @@ func Cells(path string) ([]CellInfo, error) {
 	}
 	raw := tileBytes(out, outLen)
 	var wire []struct {
-		CellInfo
+		ChartRecord
 		BBox []float64 `json:"bbox"`
 	}
 	if err := json.Unmarshal(raw, &wire); err != nil {
-		return nil, fmt.Errorf("tile57: cell metadata decode: %w", err)
+		return nil, fmt.Errorf("tile57: chart metadata decode: %w", err)
 	}
-	infos := make([]CellInfo, len(wire))
+	infos := make([]ChartRecord, len(wire))
 	for i, w := range wire {
-		infos[i] = w.CellInfo
+		infos[i] = w.ChartRecord
 		if len(w.BBox) == 4 {
 			copy(infos[i].BBox[:], w.BBox)
 			infos[i].HasBBox = true
@@ -74,7 +74,7 @@ func Cells(path string) ([]CellInfo, error) {
 type CatalogEntry struct {
 	File     string     `json:"file"`     // recorded path, '/'-normalised
 	LongName string     `json:"longName"` // LFIL — the human chart title ("" when absent)
-	Impl     string     `json:"impl"`     // "BIN" (a cell), "ASC", "TXT"
+	Impl     string     `json:"impl"`     // "BIN" (a chart), "ASC", "TXT"
 	BBox     [4]float64 `json:"bbox"`     // [west, south, east, north]
 	HasBBox  bool       `json:"-"`
 }
@@ -122,10 +122,10 @@ type Feature struct {
 	Geometry json.RawMessage   // the GeoJSON geometry object (lon/lat; soundings carry depth as a 3rd coord)
 }
 
-// Features returns the features of the S-57 data at path (one cell, updates
+// Features returns the features of the S-57 data at path (one chart, updates
 // applied, or a whole ENC_ROOT) for the given object-class acronyms (e.g.
 // "DEPARE", "DRGARE"), parsed without portrayal. A whole-ENC_ROOT extraction
-// walks every cell — the caller owns that cost.
+// walks every chart — the caller owns that cost.
 func Features(path string, classes ...string) ([]Feature, error) {
 	if path == "" {
 		return nil, fmt.Errorf("tile57: empty path: %w", ErrEmptyInput)
@@ -146,11 +146,11 @@ func Features(path string, classes ...string) ([]Feature, error) {
 	return decodeFeatures(out, outLen)
 }
 
-// FeaturesBytes is [Features] over in-memory base-cell bytes (a .000 read from a
+// FeaturesBytes is [Features] over in-memory base .000 bytes (read from a
 // zip member, say). No update chain is applied.
 func FeaturesBytes(base []byte, classes ...string) ([]Feature, error) {
 	if len(base) == 0 {
-		return nil, fmt.Errorf("tile57: empty cell bytes: %w", ErrEmptyInput)
+		return nil, fmt.Errorf("tile57: empty chart bytes: %w", ErrEmptyInput)
 	}
 	if len(classes) == 0 {
 		return nil, nil

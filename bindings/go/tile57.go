@@ -10,12 +10,12 @@
 // below link it by a path relative to this package, so an importing module needs a
 // `replace` pointing at a local checkout (see this package's README).
 //
-// The pipeline mirrors the C header: bake ENC cells to per-cell PMTiles
-// ([BakeCell] / [BakeTree]), open each archive as a [Source] ([Open] /
+// The pipeline mirrors the C header: bake ENC charts to per-chart PMTiles
+// ([BakeChart] / [BakeTree]), open each archive as a [Source] ([Open] /
 // [OpenBytes]) for metadata, and compose the open charts into one seamless tile
 // pyramid with [OpenCompose] / [OpenComposeCharts] for serving. Raw S-57 reading
-// (cell inventory, feature extraction, catalogue decode) is handle-free — see
-// [Cells], [Features], [FeaturesBytes], [CatalogEntries].
+// (chart inventory, feature extraction, catalogue decode) is handle-free — see
+// [Charts], [Features], [FeaturesBytes], [CatalogEntries].
 //
 // libtile57 is NOT internally synchronized, so every call into a handle is
 // guarded by a mutex.
@@ -35,7 +35,7 @@ import (
 	"unsafe"
 )
 
-// Version returns the libtile57 version string (e.g. "0.2.0").
+// Version returns the libtile57 version string (e.g. "0.3.0").
 func Version() string { return C.GoString(C.tile57_version()) }
 
 // statusError turns a non-OK tile57_status (with the optional tile57_error the
@@ -113,7 +113,7 @@ type Meta struct {
 // are serialized internally.
 type Source struct {
 	mu     sync.Mutex
-	ptr    *C.tile57
+	ptr    *C.tile57_chart
 	scamin []uint32 // cached SCAMIN manifest (resolved once on first use)
 	scaminDone bool
 }
@@ -127,23 +127,23 @@ func Open(path string) (*Source, error) {
 	}
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
-	var ptr *C.tile57
+	var ptr *C.tile57_chart
 	var cerr C.tile57_error
-	if st := C.tile57_open(cPath, &ptr, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_chart_open(cPath, &ptr, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	return &Source{ptr: ptr}, nil
 }
 
 // OpenBytes opens a baked PMTiles archive from in-memory bytes (e.g. straight from
-// [BakeCell], before any file exists). Bytes are copied.
+// [BakeChart], before any file exists). Bytes are copied.
 func OpenBytes(pmtiles []byte) (*Source, error) {
 	if len(pmtiles) == 0 {
 		return nil, fmt.Errorf("tile57: empty archive bytes: %w", ErrEmptyInput)
 	}
-	var ptr *C.tile57
+	var ptr *C.tile57_chart
 	var cerr C.tile57_error
-	if st := C.tile57_open_bytes((*C.uint8_t)(unsafe.Pointer(&pmtiles[0])), C.size_t(len(pmtiles)), &ptr, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_chart_open_bytes((*C.uint8_t)(unsafe.Pointer(&pmtiles[0])), C.size_t(len(pmtiles)), &ptr, &cerr); st != C.TILE57_OK {
 		return nil, statusError(st, &cerr)
 	}
 	return &Source{ptr: ptr}, nil
@@ -161,7 +161,7 @@ type ChartInfo struct {
 	AnchorLat, AnchorLon, AnchorZoom float64
 	// TileType is the archive's stored encoding (FormatMVT or FormatMLT).
 	TileType TileFormat
-	// NativeScale is the compilation scale (1:N) embedded by the per-cell bake;
+	// NativeScale is the compilation scale (1:N) embedded by the per-chart bake;
 	// 0 = unknown (a composed/foreign archive — derive from the zoom band).
 	NativeScale int32
 }
@@ -171,7 +171,7 @@ func (s *Source) Info() ChartInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var ci C.tile57_info
-	C.tile57_get_info(s.ptr, &ci)
+	C.tile57_chart_get_info(s.ptr, &ci)
 	return ChartInfo{
 		MinZoom: uint8(ci.min_zoom), MaxZoom: uint8(ci.max_zoom),
 		Bands:     uint32(ci.bands),
@@ -195,7 +195,7 @@ func (s *Source) Meta() Meta {
 		return m
 	}
 	var ci C.tile57_info
-	C.tile57_get_info(s.ptr, &ci)
+	C.tile57_chart_get_info(s.ptr, &ci)
 	m.MinZoom, m.MaxZoom = uint8(ci.min_zoom), uint8(ci.max_zoom)
 	if bool(ci.has_bounds) {
 		m.W, m.S, m.E, m.N = float64(ci.west), float64(ci.south), float64(ci.east), float64(ci.north)
@@ -224,7 +224,7 @@ func (s *Source) scaminLocked() []uint32 {
 	var out *C.int32_t
 	var n C.size_t
 	var cerr C.tile57_error
-	if C.tile57_scamin(s.ptr, &out, &n, &cerr) == C.TILE57_OK && out != nil && n > 0 {
+	if C.tile57_chart_scamin(s.ptr, &out, &n, &cerr) == C.TILE57_OK && out != nil && n > 0 {
 		vals := unsafe.Slice(out, int(n))
 		res := make([]uint32, n)
 		for i, v := range vals {
@@ -243,7 +243,7 @@ func (s *Source) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ptr != nil {
-		C.tile57_close(s.ptr)
+		C.tile57_chart_close(s.ptr)
 		s.ptr = nil
 	}
 	return nil
