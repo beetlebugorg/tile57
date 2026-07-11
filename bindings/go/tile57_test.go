@@ -3,9 +3,9 @@
 package tile57
 
 import (
-	"bytes"
 	"math"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -28,158 +28,73 @@ func TestColortablesDefault(t *testing.T) {
 	}
 }
 
-// A resident chart (OpenChartBytes) portrays live, so its generated tiles carry the
-// S-52 §10.8 pick-report attributes (class / cell / s57) on every feature by default.
-// The per-cell Name badge and the pick-attrs opt-out were parameters of the dropped
-// multi-cell open (chart-api.md); the surviving live-open surface always includes the
-// pick report.
-func TestPickAttrs(t *testing.T) {
-	data, err := os.ReadFile(testCell)
-	if err != nil {
-		t.Skipf("no test cell: %v", err)
-	}
-	src, err := OpenChartBytes(data)
-	if err != nil {
-		t.Fatalf("OpenChartBytes: %v", err)
-	}
-	defer src.Close()
-
-	// Scan the tile grid covering the chart bounds until a tile carries the pick-report
-	// property keys (present on every feature when pick attrs are on).
-	info := src.Info()
-	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
-		x0, y0 := lonLatToTile(info.West, info.North, z)
-		x1, y1 := lonLatToTile(info.East, info.South, z)
-		for x := x0; x <= x1; x++ {
-			for y := y0; y <= y1; y++ {
-				body, err := src.Tile(z, x, y)
-				if err != nil {
-					t.Fatalf("Tile %d/%d/%d: %v", z, x, y, err)
-				}
-				if bytes.Contains(body, []byte("class")) && bytes.Contains(body, []byte("s57")) {
-					return // pick-report attributes present — done
-				}
-			}
-		}
-	}
-	t.Fatal("resident chart tiles carry no pick-report attributes (class/s57) — expected them by default")
-}
-
-func TestOpenCellAndTile(t *testing.T) {
-	data, err := os.ReadFile(testCell)
-	if err != nil {
-		t.Skipf("no test cell: %v", err)
-	}
-	src, err := OpenChartBytes(data)
-	if err != nil {
-		t.Fatalf("OpenChartBytes: %v", err)
-	}
-	defer src.Close()
-
-	info := src.Info()
-	if info.MaxZoom < info.MinZoom {
-		t.Fatalf("bad zoom range %d..%d", info.MinZoom, info.MaxZoom)
-	}
-	if !info.HasBounds {
-		t.Fatal("expected known bounds for a single cell")
-	}
-	t.Logf("zoom %d..%d, bands=%#b, bounds W=%.4f S=%.4f E=%.4f N=%.4f",
-		info.MinZoom, info.MaxZoom, info.Bands, info.West, info.South, info.East, info.North)
-
-	// Address the tile covering the cell's bounds centre at each zoom; assert at
-	// least one non-empty MVT is produced across the cell's range.
-	got := false
-	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
-		tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, z)
-		body, err := src.Tile(z, tx, ty)
-		if err != nil {
-			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
-		}
-		if len(body) > 0 {
-			got = true
-			t.Logf("tile %d/%d/%d -> %d bytes MVT", z, tx, ty, len(body))
-		}
-	}
-	if !got {
-		t.Fatal("no non-empty tile produced across the cell's zoom range")
-	}
-}
-
-// TestOpenPath opens the testdata directory as a STREAMING chart (engine enumerates
-// + reads the .000 on demand) and asserts it tiles like the byte-opened cell.
-func TestOpenPath(t *testing.T) {
+// bakeTestCell bakes the testdata cell for tests that need an archive.
+func bakeTestCell(t *testing.T) []byte {
+	t.Helper()
 	if _, err := os.Stat(testCell); err != nil {
 		t.Skipf("no test cell: %v", err)
 	}
-	src, err := Open("testdata")
+	pm, err := BakeChart(testCell)
 	if err != nil {
-		t.Fatalf("Open(testdata): %v", err)
+		t.Fatalf("BakeChart: %v", err)
 	}
-	defer src.Close()
-
-	info := src.Info()
-	if !info.HasBounds {
-		t.Fatal("expected known bounds for the streamed ENC_ROOT")
-	}
-	t.Logf("streamed: zoom %d..%d bounds W=%.4f S=%.4f E=%.4f N=%.4f",
-		info.MinZoom, info.MaxZoom, info.West, info.South, info.East, info.North)
-
-	got := false
-	for z := info.MinZoom; z <= info.MaxZoom && z <= 14; z++ {
-		tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, z)
-		body, err := src.Tile(z, tx, ty)
-		if err != nil {
-			t.Fatalf("Tile %d/%d/%d: %v", z, tx, ty, err)
-		}
-		if len(body) > 0 {
-			got = true
-		}
-	}
-	if !got {
-		t.Fatal("no non-empty tile from the streamed chart")
-	}
+	return pm
 }
 
-// TestOpenPMTilesAndInfo bakes the fixture to a PMTiles file, opens it via the path,
-// and exercises the chart_get_info getter. Also covers OpenChartBytes.
-func TestOpenPMTilesAndInfo(t *testing.T) {
-	data, err := os.ReadFile(testCell)
+// A chart is ONE baked archive: opened from bytes it must report the zoom range,
+// bounds, tile encoding, the compilation scale the bake embedded, and the real
+// M_COVR coverage rings — everything a host chart-database needs with no .000.
+func TestOpenBytesInfoCoverage(t *testing.T) {
+	src, err := OpenBytes(bakeTestCell(t))
 	if err != nil {
-		t.Skipf("no test cell: %v", err)
-	}
-	// OpenChartBytes (resident single cell) + Info.
-	rc, err := OpenChartBytes(data)
-	if err != nil {
-		t.Fatalf("OpenChartBytes: %v", err)
-	}
-	if info := rc.Info(); !info.HasBounds || info.MaxZoom < info.MinZoom {
-		t.Fatalf("resident chart info looks unset: %+v", info)
-	}
-	rc.Close()
-
-	// Bake to a PMTiles file, then open it by path.
-	pm, err := BakePmtiles([]Cell{{Base: data}}, BakeOpts{MaxZoom: 24}, nil)
-	if err != nil {
-		t.Fatalf("BakePmtiles: %v", err)
-	}
-	tmp := t.TempDir() + "/chart.pmtiles"
-	if err := os.WriteFile(tmp, pm, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	src, err := OpenPMTiles(tmp)
-	if err != nil {
-		t.Fatalf("OpenPMTiles: %v", err)
+		t.Fatalf("OpenBytes: %v", err)
 	}
 	defer src.Close()
 
 	info := src.Info()
 	if info.MaxZoom < info.MinZoom || !info.HasBounds {
-		t.Fatalf("pmtiles chart info looks unset: %+v", info)
+		t.Fatalf("chart info looks unset: %+v", info)
 	}
-	t.Logf("pmtiles: zoom %d..%d bounds W=%.4f E=%.4f anchor=%v", info.MinZoom, info.MaxZoom, info.West, info.East, info.HasAnchor)
-	tx, ty := lonLatToTile((info.West+info.East)/2, (info.South+info.North)/2, info.MaxZoom)
-	if _, err := src.Tile(info.MaxZoom, tx, ty); err != nil {
-		t.Fatalf("Tile: %v", err)
+	if info.NativeScale != 12000 {
+		t.Fatalf("NativeScale = %d, want 12000 (embedded by the bake)", info.NativeScale)
+	}
+	if info.TileType != FormatMLT {
+		t.Fatalf("TileType = %v, want FormatMLT", info.TileType)
+	}
+	cov, err := src.Coverage()
+	if err != nil {
+		t.Fatalf("Coverage: %v", err)
+	}
+	if len(cov) == 0 || len(cov[0]) < 3 {
+		t.Fatalf("expected real M_COVR coverage rings, got %d", len(cov))
+	}
+	for _, ring := range cov {
+		for _, p := range ring {
+			if p[0] < info.West-1e-6 || p[0] > info.East+1e-6 || p[1] < info.South-1e-6 || p[1] > info.North+1e-6 {
+				t.Fatalf("coverage vertex %v outside bounds", p)
+			}
+		}
+	}
+	t.Logf("zoom %d..%d, scale 1:%d, %d coverage ring(s), bounds W=%.4f S=%.4f E=%.4f N=%.4f",
+		info.MinZoom, info.MaxZoom, info.NativeScale, len(cov),
+		info.West, info.South, info.East, info.North)
+}
+
+// Open (path) mmaps the archive and must agree with the bytes-open on metadata.
+func TestOpenPath(t *testing.T) {
+	pm := bakeTestCell(t)
+	path := filepath.Join(t.TempDir(), "US5MD1MC.pmtiles")
+	if err := os.WriteFile(path, pm, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer src.Close()
+	info := src.Info()
+	if !info.HasBounds || info.NativeScale != 12000 {
+		t.Fatalf("mmap'd chart info looks unset: %+v", info)
 	}
 }
 

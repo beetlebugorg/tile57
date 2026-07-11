@@ -34,25 +34,39 @@ replace github.com/beetlebugorg/tile57/bindings/go => /path/to/chartplotter-nati
 ```go
 import tile57 "github.com/beetlebugorg/tile57/bindings/go"
 
-// Bake a single cell.000 or a whole ENC_ROOT dir into a self-contained bundle.
-cells, bbox, err := tile57.BakeBundle("/enc/ENC_ROOT", "/out/bundle", "", "", "", 0, 16, nil)
+// Bake an ENC_ROOT: each cell becomes its own PMTiles under <out>/tiles/, plus
+// an ownership partition at <out>/partition.tpart.
+n, err := tile57.BakeTree("/enc/ENC_ROOT", "/out", 4, nil)
 
-// Or serve tiles live, and publish the SCAMIN manifest for the style.
-src, _ := tile57.Open("/enc/ENC_ROOT")
+// Open the compositor over the baked archives + partition, and serve tiles.
+src, _ := tile57.OpenCompose([]string{"/out/tiles/US5MD1MC.pmtiles"}, "/out/partition.tpart")
 defer src.Close()
-mvt, _ := src.Tile(13, 2359, 3139)
-manifest := src.Scamin() // []uint32, ascending
+body, owned, _ := src.Tile(13, 2359, 3139) // owned=false, body=nil => open ocean
+
+// Or open one baked archive as a chart (bounds, scale, coverage, SCAMIN).
+chart, _ := tile57.Open("/out/tiles/US5MD1MC.pmtiles")
+defer chart.Close()
+info := chart.Info()     // zoom range, bounds, embedded 1:N scale
+scamin := chart.Scamin() // []uint32, ascending
+
+// Raw S-57 reading is handle-free (cell inventory, feature extraction).
+charts, _ := tile57.Charts("/enc/ENC_ROOT")
+water, _ := tile57.Features("/enc/ENC_ROOT/US5MD1MC/US5MD1MC.000", "DEPARE", "DRGARE")
 ```
 
 ## Surface
 
-- **Charts** — `Open` (path, streaming), `OpenChartBytes` (one in-memory cell),
-  `OpenPMTiles` (baked bundle); `Source.Tile`, `Info`, `Meta`, `Scamin`,
-  `ClearCache`, `Close`.
-- **Bake** — `BakeCells` (→ one PMTiles archive in memory), `BakeBundle` (→ a full
-  on-disk bundle: tiles + assets + per-scheme styles + manifest).
-- **Assets / style** — `ColortablesDefault`, `Colortables`, `Linestyles`,
-  `SpriteAtlas`, `PatternAtlas`, `StyleTemplate`, `BuildStyle`, `Style`,
+- **Charts (a baked archive: metadata + query)** — `Open` (path, mmap'd),
+  `OpenBytes`; `Source.Info`, `Meta`, `Scamin`, `Coverage`, `Close`.
+- **S-57 source readers (handle-free)** — `Charts` (per-chart metadata of a .000 or
+  ENC_ROOT), `Features` / `FeaturesBytes` (GeoJSON extraction), `CatalogEntries`
+  (CATALOG.031 decode).
+- **Bake** — `BakeChart` (one chart → PMTiles bytes), `BakeTree` (an ENC_ROOT → per-chart
+  archives), `BakeAssets` (portrayal assets in memory).
+- **Compose** — `OpenCompose` (paths; owns its charts) / `OpenComposeCharts`
+  (borrows yours); `ComposeSource.Serve` (a tile, with an ownership flag), `Meta`,
+  `SavePartition`, `Close`.
+- **Style** — `ColortablesDefault`, `Style`, `BuildStyle`, `StyleDiff`,
   `MarinerDefaults`.
 
 `libtile57` is not internally synchronized; every `Source` method is mutex-guarded,

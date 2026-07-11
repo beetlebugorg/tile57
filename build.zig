@@ -162,16 +162,24 @@ pub fn build(b: *std.Build) void {
     // libc/Lua) and target-agnostic: they omit target/optimize so the same module
     // objects compile under both the glibc test/lib build and the static-musl
     // baker build, inheriting each consumer's target.
-    // DAG: s57 (incl. iso8211) <- s100; tiles (leaf) <- render <- scene.
-    // The embedded catalogue JSON rides on s100 (catalogue.zig @embedFile's it).
+    // DAG: iso8211 <- s57 <- s101; tiles (leaf) <- render <- scene.
+    // The embedded catalogue JSON rides on s101 (catalogue.zig @embedFile's it).
+    //
+    // ISO/IEC 8211 container reader (src/iso8211/): the bottom layer, a pure
+    // std-only leaf. Its own module so a consumer can decode 8211 records
+    // without depending on any S-57 semantics.
+    const iso8211_mod = b.addModule("iso8211", .{
+        .root_source_file = b.path("src/iso8211/iso8211.zig"),
+    });
     const s57_mod = b.addModule("s57", .{
         .root_source_file = b.path("src/s57/s57.zig"),
+        .imports = &.{.{ .name = "iso8211", .module = iso8211_mod }},
     });
-    const s100_mod = b.addModule("s100", .{
-        .root_source_file = b.path("src/s100/s100.zig"),
+    const s101_mod = b.addModule("s101", .{
+        .root_source_file = b.path("src/s101/s101.zig"),
         .imports = &.{.{ .name = "s57", .module = s57_mod }},
     });
-    addCatalogueJson(b, s100_mod);
+    addCatalogueJson(b, s101_mod);
 
     // Tile encoding + addressing (src/tiles/): MVT + MLT encoders, gzip, the
     // PMTiles container, and web-mercator tile math. One pure leaf module
@@ -183,9 +191,9 @@ pub fn build(b: *std.Build) void {
     // Render engine (src/render/): the semantic Surface contract + noop
     // surface, the resolver (colors at palette, display gates), and the pixel
     // machinery (Canvas primitive seam, RasterCanvas, PNG encoder, PixelSurface).
-    // One pure module; imports tiles (TilePoint alias) + assets (settings model)
-    // only — never s57/s100/portray. NOTE: declared before assets_mod exists,
-    // so that edge is attached right after assets_mod below.
+    // One pure module; imports tiles (TilePoint alias) + style (settings model)
+    // only — never s57/s101/portray. NOTE: declared before style_mod exists,
+    // so that edge is attached right after style_mod below.
     const render_mod = b.addModule("render", .{
         .root_source_file = b.path("src/render/render.zig"),
         .imports = &.{.{ .name = "tiles", .module = tiles_mod }},
@@ -199,10 +207,37 @@ pub fn build(b: *std.Build) void {
     }.f;
     addFont(b, render_mod);
 
-    // Integer computational geometry (src/geo/): the Martinez polygon boolean +
+    // Integer computational geometry (src/geometry/): the Martinez polygon boolean +
     // the coverage-clipped best-available partition. Pure (std-only); the scene
     // engine + baker use it for the cross-band composite.
-    const geo_mod = b.addModule("geo", .{ .root_source_file = b.path("src/geo/geo.zig") });
+    const geometry_mod = b.addModule("geometry", .{ .root_source_file = b.path("src/geometry/geometry.zig") });
+
+    // Per-cell M_COVR coverage sidecar (src/coverage/): CellCoverage plus the
+    // fromCell / encodeJson / decodeFromMetadata round-trip carried in PMTiles
+    // metadata. Pure over s57 (the LonLat point type) + std.json; the baker writes
+    // it and the compositor reads it.
+    const coverage_mod = b.addModule("coverage", .{
+        .root_source_file = b.path("src/coverage/coverage.zig"),
+        .imports = &.{.{ .name = "s57", .module = s57_mod }},
+    });
+
+    // The engine error taxonomy (src/errors.zig): the error set the C ABI maps to
+    // tile57_status, plus describe() for the per-call message. Pure std-only leaf.
+    const errors_mod = b.addModule("errors", .{ .root_source_file = b.path("src/errors.zig") });
+
+    // The runtime tile compositor (src/compose/): serve any (z,x,y) on demand from
+    // N per-cell PMTiles archives + an ownership partition. Reads baked archives
+    // only — never parses S-57 or runs portrayal — so it depends solely on the
+    // tile / geometry / coverage leaves (s57 rides in for the LonLat point type).
+    const compose_mod = b.addModule("compose", .{
+        .root_source_file = b.path("src/compose/compose.zig"),
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "s57", .module = s57_mod },
+        },
+    });
 
     // The tile engine (src/scene/): S-57 -> tile-surface generation plus the
     // banded ENC_ROOT baker (bake_enc.zig, mirrors the Go oracle's
@@ -211,10 +246,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/scene/scene.zig"),
         .imports = &.{
             .{ .name = "s57", .module = s57_mod },
-            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "s101", .module = s101_mod },
             .{ .name = "tiles", .module = tiles_mod },
             .{ .name = "render", .module = render_mod },
-            .{ .name = "geo", .module = geo_mod },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
         },
     });
 
@@ -230,7 +266,7 @@ pub fn build(b: *std.Build) void {
         .pic = true,
         .imports = &.{
             .{ .name = "s57", .module = s57_mod },
-            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "s101", .module = s101_mod },
         },
     });
     addLua(b, portray_mod, lua_posix);
@@ -239,18 +275,18 @@ pub fn build(b: *std.Build) void {
     // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
     portray_mod.addImport("rules_registry", embedDir(b, "rules_registry", PORTRAYAL_CATALOG ++ "/Rules", ".lua"));
 
-    // Asset/style generation for the chart bundle (src/assets/): colortables,
-    // manifest, style.json + the S-52 mariner expression builders
-    // (chartstyle.zig, a Zig port of the web client's s52-style.mjs builders —
-    // folded in; consumed by the style builder, the C ABI, and the render
-    // resolver's settings model). Pure + target-agnostic.
-    const assets_mod = b.addModule("assets", .{
-        .root_source_file = b.path("src/assets/assets.zig"),
+    // MapLibre style generation (src/style/): color tables, line styles, the
+    // style.json layer set (maplibre.zig), and the S-52 mariner settings model +
+    // expression builders (chartstyle.zig, a Zig port of the web client's
+    // s52-style.mjs builders). Consumed by the C ABI, the CLI, and the render
+    // resolver's settings model. Pure + target-agnostic.
+    const style_mod = b.addModule("style", .{
+        .root_source_file = b.path("src/style/style.zig"),
     });
-    // The render module's settings-model edge (declared above assets_mod).
-    render_mod.addImport("assets", assets_mod);
+    // The render module's settings-model edge (declared above style_mod).
+    render_mod.addImport("style", style_mod);
     // The scene module's complex-linestyle XML analysis (also declared above).
-    scene_mod.addImport("assets", assets_mod);
+    scene_mod.addImport("style", style_mod);
 
     // S-101 sprite/pattern atlas builder (nanosvg + stb PNG). libc (the C libs),
     // target-less so it inherits the consumer's target (only the bake tool, which
@@ -268,12 +304,12 @@ pub fn build(b: *std.Build) void {
     // (portray is libc, wired separately into the lib + baker only.)
     const pure_pkgs = [_]std.Build.Module.Import{
         .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "s101", .module = s101_mod },
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
-        .{ .name = "assets", .module = assets_mod },
-        .{ .name = "geo", .module = geo_mod },
+        .{ .name = "style", .module = style_mod },
+        .{ .name = "geometry", .module = geometry_mod },
     };
 
     // Full engine surface (the pure root.zig packages + the embedded-Lua `portray`
@@ -306,18 +342,19 @@ pub fn build(b: *std.Build) void {
     catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
     catalog_embed.addImport("colorprofile_registry", colorprofile_registry);
 
-    // The chart-bundle pipeline as a library module (bundle.bakeBundle): tiles +
-    // assets + manifest. Target-agnostic + libc (the sprite atlas builder), so the
-    // CLI baker AND libtile57.a (the C ABI, tile57_bake_bundle) build the SAME bundle
-    // over the shared singleton packages. See src/bundle.zig.
+    // The chart-bundle module: S-101 portrayal asset emission + the per-cell composite
+    // (ownership partition + on-demand compositor). Target-agnostic + libc (the sprite
+    // atlas builder), so the CLI baker AND libtile57.a share the SAME emitters over the
+    // shared singleton packages. See src/bundle.zig.
     const bundle_mod = b.createModule(.{
         .root_source_file = b.path("src/bundle.zig"),
         .link_libc = true,
         .imports = &.{
             .{ .name = "engine", .module = engine_full },
-            .{ .name = "assets", .module = assets_mod },
+            .{ .name = "style", .module = style_mod },
             .{ .name = "sprite", .module = sprite_mod },
             .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "compose", .module = compose_mod }, // debug bake reuses LoadedCov/toPlaneCells
         },
     });
 
@@ -345,6 +382,9 @@ pub fn build(b: *std.Build) void {
     addPkgs(tile57_mod, &pure_pkgs);
     tile57_mod.addImport("portray", portray_mod);
     tile57_mod.addImport("sprite", sprite_mod); // sprite/pattern atlas generation
+    tile57_mod.addImport("coverage", coverage_mod); // per-cell coverage sidecar
+    tile57_mod.addImport("compose", compose_mod); // the runtime compositor
+    tile57_mod.addImport("errors", errors_mod); // the error taxonomy
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -359,7 +399,10 @@ pub fn build(b: *std.Build) void {
     addPkgs(lib_mod, &pure_pkgs);
     lib_mod.addImport("portray", portray_mod);
     lib_mod.addImport("sprite", sprite_mod); // C ABI: sprite/pattern atlas generation
-    lib_mod.addImport("bundle", bundle_mod); // C ABI: the whole chart-bundle pipeline (bake_bundle)
+    lib_mod.addImport("bundle", bundle_mod); // C ABI: portrayal-asset emitters + debug bake
+    lib_mod.addImport("compose", compose_mod); // C ABI: tile57_compose_* (the runtime compositor)
+    lib_mod.addImport("coverage", coverage_mod); // the tile57 public root re-exports it
+    lib_mod.addImport("errors", errors_mod); // C ABI: error taxonomy -> tile57_status
     // The full engine surface as a NAMED import (not a root.zig file-import), so the
     // single root.zig file isn't claimed by both lib_mod and engine_full (which bundle
     // pulls in) — Zig requires each file to belong to exactly one module per artifact.
@@ -370,6 +413,12 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("colorprofile_registry", colorprofile_registry);
     lib_mod.addImport("catalog", catalog_embed); // chart.renderView symbol/pattern store
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
+    // Bundle compiler-rt INTO the static archive. A non-Zig linker (the CGO host's gcc/clang,
+    // `go test`) has no access to Zig's compiler-rt, so builtins the code references — e.g.
+    // `roundq` (f128 @round, pulled in by std.json's number→int coercion in coverage decode) —
+    // would be undefined at link time. Static libs default to NOT bundling it; force it on so
+    // libtile57.a is self-contained for C consumers.
+    lib.bundle_compiler_rt = true;
     if (target.result.os.tag == .macos) {
         // Apple's ld64 rejects 64-bit mach-o archive members whose offsets aren't
         // 8-byte aligned, and Zig's archiver doesn't align them — so the raw
@@ -386,6 +435,15 @@ pub fn build(b: *std.Build) void {
     } else {
         b.installArtifact(lib);
     }
+
+    // `zig build lib` installs only libtile57.a for the resolved target. The
+    // default install also builds the host-only bake CLI (which force-links
+    // static musl and so can't cross-compile); an embedder cross-building the
+    // library for another platform — e.g. a Qt6 viewer for the reMarkable
+    // tablet (arm-linux-gnueabihf / aarch64-linux-gnu) — uses this step to get
+    // just the archive without the CLI.
+    const lib_only_step = b.step("lib", "Build only libtile57.a for the target");
+    lib_only_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
 
     // The offline baker / inspector CLI. It runs the embedded-Lua S-101 portrayal
     // so baked tiles get full S-101 styling (not the classify() fallback), so —
@@ -409,7 +467,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true, // portray (embedded Lua)
         .imports = &.{
             .{ .name = "s57", .module = s57_mod },
-            .{ .name = "s100", .module = s100_mod },
+            .{ .name = "s101", .module = s101_mod },
             .{ .name = "tiles", .module = tiles_mod },
             .{ .name = "scene", .module = scene_mod },
             .{ .name = "render", .module = render_mod },
@@ -418,7 +476,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "catalog", .module = catalog_embed },
         },
     });
-    chart_mod.addImport("assets", assets_mod); // linestyle XML analysis
+    chart_mod.addImport("style", style_mod); // linestyle XML analysis
+    chart_mod.addImport("coverage", coverage_mod); // embedded-coverage attach on PMTiles opens
+    chart_mod.addImport("compose", compose_mod); // compose-backed view renders
 
     const bake_target = if (target.result.os.tag == .linux and target.result.abi != .musl)
         b.resolveTargetQuery(.{ .cpu_arch = target.result.cpu.arch, .os_tag = .linux, .abi = .musl })
@@ -434,10 +494,12 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "engine", .module = engine_full },
-                .{ .name = "assets", .module = assets_mod },
+                .{ .name = "style", .module = style_mod },
                 .{ .name = "sprite", .module = sprite_mod },
                 .{ .name = "catalog", .module = catalog_embed },
                 .{ .name = "bundle", .module = bundle_mod },
+                .{ .name = "compose", .module = compose_mod }, // compose-tile CLI
+                .{ .name = "geometry", .module = geometry_mod }, // compose-tile --scan reads the boolean diagnostics
                 .{ .name = "render", .module = render_mod }, // renderpng pixel path
                 .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
             },
@@ -476,7 +538,7 @@ pub fn build(b: *std.Build) void {
     // build test` is unaffected; `zig build wasm` builds the wasm.
     const style_settings_mod = b.addModule("style_settings", .{
         .root_source_file = b.path("bindings/shared/settings.zig"),
-        .imports = &.{.{ .name = "assets", .module = assets_mod }},
+        .imports = &.{.{ .name = "style", .module = style_mod }},
     });
 
     // Attach the embedded template + colortables to a bindings consumer module.
@@ -493,7 +555,7 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = .ReleaseSmall, // smallest wasm; this isn't a hot path
         .imports = &.{
-            .{ .name = "assets", .module = assets_mod },
+            .{ .name = "style", .module = style_mod },
             .{ .name = "settings", .module = style_settings_mod },
         },
     });
@@ -512,7 +574,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "assets", .module = assets_mod },
+            .{ .name = "style", .module = style_mod },
             .{ .name = "settings", .module = style_settings_mod },
         },
     });
@@ -535,30 +597,69 @@ pub fn build(b: *std.Build) void {
     sprite_test.link_libc = true;
     addSvgRaster(b, sprite_test);
 
-    _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{});
-    const s100_test = addPkgTest(b, test_step, "src/s100/s100.zig", target, optimize, &.{
+    _ = addPkgTest(b, test_step, "src/iso8211/iso8211.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{
+        .{ .name = "iso8211", .module = iso8211_mod },
+    });
+    const s101_test = addPkgTest(b, test_step, "src/s101/s101.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
     });
-    addCatalogueJson(b, s100_test); // catalogue.zig @embedFile's the JSON
+    addCatalogueJson(b, s101_test); // catalogue.zig @embedFile's the JSON
     const tiles_test = addPkgTest(b, test_step, "src/tiles/tiles.zig", target, optimize, &.{});
     addMvtFixture(b, tiles_test); // pmtiles.zig's round-trip test embeds it
     _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "s101", .module = s101_mod },
         .{ .name = "tiles", .module = tiles_mod },
         .{ .name = "render", .module = render_mod },
-        .{ .name = "assets", .module = assets_mod },
-        .{ .name = "geo", .module = geo_mod },
+        .{ .name = "style", .module = style_mod },
+        .{ .name = "geometry", .module = geometry_mod },
     });
-    _ = addPkgTest(b, test_step, "src/assets/assets.zig", target, optimize, &.{});
-    // Geometry core for the cross-band composition redesign (pure, std-only).
-    _ = addPkgTest(b, test_step, "src/geo/geo.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/style/style.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/errors.zig", target, optimize, &.{});
+    // Geometry core for the cross-band composition (pure, std-only).
+    _ = addPkgTest(b, test_step, "src/geometry/geometry.zig", target, optimize, &.{});
+    // The runtime compositor + its clip core: pure over tiles + geometry + coverage.
+    // Its own step for fast iteration, and part of the main suite.
+    const compose_deps = [_]std.Build.Module.Import{
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "geometry", .module = geometry_mod },
+        .{ .name = "coverage", .module = coverage_mod },
+        .{ .name = "s57", .module = s57_mod },
+    };
+    const compose_step = b.step("compose-test", "Run the runtime compositor + clip-core tests");
+    _ = addPkgTest(b, compose_step, "src/compose/compose.zig", target, optimize, &compose_deps);
+    _ = addPkgTest(b, test_step, "src/compose/compose.zig", target, optimize, &compose_deps);
+
+    // The chart-bundle module hosts the per-cell composite (composeTile / ComposeSource). Its full
+    // dep set (engine + assets/sprite/catalog) needs libc, so create the test module directly
+    // rather than via addPkgTest (which omits link_libc).
+    const bundle_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+        },
+    });
+    const bundle_test_step = b.step("bundle-test", "Run the bundle / per-cell composite tests");
+    bundle_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bundle_test_mod })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bundle_test_mod })).step);
+    // Per-cell coverage sidecar (JSON round-trip carried in PMTiles metadata): pure
+    // over s57 + std.json. Part of the main suite.
+    _ = addPkgTest(b, test_step, "src/coverage/coverage.zig", target, optimize, &.{
+        .{ .name = "s57", .module = s57_mod },
+    });
     // The render module: Surface contract + noop lifecycle smoke test (pins
     // the contract), resolver gates/colors, Canvas + RasterCanvas + PNG +
     // PixelSurface.
     const render_test = addPkgTest(b, test_step, "src/render/render.zig", target, optimize, &.{
         .{ .name = "tiles", .module = tiles_mod },
-        .{ .name = "assets", .module = assets_mod },
+        .{ .name = "style", .module = style_mod },
     });
     addFont(b, render_test);
     // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
@@ -595,14 +696,14 @@ pub fn build(b: *std.Build) void {
     _ = addPkgTest(b, test_step, "src/render/inspect_view_test.zig", target, optimize, &.{
         .{ .name = "portray", .module = portray_mod },
         .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s100", .module = s100_mod },
+        .{ .name = "s101", .module = s101_mod },
         .{ .name = "scene", .module = scene_mod },
         .{ .name = "render", .module = render_mod },
         .{ .name = "tiles", .module = tiles_mod },
     });
     // bindings/ shared settings parser (used by the wasm engine + parity oracle).
     _ = addPkgTest(b, test_step, "bindings/shared/settings.zig", target, optimize, &.{
-        .{ .name = "assets", .module = assets_mod },
+        .{ .name = "style", .module = style_mod },
     });
     // The public root (src/tile57.zig) is compile-checked via lib_root.zig in the
     // libtile57.a build — it imports source.zig (Lua/libc), so it can't be a pure

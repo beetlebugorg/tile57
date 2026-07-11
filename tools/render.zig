@@ -1,6 +1,6 @@
 const std = @import("std");
 const engine = @import("engine");
-const assets = @import("assets");
+const style = @import("style");
 const sprite = @import("sprite");
 const render = @import("render");
 const chart = @import("chart");
@@ -19,7 +19,7 @@ const resolveRulesDir = common.resolveRulesDir;
 // tile (labels + declutter over the full canvas, no seams).
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output: render.pixel.Output) !void {
     if (args.len < 4) {
-        std.debug.print("usage: tile57 {s} <cell.000|bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--scale F]\n" ++
+        std.debug.print("usage: tile57 {s} <cell.000|bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--meta] [--scale F]\n" ++
             "       tile57 {s} <source> --view <lon,lat,zoom> --size WxH -o <out> [flags]\n", .{ @tagName(output), @tagName(output) });
         return;
     }
@@ -44,7 +44,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     var size_scale: f64 = 1.0; // physical-size multiplier (S-52 mm -> true mm)
     var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
     // Mariner settings (defaults match the app: other ON for spot soundings).
-    var m = render.resolve.MarinerSettings{ .display_other = true };
+    var m = render.resolve.Settings{ .display_other = true };
     var f = Flags{ .args = args, .i = if (tile_mode) 5 else 2 };
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "-o")) {
@@ -72,6 +72,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             rules = f.next() orelse return usageErr("--rules needs a dir");
         } else if (std.mem.eql(u8, arg, "--dq")) {
             dq = true; // S-52 data-quality overlay (M_QUAL DQUAL* patterns)
+        } else if (std.mem.eql(u8, arg, "--meta")) {
+            m.show_meta_bounds = true; // meta-object coverage/scale/nav-system bounds inspection view
         } else if (std.mem.eql(u8, arg, "--scale")) {
             const v = f.next() orelse return usageErr("--scale needs a value");
             size_scale = std.fmt.parseFloat(f64, v) catch return usageErr("bad --scale");
@@ -182,9 +184,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     ps.output = output;
 
     // Complex-linestyle table (idempotent; arena-backed — this run only).
-    const ls_srcs = try a.alloc(assets.LineStyleSrc, catalog_embed.linestyles.len);
+    const ls_srcs = try a.alloc(style.LineStyleSrc, catalog_embed.linestyles.len);
     for (catalog_embed.linestyles, 0..) |e, li| ls_srcs[li] = .{ .id = e.name, .xml = e.bytes };
-    engine.scene.registerLinestylesXml(a, ls_srcs);
+    engine.scene.linestyle.registerLinestylesXml(a, ls_srcs);
 
     const bytes = if (from_bundle) blk: {
         // Bundle-sourced replay: decode each covering baked tile and re-emit

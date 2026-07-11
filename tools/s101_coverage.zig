@@ -1,9 +1,8 @@
-//! S-57 -> S-101 portrayal attribute-coverage check
-//! (Tasks 2-3 of the conformance-testability brief; see
-//! specs/conformance-testability.md). Run it: `zig build s101-coverage`
+//! S-57 -> S-101 portrayal attribute-coverage check. Run it:
+//! `zig build s101-coverage`
 //! (append `-- --json out.json` / `-- --fail-on-new tools/s101_coverage_baseline.json`).
-//! The gate baseline lives at tools/s101_coverage_baseline.json (tracked; /specs/
-//! is gitignored). Regenerate it after an intended change with --write-baseline.
+//! The gate baseline lives at tools/s101_coverage_baseline.json (tracked).
+//! Regenerate it after an intended change with --write-baseline.
 //!
 //! 1. STATIC READ-SET (Task 2): scan the vendored S-101 Portrayal Catalogue Lua
 //!    rules and, per feature-class rule, collect every attribute the rule reads
@@ -16,7 +15,7 @@
 //!
 //! 2. ADAPTER COVERAGE (Task 3): classify each consumed attribute as
 //!      (a) SOURCED   - non-empty S-57 `alias` in catalogue.json, so the adapter's
-//!                      resolveAttrByCode forwards it (s101_adapt.zig:468).
+//!                      resolveAttrByCode forwards it (adapter.zig:468).
 //!      (b) DEFAULTED - the adapter synthesizes it without an S-57 alias (light
 //!                      sectors, topmark, featureName<-OBJNAM, zoneOfConfidence
 //!                      <-CATZOC, ...; ADAPTER_SYNTHESIZED below).
@@ -37,10 +36,10 @@ const PERMITTED = "vendor/s101/permitted.json"; // per-class permitted enum valu
 const RULES_DIR = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog/Rules";
 
 // Attributes the adapter synthesizes/derives WITHOUT a direct S-57 alias.
-// Sourced verbatim from src/s100/s101_adapt.zig (2026-07-01); grow this when the
+// Sourced verbatim from src/s101/adapter.zig (2026-07-01); grow this when the
 // adapter grows new synthesis.
 const ADAPTER_SYNTHESIZED = [_][]const u8{
-    // orientation / clearance complexes (s101_adapt.zig:122-127, 494-501)
+    // orientation / clearance complexes (adapter.zig:122-127, 494-501)
     "orientation",                      "orientationValue",
     "verticalClearanceClosed",          "verticalClearanceFixed",
     "verticalClearanceOpen",            "verticalClearanceValue",
@@ -48,13 +47,13 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
     // Gate's HORCLR -> horizontalClearanceOpen (class-keyed; the other 8 classes that
     // reference it bind …Fixed, so its absence there is an expected-absence)
     "horizontalClearanceOpen",
-    // openingBridge synthesized from CATBRG 2..8 for BRIDGE->Bridge (s101_adapt.zig)
+    // openingBridge synthesized from CATBRG 2..8 for BRIDGE->Bridge (adapter.zig)
              "openingBridge",
-    // current velocity CURVEL -> speed.speedMaximum (s101_adapt.zig complex_from_simple)
+    // current velocity CURVEL -> speed.speedMaximum (adapter.zig complex_from_simple)
     "speed",                            "speedMaximum",
     "speedMinimum",
     // NATSUR list -> surfaceCharacteristics[].natureOfSurface for SeabedArea
-    // (s101_adapt.zig buildSurfaceCharacteristics; off-list values dropped)
+    // (adapter.zig buildSurfaceCharacteristics; off-list values dropped)
                         "surfaceCharacteristics",
     // CATMOR {1,2} -> categoryOfDolphin for MORFAC-routed Dolphin (same coding)
     "categoryOfDolphin",
@@ -62,9 +61,9 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
                    "valueOfLocalMagneticAnomaly",
     "magneticAnomalyValue",
     // inTheWater: producer spatial derivation (point over DEPARE and not over LNDARE),
-    // no S-57 source (s101_adapt.zig readsInTheWater); true-only, else absent
+    // no S-57 source (adapter.zig readsInTheWater); true-only, else absent
                 "inTheWater",
-    // light sector + rhythm synthesis (s101_adapt.zig:376-431, 697-710)
+    // light sector + rhythm synthesis (adapter.zig:376-431, 697-710)
     "sectorCharacteristics",            "lightSector",
     "sectorLimit",                      "sectorLimitOne",
     "sectorLimitTwo",                   "sectorBearing",
@@ -72,21 +71,21 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
     "lightCharacteristic",              "signalGroup",
     "signalPeriod",                     "valueOfNominalRange",
     "lightVisibility",
-    // featureName from OBJNAM (s101_adapt.zig:466, 477-480)
+    // featureName from OBJNAM (adapter.zig:466, 477-480)
                      "featureName",
     "name",                             "language",
     "nameUsage",
-    // zoneOfConfidence from M_QUAL CATZOC (s101_adapt.zig:482-489)
+    // zoneOfConfidence from M_QUAL CATZOC (adapter.zig:482-489)
                            "zoneOfConfidence",
     "categoryOfZoneOfConfidenceInData",
-    // topmark fold (s101_adapt.zig:513-522, 641-643)
+    // topmark fold (adapter.zig:513-522, 641-643)
     "topmark",
     "topmarkDaymarkShape",
-    // QUAPOS aggregate -> feature attr (s101_adapt.zig:552-557)
+    // QUAPOS aggregate -> feature attr (adapter.zig:552-557)
                  "qualityOfHorizontalMeasurement",
-    // depth range served for DepthArea/DepthContour (s101_adapt.zig:607-610)
+    // depth range served for DepthArea/DepthContour (adapter.zig:607-610)
     "depthRangeMinimumValue",
-    // underwater-hazard depths for UDWHAZ05/OBSTRN07/WRECKS05 (s101_adapt.zig:544-549):
+    // underwater-hazard depths for UDWHAZ05/OBSTRN07/WRECKS05 (adapter.zig:544-549):
     // defaultClearanceDepth always, surroundingDepth when the danger sits in a depth area
               "surroundingDepth",
     "defaultClearanceDepth",
@@ -96,8 +95,8 @@ const ADAPTER_SYNTHESIZED = [_][]const u8{
 // The coverage buckets above answer "is the attribute supplied?". These answer
 // "is the supplied VALUE valid S-101?". A slot is at-risk when the adapter
 // forwards a raw S-57 value that S-65 says must be remapped, dropped, or is off
-// the S-101 allowable list. Keyed by S-57 acronym/object (matching S-65 and
-// specs/s57-s101-conversion-gaps.md); translated to S-101 names at run time via
+// the S-101 allowable list. Keyed by S-57 acronym/object (matching S-65);
+// translated to S-101 names at run time via
 // the catalogue alias maps, so only attributes a rule ACTUALLY reads surface.
 
 const AttrNote = struct { acr: []const u8, note: []const u8 };
@@ -110,7 +109,7 @@ const VALUE_REMAP = [_]AttrNote{
 };
 
 // Acronyms whose VALUE_REMAP the adapter now applies before the value reaches a
-// rule (s101_adapt.zig s65RemapValue / s65RemapQuapos): the prohibited/remapped
+// rule (adapter.zig s65RemapValue / s65RemapQuapos): the prohibited/remapped
 // values are dropped or mapped, and every surviving value is inside the S-101
 // allowable list — so the "remap" concern is retired. The per-object RESTRICTED
 // allowable-list axis, if any, is still reported (a separate concern). Grow this as
@@ -143,11 +142,11 @@ const RESTRICTED = [_]AttrObjs{
     .{ .acr = "BOYSHP", .objs = &.{"MORFAC"} },
 };
 
-// `enforced` = the adapter drops this attribute write-side (s101_adapt.zig DROP_ATTRS /
+// `enforced` = the adapter drops this attribute write-side (adapter.zig DROP_ATTRS /
 // isDroppedAttr), so the value never reaches a rule and the slot is NOT at-risk even if
 // a rule reads it. Defaults true: every §E pair below is enforced. A future §E entry the
 // adapter hasn't wired yet sets `.enforced = false` and still flags (the CI safety net,
-// like VALUE_REMAP vs VALUE_REMAP_DONE). Keep this table in sync with s101_adapt.zig.
+// like VALUE_REMAP vs VALUE_REMAP_DONE). Keep this table in sync with adapter.zig.
 const ObjAttr = struct { obj: []const u8, acr: []const u8, enforced: bool = true };
 // Per-object attribute drops — "will not be converted" for that feature (gaps doc §E).
 // Enforced write-side by the adapter; the entries stay as the §E reference + safety net.

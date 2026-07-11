@@ -23,9 +23,11 @@ pub const tile = root.tile;
 pub const iso8211 = root.iso8211;
 pub const s57 = root.s57;
 pub const scene = root.scene;
-pub const s101_instr = root.s101_instr;
-pub const s101_adapt = root.s101_adapt;
+pub const s101 = root.s101;
+pub const s101_instructions = root.s101_instructions;
+pub const s101_adapter = root.s101_adapter;
 pub const catalogue = root.catalogue;
 pub const bake_enc = root.bake_enc;
+pub const geometry = @import("geometry"); // integer geometry: boolean, plane, partition
 
 pub const portray = @import("portray");

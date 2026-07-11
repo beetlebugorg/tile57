@@ -22,8 +22,8 @@ const s57 = @import("s57");
 const scene = @import("scene.zig");
 const pmtiles = @import("tiles").pmtiles;
 const tile = @import("tiles").tile;
-const assets = @import("assets"); // displayDenomZ: the physical display-scale formula
-const geometry = @import("geo"); // Martinez boolean for the coverage-clipped composite
+const style = @import("style"); // displayDenomZ: the physical display-scale formula
+const geometry = @import("geometry"); // Martinez boolean for the coverage-clipped composite
 
 /// A parsed + portrayed cell ready to bake. `portrayal` is the per-feature S-101
 /// instruction stream (null = bake with the classify() fallback); `bounds` is
@@ -160,15 +160,13 @@ fn coversAny(backends: []const Backend, idxs: []const u32, lon: f64, lat: f64) b
     return coversAnyCtx(BackendCov{ .backends = backends }, idxs, lon, lat);
 }
 
-// Whether cell `a` orders strictly before cell `b` in the equal-scale clip
-// order: newer DSID issue/update date first (YYYYMMDD compares lexically; a
-// dated cell orders before an undated one), then cell name ascending - total
-// and deterministic for distinct cells, so bake output is byte-stable.
+// The equal-scale clip-order tiebreak (newer date, then name) lives in
+// geometry.partition, so the baker and the ownership partition pick the same
+// winner. Re-exported here for this module's callers.
+pub const ordersBeforeKeys = geometry.partition.ordersBeforeKeys;
+
 fn ordersBefore(ctx: anytype, a_idx: u32, b_idx: u32) bool {
-    const da = ctx.date(a_idx);
-    const db = ctx.date(b_idx);
-    if (!std.mem.eql(u8, da, db)) return std.mem.lessThan(u8, db, da); // newer first
-    return std.mem.lessThan(u8, ctx.name(a_idx), ctx.name(b_idx));
+    return ordersBeforeKeys(ctx.date(a_idx), ctx.name(a_idx), ctx.date(b_idx), ctx.name(b_idx));
 }
 
 /// coverClipForCell's per-tile verdict — the cheap FULL/EMPTY/SEAM classifier
@@ -218,9 +216,8 @@ fn ringsTouchRect(rings: []const []const s57.LonLat, w: f64, so: f64, e: f64, n:
 /// The finer-scale coverage to subtract from cell `cscl_self`'s fills in tile
 /// (z,x,y): the union of every strictly-finer cell's M_COVR (CATCOV=1), projected
 /// into the tile's i32 space and box-clipped, as a clean ring set. This is the
-/// coverage-clipped best-available composite's exact subtrahend
-/// (specs/cross-band-composition-redesign.md) — it replaces the point-sampled
-/// whole-tile suppress_whole with true geometry, so a coarse fill is cut exactly
+/// coverage-clipped best-available composite's exact subtrahend — it uses true
+/// geometry rather than a point-sampled whole-tile flag, so a coarse fill is cut exactly
 /// where a finer cell owns the ground (no seam double-draw) and kept everywhere
 /// else, including inside a finer no-data hole (no blank). null = nothing finer
 /// covers this tile (the cell is finest here → draw everything). Allocated in `a`
@@ -396,8 +393,8 @@ pub const OVERSCALE_FACTOR = 2;
 ///
 /// Baking the halved value (rather than the raw cscl quantized UP the SCAMIN
 /// ladder, the old behaviour) fixes the "fires early" defect: the zoom-derived
-/// clause `oscl > K/2^zoom` now flips EXACTLY at 2x and never before 1x
-/// (specs/overscale.md v3 defect 1). 0 when the compilation scale is unknown.
+/// clause `oscl > K/2^zoom` flips EXACTLY at 2x and never before 1x.
+/// Returns 0 when the compilation scale is unknown.
 pub fn overscaleGateDenom(cscl: i32) i64 {
     if (cscl <= 0) return 0;
     return @divTrunc(cscl, OVERSCALE_FACTOR);
@@ -405,7 +402,7 @@ pub fn overscaleGateDenom(cscl: i32) i64 {
 
 /// The effScamin floor for a cell (spec §4): the display denominator of the
 /// cell's band-floor zoom under the client's static gate constant
-/// (assets.scaminGateK at the equator — the largest K over all latitudes, so
+/// (style.scaminGateK at the equator — the largest K over all latitudes, so
 /// the clamp holds everywhere). A feature's emitted `scamin` is floored here so
 /// an aggressive SCAMIN cannot blank a point between the cell's floor tier and
 /// its own activation zoom — the finer cell owns that ground geometrically, so
@@ -420,67 +417,28 @@ pub fn effScaminFloor(cscl: i32) i64 {
     // window can open — leave its SCAMINs raw (a z0 clamp would disable
     // decluttering at world view entirely).
     if (floor_z == 0) return 0;
-    const k = assets.scaminGateK(0);
+    const k = style.scaminGateK(0);
     return @intFromFloat(@ceil(k / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(floor_z)))));
 }
 
-/// Native [minzoom, maxzoom] Web-Mercator span for a navigational-purpose band.
-pub const ZoomRange = struct { min: u8, max: u8 };
+// The navigational-band / scale->zoom mapping lives in tiles.band (a pure leaf
+// both the baker and the compositor share). Re-exported here so this module's
+// callers (chart, coverage) keep reaching it through bake_enc. (Inline @import
+// rather than a `band` binding, so the many `band: Band` parameters below don't
+// shadow it.)
+pub const ZoomRange = @import("tiles").band.ZoomRange;
+pub const Band = @import("tiles").band.Band;
+pub const bands_fine_to_coarse = @import("tiles").band.bands_fine_to_coarse;
+pub const bandOf = @import("tiles").band.bandOf;
+pub const FILLUP_DZ = @import("tiles").band.FILLUP_DZ;
+pub const FILLUP_CEIL = @import("tiles").band.FILLUP_CEIL;
+pub const bandZooms = @import("tiles").band.bandZooms;
 
 /// Restricts a bakeBand pass to the tiles under one "super-tile" (a tile at the
 /// coarser zoom `zs`): only (z,x,y) with z >= zs whose ancestor at zs is (sx,sy)
 /// are generated. Lets the lazy baker process a band one spatial super-tile at a
 /// time — loading only the cells overlapping it — instead of the whole band.
 pub const TileClip = struct { zs: u8, sx: u32, sy: u32 };
-
-/// Navigational-purpose bands, finest → coarsest (the order bands must be baked in
-/// for best-band dedup). Mirrors chartplotter-go bake.Band.
-pub const Band = enum(u8) { berthing = 0, harbor, approach, coastal, general, overview };
-
-/// All bands finest → coarsest (the bakeBand call order).
-pub const bands_fine_to_coarse = [_]Band{ .berthing, .harbor, .approach, .coastal, .general, .overview };
-
-/// Map a compilation-scale denominator (CSCL, 1:N) to its band (Go BandForScale).
-pub fn bandOf(cscl: i32) Band {
-    const n: i64 = if (cscl <= 0) 50_000 else cscl;
-    if (n <= 8_000) return .berthing;
-    if (n <= 32_000) return .harbor;
-    if (n <= 130_000) return .approach;
-    if (n <= 500_000) return .coastal;
-    if (n <= 2_300_000) return .general;
-    return .overview;
-}
-
-/// Overscale fill-up depth DEFAULT: how many zooms past its native max a
-/// band's own cells keep baking (only where nothing finer already emitted).
-/// Every extension zoom ~4x that band's tile count over its uncovered
-/// footprint (measured: +2 turned a 5.6k-tile approach pass into 41k), so the
-/// default is ONE crisp overscale zoom; TILE57_FILLUP_DZ=0..2 overrides per
-/// bake (Baker.fillup_dz). 0 never blanks — the client camera stops at the
-/// probed data depth and MapLibre stretches one level past it.
-pub const FILLUP_DZ: u8 = 1;
-
-/// Absolute fill-up ceiling: extension zooms never exceed this. The fill-up
-/// serves the MID-ZOOM seam where a coarse chart is the finest coverage (the
-/// blank bay at z12-15); letting fine bands extend too (harbor→z17-18,
-/// berthing→z19-20) quadruples the tile count per extra zoom across every
-/// harbor footprint for content nobody needs — a district pack ballooned from
-/// ~800k to 13M+ planned tiles. A band's NATIVE window is never clamped by
-/// this; past its data the camera stops at the probed depth instead.
-pub const FILLUP_CEIL: u8 = 15;
-
-/// A band's native zoom span (Go Band.ZoomRange). Adjacent bands overlap by one
-/// zoom; best-band dedup resolves the overlap to the finer band.
-pub fn bandZooms(band: Band) ZoomRange {
-    return switch (band) {
-        .berthing => .{ .min = 16, .max = 18 },
-        .harbor => .{ .min = 13, .max = 16 },
-        .approach => .{ .min = 11, .max = 13 },
-        .coastal => .{ .min = 9, .max = 11 },
-        .general => .{ .min = 7, .max = 9 },
-        .overview => .{ .min = 0, .max = 7 },
-    };
-}
 
 /// The live-path fallback band for a tile whose zoom sits OUTSIDE every
 /// overlapping cell's native window (chart.zig tileRefs). ABOVE every window
@@ -601,6 +559,16 @@ fn parWorker(pc: *ParCtx) void {
         pc.func(pc.user, i, scratch);
         _ = arena.reset(.retain_capacity);
     }
+}
+
+/// Run func(user, i, scratch) for every i in [0, n) SERIALLY on the calling thread (a per-thread
+/// scratch arena reset between items, exactly like parallelFor with one thread). Tile generation
+/// uses this: the parallel unit is the CELL (chart.bakeCellsParallel runs one worker per cell), so
+/// per-cell tile-gen stays single-threaded and W workers stay W threads — no nested thread pool.
+pub fn serialFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *const fn (*anyopaque, usize, std.mem.Allocator) void) void {
+    if (n == 0) return;
+    var pc = ParCtx{ .next = std.atomic.Value(usize).init(0), .n = n, .user = user, .func = func, .gpa = gpa };
+    parWorker(&pc);
 }
 
 /// Run func(user, i, scratch) for every i in [0, n) across the CPU threads. func
@@ -735,7 +703,7 @@ const TileGenCtx = struct {
         // composite (coverClipForCell + subtractCoverage + coveredByFiner) does it
         // exactly per-feature. All that remains here is the overscale scale-boundary
         // scan: the finest compilation scale CONTRIBUTING to this tile.
-        // Scale-boundary overscale refinement (specs/overscale.md): the finest
+        // Scale-boundary overscale refinement: the finest
         // compilation scale CONTRIBUTING to this tile — over the quilting's own
         // participant list (any overlapping cell, reach-only riders excluded),
         // not point-sampled coverage. A cell hatches its OVERSC01 coverage only
@@ -1098,7 +1066,7 @@ pub const Baker = struct {
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
         var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .context = self.context, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
-        parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
+        serialFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
             const mvt_bytes = mvt_opt orelse continue;
@@ -1179,7 +1147,7 @@ pub const Baker = struct {
         const bname: [*:0]const u8 = @tagName(band).ptr;
         var done = std.atomic.Value(usize).init(0);
         var tg = TileGenCtx{ .keys = keys, .idx_lists = idx_lists, .results = results, .backends = backends, .gpa = self.gpa, .format = self.format, .pick_attrs = self.pick_attrs, .context = self.context, .progress = progress, .pctx = ctx, .base = self.count, .band_base = self.band_base, .band_total = self.band_total, .band_index = self.band_index, .band_count = self.band_count, .band_name = bname, .done = &done };
-        parallelFor(self.gpa, n, &tg, TileGenCtx.gen);
+        serialFor(self.gpa, n, &tg, TileGenCtx.gen);
 
         for (keys, results) |key, mvt_opt| {
             const mvt_bytes = mvt_opt orelse continue;
@@ -1522,15 +1490,26 @@ test "fill-down bake: a coastal-only bay gets low-zoom tiles the overview extend
     // band the extend_min fill rides), but it does not cover the bay. Without
     // fill-down the bay has no tiles below coastal's window (z<9): the reported
     // district-pack z6–z8 hole.
+    // Two features: a SCAMIN-gated buoy (hidden below its display scale — the
+    // sub-band cull drops it from fill-down tiles, where the client gate would
+    // hide it anyway) and a SCAMIN-less one (land/coast in real cells) that
+    // keeps the low-zoom tiles populated.
     const scamin_attr = [_]s57.Attr{.{ .code = 133, .value = "260000" }};
-    const feats = [_]s57.Feature{.{
+    const feats = [_]s57.Feature{ .{
         .rcnm = 0,
         .rcid = 1,
         .prim = 1,
         .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &scamin_attr,
-    }};
+    }, .{
+        .rcnm = 0,
+        .rcid = 2,
+        .prim = 1,
+        .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+        .attrs = &.{},
+    } };
     var bay_cell = try testCell(gpa, 0.35, 0.35, 200_000, &feats);
     defer bay_cell.deinit();
     var ov_cell = try testCell(gpa, 10.5, 10.5, 3_000_000, &feats);
@@ -1545,7 +1524,7 @@ test "fill-down bake: a coastal-only bay gets low-zoom tiles the overview extend
     const cover = [_][]const []const s57.LonLat{&rings};
     const bay_bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
     const ov_bounds = [4]f64{ 10.2, 10.2, 10.8, 10.8 };
-    const streams = [_]?[]const u8{"DrawingPriority:7;PointInstruction:BOYLAT01"};
+    const streams = [_]?[]const u8{ "DrawingPriority:7;PointInstruction:BOYLAT01", "DrawingPriority:7;PointInstruction:BOYLAT01" };
     const scamins = [_]u32{260_000};
 
     var bay = Backend{ .cell = bay_cell, .portrayal = &streams, .bounds = bay_bounds, .cscl = 200_000, .coverage = &cover, .scamins = &scamins };
@@ -1574,7 +1553,7 @@ test "fill-down bake: a coastal-only bay gets low-zoom tiles the overview extend
     try std.testing.expect(ov_t6[0] != bay_t6[0] or ov_t6[1] != bay_t6[1]);
 }
 
-test "overscale: a coarse cell occluded everywhere by finer coverage emits NO hatch (specs/overscale.md v3 defect 2)" {
+test "overscale: a coarse cell occluded everywhere by finer coverage emits NO hatch" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

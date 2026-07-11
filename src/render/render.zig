@@ -16,7 +16,7 @@
 //!   ascii    — AsciiSurface: the chart as a Unicode text grid (optional
 //!              ANSI-256 color). The worked example of adding a backend.
 //!
-//! Rule: nothing in this module imports s57, s100, or portray. If a surface
+//! Rule: nothing in this module imports s57, s101, or portray. If a surface
 //! needs a fact the Surface calls don't carry, that's an engine bug — extend
 //! the contract, never back-channel.
 

@@ -4,26 +4,21 @@ package tile57
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 )
 
-// TestCells reads the testdata cell's DSID identity + coverage through the
-// chart handle — the metadata a host previously parsed from ISO-8211 itself.
+// TestCells reads the testdata cell's DSID identity + coverage handle-free —
+// the metadata a host previously parsed from ISO-8211 itself.
 func TestCells(t *testing.T) {
-	src, err := Open(testCell)
+	charts, err := Charts(testCell)
 	if err != nil {
-		t.Fatalf("Open: %v", err)
+		t.Fatalf("Charts: %v", err)
 	}
-	defer src.Close()
-
-	cells, err := src.Cells()
-	if err != nil {
-		t.Fatalf("Cells: %v", err)
+	if len(charts) != 1 {
+		t.Fatalf("charts = %d, want 1", len(charts))
 	}
-	if len(cells) != 1 {
-		t.Fatalf("cells = %d, want 1", len(cells))
-	}
-	c := cells[0]
+	c := charts[0]
 	if c.Name != "US5MD1MC" {
 		t.Errorf("name = %q, want US5MD1MC", c.Name)
 	}
@@ -44,15 +39,21 @@ func TestCells(t *testing.T) {
 // TestFeatures runs the NMEA-simulator water-mask query: DEPARE/DRGARE
 // polygons with DRVAL1, closed rings, lon/lat coordinates.
 func TestFeatures(t *testing.T) {
-	src, err := Open(testCell)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer src.Close()
-
-	feats, err := src.Features("DEPARE", "DRGARE")
+	feats, err := Features(testCell, "DEPARE", "DRGARE")
 	if err != nil {
 		t.Fatalf("Features: %v", err)
+	}
+	// The bytes variant (the NMEA simulator's zip-member path) must agree.
+	data, err := os.ReadFile(testCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bfeats, err := FeaturesBytes(data, "DEPARE", "DRGARE")
+	if err != nil {
+		t.Fatalf("FeaturesBytes: %v", err)
+	}
+	if len(bfeats) == 0 {
+		t.Fatal("FeaturesBytes returned nothing")
 	}
 	if len(feats) == 0 {
 		t.Fatal("no DEPARE/DRGARE features")

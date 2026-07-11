@@ -41,10 +41,10 @@ zig build test    # runs the test suite
 
 | Target | What it is |
 |--------|-----------|
-| `tile57` (`zig-out/bin/tile57`) | the offline CLI: bake cells/ENC_ROOTs to PMTiles or a chart bundle, and emit portrayal assets. |
+| `tile57` (`zig-out/bin/tile57`) | the offline CLI: bake charts/ENC_ROOTs to PMTiles or a chart bundle, and emit portrayal assets. |
 | `libtile57.a` | the static library behind the [C ABI](./c-api.md) (`include/tile57.h`). |
 
-The engine is also a Zig package named `tile57` (v0.1.0); a Zig consumer
+The engine is also a Zig package named `tile57` (v0.3.0); a Zig consumer
 depends on it and uses `@import("tile57")` — see the [Zig API](./zig-api.md).
 
 :::note Consume it as a path dependency (for now)
@@ -66,7 +66,7 @@ build. Until that's fixed, use a path dependency.
 
 ## Runtime knob
 
-- `TILE57_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57 cells.
+- `TILE57_S101_RULES=<dir>` — S-101 portrayal rules directory for raw S-57 charts.
   An **override**: the rules are embedded in the binary by default, so this is
   only needed to portray against a different on-disk catalogue (it applies when a
   caller passes `NULL`/`null` for the `rules_dir` argument). The CLI accepts the

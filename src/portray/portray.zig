@@ -1,15 +1,15 @@
-//! Cell-driven S-101 portrayal. Adapts a cell's features (s101_adapt), exposes
+//! Cell-driven S-101 portrayal. Adapts a cell's features (s101.adapter), exposes
 //! them to the embedded Lua via C-ABI accessors (tgp_*), runs the rules once
 //! (tg_portray_run in lua_shim.c), and returns per-feature instruction streams
-//! for translation to MVT (s101_instr).
+//! for translation to MVT (s101.instructions).
 //!
 //! Lib-only (links Lua via the C shim) — not part of the pure root.zig used by
 //! the tests/bake exe.
 
 const std = @import("std");
 const s57 = @import("s57");
-const adapt = @import("s100").s101_adapt;
-const catalogue = @import("s100").catalogue; // S-57 OBJL -> acronym for the quesmrk diagnostic
+const adapter = @import("s101").adapter;
+const catalogue = @import("s101").catalogue; // S-57 OBJL -> acronym for the quesmrk diagnostic
 
 // The embedded S-101 rules accessor (tg_embedded_lua) — referenced so its C-ABI
 // exports land in the compiled module; the Lua `require` searcher in lua_shim.c
@@ -19,7 +19,7 @@ comptime {
 }
 
 const Ctx = struct {
-    adapted: []adapt.Adapted,
+    adapted: []adapter.Adapted,
     results: [][]const u8, // per adapted index -> instruction stream (arena-owned)
     arena: std.mem.Allocator,
     cell: *const s57.Cell, // for FFPT feature-to-feature association resolution
@@ -285,7 +285,7 @@ pub const Context = struct {
 /// Run the S-101 rules over `adapted` with `ov`, returning a stream array indexed
 /// by cell.features index (null where the adapted subset doesn't cover a feature,
 /// or it emitted nothing). `features_len` is cell.features.len.
-fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapt.Adapted, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
+fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapter.Adapted, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
     const results = try arena.alloc([]const u8, adapted.len);
     for (results) |*r| r.* = "";
 
@@ -320,7 +320,7 @@ fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapt.
 /// feature's S-101 instruction stream (or null if the class is unmapped / it
 /// emitted nothing). Allocates into `arena` (must outlive tile generation).
 pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) ![]?[]const u8 {
-    const adapted = try adapt.adaptCell(arena, cell);
+    const adapted = try adapter.adaptCell(arena, cell);
     return runAdapted(arena, cell, adapted, rules_dir, .{});
 }
 
@@ -329,7 +329,7 @@ pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: [
 /// boundary + point styles evaluate inside the rules, so the output needs none
 /// of the tile path's live-swap props. One pass, one context.
 pub fn portrayCellWith(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8, ctx: Context) ![]?[]const u8 {
-    const adapted = try adapt.adaptCell(arena, cell);
+    const adapted = try adapter.adaptCell(arena, cell);
     return runAdapted(arena, cell, adapted, rules_dir, ctx);
 }
 
@@ -345,29 +345,6 @@ pub const CellPortrayal = struct {
     simplified: ?[]const ?[]const u8 = null,
 };
 
-/// Portray only the features whose index is set in `mask` (indexed by
-/// cell.features index): the default pass plus the SimplifiedSymbols variant
-/// over the masked POINT features. Used by the scamin-standalone bake pre-pass
-/// to portray just the deduped cross-cell winners — a small fraction of the
-/// cell — without paying for a whole-cell portrayal twice. The whole cell is
-/// still ADAPTED first (cheap, pure Zig) so cross-feature context (topmark
-/// platforms etc.) matches the full-cell pass exactly; only the rule
-/// evaluation is subset. Returned arrays are indexed by cell.features index.
-pub fn portrayCellSubset(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8, mask: []const bool) !CellPortrayal {
-    const adapted = try adapt.adaptCell(arena, cell);
-    var subset = std.ArrayList(adapt.Adapted).empty;
-    var points = std.ArrayList(adapt.Adapted).empty;
-    for (adapted) |ad| {
-        if (ad.feature_index >= mask.len or !mask[ad.feature_index]) continue;
-        try subset.append(arena, ad);
-        if (std.mem.eql(u8, ad.primitive, "Point")) try points.append(arena, ad);
-    }
-    var cp = CellPortrayal{ .base = try runAdapted(arena, cell, subset.items, rules_dir, .{}) };
-    if (points.items.len > 0)
-        cp.simplified = runAdapted(arena, cell, points.items, rules_dir, .{ .simplified_symbols = true }) catch null;
-    return cp;
-}
-
 /// Portray a cell three ways so the client can toggle boundary style (areas) and
 /// point-symbol style (points) live: the default pass, a PlainBoundaries pass over
 /// only the area features, and a SimplifiedSymbols pass over only the point
@@ -375,14 +352,14 @@ pub fn portrayCellSubset(arena: std.mem.Allocator, cell: *const s57.Cell, rules_
 /// vary (areas for bnd, points for pts) — lines/soundings never read either
 /// override — so the extra rule evaluation is bounded to the relevant features.
 pub fn portrayCellVariants(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) !CellPortrayal {
-    const adapted = try adapt.adaptCell(arena, cell);
+    const adapted = try adapter.adaptCell(arena, cell);
     const base = try runAdapted(arena, cell, adapted, rules_dir, .{});
 
     // Partition the adapted features by the variant they can contribute. "Surface"
     // → the plain-boundary variant; "Point" → the simplified-symbol variant
     // (SOUNDG is already excluded from `adapted`, and "Curve" varies under neither).
-    var areas = std.ArrayList(adapt.Adapted).empty;
-    var points = std.ArrayList(adapt.Adapted).empty;
+    var areas = std.ArrayList(adapter.Adapted).empty;
+    var points = std.ArrayList(adapter.Adapted).empty;
     for (adapted) |ad| {
         if (std.mem.eql(u8, ad.primitive, "Surface")) {
             try areas.append(arena, ad);

@@ -290,7 +290,7 @@ pub fn attrAcronym(attl: u16) ?[]const u8 {
     return c.attr_acronym.get(attl);
 }
 
-// ---- Zig-side lookups (for s101_adapt) -----------------------------------
+// ---- Zig-side lookups (for the S-101 adapter) ----------------------------
 
 pub fn resolveFeature(s57_acronym: []const u8) ?[]const u8 {
     ensureLoaded();

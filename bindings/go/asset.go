@@ -9,7 +9,6 @@ package tile57
 import "C"
 
 import (
-	"fmt"
 	"unsafe"
 )
 
@@ -19,8 +18,9 @@ import (
 func ColortablesDefault() ([]byte, error) {
 	var out *C.uint8_t
 	var n C.size_t
-	if C.tile57_colortables_default(&out, &n) != 1 {
-		return nil, fmt.Errorf("tile57: colortables_default failed")
+	var cerr C.tile57_error
+	if st := C.tile57_colortables_default(&out, &n, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
 	}
 	return tileBytes(out, n), nil
 }
@@ -39,8 +39,9 @@ func BakeAssets(catalogDir string) (Assets, error) {
 	cdir, free := cStringOrNil(catalogDir)
 	defer free()
 	var ca C.tile57_assets
-	if C.tile57_bake_assets(cdir, &ca) != 1 {
-		return Assets{}, fmt.Errorf("tile57: bake_assets failed")
+	var cerr C.tile57_error
+	if st := C.tile57_bake_assets(cdir, &ca, &cerr); st != C.TILE57_OK {
+		return Assets{}, statusError(st, &cerr)
 	}
 	defer C.tile57_assets_free(&ca)
 	return Assets{

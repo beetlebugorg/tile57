@@ -1,11 +1,10 @@
-//! engine — the Zig chart tile generator.
+//! The pure-Zig engine surface: the format, geometry, and encoding packages that
+//! need no libc. It is the root of the unit-test build, which stays free of libc
+//! and the embedded Lua so `zig build test` links no system C runtime.
 //!
-//! Bottom-up build order (see ../../docs/docs/architecture.md):
-//!   M4: mvt + pmtiles + tile (encode MVT, write PMTiles)   <- in progress
-//!   M5: capi (libtile57.a) for live in-process generation
-//!   M6: iso8211 + s57 decode -> embedded-Lua S-101 portrayal
-//!
-//! The Go project at ../../reference/chartplotter-go is the parity oracle.
+//! The S-101 Lua portrayal runner lives in the separate `portray` module, added
+//! on top of this surface by `bake_root.zig` (the CLI) and `lib_root.zig`
+//! (libtile57.a). See build.zig for how the roots compose.
 
 const std = @import("std");
 
@@ -17,13 +16,13 @@ pub const tile = @import("tiles").tile;
 pub const iso8211 = @import("s57").iso8211;
 pub const s57 = @import("s57");
 pub const scene = @import("scene");
-pub const s100 = @import("s100");
-pub const s101_instr = s100.s101_instr;
-pub const s101_adapt = s100.s101_adapt;
-pub const catalogue = s100.catalogue;
+pub const s101 = @import("s101");
+pub const s101_instructions = s101.instructions;
+pub const s101_adapter = s101.adapter;
+pub const catalogue = s101.catalogue;
 pub const bake_enc = @import("scene").bake_enc; // banded multi-cell ENC_ROOT -> PMTiles
-pub const assets = @import("assets"); // chart-bundle asset/manifest generation
-pub const chartstyle = @import("assets").chartstyle; // mariner-driven MapLibre style patching
+pub const style = @import("style"); // colortables, line styles, and style.json generation
+pub const mariner = @import("style").mariner; // mariner-driven MapLibre style patching
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {
@@ -34,11 +33,11 @@ test {
     _ = iso8211;
     _ = s57;
     _ = scene;
-    _ = s101_instr;
-    _ = s101_adapt;
+    _ = s101_instructions;
+    _ = s101_adapter;
     _ = catalogue;
     _ = bake_enc;
-    _ = assets;
-    _ = chartstyle;
+    _ = style;
+    _ = mariner;
     _ = @import("mvt_parity_test.zig");
 }

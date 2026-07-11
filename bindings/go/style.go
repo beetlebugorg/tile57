@@ -66,7 +66,7 @@ type Mariner struct {
 	DateDependent, HighlightDateDependent                   bool
 	DateView                                                string  // "YYYYMMDD" or "" (today)
 	IgnoreScamin                                            bool    // ?ignoreScamin: drop SCAMIN gating, show all in-band
-	ScaminFilterGate                                        bool    // scamin-layers.md: one live-filtered *_scamin layer per render-type instead of per-value buckets
+	ScaminFilterGate                                        bool    // one live-filtered *_scamin layer per render-type instead of per-value buckets
 	ShowOverscale                                           bool    // S-52 §10.1.10 AP(OVERSC01) overscale indication (default true)
 	SizeScale                                               float64 // physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
 	ViewingGroupsOff                                        []int32 // S-52 §14.5 DENY-LIST: vg ids turned OFF (nil/empty = show all)
@@ -99,9 +99,10 @@ func StyleTemplate(scheme Scheme, sourceTiles, sprite, glyphs string, minZoom, m
 	defer f3()
 	var out *C.uint8_t
 	var n C.size_t
-	if C.tile57_style_template(C.tile57_scheme(scheme), cSrc, cSpr, cGly,
-		C.uint32_t(minZoom), C.uint32_t(maxZoom), C.uint8_t(encoding), &out, &n) != 1 {
-		return nil, fmt.Errorf("tile57: style_template failed")
+	var cerr C.tile57_error
+	if st := C.tile57_style_template(C.tile57_scheme(scheme), cSrc, cSpr, cGly,
+		C.uint32_t(minZoom), C.uint32_t(maxZoom), C.uint8_t(encoding), &out, &n, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
 	}
 	return tileBytes(out, n), nil
 }
@@ -136,8 +137,9 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 
 	var out *C.uint8_t
 	var outLen C.size_t
-	if C.tile57_build_style(tmplPtr, tmplLen, &cm, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen) != 1 {
-		return nil, fmt.Errorf("tile57: build_style failed")
+	var cerr C.tile57_error
+	if st := C.tile57_style_build(tmplPtr, tmplLen, &cm, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
 	}
 	return tileBytes(out, outLen), nil
 }
@@ -147,8 +149,8 @@ func BuildStyle(template []byte, m Mariner, colortables []byte, enabledBands []i
 // inputs of BuildStyle so the two styles are comparable. The result is "[]" when
 // nothing changed, one op per differing filter/paint/layout key, or
 // [{"op":"rebuild"}] when the host should fall back to a full setStyle. The host
-// applies each op with map.setFilter / setPaintProperty / setLayoutProperty (see
-// specs/style-diff.md); the raw JSON is returned so a server can forward it to the
+// applies each op with map.setFilter / setPaintProperty / setLayoutProperty;
+// the raw JSON is returned so a server can forward it to the
 // browser untouched.
 func StyleDiff(template []byte, from, to Mariner, colortables []byte, enabledBands []int32, scamin []int32, scaminLat float64) ([]byte, error) {
 	if len(template) == 0 {
@@ -165,8 +167,9 @@ func StyleDiff(template []byte, from, to Mariner, colortables []byte, enabledBan
 
 	var out *C.uint8_t
 	var outLen C.size_t
-	if C.tile57_style_diff(tmplPtr, tmplLen, &cFrom, &cTo, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen) != 1 {
-		return nil, fmt.Errorf("tile57: style_diff failed")
+	var cerr C.tile57_error
+	if st := C.tile57_style_diff(tmplPtr, tmplLen, &cFrom, &cTo, ctPtr, ctLen, bandsPtr, bandsN, scaminPtr, scaminN, C.double(scaminLat), &out, &outLen, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
 	}
 	return tileBytes(out, outLen), nil
 }

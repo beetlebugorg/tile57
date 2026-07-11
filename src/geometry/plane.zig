@@ -1,6 +1,6 @@
-//! Coverage-clipped best-available partition — the Stage-0 planar partition of
-//! the cross-band composition redesign (specs/cross-band-composition-redesign.md,
-//! Phase 0). "The finest cell whose M_COVR(CATCOV=1) covers a point owns that
+//! Coverage-clipped best-available partition — the first-stage planar partition of
+//! the cross-band chart composition. "The finest cell whose M_COVR(CATCOV=1) covers
+//! a point owns that
 //! ground; every other cell is clipped away there." This module turns a set of
 //! ENC cells (each carrying a compilation scale, a band-eligibility floor, and
 //! coverage rings) into, per **zoom tier**, one `owned` region per cell — a
@@ -12,17 +12,16 @@
 //! basin owned by a below-floor fine cell (the HOLES blocker); recomputing per
 //! distinct floor (≤6 tiers) closes it geometrically.
 //!
-//! Everything runs on the E7 integer lattice via `boolean.Pt` (i64) — coverage
-//! coordinates are `round(deg·1e7)`, so seams that adjacent cells digitised
-//! independently collapse to exact integer equality before any boolean runs.
+//! Everything runs on integer coordinates via `boolean.Pt` (i64): coverage is
+//! stored as degrees × 10⁷, so seams that adjacent cells digitised independently
+//! round to the same integers before any boolean runs.
 //! All set algebra goes through `boolean` (Martinez, overlap-typed, deterministic).
 //!
-//! Phase 0 scope: this computes and validates the partition, the tile classifier
-//! (FULL / EMPTY / SEAM), and `clipLineOutsidePolys`. Nothing here is wired to the
-//! baker or the live oracle yet — that is a later phase. The S-57 adapter (filling
-//! `Cell` from an `s57.Cell`, the cscl≤0 / date-order tie-break decisions Q1/Q4)
-//! is also deferred; `Cell` is deliberately decoupled so this stays pure and
-//! unit-testable.
+//! Scope: this computes and validates the partition, the tile classifier
+//! (FULL / EMPTY / SEAM), and the coverage line clips. The S-57 adapter (filling
+//! `Cell` from an `s57.Cell`, incl. the cscl≤0 and date-order tie-break policy)
+//! lives with the consumers; `Cell` is deliberately decoupled so this stays pure
+//! and unit-testable.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -32,7 +31,8 @@ pub const Pt = boolean.Pt;
 /// A polygon: a set of even-odd rings (exterior + holes). One M_COVR feature.
 pub const Poly = boolean.Polygon;
 
-/// One ENC cell as the partition sees it. Coverage is already on the E7 lattice.
+/// One ENC cell as the partition sees it. Coverage is already in integer
+/// coordinates (degrees × 10⁷).
 /// `cov1`/`cov2` are bags of features that may mutually overlap — they are
 /// `unionAll`-cleaned into one simple region before use.
 pub const Cell = struct {
@@ -42,12 +42,32 @@ pub const Cell = struct {
     band_floor: u8,
     /// Deterministic tie-break among equal-cscl cells — the adapter fills this
     /// from cell identity (issue/update date, then DSNM) so the newer survey wins
-    /// a double-owned strip (spec Q4). Lower sorts finer (earlier in the walk).
+    /// a double-owned strip. Lower sorts finer (earlier in the walk).
     order: u64,
+    /// Highest zoom this cell can EMIT tiles at (native window + overscale fill-up);
+    /// the cell is excluded from tiers beyond it. Its face there is dead weight — it
+    /// renders nothing there — and the exclusion is invisible to every renderable
+    /// face: the builders apply an EFFECTIVE reach (the max of the cell's own and
+    /// every coarser cell's, so exclusions always drop a suffix of the finest→
+    /// coarsest walk and no kept cell's subtrahend changes — see the reach cut in
+    /// `ownedAtTier`). What it buys: the partition skips the expensive coarse-cell
+    /// booleans at fine tiers (a whole-district compose spent GBs subtracting
+    /// hundreds of harbour coverages from an overview cell that could never draw
+    /// there). Must be a true upper bound on the cell's emit zoom; the default (255)
+    /// never excludes — pure-geometry callers keep the full pool per tier.
+    reach: u8 = 255,
     /// CATCOV=1 coverage features.
     cov1: []const Poly,
     /// CATCOV=2 explicit no-data features (subtracted, so a coarser band can fill).
     cov2: []const Poly = &.{},
+    /// Sector-figure reach (the archive's "light_reach" metadata): union bbox
+    /// [w,s,e,n] in DEGREES of the cell's figure-constructing light anchors, and
+    /// the max ground-length directional leg in metres. The compositor consults
+    /// the cell in tiles this ring touches even when it owns no ground there, so
+    /// legs/arcs don't amputate at the tile boundary. null = no figures. Carried
+    /// beside the partition inputs (never serialized — it rides the live cells).
+    light_bbox: ?[4]f64 = null,
+    light_range_m: f64 = 0,
 };
 
 /// A cell's owned region at a tier: `index` into the caller's cell slice and the
@@ -77,10 +97,30 @@ fn finerLess(_: void, a: Cell, b: Cell) bool {
     return a.order < b.order;
 }
 
-/// The per-tier partition: for every cell eligible at `tier` (band_floor ≤ tier),
-/// walking finest→coarsest, `owned = coverage \ (∪ coverage of all finer eligible
-/// cells)`. The union of the returned `owned` regions equals the union of all
-/// eligible coverages, partitioned with no overlap (validated by the tests).
+/// The reach cap: shrink `order` (sorted finest→coarsest) to the cells whose
+/// EFFECTIVE reach covers `tier`. Removing a cell only grows the faces of cells
+/// AFTER it in the walk (their subtrahend shrinks), and a grown face is sound only
+/// if that cell cannot render at this tier either — so the cut must be a SUFFIX of
+/// the walk. Per-cell reach values need not be monotone in the sort key (a
+/// scale-less cell sorts finest yet gets a mid-band default; a foreign archive can
+/// carry tiles past its band window), so each cell's effective reach is the max of
+/// its own and every coarser cell's: the drop is a suffix by construction, and
+/// raising reach only KEEPS more cells, so nothing that could emit is ever cut.
+fn reachCut(cells: []const Cell, order: *std.ArrayList(usize), tier: u8) void {
+    var keep = order.items.len;
+    var eff: u8 = 0;
+    while (keep > 0) {
+        eff = @max(eff, cells[order.items[keep - 1]].reach);
+        if (tier <= eff) break;
+        keep -= 1;
+    }
+    order.shrinkRetainingCapacity(keep);
+}
+
+/// The per-tier partition: for every cell eligible at `tier` (band_floor ≤ tier ≤
+/// reach), walking finest→coarsest, `owned = coverage \ (∪ coverage of all finer
+/// eligible cells)`. The union of the returned `owned` regions equals the union of
+/// all eligible coverages, partitioned with no overlap (validated by the tests).
 pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     // Eligible cells, in a total finest→coarsest, path-independent order.
     var order = std.ArrayList(usize).empty;
@@ -91,6 +131,25 @@ pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     std.mem.sort(usize, order.items, cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
             return finerLess({}, cs[ia], cs[ib]);
+        }
+    }.lt);
+    reachCut(cells, &order, tier);
+
+    // Fill-up gap-fillers: FINER cells (band_floor > tier) own ground at this
+    // coarser tier only where NO eligible cell covers — appended after every
+    // eligible cell, so they can never take ground from the band's own cells
+    // (position in `order` is priority: each cell's face is its coverage minus
+    // every earlier cell's). Among the fillers the COARSEST wins (closest to
+    // this tier's display scale), equal scales by the usual tie-break. So a
+    // harbor-only region still has an owner at z4, scamin-thinned by the bake.
+    const n_eligible = order.items.len;
+    for (cells, 0..) |c, i| {
+        if (c.band_floor > tier) try order.append(gpa, i);
+    }
+    std.mem.sort(usize, order.items[n_eligible..], cells, struct {
+        fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
+            if (cs[ia].cscl != cs[ib].cscl) return cs[ia].cscl > cs[ib].cscl; // coarsest first
+            return cs[ia].order < cs[ib].order;
         }
     }.lt);
 
@@ -107,18 +166,141 @@ pub fn ownedAtTier(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
     // Accumulated coverage of all finer eligible cells processed so far.
     var covered: [][]Pt = try sa.alloc([]Pt, 0);
 
-    for (order.items) |i| {
+    for (order.items, 0..) |i, k| {
         const cov = try cellCoverage(sa, cells[i]);
         // owned = cov \ covered, allocated in gpa (the kept result).
         const owned = if (covered.len == 0)
             try dupePolygonGpa(gpa, cov)
         else
             try boolean.compute(gpa, cov, covered, .diff);
-        try out.append(gpa, .{ .index = i, .owned = owned });
+        // A gap-filler fully covered by the eligible cells owns nothing here —
+        // drop its empty face so a nested finer cell adds no face at all.
+        if (k >= n_eligible and owned.len == 0) {
+            boolean.freePolygon(gpa, owned);
+        } else {
+            try out.append(gpa, .{ .index = i, .owned = owned });
+        }
 
         // covered ∪= cov (scratch).
         const merged = try boolean.compute(sa, covered, cov, .unite);
         covered = merged;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn polyBbox(rings: []const []const Pt) [4]i64 {
+    var b = [4]i64{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+    for (rings) |ring| for (ring) |p| {
+        b[0] = @min(b[0], p.x);
+        b[1] = @min(b[1], p.y);
+        b[2] = @max(b[2], p.x);
+        b[3] = @max(b[3], p.y);
+    };
+    return b;
+}
+
+fn bboxOverlap(a: [4]i64, b: [4]i64) bool {
+    return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3];
+}
+
+/// Identical result to `ownedAtTier`, built for scale. `ownedAtTier` accumulates a
+/// GLOBAL union of every finer cell and differences each cell against it — the
+/// operands grow to the whole nation, so it is O(cells²) in operand size (a
+/// national district takes seconds). Here each cell is differenced only against
+/// the finer eligible cells whose bounding box OVERLAPS it. A finer cell whose
+/// bbox is disjoint cannot remove any area, so the result is the same partition
+/// (cross-checked by the test below); charts overlap locally, so the per-cell
+/// subtrahend stays small. Use this variant for real ENC data.
+pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
+    var order = std.ArrayList(usize).empty;
+    defer order.deinit(gpa);
+    for (cells, 0..) |c, i| {
+        if (c.band_floor <= tier) try order.append(gpa, i);
+    }
+    std.mem.sort(usize, order.items, cells, struct {
+        fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
+            return finerLess({}, cs[ia], cs[ib]);
+        }
+    }.lt);
+    reachCut(cells, &order, tier);
+
+    // Fill-up gap-fillers: FINER cells (band_floor > tier) own ground at this
+    // coarser tier only where NO eligible cell covers — appended after every
+    // eligible cell, so they can never take ground from the band's own cells
+    // (position in `order` is priority: each cell's face is its coverage minus
+    // every earlier cell's). Among the fillers the COARSEST wins (closest to
+    // this tier's display scale), equal scales by the usual tie-break. So a
+    // harbor-only region still has an owner at z4, scamin-thinned by the bake.
+    const n_eligible = order.items.len;
+    for (cells, 0..) |c, i| {
+        if (c.band_floor > tier) try order.append(gpa, i);
+    }
+    std.mem.sort(usize, order.items[n_eligible..], cells, struct {
+        fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
+            if (cs[ia].cscl != cs[ib].cscl) return cs[ia].cscl > cs[ib].cscl; // coarsest first
+            return cs[ia].order < cs[ib].order;
+        }
+    }.lt);
+
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    // Coverage + bbox per eligible cell (in finest→coarsest order), computed once.
+    const m = order.items.len;
+    const covs = try sa.alloc([][]Pt, m);
+    const bbs = try sa.alloc([4]i64, m);
+    for (order.items, 0..) |ci, k| {
+        covs[k] = try cellCoverage(sa, cells[ci]);
+        bbs[k] = polyBbox(covs[k]);
+    }
+
+    var out = std.ArrayList(OwnedCell).empty;
+    errdefer {
+        for (out.items) |c| boolean.freePolygon(gpa, c.owned);
+        out.deinit(gpa);
+    }
+
+    // Subtrahend pointer list, reused (cleared) each iteration — it only holds borrowed
+    // pointers into `covs`, so it stays tiny. The boolean intermediates below deliberately
+    // do NOT live in `sa`: it caches every cell's coverage for the whole loop, so scratch
+    // parked there would never be reclaimed — a coarse cell unions hundreds of finer
+    // cells, and every cell's union piling up was a whole-district compose's memory
+    // blow-up (tens of GB).
+    var subtr = std.ArrayList(Poly).empty;
+    defer subtr.deinit(gpa);
+
+    for (order.items, 0..) |ci, k| {
+        // owned = cov \ (∪ finer cells whose bbox overlaps this one). The union/diff
+        // intermediates run on the page allocator, not `gpa`: they are large,
+        // odd-sized, and freed within the iteration, and a pooling gpa parks each
+        // freed size class on its own freelist — across hundreds of cells those
+        // parked pages inflated the compose's peak RSS by whole GBs. Page-granular
+        // allocation returns them to the OS at each free (unionAll frees its running
+        // accumulator each step, `uni`/`diff` right after use), and the boolean ops
+        // are far too coarse to feel the per-page cost. Only the finished `owned`
+        // polygon is copied into `gpa` (retained, held by the partition).
+        subtr.clearRetainingCapacity();
+        for (0..k) |j| {
+            if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(gpa, covs[j]);
+        }
+        const owned = if (subtr.items.len == 0)
+            try dupePolygonGpa(gpa, covs[k])
+        else blk: {
+            const pa = std.heap.page_allocator;
+            const uni = try boolean.unionAll(pa, subtr.items);
+            defer boolean.freePolygon(pa, uni);
+            const diff = try boolean.compute(pa, covs[k], uni, .diff);
+            defer boolean.freePolygon(pa, diff);
+            break :blk try dupePolygonGpa(gpa, diff);
+        };
+        // A gap-filler fully covered by the eligible cells owns nothing here —
+        // drop its empty face so a nested finer cell adds no face at all.
+        if (k >= n_eligible and owned.len == 0) {
+            boolean.freePolygon(gpa, owned);
+            continue;
+        }
+        try out.append(gpa, .{ .index = ci, .owned = owned });
     }
     return out.toOwnedSlice(gpa);
 }
@@ -160,14 +342,12 @@ fn pointInEvenOddF(rings: Poly, x: f64, y: f64) bool {
     return inside;
 }
 
-/// Keep the parts of `line` that lie OUTSIDE `covered`. Each segment is split at
-/// its integer crossings with every covered edge; a sub-run survives iff its
-/// midpoint is outside `covered` (the finer cell owns the covered side and the
-/// seam stroke). Returns a list of poly-lines allocated in `gpa`.
-///
-/// This is the line analogue of the area difference — no polygon boolean, so a
-/// coarse coastline inside finer coverage is dropped whole (not offset-doubled).
-pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
+/// Split `line` at every integer crossing with `covered`'s edges and keep each
+/// sub-run whose midpoint is on the wanted side — INSIDE `covered` when `keep_inside`,
+/// else OUTSIDE. Returns a list of poly-lines allocated in `gpa`. The line analogue of
+/// a polygon intersect/difference: no polygon boolean, so a line crossing the boundary
+/// is cut cleanly, not offset-doubled.
+fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_inside: bool) ![][]Pt {
     var out = std.ArrayList([]Pt).empty;
     errdefer {
         for (out.items) |r| gpa.free(r);
@@ -211,8 +391,8 @@ pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![]
         }
         std.mem.sort(SplitPt, splits.items, {}, SplitPt.lt);
 
-        // Walk consecutive distinct split points; keep sub-runs whose midpoint is
-        // outside covered.
+        // Walk consecutive distinct split points; keep sub-runs whose midpoint is on
+        // the wanted side of `covered`.
         var prev = splits.items[0].p;
         if (run.items.len == 0) try run.append(gpa, prev);
         for (splits.items[1..]) |sp| {
@@ -220,8 +400,8 @@ pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![]
             if (q.eql(prev)) continue;
             const mx = (@as(f64, @floatFromInt(prev.x)) + @as(f64, @floatFromInt(q.x))) / 2;
             const my = (@as(f64, @floatFromInt(prev.y)) + @as(f64, @floatFromInt(q.y))) / 2;
-            if (pointInEvenOddF(covered, mx, my)) {
-                // Sub-run is covered: flush the kept run (it ends at prev) and skip.
+            if (pointInEvenOddF(covered, mx, my) != keep_inside) {
+                // Sub-run is on the unwanted side: flush the kept run (ends at prev), skip.
                 try flushRun(gpa, &out, &run);
                 try run.append(gpa, q);
             } else {
@@ -232,6 +412,18 @@ pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![]
     }
     try flushRun(gpa, &out, &run);
     return out.toOwnedSlice(gpa);
+}
+
+/// Keep the parts of `line` OUTSIDE `covered` — the parts a cell owns when `covered`
+/// is the finer coverage that beats it (the seam stroke stays on the covered side).
+pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
+    return clipLineByCoverage(gpa, line, covered, false);
+}
+
+/// Keep the parts of `line` INSIDE `covered` — clips a cell's line features to its
+/// owned face at compose time (`covered` = the cell's owned region).
+pub fn clipLineInsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
+    return clipLineByCoverage(gpa, line, covered, true);
 }
 
 const SplitPt = struct {
@@ -449,6 +641,117 @@ test "ownedAtTier: below-floor fine cell drops out of the pool (no blank window)
     try testing.expect(boolean.pointInEvenOdd(t10[0].owned, 10, 10));
 }
 
+test "reach cap: a cell beyond its tile reach drops out of finer tiers only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Coarse [0,100]² can emit up to z10 (native max 9 + one fill-up); fine [40,60]²
+    // is unbounded. At tier 13 the coarse cell is out of the pool — the fine cell
+    // owns its box and NOTHING owns the surround; at tier 9 the coarse cell is back
+    // (fine below floor) and owns the whole basin.
+    const coarse_cov = try boxPoly(a, 0, 0, 100, 100);
+    const fine_cov = try boxPoly(a, 40, 40, 60, 60);
+    const cells = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .reach = 10, .cov1 = &.{coarse_cov} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 0, .cov1 = &.{fine_cov} },
+    };
+
+    for ([_]bool{ false, true }) |indexed| {
+        const t13 = if (indexed) try ownedAtTierIndexed(a, &cells, 13) else try ownedAtTier(a, &cells, 13);
+        try testing.expectEqual(@as(usize, 1), t13.len);
+        try testing.expectEqual(@as(usize, 1), t13[0].index); // only the fine cell
+        try testing.expect(boolean.pointInEvenOdd(t13[0].owned, 50, 50));
+        // The fine cell's face is its own coverage, unchanged by the exclusion —
+        // it never subtracted against the (coarser) capped cell.
+        try testing.expect(!boolean.pointInEvenOdd(t13[0].owned, 10, 10));
+
+        const t9 = if (indexed) try ownedAtTierIndexed(a, &cells, 9) else try ownedAtTier(a, &cells, 9);
+        try testing.expectEqual(@as(usize, 1), t9.len);
+        try testing.expectEqual(@as(usize, 0), t9[0].index); // coarse back in the pool
+        try testing.expect(boolean.pointInEvenOdd(t9[0].owned, 50, 50));
+    }
+}
+
+test "reach cap: non-monotone reach cuts only a suffix (effective reach keeps the finer cell)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Pathological input: the FINER cell has the LOWER reach (a scale-less cell that
+    // sorted finest but banded mid-ladder, or a foreign archive). Cutting it while the
+    // coarser cell stays would grow the coarse face over ground the finer cell used to
+    // mask — so the effective reach (max of own + all coarser) must keep it, and the
+    // partition must match the uncapped one exactly.
+    const coarse_cov = try boxPoly(a, 0, 0, 100, 100);
+    const fine_cov = try boxPoly(a, 40, 40, 60, 60);
+    const capped = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .reach = 255, .cov1 = &.{coarse_cov} },
+        .{ .cscl = 20_000, .band_floor = 9, .order = 0, .reach = 10, .cov1 = &.{fine_cov} },
+    };
+    const uncapped = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coarse_cov} },
+        .{ .cscl = 20_000, .band_floor = 9, .order = 0, .cov1 = &.{fine_cov} },
+    };
+
+    for ([_]bool{ false, true }) |indexed| {
+        const got = if (indexed) try ownedAtTierIndexed(a, &capped, 13) else try ownedAtTier(a, &capped, 13);
+        const want = if (indexed) try ownedAtTierIndexed(a, &uncapped, 13) else try ownedAtTier(a, &uncapped, 13);
+        try testing.expectEqual(want.len, got.len); // both cells kept
+        // Same owner at a probe point inside the fine box and one outside it.
+        for ([_][2]i64{ .{ 50, 50 }, .{ 10, 10 } }) |p| {
+            var want_owner: ?usize = null;
+            var got_owner: ?usize = null;
+            for (want) |oc| if (boolean.pointInEvenOdd(oc.owned, p[0], p[1])) {
+                want_owner = oc.index;
+            };
+            for (got) |oc| if (boolean.pointInEvenOdd(oc.owned, p[0], p[1])) {
+                got_owner = oc.index;
+            };
+            try testing.expectEqual(want_owner, got_owner);
+        }
+    }
+}
+
+test "ownedAtTierIndexed matches ownedAtTier (owner-at-point, overlap + adjacency)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A mix: coarse [0,100]² with a nested fine [40,60]² (vertical overlap), plus
+    // two same-cscl [0,50]² / [50,100]² halves that abut (horizontal adjacency).
+    const coarse = try boxPoly(a, 0, 0, 100, 100);
+    const fine = try boxPoly(a, 40, 40, 60, 60);
+    const west = try boxPoly(a, 0, 0, 50, 100);
+    const east = try boxPoly(a, 50, 0, 100, 100);
+    const cells = [_]Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coarse} },
+        .{ .cscl = 20_000, .band_floor = 9, .order = 0, .cov1 = &.{fine} },
+        .{ .cscl = 50_000, .band_floor = 9, .order = 0, .cov1 = &.{west} },
+        .{ .cscl = 50_000, .band_floor = 9, .order = 1, .cov1 = &.{east} },
+    };
+
+    const plain = try ownedAtTier(a, &cells, 9);
+    const idx = try ownedAtTierIndexed(a, &cells, 9);
+
+    const ownerAt = struct {
+        fn f(faces: []const OwnedCell, x: i64, y: i64) ?usize {
+            for (faces) |oc| if (boolean.pointInEvenOdd(oc.owned, x, y)) return oc.index;
+            return null;
+        }
+    }.f;
+
+    // Step 7 from 2 never lands on an edge (40/50/60/100), avoiding even-odd
+    // ambiguity; the two builders must name the same owner at every point.
+    var y: i64 = 2;
+    while (y < 100) : (y += 7) {
+        var x: i64 = 2;
+        while (x < 100) : (x += 7) {
+            try testing.expectEqual(ownerAt(plain, x, y), ownerAt(idx, x, y));
+        }
+    }
+}
+
 test "fuzz: partition == per-point finest-eligible-covering, zero overlap, zero gap" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -487,13 +790,23 @@ test "fuzz: partition == per-point finest-eligible-covering, zero overlap, zero 
         while (qy <= 11 * grid) : (qy += 19) {
             var qx: i64 = -7 * grid;
             while (qx <= 11 * grid) : (qx += 19) {
-                // Reference: finest (smallest cscl) eligible cell whose bbox covers.
+                // Reference: finest (smallest cscl) eligible cell whose bbox covers;
+                // where none covers, the COARSEST (largest cscl) finer cell fills up.
                 var best: ?usize = null;
                 for (cells.items, 0..) |c, i| {
                     if (c.band_floor > tier) continue;
                     const bb = bboxes.items[i];
                     if (qx >= bb[0] and qx <= bb[2] and qy >= bb[1] and qy <= bb[3]) {
                         if (best == null or c.cscl < cells.items[best.?].cscl) best = i;
+                    }
+                }
+                if (best == null) {
+                    for (cells.items, 0..) |c, i| {
+                        if (c.band_floor <= tier) continue;
+                        const bb = bboxes.items[i];
+                        if (qx >= bb[0] and qx <= bb[2] and qy >= bb[1] and qy <= bb[3]) {
+                            if (best == null or c.cscl > cells.items[best.?].cscl) best = i;
+                        }
                     }
                 }
                 // Skip points on any bbox edge (even-odd ambiguity).
@@ -570,6 +883,21 @@ test "clipLineOutsidePolys: fully-covered line yields nothing; fully-outside lin
     try testing.expectEqual(@as(usize, 3), out_runs[0].len);
 }
 
+test "clipLineInsidePolys: keeps the inside, drops the outside (compose clip-to-face)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const covered = try boxPoly(a, 40, -10, 60, 10); // covers x∈[40,60] on the y=0 line
+    const line = [_]Pt{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 } };
+    const runs = try clipLineInsidePolys(a, &line, covered);
+    // Complement of the OUTSIDE clip: keep only the covered middle [40,60].
+    try testing.expectEqual(@as(usize, 1), runs.len);
+    const r = runs[0];
+    try testing.expectEqual(@as(i64, 40), @min(r[0].x, r[r.len - 1].x));
+    try testing.expectEqual(@as(i64, 60), @max(r[0].x, r[r.len - 1].x));
+}
+
 // Clip every coverage feature of a cell to `box` (a quadrant), dropping empties —
 // the operation the quadrant-partitioned Stage 0 applies before computing a
 // quadrant's partition locally.
@@ -594,7 +922,7 @@ fn clipCellToBox(a: Allocator, cell: Cell, box: Box) !Cell {
     };
 }
 
-test "quadrant-split Stage 0 stitches to the same partition (shared E7 lattice)" {
+test "quadrant-split partition stitches to the same result (shared integer grid)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -602,7 +930,7 @@ test "quadrant-split Stage 0 stitches to the same partition (shared E7 lattice)"
     var prng = std.Random.DefaultPrng.init(0x9042BEEF);
     const rnd = prng.random();
     const grid: i64 = 64;
-    // Split seam on the E7 lattice; cell coords are grid multiples so coverage
+    // Split seam on the integer grid; cell coords are grid multiples so coverage
     // edges meeting the seam collapse to exact equality.
     const sx: i64 = 0;
     const sy: i64 = 0;

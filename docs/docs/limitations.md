@@ -1,13 +1,13 @@
 ---
 id: limitations
 title: Known Limitations
-sidebar_position: 8
+sidebar_position: 9
 ---
 
 # Known Limitations
 
 tile57 runs the official IHO S-101 Portrayal Catalogue, and on the
-test cells (`US4MD81M.000`, `US5MD1MC.000` + updates) **every feature portrays
+test charts (`US4MD81M.000`, `US5MD1MC.000` + updates) **every feature portrays
 with zero rule errors** — depth areas and contours, soundings, coastline and land,
 buoys and beacons, lights (including sector legs and arcs), dangers
 (obstructions / wrecks / rocks), data-quality zones, restricted/anchorage areas,
@@ -22,10 +22,27 @@ See the warning on the [introduction](./intro.md). NOAA ENC charts are U.S. publ
 domain and not for navigation; this renderer adds its own gaps on top.
 :::
 
+## S-57 → S-101 conversion
+
+tile57's input is S-57 but its portrayal rules are S-101, so every chart passes
+through an S-57 → S-101 adapter (`src/s101/adapter.zig`) before the rules run.
+The adapter is an interim solution — the goal is S-101 throughout, reading
+native S-101 charts directly as hydrographic offices publish them. S-57 has no
+perfect S-101 translation; the adapter follows the IHO S-65 conversion
+guidance, and the result is **best effort**:
+
+- **Missing S-101 content stays missing.** S-101 attributes and features with
+  no S-57 source are never invented; rules that test them take their fallback
+  branch.
+- **Unconvertible objects fall back or drop.** An S-57 object class with no
+  S-101 equivalent portrays as the S-52 question mark (QUESMRK1) — or, where
+  the S-65 guidance says the object is simply not carried into S-101 (e.g. an
+  area-geometry recommended track), it is dropped.
+
 ## Portrayal gaps
 
 - **Ignored portrayal-instruction keys.** The instruction translator
-  (`src/s100/s101_instr.zig`) lowers the drawing vocabulary the catalogue
+  (`src/s101/instructions.zig`) lowers the drawing vocabulary the catalogue
   actually leans on (point/line/text instructions, colour fills, area-fill and
   viewing-group references, `AugmentedRay` / `ArcByRadius` / `AugmentedPoint`
   construction — that is how light-sector legs and arcs render). A few keys are
@@ -37,12 +54,16 @@ domain and not for navigation; this renderer adds its own gaps on top.
   S-52 display length; the mariner's *full-length sector line* variant (legs
   drawn to the light's nominal range) is not emitted, so the
   `show_full_sector_lines` setting currently has nothing to act on.
-- **Sector figures stop at the cell's tile span.** Legs and arcs are
-  tessellated per tile, and only tiles covering the source cell's bounding box
-  are generated for that cell — a fixed-display-size arc near a cell edge is
-  chopped where the neighbouring tile isn't baked from that cell.
+- **Sector figures can stop at a tile boundary beyond the owning chart.** The
+  compositor keeps a light's sector legs and arcs WHOLE across ownership
+  boundaries (they are fixed-size decorations anchored at the light, exempt
+  from face clipping). The remaining gap: a figure reaching into a tile where the owning
+  chart holds no ground at all is absent there — the compositor never consults
+  that chart for the tile — so a figure within roughly one tile of the chart's
+  owned ground can cut at that tile's edge (directional ground-length legs can
+  reach further).
 - **Single-primitive rules vs. non-conformant geometry.** Some S-101 rules
-  handle only one primitive (e.g. RecommendedTrack is Curve-only); a cell that
+  handle only one primitive (e.g. RecommendedTrack is Curve-only); a chart that
   encodes the feature with another primitive (an area-encoded recommended
   track) errors in the rule and the feature is suppressed.
 - **Low-accuracy sounding ring via spatial QUAPOS.** SNDFRM04's low-accuracy
@@ -61,7 +82,7 @@ domain and not for navigation; this renderer adds its own gaps on top.
   indication (`OVERSC01`, see [architecture](./architecture.md)) is gated
   correctly everywhere, but only the generated MapLibre style sandwiches the
   hatch under finer at-scale fills. The PNG/PDF/ASCII surfaces draw in S-52
-  priority order without that sandwich, so where a finer cell overlaps a
+  priority order without that sandwich, so where a finer chart overlaps a
   coarser one the hatch can show through fills that should occlude it.
 - **SCAMIN gating snaps to integer zooms outside bucket mode.** With a SCAMIN
   manifest, the style builds per-value layers with exact fractional native
@@ -77,19 +98,18 @@ has its own short list of deliberate gaps — see
 
 ## ENC_ROOT loading
 
-Opening an ENC_ROOT (`Chart.openPath` / `openCellsStreaming`) builds a cheap
-spatial index (band + bbox per cell) and generates tiles **on demand**, parsing +
-portraying only the cells a requested tile needs (best-available scale band per
-tile, recent cells held in an LRU). The catalogue opens in seconds; memory stays
-bounded. Caveats:
+Opening an ENC_ROOT (`Chart.openPath` / `openChartsStreaming`) builds a cheap
+spatial index (band + bbox per chart) and reads a chart's bytes only when a
+metadata or feature query needs them — the catalogue opens in seconds and
+memory stays bounded. It serves metadata and extraction only: tiles and views
+always come from a bake (bake each chart once, then compose on demand).
+Caveats:
 
-- **First-view latency.** The first tile over a fresh area parses + portrays its
-  1–4 cells (tens of ms), then they're cached. Opening the whole NOAA catalogue
-  also pays a one-time index scan (a few seconds, parsing every cell header).
-- **Offline bake.** For smooth panning everywhere, bake the ENC_ROOT once to a
-  cached PMTiles archive (`tile57 bake`, or `bakeArchive` /
-  `tile57_bake_pmtiles`) and open that instead. The whole catalogue is a
-  multi-minute one-time bake; a region is far quicker.
+- **Baking is the import step.** The whole NOAA catalogue is a multi-minute
+  one-time bake (`tile57 bake` / `tile57_bake_tree`); a region is far quicker,
+  and re-runs are incremental — only charts whose source changed re-bake.
+- **Index-scan cost.** Opening the whole catalogue as a streaming chart pays a
+  one-time index scan (a few seconds, parsing every chart header).
 - **Low zoom is style-gated.** The generated style's vector-source `minzoom` is
   the bake's tile floor (default 8), and MapLibre never requests tiles below a
   source's minzoom — nothing draws below it regardless of the data.

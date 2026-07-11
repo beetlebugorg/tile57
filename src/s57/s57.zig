@@ -10,9 +10,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-/// The ISO/IEC 8211 record parser S-57 rides on (folded into this module —
-/// its only consumer). Re-exported for the CLI inspector + lib root.
-pub const iso8211 = @import("iso8211.zig");
+/// The ISO/IEC 8211 container reader S-57 rides on, re-exported for consumers
+/// that want the raw records. It is its own module (`@import("iso8211")`), so a
+/// caller can depend on the 8211 layer without pulling in S-57 semantics.
+pub const iso8211 = @import("iso8211");
 const iso = iso8211;
 
 // Geographic coordinate stored in S-57's native integer ×1e7 units (lon ±1.8e9,
@@ -750,7 +751,7 @@ pub const Cell = struct {
     /// lineGeometryParts (which only checks the current tail against the NEXT FSPT
     /// edge) fragments it into spurious parts. Byte-identical to lineGeometryParts
     /// when the FSPT list is already connected (the index's first-unused-touching
-    /// pick is then the next edge). The result feeds orientAreaRings, which derives
+    /// pick is then the next edge). The result feeds mvt.orientAreaRings, which derives
     /// exterior-vs-hole by geometric nesting, so ring USAG/order is not needed here.
     /// Lines keep the FSPT-order assembly (the oracle's constructLineStringGeometry
     /// is FSPT-order too).
@@ -866,6 +867,63 @@ pub const Cell = struct {
                     cur = std.ArrayList(LonLat).empty;
                 }
                 broken = true; // degenerate edge still interrupts continuity
+                continue;
+            }
+            if (cur.items.len == 0 or broken) {
+                if (cur.items.len > 0) {
+                    try parts.append(a, cur.items);
+                    cur = std.ArrayList(LonLat).empty;
+                }
+                try cur.appendSlice(a, edge);
+                broken = false;
+                continue;
+            }
+            const tail = cur.items[cur.items.len - 1];
+            const last = edge[edge.len - 1];
+            if (tail.lon_e7 == edge[0].lon_e7 and tail.lat_e7 == edge[0].lat_e7) {
+                try cur.appendSlice(a, edge[1..]);
+            } else if (tail.lon_e7 == last.lon_e7 and tail.lat_e7 == last.lat_e7) {
+                std.mem.reverse(LonLat, edge);
+                try cur.appendSlice(a, edge[1..]);
+            } else {
+                try parts.append(a, cur.items);
+                cur = std.ArrayList(LonLat).empty;
+                try cur.appendSlice(a, edge);
+            }
+        }
+        if (cur.items.len > 0) try parts.append(a, cur.items);
+        return parts.items;
+    }
+
+    /// The complement of drawableLineParts: ONLY the edges §8.6.2 masking drops —
+    /// MASK==1, USAG==3, or coast-coincident on a non-coast-definer area. These are
+    /// the cell-limit stretches of a boundary; the meta-bounds inspection view bakes
+    /// them (tagged) so a meta object can be outlined even where its whole boundary
+    /// is the cell limit. Kept edges are chained into continuous parts like the
+    /// drawable walk; a drawn (or degenerate) edge breaks the chain.
+    pub fn maskedLineParts(self: Cell, a: Allocator, f: Feature) ![][]LonLat {
+        const mask_coast = f.prim == 3 and !isCoastDefiner(f.objl);
+        var parts = std.ArrayList([]LonLat).empty;
+        var cur = std.ArrayList(LonLat).empty;
+        var broken = false;
+        for (f.refs) |ref| {
+            if (ref.name.rcnm != RCNM_VE) continue;
+            const masked = ref.mask == 1 or ref.usag == 3 or (mask_coast and self.coast_edges.contains(ref.name.rcid));
+            if (!masked) {
+                if (cur.items.len > 0) {
+                    try parts.append(a, cur.items);
+                    cur = std.ArrayList(LonLat).empty;
+                }
+                broken = true; // a drawn edge separates two masked stretches
+                continue;
+            }
+            const edge = try self.edgeCoordsRaw(a, ref.name.rcid, ref.ornt);
+            if (edge.len == 0) {
+                if (cur.items.len > 0) {
+                    try parts.append(a, cur.items);
+                    cur = std.ArrayList(LonLat).empty;
+                }
+                broken = true;
                 continue;
             }
             if (cur.items.len == 0 or broken) {

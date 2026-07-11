@@ -2,8 +2,8 @@
 
 package tile57
 
-// Chart metadata + raw S-57 access: per-cell metadata, exchange-set catalogue
-// decode, and raw feature access — everything a host previously parsed from
+// Raw S-57 access, handle-free: per-chart metadata, GeoJSON feature extraction,
+// and exchange-set catalogue decode — everything a host previously parsed from
 // S-57/ISO-8211 itself. With these, a host's S-57 knowledge shrinks to file
 // staging conventions (.000/.NNN, ENC_ROOT/, CATALOG.031 as opaque bytes).
 
@@ -20,10 +20,10 @@ import (
 	"unsafe"
 )
 
-// CellInfo is one cell's identity + coverage, as recorded in its DSID/DSPM
+// ChartRecord is one chart's identity + coverage, as recorded in its DSID/DSPM
 // after the applied update chain.
-type CellInfo struct {
-	Name      string     `json:"name"`      // cell stem, e.g. "US5MD1MC"
+type ChartRecord struct {
+	Name      string     `json:"name"`      // chart stem, e.g. "US5MD1MC"
 	Scale     int        `json:"scale"`     // DSPM CSCL (1:N)
 	Edition   string     `json:"edition"`   // DSID EDTN
 	Update    string     `json:"update"`    // DSID UPDN (last applied update)
@@ -33,35 +33,35 @@ type CellInfo struct {
 	HasBBox   bool       `json:"-"`
 }
 
-// Cells returns the chart's per-cell metadata (one entry per cell, DSID fields
-// after the update chain). A PMTiles source returns nil — its bundle manifest
-// carries the cell inventory.
-func (s *Source) Cells() ([]CellInfo, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return nil, ErrSourceClosed
+// Charts returns the per-chart metadata of the S-57 data at path — one .000 file
+// (with its update chain applied) or a whole ENC_ROOT directory — for a host's
+// chart-database scan.
+func Charts(path string) ([]ChartRecord, error) {
+	if path == "" {
+		return nil, fmt.Errorf("tile57: empty path: %w", ErrEmptyInput)
 	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
 	var out *C.uint8_t
 	var outLen C.size_t
-	switch C.tile57_chart_cells(s.ptr, &out, &outLen) {
-	case 1:
-	case 0:
+	var cerr C.tile57_error
+	if st := C.tile57_enc_charts(cPath, &out, &outLen, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
+	}
+	if out == nil {
 		return nil, nil
-	default:
-		return nil, fmt.Errorf("tile57: cell metadata error")
 	}
 	raw := tileBytes(out, outLen)
 	var wire []struct {
-		CellInfo
+		ChartRecord
 		BBox []float64 `json:"bbox"`
 	}
 	if err := json.Unmarshal(raw, &wire); err != nil {
-		return nil, fmt.Errorf("tile57: cell metadata decode: %w", err)
+		return nil, fmt.Errorf("tile57: chart metadata decode: %w", err)
 	}
-	infos := make([]CellInfo, len(wire))
+	infos := make([]ChartRecord, len(wire))
 	for i, w := range wire {
-		infos[i] = w.CellInfo
+		infos[i] = w.ChartRecord
 		if len(w.BBox) == 4 {
 			copy(infos[i].BBox[:], w.BBox)
 			infos[i].HasBBox = true
@@ -74,7 +74,7 @@ func (s *Source) Cells() ([]CellInfo, error) {
 type CatalogEntry struct {
 	File     string     `json:"file"`     // recorded path, '/'-normalised
 	LongName string     `json:"longName"` // LFIL — the human chart title ("" when absent)
-	Impl     string     `json:"impl"`     // "BIN" (a cell), "ASC", "TXT"
+	Impl     string     `json:"impl"`     // "BIN" (a chart), "ASC", "TXT"
 	BBox     [4]float64 `json:"bbox"`     // [west, south, east, north]
 	HasBBox  bool       `json:"-"`
 }
@@ -87,12 +87,12 @@ func CatalogEntries(catalog []byte) ([]CatalogEntry, error) {
 	}
 	var out *C.uint8_t
 	var outLen C.size_t
-	switch C.tile57_catalog_entries((*C.uint8_t)(unsafe.Pointer(&catalog[0])), C.size_t(len(catalog)), &out, &outLen) {
-	case 1:
-	case 0:
+	var cerr C.tile57_error
+	if st := C.tile57_enc_catalog((*C.uint8_t)(unsafe.Pointer(&catalog[0])), C.size_t(len(catalog)), &out, &outLen, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
+	}
+	if out == nil {
 		return nil, nil
-	default:
-		return nil, fmt.Errorf("tile57: catalogue parse error")
 	}
 	raw := tileBytes(out, outLen)
 	var wire []struct {
@@ -113,8 +113,8 @@ func CatalogEntries(catalog []byte) ([]CatalogEntry, error) {
 	return entries, nil
 }
 
-// Feature is one S-57 feature from [Source.Features]: its class acronym, the
-// full attribute map (acronym → raw string value), and GeoJSON geometry.
+// Feature is one S-57 feature from [Features]: its class acronym, the full
+// attribute map (acronym → raw string value), and GeoJSON geometry.
 type Feature struct {
 	Class    string            // e.g. "DEPARE"
 	Attrs    map[string]string // full S-57 attribute set, e.g. {"DRVAL1":"3.6"}
@@ -122,14 +122,35 @@ type Feature struct {
 	Geometry json.RawMessage   // the GeoJSON geometry object (lon/lat; soundings carry depth as a 3rd coord)
 }
 
-// Features returns the chart's features for the given object-class acronyms
-// (e.g. "DEPARE", "DRGARE"), parsed without portrayal. A whole-ENC_ROOT query
-// walks every cell — the caller owns that cost.
-func (s *Source) Features(classes ...string) ([]Feature, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ptr == nil {
-		return nil, ErrSourceClosed
+// Features returns the features of the S-57 data at path (one chart, updates
+// applied, or a whole ENC_ROOT) for the given object-class acronyms (e.g.
+// "DEPARE", "DRGARE"), parsed without portrayal. A whole-ENC_ROOT extraction
+// walks every chart — the caller owns that cost.
+func Features(path string, classes ...string) ([]Feature, error) {
+	if path == "" {
+		return nil, fmt.Errorf("tile57: empty path: %w", ErrEmptyInput)
+	}
+	if len(classes) == 0 {
+		return nil, nil
+	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	cs := C.CString(strings.Join(classes, ","))
+	defer C.free(unsafe.Pointer(cs))
+	var out *C.uint8_t
+	var outLen C.size_t
+	var cerr C.tile57_error
+	if st := C.tile57_enc_features(cPath, cs, &out, &outLen, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
+	}
+	return decodeFeatures(out, outLen)
+}
+
+// FeaturesBytes is [Features] over in-memory base .000 bytes (read from a
+// zip member, say). No update chain is applied.
+func FeaturesBytes(base []byte, classes ...string) ([]Feature, error) {
+	if len(base) == 0 {
+		return nil, fmt.Errorf("tile57: empty chart bytes: %w", ErrEmptyInput)
 	}
 	if len(classes) == 0 {
 		return nil, nil
@@ -138,12 +159,18 @@ func (s *Source) Features(classes ...string) ([]Feature, error) {
 	defer C.free(unsafe.Pointer(cs))
 	var out *C.uint8_t
 	var outLen C.size_t
-	switch C.tile57_chart_features(s.ptr, cs, &out, &outLen) {
-	case 1:
-	case 0:
+	var cerr C.tile57_error
+	if st := C.tile57_enc_features_bytes((*C.uint8_t)(unsafe.Pointer(&base[0])), C.size_t(len(base)), cs, &out, &outLen, &cerr); st != C.TILE57_OK {
+		return nil, statusError(st, &cerr)
+	}
+	return decodeFeatures(out, outLen)
+}
+
+// decodeFeatures unmarshals an engine GeoJSON FeatureCollection buffer (freeing
+// it) into []Feature. A nil buffer (nothing matched) decodes to nil.
+func decodeFeatures(out *C.uint8_t, outLen C.size_t) ([]Feature, error) {
+	if out == nil {
 		return nil, nil
-	default:
-		return nil, fmt.Errorf("tile57: feature query error")
 	}
 	raw := tileBytes(out, outLen)
 	var fc struct {

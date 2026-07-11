@@ -85,7 +85,7 @@ test "ascii view: water shades left, land '#' right, coastline between" {
     const streams = try portray.portrayCell(a, &cell, "");
 
     var colors = try render.resolve.Colors.init(a, colorprofile_registry.entries[0].bytes);
-    const settings = render.resolve.MarinerSettings{};
+    const settings = render.resolve.Settings{};
     // 64x32 chars = a 64x64 px view at z8 (px_per_tile 256), centred on the
     // tile: the whole grid sits inside the fixture, split down the middle.
     const cols: u32 = 64;

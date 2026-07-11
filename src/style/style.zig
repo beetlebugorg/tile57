@@ -1,40 +1,40 @@
-//! assets — offline portrayal-asset generation for the chart bundle. Mirrors the
-//! Go oracle's internal/engine/assets (EmitS101): the rendering half of the
-//! tile/style contract, emitted from the same S-101 catalogue that drives the
-//! tiles so the two can't drift. Mirrors the Go oracle's bundle assets.
+//! style — MapLibre style generation for the chart tiles: color tables, line
+//! styles, and the style.json layer set, plus the S-52 mariner expression
+//! builders. The style and the tiles come from the same S-101 catalogue, so the
+//! two stay in sync.
 //!
 //! Pure Zig (no libc/fs): callers read the catalogue bytes and pass them in, the
-//! same shape as s100/catalogue.zig. RGB lives ONLY in colortables.json; the
-//! tiles stay colour *tokens*.
+//! same shape as s101/catalogue.zig. RGB lives only in the color tables; the
+//! tiles carry color *tokens*.
 //!
-//! Implemented now: colortables.json (token -> hex, per day/dusk/night palette),
-//! the MapLibre style.json layer set (style.zig), and manifest.json (pins
-//! schema_version; couples tiles <-> portrayal). TODO, tracked in
-//! next: linestyles.json, sprite/pattern atlases (SVG raster),
-//! and glyphs (SDF) — to light up the symbol/text/pattern layers.
+//!   * color tables — token -> hex, one per day/dusk/night palette
+//!   * the MapLibre style.json layer set (maplibre.zig)
+//!   * line styles and the S-52 mariner expression builders (mariner.zig)
 
 const std = @import("std");
 
-/// The tile-vocabulary version both halves of a bundle are stamped with: the MVT
-/// layer/property set in scene.zig and the style/colortables that render it.
-/// Bump on ANY change to layer names or feature property keys. tile57/2 = the
-/// 6-source-layer schema (the `_scamin` twins folded into their base; SCAMIN is a
-/// per-feature `scamin` property the style gates band-independently).
+/// The tile-vocabulary version both the tiles and the style are stamped with:
+/// the MVT layer/property set in scene.zig and the style/color tables that
+/// render it. Bump on any change to layer names or feature property keys.
+/// tile57/2 = the 6-source-layer schema (the `_scamin` twins folded into their
+/// base; SCAMIN is a per-feature `scamin` property the style gates
+/// band-independently).
 pub const SCHEMA_VERSION = "tile57/2";
 
-// MapLibre style.json generation lives in style.zig.
-pub const StyleOpts = @import("style.zig").StyleOpts;
-pub const styleJson = @import("style.zig").styleJson;
-pub const displayDenom = @import("style.zig").displayDenom;
-pub const displayDenomZ = @import("style.zig").displayDenomZ;
-pub const scaminGateK = @import("style.zig").scaminGateK;
-pub const buildFromTemplate = @import("style.zig").buildFromTemplate;
-pub const buildFromTemplateScamin = @import("style.zig").buildFromTemplateScamin;
-pub const styleDiff = @import("style.zig").styleDiff;
+// MapLibre style.json generation lives in maplibre.zig.
+pub const Options = @import("maplibre.zig").Options;
+pub const json = @import("maplibre.zig").json;
+pub const displayDenom = @import("maplibre.zig").displayDenom;
+pub const displayDenomZ = @import("maplibre.zig").displayDenomZ;
+pub const scaminGateK = @import("maplibre.zig").scaminGateK;
+pub const buildFromTemplate = @import("maplibre.zig").buildFromTemplate;
+pub const buildFromTemplateScamin = @import("maplibre.zig").buildFromTemplateScamin;
+pub const diff = @import("maplibre.zig").diff;
 
-/// The S-52 mariner expression builders (MapLibre style patching) — folded
-/// in: assets is its only sibling and every consumer wants both.
-pub const chartstyle = @import("chartstyle.zig");
+/// The S-52 mariner display settings model (`mariner.Settings`) and the builders
+/// that encode those settings as MapLibre expressions. maplibre.zig calls these
+/// for the mariner-driven parts of the style.
+pub const mariner = @import("mariner.zig");
 
 // ---- colortables.json ----------------------------------------------------
 
@@ -406,54 +406,6 @@ pub fn linestylesJson(alloc: std.mem.Allocator, srcs: []const LineStyleSrc) ![]u
     return out.toOwnedSlice(alloc);
 }
 
-// ---- manifest.json -------------------------------------------------------
-
-/// Inputs for the bundle manifest. Relative paths only (the bundle is
-/// relocatable). bbox is [west, south, east, north]; anchor is [lon, lat].
-pub const Manifest = struct {
-    generator: []const u8,
-    created: []const u8 = "", // ISO 8601; Zig has no wall clock, so passed in
-    catalogue_version: []const u8 = "",
-    tiles_rel: []const u8,
-    colortables_rel: []const u8,
-    minzoom: u8,
-    maxzoom: u8,
-    bbox: [4]f64,
-    anchor: [2]f64,
-    cells: []const []const u8,
-    styles: ?Styles = null, // per-palette style.json paths, if emitted
-
-    pub const Styles = struct { day: []const u8, dusk: []const u8, night: []const u8 };
-};
-
-/// Emit the bundle manifest.json. Loaded first by a renderer, which refuses a
-/// bundle whose schema_version it doesn't speak — turning tile/style coupling
-/// into a checked invariant. Returns allocator-owned bytes.
-pub fn manifestJson(alloc: std.mem.Allocator, m: Manifest) ![]u8 {
-    // The manifest is plain data: describe it as a value and let std.json emit it.
-    // indent_2 keeps it human-readable; emit_null_optional_fields drops "styles"
-    // (the one optional) when absent.
-    return std.json.Stringify.valueAlloc(alloc, .{
-        .bundle_version = 1,
-        .schema_version = SCHEMA_VERSION,
-        .generator = m.generator,
-        .created = m.created,
-        .catalogue_version = m.catalogue_version,
-        .data = .{
-            .tiles = m.tiles_rel,
-            .minzoom = m.minzoom,
-            .maxzoom = m.maxzoom,
-            .bbox = m.bbox,
-            .anchor = m.anchor,
-            .cells = m.cells,
-        },
-        .portrayal = .{
-            .colortables = m.colortables_rel,
-            .styles = m.styles,
-        },
-    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
-}
-
 // ---- tests ---------------------------------------------------------------
 
 test "colorTablesJson: sorted tokens, lowercase hex, all three palettes" {
@@ -515,35 +467,7 @@ test "linestylesJson: dash pattern + placed symbols, sorted ids, skips no-interv
     try std.testing.expectEqualStrings(expected, out);
 }
 
-test "manifestJson: pins schema_version and couples tiles to portrayal" {
-    const out = try manifestJson(std.testing.allocator, .{
-        .generator = "tile57 0.1.0",
-        .created = "2026-06-27T00:00:00Z",
-        .catalogue_version = "S-101 PC 1.4.0",
-        .tiles_rel = "tiles/chart.pmtiles",
-        .colortables_rel = "assets/colortables.json",
-        .minzoom = 8,
-        .maxzoom = 16,
-        .bbox = .{ -76.55, 38.90, -76.40, 39.02 },
-        .anchor = .{ -76.475, 38.96 },
-        .cells = &.{ "US5MD1MC", "US4MD81M" },
-    });
-    defer std.testing.allocator.free(out);
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
-    defer parsed.deinit();
-    const o = parsed.value.object;
-    try std.testing.expectEqualStrings("tile57/2", o.get("schema_version").?.string);
-    const data = o.get("data").?.object;
-    try std.testing.expectEqualStrings("tiles/chart.pmtiles", data.get("tiles").?.string);
-    try std.testing.expectEqual(@as(usize, 2), data.get("cells").?.array.items.len);
-    try std.testing.expectEqualStrings("US5MD1MC", data.get("cells").?.array.items[0].string);
-    const portrayal = o.get("portrayal").?.object;
-    try std.testing.expectEqualStrings("assets/colortables.json", portrayal.get("colortables").?.string);
-    // "styles" is omitted when not provided (emit_null_optional_fields = false)
-    try std.testing.expect(portrayal.get("styles") == null);
-}
-
 test {
-    _ = chartstyle;
-    _ = @import("style.zig"); // run style.zig's styleJson / buildFromTemplate tests too
+    _ = mariner;
+    _ = @import("maplibre.zig"); // run the style.json builder tests too
 }

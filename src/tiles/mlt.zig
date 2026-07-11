@@ -638,14 +638,16 @@ fn unzigzag32(v: u64) i32 {
     return @bitCast((u >> 1) ^ (0 -% (u & 1)));
 }
 
-const StreamMeta = struct { phys: u8, sub: u8, num_values: u64, byte_length: u64 };
+// num_values / byte_length count and address in-memory data, so they are usize
+// (u32 on 32-bit targets); the wire varints are range-checked into them here.
+const StreamMeta = struct { phys: u8, sub: u8, num_values: usize, byte_length: usize };
 
 fn readStreamMeta(r: *DecReader) StreamMeta {
     const b0 = r.byte();
     _ = r.byte(); // llt/plt byte — the subset's streams are self-describing by (phys, sub)
     const nv = r.varint();
     const bl = r.varint();
-    return .{ .phys = b0 >> 4, .sub = b0 & 0x0F, .num_values = nv, .byte_length = bl };
+    return .{ .phys = b0 >> 4, .sub = b0 & 0x0F, .num_values = @intCast(nv), .byte_length = @intCast(bl) };
 }
 
 // ORC byte-RLE (as writePresentStream emits, plus repeat runs for safety):
@@ -691,14 +693,14 @@ pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
     var layers = std.ArrayList(mvt.DecodedLayer).empty;
     var top = DecReader{ .buf = data };
     while (top.pos < data.len) {
-        const block_len = top.varint();
+        const block_len: usize = @intCast(top.varint());
         const block = top.bytes(block_len);
         var r = DecReader{ .buf = block };
         if (r.varint() != 1) return error.BadTile; // tag
 
-        const name = try a.dupe(u8, r.bytes(r.varint()));
+        const name = try a.dupe(u8, r.bytes(@intCast(r.varint())));
         const extent: u32 = @intCast(r.varint());
-        const ncols = r.varint();
+        const ncols: usize = @intCast(r.varint());
         if (ncols == 0 or r.byte() != TYPECODE_GEOMETRY) return error.BadTile;
         var cols = std.ArrayList(DecCol).empty;
         for (1..ncols) |_| {
@@ -713,16 +715,16 @@ pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
                 ST_FLOAT => .float,
                 else => return error.BadTile,
             };
-            const key = try a.dupe(u8, r.bytes(r.varint()));
+            const key = try a.dupe(u8, r.bytes(@intCast(r.varint())));
             try cols.append(a, .{ .kind = kind, .nullable = (tc - 10) % 2 == 1, .key = key });
         }
 
         // ---- geometry column ----------------------------------------------
-        const n_gstreams = r.varint();
+        const n_gstreams: usize = @intCast(r.varint());
         var gtypes: []u32 = &.{};
-        var geoms: []u64 = &.{};
-        var parts_lens: []u64 = &.{};
-        var rings_lens: []u64 = &.{};
+        var geoms: []usize = &.{};
+        var parts_lens: []usize = &.{};
+        var rings_lens: []usize = &.{};
         var verts: []i32 = &.{};
         for (0..n_gstreams) |si| {
             const m = readStreamMeta(&r);
@@ -731,14 +733,14 @@ pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
                 gtypes = try a.alloc(u32, m.num_values);
                 for (gtypes) |*g| g.* = @intCast(r.varint());
             } else if (m.phys == PHYS_LENGTH and m.sub == LEN_GEOMETRIES) {
-                geoms = try a.alloc(u64, m.num_values);
-                for (geoms) |*v| v.* = r.varint();
+                geoms = try a.alloc(usize, m.num_values);
+                for (geoms) |*v| v.* = @intCast(r.varint());
             } else if (m.phys == PHYS_LENGTH and m.sub == LEN_PARTS) {
-                parts_lens = try a.alloc(u64, m.num_values);
-                for (parts_lens) |*v| v.* = r.varint();
+                parts_lens = try a.alloc(usize, m.num_values);
+                for (parts_lens) |*v| v.* = @intCast(r.varint());
             } else if (m.phys == PHYS_LENGTH and m.sub == LEN_RINGS) {
-                rings_lens = try a.alloc(u64, m.num_values);
-                for (rings_lens) |*v| v.* = r.varint();
+                rings_lens = try a.alloc(usize, m.num_values);
+                for (rings_lens) |*v| v.* = @intCast(r.varint());
             } else { // VertexBuffer (componentwise delta + zigzag)
                 verts = try a.alloc(i32, m.num_values);
                 var px: i32 = 0;
@@ -763,7 +765,7 @@ pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
         for (gtypes, 0..) |g, fi| {
             switch (g) {
                 G_POINT, G_MULTIPOINT => {
-                    const n: u64 = if (g == G_POINT) 1 else blk: {
+                    const n: usize = if (g == G_POINT) 1 else blk: {
                         const v = geoms[gi];
                         gi += 1;
                         break :blk v;
@@ -778,7 +780,7 @@ pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
                     feats[fi] = .{ .geom_type = .point, .parts = parts, .properties = &.{} };
                 },
                 G_MULTILINESTRING, G_LINESTRING => {
-                    const nlines: u64 = if (g == G_MULTILINESTRING) blk: {
+                    const nlines: usize = if (g == G_MULTILINESTRING) blk: {
                         const v = geoms[gi];
                         gi += 1;
                         break :blk v;
@@ -831,8 +833,8 @@ pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
                 }
                 if (nstreams == 3) { // dictionary
                     const lm = readStreamMeta(&r);
-                    const dlens = try a.alloc(u64, lm.num_values);
-                    for (dlens) |*v| v.* = r.varint();
+                    const dlens = try a.alloc(usize, lm.num_values);
+                    for (dlens) |*v| v.* = @intCast(r.varint());
                     const dm = readStreamMeta(&r);
                     _ = dm;
                     const dict = try a.alloc([]const u8, dlens.len);
@@ -840,15 +842,15 @@ pub fn decode(a: std.mem.Allocator, data: []const u8) ![]mvt.DecodedLayer {
                     const om = readStreamMeta(&r);
                     var fi: usize = 0;
                     for (0..om.num_values) |_| {
-                        const ix = r.varint();
+                        const ix: usize = @intCast(r.varint());
                         while (present != null and !present.?[fi]) fi += 1;
                         try propbuf[fi].append(a, .{ .key = col.key, .value = .{ .string = dict[ix] } });
                         fi += 1;
                     }
                 } else { // plain: lengths + data
                     const lm = readStreamMeta(&r);
-                    const lens = try a.alloc(u64, lm.num_values);
-                    for (lens) |*v| v.* = r.varint();
+                    const lens = try a.alloc(usize, lm.num_values);
+                    for (lens) |*v| v.* = @intCast(r.varint());
                     _ = readStreamMeta(&r);
                     var fi: usize = 0;
                     for (lens) |sl| {

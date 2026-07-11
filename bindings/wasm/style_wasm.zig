@@ -1,10 +1,10 @@
 //! style_wasm — a tiny `wasm32-freestanding` entry point around the pure-Zig
-//! `chartstyle.buildStyle`, so a browser / Node front-end can turn S-52 "mariner
+//! `the mariner builders`, so a browser / Node front-end can turn S-52 "mariner
 //! settings" into a concrete MapLibre style.json entirely client-side.
 //!
 //! The MapLibre style *template* and the S-52 *colortables* are @embedFile'd at
 //! build time (generated once by `tile57 style` / `tile57 assets`; see
-//! bindings/scripts/gen-assets.sh), so the wasm needs NO external file inputs.
+//! bindings/scripts/gen-style.sh), so the wasm needs NO external file inputs.
 //! The JS host only passes the mariner settings as a small JSON blob.
 //!
 //! ABI — every pointer is a byte OFFSET (usize) into the wasm linear memory, so
@@ -21,8 +21,8 @@
 //! style_free(result_ptr, result_len).
 
 const std = @import("std");
-const assets = @import("assets");
-const chartstyle = @import("assets").chartstyle;
+const style = @import("style");
+const mariner = @import("style").mariner;
 const settings = @import("settings");
 
 // Base MapLibre style template + S-52 colortables, embedded at build time.
@@ -86,7 +86,7 @@ export fn style_build(settings_ptr: usize, settings_len: usize, now_unix: f64) i
     };
     const m = settings.parse(arena.allocator(), settings_bytes);
     const now: i64 = @intFromFloat(now_unix);
-    const out = assets.buildFromTemplate(gpa, template_json, &m, colortables_json, null, now) catch return 0;
+    const out = style.buildFromTemplate(gpa, template_json, &m, colortables_json, null, now) catch return 0;
     g_result_ptr = @intFromPtr(out.ptr);
     g_result_len = out.len;
     return 1;

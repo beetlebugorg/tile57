@@ -46,18 +46,9 @@ func (a *cArena) str(s string) *C.char {
 	return (*C.char)(a.track(unsafe.Pointer(C.CString(s))))
 }
 
-// cOmit maps the Go BakeOpts.OmitPickAttrs bool to the C omit_pick_attrs int: 0 =
-// include the per-feature pick attrs (the default), 1 = omit them.
-func cOmit(omit bool) C.int {
-	if omit {
-		return 1
-	}
-	return 0
-}
-
 // int32Array copies a Go []int32 into a malloc'd C int32_t array, returning the
 // base pointer + count (NULL/0 for an empty slice). Used for the enabled-bands and
-// SCAMIN-manifest inputs to tile57_build_style.
+// SCAMIN-manifest inputs to tile57_style_build.
 func (a *cArena) int32Array(v []int32) (*C.int32_t, C.size_t) {
 	n := len(v)
 	if n == 0 {
@@ -71,36 +62,3 @@ func (a *cArena) int32Array(v []int32) (*C.int32_t, C.size_t) {
 	return p, C.size_t(n)
 }
 
-// cellInputs builds a C tile57_cell array from cells. Returns the typed Go view
-// (for length bookkeeping) and the base pointer to hand to C.
-func (a *cArena) cellInputs(cells []Cell) ([]C.tile57_cell, *C.tile57_cell) {
-	n := len(cells)
-	base := (*C.tile57_cell)(a.track(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.tile57_cell{})))))
-	inputs := unsafe.Slice(base, n)
-	for i, c := range cells {
-		in := &inputs[i]
-		in.base = a.bytes(c.Base)
-		in.base_len = C.size_t(len(c.Base))
-		in.updates = nil
-		in.update_lens = nil
-		in.update_count = 0
-		in.name = nil
-		if c.Name != "" {
-			in.name = a.str(c.Name)
-		}
-		if m := len(c.Updates); m > 0 {
-			updPtrs := (**C.uint8_t)(a.track(C.malloc(C.size_t(m) * C.size_t(unsafe.Sizeof((*C.uint8_t)(nil))))))
-			updLens := (*C.size_t)(a.track(C.malloc(C.size_t(m) * C.size_t(unsafe.Sizeof(C.size_t(0))))))
-			ps := unsafe.Slice(updPtrs, m)
-			ls := unsafe.Slice(updLens, m)
-			for j, u := range c.Updates {
-				ps[j] = a.bytes(u)
-				ls[j] = C.size_t(len(u))
-			}
-			in.updates = updPtrs
-			in.update_lens = updLens
-			in.update_count = C.size_t(m)
-		}
-	}
-	return inputs, base
-}

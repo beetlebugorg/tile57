@@ -1,9 +1,8 @@
-//! style.zig — MapLibre GL style.json generation for the chart bundle. Resolves
-//! each S-52 colour token to hex for a palette and emits the fill / line / symbol
-//! / text layer set. Ported from the chartplotter web frontend's s52-style.mjs /
-//! chart-style.mjs (and the now-removed style/build_style.py, kept in git history;
-//! it was verified layer-for-layer identical during the port). The sole style
-//! generator now. Part of the `assets` module.
+//! maplibre.zig — MapLibre GL style.json generation. Resolves each S-52 colour
+//! token to hex for a palette and emits the fill / line / symbol / text layer
+//! set. Ported from the chartplotter web frontend's s52-style.mjs /
+//! chart-style.mjs, verified layer-for-layer identical during the port. The one
+//! style.json generator; part of the `style` module.
 //!
 //! MapLibre expressions are written as Zig comptime tuples — `.{ "get", "drval1" }`
 //! serialises to `["get","drval1"]` — through std.json's Stringify write-stream,
@@ -13,18 +12,18 @@
 
 const std = @import("std");
 const Stringify = std.json.Stringify;
-const chartstyle = @import("chartstyle.zig");
+const mariner = @import("mariner.zig");
 
 const FALLBACK = "#ff00ff";
 const FONT = .{"Noto Sans Regular"};
 
 // ---- MapLibre expressions, as comptime tuples ----------------------------
 // SEABED01 depth shading, the danger-symbol swap, and the sounding bold/faint split
-// are mariner-dependent and now resolve through the chartstyle builders (one style
+// are mariner-dependent and now resolve through the mariner builders (one style
 // builder); only the mariner-INDEPENDENT layout exprs remain comptime tuples here.
 
 // The static (no-manifest) SCAMIN/oscl gate is now expressed as K / 2^zoom —
-// the SAME display-denominator form the bucket path uses (styleJson computes
+// the SAME display-denominator form the bucket path uses (json computes
 // K = M_PER_PX_Z0·cos(scamin_lat)/(pitch/1000) once per archive). The old hardcoded
 // DENOM_Z0 (0.28 mm OGC pixel, equator) gated ~0.4 z late at mid-latitude and used
 // the uncalibrated CSS pixel; K is latitude-corrected and calibrated. See
@@ -51,7 +50,7 @@ pub fn scaminDisplayZoom(scamin: f64, lat: f64) f64 {
 /// The per-archive display-denominator constant K such that the on-screen 1:N
 /// denominator at Web-Mercator `zoom` is K / 2^zoom (== displayDenom). Baked into the
 /// static SCAMIN/oscl gate at the archive-center latitude; the SAME constant the
-/// bucket path computes (styleJson). Replaces the old equator-only OGC DENOM_Z0.
+/// bucket path computes (json). Replaces the old equator-only OGC DENOM_Z0.
 pub fn scaminGateK(lat: f64) f64 {
     return M_PER_PX_Z0 * @cos(lat * std.math.pi / 180.0) / (DEFAULT_PX_PITCH_MM / 1000.0);
 }
@@ -157,7 +156,7 @@ const TEXT_OFFSET = .{
     .{ "literal", .{ 0, 0 } },
 };
 
-pub const StyleOpts = struct {
+pub const Options = struct {
     scheme: []const u8, // "day" | "dusk" | "night"
     colortables_json: []const u8,
     source_tiles: ?[]const u8 = null, // tiles template; else pmtiles_url
@@ -182,10 +181,10 @@ pub const StyleOpts = struct {
     // S-52 mariner display options. null = a TEMPLATE (no client display filters
     // baked in — the bundle + tile57_style_template path; the client gates live).
     // Non-null = the full style with the mariner's display filters + depth shading /
-    // sounding-split / danger-swap baked in (the C-ABI tile57_build_style path).
-    // Colour + layout always resolve through the chartstyle builders (default mariner
-    // when null), so there is ONE style builder — chartstyle.buildStyle is retired.
-    mariner: ?chartstyle.MarinerSettings = null,
+    // sounding-split / danger-swap baked in (the C-ABI tile57_style_build path).
+    // Colour + layout always resolve through the mariner builders (default mariner
+    // when null), so there is ONE style builder — the mariner builders is retired.
+    mariner: ?mariner.Settings = null,
     enabled_bands: ?[]const i32 = null, // mariner NOAA-band filter (null = all bands)
     now_unix: i64 = 0, // host wall-clock (epoch s) for the date filter's "today"
     // §2 ?ignoreScamin host debug toggle: when true, disable SCAMIN scale-gating
@@ -213,8 +212,8 @@ pub const StyleOpts = struct {
 };
 
 // Precomputed, mariner-aware style expressions shared by every layer of one
-// styleJson call — the single style builder. Colours / depth shading / icon images
-// resolve ONCE through the chartstyle builders (so chartstyle.buildStyle's patch pass
+// json call — the single style builder. Colours / depth shading / icon images
+// resolve ONCE through the mariner builders
 // is retired); `common`/`text_group` are the S-52 display filters, empty/null in
 // template mode (opts.mariner == null) so a template renders without baked gating.
 const SCtx = struct {
@@ -247,7 +246,7 @@ const DenomGate = union(enum) {
     zoom_k: f64,
 };
 
-// The overscale (oscl) clause — S-52 §10.1.10 (specs/overscale.md). The
+// The overscale (oscl) clause — S-52 §10.1.10. The
 // filter-gate form is EXACTLY
 //   [">", ["coalesce", ["get","oscl"], 0], DENOM]
 // ("the display is FINER than the cell's quantized compilation scale"), or its
@@ -320,12 +319,12 @@ const Bucket = struct {
     filter_gate: bool = false, // scamin-layers.md: the live client-driven SCAMIN clause (?scaminexact)
     cur_denom: f64 = 0, // filter_gate: the current-display-scale denominator literal (client-overwritten)
     suffix: []const u8 = "", // id suffix: "#oscl" (overscaled fill pass) / "" (plain)
-    // Overscale (oscl) clause role (S-52 §10.1.10, specs/overscale.md) — see OverscaleRole.
+    // Overscale (oscl) clause role (S-52 §10.1.10) — see OverscaleRole.
     oscl: OverscaleRole = .none,
 };
 
 // Overscale (oscl) clause role a fill/pattern layer plays in the AP(OVERSC01)
-// occlusion sandwich (S-52 §10.1.10, specs/overscale.md):
+// occlusion sandwich (S-52 §10.1.10):
 //   .none — no oscl clause (every layer outside the sandwich).
 //   .overscaled — [">", coalesce(oscl,0), DENOM]: this cell's data is displayed FINER
 //     than its compilation scale (the fills under the hatch + the hatch itself).
@@ -446,7 +445,7 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
     // first = underneath). draw_prio is the SOLE axis; the danger-over-sounding
     // deviation is a sort VALUE (effective 19), not a class tier. z-order "auto" makes
     // the sort-key take effect. Mirrors fill-sort-key on the fill layers. NOTE: this
-    // orders WITHIN one layer only; LIGHTS get their own top layer set (see styleJson).
+    // orders WITHIN one layer only; LIGHTS get their own top layer set (see json).
     try js.objectField("symbol-sort-key");
     try js.write(SYMBOL_SORT);
     try js.objectField("symbol-z-order");
@@ -669,11 +668,11 @@ fn patternLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !vo
     try js.endObject();
 }
 
-// The AP(OVERSC01) overscale-indication layer (S-52 §10.1.10, specs/overscale.md):
+// The AP(OVERSC01) overscale-indication layer (S-52 §10.1.10):
 // every contributing cell's M_COVR coverage polygon (baked into `area_patterns`
 // as pattern OVERSC01, tagged `oscl`), shown only while the display is FINER than
 // the cell's quantized compilation scale (the oscl clause). Sandwiched between
-// the overscaled and at-scale fill passes (styleJson §2), so a finer cell's
+// the overscaled and at-scale fill passes (json §2), so a finer cell's
 // opaque fills occlude a coarser cell's hatch — the hatch survives only on
 // coarse-only patches. The showOverscale mariner toggle drives layout.visibility
 // alone (layer set unchanged -> a one-op style diff).
@@ -794,7 +793,7 @@ fn dangerSoundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
 }
 
 /// Emit a MapLibre style.json for `opts.scheme`. Returns allocator-owned bytes.
-pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
+pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, opts.colortables_json, .{}) catch
         return error.BadColortables;
     defer parsed.deinit();
@@ -835,28 +834,28 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     const scamin_buckets: []const Bucket = &.{gate};
 
     // The single style builder: resolve every mariner-aware colour / icon / display
-    // filter ONCE through the chartstyle builders (retiring chartstyle.buildStyle's
+    // filter ONCE through the mariner builders
     // template-patch pass). scheme always comes from opts.scheme (the bundle emits one
     // style per scheme); a null opts.mariner is a TEMPLATE — default mariner for the
     // colour/layout exprs, but NO display filters baked in (the client gates live).
-    const scheme_e: chartstyle.Scheme = if (std.mem.eql(u8, opts.scheme, "night"))
+    const scheme_e: mariner.Scheme = if (std.mem.eql(u8, opts.scheme, "night"))
         .night
     else if (std.mem.eql(u8, opts.scheme, "dusk")) .dusk else .day;
-    var m: chartstyle.MarinerSettings = opts.mariner orelse .{};
+    var m: mariner.Settings = opts.mariner orelse .{};
     m.scheme = scheme_e;
     const filters_on = opts.mariner != null;
-    const b = chartstyle.B{ .a = ba };
+    const b = mariner.B{ .a = ba };
     const s = SCtx{
-        .fill_color = try chartstyle.areasFillColor(b, &palette, &m),
-        .line_color = try chartstyle.lineColor(b, &palette),
-        .text_color = try chartstyle.textColor(b, m.scheme, &palette),
-        .halo = chartstyle.textHaloColor(b, m.scheme),
-        .contour_color = try chartstyle.contourLabelColor(b, m.scheme, &palette),
-        .sound_img = try chartstyle.soundingsIconImage(b, &m),
-        .point_img = try chartstyle.pointSymbolImage(b, &m),
-        .contour_field = try chartstyle.contourLabelField(b, &m),
-        .common = if (filters_on) try chartstyle.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
-        .text_group = if (filters_on) try chartstyle.textGroupFilter(b, &m) else null,
+        .fill_color = try mariner.areasFillColor(b, &palette, &m),
+        .line_color = try mariner.lineColor(b, &palette),
+        .text_color = try mariner.textColor(b, m.scheme, &palette),
+        .halo = mariner.textHaloColor(b, m.scheme),
+        .contour_color = try mariner.contourLabelColor(b, m.scheme, &palette),
+        .sound_img = try mariner.soundingsIconImage(b, &m),
+        .point_img = try mariner.pointSymbolImage(b, &m),
+        .contour_field = try mariner.contourLabelField(b, &m),
+        .common = if (filters_on) try mariner.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
+        .text_group = if (filters_on) try mariner.textGroupFilter(b, &m) else null,
         .size_scale = opts.size_scale,
         // Overscale gate mode follows the SCAMIN gating mode: the filter-gate
         // literal when the live client drives it (same injected DENOM), else the
@@ -936,7 +935,7 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
     // the hatch) each bucket's fill splits around the AP(OVERSC01) overscale layer:
     // overscaled cells' fills (#oscl) UNDER the hatch, at-scale fills ABOVE it — so
     // finer opaque DEPARE/LNDARE occlude a coarser cell's hatch and it survives only
-    // on coarse-only patches (S-52 §10.1.10, specs/overscale.md). ignore_scamin (gate
+    // on coarse-only patches (S-52 §10.1.10). ignore_scamin (gate
     // off) or no sprite keeps a single plain fill layer per bucket.
     if (sprite_on) {
         for (scamin_buckets) |bkt| try fillLayer(js, &s, "areas", try bucketWithOverscale(ba, bkt, .overscaled));
@@ -1010,16 +1009,16 @@ pub fn styleJson(alloc: std.mem.Allocator, opts: StyleOpts) ![]u8 {
 }
 
 /// Build a full MapLibre style from a base template + mariner settings — the single
-/// builder behind the C-ABI / WASM / parity callers (replaces chartstyle.buildStyle's
+/// builder behind the C-ABI / WASM / parity callers (replaces the mariner builders's
 /// template-patch pass). The passed template carries ONLY the host's source config
 /// (sprite / glyphs / chart tiles+zoom); this lifts that out and regenerates every
-/// layer via styleJson with the mariner baked in. Signature mirrors the retired
+/// layer via json with the mariner baked in. Signature mirrors the retired
 /// buildStyle so callers are a one-line change. A bad template or unusable colortables
 /// returns the template bytes unchanged (alloc-owned dup), as buildStyle did.
 pub fn buildFromTemplate(
     alloc: std.mem.Allocator,
     template_json: []const u8,
-    m: *const chartstyle.MarinerSettings,
+    m: *const mariner.Settings,
     colortables_json: []const u8,
     enabled_bands: ?[]const i32,
     now_unix: i64,
@@ -1032,13 +1031,13 @@ pub fn buildFromTemplate(
 /// Same as buildFromTemplate but threading a SCAMIN manifest (the distinct
 /// denominators present + a representative latitude), so the RUNTIME style gets the
 /// SAME per-value native-minzoom bucket layers the offline bundle does (host
-/// host-canonical-backend.md §"Still needed" #1 — the `tile57_build_style` runtime
+/// host-canonical-backend.md §"Still needed" #1 — the `tile57_style_build` runtime
 /// path otherwise leaves every `_scamin` layer ungated). Empty `scamin` == the
 /// plain buildFromTemplate behaviour.
 pub fn buildFromTemplateScamin(
     alloc: std.mem.Allocator,
     template_json: []const u8,
-    m: *const chartstyle.MarinerSettings,
+    m: *const mariner.Settings,
     colortables_json: []const u8,
     enabled_bands: ?[]const i32,
     now_unix: i64,
@@ -1048,7 +1047,7 @@ pub fn buildFromTemplateScamin(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, template_json, .{}) catch
         return alloc.dupe(u8, template_json);
     defer parsed.deinit();
-    var opts = StyleOpts{
+    var opts = Options{
         .scheme = switch (m.scheme) {
             .dusk => "dusk",
             .night => "night",
@@ -1083,7 +1082,7 @@ pub fn buildFromTemplateScamin(
                         if (t == .array and t.array.items.len > 0 and t.array.items[0] == .string)
                             opts.source_tiles = t.array.items[0].string;
                     }
-                    if (c.get("encoding")) |e| { // MLT hint rides the rebuild (tile57_build_style / style_diff)
+                    if (c.get("encoding")) |e| { // MLT hint rides the rebuild (tile57_style_build / style_diff)
                         if (e == .string) opts.encoding = e.string;
                     }
                     if (c.get("minzoom")) |z| {
@@ -1096,12 +1095,12 @@ pub fn buildFromTemplateScamin(
             };
         }
     }
-    return styleJson(alloc, opts) catch alloc.dupe(u8, template_json);
+    return json(alloc, opts) catch alloc.dupe(u8, template_json);
 }
 
-// ---- style diff (style-diff.md) --------------------------------------------
+// ---- style diff --------------------------------------------
 // Compute the minimal MapLibre style-mutation ops that turn one built style into
-// another. The engine knows both styles come from styleJson (same layer set +
+// another. The engine knows both styles come from json (same layer set +
 // deterministic key order), so a structural layer-by-layer compare yields exactly
 // the ops MapLibre's setStyle(diff:true) would — but scoped to the chart layers and
 // returned as data the host applies with setFilter / setPaintProperty /
@@ -1127,7 +1126,7 @@ fn layerId(v: std.json.Value) ?[]const u8 {
 }
 
 /// Structural deep-equality for two parsed JSON values. std.json.Value has no
-/// built-in equal; both operands here come from the same styleJson generator, so
+/// built-in equal; both operands here come from the same json generator, so
 /// corresponding keys share a representation (integer stays integer, object key
 /// order matches) and a recursive compare is exact.
 fn jsonEql(a: std.json.Value, b: std.json.Value) bool {
@@ -1211,12 +1210,12 @@ fn diffSubObject(js: *Stringify, op: []const u8, id: []const u8, old_v: ?std.jso
 }
 
 /// Compute the minimal MapLibre style-mutation ops (a JSON array) to turn the
-/// serialized style `old_json` into `new_json`. Both must be styleJson output (same
+/// serialized style `old_json` into `new_json`. Both must be json output (same
 /// template/colortables/bands/scamin inputs, differing only in mariner). Returns
 /// allocator-owned bytes: `"[]"` when nothing differs; one op per differing
 /// `filter` / `paint.*` / `layout.*` key; `[{"op":"rebuild"}]` when the two styles
 /// carry a different SET of layer ids (the host then falls back to a full setStyle).
-pub fn styleDiff(alloc: std.mem.Allocator, old_json: []const u8, new_json: []const u8) ![]u8 {
+pub fn diff(alloc: std.mem.Allocator, old_json: []const u8, new_json: []const u8) ![]u8 {
     var old_parsed = std.json.parseFromSlice(std.json.Value, alloc, old_json, .{}) catch
         return alloc.dupe(u8, rebuild_ops);
     defer old_parsed.deinit();
@@ -1263,11 +1262,11 @@ pub fn styleDiff(alloc: std.mem.Allocator, old_json: []const u8, new_json: []con
     return aw.toOwnedSlice();
 }
 
-test "styleJson: valid JSON, expected layers, palette-resolved colour" {
+test "json: valid JSON, expected layers, palette-resolved colour" {
     const ct =
         \\{"day":{"DEPDW":"#c9edff","CHGRD":"#4c5b63","CHBLK":"#000000"},"dusk":{},"night":{"DEPDW":"#0a141e"}}
     ;
-    const out = try styleJson(std.testing.allocator, .{
+    const out = try json(std.testing.allocator, .{
         .scheme = "day",
         .colortables_json = ct,
         .source_tiles = "tile57://{z}/{x}/{y}",
@@ -1287,13 +1286,13 @@ test "styleJson: valid JSON, expected layers, palette-resolved colour" {
     try std.testing.expect(std.mem.indexOf(u8, out, "#c9edff") != null);
 }
 
-test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
+test "json: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
     const sm = [_]u32{ 30000, 90000 };
-    const base = StyleOpts{
+    const base = Options{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1303,7 +1302,7 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
 
     // Manifest present, gating ON -> the merged zoom-gate rides every layer (per-value
     // #sm buckets are retired — a manifest never buckets now).
-    const gated = try styleJson(a, base);
+    const gated = try json(a, base);
     defer a.free(gated);
     try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, gated, "#sm") == null);
@@ -1311,7 +1310,7 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     // Manifest present, ignore_scamin -> no buckets at all.
     var ign = base;
     ign.ignore_scamin = true;
-    const out_ign = try styleJson(a, ign);
+    const out_ign = try json(a, ign);
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "#sm") == null);
 
@@ -1319,7 +1318,7 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     // scamin>=D(zoom) fallback shape, no per-value buckets).
     var nomanifest = base;
     nomanifest.scamin = &.{};
-    const out_fb = try styleJson(a, nomanifest);
+    const out_fb = try json(a, nomanifest);
     defer a.free(out_fb);
     try std.testing.expect(std.mem.indexOf(u8, out_fb, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_fb, "#sm") == null);
@@ -1328,7 +1327,7 @@ test "styleJson: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     // No manifest + ignore_scamin -> even the static gate is gone.
     var nm_ign = nomanifest;
     nm_ign.ignore_scamin = true;
-    const out_nm_ign = try styleJson(a, nm_ign);
+    const out_nm_ign = try json(a, nm_ign);
     defer a.free(out_nm_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "#sm") == null);
@@ -1339,12 +1338,12 @@ fn layerIndexById(layers: []std.json.Value, id: []const u8) ?usize {
     return null;
 }
 
-test "styleJson: point z-order = draw_prio alone (threshold partition + danger sort-value)" {
+test "json: point z-order = draw_prio alone (threshold partition + danger sort-value)" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
-    const out = try styleJson(a, .{
+    const out = try json(a, .{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1379,12 +1378,12 @@ test "styleJson: point z-order = draw_prio alone (threshold partition + danger s
     try std.testing.expect(i_over < i_lt);
 }
 
-test "styleJson: size_scale wraps icon/line/text sizes in a multiplier" {
+test "json: size_scale wraps icon/line/text sizes in a multiplier" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
-    const base = StyleOpts{
+    const base = Options{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1392,7 +1391,7 @@ test "styleJson: size_scale wraps icon/line/text sizes in a multiplier" {
     };
 
     // Default scale 1.0: sizes written verbatim, no multiplier wrapper.
-    const def = try styleJson(a, base);
+    const def = try json(a, base);
     defer a.free(def);
     try std.testing.expect(std.mem.indexOf(u8, def, "\"line-width\":[\"coalesce\",[\"get\",\"width_px\"],1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, def, "\"line-width\":[\"*\"") == null);
@@ -1400,7 +1399,7 @@ test "styleJson: size_scale wraps icon/line/text sizes in a multiplier" {
     // Scaled: icon-size / line-width / text-size each wrap in ["*", scale, expr].
     var scaled = base;
     scaled.size_scale = 2.0;
-    const sc = try styleJson(a, scaled);
+    const sc = try json(a, scaled);
     defer a.free(sc);
     try std.testing.expect(std.mem.indexOf(u8, sc, "\"line-width\":[\"*\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sc, "\"icon-size\":[\"*\"") != null);
@@ -1410,7 +1409,7 @@ test "styleJson: size_scale wraps icon/line/text sizes in a multiplier" {
 }
 
 // ---- single-builder (buildFromTemplate) tests — ported from the retired
-//      chartstyle.buildStyle tests, now exercising the one styleJson path. -------
+//      the mariner builders tests, now exercising the one json path. -------
 const cs_template =
     \\{"version":8,"sources":{"chart":{"type":"vector","url":"pmtiles://x"}},"sprite":"x","glyphs":"x","layers":[]}
 ;
@@ -1420,7 +1419,7 @@ const cs_ct =
 
 test "buildFromTemplate: defaults bake SEABED fill + category/M_QUAL filter (single-pass)" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "DEPMD") != null); // SEABED01 band
@@ -1432,7 +1431,7 @@ test "buildFromTemplate: defaults bake SEABED fill + category/M_QUAL filter (sin
 
 test "buildFromTemplate: night scheme -> neutral ink + dark halo" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{ .scheme = .night };
+    const m = mariner.Settings{ .scheme = .night };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "#aab7bf") != null);
@@ -1441,7 +1440,7 @@ test "buildFromTemplate: night scheme -> neutral ink + dark halo" {
 
 test "buildFromTemplate: feet depth unit -> contour label uses M_TO_FT" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{ .depth_unit = .feet };
+    const m = mariner.Settings{ .depth_unit = .feet };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "3.280839895") != null);
@@ -1462,7 +1461,7 @@ test "buildFromTemplate: feet picks the sounding feet glyph variant; metres does
 
 test "buildFromTemplate: enabled bands add a band filter" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     const bands = [_]i32{ 2, 3 };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, &bands, 1700000000);
     defer a.free(out);
@@ -1471,18 +1470,18 @@ test "buildFromTemplate: enabled bands add a band filter" {
 
 test "buildFromTemplate: date resolution (pinned + today + off)" {
     const a = std.testing.allocator;
-    const m1 = chartstyle.MarinerSettings{ .date_view = "20240115" };
+    const m1 = mariner.Settings{ .date_view = "20240115" };
     const o1 = try buildFromTemplate(a, cs_template, &m1, cs_ct, null, 1700000000);
     defer a.free(o1);
     try std.testing.expect(std.mem.indexOf(u8, o1, "20240115") != null);
     try std.testing.expect(std.mem.indexOf(u8, o1, "0115") != null);
 
-    const m2 = chartstyle.MarinerSettings{};
+    const m2 = mariner.Settings{};
     const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
     defer a.free(o2);
     try std.testing.expect(std.mem.indexOf(u8, o2, "20231114") != null);
 
-    const m3 = chartstyle.MarinerSettings{ .date_dependent = false };
+    const m3 = mariner.Settings{ .date_dependent = false };
     const o3 = try buildFromTemplate(a, cs_template, &m3, cs_ct, null, 1700000000);
     defer a.free(o3);
     try std.testing.expect(std.mem.indexOf(u8, o3, "date_recurring") == null);
@@ -1493,7 +1492,7 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
     // A non-empty off-set hides the listed groups -> the style references the `vg`
     // property and the off ids, negated (deny-list).
     const off = [_]i32{ 26070, 27070 };
-    const m = chartstyle.MarinerSettings{ .viewing_groups_off = &off };
+    const m = mariner.Settings{ .viewing_groups_off = &off };
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"vg\"") != null);
@@ -1501,13 +1500,13 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
     // The filter is a deny-list: ["!",["in",...]] so the off groups are EXCLUDED.
     try std.testing.expect(std.mem.indexOf(u8, out, "\"in\"") != null);
     // null off-set -> no vg filter at all.
-    const m2 = chartstyle.MarinerSettings{};
+    const m2 = mariner.Settings{};
     const o2 = try buildFromTemplate(a, cs_template, &m2, cs_ct, null, 1700000000);
     defer a.free(o2);
     try std.testing.expect(std.mem.indexOf(u8, o2, "\"vg\"") == null);
     // empty off-set -> also no filter (show all).
     const empty = [_]i32{};
-    const m3 = chartstyle.MarinerSettings{ .viewing_groups_off = &empty };
+    const m3 = mariner.Settings{ .viewing_groups_off = &empty };
     const o3 = try buildFromTemplate(a, cs_template, &m3, cs_ct, null, 1700000000);
     defer a.free(o3);
     try std.testing.expect(std.mem.indexOf(u8, o3, "\"vg\"") == null);
@@ -1515,7 +1514,7 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
 
 test "buildFromTemplateScamin: a manifest no longer buckets — the merged zoom-gate rides every layer" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     // No manifest -> the static K/2^zoom SCAMIN zoom-gate, no #sm buckets.
     const plain = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(plain);
@@ -1533,17 +1532,16 @@ test "buildFromTemplateScamin: a manifest no longer buckets — the merged zoom-
 
 // ---- smax removal -----------------------------------------------------------
 
-test "styleJson: no smax clause in any gating mode (band-handoff gate retired)" {
-    // The coverage-clipped composite owns cross-band occlusion geometrically
-    // (specs/cross-band-composition-redesign.md §3): no layer carries a
-    // band-handoff smax clause any more, in any gating mode — and the overscale
-    // gate survives ?ignoreScamin (decoupled per spec §5).
+test "json: no smax clause in any gating mode (band-handoff gate retired)" {
+    // The coverage-clipped composite owns cross-band occlusion geometrically, so
+    // no layer carries a band-handoff smax clause in any gating mode, and the
+    // overscale gate survives ?ignoreScamin (the two gates are decoupled).
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
     const sm = [_]u32{ 45000, 90000 };
-    const base = StyleOpts{
+    const base = Options{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1555,40 +1553,40 @@ test "styleJson: no smax clause in any gating mode (band-handoff gate retired)" 
     var gated_opts = base;
     gated_opts.scamin_filter_gate = true;
     gated_opts.scamin_cur_denom = 50000;
-    const gated = try styleJson(a, gated_opts);
+    const gated = try json(a, gated_opts);
     defer a.free(gated);
     try std.testing.expect(std.mem.indexOf(u8, gated, "smax") == null);
     // The scamin clause still gates (same injected DENOM literal).
     try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],50000]") != null);
 
-    const bucketed = try styleJson(a, base);
+    const bucketed = try json(a, base);
     defer a.free(bucketed);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "smax") == null);
 
     var nm = base;
     nm.scamin = &.{};
-    const fb = try styleJson(a, nm);
+    const fb = try json(a, nm);
     defer a.free(fb);
     try std.testing.expect(std.mem.indexOf(u8, fb, "smax") == null);
 
     var ign = base;
     ign.ignore_scamin = true;
-    const out_ign = try styleJson(a, ign);
+    const out_ign = try json(a, ign);
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "smax") == null);
     // ignoreScamin no longer kills the overscale indication (spec §5).
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") != null);
 }
 
-// ---- overscale (oscl) gate tests (specs/overscale.md) -----------------------
+// ---- overscale (oscl) gate tests -------------------------------------------
 
-test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
+test "json: the overscale oscl clause has the EXACT client-matched shape" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
     const sm = [_]u32{ 45000, 90000 };
-    const gated = try styleJson(a, .{
+    const gated = try json(a, .{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1612,7 +1610,7 @@ test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
     // The boot/diff PLACEHOLDER (cur_denom 0) maps to 1e12 — hide the hatch and
     // keep every fill in the at-scale pass (today's rendering) until the client
     // injects the live denominator (the placeholder lesson, cb91c4d).
-    const boot = try styleJson(a, .{
+    const boot = try json(a, .{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1649,13 +1647,13 @@ test "styleJson: the overscale oscl clause has the EXACT client-matched shape" {
     try std.testing.expectEqualStrings("visible", hatch.get("layout").?.object.get("visibility").?.string);
 }
 
-test "styleJson: showOverscale=false hides the hatch layer; ignoreScamin keeps it (decoupled)" {
+test "json: showOverscale=false hides the hatch layer; ignoreScamin keeps it (decoupled)" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
     const sm = [_]u32{ 45000, 90000 };
-    const base = StyleOpts{
+    const base = Options{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1667,14 +1665,14 @@ test "styleJson: showOverscale=false hides the hatch layer; ignoreScamin keeps i
     // so a style diff is a single setLayoutProperty op).
     var off = base;
     off.mariner = .{ .show_overscale = false };
-    const hidden = try styleJson(a, off);
+    const hidden = try json(a, off);
     defer a.free(hidden);
     try std.testing.expect(std.mem.indexOf(u8, hidden, "\"id\":\"overscale\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, hidden, "{\"visibility\":\"none\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, hidden, "\"oscl\"") != null);
 
     // Bucket mode derives the oscl DENOM from zoom (same K as the scamin clause).
-    const bucketed = try styleJson(a, base);
+    const bucketed = try json(a, base);
     defer a.free(bucketed);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],[\"/\",") != null);
 
@@ -1682,7 +1680,7 @@ test "styleJson: showOverscale=false hides the hatch layer; ignoreScamin keeps i
     // (spec §5) — the oscl clauses + hatch layer survive the debug toggle.
     var ign = base;
     ign.ignore_scamin = true;
-    const out_ign = try styleJson(a, ign);
+    const out_ign = try json(a, ign);
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "\"id\":\"overscale\",") != null);
@@ -1690,15 +1688,15 @@ test "styleJson: showOverscale=false hides the hatch layer; ignoreScamin keeps i
     // No sprite -> nothing can draw the hatch: single plain fill layer, no sandwich.
     var nospr = base;
     nospr.sprite = null;
-    const out_ns = try styleJson(a, nospr);
+    const out_ns = try json(a, nospr);
     defer a.free(out_ns);
     try std.testing.expect(std.mem.indexOf(u8, out_ns, "oscl") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_ns, "\"id\":\"overscale\",") == null);
 }
 
-// ---- styleDiff tests (style-diff.md §5) ------------------------------------
+// ---- diff tests ------------------------------------
 
-test "styleDiff: filter + paint + layout changes emit precise, scoped ops" {
+test "diff: filter + paint + layout changes emit precise, scoped ops" {
     const a = std.testing.allocator;
     const old_j =
         \\{"layers":[
@@ -1712,7 +1710,7 @@ test "styleDiff: filter + paint + layout changes emit precise, scoped ops" {
         \\{"id":"text","type":"symbol","paint":{"text-color":"#000"}}
         \\]}
     ;
-    const ops = try styleDiff(a, old_j, new_j);
+    const ops = try diff(a, old_j, new_j);
     defer a.free(ops);
     // areas: filter, paint fill-color, layout visibility all changed -> one op each.
     try std.testing.expect(std.mem.indexOf(u8, ops, "{\"op\":\"setFilter\",\"layer\":\"areas\",\"value\":[\"==\",\"x\",2]}") != null);
@@ -1722,11 +1720,11 @@ test "styleDiff: filter + paint + layout changes emit precise, scoped ops" {
     try std.testing.expect(std.mem.indexOf(u8, ops, "\"layer\":\"text\"") == null);
 }
 
-test "styleDiff: a removed paint key emits value:null" {
+test "diff: a removed paint key emits value:null" {
     const a = std.testing.allocator;
     const old_j = "{\"layers\":[{\"id\":\"l\",\"paint\":{\"fill-color\":\"#111\",\"fill-opacity\":0.5}}]}";
     const new_j = "{\"layers\":[{\"id\":\"l\",\"paint\":{\"fill-color\":\"#111\"}}]}";
-    const ops = try styleDiff(a, old_j, new_j);
+    const ops = try diff(a, old_j, new_j);
     defer a.free(ops);
     try std.testing.expectEqualStrings(
         "[{\"op\":\"setPaintProperty\",\"layer\":\"l\",\"property\":\"fill-opacity\",\"value\":null}]",
@@ -1734,39 +1732,39 @@ test "styleDiff: a removed paint key emits value:null" {
     );
 }
 
-test "styleDiff: a differing layer-id set -> rebuild" {
+test "diff: a differing layer-id set -> rebuild" {
     const a = std.testing.allocator;
     // id renamed
-    const r1 = try styleDiff(a, "{\"layers\":[{\"id\":\"x\"}]}", "{\"layers\":[{\"id\":\"y\"}]}");
+    const r1 = try diff(a, "{\"layers\":[{\"id\":\"x\"}]}", "{\"layers\":[{\"id\":\"y\"}]}");
     defer a.free(r1);
     try std.testing.expectEqualStrings(rebuild_ops, r1);
     // count differs
-    const r2 = try styleDiff(a, "{\"layers\":[{\"id\":\"x\"}]}", "{\"layers\":[{\"id\":\"x\"},{\"id\":\"z\"}]}");
+    const r2 = try diff(a, "{\"layers\":[{\"id\":\"x\"}]}", "{\"layers\":[{\"id\":\"x\"},{\"id\":\"z\"}]}");
     defer a.free(r2);
     try std.testing.expectEqualStrings(rebuild_ops, r2);
 }
 
-test "styleDiff: same mariner -> [] (no ops)" {
+test "diff: same mariner -> [] (no ops)" {
     const a = std.testing.allocator;
-    const m = chartstyle.MarinerSettings{};
+    const m = mariner.Settings{};
     const s1 = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(s1);
     const s2 = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(s2);
-    const ops = try styleDiff(a, s1, s2);
+    const ops = try diff(a, s1, s2);
     defer a.free(ops);
     try std.testing.expectEqualStrings("[]", ops);
 }
 
-test "styleDiff: display_other flip emits only setFilter ops" {
+test "diff: display_other flip emits only setFilter ops" {
     const a = std.testing.allocator;
-    const base = chartstyle.MarinerSettings{};
-    const other = chartstyle.MarinerSettings{ .display_other = true };
+    const base = mariner.Settings{};
+    const other = mariner.Settings{ .display_other = true };
     const s1 = try buildFromTemplate(a, cs_template, &base, cs_ct, null, 1700000000);
     defer a.free(s1);
     const s2 = try buildFromTemplate(a, cs_template, &other, cs_ct, null, 1700000000);
     defer a.free(s2);
-    const ops = try styleDiff(a, s1, s2);
+    const ops = try diff(a, s1, s2);
     defer a.free(ops);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setFilter") != null);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setPaintProperty") == null);
@@ -1774,15 +1772,15 @@ test "styleDiff: display_other flip emits only setFilter ops" {
     try std.testing.expect(!std.mem.eql(u8, ops, "[]"));
 }
 
-test "styleDiff: day vs night emits setPaintProperty colour ops, no filter change" {
+test "diff: day vs night emits setPaintProperty colour ops, no filter change" {
     const a = std.testing.allocator;
-    const day = chartstyle.MarinerSettings{ .scheme = .day };
-    const night = chartstyle.MarinerSettings{ .scheme = .night };
+    const day = mariner.Settings{ .scheme = .day };
+    const night = mariner.Settings{ .scheme = .night };
     const s1 = try buildFromTemplate(a, cs_template, &day, cs_ct, null, 1700000000);
     defer a.free(s1);
     const s2 = try buildFromTemplate(a, cs_template, &night, cs_ct, null, 1700000000);
     defer a.free(s2);
-    const ops = try styleDiff(a, s1, s2);
+    const ops = try diff(a, s1, s2);
     defer a.free(ops);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setPaintProperty") != null);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setFilter") == null);
@@ -1796,13 +1794,13 @@ fn layerCount(a: std.mem.Allocator, style: []const u8) !usize {
     return p.value.object.get("layers").?.array.items.len;
 }
 
-test "styleJson: both merged modes (zoom-gate default, filter-gate exact) give one layer per render-type — no per-value buckets" {
+test "json: both merged modes (zoom-gate default, filter-gate exact) give one layer per render-type — no per-value buckets" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
     const sm = [_]u32{ 3000, 8000, 12000, 22000, 45000, 90000, 180000 }; // 7 denominators
-    const base = StyleOpts{
+    const base = Options{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1813,7 +1811,7 @@ test "styleJson: both merged modes (zoom-gate default, filter-gate exact) give o
 
     // Default (a manifest present): the merged zoom-gate — ONE self-gating layer per
     // family, NO per-value #sm buckets, NO native minzoom.
-    const merged = try styleJson(a, base);
+    const merged = try json(a, base);
     defer a.free(merged);
     try std.testing.expect(std.mem.indexOf(u8, merged, "#sm") == null);
     try std.testing.expect(std.mem.indexOf(u8, merged, "minzoom") == null);
@@ -1823,7 +1821,7 @@ test "styleJson: both merged modes (zoom-gate default, filter-gate exact) give o
     // set, with the client-driven curDenom clause instead of the zoom expression.
     var fg = base;
     fg.scamin_filter_gate = true;
-    const gated = try styleJson(a, fg);
+    const gated = try json(a, fg);
     defer a.free(gated);
     try std.testing.expect(std.mem.indexOf(u8, gated, "#sm") == null); // no per-value buckets
     try std.testing.expect(std.mem.indexOf(u8, gated, "minzoom") == null); // no native minzoom gating
@@ -1835,13 +1833,13 @@ test "styleJson: both merged modes (zoom-gate default, filter-gate exact) give o
     try std.testing.expectEqual(try layerCount(a, merged), try layerCount(a, gated));
 }
 
-test "styleJson: scamin_filter_gate honors the cur_denom literal + ignore_scamin drops the clause" {
+test "json: scamin_filter_gate honors the cur_denom literal + ignore_scamin drops the clause" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
     ;
     const sm = [_]u32{ 45000, 90000 };
-    const base = StyleOpts{
+    const base = Options{
         .scheme = "day",
         .colortables_json = ct,
         .sprite = "sprite",
@@ -1851,7 +1849,7 @@ test "styleJson: scamin_filter_gate honors the cur_denom literal + ignore_scamin
         .scamin_filter_gate = true,
         .scamin_cur_denom = 50000,
     };
-    const gated = try styleJson(a, base);
+    const gated = try json(a, base);
     defer a.free(gated);
     // The baked default denominator appears in the clause.
     try std.testing.expect(std.mem.indexOf(u8, gated, "50000") != null);
@@ -1859,7 +1857,7 @@ test "styleJson: scamin_filter_gate honors the cur_denom literal + ignore_scamin
     // ignore_scamin overrides filter_gate: single plain layer, no SCAMIN clause at all.
     var ign = base;
     ign.ignore_scamin = true;
-    const out_ign = try styleJson(a, ign);
+    const out_ign = try json(a, ign);
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "1000000000000") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "#sm") == null);

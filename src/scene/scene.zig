@@ -1,9 +1,14 @@
-//! Direct S-57 -> MVT tile generation (M6c demo, BYPASSING S-101 portrayal).
+//! The tile engine: S-57 features plus their S-101 portrayal instructions become
+//! a tile Surface, then an MVT or MLT vector tile for a given (z, x, y).
 //!
-//! Generates a vector tile for (z,x,y) straight from an S-57 cell with a small
-//! hardcoded object-class -> S-52 color-token mapping, so the existing chart
-//! style renders it. This proves cell -> MVT -> MapLibre end to end before the
-//! S-101 Lua portrayal engine lands and replaces classify() with real rules.
+//! A cell's features carry S-101 portrayal instructions from the Lua rules (see
+//! the `portray` module). This module projects each feature's geometry to tile
+//! space, resolves its layer and draw properties, and serializes the result. A
+//! `classify()` fallback supplies a small object-class -> S-52 mapping for the
+//! few paths that run without portrayal instructions.
+//!
+//! This module also hosts the banded multi-cell ENC_ROOT baker (`bake_enc`),
+//! the engine's batch driver.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -12,22 +17,37 @@ const tile = @import("tiles").tile;
 const mvt = @import("tiles").mvt;
 const mlt = @import("tiles").mlt;
 const render = @import("render");
-const assets = @import("assets");
-const geometry = @import("geo"); // Martinez boolean; `geo` is a common param name here
+const style = @import("style");
+const geometry = @import("geometry"); // Martinez boolean; `geo` is a common param name here
 const rs = render.surface;
 
 /// The banded multi-cell ENC_ROOT -> PMTiles baker (folded in: it is the
 /// batch driver of this engine). Re-exported for the CLI + lib root.
 pub const bake_enc = @import("bake_enc.zig");
+pub const coverage = @import("coverage"); // per-cell coverage sidecar (in PMTiles metadata)
+const symins = @import("symins.zig"); // SYMINS02 native fallback (NEWOBJ producer draw ops)
 
-/// SCAMIN standalone (specs/scamin-standalone.md): cross-cell point-object
-/// matching + SCAMIN union + scale-window eligibility for the *_scamin point/
-/// text layers. Shared by the bake pre-pass and the live per-tile dedup.
-/// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile (optional).
+// Light-sector reach (scene/lightreach.zig), re-exported so chart + bake_enc keep
+// reaching it through the scene module.
+const lightreach = @import("lightreach.zig");
+pub const LightReach = lightreach.LightReach;
+pub const collectLightReach = lightreach.collectLightReach;
+pub const lightReachTiles = lightreach.lightReachTiles;
+pub const LIGHT_AUG_REACH_TILES = lightreach.LIGHT_AUG_REACH_TILES;
+
+// Complex-linestyle tessellation + registry (scene/linestyle.zig). Exposed so
+// chart + bundle register and look up styles through `scene.linestyle`.
+pub const linestyle = @import("linestyle.zig");
+
+// Baked-tile replay (scene/replay.zig): a decoded tile -> Surface draw calls.
+const replay = @import("replay.zig");
+pub const replayTile = replay.replayTile;
+
+/// Output tile encoding: classic Mapbox Vector Tile, or MapLibre Tile.
 pub const TileFormat = enum { mvt, mlt };
-const s101 = @import("s100").s101_instr;
-const catalogue = @import("s100").catalogue;
-const s101_adapt = @import("s100").s101_adapt;
+const instructions = @import("s101").instructions;
+const catalogue = @import("s101").catalogue;
+const adapter = @import("s101").adapter;
 
 // S-52 symbol scale the Go baker emits for every point symbol / sounding. The
 // style's icon-size = scale / ATLAS_PPU (0.08), so this renders symbols at
@@ -40,140 +60,9 @@ const SYMBOL_SCALE: f64 = @import("render").sndfrm.SYMBOL_SCALE;
 // so the generated style can show soundings in feet when the mariner picks that unit —
 // a recreational-chartplotter convenience, not ECDIS behaviour. The feet value runs
 // through the same SNDFRM04 glyph composition as metres, so it keeps one decimal place
-// for shallow soundings (the depth-contour feet label, chartstyle.contourLabelField,
+// for shallow soundings (the depth-contour feet label, mariner.contourLabelField,
 // rounds to whole feet — contour valdco values are whole metres).
 const M_TO_FT: f64 = @import("render").sndfrm.M_TO_FT;
-
-// Worst-case reach of a light's sector legs/arcs (emitAugFigures) as a fraction of a
-// tile — these are drawn at a fixed DISPLAY size (radius/length in mm), so the reach
-// is ~constant in tile units at every zoom (offset_tiles = mm * PX_PER_MM / 256).
-// Used to widen the LIGHTS spatial-cull margin so an arc isn't dropped on the tiles it
-// crosses (S-52 legs ~25 mm / arcs ~20 mm ≈ 0.8 tile; 1.0 leaves headroom).
-// GROUND-length legs (directional lights: nmi2metres(nominal range), LightSectored.lua)
-// exceed this by far at fine zooms — lightReachTiles is the honest per-zoom bound.
-pub const LIGHT_AUG_REACH_TILES: f64 = 1.0;
-
-/// How far a cell's constructed sector figures (emitAugFigures) can reach beyond
-/// their feature anchors, summarised per cell so tile addressing (bake_enc
-/// buildTileMap / the live tileRefs) can include the cell in neighbouring tiles
-/// its raw bbox never touches — otherwise legs/arcs clip exactly at the boundary.
-pub const LightReach = struct {
-    /// Union bbox [w,s,e,n] of the aug-figure-bearing features' anchors (feature
-    /// nodes + explicit AugmentedPoint anchors); null = no sector figures at all.
-    bbox: ?[4]f64 = null,
-    /// Max ground-distance leg length in metres (AugmentedRay with a GeographicCRS
-    /// length — directional-light legs); 0 = display-mm figures only.
-    range_m: f64 = 0,
-};
-
-/// Worst-case tile-unit reach of sector figures at zoom z, latitude `lat`:
-/// display-mm figures reach a ~constant LIGHT_AUG_REACH_TILES, ground-length legs
-/// reach range_m metres = range_m·2^z/(cosφ·C) tiles (the emitAugFigures
-/// projection: len_px = range_m/(cosφ·EARTH_CIRCUM_M)·worldPx). Never below the
-/// mm bound — a cell with figures always reaches at least the display-sized ones.
-pub fn lightReachTiles(range_m: f64, z: u8, lat: f64) f64 {
-    if (range_m <= 0) return LIGHT_AUG_REACH_TILES;
-    const cos_lat = @max(@cos(lat * std.math.pi / 180.0), 1e-6);
-    const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
-    return @max(LIGHT_AUG_REACH_TILES, range_m * scale / (cos_lat * EARTH_CIRCUM_M));
-}
-
-// The nth comma-separated field of an instruction argument ("" past the end).
-fn instrCsv(s: []const u8, n: usize) []const u8 {
-    var it = std.mem.splitScalar(u8, s, ',');
-    var i: usize = 0;
-    while (it.next()) |part| : (i += 1) if (i == n) return std.mem.trim(u8, part, " ");
-    return "";
-}
-
-// Fold one aug-figure-bearing feature's anchors + ground length into `r`:
-// the feature node plus any explicit AugmentedPoint anchors in the stream.
-fn foldLightReach(r: *LightReach, cell: *const s57.Cell, f: s57.Feature, stream: []const u8) void {
-    var b: [4]f64 = if (r.bbox) |bb| bb else .{ 1e9, 1e9, -1e9, -1e9 };
-    if (cell.pointGeometry(f)) |pg| {
-        b[0] = @min(b[0], pg.lon());
-        b[1] = @min(b[1], pg.lat());
-        b[2] = @max(b[2], pg.lon());
-        b[3] = @max(b[3], pg.lat());
-    }
-    var it = std.mem.splitScalar(u8, stream, ';');
-    while (it.next()) |item| {
-        const colon = std.mem.indexOfScalar(u8, item, ':') orelse continue;
-        const key = item[0..colon];
-        const val = item[colon + 1 ..];
-        if (std.mem.eql(u8, key, "AugmentedRay")) {
-            // "AugmentedRay:<bearingCRS>,<bearing>,<lenCRS>,<len>" — a GeographicCRS
-            // length is ground metres (the directional-light leg); else display mm.
-            if (std.mem.eql(u8, instrCsv(val, 2), "GeographicCRS")) {
-                const len = std.fmt.parseFloat(f64, instrCsv(val, 3)) catch 0;
-                r.range_m = @max(r.range_m, len);
-            }
-        } else if (std.mem.eql(u8, key, "AugmentedPoint")) {
-            // "AugmentedPoint:<CRS>,<lon>,<lat>" — an explicit figure anchor.
-            const lon = std.fmt.parseFloat(f64, instrCsv(val, 1)) catch continue;
-            const lat = std.fmt.parseFloat(f64, instrCsv(val, 2)) catch continue;
-            b[0] = @min(b[0], lon);
-            b[1] = @min(b[1], lat);
-            b[2] = @max(b[2], lon);
-            b[3] = @max(b[3], lat);
-        }
-    }
-    if (b[0] <= b[2]) r.bbox = b;
-}
-
-/// EXACT per-cell sector-figure reach, from the portrayal instruction streams:
-/// a feature constructs figures iff its stream carries AugmentedRay/ArcByRadius
-/// (LightSectored legs/arcs), so this can't drift from what emitAugFigures will
-/// actually draw (including context-parameter effects like FullLightLines).
-/// Only prim==1 features can emit figures (processFeatureParsed). Allocation-free.
-pub fn collectLightReach(cell: *const s57.Cell, portrayal: ?[]const ?[]const u8) LightReach {
-    var r = LightReach{};
-    const streams = portrayal orelse return r;
-    for (cell.features, 0..) |f, fi| {
-        if (f.prim != 1 or fi >= streams.len) continue;
-        const stream = streams[fi] orelse continue;
-        if (std.mem.indexOf(u8, stream, "AugmentedRay:") == null and
-            std.mem.indexOf(u8, stream, "ArcByRadius:") == null) continue;
-        foldLightReach(&r, cell, f, stream);
-    }
-    return r;
-}
-
-/// CONSERVATIVE per-cell sector-figure reach from the raw S-57 attributes, for
-/// paths that have a parsed cell but no portrayal yet (the bundle baker's
-/// pre-pass super-tile index + planned-tile estimate). Must be a SUPERSET of
-/// collectLightReach under the default portrayal context: any LIGHTS point is a
-/// figure candidate (sector legs/arcs, all-round major-light rings), and a
-/// directional light (CATLIT 1 + ORIENT) draws a nmi2metres(VALNMR || 9) ground
-/// leg (LightSectored.lua). A non-default FullLightLines context could still
-/// exceed this for plain sectored lights — the bake default keeps it off.
-pub fn scanLightReachAttrs(cell: *const s57.Cell) LightReach {
-    var r = LightReach{};
-    for (cell.features) |f| {
-        if (f.objl != 75 or f.prim != 1) continue; // LIGHTS points only
-        var b: [4]f64 = if (r.bbox) |bb| bb else .{ 1e9, 1e9, -1e9, -1e9 };
-        const pg = cell.pointGeometry(f) orelse continue;
-        b[0] = @min(b[0], pg.lon());
-        b[1] = @min(b[1], pg.lat());
-        b[2] = @max(b[2], pg.lon());
-        b[3] = @max(b[3], pg.lat());
-        r.bbox = b;
-        // Directional (CATLIT list contains 1) with an orientation: the rule
-        // always draws the full nominal-range ground leg.
-        const catlit = f.attr(s57.ATTR_CATLIT) orelse "";
-        var directional = false;
-        var it = std.mem.splitScalar(u8, catlit, ',');
-        while (it.next()) |v| {
-            if (std.mem.eql(u8, std.mem.trim(u8, v, " "), "1")) directional = true;
-        }
-        const orient: []const u8 = f.attr(s57.ATTR_ORIENT) orelse "";
-        if (directional and orient.len > 0) {
-            const nmi = f.attrFloat(s57.ATTR_VALNMR) orelse 9.0;
-            r.range_m = @max(r.range_m, nmi * 1852.0);
-        }
-    }
-    return r;
-}
 
 // S-57 attribute code for SCAMIN (the minimum display scale 1:N, S-57 Appendix A
 // attr 133 / S-52 §8.4). Features carrying it are routed to a dedicated *_scamin
@@ -216,7 +105,7 @@ fn quaposSolidClass(objl: u16) bool {
 }
 
 /// True if the S-57 comma-separated list value `csv` contains any of `targets`.
-/// (Mirrors s101_adapt.hasListVal; S-57 list attributes are comma-joined.)
+/// (Mirrors adapter.hasListVal; S-57 list attributes are comma-joined.)
 fn listHasAny(csv: []const u8, targets: []const i64) bool {
     var it = std.mem.splitScalar(u8, csv, ',');
     while (it.next()) |p| {
@@ -315,7 +204,7 @@ fn clipSimplifyPoly(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]con
     return if (ring.len >= 3) ring else clipped[0..0];
 }
 
-// Coverage-clipped best-available composite (specs/cross-band-composition-redesign.md):
+// Coverage-clipped best-available composite:
 // subtract the finer-scale coverage `clip` (already projected + box-clipped into this
 // tile's i32 space, a clean union) from a coarser cell's box-clipped area rings, so a
 // feature is emitted by exactly one cell — the finest whose M_COVR covers it. Replaces
@@ -440,112 +329,6 @@ fn coveredByFiner(cover_clip: []const []const mvt.Point, lon: f64, lat: f64, z: 
 }
 
 // Clip a line + simplify each kept run (drop runs that collapse below 2 vertices).
-fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]const []const mvt.Point {
-    const sub = try tile.clipLine(a, proj, box);
-    var out = std.ArrayList([]const mvt.Point).empty;
-    for (sub) |run| {
-        const s = try tile.simplifyRing(a, run);
-        if (s.len >= 2) try out.append(a, s);
-    }
-    return out.items;
-}
-
-/// Shoelace signed area (x2) of a ring in tile space; only its sign is used.
-/// y is down, so a positive value is a clockwise (exterior) ring per the MVT spec.
-fn ringSignedArea(ring: []const mvt.Point) i64 {
-    if (ring.len < 3) return 0;
-    var area: i64 = 0;
-    var j: usize = ring.len - 1;
-    for (ring, 0..) |p, i| {
-        const q = ring[j];
-        area += @as(i64, q.x) * @as(i64, p.y) - @as(i64, p.x) * @as(i64, q.y);
-        j = i;
-    }
-    return area;
-}
-
-/// Even-odd ray test: is tile-space point `pt` inside `ring`?
-fn ringContains(ring: []const mvt.Point, pt: mvt.Point) bool {
-    if (ring.len < 3) return false;
-    var inside = false;
-    const px: f64 = @floatFromInt(pt.x);
-    const py: f64 = @floatFromInt(pt.y);
-    var j: usize = ring.len - 1;
-    for (ring, 0..) |p, i| {
-        const q = ring[j];
-        const ax: f64 = @floatFromInt(p.x);
-        const ay: f64 = @floatFromInt(p.y);
-        const bx: f64 = @floatFromInt(q.x);
-        const by: f64 = @floatFromInt(q.y);
-        if ((ay > py) != (by > py) and
-            px < (bx - ax) * (py - ay) / (by - ay) + ax)
-        {
-            inside = !inside;
-        }
-        j = i;
-    }
-    return inside;
-}
-
-/// Orient + order a feature's clipped area rings into MVT multipolygon parts so
-/// holes are SUBTRACTED instead of filled (e.g. an island inside a sea/depth
-/// area). Mirrors the Go reference encodePolygon: classify each ring by geometric
-/// nesting depth (even = exterior, odd = hole), force exteriors to a positive
-/// signed area (clockwise in y-down tile space) and holes to negative, and emit
-/// each exterior immediately followed by the holes it directly contains. This is
-/// independent of the FSPT USAG tags, and keeps disjoint multi-part areas
-/// (multiple exteriors) working as a proper multipolygon. `rings` are the clipped
-/// rings (open, >= 3 pts); returned parts may reverse a ring into a fresh copy.
-fn orientAreaRings(a: Allocator, rings: []const []const mvt.Point) ![]const []const mvt.Point {
-    const n = rings.len;
-    const depth = try a.alloc(usize, n);
-    for (rings, 0..) |ri, i| {
-        var d: usize = 0;
-        for (rings, 0..) |rj, j| {
-            if (i != j and ringContains(rj, ri[0])) d += 1;
-        }
-        depth[i] = d;
-    }
-
-    const done = try a.alloc(bool, n);
-    @memset(done, false);
-    var out = std.ArrayList([]const mvt.Point).empty;
-
-    const emit = struct {
-        fn one(al: Allocator, list: *std.ArrayList([]const mvt.Point), ring: []const mvt.Point, d: usize) !void {
-            const want_pos = (d % 2) == 0; // even depth = exterior (positive), odd = hole
-            if ((ringSignedArea(ring) >= 0) == want_pos) {
-                try list.append(al, ring);
-            } else {
-                const rev = try al.alloc(mvt.Point, ring.len);
-                for (ring, 0..) |p, k| rev[ring.len - 1 - k] = p;
-                try list.append(al, rev);
-            }
-        }
-    }.one;
-
-    // Each exterior (even depth) followed by the holes it directly contains, so a
-    // decoder attaches each hole to the right exterior (depth exactly +1, inside).
-    for (0..n) |i| {
-        if (done[i] or depth[i] % 2 != 0) continue;
-        done[i] = true;
-        try emit(a, &out, rings[i], depth[i]);
-        for (0..n) |k| {
-            if (done[k] or depth[k] != depth[i] + 1) continue;
-            if (ringContains(rings[i], rings[k][0])) {
-                done[k] = true;
-                try emit(a, &out, rings[k], depth[k]);
-            }
-        }
-    }
-    // Safety net: emit anything not placed (malformed nesting) on its own.
-    for (0..n) |i| {
-        if (done[i]) continue;
-        done[i] = true;
-        try emit(a, &out, rings[i], depth[i]);
-    }
-    return out.items;
-}
 
 fn geomBounds(g: []const s57.LonLat) [4]f64 {
     var b = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
@@ -599,7 +382,7 @@ pub const CellOpts = struct {
     /// and emitted as the AP(OVERSC01) overscale hatch's gate (hatch shows while
     /// the display denominator is FINER/smaller than oscl). See emitOverscaleHatch.
     oscl: i64 = 0,
-    /// Scale-boundary overscale (specs/overscale.md, S-52 §10.1.10.2): emit this
+    /// Scale-boundary overscale (S-52 §10.1.10.2): emit this
     /// cell's AP(OVERSC01) coverage hatch into the tile. Set only when BOTH (a) a
     /// strictly-finer-CSCL cell also contributes to the SAME tile — a scale
     /// boundary exists (else whole-view overscale, the HUD "overscale ×n" readout's
@@ -650,7 +433,7 @@ pub const TileSurface = struct {
     texts: std.ArrayList(mvt.Feature) = .empty,
     // SCAMIN buckets: a feature carrying SCAMIN (s57 attr 133) routes here instead
     // of the base list, and carries a `scamin` property so the style gates its
-    // display below the feature's 1:N scale (see ATTR_SCAMIN / assets/style.zig).
+    // display below the feature's 1:N scale (see ATTR_SCAMIN / style/maplibre.zig).
     areas_scamin: std.ArrayList(mvt.Feature) = .empty,
     area_patterns_scamin: std.ArrayList(mvt.Feature) = .empty,
     lines_scamin: std.ArrayList(mvt.Feature) = .empty,
@@ -676,7 +459,6 @@ pub const TileSurface = struct {
         .endScene = endScene,
         // Bake path: store complex runs un-tessellated (no size_scale set — bake is
         // native; replay re-walks the period display-scaled).
-        .store_complex_run = storeComplexRun,
     };
 
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
@@ -722,6 +504,7 @@ pub const TileSurface = struct {
             .s57 = meta.s57_json,
             .cell = meta.cell_name,
             .band = meta.band,
+            .masked = meta.masked,
             .date_start = meta.date_start,
             .date_end = meta.date_end,
             .bnd = meta.bnd,
@@ -740,7 +523,7 @@ pub const TileSurface = struct {
         // The cell's quantized compilation scale: the style's overscale machinery
         // splits area fills into a below-the-hatch (overscaled) and an above-the-
         // hatch (at-scale) pass on this tag — so a finer cell's opaque fill
-        // occludes a coarser cell's OVERSC01 hatch (specs/overscale.md).
+        // occludes a coarser cell's OVERSC01 hatch.
         if (s.cur.oscl > 0) try props.append(s.a, .{ .key = "oscl", .value = .{ .int = s.cur.oscl } });
         try appendMeta(s.a, &props, s.cur);
         try s.areasL().append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
@@ -770,22 +553,6 @@ pub const TileSurface = struct {
         if (valdco) |v| try props.append(s.a, .{ .key = "valdco", .value = .{ .double = v } });
         try appendMeta(s.a, &props, s.cur);
         try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = lines, .properties = props.items });
-    }
-
-    /// Store one clipped complex-linestyle run un-tessellated (display-independent
-    /// bake): a `lines` feature tagged with `ls_style`/`ls_arc0` so replayTile
-    /// re-looks-up the LsInfo and re-walks the period display-scaled at render time.
-    fn storeComplexRun(ctx: *anyopaque, style: []const u8, color: rs.ColorToken, width_px: f64, arc0: f64, run: []const rs.TilePoint) anyerror!void {
-        const s = sp(ctx);
-        var props = std.ArrayList(mvt.Prop).empty;
-        try props.append(s.a, .{ .key = "color_token", .value = .{ .string = color } });
-        try props.append(s.a, .{ .key = "width_px", .value = .{ .double = width_px } });
-        try props.append(s.a, .{ .key = "ls_style", .value = .{ .string = style } });
-        try props.append(s.a, .{ .key = "ls_arc0", .value = .{ .double = arc0 } });
-        try appendMeta(s.a, &props, s.cur);
-        const parts = try s.a.alloc([]const mvt.Point, 1);
-        parts[0] = run;
-        try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -833,10 +600,10 @@ pub const TileSurface = struct {
         try s.soundings.append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 
-    fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
+    fn drawText(ctx: *anyopaque, text: []const u8, text_style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
-        try appendTextProps(s.a, &props, text, style); // text already shortened by engine
+        try appendTextProps(s.a, &props, text, text_style); // text already shortened by engine
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
         const single = try s.a.alloc(mvt.Point, 1);
@@ -934,24 +701,23 @@ test "hasAdditionalInfo: INFORM/TXTDSC trigger; blank/absent/other don't" {
     try std.testing.expect(!hasAdditionalInfo(.{ .rcnm = 100, .rcid = 5, .prim = 1, .objl = 75, .attrs = &.{.{ .code = inform, .value = "  \t " }} }));
 }
 
-/// The vector layers this engine emits, in emit order — the source-layer ids the
-/// generated MapLibre style reads. v2 tile schema (tile57/2): 6 layers, one per
-/// render family. Each former `_scamin` twin is folded into its base at emit time
-/// (endScene) — SCAMIN is now a per-feature `scamin` property the style gates, not a
-/// separate layer — and complex/sector lines fold into `lines`. Static: an archive
-/// may omit empties, but the TileJSON advertises the full set. Keep in sync with the
-/// layer appends in endScene.
-pub const VECTOR_LAYERS = [_][]const u8{
-    "areas", "area_patterns", "lines", "point_symbols", "soundings", "text",
-};
+/// The vector layers this engine emits, in emit order — the tile57/2 source-layer
+/// set. Defined in tiles.mvt (shared with the compositor) and re-exported here;
+/// keep the layer appends in endScene in sync with it.
+pub const VECTOR_LAYERS = mvt.VECTOR_LAYERS;
 
 /// PMTiles archive metadata JSON: the static vector_layers list MapLibre reads from
 /// the TileJSON, plus a "scamin" array of the distinct SCAMIN denominators present
 /// (ascending) so the client builds one native-minzoom bucket layer per value at
-/// load (host-canonical-backend.md §2) instead of probing tiles. Mirrors the Go
-/// pmtiles.Builder.metadata (vector_layers + scamin splice). `scamin` empty -> omit
-/// the field. Caller owns the returned bytes (allocated in `a`).
-pub fn metadataJson(a: Allocator, scamin: []const u32) ![]const u8 {
+/// load instead of probing tiles. Mirrors the Go pmtiles.Builder.metadata
+/// (vector_layers + scamin splice). `scamin` empty -> omit the field. `coverage_json`,
+/// when non-null, is a per-cell coverage object (see `coverage.encodeJson`) spliced
+/// under a "coverage" key — a single-cell composite bake carries its own M_COVR there.
+/// `light_reach_json` (see `coverage.encodeLightReachJson`), when non-null, is the
+/// cell's sector-figure reach summary spliced under a "light_reach" key so the
+/// compositor can widen its tile addressing without re-portraying the cell.
+/// Caller owns the returned bytes (allocated in `a`).
+pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u8, light_reach_json: ?[]const u8) ![]const u8 {
     var b = std.ArrayList(u8).empty;
     try b.appendSlice(a, "{\"name\":\"chartplotter\",\"format\":\"pbf\",\"vector_layers\":[");
     for (VECTOR_LAYERS, 0..) |name, i| {
@@ -969,6 +735,14 @@ pub fn metadataJson(a: Allocator, scamin: []const u32) ![]const u8 {
             try b.appendSlice(a, std.fmt.bufPrint(&nbuf, "{d}", .{v}) catch unreachable);
         }
         try b.append(a, ']');
+    }
+    if (coverage_json) |cj| {
+        try b.appendSlice(a, ",\"coverage\":");
+        try b.appendSlice(a, cj);
+    }
+    if (light_reach_json) |lj| {
+        try b.appendSlice(a, ",\"light_reach\":");
+        try b.appendSlice(a, lj);
     }
     try b.append(a, '}');
     return b.toOwnedSlice(a);
@@ -995,6 +769,7 @@ const Meta = struct {
     // (unknown cell name, or pick attributes disabled). From s57.Cell.name.
     cell: []const u8 = "",
     band: u8 = 0, // NOAA band rank (0 finest … 5 coarsest)
+    masked: bool = false, // S-52 §8.6.2 suppressed boundary piece (meta-bounds view only)
     date_start: []const u8 = "",
     date_end: []const u8 = "",
     // S-52 boundary symbolization (§8.6.1) and point-symbol style (§11.2.2) tags
@@ -1014,31 +789,6 @@ const Meta = struct {
 // modifier, or 12 by default), halign/valign (the resolved TextAlign values the
 // style's TEXT_ANCHOR keys on), and the §14.5 text group. Halo + offset are
 // separate findings (still on the OpText halo / LocalOffset rows).
-/// Case-insensitive last occurrence of `needle` in `haystack`.
-fn lastIndexOfCI(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or needle.len > haystack.len) return null;
-    var i: usize = haystack.len - needle.len + 1;
-    while (i > 0) {
-        i -= 1;
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
-
-/// Reduce a buoy/lighted-buoy name label to its chart designation. The S-101 buoy
-/// rules tag the feature "by <OBJNAM>" (EncodeString 'by %s'); NOAA OBJNAM is the full
-/// descriptive name ("Chesapeake Channel Lighted Buoy 78A") but a chart shows only the
-/// trailing designation ("78A"), which also de-clutters a channel of buoys whose long
-/// prefix repeats. The "by " prefix marks these name labels; all other text (depth
-/// labels, light elevations, …) has no such prefix and passes through unchanged. The
-/// designation is whatever follows the LAST buoy/beacon type-word; "Light"/"Lt" are
-/// deliberately excluded so a named light keeps its name, and a name with no type-word
-/// keeps its stripped form (e.g. a bare "22").
-///
-/// An extracted designation is QUOTED ("78A") like the paper chart: an aid's
-/// designation in quotes cannot be misread as a sounding or a depth — the
-/// chart convention exists for exactly that reason. Unshortened text passes
-/// through borrowed; a quoted designation allocates from `a`.
 // SBDARE nature-of-surface labels arrive from the (pristine, vendored) S-101
 // rule as INT1 abbreviations ("S", "M", "Cy" …, space-joined for multiple
 // surfaces). A screen has no chart-margin legend to decode them against, so
@@ -1076,40 +826,30 @@ fn expandSeabedText(a: Allocator, class: []const u8, text: []const u8) ![]const 
     return out.toOwnedSlice(a);
 }
 
-fn shortenName(a: Allocator, text: []const u8) ![]const u8 {
-    // "by " = buoy names, "bn " = beacon names (EncodeString prefixes in the
-    // buoy/beacon rules); both reduce to the designation.
-    const tagged = std.mem.startsWith(u8, text, "by ") or std.mem.startsWith(u8, text, "bn ");
-    if (!tagged) return text;
-    const name = std.mem.trim(u8, text[3..], " ");
-    const keywords = [_][]const u8{ "Daybeacon", "Daymark", "Buoy", "Beacon" };
-    var best_end: ?usize = null;
-    for (keywords) |kw| {
-        if (lastIndexOfCI(name, kw)) |idx| {
-            const end = idx + kw.len;
-            if (best_end == null or end > best_end.?) best_end = end;
-        }
-    }
-    if (best_end) |end| {
-        const rest = std.mem.trim(u8, name[end..], " ");
-        if (rest.len > 0) return std.fmt.allocPrint(a, "\"{s}\"", .{rest});
-    }
-    return name;
+/// Strip the "by "/"bn " aid-name tag the S-101 buoy/beacon rules add (EncodeString
+/// 'by %s' / 'bn %s') and show the FULL name. Previously this reduced the name to its
+/// trailing chart designation ("Chesapeake Channel Lighted Buoy 78A" -> "78A"); that
+/// shortening was removed so aid names read in full. Untagged text (depth labels, light
+/// elevations, place names) passes through unchanged. Returns a borrowed slice.
+fn stripNameTag(text: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, text, "by ") or std.mem.startsWith(u8, text, "bn "))
+        return std.mem.trim(u8, text[3..], " ");
+    return text;
 }
 
 /// Serialize a text label's props in the tile schema order. `text` arrives already
 /// shortened/resolved by the engine. A minimal label (empty halign — see
 /// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
-fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, style: *const rs.TextStyle) !void {
+fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, text_style: *const rs.TextStyle) !void {
     // Resolved body size: the FontSize modifier px, or 12 (oracle default). Drives
     // both the emitted font_size_px and the halo gate below.
-    const font_px: f64 = if (style.font_size > 0) style.font_size else 12;
+    const font_px: f64 = if (text_style.font_size > 0) text_style.font_size else 12;
     try props.append(a, .{ .key = "text", .value = .{ .string = text } });
-    try props.append(a, .{ .key = "color_token", .value = .{ .string = style.color } });
+    try props.append(a, .{ .key = "color_token", .value = .{ .string = text_style.color } });
     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = font_px } });
-    if (style.halign.len == 0) return; // minimal label: no alignment/halo/group spec
-    try props.append(a, .{ .key = "halign", .value = .{ .string = style.halign } });
-    try props.append(a, .{ .key = "valign", .value = .{ .string = style.valign } });
+    if (text_style.halign.len == 0) return; // minimal label: no alignment/halo/group spec
+    try props.append(a, .{ .key = "halign", .value = .{ .string = text_style.halign } });
+    try props.append(a, .{ .key = "valign", .value = .{ .string = text_style.valign } });
     // S-101 LocalOffset -> label-offset key in text-body units (3.51 mm = one text
     // body height = 1 em): the style's text-offset match keys on "ux,uy" to shift a
     // name clear of its symbol (PortrayFeatureName emits 0,-3.51 = one body up).
@@ -1117,21 +857,21 @@ fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const 
     // right / +y down, which matches MapLibre's text-offset.
     {
         const TEXT_BODY_MM = 3.51;
-        const ux: i64 = @intFromFloat(@round(style.offset_x / TEXT_BODY_MM));
-        const uy: i64 = @intFromFloat(@round(style.offset_y / TEXT_BODY_MM));
+        const ux: i64 = @intFromFloat(@round(text_style.offset_x / TEXT_BODY_MM));
+        const uy: i64 = @intFromFloat(@round(text_style.offset_y / TEXT_BODY_MM));
         if (ux != 0 or uy != 0)
             try props.append(a, .{ .key = "loff", .value = .{ .string = try std.fmt.allocPrint(a, "{d},{d}", .{ ux, uy }) } });
     }
     // §10 text halo: the oracle attaches a CHWHT, 1px halo to text >= 10 px
     // (s101emit.go:130-133) and emits it as halo_color_token / halo_width tile
     // properties (bake.go:1147-1148); smaller text gets no halo ("" / 0). Our served
-    // style still renders text solid (no halo) by deliberate S-52 choice (style.zig
+    // style still renders text solid (no halo) by deliberate S-52 choice (maplibre.zig
     // textPaint passes halo_width 0) — these are tile-parity properties for a client
     // that wants the legibility halo.
     const haloed = font_px >= 10;
     try props.append(a, .{ .key = "halo_color_token", .value = .{ .string = if (haloed) "CHWHT" else "" } });
     try props.append(a, .{ .key = "halo_width", .value = .{ .double = if (haloed) 1 else 0 } });
-    try props.append(a, .{ .key = "tgrp", .value = .{ .int = style.group } });
+    try props.append(a, .{ .key = "tgrp", .value = .{ .int = text_style.group } });
 }
 
 /// JSON-escape `s` (surrounding quotes included) into `buf`: escapes ", \, and the
@@ -1226,6 +966,9 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     // unvarying feature's tile footprint unchanged.
     if (m.bnd != 2) try props.append(a, .{ .key = "bnd", .value = .{ .int = m.bnd } });
     if (m.pts != 2) try props.append(a, .{ .key = "pts", .value = .{ .int = m.pts } });
+    // §8.6.2-suppressed boundary piece — present only on the meta-bounds extras,
+    // so every normally-drawn feature's tile footprint is unchanged.
+    if (m.masked) try props.append(a, .{ .key = "masked", .value = .{ .int = 1 } });
     // Date-dependent display (S-52 §10.4.1.1): recurring iff a "--" month-day prefix,
     // stripped so the client compares MMDD (recurring) / YYYYMMDD (fixed).
     if (m.date_start.len > 0 or m.date_end.len > 0) {
@@ -1330,10 +1073,15 @@ pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, stre
     var tmp = std.heap.ArenaAllocator.init(a);
     defer tmp.deinit();
     for (cell.features, 0..) |f, i| {
-        if (f.prim != 2 and f.prim != 3) continue;
+        // Polylabel (areaRepresentativePoint) is AREA-only — lines anchor at their mid-vertex.
+        // Cache every portrayed area: labelPoint is consulted not just for Text/PointInstruction
+        // labels but also for the native INFORM01/QUESMRK1 centred markers (which carry no such
+        // instruction), so the earlier Text/Point-only gate left those recomputing per tile —
+        // the dominant cost on large coarse cells. Byte-identical: labelPoint returns the same
+        // point cached or live.
+        if (f.prim != 3) continue;
         if (i >= ss.len) break;
-        const s = ss[i] orelse continue;
-        if (std.mem.indexOf(u8, s, "TextInstruction") == null and std.mem.indexOf(u8, s, "PointInstruction") == null) continue;
+        _ = ss[i] orelse continue; // portrayed at all (an unportrayed area never reaches labelPoint)
         const parts = featureParts(tmp.allocator(), cell.*, geo, i, f) catch continue;
         out[i] = s57.areaRepresentativePoint(tmp.allocator(), parts);
         _ = tmp.reset(.retain_capacity);
@@ -1489,11 +1237,11 @@ fn variantDiffers(base: []const u8, variant: ?[]const u8) bool {
 /// processFeatureParsed, splitting into two passes only when a variant differs
 /// (S-52 boundary §8.6.1 / point-symbol §11.2.2 axes -> the bnd/pts tags).
 fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
-    const base = try s101.parse(a, instr);
+    const base = try instructions.parse(a, instr);
     if (f.prim == 1) {
         if (variantDiffers(instr, simplified)) {
             try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 0, z, x, y, tb, box, opts, surf);
-            const sp2 = try s101.parse(a, simplified.?);
+            const sp2 = try instructions.parse(a, simplified.?);
             try processFeatureParsed(a, cell, f, fi, geo, geo_world, sp2, 2, 1, z, x, y, tb, box, opts, surf);
         } else {
             try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, opts, surf);
@@ -1502,7 +1250,7 @@ fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, 
     }
     if (f.prim == 3 and variantDiffers(instr, plain)) {
         try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 1, 2, z, x, y, tb, box, opts, surf);
-        const pl = try s101.parse(a, plain.?);
+        const pl = try instructions.parse(a, plain.?);
         try processFeatureParsed(a, cell, f, fi, geo, geo_world, pl, 0, 2, z, x, y, tb, box, opts, surf);
         return;
     }
@@ -1535,10 +1283,16 @@ fn bearingToScreen(deg: f64) [2]f64 {
 /// (bake_enc.bandZooms(.approach).min = 11). Partial sector arcs are unaffected.
 const RING_MIN_ZOOM: u8 = 11;
 
-fn emitAugFigures(a: Allocator, figs: []const s101.AugFigure, anchor: s57.LonLat, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, box: tile.Box, surf: rs.Surface) !void {
+fn emitAugFigures(a: Allocator, figs: []const instructions.AugFigure, anchor: s57.LonLat, fmeta: rs.FeatureMeta, z: u8, x: u32, y: u32, box: tile.Box, surf: rs.Surface) !void {
     if (figs.len == 0) return;
-    const world_px = 256.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
-    const pxmm = s101.PX_PER_MM;
+    // One tile renders as 512 CSS px (the engine's physical-scale model — style
+    // scaminGateK's M_PER_PX_Z0 is the 512-tile metres-per-CSS-px, and MapLibre
+    // lays vector tiles out at 512 logical px), so a display-mm length converts
+    // to a tile fraction against a 512·2^z world. The old 256-unit MVT world drew
+    // every figure at exactly 2x its catalogue size (20 mm sector arcs read
+    // 40 mm on the map). Ground-metre legs are a world-fraction ratio either way.
+    const world_px = 512.0 * @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z)));
+    const pxmm = instructions.PX_PER_MM;
     for (figs) |fig| {
         const alon = if (fig.has_anchor) fig.anchor_lon else anchor.lon();
         const alat = if (fig.has_anchor) fig.anchor_lat else anchor.lat();
@@ -1614,7 +1368,7 @@ fn appendDepthVals(a: Allocator, props: *std.ArrayList(mvt.Prop), f: s57.Feature
 /// every primitive with the pass's meta (draw_prio/cat/vg/scamin/bnd/pts + pick
 /// attrs). The engine work happens here — geometry assembly, projection, tile
 /// clipping/simplification, anchoring — so surfaces only ever see draw calls.
-fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: s101.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: instructions.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const scamin = effScamin(f, opts);
     const s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "";
     const cell_name = if (opts.pick_attrs) cell.name else "";
@@ -1677,7 +1431,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 try surf.endFeature();
             }
             for (p.texts) |t| {
-                const style = rs.TextStyle{
+                const ts = rs.TextStyle{
                     .color = t.color,
                     .font_size = t.font_size,
                     .halign = t.halign,
@@ -1687,7 +1441,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                     .group = t.group,
                 };
                 try surf.beginFeature(&fmeta);
-                try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, pt);
+                try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, pt);
                 try surf.endFeature();
             }
         }
@@ -1730,7 +1484,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         // Best-available: cut this cell's fill where a finer cell covers the ground.
         const arings = if (opts.cover_clip) |cc| subtractCoverage(a, rings.items, cc) else rings.items;
         if (arings.len > 0) {
-            const rparts = try orientAreaRings(a, arings);
+            const rparts = try mvt.orientAreaRings(a, arings);
             const dv = depthVals(f);
             const dr: ?rs.DepthRange = if (dv) |d| .{ .d1 = d[0], .d2 = d[1] } else null;
             const fillmeta = fmeta;
@@ -1776,7 +1530,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         var want_geo = false;
         var want_proj = false;
         if (!opts.suppress_lines) for (p.lines) |ln| {
-            if (!std.mem.eql(u8, ln.style, "solid") and g_linestyles.get(ln.style) != null) want_geo = true else want_proj = true;
+            if (!std.mem.eql(u8, ln.style, "solid") and linestyle.lookup(ln.style) != null) want_geo = true else want_proj = true;
         };
         if (want_geo) stroke_geo = clipGeoPartsOutsideCover(a, stroke_geo, cc, z, x, y);
         if (want_proj) stroke_proj = clipRunsOutsideCover(a, stroke_proj, cc);
@@ -1786,9 +1540,9 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
 
     if (!opts.suppress_lines) for (p.lines) |ln| {
         if (!std.mem.eql(u8, ln.style, "solid")) {
-            if (g_linestyles.get(ln.style)) |info| {
+            if (linestyle.lookup(ln.style)) |info| {
                 // Complex linestyle: tessellated dash runs + tangent-rotated symbols.
-                try emitComplexLine(a, stroke_geo, info, ln.style, ln.color, !opts.suppress_points, z, x, y, box, &fmeta, surf);
+                try linestyle.drawComplexLine(a, stroke_geo, info, ln.style, ln.color, !opts.suppress_points, z, x, y, box, &fmeta, surf);
                 continue;
             }
         }
@@ -1797,15 +1551,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         else
             "dashed";
         const dash: rs.Dash = if (std.mem.eql(u8, dash_str, "solid")) .solid else .dashed;
-        for (stroke_proj) |proj| {
-            const sub = try clipSimplifyLine(a, proj, box);
-            if (sub.len == 0) continue;
-            const seg_parts = try a.alloc([]const mvt.Point, sub.len);
-            for (sub, 0..) |seg, i| seg_parts[i] = seg;
-            try surf.beginFeature(&fmeta);
-            try surf.strokeLine(ln.color, ln.width, dash, seg_parts, valdco);
-            try surf.endFeature();
-        }
+        try linestyle.drawPlainLine(a, stroke_proj, ln.color, ln.width, dash, box, &fmeta, valdco, surf);
     };
 
     if (!opts.suppress_points and p.texts.len > 0) {
@@ -1813,7 +1559,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 for (p.texts) |t| {
-                    const style = rs.TextStyle{
+                    const ts = rs.TextStyle{
                         .color = t.color,
                         .font_size = t.font_size,
                         .halign = t.halign,
@@ -1823,7 +1569,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                         .group = t.group,
                     };
                     try surf.beginFeature(&fmeta);
-                    try surf.drawText(try expandSeabedText(a, fmeta.class, try shortenName(a, t.text)), &style, cpt);
+                    try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, cpt);
                     try surf.endFeature();
                 }
             }
@@ -1865,484 +1611,6 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     }
 }
 
-// === SYMINS02 native fallback (S-52 PresLib §13.2.18 / §10.3.3.8) ===========
-// Portray an S-57 NEWOBJ from its producer SYMINS attribute (code 192): a
-// ';'-separated list of S-52 draw ops — SY()/TX()/TE()/LS()/LC()/AC()/AP() —
-// rendered verbatim instead of the S-101 V-AIS alias the FeatureCatalogue maps
-// NEWOBJ to. This is how the S-52 PresLib "ECDIS Chart 1" labels/boundaries/fills
-// are drawn. Mirrors Go parseSYMINS (internal/engine/portrayal/symins.go).
-
-const SYMINS_ATTR: u16 = 192;
-
-fn syminsTrimQuotes(s: []const u8) []const u8 {
-    return std.mem.trim(u8, s, "'\"");
-}
-
-fn syminsArgAt(args: []const []const u8, i: usize) []const u8 {
-    return if (i < args.len) args[i] else "";
-}
-
-/// The S-57 attribute value referenced by acronym (e.g. "OBJNAM"), trimmed, or null
-/// when absent/blank. Mirrors Go lookupAttributeText over the feature's attrs.
-fn syminsFeatAttr(f: s57.Feature, acr: []const u8) ?[]const u8 {
-    for (f.attrs) |at| {
-        const a2 = catalogue.attrAcronym(at.code) orelse continue;
-        if (std.ascii.eqlIgnoreCase(a2, acr)) {
-            const v = std.mem.trim(u8, at.value, " ");
-            return if (v.len == 0) null else v;
-        }
-    }
-    return null;
-}
-
-/// Split a SYMINS string on ';', honouring quotes and nested parens (so a ';' inside
-/// TX('a;b',…) or between parens isn't a split). Returns slices into `s`.
-fn syminsSplitInstructions(a: Allocator, s: []const u8) ![]const []const u8 {
-    var out = std.ArrayList([]const u8).empty;
-    var depth: i32 = 0;
-    var in_quote = false;
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        switch (s[i]) {
-            '\'', '"' => in_quote = !in_quote,
-            '(' => if (!in_quote) {
-                depth += 1;
-            },
-            ')' => if (!in_quote) {
-                depth -= 1;
-            },
-            ';' => if (!in_quote and depth == 0) {
-                try out.append(a, s[start..i]);
-                start = i + 1;
-            },
-            else => {},
-        }
-    }
-    if (start < s.len) try out.append(a, s[start..]);
-    return out.items;
-}
-
-/// Split "OP(params)" into the op and inner params, or null when malformed.
-fn syminsSplitOp(instr0: []const u8) ?struct { op: []const u8, params: []const u8 } {
-    const instr = std.mem.trim(u8, instr0, " \t");
-    const open = std.mem.indexOfScalar(u8, instr, '(') orelse return null;
-    const close = std.mem.lastIndexOfScalar(u8, instr, ')') orelse return null;
-    if (open == 0 or close < open) return null;
-    return .{ .op = std.mem.trim(u8, instr[0..open], " \t"), .params = instr[open + 1 .. close] };
-}
-
-/// Split an instruction's params on ',', honouring quotes. Returns trimmed slices.
-fn syminsSplitArgs(a: Allocator, params: []const u8) ![]const []const u8 {
-    var out = std.ArrayList([]const u8).empty;
-    var in_quote = false;
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < params.len) : (i += 1) {
-        const c = params[i];
-        if (c == '\'' or c == '"') {
-            in_quote = !in_quote;
-        } else if (c == ',' and !in_quote) {
-            try out.append(a, std.mem.trim(u8, params[start..i], " \t"));
-            start = i + 1;
-        }
-    }
-    try out.append(a, std.mem.trim(u8, params[start..], " \t"));
-    return out.items;
-}
-
-/// printf-style format substitution for a SYMINS TE() instruction (S-52 §3.2.3.2):
-/// each %-spec consumes the next attribute name and formats its value (floats honour
-/// .precision; integer convs round; the '0' flag + width zero-pad). Mirrors Go
-/// formatSubstitute + appendConverted + zeroPad. Returns null when an attribute is
-/// missing (the whole label is then dropped, as in Go).
-fn syminsZeroPad(a: Allocator, out: *std.ArrayList(u8), s: []const u8, width: usize, flags: []const u8) !void {
-    const has0 = std.mem.indexOfScalar(u8, flags, '0') != null;
-    const has_minus = std.mem.indexOfScalar(u8, flags, '-') != null;
-    if (width <= s.len or !has0 or has_minus) {
-        try out.appendSlice(a, s);
-        return;
-    }
-    const pad = width - s.len;
-    const signed = s.len > 0 and (s[0] == '-' or s[0] == '+' or s[0] == ' ');
-    if (signed) try out.append(a, s[0]);
-    var k: usize = 0;
-    while (k < pad) : (k += 1) try out.append(a, '0');
-    try out.appendSlice(a, if (signed) s[1..] else s);
-}
-
-fn syminsAppendConverted(a: Allocator, out: *std.ArrayList(u8), val: []const u8, conv: u8, precision: i32, width: usize, flags: []const u8) !void {
-    var buf: [512]u8 = undefined;
-    var s: []const u8 = val;
-    switch (conv) {
-        'f', 'e', 'g' => {
-            if (std.fmt.parseFloat(f64, std.mem.trim(u8, val, " \t"))) |x| {
-                s = std.fmt.float.render(&buf, x, .{
-                    .mode = .decimal,
-                    .precision = if (precision >= 0) @as(usize, @intCast(precision)) else null,
-                }) catch val;
-            } else |_| {}
-        },
-        'd', 'i', 'u', 'x' => {
-            if (std.fmt.parseFloat(f64, std.mem.trim(u8, val, " \t"))) |x| {
-                const r: i64 = @intFromFloat(@round(x));
-                s = std.fmt.bufPrint(&buf, "{d}", .{r}) catch val;
-            } else |_| {}
-        },
-        else => {},
-    }
-    try syminsZeroPad(a, out, s, width, flags);
-}
-
-fn syminsFormatSubstitute(a: Allocator, f: s57.Feature, format: []const u8, names: []const []const u8) !?[]const u8 {
-    var out = std.ArrayList(u8).empty;
-    var attr_idx: usize = 0;
-    var i: usize = 0;
-    while (i < format.len) {
-        if (format[i] != '%' or i + 1 >= format.len) {
-            try out.append(a, format[i]);
-            i += 1;
-            continue;
-        }
-        if (format[i + 1] == '%') {
-            try out.append(a, '%');
-            i += 2;
-            continue;
-        }
-        var j = i + 1;
-        const flags_start = j;
-        while (j < format.len and std.mem.indexOfScalar(u8, "-+ #0", format[j]) != null) j += 1;
-        const flags = format[flags_start..j];
-        var width: usize = 0;
-        while (j < format.len and format[j] >= '0' and format[j] <= '9') : (j += 1) width = width * 10 + (format[j] - '0');
-        var precision: i32 = -1;
-        if (j < format.len and format[j] == '.') {
-            j += 1;
-            var p: i32 = 0;
-            while (j < format.len and format[j] >= '0' and format[j] <= '9') : (j += 1) p = p * 10 + @as(i32, format[j] - '0');
-            precision = p;
-        }
-        while (j < format.len and (format[j] == 'l' or format[j] == 'h' or format[j] == 'L')) j += 1;
-        if (j >= format.len) {
-            try out.appendSlice(a, format[i..]); // malformed trailing spec -> literal
-            break;
-        }
-        const conv = format[j];
-        switch (conv) {
-            's', 'c', 'd', 'i', 'u', 'x', 'f', 'e', 'g' => {
-                if (attr_idx >= names.len) return null;
-                const acr = names[attr_idx];
-                attr_idx += 1;
-                const val = syminsFeatAttr(f, acr) orelse return null;
-                try syminsAppendConverted(a, &out, val, conv, precision, width, flags);
-            },
-            else => try out.appendSlice(a, format[i .. j + 1]), // unknown conversion -> literal
-        }
-        i = j + 1;
-    }
-    return out.items;
-}
-
-/// Parse a SYMINS TX()/TE() instruction into a Text. The Text model carries the
-/// label string, colour and viewing group; the S-52 justification / offset / font /
-/// halo fields are dropped (tracked OpText findings), matching the current text path.
-fn syminsText(a: Allocator, f: s57.Feature, op: []const u8, params: []const u8) !?s101.Text {
-    const args = try syminsSplitArgs(a, params);
-    var text: []const u8 = "";
-    var color_idx: usize = undefined;
-    var display_idx: usize = undefined;
-    if (std.mem.eql(u8, op, "TE")) {
-        if (args.len < 10) return null;
-        var names = std.ArrayList([]const u8).empty;
-        var it = std.mem.splitScalar(u8, syminsTrimQuotes(args[1]), ',');
-        while (it.next()) |nm| {
-            const t = std.mem.trim(u8, nm, " \t");
-            if (t.len > 0) try names.append(a, t);
-        }
-        text = (try syminsFormatSubstitute(a, f, syminsTrimQuotes(args[0]), names.items)) orelse return null;
-        color_idx = 8;
-        display_idx = 9;
-    } else { // TX
-        if (args.len < 9) return null;
-        const raw = args[0];
-        if (raw.len > 0 and (raw[0] == '\'' or raw[0] == '"')) {
-            text = syminsTrimQuotes(raw); // literal
-        } else {
-            text = syminsFeatAttr(f, std.mem.trim(u8, raw, " \t")) orelse return null;
-        }
-        color_idx = 7;
-        display_idx = 8;
-    }
-    if (text.len == 0) return null;
-    var color = std.mem.trim(u8, syminsArgAt(args, color_idx), " \t");
-    if (color.len == 0) color = "CHBLK";
-    const group = std.fmt.parseInt(i64, std.mem.trim(u8, syminsArgAt(args, display_idx), " \t"), 10) catch 0;
-    return s101.Text{ .text = text, .color = color, .group = group };
-}
-
-/// Build an S-101 Portrayal from a NEWOBJ's SYMINS attribute, or null when there is
-/// no usable SYMINS (caller then falls back to the default new-object symbology).
-/// Geometry/anchoring/clipping is handled by processFeatureParsed exactly like a rule stream.
-fn buildSyminsPortrayal(a: Allocator, f: s57.Feature) !?s101.Portrayal {
-    const raw0 = f.attr(SYMINS_ATTR) orelse return null;
-    const raw = std.mem.trim(u8, raw0, " ");
-    if (raw.len == 0) return null;
-
-    var points = std.ArrayList(s101.Point).empty;
-    var texts = std.ArrayList(s101.Text).empty;
-    var lines = std.ArrayList(s101.Line).empty;
-    var patterns = std.ArrayList([]const u8).empty;
-    var fill_token: ?[]const u8 = null;
-
-    for (try syminsSplitInstructions(a, raw)) |instr| {
-        const opp = syminsSplitOp(instr) orelse continue;
-        if (std.mem.eql(u8, opp.op, "SY")) { // SY(NAME[,rot])
-            const args = try syminsSplitArgs(a, opp.params);
-            const name = std.mem.trim(u8, syminsArgAt(args, 0), " \t");
-            if (name.len == 0) continue;
-            const rot: f64 = if (args.len > 1) (std.fmt.parseFloat(f64, std.mem.trim(u8, args[1], " \t")) catch 0) else 0;
-            try points.append(a, .{ .symbol = name, .rotation = rot, .offset_x = 0, .offset_y = 0 });
-        } else if (std.mem.eql(u8, opp.op, "TX") or std.mem.eql(u8, opp.op, "TE")) {
-            if (try syminsText(a, f, opp.op, opp.params)) |t| try texts.append(a, t);
-        } else if (std.mem.eql(u8, opp.op, "LS")) { // LS(style,width,colour)
-            const args = try syminsSplitArgs(a, opp.params);
-            if (args.len < 3) continue;
-            var w = std.fmt.parseInt(i64, std.mem.trim(u8, args[1], " \t"), 10) catch 0;
-            if (w <= 0) w = 1;
-            const st = std.mem.trim(u8, args[0], " \t");
-            const dashed = std.ascii.eqlIgnoreCase(st, "DASH") or std.ascii.eqlIgnoreCase(st, "DOTT");
-            try lines.append(a, .{
-                .style = if (dashed) "dash" else "solid",
-                .width = @floatFromInt(w),
-                .color = std.mem.trim(u8, args[2], " \t"),
-            });
-        } else if (std.mem.eql(u8, opp.op, "LC")) { // LC(LINESTYLE) — approximated as dashed
-            const name = std.mem.trim(u8, syminsArgAt(try syminsSplitArgs(a, opp.params), 0), " \t");
-            if (name.len == 0) continue;
-            try lines.append(a, .{ .style = name, .width = 1, .color = "CHBLK" });
-        } else if (std.mem.eql(u8, opp.op, "AC")) { // AC(COLOUR[,transp])
-            const color = std.mem.trim(u8, syminsArgAt(try syminsSplitArgs(a, opp.params), 0), " \t");
-            if (color.len > 0) fill_token = color;
-        } else if (std.mem.eql(u8, opp.op, "AP")) { // AP(PATTERN)
-            const name = std.mem.trim(u8, syminsArgAt(try syminsSplitArgs(a, opp.params), 0), " \t");
-            if (name.len > 0) try patterns.append(a, name);
-        }
-    }
-    if (points.items.len == 0 and texts.items.len == 0 and lines.items.len == 0 and
-        patterns.items.len == 0 and fill_token == null) return null;
-    return s101.Portrayal{
-        .fill_token = fill_token,
-        .patterns = patterns.items,
-        .lines = lines.items,
-        .points = points.items,
-        .texts = texts.items,
-    };
-}
-
-// === Complex (symbolised) line tessellation (S-101 LineStyles) =============
-// A named linestyle (LC / a LineInstruction whose style is not "_simple_") is
-// tessellated per zoom: walk the line by arc length and emit, per period, the dash
-// "on" runs as line segments + each embedded symbol as a point rotated to the local
-// tangent. Mirrors Go bake/complexline.go + linestyle_catalog.go. The mm geometry is
-// parsed by assets.parseLineStyle; the baker converts it to LsInfo at the PresLib
-// FEATURE scale (ls_px_per_mm) and registers it before baking.
-
-const ls_feature_scale: f64 = 0.01 / 0.35278; // px per 0.01-mm PresLib unit (= SYMBOL_SCALE)
-const ls_px_per_mm: f64 = 100.0 * ls_feature_scale; // mm -> screen px
-/// The mm->px feature scale the baker must apply when building an LsInfo from the raw
-/// millimetre LineStyles geometry (assets.parseLineStyle), so the tessellator and the
-/// table agree. Differs from the symbol-scale assets.analysePattern uses for the
-/// client linestyles.json.
-pub const LINESTYLE_PX_PER_MM = ls_px_per_mm;
-
-pub const LsSym = struct { name: []const u8, offset_px: f64 };
-pub const LsInfo = struct {
-    period_px: f64,
-    on_runs: []const [2]f64, // [lo,hi] screen px from period start
-    symbols: []const LsSym,
-    color_token: []const u8,
-    width_px: f64,
-};
-
-// Set once by the baker before tile generation; read-only during the parallel bake
-// (encodeTile only reads), so it needs no lock. Absent => named lines fall
-// back to the generic dashed stroke (live/host path, no regression).
-var g_linestyles: std.StringHashMapUnmanaged(LsInfo) = .{};
-
-/// Register one analysed complex linestyle (id = LineStyles file stem). `id` and the
-/// LsInfo slices must outlive the bake (embedded XML / the bake's long-lived alloc).
-pub fn registerLinestyle(gpa: Allocator, id: []const u8, info: LsInfo) void {
-    g_linestyles.put(gpa, id, info) catch {};
-}
-
-/// Drop all registered linestyles (host/test reset).
-pub fn clearLinestyles(gpa: Allocator) void {
-    g_linestyles.deinit(gpa);
-    g_linestyles = .{};
-}
-
-/// Populate the complex-linestyle table from S-101 LineStyles XML sources
-/// (id = file stem). IDEMPOTENT — a populated table is left untouched, so
-/// every scene entry point (bake, lib renderView, CLI render) can call it
-/// unconditionally; forgetting it silently degrades named linestyles
-/// (MARSYS51, cables, pipelines, …) to generic dashed strokes. Mirrors the
-/// Go lsInfoFromCatalog: mm geometry at the PresLib feature scale, S-52
-/// minimum pen width. `gpa` + `srcs` must outlive all tile generation.
-pub fn registerLinestylesXml(gpa: Allocator, srcs: []const assets.LineStyleSrc) void {
-    if (g_linestyles.count() > 0) return;
-    const px = LINESTYLE_PX_PER_MM;
-    for (srcs) |s| {
-        const parsed = assets.parseLineStyle(gpa, s.xml) catch continue;
-        const period = parsed.interval_length * px;
-        if (period < 0.5) continue; // no interval to tile (pure-symbol style)
-        var runs = std.ArrayList([2]f64).empty;
-        for (parsed.dashes) |d| {
-            const lo = d.start * px;
-            const hi = (d.start + d.length) * px;
-            if (hi - lo > 1e-6) runs.append(gpa, .{ lo, hi }) catch {};
-        }
-        var syms = std.ArrayList(LsSym).empty;
-        for (parsed.symbols) |sym| syms.append(gpa, .{ .name = sym.reference, .offset_px = sym.position * px }) catch {};
-        var width = parsed.pen_width * px;
-        if (width < 0.6) width = 0.9; // S-52 minimum pen
-        registerLinestyle(gpa, s.id, .{
-            .period_px = period,
-            .on_runs = runs.items,
-            .symbols = syms.items,
-            .color_token = parsed.pen_color,
-            .width_px = width,
-        });
-    }
-}
-
-const LsTangent = struct { p: tile.FPoint, dx: f64, dy: f64 };
-
-/// Point at local arc `d` along rp plus the (un-normalised) tangent of its segment.
-fn lsPointAndTangent(rp: []const tile.FPoint, rarc: []const f64, d_in: f64) ?LsTangent {
-    const total = rarc[rarc.len - 1];
-    const d = std.math.clamp(d_in, 0, total);
-    var i: usize = 0;
-    while (i + 1 < rp.len) : (i += 1) {
-        if (d <= rarc[i + 1] or i + 2 == rp.len) {
-            const seg = rarc[i + 1] - rarc[i];
-            const t: f64 = if (seg > 1e-12) (d - rarc[i]) / seg else 0;
-            return .{
-                .p = .{ .x = rp[i].x + t * (rp[i + 1].x - rp[i].x), .y = rp[i].y + t * (rp[i + 1].y - rp[i].y) },
-                .dx = rp[i + 1].x - rp[i].x,
-                .dy = rp[i + 1].y - rp[i].y,
-            };
-        }
-    }
-    return null;
-}
-
-fn lsLerpArc(rp: []const tile.FPoint, rarc: []const f64, d: f64) tile.FPoint {
-    return (lsPointAndTangent(rp, rarc, d) orelse LsTangent{ .p = rp[0], .dx = 0, .dy = 0 }).p;
-}
-
-/// Sub-polyline of rp between local arc distances d0..d1 (endpoints interpolated).
-fn lsSubPathByArc(a: Allocator, rp: []const tile.FPoint, rarc: []const f64, d0_in: f64, d1_in: f64) ![]tile.FPoint {
-    const total = rarc[rarc.len - 1];
-    const d0 = std.math.clamp(d0_in, 0, total);
-    const d1 = std.math.clamp(d1_in, 0, total);
-    if (d1 - d0 < 1e-9) return &.{};
-    var out = std.ArrayList(tile.FPoint).empty;
-    try out.append(a, lsLerpArc(rp, rarc, d0));
-    for (rp, 0..) |p, i| {
-        if (rarc[i] > d0 and rarc[i] < d1) try out.append(a, p);
-    }
-    try out.append(a, lsLerpArc(rp, rarc, d1));
-    return out.items;
-}
-
-/// Tessellate a complex linestyle along a feature's geometry parts into this tile.
-/// `emit_symbols` is false when best-band suppression drops the coarse cell's points.
-/// Stage B: walk ONE clipped tile-local run by the complex-linestyle period,
-/// emitting dash "on" segments and tangent-rotated embedded symbols. Runs are
-/// already tile-local (no z/x/y needed). At RENDER the period AND the px offsets
-/// are multiplied by `size_scale`, so spacing and brick size both scale with the
-/// display (vector.zig scales the brick to match) and the BAKED tiles stay
-/// display-independent. `size_scale <= 0` (bake / CLI) collapses to 1.0.
-fn walkComplexRun(a: Allocator, rp: []const tile.FPoint, arc0: f64, info: LsInfo, color: []const u8, size_scale: f64, emit_symbols: bool, surf: rs.Surface) !void {
-    if (rp.len < 2) return;
-    const ext: f64 = @floatFromInt(tile.EXTENT);
-    const px_scale = ext / 256.0; // figures are laid out in 256-px-per-tile space
-    const ss = if (size_scale > 0) size_scale else 1.0;
-    const period = info.period_px * px_scale * ss;
-    if (period < 1e-6) return;
-    const rarc = try a.alloc(f64, rp.len);
-    rarc[0] = 0;
-    for (1..rp.len) |i| rarc[i] = rarc[i - 1] + std.math.hypot(rp[i].x - rp[i - 1].x, rp[i].y - rp[i - 1].y);
-    const g0 = arc0;
-    const run_end = g0 + rarc[rp.len - 1];
-    var k: i64 = @intFromFloat(@floor(g0 / period));
-    while (@as(f64, @floatFromInt(k)) * period < run_end) : (k += 1) {
-        const base = @as(f64, @floatFromInt(k)) * period;
-        for (info.on_runs) |on| { // dash on-runs -> line segments
-            const lo = @max(base + on[0] * px_scale * ss, g0);
-            const hi = @min(base + on[1] * px_scale * ss, run_end);
-            if (hi - lo < 1e-6) continue;
-            const sub = try lsSubPathByArc(a, rp, rarc, lo - g0, hi - g0);
-            if (sub.len < 2) continue;
-            const seg = try a.alloc(mvt.Point, sub.len);
-            for (sub, 0..) |spt, i| seg[i] = tile.quantizeF(spt);
-            const segparts = try a.alloc([]const mvt.Point, 1);
-            segparts[0] = seg;
-            try surf.strokeLine(color, info.width_px, .solid, segparts, null);
-        }
-        if (!emit_symbols) continue;
-        for (info.symbols) |sym| { // embedded symbols -> tangent-rotated points
-            if (sym.name.len == 0) continue;
-            const gp = base + sym.offset_px * px_scale * ss;
-            if (gp < g0 or gp > run_end) continue;
-            const tp = lsPointAndTangent(rp, rarc, gp - g0) orelse continue;
-            const qp = tile.quantizeF(tp.p);
-            // Own each embedded symbol by exactly ONE tile: emit it only when its
-            // position lands inside the RAW tile [0,EXTENT). The dash-run lines
-            // keep the buffered clip (seamless strokes across the seam), but a
-            // symbol in the buffer zone would otherwise be tessellated by BOTH
-            // this tile and its neighbour -> the same symbol drawn twice at every
-            // tile seam (user-reported "double symbols"). Half-open so a symbol on
-            // the seam belongs to exactly one side (no gap, no double).
-            if (qp.x < 0 or qp.x >= tile.EXTENT or qp.y < 0 or qp.y >= tile.EXTENT) continue;
-            const rot = std.math.atan2(tp.dy, tp.dx) * 180.0 / std.math.pi;
-            try surf.drawSymbol(sym.name, qp, rot, SYMBOL_SCALE, true, .line, null);
-        }
-    }
-}
-
-/// Tessellate a complex linestyle along a feature's geometry parts into this tile.
-/// `emit_symbols` is false when best-band suppression drops the coarse cell's points.
-/// `style` is the linestyle id: at BAKE we store each clipped run un-tessellated
-/// (tagged with the id) so replay can re-walk the period display-scaled; on a live
-/// render surface we walk it here at that surface's size_scale.
-fn emitComplexLine(a: Allocator, parts: []const []s57.LonLat, info: LsInfo, style: []const u8, color: []const u8, emit_symbols: bool, z: u8, x: u32, y: u32, box: tile.Box, fmeta: *const rs.FeatureMeta, surf: rs.Surface) !void {
-    const store = surf.canStoreComplexRun();
-    const ss = surf.sizeScale();
-    try surf.beginFeature(fmeta);
-    for (parts) |part| {
-        if (part.len < 2) continue;
-        const fpts = try a.alloc(tile.FPoint, part.len);
-        for (part, 0..) |pt, i| fpts[i] = tile.worldToTileF(tile.lonLatToWorld(pt.lon(), pt.lat()), z, x, y, tile.EXTENT);
-        const arc = try a.alloc(f64, part.len);
-        arc[0] = 0;
-        for (1..part.len) |i| arc[i] = arc[i - 1] + std.math.hypot(fpts[i].x - fpts[i - 1].x, fpts[i].y - fpts[i - 1].y);
-        for (try tile.clipLinePhased(a, fpts, arc, box)) |run| {
-            if (run.points.len < 2) continue;
-            if (store) {
-                // BAKE: store the clipped run un-tessellated (display-independent).
-                const qpts = try a.alloc(mvt.Point, run.points.len);
-                for (run.points, 0..) |p, i| qpts[i] = tile.quantizeF(p);
-                try surf.storeComplexRun(style, color, info.width_px, run.arc0, qpts);
-            } else {
-                // LIVE / CLI render: walk the period at this surface's display scale.
-                try walkComplexRun(a, run.points, run.arc0, info, color, ss, emit_symbols, surf);
-            }
-        }
-    }
-    try surf.endFeature();
-}
-
 /// Native S-52 fallback for SweptArea (SWPARE, objl 134). The S-101 Portrayal
 /// Catalogue ships no SweptArea rule (an IHO gap), so the Lua engine emits
 /// nothing for it. Mirror the Go reference's sweptAreaBuild: a dashed CHGRD
@@ -2369,7 +1637,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        var sub = try clipSimplifyLine(a, proj, box);
+        var sub = try tile.clipSimplifyLine(a, proj, box);
         if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -2399,14 +1667,21 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// limit: stroke each ring with the MARSYS51 complex linestyle — the dashed "—A——B—"
 /// pattern carrying the EMMARS01 (IALA-A) and EMMARS02 (IALA-B) letter symbols — or
 /// NAVARE51 when ORIENT marks a direction of buoyage. The S-101 catalogue routes
-/// M_NSYS to nothing (s101_adapt excludes it so this rule owns it), so without this
+/// M_NSYS to nothing (the S-101 adapter excludes it so this rule owns it), so without this
 /// the boundary draws nothing. DrawingPriority 12. NOTE: the ORIENT-only DIRBOY
 /// direction-of-buoyage arrow (DIRBOY01/A1/B1, CentreOnArea) is not yet ported —
 /// absent on the reference data; the A/B boundary line is the visible feature.
 fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     if (opts.suppress_lines) return;
-    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
-    if (geo_parts.len == 0) return;
+    // S-52 §8.6.2 boundary masking, mirrored from the portrayal stroke path: the
+    // producer flags the M_NSYS edges that coincide with the cell limit (MASK/USAG),
+    // so the system boundary strokes only where a REAL division runs — not along
+    // every cell junction of a uniform IALA region. The fill is unaffected.
+    const masked_boundary = cell.needsDrawableBoundary(f);
+    const geo_parts = if (masked_boundary)
+        cell.drawableLineParts(a, f) catch return
+    else
+        featureParts(a, cell, geo, fi, f) catch return;
 
     const fmeta = rs.FeatureMeta{
         .draw_prio = 12,
@@ -2421,12 +1696,17 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     // IALA A/B system boundary (MARSYS51). Both stroke in CHGRD.
     const boundary: []const u8 = if (f.attr(s57.ATTR_ORIENT) != null) "NAVARE51" else "MARSYS51";
 
+    // The masked complement (cell-limit stretches) rides along tagged, for the
+    // meta-bounds view; the standard display filters the class out anyway.
+    if (masked_boundary) try emitMaskedBoundary(a, cell, f, fmeta, z, x, y, tb, box, surf);
+    if (geo_parts.len == 0) return;
+
     // Best-available: cut the covered stretches before tessellating/stroking.
     const nav_parts = if (opts.cover_clip) |cc| clipGeoPartsOutsideCover(a, geo_parts, cc, z, x, y) else geo_parts;
 
     // Tessellate the registered complex linestyle (dashes + the A/B letter symbols).
-    if (g_linestyles.get(boundary)) |info| {
-        try emitComplexLine(a, nav_parts, info, boundary, "CHGRD", !opts.suppress_points, z, x, y, box, &fmeta, surf);
+    if (linestyle.lookup(boundary)) |info| {
+        try linestyle.drawComplexLine(a, nav_parts, info, boundary, "CHGRD", !opts.suppress_points, z, x, y, box, &fmeta, surf);
         return;
     }
     // No registered linestyle (live/host path, no table): a plain dashed CHGRD ring.
@@ -2436,7 +1716,39 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try clipSimplifyLine(a, proj, box);
+        const sub = try tile.clipSimplifyLine(a, proj, box);
+        if (sub.len == 0) continue;
+        const parts = try a.alloc([]const mvt.Point, sub.len);
+        for (sub, 0..) |s, i| parts[i] = s;
+        try surf.strokeLine("CHGRD", 1, .dashed, parts, null);
+    }
+    try surf.endFeature();
+}
+
+/// The §8.6.2-masked complement of a boundary, baked as a `masked`-tagged plain
+/// dashed line so the meta-bounds inspection view can OUTLINE the meta object —
+/// a whole-cell M_NSYS has its entire boundary flagged as the cell limit, and
+/// masking alone leaves the toggle nothing to show. The standard display never
+/// renders it (the meta classes are filtered out unless meta-bounds is on), and
+/// the tag keeps the masked pieces letter-free in the styled view too.
+fn emitMaskedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, base: rs.FeatureMeta, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, surf: rs.Surface) !void {
+    const masked_parts = cell.maskedLineParts(a, f) catch return;
+    if (masked_parts.len == 0) return;
+    var fmeta = base;
+    fmeta.masked = true;
+    // NOT cover-clipped: this is the meta-bounds inspection outline of one chart's
+    // OWN extent, so it must trace that chart's whole boundary even where a finer
+    // chart owns the ground on top of it. Clipping it to the best-available cover
+    // (as the drawn portrayal is) carves the outline apart wherever a finer chart
+    // overlaps — a coarse chart's rectangle comes out in disjoint fragments. The
+    // inspection view wants every contributing chart's complete extent.
+    try surf.beginFeature(&fmeta);
+    for (masked_parts) |gp| {
+        if (gp.len < 2) continue;
+        if (!overlaps(geomBounds(gp), tb)) continue;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
+        const sub = try tile.clipSimplifyLine(a, proj, box);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -2456,7 +1768,12 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, color: []const u8, width: f64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     if (f.prim != 2 and f.prim != 3) return;
     if (opts.suppress_lines) return; // coarse band over finer M_COVR (centre): drop the stroke
-    const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
+    // Same S-52 §8.6.2 boundary masking as the portrayal stroke path (see
+    // emitNavSystemFallback): masked cell-limit edges don't stroke.
+    const geo_parts = if (cell.needsDrawableBoundary(f))
+        cell.drawableLineParts(a, f) catch return
+    else
+        featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
 
     const fmeta = rs.FeatureMeta{
@@ -2473,7 +1790,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        var sub = try clipSimplifyLine(a, proj, box);
+        var sub = try tile.clipSimplifyLine(a, proj, box);
         if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -2499,7 +1816,7 @@ fn isCoverageFeature(f: s57.Feature) bool {
 /// CellOpts.oscl). The style shows it only while the display is grossly overscale
 /// (denominator FINER/smaller than oscl, i.e. X2+) and paints it ABOVE overscaled
 /// cells' fills but BELOW at-scale (finer) cells' fills — the occlusion trick that
-/// leaves the hatch only on coarse-only patches (specs/overscale.md).
+/// leaves the hatch only on coarse-only patches.
 fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const geo_parts = featureParts(a, cell, geo, fi, f) catch return;
     if (geo_parts.len == 0) return;
@@ -2513,7 +1830,7 @@ fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (ring.len >= 3) try rings.append(a, ring);
     }
     if (rings.items.len == 0) return;
-    const parts = try orientAreaRings(a, rings.items);
+    const parts = try mvt.orientAreaRings(a, rings.items);
     const fmeta = rs.FeatureMeta{
         // S-52 §10.1.10.2: the overscale pattern draws at display priority 3 in
         // DISPLAY BASE (the indication is never optional content). No class/pick
@@ -2796,10 +2113,40 @@ fn appendCellFeatures(
     // LIGHTS cull margin: display-mm sector figures reach ~1 tile at every zoom;
     // ground-length legs (directional lights) reach their honest per-zoom span.
     const light_reach = lightReachTiles(opts.light_range_m, z, (tb[1] + tb[3]) * 0.5);
+    // Sub-band SCAMIN cull: below the cell's native band floor this is a fill-up
+    // tile (the compositor pulls finer data into coarser zooms where nothing
+    // coarser covers), and a feature whose (floored) SCAMIN cannot display
+    // anywhere in this tile is dead weight — cull it so the z4 copy of a harbor
+    // cell carries land/coast/majors, not every sounding. The threshold is the
+    // tile's most permissive display denominator (its highest-|lat| edge) with
+    // one zoom of slack, so the cull stays strictly looser than any client
+    // gate-latitude choice; SCAMIN-less features always pass.
+    const subband_floor = @import("tiles").band.bandZooms(@import("tiles").band.bandOf(cell.params.cscl)).min;
+    const subband_min_denom: f64 = if (z < subband_floor) blk: {
+        const max_abs_lat = @max(@abs(tb[1]), @abs(tb[3]));
+        const k = @import("style").scaminGateK(max_abs_lat);
+        break :blk k / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(z))) / 2.0;
+    } else 0;
     for (cell.features, 0..) |f, fi| {
         // Isolated single-feature render (explore --kitty thumbnail): draw only
         // the requested feature, skip the rest of the cell.
         if (opts.only_fi) |only| if (fi != only) continue;
+        if (subband_min_denom > 0) {
+            if (effScamin(f, opts)) |sc| {
+                if (@as(f64, @floatFromInt(sc)) < subband_min_denom) continue;
+            } else if (f.objl == 75) {
+                // LIGHTS is the one class whose SCAMIN-less features do NOT ride
+                // sub-band: producers leave SCAMIN off most fine-band lights (cell
+                // selection is the intended gate — an ECDIS at this scale would
+                // never load the cell), and a light's portrayal is all fixed
+                // display-size construction — flare, characteristic text, 20/25 mm
+                // sector legs and arcs — which reads as a continent-sized doodle
+                // on a fill-up tile. The true small-scale lights arrive from the
+                // overview/general cells, SCAMIN-carrying. Ground features
+                // (land/coast/depth) keep riding.
+                continue;
+            }
+        }
         var ml = mlon;
         var mt = mlat;
         if (f.objl == 75) {
@@ -2838,8 +2185,8 @@ fn appendCellFeatures(
         if (!fopts.suppress_points and hasAdditionalInfo(f)) {
             try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, fopts, surf);
         }
-        // S-52 §10.1.10.2 overscale area at a chart scale boundary
-        // (specs/overscale.md): a cell's M_COVR (CATCOV=1) coverage polygon rides
+        // S-52 §10.1.10.2 overscale area at a chart scale boundary:
+        // a cell's M_COVR (CATCOV=1) coverage polygon rides
         // the tile as an AP(OVERSC01) hatch gated on `oscl` (X2) ONLY when
         // overscale_hatch is set — a strictly-finer-CSCL cell rides the tile (a
         // scale boundary) AND this cell wins the pure quilt somewhere (it is the
@@ -2866,7 +2213,7 @@ fn appendCellFeatures(
             continue;
         }
         if (f.objl == 163) {
-            if (try buildSyminsPortrayal(a, f)) |sp| {
+            if (try symins.buildSyminsPortrayal(a, f)) |sp| {
                 try processFeatureParsed(a, cell.*, f, fi, geo, geo_world, sp, 2, 2, z, x, y, tb, box, fopts, surf);
                 continue;
             }
@@ -2893,7 +2240,7 @@ fn appendCellFeatures(
             try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, fopts, surf);
             continue;
         }
-        if (f.objl != s57.OBJL_TOPMAR and s101_adapt.resolveClass(f) == null) {
+        if (f.objl != s57.OBJL_TOPMAR and adapter.resolveClass(f) == null) {
             if (!fopts.suppress_points) try emitCentredSymbol(a, cell.*, f, fi, geo, "QUESMRK1", 6, 1, z, x, y, tb, fopts, surf);
             continue;
         }
@@ -2918,7 +2265,7 @@ fn appendCellFeatures(
                 if (ring.len >= 3) try rings.append(a, ring);
             }
             if (rings.items.len == 0) continue;
-            const parts = try orientAreaRings(a, rings.items);
+            const parts = try mvt.orientAreaRings(a, rings.items);
             var aprops = std.ArrayList(mvt.Prop).empty;
             try aprops.append(a, .{ .key = "class", .value = .{ .string = cls.name } });
             try aprops.append(a, .{ .key = "color_token", .value = .{ .string = cls.color } });
@@ -2936,7 +2283,7 @@ fn appendCellFeatures(
             if (!overlaps(geomBounds(gp), tb)) continue;
             const proj = try a.alloc(mvt.Point, gp.len);
             for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-            var sub = try clipSimplifyLine(a, proj, box);
+            var sub = try tile.clipSimplifyLine(a, proj, box);
             if (fopts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -3065,26 +2412,17 @@ test "appendTextProps: halo (CHWHT/1) gated on font_size >= 10, matching the ora
     }
 }
 
-test "shortenName: buoy/light names reduce to the QUOTED chart designation" {
-    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_s.deinit();
-    const al = arena_s.allocator();
-    // Verbose NOAA OBJNAM tagged "by <name>" by the S-101 buoy rules -> the
-    // designation IN QUOTES (paper-chart convention: not misread as a sounding).
-    try std.testing.expectEqualStrings("\"78A\"", try shortenName(al, "by Chesapeake Channel Lighted Buoy 78A"));
-    try std.testing.expectEqualStrings("\"CR\"", try shortenName(al, "by Chesapeake Channel Lighted Buoy CR"));
-    try std.testing.expectEqualStrings("\"3\"", try shortenName(al, "by Tangier Sound Daybeacon 3"));
-    try std.testing.expectEqualStrings("\"2CR\"", try shortenName(al, "by Lighted Whistle Buoy 2CR"));
-    // No type-word -> the stripped name (already short), unquoted.
-    try std.testing.expectEqualStrings("22", try shortenName(al, "by 22"));
-    // No "by " prefix -> passthrough (depth label, light elevation, place name).
-    try std.testing.expectEqualStrings(" 4.6m", try shortenName(al, " 4.6m"));
-    try std.testing.expectEqualStrings("Herring Bay", try shortenName(al, "Herring Bay"));
-    // "Light"/"Lt" are NOT split words -> a named light keeps its name (defensive; such
-    // labels don't carry the "by " buoy prefix anyway).
-    try std.testing.expectEqualStrings("Thomas Point Light", try shortenName(al, "by Thomas Point Light"));
-    // Beacon names ("bn " prefix) reduce the same way.
-    try std.testing.expectEqualStrings("\"2\"", try shortenName(al, "bn Turn Rock Daybeacon 2"));
+test "stripNameTag: strips the by/bn aid-name tag, keeps the full name" {
+    // The S-101 buoy/beacon rules tag OBJNAM "by <name>"/"bn <name>"; the tag is
+    // stripped and the FULL name shown (the designation-shortening was removed).
+    try std.testing.expectEqualStrings("Chesapeake Channel Lighted Buoy 78A", stripNameTag("by Chesapeake Channel Lighted Buoy 78A"));
+    try std.testing.expectEqualStrings("Tangier Sound Daybeacon 3", stripNameTag("by Tangier Sound Daybeacon 3"));
+    try std.testing.expectEqualStrings("Turn Rock Daybeacon 2", stripNameTag("bn Turn Rock Daybeacon 2"));
+    try std.testing.expectEqualStrings("22", stripNameTag("by 22"));
+    // No "by "/"bn " prefix -> passthrough (depth label, light elevation, place name).
+    try std.testing.expectEqualStrings(" 4.6m", stripNameTag(" 4.6m"));
+    try std.testing.expectEqualStrings("Herring Bay", stripNameTag("Herring Bay"));
+    try std.testing.expectEqualStrings("Thomas Point Light", stripNameTag("by Thomas Point Light"));
 }
 
 test "listHasAny splits S-57 comma lists and matches any target" {
@@ -3093,54 +2431,6 @@ test "listHasAny splits S-57 comma lists and matches any target" {
     try std.testing.expect(listHasAny(" 3 , 7 ", &.{ 3, 4, 5, 8, 9 }));
     try std.testing.expect(!listHasAny("1,2,6", &.{ 4, 18 }));
     try std.testing.expect(!listHasAny("", &.{18}));
-}
-
-test "orientAreaRings subtracts a hole: exterior CW (+), interior CCW (-)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // A sea-area exterior square (CCW as authored) with a smaller island hole
-    // inside it (also CCW as authored). y is down in tile space.
-    const ext = [_]mvt.Point{
-        .{ .x = 0, .y = 0 },     .{ .x = 0, .y = 100 },
-        .{ .x = 100, .y = 100 }, .{ .x = 100, .y = 0 },
-    };
-    const hole = [_]mvt.Point{
-        .{ .x = 40, .y = 40 }, .{ .x = 40, .y = 60 },
-        .{ .x = 60, .y = 60 }, .{ .x = 60, .y = 40 },
-    };
-    // Pass the hole first to prove ordering is by geometry, not input order.
-    const rings = [_][]const mvt.Point{ hole[0..], ext[0..] };
-    const out = try orientAreaRings(a, &rings);
-
-    try std.testing.expectEqual(@as(usize, 2), out.len);
-    // First emitted ring is the exterior (positive signed area), then its hole
-    // (negative). This is the winding MapLibre reads to cut the hole out.
-    try std.testing.expect(ringSignedArea(out[0]) > 0);
-    try std.testing.expect(ringSignedArea(out[1]) < 0);
-    // The exterior must be the 100x100 ring, the hole the 20x20 one.
-    try std.testing.expect(@abs(ringSignedArea(out[0])) > @abs(ringSignedArea(out[1])));
-}
-
-test "orientAreaRings keeps disjoint parts as separate exteriors (multipolygon)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Two disjoint squares (CTNARE-style multi-part area): both are exteriors,
-    // both wound positive, neither becomes a hole of the other.
-    const r0 = [_]mvt.Point{
-        .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 10 }, .{ .x = 10, .y = 10 }, .{ .x = 10, .y = 0 },
-    };
-    const r1 = [_]mvt.Point{
-        .{ .x = 50, .y = 50 }, .{ .x = 50, .y = 60 }, .{ .x = 60, .y = 60 }, .{ .x = 60, .y = 50 },
-    };
-    const rings = [_][]const mvt.Point{ r0[0..], r1[0..] };
-    const out = try orientAreaRings(a, &rings);
-    try std.testing.expectEqual(@as(usize, 2), out.len);
-    try std.testing.expect(ringSignedArea(out[0]) > 0);
-    try std.testing.expect(ringSignedArea(out[1]) > 0);
 }
 
 fn findProp(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
@@ -3155,87 +2445,6 @@ test "featureScamin reads s57 attr 133" {
     try std.testing.expectEqual(@as(?i64, null), featureScamin(zero)); // 0 = "always shown", not a bucket
     const without = s57.Feature{ .rcnm = 0, .rcid = 3, .prim = 1, .objl = 14 };
     try std.testing.expectEqual(@as(?i64, null), featureScamin(without));
-}
-
-test "collectLightReach: AugmentedRay ground legs + anchors from the streams" {
-    const gpa = std.testing.allocator;
-    const feats = [_]s57.Feature{
-        // A directional light: GeographicCRS leg 16668 m + a sector arc.
-        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 75, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }} },
-        // A plain sectored light: LocalCRS (display-mm) legs only.
-        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 75, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 2 }, .ornt = 255 }} },
-        // A buoy with no figures at all.
-        .{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 14, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 3 }, .ornt = 255 }} },
-    };
-    var cell = s57.Cell{
-        .params = .{ .cscl = 80_000 },
-        .vectors = &.{},
-        .features = &feats,
-        .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
-        .edges = std.AutoHashMap(u32, usize).init(gpa),
-        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
-        .arena = std.heap.ArenaAllocator.init(gpa),
-    };
-    defer cell.deinit();
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.52, 39.20));
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 2, s57.LonLat.init(-76.40, 39.30));
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 3, s57.LonLat.init(-76.10, 39.10));
-
-    const streams = [_]?[]const u8{
-        "ViewingGroup:27070;DrawingPriority:8;AugmentedRay:GeographicCRS,45.0,GeographicCRS,16668;LineStyle:dash,3.51,0.32,CHBLK;LineInstruction:_simple_;ClearGeometry",
-        "DrawingPriority:8;AugmentedRay:GeographicCRS,120.0,LocalCRS,25.0;LineInstruction:_simple_;ArcByRadius:0,0,20,120,90;LineInstruction:_simple_;ClearGeometry",
-        "DrawingPriority:7;PointInstruction:BOYLAT01",
-    };
-    const r = collectLightReach(&cell, &streams);
-    // Ground range from the directional leg only; mm-only figures add no range.
-    try std.testing.expectEqual(@as(f64, 16668), r.range_m);
-    // The bbox unions BOTH figure-bearing lights, not the figuresless buoy.
-    const bb = r.bbox orelse return error.TestUnexpectedResult;
-    try std.testing.expectApproxEqAbs(@as(f64, -76.52), bb[0], 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 39.20), bb[1], 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, -76.40), bb[2], 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 39.30), bb[3], 1e-9);
-
-    // No streams at all -> no reach.
-    try std.testing.expectEqual(@as(?[4]f64, null), collectLightReach(&cell, null).bbox);
-
-    // An explicit AugmentedPoint anchor extends the bbox beyond the node.
-    const anchored = [_]?[]const u8{
-        "AugmentedPoint:GeographicCRS,-76.60,39.10;ArcByRadius:0,0,25,0,360;LineInstruction:_simple_;ClearGeometry",
-        null,
-        null,
-    };
-    const ra = collectLightReach(&cell, &anchored);
-    const ab = ra.bbox orelse return error.TestUnexpectedResult;
-    try std.testing.expectApproxEqAbs(@as(f64, -76.60), ab[0], 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 39.10), ab[1], 1e-9);
-}
-
-test "scanLightReachAttrs: sectored/directional attrs drive the conservative reach" {
-    const gpa = std.testing.allocator;
-    const sect_attrs = [_]s57.Attr{ .{ .code = s57.ATTR_SECTR1, .value = "45" }, .{ .code = s57.ATTR_SECTR2, .value = "90" } };
-    const dir_attrs = [_]s57.Attr{ .{ .code = s57.ATTR_CATLIT, .value = "1" }, .{ .code = s57.ATTR_ORIENT, .value = "195" }, .{ .code = s57.ATTR_VALNMR, .value = "12" } };
-    const feats = [_]s57.Feature{
-        .{ .rcnm = 100, .rcid = 1, .prim = 1, .objl = 75, .attrs = &sect_attrs, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }} },
-        .{ .rcnm = 100, .rcid = 2, .prim = 1, .objl = 75, .attrs = &dir_attrs, .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 2 }, .ornt = 255 }} },
-    };
-    var cell = s57.Cell{
-        .params = .{ .cscl = 80_000 },
-        .vectors = &.{},
-        .features = &feats,
-        .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
-        .edges = std.AutoHashMap(u32, usize).init(gpa),
-        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
-        .arena = std.heap.ArenaAllocator.init(gpa),
-    };
-    defer cell.deinit();
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 1, s57.LonLat.init(-76.52, 39.20));
-    try cell.nodes.put((@as(u64, s57.RCNM_VI) << 32) | 2, s57.LonLat.init(-76.40, 39.30));
-
-    const r = scanLightReachAttrs(&cell);
-    try std.testing.expect(r.bbox != null);
-    // Directional CATLIT 1 + ORIENT: nmi2metres(VALNMR 12) ground leg.
-    try std.testing.expectEqual(@as(f64, 12.0 * 1852.0), r.range_m);
 }
 
 test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/scamin" {
@@ -3420,51 +2629,6 @@ test "generate a tile from a cell is well-formed MVT" {
     try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
-test "buildSyminsPortrayal parses SY/TX/LS/LC/AC/AP" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const attrs = [_]s57.Attr{.{
-        .code = SYMINS_ATTR,
-        .value = "SY(BOYSPP01,45);TX('Hello',1,2,0,'15110',0,0,CHRED,28);" ++
-            "LS(DASH,3,CHGRD);LS(SOLD,2,CHBLK);LC(NAVARE51);AC(DEPVS);AP(DIAMOND1)",
-    }};
-    const f = s57.Feature{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 163, .attrs = &attrs };
-
-    const p = (try buildSyminsPortrayal(a, f)) orelse return error.NoPortrayal;
-
-    try std.testing.expectEqual(@as(usize, 1), p.points.len);
-    try std.testing.expectEqualStrings("BOYSPP01", p.points[0].symbol);
-    try std.testing.expectEqual(@as(f64, 45), p.points[0].rotation);
-
-    try std.testing.expectEqual(@as(usize, 1), p.texts.len);
-    try std.testing.expectEqualStrings("Hello", p.texts[0].text);
-    try std.testing.expectEqualStrings("CHRED", p.texts[0].color);
-    try std.testing.expectEqual(@as(i64, 28), p.texts[0].group);
-
-    try std.testing.expectEqual(@as(usize, 3), p.lines.len); // 2x LS + 1x LC
-    try std.testing.expectEqualStrings("dash", p.lines[0].style); // DASH -> dashed
-    try std.testing.expectEqual(@as(f64, 3), p.lines[0].width);
-    try std.testing.expectEqualStrings("CHGRD", p.lines[0].color);
-    try std.testing.expectEqualStrings("solid", p.lines[1].style); // SOLD -> solid
-    try std.testing.expectEqualStrings("NAVARE51", p.lines[2].style); // LC name verbatim
-
-    try std.testing.expectEqualStrings("DEPVS", p.fill_token.?);
-    try std.testing.expectEqual(@as(usize, 1), p.patterns.len);
-    try std.testing.expectEqualStrings("DIAMOND1", p.patterns[0]);
-
-    // A blank / absent SYMINS yields no portrayal.
-    const f_empty = s57.Feature{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 163, .attrs = &[_]s57.Attr{.{ .code = SYMINS_ATTR, .value = "   " }} };
-    try std.testing.expect((try buildSyminsPortrayal(a, f_empty)) == null);
-
-    // Instruction-splitting honours a ';' inside a quoted TX string.
-    const f_semi = s57.Feature{ .rcnm = 100, .rcid = 3, .prim = 1, .objl = 163, .attrs = &[_]s57.Attr{.{ .code = SYMINS_ATTR, .value = "TX('a;b',1,2,0,'15110',0,0,CHBLK,28)" }} };
-    const ps = (try buildSyminsPortrayal(a, f_semi)) orelse return error.NoPortrayal;
-    try std.testing.expectEqual(@as(usize, 1), ps.texts.len);
-    try std.testing.expectEqualStrings("a;b", ps.texts[0].text);
-}
-
 test "QUASOU=5 no-bottom sounding draws the low-accuracy ring (S-65 DepthNoBottomFound)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3558,157 +2722,8 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
 
 test {
     _ = bake_enc;
-}
-
-// ---- bundle-sourced replay (baked tile -> Surface calls) --------------------
-//
-// The tile schema is a serialized Surface-call stream, so a baked tile can be
-// replayed onto any Surface — the substrate for rendering PMTiles bundles to
-// pixels with no source cells. LOSSY by design: the bake-time portrayal
-// context is frozen (SafetyContour/Depth 30); the live-swappable props the
-// tile path bakes (danger_depth/sym_deep, sym_s/sym_g depth + quality-ring
-// prefixes) are re-expanded here, so the mariner's danger swap, sounding
-// bold/faint split, and display unit still evaluate LIVE.
-
-fn propOf(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
-    for (props) |p| if (std.mem.eql(u8, p.key, key)) return p.value;
-    return null;
-}
-
-fn propInt(props: []const mvt.Prop, key: []const u8, default: i64) i64 {
-    const v = propOf(props, key) orelse return default;
-    return switch (v) {
-        .int => |i| i,
-        .uint => |u| @intCast(u),
-        .double => |d| @intFromFloat(d),
-        .float => |f| @intFromFloat(f),
-        else => default,
-    };
-}
-
-fn propF64(props: []const mvt.Prop, key: []const u8) ?f64 {
-    const v = propOf(props, key) orelse return null;
-    return switch (v) {
-        .double => |d| d,
-        .float => |f| f,
-        .int => |i| @floatFromInt(i),
-        .uint => |u| @floatFromInt(u),
-        else => null,
-    };
-}
-
-fn propStr(props: []const mvt.Prop, key: []const u8) []const u8 {
-    const v = propOf(props, key) orelse return "";
-    return switch (v) {
-        .string => |s| s,
-        else => "",
-    };
-}
-
-fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
-    return .{
-        .draw_prio = propInt(props, "draw_prio", 0),
-        .cat = propInt(props, "cat", 1),
-        .vg = propInt(props, "vg", 0),
-        .scamin = if (propOf(props, "scamin")) |_| propInt(props, "scamin", 0) else null,
-        .class = propStr(props, "class"),
-        .s57_json = propStr(props, "s57"), // cursor-pick attribute blob (baked)
-        .cell_name = propStr(props, "cell"), // source cell badge (baked)
-        .band = @intCast(std.math.clamp(propInt(props, "band", 0), 0, 255)),
-        .bnd = propInt(props, "bnd", 2),
-        .pts = propInt(props, "pts", 2),
-        .date_start = propStr(props, "date_start"),
-        .date_end = propStr(props, "date_end"),
-    };
-}
-
-/// Replay one decoded tile's layers as Surface calls (between the caller's
-/// begin/endScene). Layer names route exactly as TileSurface emitted them.
-pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLayer) !void {
-    for (layers) |layer| {
-        const is_areas = std.mem.startsWith(u8, layer.name, "areas");
-        const is_patterns = std.mem.startsWith(u8, layer.name, "area_patterns");
-        const is_lines = std.mem.startsWith(u8, layer.name, "lines");
-        const is_points = std.mem.startsWith(u8, layer.name, "point_symbols");
-        const is_soundings = std.mem.eql(u8, layer.name, "soundings");
-        const is_text = std.mem.startsWith(u8, layer.name, "text");
-        for (layer.features) |f| {
-            const meta = metaFromProps(f.properties);
-            try surf.beginFeature(&meta);
-            defer surf.endFeature() catch {};
-            if (is_patterns) {
-                try surf.fillPattern(propStr(f.properties, "pattern_name"), f.parts);
-            } else if (is_areas) {
-                const d1 = propF64(f.properties, "drval1");
-                const dr: ?rs.DepthRange = if (d1) |v| .{ .d1 = @floatCast(v), .d2 = @floatCast(propF64(f.properties, "drval2") orelse v) } else null;
-                try surf.fillArea(propStr(f.properties, "color_token"), f.parts, dr);
-            } else if (is_lines) {
-                // Complex (symbolised) linestyle: the bake stored the clipped run
-                // un-tessellated (tagged ls_style). Re-walk the period at the render
-                // surface's display scale so spacing + brick size track the display.
-                const ls_style = propStr(f.properties, "ls_style");
-                if (ls_style.len > 0) {
-                    if (g_linestyles.get(ls_style)) |info| {
-                        const color = propStr(f.properties, "color_token");
-                        const arc0 = propF64(f.properties, "ls_arc0") orelse 0;
-                        for (f.parts) |part| {
-                            if (part.len < 2) continue;
-                            const fpts = try a.alloc(tile.FPoint, part.len);
-                            for (part, 0..) |p, i| fpts[i] = .{ .x = @floatFromInt(p.x), .y = @floatFromInt(p.y) };
-                            try walkComplexRun(a, fpts, arc0, info, color, surf.sizeScale(), true, surf);
-                        }
-                        continue;
-                    }
-                    // Style not registered (host without the table): fall back to a
-                    // plain dashed stroke so the line never disappears.
-                    try surf.strokeLine(propStr(f.properties, "color_token"), propF64(f.properties, "width_px") orelse 1, .dashed, f.parts, null);
-                    continue;
-                }
-                const dash: rs.Dash = if (std.mem.eql(u8, propStr(f.properties, "dash"), "solid")) .solid else .dashed;
-                try surf.strokeLine(propStr(f.properties, "color_token"), propF64(f.properties, "width_px") orelse 1, dash, f.parts, propF64(f.properties, "valdco"));
-            } else if (is_points) {
-                if (f.parts.len == 0 or f.parts[0].len == 0) continue;
-                try surf.drawSymbol(
-                    propStr(f.properties, "symbol_name"),
-                    f.parts[0][0],
-                    propF64(f.properties, "rotation_deg") orelse 0,
-                    propF64(f.properties, "scale") orelse SYMBOL_SCALE,
-                    propInt(f.properties, "rot_north", 0) != 0,
-                    .point,
-                    propF64(f.properties, "danger_depth"), // live swap re-evaluates
-                );
-            } else if (is_soundings) {
-                if (f.parts.len == 0 or f.parts[0].len == 0) continue;
-                const depth = propF64(f.properties, "depth") orelse continue;
-                // The quality-ring flags are encoded in the baked glyph list's
-                // leading tokens (SNDFRM04 B1 swept / C2/C3 low-accuracy) —
-                // recover them so the live recomposition keeps the rings.
-                const sym_s = propStr(f.properties, "sym_s");
-                const swept = std.mem.indexOf(u8, sym_s, "SB1") != null;
-                const low_acc = std.mem.indexOf(u8, sym_s, "SC3") != null;
-                try surf.drawSounding(depth, swept, low_acc, f.parts[0][0]);
-            } else if (is_text) {
-                if (f.parts.len == 0 or f.parts[0].len == 0) continue;
-                var ox: f64 = 0;
-                var oy: f64 = 0;
-                const loff = propStr(f.properties, "loff");
-                if (loff.len > 0) {
-                    var it = std.mem.splitScalar(u8, loff, ',');
-                    const TEXT_BODY_MM = 3.51;
-                    ox = (std.fmt.parseFloat(f64, it.next() orelse "0") catch 0) * TEXT_BODY_MM;
-                    oy = (std.fmt.parseFloat(f64, it.next() orelse "0") catch 0) * TEXT_BODY_MM;
-                }
-                const style = rs.TextStyle{
-                    .color = propStr(f.properties, "color_token"),
-                    .font_size = propF64(f.properties, "font_size_px") orelse 12,
-                    .halign = propStr(f.properties, "halign"),
-                    .valign = propStr(f.properties, "valign"),
-                    .offset_x = ox,
-                    .offset_y = oy,
-                    .group = propInt(f.properties, "tgrp", 0),
-                };
-                try surf.drawText(propStr(f.properties, "text"), &style, f.parts[0][0]);
-            }
-        }
-    }
+    _ = symins;
+    _ = lightreach;
+    _ = linestyle;
+    _ = replay;
 }

@@ -1,15 +1,15 @@
 //! tile57 — the offline S-57 -> PMTiles baker / inspector CLI.
 //!
 //! Subcommands:
-//!   bake <cell.000> -o <out.pmtiles> [--rules DIR] [--minzoom N] [--maxzoom N] [update.001 ...]
-//!       Decode an S-57 base cell (applying any update files), portray it, and
-//!       pre-bake every web-mercator MVT tile covering the cell's bounds across
-//!       the requested zoom range into a clustered PMTiles archive.
+//!   bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]
+//!       Bake each chart to <out-dir>/tiles/<STEM>.pmtiles and write the ownership
+//!       partition to <out-dir>/partition.tpart — the live-composite structure a
+//!       runtime compositor serves tiles from on demand.
 //!   inspect <file.pmtiles> [z x y]
 //!       Parse a PMTiles archive (header + directory) and, if z/x/y is given,
 //!       read+gunzip+decode that tile and list its MVT layers.
 //!   cell <file.000>
-//!       Decode + summarise an S-57 cell (record tally, bounds, topology).
+//!       Decode + summarise an S-57 chart (record tally, bounds, topology).
 //!   version
 //!       Print the baker version.
 //!   help
@@ -23,11 +23,13 @@ const std = @import("std");
 const common = @import("common.zig");
 
 const bake = @import("bake.zig");
+const compose_tile = @import("compose_tile.zig");
 const assets = @import("assets.zig");
 const sprite = @import("sprite.zig");
 const pattern = @import("pattern.zig");
 const sprite_mln = @import("sprite_mln.zig");
 const style = @import("style.zig");
+const tiledump = @import("tiledump.zig");
 const render = @import("render.zig");
 const ascii = @import("ascii.zig");
 const explore = @import("explore.zig");
@@ -40,6 +42,7 @@ const audit_holes = @import("audit_holes.zig");
 const audit_pairs = @import("audit_pairs.zig");
 const objlcount = @import("objlcount.zig");
 const cell = @import("cell.zig");
+const partdbg_png = @import("partdbg_png.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -50,6 +53,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "bake")) {
         return bake.run(io, arena, args);
+    }
+    if (std.mem.eql(u8, sub, "compose-tile")) {
+        return compose_tile.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "assets")) {
@@ -72,8 +78,15 @@ pub fn main(init: std.process.Init) !void {
         return style.run(io, arena, args);
     }
 
+    if (std.mem.eql(u8, sub, "tiledump")) {
+        return tiledump.run(io, arena, args);
+    }
+
     if (std.mem.eql(u8, sub, "png") or std.mem.eql(u8, sub, "renderpng")) {
         return render.run(io, arena, args, .png);
+    }
+    if (std.mem.eql(u8, sub, "partdbg-png")) {
+        return partdbg_png.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "pdf")) {

@@ -1,26 +1,25 @@
 //! Integer polygon boolean operations — a Martinez–Rueda–Feito sweep-line.
 //!
-//! This is the geometry core of the cross-band composition redesign
-//! (specs/cross-band-composition-redesign.md, Phase 0). It computes the
-//! union / intersection / difference / symmetric-difference of two polygons
-//! whose vertices live on an integer lattice (the E7 coverage lattice for the
-//! Stage-0 partition, or world-pixel space for per-tile emission). Integers are
-//! deliberate: adjacent ENC cells that digitise a shared seam independently
-//! collapse to *exact* integer equality once snapped to the lattice, so the
-//! dominant seam case is a run of coincident edges rather than a cloud of
+//! This is the geometry core of the cross-band chart composition. It computes the
+//! union / intersection / difference / symmetric-difference of two polygons whose
+//! vertices are integers (coverage in degrees × 10⁷ for the partition, or
+//! world-pixel space for per-tile emission). Integers are deliberate: adjacent ENC
+//! cells that digitise a shared seam independently round to the *same* integers, so
+//! the dominant seam case is a run of coincident edges rather than a cloud of
 //! near-misses. The sweep types those coincident (overlapping) edges
 //! (SAME_TRANSITION / DIFFERENT_TRANSITION / NON_CONTRIBUTING) so a shared seam
 //! contributes to the result exactly once.
 //!
 //! Coordinate discipline:
-//!   * `Pt` holds i64. E7 degrees are ±1.8e9 (fit i32), but *differences* reach
-//!     3.6e9 (need i64) and orientation cross-products reach ~1.3e19 (overflow
-//!     i64) — every orientation / area predicate therefore promotes to i128.
+//!   * `Pt` holds i64. Coverage coordinates (degrees × 10⁷) are ±1.8e9 (fit i32),
+//!     but *differences* reach 3.6e9 (need i64) and orientation cross-products
+//!     reach ~1.3e19 (overflow i64) — every orientation / area predicate therefore
+//!     promotes to i128.
 //!   * A proper crossing point is rational; it is computed from exact i128
-//!     numerators in f64 and rounded to the nearest lattice point. Both sides of
+//!     numerators in f64 and rounded to the nearest integer point. Both sides of
 //!     a seam compute the same crossing from the same integer endpoints, so the
-//!     snap is deterministic (bake == live) and the ≤0.5-unit error is ~0.5 cm
-//!     at E7. Collinear-overlap endpoints are real input vertices, so they are
+//!     snap is deterministic (bake == live) and the ≤0.5-unit error is ~0.5 cm.
+//!     Collinear-overlap endpoints are real input vertices, so they are
 //!     reproduced exactly.
 //!
 //! Determinism: the event order and the sweep-status order share one strict
@@ -29,14 +28,14 @@
 //!
 //! Winding: the result contours are emitted as *open* rings with unspecified
 //! orientation — even-odd fill of the returned ring-set is the region. Callers
-//! that need MVT winding hand the rings to scene.orientAreaRings (the sole
+//! that need MVT winding hand the rings to mvt.orientAreaRings (the sole
 //! winding authority); nothing here relies on input orientation either, so
 //! every operand is interpreted even-odd.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// A lattice point. i64 holds any E7 or world-pixel coordinate with headroom.
+/// A point. i64 holds any coordinate (degrees × 10⁷, or world pixels) with headroom.
 pub const Pt = struct {
     x: i64,
     y: i64,
@@ -50,6 +49,25 @@ pub const Pt = struct {
 pub const Polygon = []const []const Pt;
 
 pub const Op = enum { intersect, unite, diff, sym_diff };
+
+/// Diagnostic: how many result-ring walks failed to close on a real edge since
+/// process start, AFTER the robust retry — an increase across a compute() call
+/// means that call's result still contains an open chain whose implicit
+/// closing chord slices across the region (the visible "wedge" artifact). On a
+/// parity-correct survivor graph a dead end can never happen, so any increase
+/// marks a boolean bug at the exact tile being composed. Callers snapshot
+/// before/after (single-threaded per compute).
+pub var open_chain_walks: u64 = 0;
+/// Diagnostic: how many compute() calls fell back to the region-sampled
+/// in_result recomputation because the sweep-flag pass dead-ended a walk.
+pub var robust_retries: u64 = 0;
+/// Diagnostic: how many micro-stitch edges closed a snap-divergence gap (two
+/// crossings of near-parallel edges snapping to adjacent lattice points leave
+/// the survivor graph with odd-degree vertex pairs a few units apart).
+pub var stitched_gaps: u64 = 0;
+/// Diagnostic: open chains whose implicit closing chord exceeds 32 units — the
+/// visible-artifact subset of open_chain_walks (micro chords are sub-pixel).
+pub var large_open_chains: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // Exact predicates (i128).
@@ -87,6 +105,10 @@ const SweepEvent = struct {
     other_in_out: bool = false,
     edge_type: EdgeType = .normal,
     in_result: bool = false,
+    /// The robust retry could not decide this edge by region sampling (its
+    /// midpoint lies ON the other operand's boundary — an undetected collinear
+    /// overlap); the parity repair may toggle it alongside the typed seams.
+    undecided: bool = false,
 
     inline fn vertical(self: *const SweepEvent) bool {
         return self.p.x == self.other.p.x;
@@ -135,7 +157,16 @@ fn segBelow(e1: *SweepEvent, e2: *SweepEvent) bool {
     if (a1 != 0 or a2 != 0) {
         // Not collinear.
         if (e1.p.eql(e2.p)) return e1.below(e2.other.p); // share left endpoint
-        if (queueBefore(e2, e1)) return e2.above(e1.p); // e2 inserted first
+        // A T-touch: one edge's left endpoint lies exactly ON the other segment
+        // (a subject vertex on a coincident seam edge is the common case). The
+        // on-segment point says nothing about order — decide by where the
+        // touching edge HEADS, else the toucher sorts below the touched edge
+        // and inherits its sweep flags from the wrong neighbour.
+        if (a1 == 0) return e1.below(e2.other.p); // e2 starts on e1
+        if (queueBefore(e2, e1)) {
+            if (signedArea(e2.p, e2.other.p, e1.p) == 0) return e2.above(e1.other.p); // e1 starts on e2
+            return e2.above(e1.p); // e2 inserted first
+        }
         return e1.below(e2.p);
     }
     // Collinear: subject below clip, then stable id — consistent with queueBefore.
@@ -152,14 +183,14 @@ fn segBelow(e1: *SweepEvent, e2: *SweepEvent) bool {
 /// `p0`), or 2 (a collinear overlap spanning [`p0`,`p1`]).
 pub const Inter = struct { n: u2, p0: Pt, p1: Pt };
 
-/// Intersect segment a0→a1 with b0→b1 on the integer lattice. Public so the
+/// Intersect segment a0→a1 with b0→b1 on integer coordinates. Public so the
 /// coverage clip (plane.zig) can reuse the exact classification + snapped point.
 pub fn segIntersect(a0: Pt, a1: Pt, b0: Pt, b1: Pt) Inter {
     return findIntersection(a0, a1, b0, b1);
 }
 
 inline fn roundDiv(a: Pt, num: i128, den: i128, d: Pt) Pt {
-    // a + (num/den)*d, rounded to nearest lattice point. den != 0.
+    // a + (num/den)*d, rounded to the nearest integer point. den != 0.
     const t = @as(f64, @floatFromInt(num)) / @as(f64, @floatFromInt(den));
     const rx = @round(@as(f64, @floatFromInt(a.x)) + t * @as(f64, @floatFromInt(d.x)));
     const ry = @round(@as(f64, @floatFromInt(a.y)) + t * @as(f64, @floatFromInt(d.y)));
@@ -306,7 +337,6 @@ const Sweeper = struct {
         const it = findIntersection(le1.p, le1.other.p, le2.p, le2.other.p);
         if (it.n == 0) return 0;
         if (it.n == 1 and (le1.p.eql(le2.p) or le1.other.p.eql(le2.other.p))) return 0; // shared endpoint only
-        if (it.n == 2 and le1.subject == le2.subject) return 0; // overlap within one operand: even-odd cancels, ignore
 
         if (it.n == 1) {
             if (!le1.p.eql(it.p0) and !le1.other.p.eql(it.p0)) try self.divideSegment(le1, it.p0, gpa);
@@ -348,12 +378,19 @@ const Sweeper = struct {
         }
 
         if (n == 2 or (n == 3 and ev[2] != null)) {
-            // Segments are equal, or share their left endpoint: one carries the
-            // transition, the other contributes nothing.
-            le1.edge_type = .non_contributing;
-            le2.edge_type = if (le1.in_out == le2.in_out) .same_transition else .different_transition;
+            // Segments are equal, or share their left endpoint. Across the two
+            // operands one carries the transition and the other contributes
+            // nothing. Within ONE operand there is no transition to type: both
+            // stay normal, and because the overlap was subdivided into exactly
+            // coincident pieces, the doubled pieces cancel in the result's mod-2
+            // edge reduction (even-odd: a doubled edge is no boundary).
             if (n == 3) try self.divideSegment(ev[2].?.other, ev[1].?.p, gpa);
-            return 2; // typed → recompute
+            if (le1.subject != le2.subject) {
+                le1.edge_type = .non_contributing;
+                le2.edge_type = if (le1.in_out == le2.in_out) .same_transition else .different_transition;
+                return 2; // typed → recompute
+            }
+            return 3;
         }
         if (n == 3) {
             // Share the right endpoint: split the longer-left segment; the now
@@ -394,13 +431,14 @@ const Sweeper = struct {
 /// Compute `subject op clip`. Result is a freshly allocated ring-set (open
 /// rings, even-odd fill); free with `freePolygon`.
 ///
-/// Precondition: each operand is a *simple* polygon — its own rings do not
-/// overlap in area (holes are allowed as properly-nested reverse rings). Two
-/// coincident edges are fine when they come from *different* operands (the seam
-/// case, typed once), but three coincident edges — which require one operand to
-/// overlap itself — are not resolved. Build operands from overlapping coverage
-/// rings with `unionAll`, whose pairwise fold guarantees this. Coincident and
-/// shared edges across the two operands are the designed-for common case.
+/// Each operand is an even-odd ring-set. Rings of one operand may cross, touch,
+/// or share collinear runs with each other (a baked MVT polygon's rings all run
+/// along the same tile clip edge — the case that broke the pre-subdivision
+/// design): same-operand overlaps are subdivided into exactly coincident pieces
+/// which cancel mod 2 in the result reduction, same-operand crossings are
+/// subdivided like any crossing. Coincident edges across the two operands are
+/// the designed-for seam case, typed once. `unionAll` remains the way to fold
+/// many mutually-overlapping coverages into one region whose rings are clean.
 pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -417,8 +455,15 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
     defer sw.status.deinit(gpa);
     defer sw.processed.deinit(gpa);
 
-    for (subject) |ring| try addRing(&sw, ring, true, gpa);
-    for (clip) |ring| try addRing(&sw, ring, false, gpa);
+    // Each operand's edge multiset is reduced modulo 2 BEFORE the sweep: rings
+    // of one operand may share collinear runs (a baked MVT polygon's rings all
+    // running along one tile clip edge), and a doubled coincident edge flips
+    // even-odd membership twice — no boundary. Cancelling those here preserves
+    // the operand's region exactly and guarantees the sweep never sees more
+    // than one subject plus one clip edge coincident, which is the pair case
+    // its overlap typing resolves.
+    try addOperand(&sw, subject, true, gpa);
+    try addOperand(&sw, clip, false, gpa);
 
     while (sw.queue.pop()) |se| {
         try sw.processed.append(gpa, se);
@@ -452,15 +497,66 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
         }
     }
 
-    return connectEdges(gpa, sw.processed.items);
+    // First attempt: the sweep's transition-typed in_result flags. On a correct
+    // flag set every result-ring walk closes; a dead-ended walk (open chain)
+    // means some flag was corrupted by a degenerate interleaving the pairwise
+    // machinery mishandled (snapped crossing landing on a vertex, vertical at
+    // a seam, ...). The fallback recomputes every NORMAL edge's membership by
+    // exact region sampling against the ORIGINAL operands — the sweep has
+    // already subdivided all crossings and overlaps, so an edge's interior
+    // lies strictly on one side of the other operand's boundary and the
+    // midpoint test is unambiguous (coincident seam edges keep their typing,
+    // which the sampling cannot decide and the sweep handles well). Both
+    // passes are pure functions of the input geometry, so determinism holds.
+    const chains_before = open_chain_walks;
+    const large_before = large_open_chains;
+    const first = try connectEdges(gpa, sw.processed.items, false);
+    if (open_chain_walks == chains_before) return first;
+    freePolygon(gpa, first);
+    robust_retries += 1;
+    open_chain_walks = chains_before; // the retry's own walk re-judges health
+    large_open_chains = large_before;
+    for (sw.processed.items) |e| {
+        if (!(e.left and e.edge_type == .normal)) continue;
+        const other: Polygon = if (e.subject) clip else subject;
+        // Midpoint at doubled scale (exact); on-boundary keeps the sweep's call.
+        const mx = e.p.x + e.other.p.x;
+        const my = e.p.y + e.other.p.y;
+        if (pointOnEdgeScaled2(other, mx, my)) {
+            e.undecided = true;
+            continue;
+        }
+        const inside_other = pointInEvenOddScaled2(other, mx, my);
+        e.in_result = switch (op) {
+            .intersect => inside_other,
+            .unite => !inside_other,
+            .diff => if (e.subject) !inside_other else inside_other,
+            .sym_diff => true,
+        };
+    }
+    return connectEdges(gpa, sw.processed.items, true);
 }
 
-fn addRing(sw: *Sweeper, ring: []const Pt, subject: bool, gpa: Allocator) !void {
-    if (ring.len < 3) return;
-    var j = ring.len - 1;
-    for (ring, 0..) |p, i| {
-        try sw.addEdge(ring[j], p, subject, gpa);
-        j = i;
+/// Add one operand's rings to the sweep with its self-overlapping collinear
+/// runs cancelled (reduceEdges). Survivors are added in reduceEdges' sorted
+/// order so event ids — the deterministic tie-break — are a function of
+/// geometry alone.
+fn addOperand(sw: *Sweeper, rings: Polygon, subject: bool, gpa: Allocator) !void {
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    var raw = std.ArrayList(HEdge).empty;
+    for (rings) |ring| {
+        if (ring.len < 3) continue;
+        var j = ring.len - 1;
+        for (ring, 0..) |p, i| {
+            if (!ring[j].eql(p)) try raw.append(sa, .{ .a = ring[j], .b = p });
+            j = i;
+        }
+    }
+    for (try reduceEdges(sa, raw.items)) |e| {
+        try sw.addEdge(e.a, e.b, subject, gpa);
     }
 }
 
@@ -477,7 +573,7 @@ fn addRing(sw: *Sweeper, ring: []const Pt, subject: bool, gpa: Allocator) !void 
 // the even-degree survivor graph every non-start vertex always has an exit, so the
 // walk always returns to its start on a real edge; the loop's implied edges are
 // exactly the walked edges, keeping even-odd exact. Winding/nesting is deferred to
-// scene.orientAreaRings.
+// mvt.orientAreaRings.
 
 const EdgeKey = struct { ax: i64, ay: i64, bx: i64, by: i64 };
 
@@ -489,42 +585,178 @@ fn canonEdge(a: Pt, b: Pt) EdgeKey {
     return .{ .ax = b.x, .ay = b.y, .bx = a.x, .by = a.y };
 }
 
+/// The line through an edge, canonicalised so every collinear edge shares one
+/// key: direction reduced by gcd with a fixed sign, plus the line's offset.
+const LineKey = struct { dx: i64, dy: i64, c: i128 };
+
+fn lineKeyOf(a: Pt, b: Pt) LineKey {
+    var dx: i64 = b.x - a.x;
+    var dy: i64 = b.y - a.y;
+    const g: i64 = @intCast(std.math.gcd(@abs(dx), @abs(dy)));
+    dx = @divExact(dx, g);
+    dy = @divExact(dy, g);
+    if (dx < 0 or (dx == 0 and dy < 0)) {
+        dx = -dx;
+        dy = -dy;
+    }
+    // c = d × a is constant along the line for the canonical d.
+    const c: i128 = @as(i128, dx) * a.y - @as(i128, dy) * a.x;
+    return .{ .dx = dx, .dy = dy, .c = c };
+}
+
+/// Split every edge of a collinear group at every group endpoint interior to
+/// it, so partially-overlapping collinear edges become exactly coincident
+/// pieces the mod-2 reduction can cancel. The sweep subdivides edges pairwise
+/// as it discovers them, but a bundle of 3+ coincident edges (two rings of one
+/// operand sharing a tile-edge run with the other operand) can finish the sweep
+/// subdivided inconsistently; this pass makes the reduction see one common
+/// subdivision. All split points are existing endpoints — exact, no rounding.
+fn splitCollinearGroup(sa: Allocator, group: []const HEdge, out: *std.ArrayList(HEdge)) !void {
+    // Parametrise along the canonical direction: t = d · p (monotonic, exact,
+    // and on one line a parameter identifies its point uniquely).
+    const Cut = struct { t: i128, p: Pt };
+    var cuts = std.ArrayList(Cut).empty;
+    const k = lineKeyOf(group[0].a, group[0].b);
+    for (group) |e| {
+        for ([_]Pt{ e.a, e.b }) |p| {
+            try cuts.append(sa, .{ .t = @as(i128, k.dx) * p.x + @as(i128, k.dy) * p.y, .p = p });
+        }
+    }
+    std.mem.sort(Cut, cuts.items, {}, struct {
+        fn lt(_: void, x: Cut, y: Cut) bool {
+            return x.t < y.t;
+        }
+    }.lt);
+    for (group) |e| {
+        var ta = @as(i128, k.dx) * e.a.x + @as(i128, k.dy) * e.a.y;
+        var tb = @as(i128, k.dx) * e.b.x + @as(i128, k.dy) * e.b.y;
+        var pa = e.a;
+        var pb = e.b;
+        if (ta > tb) {
+            std.mem.swap(i128, &ta, &tb);
+            std.mem.swap(Pt, &pa, &pb);
+        }
+        var prev = pa;
+        var prev_t = ta;
+        for (cuts.items) |cut| {
+            if (cut.t <= prev_t) continue;
+            if (cut.t >= tb) break;
+            try out.append(sa, .{ .a = prev, .b = cut.p });
+            prev = cut.p;
+            prev_t = cut.t;
+        }
+        try out.append(sa, .{ .a = prev, .b = pb });
+    }
+}
+
+/// Reduce an edge multiset to its even-odd boundary: group collinear edges,
+/// split each group to one common subdivision (splitCollinearGroup), and cancel
+/// exactly coincident pieces modulo 2 — a doubled edge flips membership twice
+/// and is no boundary. Output is deterministically sorted (a function of the
+/// input SET alone). The non-overlapping common case stays cheap: one key sort,
+/// no splitting. Result is allocated in `sa`.
+fn reduceEdges(sa: Allocator, raw: []const HEdge) ![]HEdge {
+    const keys = try sa.alloc(LineKey, raw.len);
+    for (raw, 0..) |e, i| keys[i] = lineKeyOf(e.a, e.b);
+    const idx = try sa.alloc(usize, raw.len);
+    for (idx, 0..) |*v, i| v.* = i;
+    const Ctx = struct { keys: []const LineKey, raw: []const HEdge };
+    std.mem.sort(usize, idx, Ctx{ .keys = keys, .raw = raw }, struct {
+        fn lt(ctx: Ctx, x: usize, y: usize) bool {
+            const a = ctx.keys[x];
+            const b = ctx.keys[y];
+            if (a.dx != b.dx) return a.dx < b.dx;
+            if (a.dy != b.dy) return a.dy < b.dy;
+            if (a.c != b.c) return a.c < b.c;
+            const ea = canonEdge(ctx.raw[x].a, ctx.raw[x].b);
+            const eb = canonEdge(ctx.raw[y].a, ctx.raw[y].b);
+            if (ea.ax != eb.ax) return ea.ax < eb.ax;
+            if (ea.ay != eb.ay) return ea.ay < eb.ay;
+            if (ea.bx != eb.bx) return ea.bx < eb.bx;
+            return ea.by < eb.by;
+        }
+    }.lt);
+
+    var out = std.ArrayList(HEdge).empty;
+    var grp = std.ArrayList(HEdge).empty;
+    var pieces = std.ArrayList(HEdge).empty;
+    var i: usize = 0;
+    while (i < idx.len) {
+        var j = i + 1;
+        while (j < idx.len and std.meta.eql(keys[idx[i]], keys[idx[j]])) j += 1;
+        if (j - i == 1) {
+            try out.append(sa, raw[idx[i]]);
+            i = j;
+            continue;
+        }
+        grp.clearRetainingCapacity();
+        for (idx[i..j]) |ri| try grp.append(sa, raw[ri]);
+        pieces.clearRetainingCapacity();
+        try splitCollinearGroup(sa, grp.items, &pieces);
+        // Cancel coincident pieces mod 2: sort canonically, keep odd-count runs.
+        std.mem.sort(HEdge, pieces.items, {}, struct {
+            fn lt(_: void, x: HEdge, y: HEdge) bool {
+                const ea = canonEdge(x.a, x.b);
+                const eb = canonEdge(y.a, y.b);
+                if (ea.ax != eb.ax) return ea.ax < eb.ax;
+                if (ea.ay != eb.ay) return ea.ay < eb.ay;
+                if (ea.bx != eb.bx) return ea.bx < eb.bx;
+                return ea.by < eb.by;
+            }
+        }.lt);
+        var p: usize = 0;
+        while (p < pieces.items.len) {
+            var q = p + 1;
+            const kp = canonEdge(pieces.items[p].a, pieces.items[p].b);
+            while (q < pieces.items.len and std.meta.eql(kp, canonEdge(pieces.items[q].a, pieces.items[q].b))) q += 1;
+            if ((q - p) % 2 == 1) try out.append(sa, pieces.items[p]);
+            p = q;
+        }
+        i = j;
+    }
+    return out.items;
+}
+
 const HEdge = struct { a: Pt, b: Pt, used: bool = false };
 
-fn connectEdges(gpa: Allocator, all: []const *SweepEvent) ![][]Pt {
+/// Is `v` within ~2 units of segment a-b (perpendicular distance ≤ 2 with the
+/// projection inside the segment, or within ~2.8 of an endpoint)? Exact i128.
+fn nearSegment(v: Pt, a: Pt, b: Pt) bool {
+    const da: i128 = (@as(i128, v.x) - a.x) * (@as(i128, v.x) - a.x) + (@as(i128, v.y) - a.y) * (@as(i128, v.y) - a.y);
+    if (da <= 8) return true;
+    const db: i128 = (@as(i128, v.x) - b.x) * (@as(i128, v.x) - b.x) + (@as(i128, v.y) - b.y) * (@as(i128, v.y) - b.y);
+    if (db <= 8) return true;
+    const abx: i128 = @as(i128, b.x) - a.x;
+    const aby: i128 = @as(i128, b.y) - a.y;
+    const len2 = abx * abx + aby * aby;
+    if (len2 == 0) return false;
+    const avx: i128 = @as(i128, v.x) - a.x;
+    const avy: i128 = @as(i128, v.y) - a.y;
+    const cross = abx * avy - aby * avx;
+    if (cross * cross > 4 * len2) return false;
+    const dot = abx * avx + aby * avy;
+    return dot >= 0 and dot <= len2;
+}
+
+fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
 
-    // (1) Reduce result edges modulo 2.
-    var parity = std.AutoHashMap(EdgeKey, void).init(sa);
+    // (1) Collect the result edges and reduce them to the even-odd boundary:
+    // reduceEdges splits collinear bundles to one common subdivision and cancels
+    // coincident pieces modulo 2 (the doubled edges an even-odd operand
+    // contributes at a shared seam). Its deterministically sorted output also
+    // fixes the trace order (ring order / start vertex) as a function of
+    // geometry alone — the byte-stability the bake==live contract needs.
+    var raw = std.ArrayList(HEdge).empty;
     for (all) |e| {
         if (!(e.left and e.in_result)) continue;
         if (e.p.eql(e.other.p)) continue;
-        const key = canonEdge(e.p, e.other.p);
-        if (parity.contains(key)) {
-            _ = parity.remove(key);
-        } else {
-            try parity.put(key, {});
-        }
+        try raw.append(sa, .{ .a = e.p, .b = e.other.p });
     }
-
     var edges = std.ArrayList(HEdge).empty;
-    var it = parity.keyIterator();
-    while (it.next()) |k| {
-        try edges.append(sa, .{ .a = .{ .x = k.ax, .y = k.ay }, .b = .{ .x = k.bx, .y = k.by } });
-    }
-    // Sort so the trace order (and hence ring order / start vertex) is a function
-    // of geometry alone, not of hash-map iteration — the byte-stability the
-    // bake==live contract needs.
-    std.mem.sort(HEdge, edges.items, {}, struct {
-        fn lt(_: void, x: HEdge, y: HEdge) bool {
-            if (x.a.x != y.a.x) return x.a.x < y.a.x;
-            if (x.a.y != y.a.y) return x.a.y < y.a.y;
-            if (x.b.x != y.b.x) return x.b.x < y.b.x;
-            return x.b.y < y.b.y;
-        }
-    }.lt);
+    try edges.appendSlice(sa, try reduceEdges(sa, raw.items));
 
     var adj = std.AutoHashMap(Pt, std.ArrayList(usize)).init(sa);
     for (edges.items, 0..) |e, idx| {
@@ -532,6 +764,169 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent) ![][]Pt {
             const gop = try adj.getOrPut(p);
             if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(usize).empty;
             try gop.value_ptr.append(sa, idx);
+        }
+    }
+
+    // (2a) Seam parity repair — FINAL pass only. The robust retry decides every
+    // NORMAL edge exactly by region sampling, but coincident cross-operand seam
+    // edges keep the sweep's transition typing, which snap debris on a diagonal
+    // seam can corrupt. Parity pins them down: on a correct boundary every
+    // vertex has even degree, so a seam edge whose BOTH endpoints are odd is
+    // included/excluded wrongly — toggling it flips both endpoint parities
+    // (monotone: odd count strictly drops by two per toggle, so this
+    // terminates). Seam edges not incident to odd vertices keep their typing.
+    if (stitch) {
+        var present = std.AutoHashMap(EdgeKey, usize).init(sa);
+        for (edges.items, 0..) |e, idx| try present.put(canonEdge(e.a, e.b), idx);
+        var deg = std.AutoHashMap(Pt, u32).init(sa);
+        for (edges.items) |e| {
+            for ([_]Pt{ e.a, e.b }) |pp| {
+                const gop = try deg.getOrPut(pp);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
+        }
+        var seams = std.ArrayList(HEdge).empty;
+        {
+            var seen = std.AutoHashMap(EdgeKey, void).init(sa);
+            for (all) |e| {
+                if (!e.left) continue;
+                if (e.edge_type == .normal and !e.undecided) continue;
+                if (e.p.eql(e.other.p)) continue;
+                const k = canonEdge(e.p, e.other.p);
+                if (seen.contains(k)) continue;
+                try seen.put(k, {});
+                try seams.append(sa, .{ .a = e.p, .b = e.other.p });
+            }
+        }
+        std.mem.sort(HEdge, seams.items, {}, struct {
+            fn lt(_: void, x: HEdge, y: HEdge) bool {
+                const ka = canonEdge(x.a, x.b);
+                const kb = canonEdge(y.a, y.b);
+                if (ka.ax != kb.ax) return ka.ax < kb.ax;
+                if (ka.ay != kb.ay) return ka.ay < kb.ay;
+                if (ka.bx != kb.bx) return ka.bx < kb.bx;
+                return ka.by < kb.by;
+            }
+        }.lt);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (seams.items) |se| {
+                const da = deg.get(se.a) orelse 0;
+                const db = deg.get(se.b) orelse 0;
+                if (da % 2 == 0 or db % 2 == 0) continue;
+                const k = canonEdge(se.a, se.b);
+                if (present.get(k)) |idx| {
+                    // Included wrongly: remove (swap-remove keeps indices dense).
+                    _ = present.remove(k);
+                    const last = edges.items.len - 1;
+                    if (idx != last) {
+                        edges.items[idx] = edges.items[last];
+                        try present.put(canonEdge(edges.items[idx].a, edges.items[idx].b), idx);
+                    }
+                    edges.items.len = last;
+                    deg.getPtr(se.a).?.* -= 1;
+                    deg.getPtr(se.b).?.* -= 1;
+                } else {
+                    try edges.append(sa, .{ .a = se.a, .b = se.b });
+                    try present.put(k, edges.items.len - 1);
+                    for ([_]Pt{ se.a, se.b }) |pp| {
+                        const gop = try deg.getOrPut(pp);
+                        if (!gop.found_existing) gop.value_ptr.* = 0;
+                        gop.value_ptr.* += 1;
+                    }
+                }
+                changed = true;
+            }
+        }
+        // Rebuild adjacency over the repaired edge set (sorted for determinism).
+        std.mem.sort(HEdge, edges.items, {}, struct {
+            fn lt(_: void, x: HEdge, y: HEdge) bool {
+                if (x.a.x != y.a.x) return x.a.x < y.a.x;
+                if (x.a.y != y.a.y) return x.a.y < y.a.y;
+                if (x.b.x != y.b.x) return x.b.x < y.b.x;
+                return x.b.y < y.b.y;
+            }
+        }.lt);
+        adj.clearRetainingCapacity();
+        for (edges.items, 0..) |e, idx| {
+            for ([_]Pt{ e.a, e.b }) |pp| {
+                const gop = try adj.getOrPut(pp);
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(usize).empty;
+                try gop.value_ptr.append(sa, idx);
+            }
+        }
+    }
+
+    // (2) Micro-stitch snap-divergence gaps — FINAL pass only (the flag-driven
+    // first pass must dead-end loudly so the robust retry can recompute its
+    // memberships; stitching there would paper over flag corruption). Crossings
+    // of near-parallel edges can snap to ADJACENT lattice points, leaving stub
+    // edges whose endpoints miss their partners by a few units — odd-degree
+    // vertices in close pairs. Pairing each with its nearest odd peer within
+    // the snap radius and adding the connecting micro-edge closes the walk with
+    // bounded (sub-pixel) error; anything farther apart is a real defect and
+    // stays a countable dead end.
+    if (stitch) {
+        var odd = std.ArrayList(Pt).empty;
+        var deg_it = adj.iterator();
+        while (deg_it.next()) |entry| {
+            if (entry.value_ptr.items.len % 2 != 0) try odd.append(sa, entry.key_ptr.*);
+        }
+        std.mem.sort(Pt, odd.items, {}, struct {
+            fn lt(_: void, x: Pt, y: Pt) bool {
+                if (x.x != y.x) return x.x < y.x;
+                return x.y < y.y;
+            }
+        }.lt);
+        const micro_r2: i128 = 16 * 16;
+        const cert_r2: i128 = 1024 * 1024;
+        var paired = try sa.alloc(bool, odd.items.len);
+        @memset(paired, false);
+        for (odd.items, 0..) |v, i| {
+            if (paired[i]) continue;
+            var best: ?usize = null;
+            var best_d2: i128 = cert_r2 + 1;
+            for (odd.items[i + 1 ..], i + 1..) |w, j| {
+                if (paired[j]) continue;
+                const dx: i128 = w.x - v.x;
+                const dy: i128 = w.y - v.y;
+                const d2 = dx * dx + dy * dy;
+                if (d2 >= best_d2) continue;
+                if (d2 > micro_r2) {
+                    // Beyond the blind micro radius a stitch is allowed only
+                    // along real boundary geometry: each endpoint AND the
+                    // stitch midpoint must lie on (subdivided) input segments,
+                    // so the stitch tracks an actual edge run — possibly across
+                    // a polyline vertex — rather than inventing a chord.
+                    const m: Pt = .{ .x = @divTrunc(v.x + w.x, 2), .y = @divTrunc(v.y + w.y, 2) };
+                    var okv = false;
+                    var okw = false;
+                    var okm = false;
+                    for (all) |ev| {
+                        if (!ev.left) continue;
+                        if (!okv and nearSegment(v, ev.p, ev.other.p)) okv = true;
+                        if (!okw and nearSegment(w, ev.p, ev.other.p)) okw = true;
+                        if (!okm and nearSegment(m, ev.p, ev.other.p)) okm = true;
+                        if (okv and okw and okm) break;
+                    }
+                    if (!(okv and okw and okm)) continue;
+                }
+                best_d2 = d2;
+                best = j;
+            }
+            const j = best orelse continue;
+            paired[i] = true;
+            paired[j] = true;
+            stitched_gaps += 1;
+            const idx = edges.items.len;
+            try edges.append(sa, .{ .a = v, .b = odd.items[j] });
+            for ([_]Pt{ v, odd.items[j] }) |pp| {
+                const gop = try adj.getOrPut(pp);
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(usize).empty;
+                try gop.value_ptr.append(sa, idx);
+            }
         }
     }
 
@@ -559,7 +954,13 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent) ![][]Pt {
                     break;
                 }
             }
-            const ei = picked orelse break;
+            const ei = picked orelse {
+                open_chain_walks += 1; // dead end: the emitted chain closes on a chord
+                const cdx: i128 = cur.x - loop_start.x;
+                const cdy: i128 = cur.y - loop_start.y;
+                if (cdx * cdx + cdy * cdy > 32 * 32) large_open_chains += 1;
+                break;
+            };
             edges.items[ei].used = true;
             cur = if (edges.items[ei].a.eql(cur)) edges.items[ei].b else edges.items[ei].a;
             if (cur.eql(loop_start)) break; // closed on a real edge
@@ -629,6 +1030,59 @@ pub fn pointInEvenOdd(rings: []const []const Pt, x: i64, y: i64) bool {
         }
     }
     return inside;
+}
+
+/// Even-odd containment of the DOUBLED-scale point (x2,y2) in a ring-set whose
+/// coordinates are at 1× — i.e. containment of the exact rational midpoint
+/// (x2/2, y2/2). Ring coordinates are doubled in the arithmetic (×2 stays in
+/// i64; the crossing products promote to i128 as everywhere else). This is the
+/// robust-fallback membership test: exact, no rounding.
+fn pointInEvenOddScaled2(rings: []const []const Pt, x2: i64, y2: i64) bool {
+    var inside = false;
+    for (rings) |ring| {
+        if (ring.len < 3) continue;
+        var j = ring.len - 1;
+        for (ring, 0..) |pi, i| {
+            const pj = ring[j];
+            j = i;
+            const yi = 2 * pi.y;
+            const yj = 2 * pj.y;
+            if ((yi > y2) != (yj > y2)) {
+                const dy: i128 = @as(i128, yj) - yi;
+                const lhs: i128 = (@as(i128, x2) - 2 * pi.x) * dy;
+                const rhs: i128 = (@as(i128, y2) - yi) * (@as(i128, 2 * pj.x) - 2 * pi.x);
+                if (dy > 0) {
+                    if (lhs < rhs) inside = !inside;
+                } else {
+                    if (lhs > rhs) inside = !inside;
+                }
+            }
+        }
+    }
+    return inside;
+}
+
+/// True if the DOUBLED-scale point (x2,y2) lies exactly on an edge of the
+/// 1×-coordinate ring-set (pointOnEdge at the rational midpoint).
+fn pointOnEdgeScaled2(rings: []const []const Pt, x2: i64, y2: i64) bool {
+    for (rings) |ring| {
+        if (ring.len < 2) continue;
+        var j = ring.len - 1;
+        for (ring, 0..) |pi, i| {
+            const pj = ring[j];
+            j = i;
+            const ax = 2 * pj.x;
+            const ay = 2 * pj.y;
+            const bx = 2 * pi.x;
+            const by = 2 * pi.y;
+            const cross: i128 = (@as(i128, bx) - ax) * (@as(i128, y2) - ay) - (@as(i128, by) - ay) * (@as(i128, x2) - ax);
+            if (cross != 0) continue;
+            if (x2 < @min(ax, bx) or x2 > @max(ax, bx)) continue;
+            if (y2 < @min(ay, by) or y2 > @max(ay, by)) continue;
+            return true;
+        }
+    }
+    return false;
 }
 
 /// True if (x,y) lies exactly on any edge of the ring-set. Used by tests to
@@ -896,6 +1350,55 @@ test "fuzz: even-odd(result) == even-odd(A) op even-odd(B), A/B cleaned via unio
                     if (want != got) {
                         std.debug.print("MISMATCH trial={} op={} at ({},{}): want={} got={}\n", .{ trial, op, qx, qy, want, got });
                         std.debug.print("  A={any}\n  B={any}\n  R={any}\n", .{ A, B, r });
+                        return error.BooleanMismatch;
+                    }
+                }
+            }
+        }
+        _ = arena_state.reset(.retain_capacity);
+    }
+}
+
+test "fuzz: raw even-odd operands — self-overlapping rings within one operand" {
+    // Operands are the boxes THEMSELVES (no unionAll cleaning): rings of one
+    // operand may overlap in area, cross, and share collinear runs — the shape a
+    // baked MVT polygon presents when several of its rings run along one tile
+    // clip edge. Even-odd oracle: a point is inside an operand iff it is in an
+    // odd number of that operand's boxes.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0xDEADFA11);
+    const rnd = prng.random();
+    const grid: i64 = 64;
+    const ops = [_]Op{ .unite, .intersect, .diff, .sym_diff };
+
+    var trial: usize = 0;
+    while (trial < 1500) : (trial += 1) {
+        const bagA = randBoxBag(rnd, grid);
+        const bagB = randBoxBag(rnd, grid);
+        var backA: [3][1][]const Pt = undefined;
+        var backB: [3][1][]const Pt = undefined;
+        const psA = bagA.polys(&backA);
+        const psB = bagB.polys(&backB);
+        // Flatten each bag's rings into ONE even-odd operand, uncleaned.
+        var ringsA = std.ArrayList([]const Pt).empty;
+        for (psA[0..bagA.n]) |p| try ringsA.appendSlice(a, p);
+        var ringsB = std.ArrayList([]const Pt).empty;
+        for (psB[0..bagB.n]) |p| try ringsB.appendSlice(a, p);
+        for (ops) |op| {
+            const r = try compute(a, ringsA.items, ringsB.items, op);
+            var qy: i64 = -9 * grid;
+            while (qy <= 12 * grid) : (qy += 17) {
+                var qx: i64 = -9 * grid;
+                while (qx <= 12 * grid) : (qx += 17) {
+                    if (pointOnEdge(ringsA.items, qx, qy) or pointOnEdge(ringsB.items, qx, qy) or pointOnEdge(r, qx, qy)) continue;
+                    const want = combine(op, pointInEvenOdd(ringsA.items, qx, qy), pointInEvenOdd(ringsB.items, qx, qy));
+                    const got = pointInEvenOdd(r, qx, qy);
+                    if (want != got) {
+                        std.debug.print("RAW MISMATCH trial={} op={} at ({},{}): want={} got={}\n", .{ trial, op, qx, qy, want, got });
+                        std.debug.print("  A={any}\n  B={any}\n  R={any}\n", .{ ringsA.items, ringsB.items, r });
                         return error.BooleanMismatch;
                     }
                 }

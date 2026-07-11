@@ -283,6 +283,11 @@ pub const Reader = struct {
     header: Header,
     root: []Entry,
     arena: std.heap.ArenaAllocator,
+    // Deserialized leaf directories by leaf offset. A compositor probes a reader once
+    // per (tile, pass); re-deserializing the same leaf into the arena on EVERY probe
+    // grew it without bound on directory-heavy archives, so each leaf is decoded once
+    // and reused. Arena-backed (freed wholesale by deinit).
+    leaves: std.AutoHashMapUnmanaged(u64, []Entry) = .empty,
 
     pub fn init(gpa: Allocator, bytes: []const u8) !Reader {
         const header = try Header.parse(bytes);
@@ -314,10 +319,15 @@ pub const Reader = struct {
             const idx = findEntry(dir, tid) orelse return null;
             const e = dir[idx];
             if (e.run_length == 0) {
-                // leaf directory pointer
+                // leaf directory pointer — decoded once per distinct leaf, then cached
                 const a = r.arena.allocator();
-                const raw = try maybeDecompress(a, r.bytes[@intCast(r.header.leaf_dir_offset + e.offset)..][0..e.length], r.header.internal_compression);
-                dir = try deserializeDir(a, raw);
+                const gop = try r.leaves.getOrPut(a, e.offset);
+                if (!gop.found_existing) {
+                    errdefer _ = r.leaves.remove(e.offset);
+                    const raw = try maybeDecompress(a, r.bytes[@intCast(r.header.leaf_dir_offset + e.offset)..][0..e.length], r.header.internal_compression);
+                    gop.value_ptr.* = try deserializeDir(a, raw);
+                }
+                dir = gop.value_ptr.*;
                 continue;
             }
             if (tid < e.tile_id + e.run_length) {
@@ -357,7 +367,8 @@ fn findEntry(dir: []const Entry, tid: u64) ?usize {
 
 // ---- writer -------------------------------------------------------------
 
-pub const InputTile = struct { z: u8, x: u32, y: u32, mvt: []const u8 };
+// A whole-tile input for the batch `write` below (test-only; the live path is StreamWriter).
+const InputTile = struct { z: u8, x: u32, y: u32, mvt: []const u8 };
 
 pub const WriteOptions = struct {
     metadata_json: []const u8 = "{}",
@@ -366,6 +377,7 @@ pub const WriteOptions = struct {
     max_lon_e7: i32 = 1800000000,
     max_lat_e7: i32 = 850000000,
     tile_type: TileType = .mvt, // .mlt for MapLibre Tile output
+    center_zoom: ?u8 = null, // header center zoom; defaults to the archive's min zoom
 };
 
 /// Streaming archive writer: feed tiles one at a time (each gzipped + content-
@@ -471,7 +483,12 @@ pub const StreamWriter = struct {
             }
             try merged.append(a, e);
         }
+        defer merged.deinit(a);
         const dirs = try buildDirectories(a, merged.items);
+        // `dirs` + `merged` are copied into `out` below, so free them once the archive prefix
+        // is assembled (they are heap-owned by `a`; `leaves` may be the empty sentinel).
+        defer a.free(dirs.root);
+        defer if (dirs.leaves.len > 0) a.free(dirs.leaves);
         const metadata = opts.metadata_json;
         const root_off: u64 = HEADER_LEN;
         const meta_off: u64 = root_off + dirs.root.len;
@@ -500,7 +517,7 @@ pub const StreamWriter = struct {
             .min_lat_e7 = opts.min_lat_e7,
             .max_lon_e7 = opts.max_lon_e7,
             .max_lat_e7 = opts.max_lat_e7,
-            .center_zoom = min_z,
+            .center_zoom = opts.center_zoom orelse min_z,
             .center_lon_e7 = @divTrunc(opts.min_lon_e7 + opts.max_lon_e7, 2),
             .center_lat_e7 = @divTrunc(opts.min_lat_e7 + opts.max_lat_e7, 2),
         };
@@ -530,8 +547,10 @@ pub const StreamWriter = struct {
     }
 };
 
-/// Build a PMTiles archive from MVT tiles (gzipped + deduped). Caller owns it.
-pub fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8 {
+// Build a PMTiles archive from a whole set of MVT tiles in one call (gzipped +
+// deduped). The live baker streams via StreamWriter instead; this stays as a
+// self-contained round-trip fixture for the reader tests below.
+fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -618,14 +637,14 @@ pub fn write(gpa: Allocator, tiles: []const InputTile, opts: WriteOptions) ![]u8
         .clustered = 1,
         .internal_compression = .none,
         .tile_compression = .gzip,
-        .tile_type = .mvt,
+        .tile_type = opts.tile_type,
         .min_zoom = min_z,
         .max_zoom = max_z,
         .min_lon_e7 = opts.min_lon_e7,
         .min_lat_e7 = opts.min_lat_e7,
         .max_lon_e7 = opts.max_lon_e7,
         .max_lat_e7 = opts.max_lat_e7,
-        .center_zoom = min_z,
+        .center_zoom = opts.center_zoom orelse min_z,
         .center_lon_e7 = @divTrunc(opts.min_lon_e7 + opts.max_lon_e7, 2),
         .center_lat_e7 = @divTrunc(opts.min_lat_e7 + opts.max_lat_e7, 2),
     };
@@ -726,6 +745,18 @@ test "large archive shards the root into leaf directories and still round-trips"
     }
     // An absent tile in the sharded archive still resolves to null.
     try std.testing.expect((try r.getTile(gpa, 15, 1, 1)) == null);
+
+    // Repeated probes reuse the cached leaf decodes — the arena must not grow once
+    // every touched leaf is resident. (A compositor probes a reader once per
+    // (tile, pass); re-deserializing a leaf per probe was unbounded growth.)
+    const probes = [_]u32{ 0, 4095, 4096, 12345, N - 1 };
+    for (probes) |i| _ = try r.getCompressed(15, i, 0);
+    const cap_before = r.arena.queryCapacity();
+    for (0..100) |_| {
+        for (probes) |i| _ = try r.getCompressed(15, i, 0);
+        _ = try r.getCompressed(15, 1, 1); // absent probes walk the directory too
+    }
+    try std.testing.expectEqual(cap_before, r.arena.queryCapacity());
 }
 
 test "header serialize/parse round-trip" {

@@ -1,9 +1,9 @@
 <h1 align="center">tile57</h1>
 
 <p align="center">
-  <b>⚓ A high-performance, low-memory S-57/S-101 chart engine: vector tiles, S-52 styles, PNG and PDF.</b><br>
-  tile57 turns IHO S-57 ENC cells into Mapbox Vector Tiles with a matching MapLibre S-52
-  style, or renders finished charts directly to PNG and PDF — one Zig library with a
+  <b>⚓ An S-57/S-101 chart engine: vector tiles, S-52 styles, PNG and PDF.</b><br>
+  tile57 turns IHO S-57 ENC cells into vector tiles (MLT or MVT) with a matching MapLibre
+  S-52 style, or renders finished charts directly to PNG and PDF — one Zig library with a
   C ABI, compiled natively or to WASM.
 </p>
 
@@ -48,11 +48,10 @@ entirely with AI assistance. A few specific goals shape its design:
 - **Language-agnostic embedding.** A thin C ABI (`libtile57.a`) bridges the Zig core to any
   language with C FFI. Go bindings ship in the repo; others are straightforward additions.
 
-- **An engine anyone can build on.** The end goal is an easy-to-use S-57/S-100 chart
-  rendering engine that anyone can use to build their marine app ideas — without first
-  becoming an IHO spec expert. Open a chart, get tiles, PNGs, or PDFs; the S-52 rules,
-  portrayal catalogue, and mariner settings are the engine's problem. Ideas it should make
-  easy:
+- **An engine to build on.** The goal is an S-57/S-100 chart engine you can use to build
+  a marine app without first becoming an IHO spec expert. Open a chart, get tiles, PNGs,
+  or PDFs; the S-52 rules, portrayal catalogue, and mariner settings are the engine's
+  problem. It aims to support:
   - an **anchor alarm** that draws your swing circle over a real chart,
   - a **Windy plugin** overlaying forecast weather on ENC charts,
   - a **native cross-platform Qt6 C++ chartplotter**,
@@ -61,24 +60,24 @@ entirely with AI assistance. A few specific goals shape its design:
 ---
 
 **tile57** decodes NOAA/IHO **S-57** ENC cells and generates **vector tiles** by
-`(z, x, y)` — MapLibre Tiles (MLT, the default bake format; MapLibre GL JS ≥ 5.12
-decodes them natively) or Mapbox Vector Tiles (`--format mvt`) — running the
+`(z, x, y)` — MapLibre Tiles (MLT, the default; MapLibre GL JS ≥ 5.12
+decodes them natively) or Mapbox Vector Tiles — running the
 official IHO **S-101 Portrayal Catalogue** in embedded Lua to produce S-52
 nautical portrayal. Alongside the tiles it emits a **MapLibre GL style** and the
 portrayal **assets** it references — colour tables, line styles, and the sprite
 + area-fill pattern atlases — so a renderer like
 [MapLibre](https://github.com/maplibre/maplibre-native) can draw a chart directly.
 
-It is **high-performance and low-memory** by design:
+It holds only its working set:
 
 - **Lazy, per-cell work.** A multi-cell ENC_ROOT is indexed cheaply (band + bbox);
   cells are parsed and portrayed only when a requested tile needs them, then held
   under an LRU bound. A **streaming** open reads a cell's bytes on demand (and
   frees them on eviction), so a host holds only the working set — not the whole
   catalogue.
-- **Band-streamed bakes.** Baking an ENC_ROOT to one PMTiles archive streams
-  band-by-band (finest → coarsest, best-band dedup), so peak memory tracks the
-  largest single band.
+- **Per-cell bakes.** Each ENC cell bakes to its own PMTiles at its compilation
+  scale, so a bake holds one cell at a time; the runtime compositor stitches the
+  cells by `(z, x, y)` on demand.
 - **Pure-Zig core.** The foundational format/encode packages have no libc; only
   the Lua portrayal + sprite rasterizer pull in C.
 
@@ -86,21 +85,24 @@ It is **high-performance and low-memory** by design:
 
 ```
 S-57 ENC cell (.000)
-   │  ISO 8211 decode                    src/s57/iso8211.zig
+   │  ISO 8211 decode                    src/iso8211/
    ▼
 S-57 feature + geometry model            src/s57/
-   │  S-101 portrayal (embedded Lua)     src/portray/ + src/s100/
+   │  adapt S-57 → S-101 features        src/s101/ (adapter)
    ▼
-portrayal instruction stream
+S-101 feature records
+   │  S-101 portrayal (embedded Lua)     src/portray/ + rules
+   ▼
+portrayal instruction stream             src/s101/ (instructions)
    │  scene generation                   src/scene/  (project + clip + draw calls)
    ▼
 render Surface ──► MVT / MLT tiles (src/tiles/)  +  MapLibre style.json + assets
              └───► PNG raster / vector PDF / terminal text (src/render/)
 ```
 
-The stages are separate Zig modules — `s57` (including its ISO 8211 decoder),
-`s100`, `tiles`, `render`, `scene`, `assets` — pure Zig with no libc; only the
-Lua portrayal (`portray`) and the sprite rasterizer (`sprite`) pull in C. See
+The stages are separate Zig modules — `iso8211`, `s57`, `s101`, `tiles`,
+`render`, `scene`, `style` — pure Zig with no libc; only the Lua portrayal
+(`portray`) and the sprite rasterizer (`sprite`) pull in C. See
 [the architecture docs](docs/docs/architecture.md).
 
 ## Use it from Zig
@@ -114,32 +116,36 @@ const tile57 = @import("tile57");
 var chart = try tile57.Chart.openPath("ENC_ROOT/", null, true);
 defer chart.deinit();
 
-if (try chart.tile(z, x, y)) |mvt| {   // decompressed MVT bytes, or null if empty
-    defer tile57.freeBytes(mvt);
-    // … hand to your renderer …
-}
+const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
+// … render a view (chart.renderView), query features, or bake an archive …
 ```
 
-`Chart.openPath` streams cells on demand (working-set only); `Chart.openBytes` opens a
-single in-memory cell. See [the Zig API docs](docs/docs/zig-api.md).
+`Chart` renders views, queries features, and reads metadata. The runtime tile
+path — bake each cell, then compose by `(z, x, y)` on demand — is exposed through
+the [C ABI](include/tile57.h). See [the Zig API docs](docs/docs/zig-api.md).
 
 ## Use it from C
 
-The same engine behind a thin C ABI ([`include/tile57.h`](include/tile57.h)):
+The same engine behind a thin C ABI ([`include/tile57.h`](include/tile57.h)).
+Tiles are made one way — bake each cell to its own PMTiles, then compose on
+demand — the structure `tile57 bake ENC_ROOT -o out/` writes:
 
 ```c
-// Open an on-disk ENC_ROOT directory (or a single .000 file).
-tile57_chart *chart = tile57_chart_open("ENC_ROOT/");
-uint8_t *mvt; size_t n;
-if (tile57_chart_tile(chart, z, x, y, &mvt, &n) == TILE57_TILE_OK) {
-    /* … render mvt … */
-    tile57_free(mvt, n);
+// out/ holds tiles/<CELL>.pmtiles (one per cell) + partition.tpart
+const char *paths[] = { "out/tiles/US5MD1MC.pmtiles" };
+tile57_compose_source *src = tile57_compose_open(paths, 1, "out/partition.tpart");
+
+uint8_t *tile; size_t n;
+if (tile57_compose_serve(src, z, x, y, &tile, &n) == 1) {   /* decompressed MLT */
+    /* … hand the tile to your renderer … */
+    tile57_free(tile, n);
 }
-tile57_chart_close(chart);
+tile57_compose_close(src);
 ```
 
-`libtile57.a` also exposes the ENC_ROOT bake, the MapLibre style builder, and the
-asset/atlas generators. See [the C API docs](docs/docs/c-api.md).
+A separate `tile57_chart` handle renders finished PNG/PDF views and answers
+metadata + object queries; `libtile57.a` also exposes the MapLibre style builder
+and the asset/atlas generators. See [the C API docs](docs/docs/c-api.md).
 
 ## The `tile57` CLI
 
@@ -147,8 +153,8 @@ The offline tool bakes charts and emits portrayal assets:
 
 ```sh
 zig build                                    # builds zig-out/bin/tile57
-tile57 bake CELL.000 -o out/                 # one cell -> bundle (tiles + style + assets + manifest)
-tile57 bake ENC_ROOT -o out/                 # whole catalogue, band-streamed -> same bundle
+tile57 bake CELL.000 -o out/                 # one cell -> out/tiles/<CELL>.pmtiles + partition.tpart
+tile57 bake ENC_ROOT -o out/                 # whole catalogue -> per-cell tiles/ + partition.tpart
 tile57 assets   -o assets/                   # colortables + linestyles + sprite + patterns
 tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
 tile57 pdf ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
@@ -172,7 +178,7 @@ Docs source lives in [`docs/`](docs/): [intro](docs/docs/intro.md),
 [getting started](docs/docs/getting-started.md), the
 [Zig API](docs/docs/zig-api.md), the [C API](docs/docs/c-api.md),
 the [architecture](docs/docs/architecture.md), and the
-[tile schema](docs/docs/tile-schema.md). See also [`CHANGELOG.md`](CHANGELOG.md).
+[tile schema](docs/docs/tile-schema.md).
 
 ## License
 

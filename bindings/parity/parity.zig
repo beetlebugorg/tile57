@@ -1,7 +1,7 @@
 //! style-parity — the NATIVE oracle for the wasm style engine.
 //!
 //! It embeds the SAME template + colortables as bindings/wasm/style_wasm.zig and
-//! drives the SAME `chartstyle.buildStyle` through the SAME shared settings
+//! drives the SAME `the mariner builders` through the SAME shared settings
 //! parser — only the compilation target differs (native vs wasm32). So a diff of
 //! this tool's output against the wasm/JS output for identical settings + now_unix
 //! is a true byte-for-byte parity check of the engine across the two backends.
@@ -12,8 +12,8 @@
 //!   out.json      : output path for the generated MapLibre style.json
 
 const std = @import("std");
-const assets = @import("assets");
-const chartstyle = @import("assets").chartstyle;
+const style = @import("style");
+const mariner = @import("style").mariner;
 const settings = @import("settings");
 
 const template_json = @embedFile("template_json");
@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     const out_path = args[3];
 
     const m = settings.parse(a, settings_json);
-    const style = try assets.buildFromTemplate(a, template_json, &m, colortables_json, null, now_unix);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = style });
-    std.debug.print("style-parity: wrote {s} ({d} bytes)\n", .{ out_path, style.len });
+    const style_json = try style.buildFromTemplate(a, template_json, &m, colortables_json, null, now_unix);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = style_json });
+    std.debug.print("style-parity: wrote {s} ({d} bytes)\n", .{ out_path, style_json.len });
 }

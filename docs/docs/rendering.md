@@ -1,13 +1,13 @@
 # The Rendering Engine
 
 tile57 contains a full **native S-52 rendering engine**: it draws a finished
-chart — raster PNG or vector PDF — straight from ENC cells, with no MapLibre,
+chart — raster PNG or vector PDF — straight from ENC charts, with no MapLibre,
 browser, or GPU involved. This page explains how it works, how to use it, and
 how to extend it.
 
 ## The one-paragraph version
 
-Charts are turned into **draw calls**. The *scene generator* reads cells, runs
+Charts are turned into **draw calls**. The *scene generator* reads charts, runs
 the official S-101 portrayal rules, and calls methods like `fillArea("DEPVS",
 rings)` or `drawSymbol("BOYLAT13", point)` on a **Surface**. What happens next
 depends on which Surface is listening: the tile surface *serializes* those
@@ -20,7 +20,7 @@ print. One engine, pluggable outputs.
 
 ```
              ┌──────────────────────────────────────────────┐
- ENC cells ─►│  scene generator (src/scene/)                │
+ ENC chart ─►│  scene generator (src/scene/)                │
              │  parse → S-101 portrayal (embedded Lua) →    │
              │  project → clip → draw calls, per tile/view  │
              └───────────────────┬──────────────────────────┘
@@ -85,27 +85,31 @@ byte-deterministic: the same scene renders the same file, every time.
 
 The tile path has to **freeze** the portrayal context at bake time (a tile
 archive can't re-run Lua per user), and papers over it with swappable
-properties the style toggles at runtime. The native path has no such limit:
-`render_view` runs the S-101 rules with the mariner's *actual* safety
-contour, boundary style, and point-symbol style. What you see is what the
-rules decided for *your* settings — the ECDIS-faithful path.
+properties the style toggles at runtime. The pixel path evaluates the
+mariner's display gates — palette, display category, SCAMIN, viewing groups,
+text groups, size scale — live at render time for any source. Rendering a
+live chart (the CLI on a `.000`, or `Chart.openBytes` in Zig) goes further:
+the S-101 rules themselves run with the mariner's *actual* safety contour,
+boundary style, and point-symbol style — what you see is what the rules
+decided for *your* settings, the ECDIS-faithful path. Rendering a baked
+archive replays its tiles, so the rule outcomes are the bake's; the
+swappable parts re-evaluate.
 
 ## Using it
 
 ### From the command line
 
 ```sh
-# One tile of a cell, as a 512px PNG
+# One tile of a chart, as a 512px PNG
 tile57 png US5MD1MC.000 14 4712 6280 -o tile.png --size 512
 
-# A view (any centre, fractional zoom, any size) from a whole ENC_ROOT —
-# cells are selected and quilted per band automatically
-tile57 png ~/charts/ENC_ROOT --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.png
+# A view (any centre, fractional zoom, any size) from a single chart
+tile57 png US5MD1MC.000 --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.png
 
 # The same view as a vector PDF with selectable text
-tile57 pdf ~/charts/ENC_ROOT --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.pdf
+tile57 pdf US5MD1MC.000 --view -76.48,38.974,15.1 --size 1600x1200 -o annapolis.pdf
 
-# From a baked PMTiles bundle instead of source cells (tile replay)
+# From a baked PMTiles bundle instead of the source chart (tile replay)
 tile57 png chart.pmtiles --view -76.48,38.974,15.1 --size 1024x768 -o out.png
 
 # Mariner settings
@@ -115,10 +119,13 @@ tile57 png ... --safety 5 --safety-depth 5 --feet --palette night \
 
 ### From C (and therefore Go, Python, C++, …)
 
-Two calls in `include/tile57.h`, mirroring `tile57_chart_tile`:
+Everything is bake, then render: open a baked archive as a chart and ask it
+for a view (same allocate-`*out` / free-with-`tile57_free` convention as the
+rest of the ABI):
 
 ```c
-tile57_chart *c = tile57_chart_open("/path/to/ENC_ROOT");
+tile57_chart *c = NULL;
+tile57_chart_open("US5MD1MC.pmtiles", &c, NULL);   /* a baked archive */
 
 tile57_mariner m;
 tile57_mariner_defaults(&m);
@@ -126,13 +133,18 @@ m.safety_contour = 5.0;
 m.scheme = TILE57_SCHEME_NIGHT;
 
 uint8_t *png; size_t len;
-tile57_chart_render_view(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &png, &len);
+tile57_chart_png(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &png, &len, NULL);
 /* ... write/display png ... */
-tile57_free(png, len);
+tile57_free(png);
 
 uint8_t *pdf; size_t plen;
-tile57_chart_render_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen);
+tile57_chart_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen, NULL);
 ```
+
+That renders ONE chart, no composition. A view across a whole chart library
+is the same call on the compositor — `tile57_compose_png` / `_pdf` — which
+composes every covering tile through the ownership partition first. See the
+[C API](./c-api.md).
 
 `m.size_scale` calibrates physical size (so 1 S-52 millimetre is a true
 millimetre on your display) and doubles as the @2x knob. Every field of
@@ -158,18 +170,21 @@ the ten Surface methods and you receive the full semantic stream — this is
 how MVT and MLT are done (`TileSurface` in `src/scene/scene.zig`), and how a
 GeoJSON debug dump or a GPU display list would be done.
 
-**From the C ABI:** not currently supported. Surface and Canvas are Zig
-interfaces; the C ABI exposes the products (tiles, PNG, PDF, styles, assets)
-and the inputs (charts, mariner settings), not the interfaces themselves. A
-C-callback Canvas — C function pointers receiving resolved paths and glyph
-runs — would be a mechanical addition and may come later. Until then, a
-custom output format means a small Zig file in `src/render/`, wired into the
-build in one place.
+**From the C ABI:** both interfaces are exposed as callback tables.
+`tile57_chart_canvas` drives a `tile57_canvas_cb` — C function pointers receiving
+resolved, flattened paths, patterns, and glyph outlines in pixel space, in
+paint order (the Canvas seat). `tile57_chart_surface` drives a `tile57_surface_cb` —
+the world-space, semantically tagged stream (per-feature class + SCAMIN, world
+anchors, reference-pixel outlines) a GPU host tessellates once and transforms
+per frame (the Surface seat). Both have composed twins on the compositor
+(`tile57_compose_canvas` / `tile57_compose_surface`). A custom output format in
+Zig is still one small file in `src/render/`.
 
 ## What's deliberately not here (yet)
 
 - Contour labels render horizontal (not rotated along the line).
 - No kerning (chart labels are short; Noto's advances read fine).
 - Translucent fills print opaque in PDF.
-- PMTiles replay doesn't overzoom past the archive's baked range.
+- Archive replay doesn't overzoom past the baked range (the compositor serves
+  one fill-up zoom past it).
 - The PDF embeds the whole label font (~600 KB) rather than a subset.

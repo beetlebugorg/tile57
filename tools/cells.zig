@@ -15,7 +15,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     };
     defer c.deinit();
-    const json = (c.cellsJson() catch null) orelse {
+    const json = (c.chartsJson() catch null) orelse {
         std.debug.print("no cells\n", .{});
         return;
     };

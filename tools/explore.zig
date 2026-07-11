@@ -95,7 +95,7 @@ const ExRow = struct {
     s101: []const u8, // S-101 feature-class name ("Light") or ""
     attrs: []const ExAttr,
     raw: ?[]const u8, // level 2: raw instruction stream
-    parsed: ?engine.s101_instr.Portrayal, // level 2: parsed
+    parsed: ?engine.s101_instructions.Portrayal, // level 2: parsed
     resolved: ?ExLevel3, // level 3
     thumb: ?ExThumb, // --kitty: where to render this feature's thumbnail (null = no geometry)
 };
@@ -422,7 +422,7 @@ fn exBuildRow(a: std.mem.Allocator, cell: *engine.s57.Cell, cell_name: []const u
     }
 
     const raw: ?[]const u8 = if (portrayal) |p| (if (fi < p.len) p[fi] else null) else null;
-    const parsed: ?engine.s101_instr.Portrayal = if (raw) |s| (engine.s101_instr.parse(a, s) catch null) else null;
+    const parsed: ?engine.s101_instructions.Portrayal = if (raw) |s| (engine.s101_instructions.parse(a, s) catch null) else null;
 
     const resolved: ?ExLevel3 = if (ctx) |c| try exFoldResolved(a, f, class, c) else null;
     const thumb: ?ExThumb = if (F.kitty) exThumbView(a, cell, f) else null;
@@ -709,7 +709,7 @@ fn exStreamCell(
     out: *OutBuf,
     first: *bool,
     palette: render.resolve.PaletteId,
-    m: *const render.resolve.MarinerSettings,
+    m: *const render.resolve.Settings,
 ) !void {
     const ca = ca_arena.allocator();
     const portrayal: ?[]const ?[]const u8 = engine.portray.portrayCell(ca, cell, rules) catch null;
@@ -784,7 +784,7 @@ fn viewportBbox(lon: f64, lat: f64, zoom: f64, w_px: f64, h_px: f64) [4]f64 {
 
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--view LON,LAT,ZOOM|URL] [--viewport WxH] [--json] [--tui] [--kitty] [--no-resolve] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--view LON,LAT,ZOOM|URL] [--viewport WxH] [--json] [--tui] [--kitty] [--no-resolve] [--meta] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -792,6 +792,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var json = false;
     var tui = false;
     var kitty = false;
+    var meta_bounds = false;
     var rules_flag: ?[]const u8 = null;
     var view: ?View = null;
     var viewport_w: f64 = 1280; // the screen the viewport filter assumes (CSS px)
@@ -823,6 +824,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             F.kitty = true;
         } else if (std.mem.eql(u8, arg, "--no-resolve")) {
             F.do_resolve = false;
+        } else if (std.mem.eql(u8, arg, "--meta")) {
+            meta_bounds = true; // resolve meta-object boundaries (M_NSYS/M_COVR/…) the inspection view shows
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules_flag = f.val("--rules") orelse return;
         } else return usageErr("unknown flag");
@@ -838,8 +841,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     // (chart.renderFeature); the --tui LIVE CELL MAP instead frames the selection
     // over the real chart (chart.renderCellView — see exTuiMap).
     const palette: render.resolve.PaletteId = .day;
-    var m = render.resolve.MarinerSettings{ .display_other = true };
+    var m = render.resolve.Settings{ .display_other = true };
     m.scheme = .day;
+    m.show_meta_bounds = meta_bounds;
 
     // explore inspects one or more source cells. `dir` stays open for the whole run
     // (the TUI re-reads cells lazily to rebuild level 3 + the map render).
@@ -994,7 +998,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 // ISOLATED — only this feature's portrayal (chart.renderFeature, only_fi = fi)
 // on a solid background, NOT a map crop of the surrounding scene. Any failure
 // prints a short note instead of an image (graceful degradation), never an error.
-fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, row: ExRow, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings) !void {
+fn exAppendThumb(a: std.mem.Allocator, out: *std.ArrayList(u8), cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, fi: usize, row: ExRow, palette: render.resolve.PaletteId, m: *const render.resolve.Settings) !void {
     const tv = row.thumb orelse {
         try out.appendSlice(a, "  resolved render: (no renderable geometry)\n");
         return;
@@ -1393,7 +1397,7 @@ fn exLoadCell(
 // + alt-screen scaffolding as `tile57 ascii --tui`; dependency-free. The map is
 // transmit-once-per-view + place, deleted each frame — the same cached-region
 // pattern as the ascii kitty TUI, so it never scrolls the layout.
-fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, source: []const u8) !void {
+fn exploreTui(io: std.Io, a: std.mem.Allocator, rows: []const ExIndexRow, cells: []const ExCellSrc, dir: std.Io.Dir, rules: []const u8, F: ExFilters, kitty: bool, palette: render.resolve.PaletteId, m: *const render.resolve.Settings, source: []const u8) !void {
     // The interactive TUI is POSIX-only: std.posix.termios is `void` on Windows,
     // so gate the whole raw-mode body out at comptime (same idiom as common.zig's
     // terminalSize). The non-interactive `explore` paths stay cross-platform.
@@ -1820,7 +1824,7 @@ fn exMapGeom(right_w: usize, left_w: usize, term_rows: usize, text_rows: usize, 
 // cursor) is the SAME escape shape as the console `--kitty` path. The image stays
 // strictly within the body rows (footer clear) so its cursor-advance can't scroll
 // the text away. Any failure clears the image and leaves the text intact.
-fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, view: MapView, highlight: ?chart.Highlight, palette: render.resolve.PaletteId, m: *const render.resolve.MarinerSettings, geom: MapGeom) void {
+fn exTuiMap(io: std.Io, stdout: std.Io.File, st: *ThumbState, cell: *engine.s57.Cell, portrayal: ?[]const ?[]const u8, view: MapView, highlight: ?chart.Highlight, palette: render.resolve.PaletteId, m: *const render.resolve.Settings, geom: MapGeom) void {
     const clear = struct {
         fn f(io_: std.Io, out: std.Io.File, s: *ThumbState) void {
             out.writeStreamingAll(io_, render.kitty.delete_all) catch {};

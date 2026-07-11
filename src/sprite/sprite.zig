@@ -18,7 +18,9 @@ extern fn tg_svg_free(p: ?*anyopaque) void;
 
 /// SDF glyph atlas for GPU text (stb_truetype), a sibling baked asset.
 pub const glyph = @import("glyph.zig");
-test { _ = glyph; }
+test {
+    _ = glyph;
+}
 
 /// device px per 0.01-mm symbol unit (matches the Go oracle's raster.go pxPerUnit).
 pub const px_per_unit: f64 = 0.08;

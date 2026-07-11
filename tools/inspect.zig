@@ -21,6 +21,15 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         const y = try std.fmt.parseInt(u32, args[5], 10);
         if (try r.getTile(a, z, x, y)) |tile| {
             {
+                // Optional trailing `-o FILE` writes the raw (decompressed) tile
+                // bytes out, so tiledump and friends can chew on the same tile.
+                var ai: usize = 6;
+                while (ai + 1 < args.len) : (ai += 1) {
+                    if (std.mem.eql(u8, args[ai], "-o")) {
+                        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[ai + 1], .data = tile });
+                        std.debug.print("  wrote {s} ({d} bytes)\n", .{ args[ai + 1], tile.len });
+                    }
+                }
                 // Decode with the codec matching the archive's tile type — both
                 // return the same DecodedLayer shape, so the dump below is shared.
                 const layers = if (h.tile_type == .mlt)

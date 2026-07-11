@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Zig package deps (build.zig.zon) aren't supported by Dependabot; the submodules
+  # carry the vendored catalogues. So the actionable surface here is the CI actions —
+  # keep them patched.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
