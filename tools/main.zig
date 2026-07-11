@@ -2,14 +2,14 @@
 //!
 //! Subcommands:
 //!   bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]
-//!       Bake each cell to <out-dir>/tiles/<STEM>.pmtiles and write the ownership
+//!       Bake each chart to <out-dir>/tiles/<STEM>.pmtiles and write the ownership
 //!       partition to <out-dir>/partition.tpart — the live-composite structure a
 //!       runtime compositor serves tiles from on demand.
 //!   inspect <file.pmtiles> [z x y]
 //!       Parse a PMTiles archive (header + directory) and, if z/x/y is given,
 //!       read+gunzip+decode that tile and list its MVT layers.
 //!   cell <file.000>
-//!       Decode + summarise an S-57 cell (record tally, bounds, topology).
+//!       Decode + summarise an S-57 chart (record tally, bounds, topology).
 //!   version
 //!       Print the baker version.
 //!   help

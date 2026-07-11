@@ -108,7 +108,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Open the resident source (mmap archives + partition once) — the amortised cost.
     const open_t0 = nowNs();
-    const src = (compose.openComposeSourceFiles(io, a, paths.items, load_bytes) catch |err| {
+    const src = (compose.ComposeSource.openFiles(io, a, paths.items, load_bytes) catch |err| {
         std.debug.print("error: open compose source failed ({s})\n", .{@errorName(err)});
         return;
     }) orelse {

@@ -324,13 +324,20 @@ pub const ComposeSource = struct {
         self.arena.deinit();
         gpa.destroy(self);
     }
+
+    /// Open over per-chart PMTiles paths (mmap'd; the chart set is never fully
+    /// resident). Null when no archive carries coverage.
+    pub const openFiles = openSourceFiles;
+    /// Open over already-open charts' archives (everything is BORROWED — the
+    /// charts must outlive this source). Null when no archive carries coverage.
+    pub const open = openSourceCharts;
 };
 
 /// Open a resident ComposeSource over per-cell PMTiles at `paths` (mmap'd, so the cell set is never
 /// fully resident). If `load_partition` is non-null and valid for this cell set the partition is
 /// loaded (no build); else it is built. Returns null if no archive carries coverage. Free with
 /// `ComposeSource.deinit`.
-pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, load_partition: ?[]const u8) !?*ComposeSource {
+fn openSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8, load_partition: ?[]const u8) !?*ComposeSource {
     const src = try gpa.create(ComposeSource);
     src.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .maps = &.{}, .readers = &.{}, .part = undefined, .minz = 0, .maxz = 0, .loop_max = 0, .bounds = .{ 0, 0, 0, 0 } };
     errdefer {
@@ -399,15 +406,15 @@ pub fn openComposeSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const
 /// BORROWS both — whatever owns them (a chart handle) must outlive the source.
 pub const ChartArchive = struct {
     reader: *pmtiles.Reader,
-    cov: coverage.CellCoverage,
+    cov: coverage.ChartCoverage,
 };
 
 /// Open a resident ComposeSource over already-open charts' archives. Nothing is
 /// opened or mmap'd here and deinit closes none of it: every archive is borrowed,
 /// so the charts must OUTLIVE this source. Archives without coverage rings are
 /// skipped (they can own no ground); returns null if none carries coverage.
-/// `load_partition` as in openComposeSourceFiles.
-pub fn openComposeSourceCharts(gpa: std.mem.Allocator, archives: []const ChartArchive, load_partition: ?[]const u8) !?*ComposeSource {
+/// `load_partition` as in `openFiles`.
+fn openSourceCharts(gpa: std.mem.Allocator, archives: []const ChartArchive, load_partition: ?[]const u8) !?*ComposeSource {
     const src = try gpa.create(ComposeSource);
     src.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .maps = &.{}, .readers = &.{}, .part = undefined, .minz = 0, .maxz = 0, .loop_max = 0, .bounds = .{ 0, 0, 0, 0 } };
     errdefer {
@@ -431,7 +438,7 @@ pub fn openComposeSourceCharts(gpa: std.mem.Allocator, archives: []const ChartAr
 }
 
 // The coverage bbox (integer lon/lat e7) as degree bounds [w, s, e, n].
-fn covDegBounds(cc: coverage.CellCoverage) [4]f64 {
+fn covDegBounds(cc: coverage.ChartCoverage) [4]f64 {
     return .{
         @as(f64, @floatFromInt(cc.bbox[0])) / 1e7, @as(f64, @floatFromInt(cc.bbox[1])) / 1e7,
         @as(f64, @floatFromInt(cc.bbox[2])) / 1e7, @as(f64, @floatFromInt(cc.bbox[3])) / 1e7,

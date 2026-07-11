@@ -13,7 +13,7 @@
 //!
 //! Threading: a Chart is NOT internally synchronized — don't call its render /
 //! query methods on the same Chart from multiple threads concurrently. Distinct
-//! charts are independent. `openCells`/`bakeCellsParallel` parallelize
+//! charts are independent. `openCharts`/`bakeChartsParallel` parallelize
 //! internally over cores.
 
 const std = @import("std");
@@ -43,16 +43,16 @@ const gpa = std.heap.smp_allocator;
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
 
 /// Backend / on-disk format. `auto` sniffs PMTiles first, then S-57.
-pub const Format = enum { auto, pmtiles, s57_cell };
+pub const Format = enum { auto, pmtiles, s57 };
 
 /// One ENC cell: the base .000 bytes plus its sequential update files (.001…).
 /// Bytes are borrowed for the duration of the call (copied where retained).
-pub const CellInput = struct {
+pub const ChartInput = struct {
     base: []const u8,
     updates: []const []const u8 = &.{},
     /// Source ENC cell name (dataset stem, e.g. "US4MD81M") for the pick report's
     /// "source cell" badge. "" = unknown (the `cell` prop is omitted). The eager
-    /// (openCells) path copies it; the bake path borrows it for the call.
+    /// (openCharts) path copies it; the bake path borrows it for the call.
     name: []const u8 = "",
 };
 
@@ -66,7 +66,7 @@ pub const Progress = ?*const fn (user: ?*anyopaque, stage: u8, done: usize, tota
 /// Pre-peeked metadata for one cell in a streaming open: its geographic extent
 /// and compilation scale (1:cscl). The host supplies these (cheap to compute, or
 /// already known) so the source opens without reading any cell bytes.
-pub const CellMeta = extern struct {
+pub const ChartMeta = extern struct {
     west: f64,
     south: f64,
     east: f64,
@@ -78,7 +78,7 @@ pub const CellMeta = extern struct {
 /// malloc-allocated buffers (base + each update); the engine frees them with
 /// libc free() once the cell is parsed. update arrays are parallel, length
 /// update_count (0 / null for a base-only cell).
-pub const CellBytes = extern struct {
+pub const ChartBytes = extern struct {
     base: [*]const u8 = undefined,
     base_len: usize = 0,
     updates: ?[*]const [*]const u8 = null,
@@ -90,7 +90,7 @@ pub const CellBytes = extern struct {
 /// engine frees them), returning true on success. Called on demand the first
 /// time a tile needs the cell (and again after the cell is LRU-evicted), so the
 /// host holds only the working set's bytes — not the whole ENC_ROOT.
-pub const CellReadFn = *const fn (user: ?*anyopaque, index: usize, out: *CellBytes) callconv(.c) bool;
+pub const ChartReadFn = *const fn (user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool;
 
 /// Free bytes returned by the render / bake / JSON entry points (page-allocator owned).
 pub fn freeBytes(bytes: []u8) void {
@@ -161,7 +161,7 @@ const LazySource = struct {
     tick: u64 = 0,
     loaded: usize = 0,
     max_loaded: usize = 256, // LRU budget on parsed+portrayed cells (wide views)
-    reader: ?CellReadFn = null, // streaming: read a cell's bytes on demand
+    reader: ?ChartReadFn = null, // streaming: read a cell's bytes on demand
     reader_user: ?*anyopaque = null,
     // Path-backed streaming (chart-api.md): when the chart was opened from an on-disk
     // ENC_ROOT, this owns the retained Io + Dir + per-cell paths and is the
@@ -199,7 +199,7 @@ fn bboxOverlap(a_: [4]f64, b_: [4]f64) bool {
 }
 
 // Free the host-malloc'd buffers a streaming reader transferred to us (libc free).
-fn freeCellBytes(cb: *CellBytes) void {
+fn freeCellBytes(cb: *ChartBytes) void {
     if (cb.base_len != 0) std.c.free(@ptrCast(@constCast(cb.base)));
     if (cb.updates) |ups| {
         var k: usize = 0;
@@ -229,7 +229,7 @@ fn cdup(bytes: []const u8) ?[*]u8 {
 // Peek `relpath`'s bbox+scale; on success append an index-aligned meta + a gpa-owned
 // copy of the path. Cells that don't read / have no coverage bbox are skipped (both
 // lists), keeping meta[i] and paths[i] aligned with the streaming cell index.
-fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(CellMeta), paths: *std.ArrayList([]u8)) !void {
+fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8)) !void {
     const bytes = dir.readFileAlloc(io, relpath, gpa, .unlimited) catch return;
     defer gpa.free(bytes);
     const m = s57.peekMeta(gpa, bytes) orelse return;
@@ -238,10 +238,10 @@ fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.Arr
     try paths.append(gpa, try gpa.dupe(u8, relpath));
 }
 
-// Internal CellReadFn for a path-backed chart: read cell `index`'s base .000 + its
+// Internal ChartReadFn for a path-backed chart: read cell `index`'s base .000 + its
 // sequential .001.. updates from the retained dir into libc-malloc'd buffers (the
 // engine frees them via freeCellBytes). Mirrors the baker's per-cell load.
-fn pathRead(user: ?*anyopaque, index: usize, out: *CellBytes) callconv(.c) bool {
+fn pathRead(user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool {
     const ctx: *PathCtx = @ptrCast(@alignCast(user orelse return false));
     if (index >= ctx.paths.len) return false;
     const bpath = ctx.paths[index];
@@ -293,7 +293,7 @@ fn pathRead(user: ?*anyopaque, index: usize, out: *CellBytes) callconv(.c) bool 
 // (freeing the host's originals). Returns false if the reader declines/fails.
 fn streamRead(ls: *LazySource, lc: *LazyCell) bool {
     const rd = ls.reader orelse return false;
-    var cb: CellBytes = .{};
+    var cb: ChartBytes = .{};
     if (!rd(ls.reader_user, lc.index, &cb)) return false;
     const base = gpa.dupe(u8, cb.base[0..cb.base_len]) catch {
         freeCellBytes(&cb);
@@ -587,11 +587,11 @@ fn readCellFiles(path: []const u8) !CellFiles {
 ///
 /// The archive metadata embeds the cell's own coverage (M_COVR + cscl + date/name),
 /// so the composite stitcher rebuilds the ownership partition from the baked archives
-/// without re-parsing the .000. Read it back with `cellCoverageFromArchive`.
-pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
+/// without re-parsing the .000. Read it back with `decodedCoverageFromArchive`.
+pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // Populate the read-only portrayal globals (feature catalogue + complex-linestyle table)
     // before portraying: without them, complex lines fall back to plain geometry and their S-52
-    // linestyle is dropped from the tile. Idempotent; in the parallel batch path bakeCellsParallel
+    // linestyle is dropped from the tile. Idempotent; in the parallel batch path bakeChartsParallel
     // has already warmed up before spawning workers, so this is a no-op there (and race-free).
     warmup();
     var cf = try readCellFiles(cell_path);
@@ -618,7 +618,7 @@ pub fn bakeCellBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // coarser zooms where nothing coarser covers — a harbor-only region still
     // shows land and coast at z4. No overscale above the window.
     const zr = bake_enc.bandZooms(bake_enc.bandOf(cscl));
-    const cell_in = [_]CellInput{.{ .base = cf.base, .updates = cf.updates }};
+    const cell_in = [_]ChartInput{.{ .base = cf.base, .updates = cf.updates }};
     return bakeArchive(&cell_in, resolveRulesDir(rules_dir), 0, zr.max, .mlt, true, null, null, coverage_json);
 }
 
@@ -644,7 +644,7 @@ fn bakeCellWorker(ctx: *BakeCtx) void {
     while (true) {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.paths.len) return;
-        ctx.out[i] = bakeCellBytes(ctx.paths[i], ctx.rules_dir) catch null;
+        ctx.out[i] = bakeChartBytes(ctx.paths[i], ctx.rules_dir) catch null;
     }
 }
 
@@ -652,9 +652,9 @@ fn bakeCellWorker(ctx: *BakeCtx) void {
 /// PMTiles bytes IN PARALLEL across up to `workers` threads, writing cell i's archive to out[i]
 /// (caller owns it — free each with freeBytes) or leaving it null when that cell produced nothing
 /// or failed. out.len must equal paths.len. Race-free: warms up the process globals first, then
-/// each bakeCellBytes is independent (thread-safe allocator, thread-local portrayal context).
+/// each bakeChartBytes is independent (thread-safe allocator, thread-local portrayal context).
 /// `workers` is clamped to [1, min(paths.len, MAX_BAKE_WORKERS)] and is a MEMORY bound.
-pub fn bakeCellsParallel(paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, out: []?[]u8) void {
+pub fn bakeChartsParallel(paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, out: []?[]u8) void {
     std.debug.assert(out.len == paths.len);
     for (out) |*o| o.* = null;
     if (paths.len == 0) return;
@@ -697,7 +697,7 @@ const BakeFileCtx = struct {
 };
 
 fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
-    const arc = (bakeCellBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
+    const arc = (bakeChartBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
     defer freeBytes(arc);
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ctx.out_paths[i], .data = arc }) catch return;
     var digest: [32]u8 = undefined;
@@ -725,7 +725,7 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
 /// the write — so the host never holds N archives (peak memory ~ the worker count). The app owns
 /// the cache and names every out_path. `progress(progress_ctx, done, total)` fires (serialised)
 /// after each cell. Race-free (warms up first; each bake is independent). Returns the count written.
-pub fn bakeCellsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) usize {
+pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) usize {
     std.debug.assert(out_paths.len == in_paths.len);
     if (in_paths.len == 0) return 0;
     warmup();
@@ -791,7 +791,7 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
         out_paths.append(a, out_path) catch continue;
     }
     if (in_paths.items.len == 0) return 0;
-    return bakeCellsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx);
+    return bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx);
 }
 
 /// The file's modification time in nanoseconds, or null if it doesn't exist / can't be statted.
@@ -971,7 +971,7 @@ pub fn pmtilesMetadata(a: std.mem.Allocator, archive: []const u8) !?[]u8 {
 /// null if absent. The whole result (rings + strings) is allocated in `a`. The
 /// composite stitcher calls this over each cell's archive to rebuild the ownership
 /// partition without re-parsing the source .000.
-pub fn cellCoverageFromArchive(a: std.mem.Allocator, archive: []const u8) !?scene.coverage.CellCoverage {
+pub fn decodedCoverageFromArchive(a: std.mem.Allocator, archive: []const u8) !?scene.coverage.ChartCoverage {
     const json = (try pmtilesMetadata(a, archive)) orelse return null;
     return scene.coverage.decodeFromMetadata(a, json);
 }
@@ -992,7 +992,7 @@ pub fn warmup() void {
 
 // Parallel open worker: peek each cell's band + bbox and copy its bytes.
 const OpenWork = struct {
-    inputs: []const CellInput,
+    inputs: []const ChartInput,
     out: []LazyCell,
     ok: []bool,
 
@@ -1026,7 +1026,7 @@ const OpenWork = struct {
     }
 };
 
-/// The public chart handle. Open with `openBytes`/`openCells`; release with
+/// The public chart handle. Open with `openBytes`/`openCharts`; release with
 /// `deinit`.
 pub const Chart = struct {
     backend: Backend,
@@ -1045,7 +1045,7 @@ pub const Chart = struct {
     // cscl, bbox, M_COVR rings) — read back by coverage()/nativeScale(), and what a
     // compositor borrows to place this chart in the ownership partition. Storage
     // lives in coverage_arena (freed in deinit).
-    cell_cov: ?cell_coverage.CellCoverage = null,
+    cell_cov: ?cell_coverage.ChartCoverage = null,
     coverage_arena: ?*std.heap.ArenaAllocator = null,
     // A path-opened archive is mmap'd rather than copied (never fully resident);
     // released in deinit. Bytes-opened archives use `data` instead.
@@ -1066,7 +1066,7 @@ pub const Chart = struct {
     /// Open an ENC_ROOT as a multi-cell source: cells are indexed cheaply (band +
     /// bbox) in parallel and parsed/portrayed lazily per tile. All bytes are
     /// copied. Errors if no cell's header parses.
-    pub fn openCells(cells_in: []const CellInput, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
+    pub fn openCharts(cells_in: []const ChartInput, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
         if (cells_in.len == 0) return error.NotFound;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
@@ -1115,7 +1115,7 @@ pub const Chart = struct {
     /// returns a cell's bytes on demand. Cell bytes are read only when a tile
     /// needs them and freed on LRU eviction, so the host holds the working set's
     /// bytes — not the whole ENC_ROOT. No bytes are read at open. Errors if empty.
-    pub fn openCellsStreaming(metas: []const CellMeta, reader: CellReadFn, user: ?*anyopaque, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
+    pub fn openChartsStreaming(metas: []const ChartMeta, reader: ChartReadFn, user: ?*anyopaque, rules_dir: ?[]const u8, pick_attrs: bool) !*Chart {
         if (metas.len == 0) return error.NotFound;
         const dir = resolveRulesDir(rules_dir);
         const dir_copy = try gpa.dupe(u8, dir);
@@ -1162,7 +1162,7 @@ pub const Chart = struct {
         var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
         errdefer dir.close(io);
 
-        var metas = std.ArrayList(CellMeta).empty;
+        var metas = std.ArrayList(ChartMeta).empty;
         defer metas.deinit(gpa);
         var paths = std.ArrayList([]u8).empty;
         errdefer {
@@ -1194,7 +1194,7 @@ pub const Chart = struct {
 
         // Reuse the streaming backend with the internal file reader; the returned
         // Chart owns the PathCtx (Io + Dir + paths) via ls.path_ctx, freed in deinit.
-        const src = try openCellsStreaming(metas.items, pathRead, null, rules_dir, pick_attrs);
+        const src = try openChartsStreaming(metas.items, pathRead, null, rules_dir, pick_attrs);
         errdefer src.deinit();
         const ctx = try gpa.create(PathCtx);
         errdefer gpa.destroy(ctx);
@@ -1232,7 +1232,7 @@ pub const Chart = struct {
     pub fn format(self: *Chart) Format {
         return switch (self.backend) {
             .reader => .pmtiles,
-            .cell, .cells => .s57_cell,
+            .cell, .cells => .s57,
         };
     }
 
@@ -1278,7 +1278,7 @@ pub const Chart = struct {
     /// The per-cell coverage embedded in the opened archive's metadata (name, date,
     /// cscl, bbox, M_COVR rings), or null if the archive carries none. Borrows the
     /// chart's storage.
-    pub fn cellCoverage(self: *const Chart) ?cell_coverage.CellCoverage {
+    pub fn decodedCoverage(self: *const Chart) ?cell_coverage.ChartCoverage {
         return self.cell_cov;
     }
 
@@ -1626,7 +1626,7 @@ pub const Chart = struct {
     /// geometry extent, omitted when none parses. Returns null when the chart
     /// has no cells (a PMTiles chart carries no cell files — its manifest is
     /// the host-side sidecar). gpa-owned; free with freeBytes.
-    pub fn cellsJson(self: *Chart) !?[]u8 {
+    pub fn chartsJson(self: *Chart) !?[]u8 {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1667,7 +1667,7 @@ pub const Chart = struct {
                     } else {
                         // Streaming cell: read transiently (collectScaminCells pattern).
                         const rd = ls.reader orelse continue;
-                        var cb: CellBytes = .{};
+                        var cb: ChartBytes = .{};
                         if (!rd(ls.reader_user, lc.index, &cb)) continue;
                         defer freeCellBytes(&cb);
                         var ups: []const []const u8 = &.{};
@@ -1743,7 +1743,7 @@ pub const Chart = struct {
                         try appendCellGeoJson(a, &out, &cell, want.items, &n);
                     } else {
                         const rd = ls.reader orelse continue;
-                        var cb: CellBytes = .{};
+                        var cb: ChartBytes = .{};
                         if (!rd(ls.reader_user, lc.index, &cb)) continue;
                         defer freeCellBytes(&cb);
                         var ups: []const []const u8 = &.{};
@@ -2104,7 +2104,7 @@ fn collectScaminCells(ls: *LazySource, set: *std.AutoHashMap(u32, void)) void {
         // Streaming cell with no resident bytes: read them via the host reader for
         // this scan only, then free (the normal tile path reads them again on demand).
         const rd = ls.reader orelse continue;
-        var cb: CellBytes = .{};
+        var cb: ChartBytes = .{};
         if (!rd(ls.reader_user, lc.index, &cb)) continue;
         defer freeCellBytes(&cb);
         var ups: []const []const u8 = &.{};
@@ -2218,7 +2218,7 @@ const BakeWork = struct {
     }
 };
 
-/// Bake an ENC_ROOT (the same cells as `openCells`) into ONE PMTiles archive,
+/// Bake an ENC_ROOT (the same cells as `openCharts`) into ONE PMTiles archive,
 /// zoom-banded per cell by compilation scale. Returns the archive bytes (free
 /// with `freeBytes`), or null if nothing was covered. Streams band-by-band
 /// (finest → coarsest, best-band dedup + the scamin-aware band handoff), holding
@@ -2227,7 +2227,7 @@ const BakeWork = struct {
 /// `progress` (nullable) fires during the load+portray phase (stage 0) and the
 /// tile-bake phase (stage 1). The caller owns the input bytes for the call.
 pub fn bakeArchive(
-    cells_in: []const CellInput,
+    cells_in: []const ChartInput,
     rules_dir: ?[]const u8,
     minzoom: u8,
     maxzoom: u8,

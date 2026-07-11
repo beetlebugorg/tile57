@@ -1,18 +1,18 @@
 //! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]` — produce a
-//! LIVE-composite structure on disk. Bake each cell to its OWN native-scale PMTiles under
+//! LIVE-composite structure on disk. Bake each chart to its OWN native-scale PMTiles under
 //! `<out-dir>/tiles/` (with its M_COVR coverage embedded in the metadata), then open a resident
 //! compositor over them and write the ownership partition to `<out-dir>/partition.tpart`. There is
 //! NO merged archive: a runtime compositor (`ComposeSource` / the `compose-tile` command / the C
-//! ABI `tile57_compose_*`) serves any tile ON DEMAND from this structure, so the per-cell bakes stay
+//! ABI `tile57_compose_*`) serves any tile ON DEMAND from this structure, so the per-chart bakes stay
 //! dumb + cacheable and the partition holds all cross-cell ownership. Native scale only — deeper
 //! coarse zooms are left to the client camera + MapLibre overzoom.
 //!
-//! `--from-archives`: `<base>` is ALREADY a directory of per-cell archives (*.pmtiles / *.cell.tmp);
+//! `--from-archives`: `<base>` is ALREADY a directory of per-chart archives (*.pmtiles / *.cell.tmp);
 //! skip the bake and only (re)build the partition sidecar into `<out-dir>/partition.tpart` over them
 //! — the fast re-partition loop over a tiles dir.
 
 const std = @import("std");
-const chart = @import("chart"); // per-cell bake (bakeCellBytes) + freeBytes
+const chart = @import("chart"); // per-chart bake (bakeChartBytes) + freeBytes
 const compose = @import("compose"); // openComposeSourceFiles + serializePartition (the resident compositor)
 const common = @import("common.zig");
 const Flags = common.Flags;
@@ -45,7 +45,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
     const rules_dir = resolveRulesDir(rules);
 
-    // The per-cell archive paths that back the compositor.
+    // The per-chart archive paths that back the compositor.
     var archive_paths = std.ArrayList([]const u8).empty;
 
     if (from_archives) {
@@ -62,7 +62,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (archive_paths.items.len == 0) return usageErr("no *.pmtiles / *.cell.tmp archives found");
         std.debug.print("re-partition: {d} pre-baked archives from {s}\n", .{ archive_paths.items.len, base_path });
     } else {
-        // Bake each cell (dedup by stem — a boundary cell shared by two districts bakes once)
+        // Bake each chart (dedup by stem — a boundary chart shared by two districts bakes once)
         // to its own <out-dir>/tiles/<STEM>.pmtiles.
         const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
         try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
@@ -87,7 +87,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
 
         for (cell_paths.items) |cp| {
-            const arc = (chart.bakeCellBytes(cp, rules_dir) catch |err| {
+            const arc = (chart.bakeChartBytes(cp, rules_dir) catch |err| {
                 std.debug.print("  warn: bake of {s} failed ({s}); skipping\n", .{ cp, @errorName(err) });
                 continue;
             }) orelse continue; // no M_COVR coverage — not a composable cell
@@ -113,9 +113,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }.lt);
 
-    // Open the resident compositor over the per-cell archives (mmap'd) and serialize its ownership
+    // Open the resident compositor over the per-chart archives (mmap'd) and serialize its ownership
     // partition to <out-dir>/partition.tpart — the sidecar a runtime open loads to skip the build.
-    const src = (compose.openComposeSourceFiles(io, a, archive_paths.items, null) catch |err| {
+    const src = (compose.ComposeSource.openFiles(io, a, archive_paths.items, null) catch |err| {
         std.debug.print("error: open compose source failed ({s})\n", .{@errorName(err)});
         return;
     }) orelse return usageErr("no coverage-carrying archives (nothing to compose)");
@@ -129,7 +129,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_path, .data = part_bytes });
 
     std.debug.print(
-        "live structure -> {s}/\n  {d} per-cell archive(s){s} + partition.tpart (serve z {d}..{d})\n",
+        "live structure -> {s}/\n  {d} per-chart archive(s){s} + partition.tpart (serve z {d}..{d})\n",
         .{ out_dir, src.readers.len, if (from_archives) " (in place)" else " under tiles/", src.minz, src.loop_max },
     );
 }

@@ -90,7 +90,7 @@ pub fn tileBoundsLonLat(z: u8, tx: u32, ty: u32) [4]f64 {
 // figures around the light (plus ground-length directional legs), so they can
 // cross into tiles the light's cell owns no ground in. Both the baker's tile
 // addressing (bake_enc buildTileMap) and the runtime compositor's reach ring
-// (compose.composeTile) widen by the same bound so the figures survive there.
+// (compose.tile) widen by the same bound so the figures survive there.
 
 const EARTH_CIRCUM_M: f64 = 40075016.686;
 

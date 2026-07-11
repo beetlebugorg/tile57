@@ -21,7 +21,7 @@ const s57 = @import("s57");
 /// this cell without re-parsing. Ring geometry is `[feature][ring][point]`, matching
 /// `s57.Cell.mcovrCoverage`, so a decoded value plugs straight into the partition
 /// adapter. Slices are owned by whoever built or decoded the value.
-pub const CellCoverage = struct {
+pub const ChartCoverage = struct {
     name: []const u8, // file basename stem (verbatim — the ownership tie-break name)
     date: []const u8, // post-update DSID ISDT (YYYYMMDD), or "" if absent
     cscl: i32, // compilation scale 1:N (0 = unknown)
@@ -52,12 +52,12 @@ pub fn encodeLightReachJson(a: std.mem.Allocator, lr: LightReach) ![]u8 {
     return std.json.Stringify.valueAlloc(a, lr, .{});
 }
 
-/// Build a CellCoverage from a parsed cell. `name` is the caller's identity string
+/// Build a ChartCoverage from a parsed cell. `name` is the caller's identity string
 /// (the file basename stem, matching the coverage loader / ownership oracle) and
 /// `band` the caller's `bake_enc.bandOf(cscl)` tag; both keep this module free of the
 /// band + loader policy. Coverage rings are allocated in `a`; `name`/`date` are
 /// borrowed (encode before the cell is freed).
-pub fn fromCell(a: std.mem.Allocator, cell: *const s57.Cell, name: []const u8, band: u8) CellCoverage {
+pub fn fromCell(a: std.mem.Allocator, cell: *const s57.Cell, name: []const u8, band: u8) ChartCoverage {
     const cov1 = cell.mcovrCoverage(a);
     return .{
         .name = name,
@@ -108,7 +108,7 @@ const Envelope = struct { coverage: ?Dto = null, light_reach: ?LightReach = null
 
 /// Serialize `cov` to the JSON object embedded under the metadata's "coverage" key.
 /// Caller owns the returned bytes (allocated in `a`).
-pub fn encodeJson(a: std.mem.Allocator, cov: CellCoverage) ![]u8 {
+pub fn encodeJson(a: std.mem.Allocator, cov: ChartCoverage) ![]u8 {
     const dto = Dto{
         .v = 1,
         .name = cov.name,
@@ -124,11 +124,11 @@ pub fn encodeJson(a: std.mem.Allocator, cov: CellCoverage) ![]u8 {
 
 /// Extract the coverage embedded in a PMTiles metadata JSON blob, or null if absent /
 /// unparseable. The whole result (rings + strings) is allocated in `a`.
-pub fn decodeFromMetadata(a: std.mem.Allocator, metadata_json: []const u8) !?CellCoverage {
+pub fn decodeFromMetadata(a: std.mem.Allocator, metadata_json: []const u8) !?ChartCoverage {
     var parsed = std.json.parseFromSlice(Envelope, a, metadata_json, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit(); // frees the DTO's own arena; the copies below live in `a`
     const dto = parsed.value.coverage orelse return null;
-    return CellCoverage{
+    return ChartCoverage{
         .name = try a.dupe(u8, dto.name),
         .date = try a.dupe(u8, dto.date),
         .cscl = dto.cscl,
@@ -191,7 +191,7 @@ test "coverage round-trips through the metadata envelope, integers exact" {
     const feat1 = try a.dupe([]const s57.LonLat, &.{ ext, hole });
     const cov1 = try a.dupe([]const []const s57.LonLat, &.{ feat0, feat1 });
 
-    const cov = CellCoverage{
+    const cov = ChartCoverage{
         .name = "US5MD1MC",
         .date = "20210115",
         .cscl = 20_000,

@@ -182,12 +182,12 @@ export fn tile57_version() callconv(.c) [*:0]const u8 {
 /// The per-cell metadata of the S-57 data at `path` (one .000 or a whole ENC_ROOT)
 /// as a JSON array — name/scale/edition/update/issueDate/agency/bbox per cell,
 /// DSID fields reflecting the applied update chain. See tile57.h.
-export fn tile57_enc_cells(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+export fn tile57_enc_charts(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
     const c = Chart.openPath(p, null, false) catch |e| return failCtx(err, e, p);
     defer c.deinit();
-    const bytes = (c.cellsJson() catch |e| return fail(err, e)) orelse return OK;
+    const bytes = (c.chartsJson() catch |e| return fail(err, e)) orelse return OK;
     return exportOut(err, o, n, bytes);
 }
 
@@ -211,8 +211,8 @@ export fn tile57_enc_features_bytes(base: ?[*]const u8, len: usize, classes: ?[*
     const b = base orelse return failWith(err, .badarg, "base must not be null");
     if (len == 0) return failWith(err, .badarg, "len must not be zero");
     const cls = spanOpt(classes) orelse return failWith(err, .badarg, "classes must not be null");
-    const cells = [_]chart.CellInput{.{ .base = b[0..len] }};
-    const c = Chart.openCells(&cells, null, false) catch |e| return fail(err, e);
+    const charts_in = [_]chart.ChartInput{.{ .base = b[0..len] }};
+    const c = Chart.openCharts(&charts_in, null, false) catch |e| return fail(err, e);
     defer c.deinit();
     const bytes = (c.featuresJson(cls) catch |e| return fail(err, e)) orelse return OK;
     return exportOut(err, o, n, bytes);
@@ -267,19 +267,19 @@ fn jsonStr(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
 /// Bake ONE cell (+ its updates, read from disk) to PMTiles bytes over its NATIVE
 /// band zoom range, into *out / *out_len (free with tile57_free); NULL/0 when the
 /// cell produced no tiles. See tile57.h.
-export fn tile57_bake_cell_bytes(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+export fn tile57_bake_chart_bytes(path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
-    const archive = chart.bakeCellBytes(p, null) catch |e| return failCtx(err, e, p);
+    const archive = chart.bakeChartBytes(p, null) catch |e| return failCtx(err, e, p);
     if (archive) |a| return exportOut(err, o, n, a);
     return OK;
 }
 
-/// Bake `n` cells to per-cell PMTiles bytes IN PARALLEL across up to `workers`
+/// Bake `n` charts to per-chart PMTiles bytes IN PARALLEL across up to `workers`
 /// threads; out_bytes[i]/out_lens[i] get cell i's archive (free each with
 /// tile57_free) or NULL/0 when it produced nothing. *out_baked (NULL to ignore) =
 /// the count that produced bytes. `workers` is a MEMORY bound. See tile57.h.
-export fn tile57_bake_cells(
+export fn tile57_bake_charts(
     paths: ?[*]const ?[*:0]const u8,
     n: usize,
     workers: u32,
@@ -302,7 +302,7 @@ export fn tile57_bake_cells(
     for (0..n) |i| list[i] = spanOpt(ps[i]) orelse return failWith(err, .badarg, "a path in paths is null");
     const results = gpa.alloc(?[]u8, n) catch |e| return fail(err, e);
     defer gpa.free(results);
-    chart.bakeCellsParallel(list, null, workers, results);
+    chart.bakeChartsParallel(list, null, workers, results);
     var baked: usize = 0;
     var oom = false;
     for (0..n) |i| {
@@ -330,7 +330,7 @@ export fn tile57_bake_cells(
     return OK;
 }
 
-/// Walk `in_dir` for S-57 base cells (*.000) and bake each IN PARALLEL to the SAME
+/// Walk `in_dir` for S-57 base charts (*.000) and bake each IN PARALLEL to the SAME
 /// relative path under `out_dir` with a .pmtiles extension (+ an <out>.sha sidecar),
 /// creating subdirs as needed. INCREMENTAL: an archive already at least as new as
 /// its whole input is skipped, so *out_baked (NULL to ignore) counts THIS run only.
@@ -402,7 +402,7 @@ export fn tile57_bake_partition_debug(
 
 /// Open a baked PMTiles archive from a file path, mmap'd (never fully resident;
 /// the file must stay in place while the chart is open). See tile57.h.
-export fn tile57_open(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+export fn tile57_chart_open(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = null;
     const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
@@ -413,7 +413,7 @@ export fn tile57_open(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError) callc
 }
 
 /// Open a baked PMTiles archive from in-memory bytes (copied). See tile57.h.
-export fn tile57_open_bytes(pmtiles_ptr: ?[*]const u8, len: usize, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
+export fn tile57_chart_open_bytes(pmtiles_ptr: ?[*]const u8, len: usize, out: ?*?*Chart, err: ?*CError) callconv(.c) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = null;
     const b = pmtiles_ptr orelse return failWith(err, .badarg, "pmtiles must not be null");
@@ -446,7 +446,7 @@ const TILE_TYPE_MLT: u8 = 2;
 
 /// Fill *out with the chart's fixed metadata (zoom range, bands, bounds, anchor,
 /// tile encoding, embedded compilation scale). See tile57.h.
-export fn tile57_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
+export fn tile57_chart_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
     const o = out orelse return;
     o.* = std.mem.zeroes(CInfo);
     const s = src orelse return;
@@ -477,7 +477,7 @@ export fn tile57_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
 /// The distinct SCAMIN denominators present in the chart (ascending, from the
 /// archive metadata); NULL/0 out when there are none. Free *out with
 /// tile57_free. See tile57.h.
-export fn tile57_scamin(handle: ?*Chart, out: ?*?[*]i32, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+export fn tile57_chart_scamin(handle: ?*Chart, out: ?*?[*]i32, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o = out orelse return failWith(err, .badarg, bad_out);
     const n = out_len orelse return failWith(err, .badarg, bad_out);
     o.* = null;
@@ -503,7 +503,7 @@ const CCoverageCb = extern struct {
 /// in the archive metadata: cb->ring is called once per polygon with its exterior
 /// ring as interleaved lon,lat doubles. OK with no calls when the archive embeds
 /// none. See tile57.h.
-export fn tile57_coverage(handle: ?*Chart, cb: ?*const CCoverageCb, err: ?*CError) callconv(.c) c_int {
+export fn tile57_chart_coverage(handle: ?*Chart, cb: ?*const CCoverageCb, err: ?*CError) callconv(.c) c_int {
     const self = handle orelse return failWith(err, .badarg, "chart must not be null");
     const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
     const polys = self.coverage() orelse return OK;
@@ -528,7 +528,7 @@ export fn tile57_coverage(handle: ?*Chart, cb: ?*const CCoverageCb, err: ?*CErro
 /// tile57_info.tile_type), with NO composition — the per-archive primitive an
 /// embedder's own compositor consumes. NULL/0 out when the archive has no tile
 /// there. See tile57.h.
-export fn tile57_tile(handle: ?*Chart, z: u8, x: u32, y: u32, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+export fn tile57_chart_tile(handle: ?*Chart, z: u8, x: u32, y: u32, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const c = handle orelse return failWith(err, .badarg, "chart must not be null");
     const rd = c.pmtilesReader() orelse return failWith(err, .badarg, "chart is not archive-backed");
@@ -541,7 +541,7 @@ const CQueryCb = @import("render").query.QueryCb;
 /// Cursor object-query at (lon,lat) for the view `zoom` (web-mercator): invokes
 /// cb->feature once per displayed feature the point falls in, with its S-57 class,
 /// attribute JSON, and source cell. See tile57.h.
-export fn tile57_query(handle: ?*Chart, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
+export fn tile57_chart_query(handle: ?*Chart, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
     const self = handle orelse return failWith(err, .badarg, "chart must not be null");
     const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
     self.queryPoint(lon, lat, zoom, cbp) catch |e| return fail(err, e);
@@ -567,7 +567,7 @@ const bad_size = "width/height must be 1..16384";
 /// one scene across every covering tile, labels decluttered over the whole
 /// canvas. No composition (see tile57_compose_png for the composed twin).
 /// `m` NULL = defaults. See tile57.h.
-export fn tile57_png(
+export fn tile57_chart_png(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -588,9 +588,9 @@ export fn tile57_png(
     return exportOut(err, o, n, bytes);
 }
 
-/// tile57_png's vector twin: the SAME scene as a deterministic single-page PDF
+/// tile57_chart_png's vector twin: the SAME scene as a deterministic single-page PDF
 /// (1 px = 1 pt, 72 dpi; vector fills, native strokes, glyph-outline text).
-export fn tile57_pdf(
+export fn tile57_chart_pdf(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -613,10 +613,10 @@ export fn tile57_pdf(
 
 const CbCanvas = @import("render").cb_canvas.CCanvas;
 
-/// tile57_png's callback twin: the SAME view painted through the C callback
+/// tile57_chart_png's callback twin: the SAME view painted through the C callback
 /// table `canvas` (see tile57.h) instead of rasterising. Geometry in canvas
 /// PIXEL space (y down), paint order, palette-resolved colours.
-export fn tile57_canvas(
+export fn tile57_chart_canvas(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -643,7 +643,7 @@ const CSurface = @import("render").vector.CSurface;
 /// (areas/lines in web-mercator [0,1]; symbols/text as a world anchor + local
 /// reference-px outline; per-feature class + SCAMIN) to the C surface callback
 /// `surface` (see tile57.h). Pan/zoom re-portray nothing on the host.
-export fn tile57_surface(
+export fn tile57_chart_surface(
     handle: ?*Chart,
     lon: f64,
     lat: f64,
@@ -665,7 +665,7 @@ export fn tile57_surface(
 
 /// Release a chart and all cached tiles. Must not be called while any borrower
 /// (a compositor, a renderer) may still read from it. See tile57.h.
-export fn tile57_close(handle: ?*Chart) callconv(.c) void {
+export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {
     if (handle) |s| s.deinit();
 }
 
@@ -673,11 +673,11 @@ export fn tile57_close(handle: ?*Chart) callconv(.c) void {
 // 5. Compose — the runtime compositor over open charts (see tile57.h)
 // ===========================================================================
 
-/// Coverage/zoom summary of a compositor, filled by tile57_compose_meta_get.
+/// Coverage/zoom summary of a compositor, filled by tile57_compose_get_meta.
 const CComposeMeta = extern struct {
     min_zoom: u8,
     max_zoom: u8, // deepest zoom that can be served (native windows + one fill-up overscale zoom)
-    cells: u32, // coverage-carrying charts held
+    charts: u32, // coverage-carrying charts held
     west: f64,
     south: f64,
     east: f64,
@@ -720,7 +720,7 @@ export fn tile57_compose_open(
     for (0..n) |i| {
         const c = cs[i] orelse return failWith(err, .badarg, "a chart in charts is null");
         const rd = c.pmtilesReader() orelse return failWith(err, .badarg, "a chart in charts is not archive-backed");
-        const cov = c.cellCoverage() orelse continue; // embeds no coverage: owns no ground
+        const cov = c.decodedCoverage() orelse continue; // embeds no coverage: owns no ground
         archives[na] = .{ .reader = rd, .cov = cov };
         na += 1;
     }
@@ -737,7 +737,7 @@ export fn tile57_compose_open(
         } else |_| {}
     }
 
-    o.* = (compose.openComposeSourceCharts(gpa, archives[0..na], owned) catch |e| return fail(err, e)) orelse
+    o.* = (compose.ComposeSource.open(gpa, archives[0..na], owned) catch |e| return fail(err, e)) orelse
         return failWith(err, .unsupported, "no chart carries per-cell coverage");
     return OK;
 }
@@ -766,7 +766,7 @@ export fn tile57_compose_tile(
     return OK;
 }
 
-/// Render a VIEW over the compositor to PNG — the composed twin of tile57_png:
+/// Render a VIEW over the compositor to PNG — the composed twin of tile57_chart_png:
 /// every covering tile is composed on demand (seams stitched through the
 /// ownership partition) and replayed through the native S-52 pixel path. See
 /// tile57.h.
@@ -838,7 +838,7 @@ export fn tile57_compose_canvas(
 }
 
 /// The composed GPU vector twin: the SAME composed view emitted as a WORLD-SPACE
-/// tagged stream to the C surface callback (see tile57.h). See tile57_surface for
+/// tagged stream to the C surface callback (see tile57.h). See tile57_chart_surface for
 /// the single-chart form.
 export fn tile57_compose_surface(
     handle: ?*compose.ComposeSource,
@@ -872,14 +872,14 @@ export fn tile57_compose_query(handle: ?*compose.ComposeSource, lon: f64, lat: f
 
 /// Fill *out with the compositor's zoom range + union coverage bounds (zeroed when
 /// the handle is NULL). See tile57.h.
-export fn tile57_compose_meta_get(handle: ?*compose.ComposeSource, out: ?*CComposeMeta) callconv(.c) void {
+export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CComposeMeta) callconv(.c) void {
     const o = out orelse return;
     o.* = std.mem.zeroes(CComposeMeta);
     const src = handle orelse return;
     o.* = .{
         .min_zoom = src.minz,
         .max_zoom = src.loop_max,
-        .cells = @intCast(src.readers.len),
+        .charts = @intCast(src.readers.len),
         .west = src.bounds[0],
         .south = src.bounds[1],
         .east = src.bounds[2],
@@ -1332,7 +1332,7 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
 // ===========================================================================
 
 /// Populate the process-global read-only registries (S-100 catalogue + linestyles) on
-/// the calling thread. Call ONCE on the main thread before opening/baking cells from
+/// the calling thread. Call ONCE on the main thread before opening/baking charts from
 /// worker threads, so concurrent bake/render is race-free. See tile57.h.
 export fn tile57_warmup() callconv(.c) void {
     chart.warmup();

@@ -6,7 +6,7 @@
 const std = @import("std");
 const bundle = @import("bundle"); // chart-bundle pipeline (asset emitters etc.) — the lib owns it
 
-pub const VERSION = "tile57 0.1.0";
+pub const VERSION = "tile57 0.3.0";
 
 // Env access lives in the Lua C shim (Zig 0.16 gates env behind std.Io);
 // returns the S-101 rules dir from TILE57_S101_RULES or null. Mirrors capi.zig.
@@ -143,7 +143,7 @@ pub fn printUsage() void {
         \\
         \\usage:
         \\  tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]
-        \\      Produce a live-composite structure: bake each cell (a single .000 +
+        \\      Produce a live-composite structure: bake each chart (a single .000 +
         \\      its auto-discovered updates, OR every <CELL>.000 in an ENC_ROOT, at
         \\      native band scale) to its own <out>/tiles/<STEM>.pmtiles with M_COVR
         \\      coverage embedded, then write the ownership partition to
@@ -151,15 +151,16 @@ pub fn printUsage() void {
         \\      serves any tile ON DEMAND from this structure — there is no merged archive.
         \\      -o, --output DIR    output directory (required)
         \\      --rules DIR         S-101 portrayal rules directory (default: embedded)
-        \\      --from-archives     <base> is already a dir of per-cell archives; skip
+        \\      --from-archives     <base> is already a dir of per-chart archives; skip
         \\                          baking, only (re)build partition.tpart over them
         \\  tile57 compose-tile <tiles-dir> <z> <x> <y> [--load-partition FILE] [-o out] [--bench N]
         \\      Serve ONE composed tile on demand from a live-composite structure
         \\      (the runtime compositor); --bench N times an NxN block around (x,y).
-        \\  tile57 assets <portrayal-catalog-dir> -o <out-dir>
-        \\      Emit just the portrayal assets (colortables.json today) for a
-        \\      catalogue, independent of any cell.
-        \\  tile57 style <portrayal-catalog-dir> --scheme day -o <out.json>
+        \\  tile57 assets [portrayal-catalog-dir] -o <out-dir>
+        \\      Emit the portrayal assets — colortables, linestyles, and the sprite
+        \\      + area-fill pattern atlases — independent of any chart. The
+        \\      catalogue defaults to the embedded copy.
+        \\  tile57 style [portrayal-catalog-dir] --scheme day -o <out.json>
         \\      Emit one MapLibre style.json (colours from the catalogue, or
         \\      --colortables FILE). --scheme day|dusk|night; --source-tiles/
         \\      --pmtiles-url pick the source; --sprite/--glyphs enable symbol/text
@@ -168,7 +169,7 @@ pub fn printUsage() void {
         \\  tile57 png|pdf <source> --view <lon,lat,zoom> --size WxH -o <out>
         \\      Render a tile or a view through the native S-52 pixel path:
         \\      PNG raster or deterministic vector PDF (real text objects).
-        \\      Sources: an S-57 cell (single-cell portrayal) or a baked .pmtiles
+        \\      Sources: an S-57 chart (single-chart portrayal) or a baked .pmtiles
         \\      bundle (tile replay). --dq data-quality overlay; --scale F
         \\      physical-size multiplier; --palette day|dusk|night.
         \\  tile57 ascii <cell.000 | bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--ansi] [--kitty]
@@ -177,19 +178,19 @@ pub fn printUsage() void {
         \\  tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX]
         \\      Dump, per feature, the RAW S-57 (class + attributes), the S-101
         \\      portrayal instruction stream (raw + parsed), and the resolved
-        \\      Surface draw calls. Takes a SINGLE .000 cell (auto-applying its
+        \\      Surface draw calls. Takes a SINGLE .000 chart (auto-applying its
         \\      .001+ updates), or an ENC_ROOT with --view LON,LAT,ZOOM (or a
-        \\      "…/#v=LON,LAT,ZOOM" share URL) to pull just the cells under that
+        \\      "…/#v=LON,LAT,ZOOM" share URL) to pull just the charts under that
         \\      viewport (--viewport WxH overrides the assumed 1280x800 screen).
         \\      --zoom N picks the resolving tile; --json; --no-resolve skips the draw-call pass;
         \\      --tui opens the two-pane explorer (arrows select, / filters, q
         \\      quits); --kitty adds, in console mode, an isolated thumbnail of
-        \\      each feature's resolved render, and in the TUI a LIVE CELL MAP that
-        \\      frames the selection (whole cell on a class header, zoomed in to
+        \\      each feature's resolved render, and in the TUI a LIVE CHART MAP that
+        \\      frames the selection (whole chart on a class header, zoomed in to
         \\      frame a feature; m toggles map-only) — for graphics terminals.
         \\  tile57 inspect <file.pmtiles> [z x y]
         \\  tile57 cell <file.000>
-        \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find cells with an object class)
+        \\  tile57 objlcount <file.000> <objl> [prim]   (corpus scan: find charts with an object class)
         \\  tile57 version
         \\  tile57 help
         \\
