@@ -436,6 +436,15 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(lib);
     }
 
+    // `zig build lib` installs only libtile57.a for the resolved target. The
+    // default install also builds the host-only bake CLI (which force-links
+    // static musl and so can't cross-compile); an embedder cross-building the
+    // library for another platform — e.g. a Qt6 viewer for the reMarkable
+    // tablet (arm-linux-gnueabihf / aarch64-linux-gnu) — uses this step to get
+    // just the archive without the CLI.
+    const lib_only_step = b.step("lib", "Build only libtile57.a for the target");
+    lib_only_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+
     // The offline baker / inspector CLI. It runs the embedded-Lua S-101 portrayal
     // so baked tiles get full S-101 styling (not the classify() fallback), so —
     // unlike the unit tests — its engine module is bake_root.zig (root.zig +
