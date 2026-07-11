@@ -31,7 +31,7 @@ const Chart = chart.Chart;
 extern fn time(tloc: ?*c_long) callconv(.c) c_long;
 
 // Keep in sync with the TILE57_VERSION_* macros in tile57.h.
-const version_string = "0.2.0";
+const version_string = "0.3.0";
 
 fn spanOpt(s: ?[*:0]const u8) ?[]const u8 {
     return if (s) |p| std.mem.span(p) else null;
@@ -170,7 +170,7 @@ export fn tile57_status_str(status: c_int) callconv(.c) [*:0]const u8 {
     };
 }
 
-/// Return the library version string ("0.2.0").
+/// Return the library version string ("0.3.0").
 export fn tile57_version() callconv(.c) [*:0]const u8 {
     return version_string;
 }
