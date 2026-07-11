@@ -784,7 +784,7 @@ fn viewportBbox(lon: f64, lat: f64, zoom: f64, w_px: f64, h_px: f64) [4]f64 {
 
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
-        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--view LON,LAT,ZOOM|URL] [--viewport WxH] [--json] [--tui] [--kitty] [--no-resolve] [--rules DIR]\n", .{});
+        std.debug.print("usage: tile57 explore <cell.000 | ENC_ROOT --view LON,LAT,ZOOM> [--class ACR[,ACR..]] [--object FOID|RCID|INDEX] [--zoom N] [--view LON,LAT,ZOOM|URL] [--viewport WxH] [--json] [--tui] [--kitty] [--no-resolve] [--meta] [--rules DIR]\n", .{});
         return;
     }
     const path = args[2];
@@ -792,6 +792,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var json = false;
     var tui = false;
     var kitty = false;
+    var meta_bounds = false;
     var rules_flag: ?[]const u8 = null;
     var view: ?View = null;
     var viewport_w: f64 = 1280; // the screen the viewport filter assumes (CSS px)
@@ -823,6 +824,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             F.kitty = true;
         } else if (std.mem.eql(u8, arg, "--no-resolve")) {
             F.do_resolve = false;
+        } else if (std.mem.eql(u8, arg, "--meta")) {
+            meta_bounds = true; // resolve meta-object boundaries (M_NSYS/M_COVR/…) the inspection view shows
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules_flag = f.val("--rules") orelse return;
         } else return usageErr("unknown flag");
@@ -840,6 +843,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     const palette: render.resolve.PaletteId = .day;
     var m = render.resolve.Settings{ .display_other = true };
     m.scheme = .day;
+    m.show_meta_bounds = meta_bounds;
 
     // explore inspects one or more source cells. `dir` stays open for the whole run
     // (the TUI re-reads cells lazily to rebuild level 3 + the map render).

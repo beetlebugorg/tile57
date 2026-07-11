@@ -19,7 +19,7 @@ const resolveRulesDir = common.resolveRulesDir;
 // tile (labels + declutter over the full canvas, no seams).
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output: render.pixel.Output) !void {
     if (args.len < 4) {
-        std.debug.print("usage: tile57 {s} <cell.000|bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--scale F]\n" ++
+        std.debug.print("usage: tile57 {s} <cell.000|bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--meta] [--scale F]\n" ++
             "       tile57 {s} <source> --view <lon,lat,zoom> --size WxH -o <out> [flags]\n", .{ @tagName(output), @tagName(output) });
         return;
     }
@@ -72,6 +72,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             rules = f.next() orelse return usageErr("--rules needs a dir");
         } else if (std.mem.eql(u8, arg, "--dq")) {
             dq = true; // S-52 data-quality overlay (M_QUAL DQUAL* patterns)
+        } else if (std.mem.eql(u8, arg, "--meta")) {
+            m.show_meta_bounds = true; // meta-object coverage/scale/nav-system bounds inspection view
         } else if (std.mem.eql(u8, arg, "--scale")) {
             const v = f.next() orelse return usageErr("--scale needs a value");
             size_scale = std.fmt.parseFloat(f64, v) catch return usageErr("bad --scale");
