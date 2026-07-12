@@ -413,6 +413,16 @@ typedef struct tile57_mariner {
                          * vertical-line hatch over regions displayed finer than their
                          * compilation scale (drives the `overscale` layer's
                          * visibility). Default true. */
+    double text_size_scale;    /* extra size multiplier for TEXT labels, on top of
+                         * size_scale. The engine scales the glyph and its collision
+                         * box together, so enlarged labels still declutter correctly.
+                         * NOT an S-52 setting. Appended for ABI-append-safety; 0 (an
+                         * un-set field) is read as 1.0 = no extra scale. */
+    double sounding_size_scale; /* extra size multiplier for SOUNDINGS, on top of
+                         * size_scale. Scales each digit AND its spacing together
+                         * (soundings arrive as one sprite per digit, so a host cannot
+                         * do this itself). NOT an S-52 setting. Appended for
+                         * ABI-append-safety; 0 is read as 1.0. */
 } tile57_mariner;
 
 /* Fill *m with the canonical default mariner settings (so a host needn't

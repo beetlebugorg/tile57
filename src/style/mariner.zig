@@ -102,6 +102,15 @@ pub const Settings = struct {
     // the host can match TRUE physical size from its calibrated CSS-pixel pitch.
     // 1.0 = catalogue sizes verbatim (byte-identical output).
     size_scale: f64 = 1.0,
+
+    // -- per-category size multipliers (NOT S-52 settings) — an extra factor ON TOP
+    // of size_scale for TEXT labels / SOUNDINGS only, so a mariner can enlarge just
+    // those for legibility. Folded into the same device scale that sizes the glyph
+    // AND its declutter box (and, for a sounding, the per-digit spacing), so the
+    // enlarged mark still collides correctly — the thing that scales it is the thing
+    // that declutters it. 1.0 = no extra scale (byte-identical output).
+    text_size_scale: f64 = 1.0,
+    sounding_size_scale: f64 = 1.0,
 };
 
 // ---- expression DSL ---------------------------------------------------------

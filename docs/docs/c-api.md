@@ -517,6 +517,12 @@ typedef struct tile57_mariner {
     bool show_overscale;            /* S-52 §10.1.10 overscale indication: the
                                      * AP(OVERSC01) hatch over regions displayed finer
                                      * than their compilation scale. Defaults true. */
+    double text_size_scale;         /* extra size multiplier for TEXT labels, on top of
+                                     * size_scale (the engine scales glyph + collision box
+                                     * together). 1.0 = none; 0 reads as 1.0. */
+    double sounding_size_scale;     /* extra size multiplier for SOUNDINGS, on top of
+                                     * size_scale (scales each digit + spacing together).
+                                     * 1.0 = none; 0 reads as 1.0. */
 } tile57_mariner;
 
 void tile57_mariner_defaults(tile57_mariner *m);   /* canonical defaults, date_view = "" */
