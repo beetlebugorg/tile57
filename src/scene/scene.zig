@@ -398,6 +398,18 @@ pub const CellOpts = struct {
     /// in the window where this cell already owns the ground geometrically.
     /// 0 = no clamp. Features without SCAMIN stay ungated.
     eff_scamin_floor: i64 = 0,
+    /// The display denominator beyond which this cell's SCAMIN-LESS SOUNDINGS stop
+    /// showing (soundingScamin of the cell's compilation scale; 0 = no imputation).
+    /// SCAMIN is optional in S-57 and producers routinely omit it on soundings, which
+    /// leaves a sounding with no minimum display scale at all: every sounding a
+    /// harbour cell holds then draws at every zoom the cell reaches, including the
+    /// zooms where the chart is stretched far past the scale it was compiled for and
+    /// the numbers are a carpet no one can read. Scale IS the density control in
+    /// S-52 — soundings are drawn as symbols precisely so they stay legible — so a
+    /// sounding the producer left ungated inherits the one scale limit its cell can
+    /// justify: its own compilation scale. Only spot soundings (SOUNDG); a wreck,
+    /// rock or obstruction is a DANGER and is never scale-gated away.
+    sounding_scamin: i64 = 0,
     /// Emit the per-feature pick-report attributes (the `s57` blob + `cell` name) for
     /// the S-52 §10.8 cursor pick + dev inspector. Defaults ON (host wants a working
     /// pick report in the local-first deployment); a lean bake can turn it off via the
@@ -654,8 +666,41 @@ pub fn featureScamin(f: s57.Feature) ?i64 {
 /// where the composite has already assigned it the ground, hiding it would
 /// open a hole nothing else may fill. No SCAMIN stays no SCAMIN.
 fn effScamin(f: s57.Feature, opts: CellOpts) ?i64 {
+    // SOUNDINGS are exempt from the band-floor clamp, and inherit a limit when the
+    // producer set none. Both for the same reason: SCAMIN is how a chart controls
+    // sounding DENSITY, and the clamp — which exists so an aggressive SCAMIN cannot
+    // blank a feature in the window where this cell already owns the ground — has
+    // nothing to protect here. A hidden sounding leaves no hole: no coarser cell is
+    // waiting to supply it, and the depth it reports is still carried by the depth
+    // areas and contours under it. Clamping it up instead OVERRIDES the producer:
+    // NOAA marks a harbour cell's soundings "not below 1:60,000" and the floor
+    // lifts that to the cell's band floor (1:273,000 for an approach cell), so
+    // every sounding the cell holds draws across its whole zoom window — the
+    // unreadable carpet at the coarse end. Honour what the producer asked for.
+    if (f.objl == OBJL_SOUNDG) return featureScamin(f) orelse
+        (if (opts.sounding_scamin > 0) opts.sounding_scamin else null);
     const sc = featureScamin(f) orelse return null;
     return @max(sc, opts.eff_scamin_floor);
+}
+
+/// S-57 object class: SOUNDG, the spot-sounding multipoint. (A wreck, rock or
+/// obstruction is a DANGER, not a sounding — it keeps the clamp, and is never
+/// scale-gated away by the rule above.)
+const OBJL_SOUNDG: u16 = 129;
+
+/// How far past its compilation scale a cell's soundings stay readable when the
+/// producer set no SCAMIN at all. The band windows already sit ~1.7x underzoomed
+/// at a band's floor zoom, so 2x keeps such a sounding across the zoom window its
+/// own cell owns and drops it only beyond that — where a coarser cell, with its
+/// own sparser soundings, is the intended source.
+pub const SOUNDING_UNDERZOOM: i64 = 2;
+
+/// The display denominator beyond which a cell's SCAMIN-LESS soundings stop
+/// showing: its compilation scale, allowed SOUNDING_UNDERZOOM x. 0 (unknown
+/// scale) imputes nothing — there is no scale to justify a limit with.
+pub fn soundingScamin(cscl: i32) i64 {
+    if (cscl <= 0) return 0;
+    return @as(i64, cscl) * SOUNDING_UNDERZOOM;
 }
 
 /// S-52 §10.6.1.1: does the feature carry ancillary information warranting the
@@ -1889,6 +1934,12 @@ pub const CellRef = struct {
     overscale_hatch: bool = false,
     /// The effScamin floor for this cell (see CellOpts.eff_scamin_floor).
     eff_scamin_floor: i64 = 0,
+    /// The imputed SCAMIN for this cell's ungated soundings (see
+    /// CellOpts.sounding_scamin). 0 = derive it from the cell's own parsed scale:
+    /// the baker keeps the compilation scale on its own backend (the cell it hands
+    /// us has no DSPM params), so it passes the value in; the live paths, which
+    /// parse the cell whole, let the fallback read it off the cell.
+    sounding_scamin: i64 = 0,
     /// Max ground-distance sector-leg length (metres) among the cell's lights
     /// (see CellOpts.light_range_m) — the honest LIGHTS cull margin.
     light_range_m: f64 = 0,
@@ -1929,6 +1980,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .oscl = cr.oscl,
             .overscale_hatch = cr.overscale_hatch,
             .eff_scamin_floor = cr.eff_scamin_floor,
+            .sounding_scamin = if (cr.sounding_scamin != 0) cr.sounding_scamin else soundingScamin(cr.cell.params.cscl),
             .pick_attrs = pick_attrs,
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
@@ -1958,6 +2010,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .oscl = cr.oscl,
             .overscale_hatch = cr.overscale_hatch,
             .eff_scamin_floor = cr.eff_scamin_floor,
+            .sounding_scamin = if (cr.sounding_scamin != 0) cr.sounding_scamin else soundingScamin(cr.cell.params.cscl),
             .pick_attrs = pick_attrs,
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
