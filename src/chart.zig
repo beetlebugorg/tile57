@@ -2341,6 +2341,7 @@ const BakeWork = struct {
         var portrayal_simplified: ?[]const ?[]const u8 = null;
         var geo: ?scene.GeoParts = null;
         var geo_world: ?scene.GeoWorld = null;
+        var feat_bbox: ?[]const ?[4]f64 = null;
         const pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(gpa);
@@ -2363,6 +2364,10 @@ const BakeWork = struct {
             // per-tile path reduce to worldToTile (multiply + round). Without this the
             // per-tile loop falls back to the full transcendental projection.
             if (geo) |g| geo_world = scene.buildGeoWorld(p.allocator(), g) catch null;
+            // Per-feature lon/lat bbox — the per-tile spatial cull in appendCellFeatures.
+            // Without it every feature in the cell is walked (and its portrayal parsed)
+            // for every tile, even the ones it lies nowhere near.
+            feat_bbox = scene.buildFeatBBox(p.allocator(), &cell, geo) catch null;
             // Per-feature label-point (polylabel) cache — tile-invariant, so compute it ONCE
             // per cell (only for Text/centred-symbol features) instead of re-running the search
             // for every tile a feature touches; the arena outlives the call via c.arenas.
@@ -2376,7 +2381,7 @@ const BakeWork = struct {
         // Sector-figure reach (exact, from the portrayal streams): buildTileMap
         // addresses the neighbouring tiles the cell's light legs/arcs cross.
         const lr = scene.collectLightReach(&cell, portrayal);
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .geo_world = geo_world, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .geo_world = geo_world, .feat_bbox = feat_bbox, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
         c.arenas[i] = pa;
     }
 };
