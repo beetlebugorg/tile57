@@ -285,33 +285,108 @@ pub const Context = struct {
 /// Run the S-101 rules over `adapted` with `ov`, returning a stream array indexed
 /// by cell.features index (null where the adapted subset doesn't cover a feature,
 /// or it emitted nothing). `features_len` is cell.features.len.
+/// Serialize an adapted attribute node (simple sub-attrs + complex children,
+/// recursively) into `kb` — the part of the dedup key that captures everything the
+/// rules read via tgp_simple / tgp_complex. Byte separators (unit/record/group) keep
+/// distinct trees distinct.
+fn appendNode(arena: std.mem.Allocator, kb: *std.ArrayList(u8), node: adapter.CNode) !void {
+    for (node.simple) |s| {
+        try kb.append(arena, 0x1f);
+        try kb.appendSlice(arena, s.name);
+        try kb.append(arena, '=');
+        try kb.appendSlice(arena, s.value);
+    }
+    for (node.children) |ch| {
+        try kb.append(arena, 0x1e);
+        try kb.appendSlice(arena, ch.code);
+        try kb.append(arena, '{');
+        for (ch.nodes) |n| {
+            try appendNode(arena, kb, n);
+            try kb.append(arena, 0x1d);
+        }
+        try kb.append(arena, '}');
+    }
+}
+
+/// The portrayal of a Curve/Surface feature with no feature-to-feature relationship is
+/// a pure function of what the rules can read for it: its class, primitive, and the
+/// SYNTHESIZED attribute tree (adaptCell's output, which already folds in the S-65
+/// spatial derivations — inTheWater, surroundingDepth — so two features agreeing on it
+/// truly portray alike). The host serves such features NO geometry (tgp_points_count is
+/// 0, so tgp_colocated finds nothing and GetSpatial is never consulted) and NO
+/// associations (tgp_assoc_features is empty without FFPT). Point features are excluded
+/// — they carry geometry the rules query (co-located aids, sector construction) — as are
+/// FFPT sources and targets, whose portrayal folds in a related feature. Returns "" (do
+/// not dedupe) for any of those.
+fn dedupKey(arena: std.mem.Allocator, ad: adapter.Adapted, f: s57.Feature, referenced: *const std.AutoHashMap(u64, void)) []const u8 {
+    if (std.mem.eql(u8, ad.primitive, "Point")) return "";
+    if (f.frefs.len > 0) return "";
+    if (f.foid != 0 and referenced.contains(f.foid)) return "";
+    var kb = std.ArrayList(u8).empty;
+    kb.appendSlice(arena, ad.code) catch return "";
+    kb.append(arena, ':') catch return "";
+    kb.appendSlice(arena, ad.primitive) catch return "";
+    appendNode(arena, &kb, ad.root) catch return "";
+    return kb.items;
+}
+
 fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapter.Adapted, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
-    const results = try arena.alloc([]const u8, adapted.len);
+    // Portrayal dedup: a Curve/Surface feature with no FFPT relationship portrays as a
+    // pure function of (class, primitive, attributes) — see dedupKey. Run the S-101
+    // rules ONCE per distinct key and fan the instruction stream out to the rest, so a
+    // cell with hundreds of same-depth areas/contours evaluates the (expensive) Lua
+    // rules a few dozen times instead of thousands. Point / FFPT-related features carry
+    // per-instance context (co-located aids, related equipment) and always run.
+    var referenced = std.AutoHashMap(u64, void).init(arena);
+    for (cell.features) |cf| for (cf.frefs) |fr| try referenced.put(fr.lnam, {});
+
+    // The reduced pass = representatives + every non-deduped feature, in original order.
+    // `src` maps each original adapted index to the reduced index whose result it takes.
+    var reduced = std.ArrayList(adapter.Adapted).empty;
+    const src = try arena.alloc(usize, adapted.len);
+    var groups = std.StringHashMap(usize).init(arena); // dedupKey -> representative's reduced index
+    for (adapted, 0..) |ad, i| {
+        const key = dedupKey(arena, ad, cell.features[ad.feature_index], &referenced);
+        if (key.len > 0) {
+            if (groups.get(key)) |ri| {
+                src[i] = ri; // a later duplicate reuses the representative's result
+                continue;
+            }
+            try groups.put(key, reduced.items.len);
+        }
+        src[i] = reduced.items.len;
+        try reduced.append(arena, ad);
+    }
+
+    const results = try arena.alloc([]const u8, reduced.items.len);
     for (results) |*r| r.* = "";
 
-    // Reverse index cell.features index -> this pass's adapted index, so an FFPT
-    // pointer (resolved to a feature index via Cell.featureIndexByFoid) maps back to
-    // the opaque Lua feature ID (the adapted index) that HostFeatureGetCode/featureCache
-    // use. Only features present in THIS pass are mapped, so a subset (variant) pass
-    // resolves associations among its own features.
+    // Reverse index cell.features index -> reduced index, so an FFPT pointer (resolved
+    // to a feature index via Cell.featureIndexByFoid) maps back to the opaque Lua
+    // feature ID (the reduced index) that HostFeatureGetCode/featureCache use. Deduped
+    // features are absent, but dedupKey never dedupes a referenced FOID, so nothing
+    // resolves to them. Only features present in THIS pass are mapped, so a subset
+    // (variant) pass resolves associations among its own features.
     const feat_to_adapted = try arena.alloc(?usize, cell.features.len);
     for (feat_to_adapted) |*x| x.* = null;
-    for (adapted, 0..) |ad, i| {
+    for (reduced.items, 0..) |ad, i| {
         if (ad.feature_index < feat_to_adapted.len) feat_to_adapted[ad.feature_index] = i;
     }
 
-    var ctx = Ctx{ .adapted = adapted, .results = results, .arena = arena, .cell = cell, .feat_to_adapted = feat_to_adapted };
+    var ctx = Ctx{ .adapted = reduced.items, .results = results, .arena = arena, .cell = cell, .feat_to_adapted = feat_to_adapted };
     g_ctx = &ctx;
     defer g_ctx = null;
 
     const cctx = pctx.toC();
     _ = tg_portray_run(rules_dir.ptr, rules_dir.len, &cctx);
 
-    // Re-key adapted-index results to cell feature index.
+    // Re-key results to cell feature index: each original feature takes its
+    // representative's (or, undeduped, its own) instruction stream.
     const by_feature = try arena.alloc(?[]const u8, cell.features.len);
     for (by_feature) |*b| b.* = null;
     for (adapted, 0..) |ad, i| {
-        if (results[i].len > 0) by_feature[ad.feature_index] = results[i];
+        const r = results[src[i]];
+        if (r.len > 0) by_feature[ad.feature_index] = r;
     }
     return by_feature;
 }
