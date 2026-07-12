@@ -378,7 +378,9 @@ export fn tile57_bake_tree(
     const in_d = spanOpt(in_dir) orelse return failWith(err, .badarg, "in_dir must not be null");
     const out_d = spanOpt(out_dir) orelse return failWith(err, .badarg, "out_dir must not be null");
     // Stand up a threaded std.Io for the tree walk + the workers' file writes.
-    const baked = chart.bakeTree(sharedIo(), in_d, out_d, null, workers, progress, progress_ctx) catch |e| return failCtx(err, e, in_d);
+    // No label callback: this ABI reports progress as a count, and a chart name would have to cross
+    // the seam as a string. A Zig caller that owns the input list names the charts itself.
+    const baked = chart.bakeTree(sharedIo(), in_d, out_d, null, workers, progress, progress_ctx, null) catch |e| return failCtx(err, e, in_d);
     if (out_baked) |p| p.* = @intCast(baked);
     return OK;
 }
