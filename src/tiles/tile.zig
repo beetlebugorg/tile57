@@ -6,6 +6,7 @@
 //! mvt.zig.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const mvt = @import("mvt.zig");
 
@@ -53,18 +54,31 @@ pub fn worldToTile(w: [2]f64, z: u8, tx: u32, ty: u32, extent: i32) mvt.Point {
 }
 
 // Round to nearest, ties away from zero == Go math.Round (Quantize, tile.go:116).
-// Truncate toward zero with the always-available CVTTSD2SI (@intFromFloat — the
-// baseline musl target has no ROUNDSD, so @round/@trunc compile to a slow libm call
-// that profiled at ~15% of the bake), then bump by the fractional part. This avoids
-// the `v ± 0.5` edge where adding 0.5 to a value just below x.5 rounds UP to x+1 in
-// double precision (half-even on the ADD), diverging from math.Round for that
-// measure-zero case — all ALU ops, no software round.
 inline fn roundI32(v: f64) i32 {
-    const ti: i64 = @intFromFloat(v);
-    const frac = v - @as(f64, @floatFromInt(ti));
-    if (frac >= 0.5) return @intCast(ti + 1);
-    if (frac <= -0.5) return @intCast(ti - 1);
-    return @intCast(ti);
+    return switch (builtin.cpu.arch) {
+        // FCVTAS *is* this function: convert-to-signed, round-to-nearest ties-away,
+        // saturating. Baseline ARMv8, one instruction.
+        .aarch64, .aarch64_be => asm ("fcvtas %[out:w], %[in:d]"
+            : [out] "=r" (-> i32),
+            : [in] "w" (v),
+        ),
+        // No ties-away convert on x86 (ROUNDSD rounds half-to-even, and is absent
+        // from the baseline musl target anyway — @round there is a libm call that
+        // profiled at ~15% of the bake). Truncate with the always-available
+        // CVTTSD2SI, then bump by the fractional part. The compares stay BRANCHLESS:
+        // a projected coordinate's fraction is uniform, so `frac >= 0.5` is a coin
+        // flip no predictor can learn, and as branches these two cost more than the
+        // projection feeding them. Going through the fraction (rather than v ± 0.5)
+        // also avoids double-rounding: adding 0.5 to a value just below x.5 rounds UP
+        // on the ADD, diverging from math.Round for that measure-zero case.
+        else => blk: {
+            const ti: i64 = @intFromFloat(v);
+            const frac = v - @as(f64, @floatFromInt(ti));
+            const up: i64 = @intFromBool(frac >= 0.5);
+            const dn: i64 = @intFromBool(frac <= -0.5);
+            break :blk @intCast(ti + up - dn);
+        },
+    };
 }
 
 /// Geographic bounds of tile (z,x,y): [min_lon, min_lat, max_lon, max_lat].

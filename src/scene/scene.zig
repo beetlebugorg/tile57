@@ -1060,12 +1060,11 @@ pub fn buildFeatBBox(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts) ![]?[4
 /// stored on the cell (cell.label_cache) and reused by the per-tile emit. The pole-
 /// of-inaccessibility (polylabel) search depends only on the feature's full geometry
 /// (tile-invariant), so computing it ONCE per cell removes the per-tile recompute that
-/// dominates the bake. ONLY area/line features whose portrayal draws a label or centred
-/// symbol (Text/PointInstruction) ever consult labelPoint, so cache only those — running
-/// the search for every other area would cost more than the per-tile recompute it saves.
-/// A null slot (unlabelled, or `streams==null`) makes labelPoint fall back to a live
-/// search, so the cached point is byte-identical either way. `streams` is the per-feature
-/// base instruction stream (parallel to cell.features); null = cache nothing.
+/// dominates the bake. Only an AREA that actually anchors something at its representative
+/// point consults labelPoint, so cache exactly those; a null slot (a plain fill area, an
+/// unlabelled one, or `streams==null`) makes labelPoint fall back to a live search, so the
+/// cached point is byte-identical either way. `streams` is the per-feature base instruction
+/// stream (parallel to cell.features); null = cache nothing.
 pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, streams: ?[]const ?[]const u8) ![]?s57.LonLat {
     const out = try a.alloc(?s57.LonLat, cell.features.len);
     @memset(out, null);
@@ -1074,14 +1073,21 @@ pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, stre
     defer tmp.deinit();
     for (cell.features, 0..) |f, i| {
         // Polylabel (areaRepresentativePoint) is AREA-only — lines anchor at their mid-vertex.
-        // Cache every portrayed area: labelPoint is consulted not just for Text/PointInstruction
-        // labels but also for the native INFORM01/QUESMRK1 centred markers (which carry no such
-        // instruction), so the earlier Text/Point-only gate left those recomputing per tile —
-        // the dominant cost on large coarse cells. Byte-identical: labelPoint returns the same
-        // point cached or live.
         if (f.prim != 3) continue;
         if (i >= ss.len) break;
-        _ = ss[i] orelse continue; // portrayed at all (an unportrayed area never reaches labelPoint)
+        const stream = ss[i] orelse continue; // portrayed at all (an unportrayed area never reaches labelPoint)
+        // Only an area that PLACES something at the representative point consults it: a centred
+        // label (TextInstruction), a centred symbol (PointInstruction), or the native INFORM01
+        // additional-info marker (hasAdditionalInfo). A plain fill/boundary area — the vast
+        // majority (DEPARE, LNDARE, SBDARE, DEPCNT, …) — anchors nothing there, and the pole-of-
+        // inaccessibility search is expensive, so skip it. QUESMRK1/SWPARE fallbacks carry a null
+        // stream (skipped above) and stay on the live path. The token test is a strict SUPERSET of
+        // what the per-tile path consults (an empty TextInstruction is dropped downstream), so a
+        // cached point is only ever spurious, never missing — labelPoint stays byte-identical and
+        // no per-tile recompute creeps back in.
+        if (!hasAdditionalInfo(f) and
+            std.mem.indexOf(u8, stream, "TextInstruction:") == null and
+            std.mem.indexOf(u8, stream, "PointInstruction:") == null) continue;
         const parts = featureParts(tmp.allocator(), cell.*, geo, i, f) catch continue;
         out[i] = s57.areaRepresentativePoint(tmp.allocator(), parts);
         _ = tmp.reset(.retain_capacity);
