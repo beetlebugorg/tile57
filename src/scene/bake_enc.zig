@@ -745,7 +745,7 @@ const TileGenCtx = struct {
             // still owns some of it (its fills aren't fully clipped away).
             const oscl: i64 = overscaleGateDenom(be.cscl);
             const wins_somewhere = cover_clip == null or !tileFullyCovered(scratch, cover_clip.?, box);
-            refs[nrefs] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .light_range_m = be.light_range_m };
+            refs[nrefs] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .sounding_scamin = scene.soundingScamin(be.cscl), .light_range_m = be.light_range_m };
             nrefs += 1;
         }
         const mvt_bytes = scene.encodeTile(scratch, scratch, refs[0..nrefs], z, x, y, c.format, c.pick_attrs) catch return;
