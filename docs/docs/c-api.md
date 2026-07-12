@@ -111,8 +111,10 @@ tile57_status tile57_bake_charts(const char *const *paths, size_t n, uint32_t wo
  * INCREMENTAL: a chart whose archive is already at least as new as its whole
  * input (.000 + update chain) is skipped, so a re-run over an unchanged tree
  * bakes nothing — *out_baked counts THIS run, and 0 over a warm cache is
- * success. progress (or NULL) fires per chart, possibly from worker threads. */
-typedef void (*tile57_bake_progress)(void *ctx, uint32_t done, uint32_t total);
+ * success. progress (or NULL) fires per chart, possibly from worker threads;
+ * returning false CANCELS the bake (at chart granularity — the charts in flight
+ * finish). A cancelled bake is TILE57_OK with *out_baked = what it completed. */
+typedef bool (*tile57_bake_progress)(void *ctx, uint32_t done, uint32_t total);
 tile57_status tile57_bake_tree(const char *in_dir, const char *out_dir, uint32_t workers,
                                tile57_bake_progress progress, void *progress_ctx,
                                uint32_t *out_baked, tile57_error *err);

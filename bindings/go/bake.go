@@ -7,7 +7,7 @@ package tile57
 #include "tile57.h"
 
 // Trampoline: the C progress callback calls back into this exported Go function.
-extern void tile57GoBakeProgress(void *ctx, uint32_t done, uint32_t total);
+extern bool tile57GoBakeProgress(void *ctx, uint32_t done, uint32_t total);
 */
 import "C"
 
@@ -17,11 +17,16 @@ import (
 	"unsafe"
 )
 
+// The C callback can cancel the bake by returning false; BakeTree's progress func has no
+// way to say so, so this always continues. (A cancellable Go bake would take a variant
+// whose callback returns bool — the C ABI already supports it.)
+//
 //export tile57GoBakeProgress
-func tile57GoBakeProgress(ctx unsafe.Pointer, done, total C.uint32_t) {
+func tile57GoBakeProgress(ctx unsafe.Pointer, done, total C.uint32_t) C.bool {
 	if fn, ok := cgo.Handle(uintptr(ctx)).Value().(func(int, int)); ok && fn != nil {
 		fn(int(done), int(total))
 	}
+	return C.bool(true)
 }
 
 // BakeChart bakes ONE on-disk chart (a .000 path + its .001.. updates) to a PMTiles
