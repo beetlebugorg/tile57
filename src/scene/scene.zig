@@ -2246,7 +2246,11 @@ fn appendCellFeatures(
             try emitNavSystemFallback(a, cell.*, f, fi, geo, z, x, y, tb, box, fopts, surf);
             continue;
         }
-        if (f.objl != s57.OBJL_TOPMAR and adapter.resolveClass(f) == null) {
+        // "Unknown feature -> ?" fallback: only for S-57 cells, where an object class
+        // with no S-101 mapping was never portrayed. A NATIVE S-101 feature always has
+        // a valid class (it came from the dataset's own FTCS table); a null/empty
+        // portrayal stream there means the rule ran and emitted nothing, not "unknown".
+        if (!cell.native and f.objl != s57.OBJL_TOPMAR and adapter.resolveClass(f) == null) {
             if (!fopts.suppress_points) try emitCentredSymbol(a, cell.*, f, fi, geo, "QUESMRK1", 6, 1, z, x, y, tb, fopts, surf);
             continue;
         }

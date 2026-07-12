@@ -618,6 +618,13 @@ pub const Cell = struct {
     /// single-tile path falls back to an on-demand search). Allocated in the baker's
     /// geometry arena, not the cell arena.
     label_cache: ?[]const ?LonLat = null,
+    /// True when this cell was assembled from a NATIVE S-101 dataset (s101.native)
+    /// rather than parsed from an S-57 source. It carries the S-57 geometry model
+    /// but its features draw their portrayal from S-101-native `adapter.Adapted`
+    /// (not `adaptCell`), so an `objl` may be a surrogate or 0 even though the
+    /// feature has a valid S-101 class. Downstream code that would treat "no S-57
+    /// class" as "unknown feature" must exempt native cells.
+    native: bool = false,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Cell) void {

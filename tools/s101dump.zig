@@ -99,13 +99,13 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         cell.features.len, loaded.adapted.len, cell.vectors.len, cell.nodes.count(), cell.edges.count(), cell.sounding_vecs.count(),
     });
     if (cell.bounds()) |b| std.debug.print("  geometry bounds: lon [{d:.5}, {d:.5}]  lat [{d:.5}, {d:.5}]\n", .{ b[0], b[2], b[1], b[3] });
-    // Spot-check assembled geometry per primitive: pick the first area, line, point,
-    // and sounding feature and report the vertex/part counts the accessors return.
+    // Spot-check assembled geometry per primitive: pick the first area/line/point
+    // adapted feature and report the vertex/part counts the accessors return.
     var did_area = false;
     var did_line = false;
     var did_pt = false;
-    var did_snd = false;
-    for (cell.features, loaded.adapted) |f, ad| {
+    for (loaded.adapted) |ad| {
+        const f = cell.features[ad.feature_index];
         if (f.prim == 3 and !did_area) {
             const parts = cell.geometryParts(a, f) catch &[_][]engine.s57.LonLat{};
             var verts: usize = 0;
@@ -118,17 +118,20 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             for (parts) |pp| verts += pp.len;
             std.debug.print("  line  {s}: {d} parts / {d} verts\n", .{ ad.code, parts.len, verts });
             did_line = true;
-        } else if (f.prim == 1 and f.objl != 129 and !did_pt) {
+        } else if (f.prim == 1 and !did_pt) {
             if (cell.pointGeometry(f)) |pt| {
                 std.debug.print("  point {s}: lon={d:.5} lat={d:.5}\n", .{ ad.code, pt.lon(), pt.lat() });
                 did_pt = true;
             }
-        } else if (f.objl == 129 and !did_snd) {
-            const snds = cell.soundingsFor(a, f) catch &[_]engine.s57.Sounding{};
-            if (snds.len > 0) {
-                std.debug.print("  sounding {s}: {d} depth pts, first depth={d:.1}m\n", .{ ad.code, snds.len, snds[0].depth });
-                did_snd = true;
-            }
+        }
+    }
+    // Soundings are emitted directly (not in `adapted`); report the first one.
+    for (cell.features) |f| {
+        if (f.objl != 129) continue;
+        const snds = cell.soundingsFor(a, f) catch &[_]engine.s57.Sounding{};
+        if (snds.len > 0) {
+            std.debug.print("  sounding: {d} depth pts, first depth={d:.1}m\n", .{ snds.len, snds[0].depth });
+            break;
         }
     }
 }

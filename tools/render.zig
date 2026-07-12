@@ -133,12 +133,11 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
         // Auto-apply the cell's sequential .001.. updates beside it (like the
         // streaming chart loader and `tile57 explore`) — a bare-.000 render of a
         // real NOAA cell without its updates shows stale/deleted features.
-        cell = try engine.s57.parseCellWithUpdates(a, data, readUpdates(io, a, path));
         engine.portray.setQuiet(true);
         // LIVE portrayal context: the mariner's real safety contour / depth /
         // contours / styles evaluate INSIDE the rules — the native win over
         // the tile path's fixed bake context.
-        streams = try engine.portray.portrayCellWith(a, &cell, resolveRulesDir(rules), .{
+        const pctx = engine.portray.Context{
             .safety_contour = m.safety_contour,
             .safety_depth = m.safety_depth,
             .shallow_contour = m.shallow_contour,
@@ -146,7 +145,17 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             .plain_boundaries = m.boundary_style == .plain,
             .simplified_symbols = m.simplified_points,
             .full_light_lines = m.show_full_sector_lines,
-        });
+        };
+        // A native S-101 dataset (.000, S-100 Part 10a) assembles + portrays without
+        // the S-57 -> S-101 adapter; an S-57 cell parses with its .001.. updates.
+        if (engine.s101.dataset.detect(data)) {
+            const loaded = try engine.s101.native.parseDataset(a, data);
+            cell = loaded.cell;
+            streams = try engine.portray.portrayCellWithAdapted(a, &cell, loaded.adapted, resolveRulesDir(rules), pctx);
+        } else {
+            cell = try engine.s57.parseCellWithUpdates(a, data, readUpdates(io, a, path));
+            streams = try engine.portray.portrayCellWith(a, &cell, resolveRulesDir(rules), pctx);
+        }
     }
     defer if (!from_bundle) cell.deinit();
 

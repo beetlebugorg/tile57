@@ -203,22 +203,28 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
             .attrs = s57attrs.items,
         });
 
-        // Native Adapted: class name + CNode tree from ATTR (no adapter).
-        var points: []const [3]f64 = &.{};
-        if (prim == 1 and fr.spas.len > 0 and fr.spas[0].rrnm == dataset.RCNM_POINT) {
-            if (nodes.get((@as(u64, VC) << 32) | fr.spas[0].rrid)) |pt| {
-                const one = try a.alloc([3]f64, 1);
-                one[0] = .{ pt.lon(), pt.lat(), 0 };
-                points = one;
+        // Native Adapted: class name + CNode tree from ATTR (no adapter). SOUNDG
+        // (objl 129) is emitted directly as a multipoint by scene, and a feature with
+        // no spatial primitive can't portray — neither goes through the rules (the
+        // Sounding rule would error on the multipoint the rule path doesn't model).
+        const primitive = primitiveName(prim);
+        if (objl != 129 and primitive.len > 0) {
+            var points: []const [3]f64 = &.{};
+            if (prim == 1 and fr.spas.len > 0 and fr.spas[0].rrnm == dataset.RCNM_POINT) {
+                if (nodes.get((@as(u64, VC) << 32) | fr.spas[0].rrid)) |pt| {
+                    const one = try a.alloc([3]f64, 1);
+                    one[0] = .{ pt.lon(), pt.lat(), 0 };
+                    points = one;
+                }
             }
+            try adapted.append(a, .{
+                .feature_index = fi,
+                .code = try a.dupe(u8, class),
+                .primitive = primitive,
+                .root = try buildNode(a, ds.*, fr.attrs, 0),
+                .points = points,
+            });
         }
-        try adapted.append(a, .{
-            .feature_index = fi,
-            .code = try a.dupe(u8, class),
-            .primitive = primitiveName(prim),
-            .root = try buildNode(a, ds.*, fr.attrs, 0),
-            .points = points,
-        });
     }
 
     // Coast-coincident masking set (COALNE/LNDARE/SLCONS edges).
@@ -243,6 +249,7 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
         .sounding_vecs = sounding_vecs,
         .coast_edges = coast_edges,
         .foid_index = foid_index,
+        .native = true,
         .arena = arena,
     };
     return .{ .cell = cell, .adapted = adapted.items };
