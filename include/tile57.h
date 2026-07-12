@@ -518,13 +518,25 @@ typedef struct {
  *           `rot_north`, and it is what a depth-contour value must follow. */
 typedef enum { TILE57_ALIGN_VIEWPORT = 0, TILE57_ALIGN_MAP = 1 } tile57_rot_align;
 
+/* The S-52 display category a feature belongs to — the axis the mariner's
+ * display_base / display_standard / display_other settings select on. A feature
+ * only reaches the surface if its category is enabled, so this says WHICH of the
+ * enabled categories it came in on. Display base is the never-hide set (the
+ * safety-of-navigation minimum): SCAMIN is not applied to it. */
+typedef enum {
+    TILE57_DISP_BASE = 0, TILE57_DISP_STANDARD = 1, TILE57_DISP_OTHER = 2
+} tile57_disp_cat;
+
 /* The feature the following draw calls belong to. `cls` is the S-57 object-class
  * acronym (NUL-terminated; "" if none); `scamin` is the SCAMIN 1:N denominator
- * (<= 0 => always visible); `plane` is the S-52 draw priority (paint hint). */
+ * (<= 0 => always visible); `plane` is the S-52 draw priority (paint hint);
+ * `disp_cat` is the feature's display category. A host that applies SCAMIN
+ * itself must skip it when disp_cat == TILE57_DISP_BASE. */
 typedef struct {
     const char *cls;
     int64_t scamin;
     int32_t plane;
+    tile57_disp_cat disp_cat;
 } tile57_feature;
 
 /* Draw table. Pointers are valid only for the duration of the call; ctx is

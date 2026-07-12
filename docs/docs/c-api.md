@@ -310,7 +310,9 @@ web-mercator world
 coordinates (the range 0 to 1, with y pointing down). Point symbols, soundings, and
 text come as a world anchor plus a small outline in reference pixels, so you can
 draw them at a fixed size on screen. Every call carries the feature's SCAMIN, so you
-can hide it by zoom in a shader.
+can hide it by zoom in a shader — together with the display category it came in on,
+so you can honour the S-52 rule that SCAMIN never hides a display-base feature
+(`f->disp_cat == TILE57_DISP_BASE` => draw it at every zoom).
 
 You pass the view rotation (`rotation_rad`, 0 = north-up) and apply it to your own
 transform. Each rotatable call carries a `tile57_rot_align` saying what its angle is
@@ -324,7 +326,11 @@ value labels laid out along their contour.
 typedef struct { double x, y; } tile57_world_point;   /* web-mercator 0..1, y down */
 typedef struct { const tile57_world_point *pts; uint32_t n;
                  const uint32_t *ring_starts; uint32_t ring_count; } tile57_world_rings;
-typedef struct { const char *cls; int64_t scamin; int32_t plane; } tile57_feature;
+/* The S-52 display category the feature came in on. */
+typedef enum { TILE57_DISP_BASE=0, TILE57_DISP_STANDARD=1, TILE57_DISP_OTHER=2 } tile57_disp_cat;
+
+typedef struct { const char *cls; int64_t scamin; int32_t plane;
+                 tile57_disp_cat disp_cat; } tile57_feature;
 
 /* What a rotatable call's angle is referenced to: VIEWPORT = screen (stay upright),
  * MAP = chart (add the view rotation, turn with the chart). */
