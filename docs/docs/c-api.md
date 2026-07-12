@@ -312,11 +312,23 @@ text come as a world anchor plus a small outline in reference pixels, so you can
 draw them at a fixed size on screen. Every call carries the feature's SCAMIN, so you
 can hide it by zoom in a shader.
 
+You pass the view rotation (`rotation_rad`, 0 = north-up) and apply it to your own
+transform. Each rotatable call carries a `tile57_rot_align` saying what its angle is
+measured against: `TILE57_ALIGN_VIEWPORT` marks stay upright on screen (a buoy, an
+ordinary label); `TILE57_ALIGN_MAP` marks are chart-relative and you add the view
+rotation, so they turn with the chart — ORIENT symbols, every linestyle-embedded
+symbol (traffic-lane and tidal-stream arrows, bank/dyke ticks), and depth-contour
+value labels laid out along their contour.
+
 ```c
 typedef struct { double x, y; } tile57_world_point;   /* web-mercator 0..1, y down */
 typedef struct { const tile57_world_point *pts; uint32_t n;
                  const uint32_t *ring_starts; uint32_t ring_count; } tile57_world_rings;
 typedef struct { const char *cls; int64_t scamin; int32_t plane; } tile57_feature;
+
+/* What a rotatable call's angle is referenced to: VIEWPORT = screen (stay upright),
+ * MAP = chart (add the view rotation, turn with the chart). */
+typedef enum { TILE57_ALIGN_VIEWPORT = 0, TILE57_ALIGN_MAP = 1 } tile57_rot_align;
 
 typedef struct {
     void *ctx;                                 /* handed back to every call */
@@ -324,25 +336,34 @@ typedef struct {
                         tile57_rgba color, int even_odd);
     void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines,
                         float width_px, float dash_on, float dash_off, tile57_rgba color);
+    /* rings arrive already rotated; align says whether to also add the view rotation. */
     void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
-                        const tile57_local_rings *rings, tile57_rgba color, int even_odd, float stroke_w);
+                        const tile57_local_rings *rings, tile57_rgba color, int even_odd,
+                        float stroke_w, tile57_rot_align align);
     void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor,
-                        const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px);
+                        const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo,
+                        float halo_px, tile57_rot_align align);
     /* Optional. Leave NULL to get vector outlines from the two calls above; set them
-     * to draw point symbols and area patterns from the sprite atlas as textured quads. */
+     * to draw point symbols and area patterns from the sprite atlas as textured quads.
+     * Draw the sprite at rot_deg + (align == MAP ? view_rotation : 0). */
     void (*draw_sprite) (void *ctx, const tile57_feature *f, const char *name, size_t name_len,
-                         tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
+                         tile57_world_point anchor, float rot_deg, tile57_rot_align align,
+                         float half_w_px, float half_h_px);
     void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len,
                          const tile57_world_rings *rings);
     /* Optional. Text as a UTF-8 string for a host SDF glyph atlas (tile57_bake_glyph_sdf),
-     * instead of tessellated outlines. */
+     * instead of tessellated outlines. Rotate the run by rot_deg + (align == MAP ?
+     * view_rotation : 0). */
     void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
                           float ox_px, float oy_px, const char *text, size_t text_len,
-                          float size_px, tile57_rgba color, tile57_rgba halo);
+                          float size_px, float rot_deg, tile57_rot_align align,
+                          tile57_rgba color, tile57_rgba halo);
 } tile57_surface_cb;
 
-/* Portray the view once and drive the callbacks. */
+/* Portray the view once and drive the callbacks. rotation_rad is the view rotation
+ * (radians clockwise; 0 = north-up), which you apply to your transform. */
 tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, double zoom,
+                             double rotation_rad,
                              uint32_t width, uint32_t height,
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
@@ -355,7 +376,14 @@ smoothed by texture filtering and cheaper than tessellating outlines. If you lea
 those two fields NULL, the same features arrive as vector outlines instead.
 
 tile57 also declutters overlapping text for you before it makes the calls (symbols
-and soundings always draw, per S-52), so you don't repeat that work.
+and soundings always draw, per S-52), so you don't repeat that work — and it lays
+out depth-contour values along their contours, so you get the same labelled contours
+as the raster and MapLibre outputs.
+
+The per-tile form `tile57_chart_tile_surface` takes no rotation: a tile is
+tessellated once, north-up, and re-transformed on the GPU each frame, so a
+continuously-turning course-up view never re-portrays or re-tessellates it — the
+`align` flags carry everything the host needs to turn the right marks with the chart.
 
 There is a pixel-space twin, `tile57_chart_canvas` with a `tile57_canvas_cb` vtable,
 that emits the SAME portrayal as resolved paint-order draw calls in canvas
@@ -419,6 +447,7 @@ tile57_status tile57_compose_canvas(tile57_compose *c, double lon, double lat, d
                                     uint32_t width, uint32_t height, const tile57_mariner *m,
                                     const tile57_canvas_cb *canvas, tile57_error *err);
 tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, double zoom,
+                                     double rotation_rad,
                                      uint32_t width, uint32_t height, const tile57_mariner *m,
                                      const tile57_surface_cb *surface, tile57_error *err);
 tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, double zoom,
