@@ -26,13 +26,13 @@ domain and not for navigation; this renderer adds its own gaps on top.
 
 A native S-101 (S-100 Part 10a) chart is read directly into the S-101 portrayal
 model with no conversion — the format is auto-detected from the file, so `png`,
-`bake`, and the C API accept a native S-101 `.000` transparently. On the SHOM
-France test datasets every feature portrays (no errors), including complex
-attributes such as light sectors and buoy topmarks. Two areas are not yet
-wired for native S-101:
+`bake`, and the C API accept a native S-101 `.000` transparently, and its
+sequential `.001…` update files are applied (record-level insert / delete /
+modify by identity). On the SHOM France test datasets and the S-164 update
+conformance set every feature portrays (no errors), including complex attributes
+such as light sectors and buoy topmarks. One area is not yet wired for native
+S-101:
 
-- **Update files.** Only the base `.000` is read; S-101 update-record merging
-  (the `.001…` sequence) is not applied yet.
 - **Feature and information associations.** `FASC`/`INAS` records are parsed but
   not yet surfaced in the feature-query / pick report. They carry no portrayal
   weight for the test charts, so rendering is unaffected.
