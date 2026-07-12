@@ -214,8 +214,16 @@ tile57_status tile57_bake_charts(const char *const *paths, size_t n, uint32_t wo
 
 /* Progress callback for tile57_bake_tree: fires after each chart with (done,
  * total). May be called CONCURRENTLY from worker threads — make it
- * thread-safe. */
-typedef void (*tile57_bake_progress)(void *ctx, uint32_t done, uint32_t total);
+ * thread-safe.
+ *
+ * Return true to continue, false to CANCEL the bake. Cancellation is at chart
+ * granularity: no new chart is started, but the charts already in flight run to
+ * completion, so the call returns within roughly one chart's bake time (not
+ * instantly). A cancelled bake is TILE57_OK — not a failure — with *out_baked
+ * counting the charts it finished before stopping; the archives it did write are
+ * complete and valid, so a later re-run resumes where it left off (the
+ * incremental skip below sees them). A host with no cancel just returns true. */
+typedef bool (*tile57_bake_progress)(void *ctx, uint32_t done, uint32_t total);
 
 /* Walk `in_dir` for S-57 base charts (*.000) and bake each IN PARALLEL to the
  * SAME relative path under `out_dir` with a .pmtiles extension
@@ -229,7 +237,9 @@ typedef void (*tile57_bake_progress)(void *ctx, uint32_t done, uint32_t total);
  * not failure. `in_dir` is the source ENC data; `out_dir` is the caller's OWN
  * cache — it owns the location + layout, so distinct library consumers each
  * keep their own chart library without clashing. `workers` is a MEMORY bound —
- * pass a small count. An unreadable `in_dir` is TILE57_ERR_IO. */
+ * pass a small count. `progress` (NULL to skip) fires per chart and can CANCEL
+ * the bake by returning false — see tile57_bake_progress. An unreadable `in_dir`
+ * is TILE57_ERR_IO. */
 tile57_status tile57_bake_tree(const char *in_dir, const char *out_dir, uint32_t workers,
                                tile57_bake_progress progress, void *progress_ctx,
                                uint32_t *out_baked, tile57_error *err);

@@ -334,7 +334,8 @@ export fn tile57_bake_charts(
 /// relative path under `out_dir` with a .pmtiles extension (+ an <out>.sha sidecar),
 /// creating subdirs as needed. INCREMENTAL: an archive already at least as new as
 /// its whole input is skipped, so *out_baked (NULL to ignore) counts THIS run only.
-/// An unreadable `in_dir` errors. See tile57.h.
+/// `progress` returning false CANCELS (OK, with out_baked = what finished — see
+/// tile57.h). An unreadable `in_dir` errors. See tile57.h.
 export fn tile57_bake_tree(
     in_dir: ?[*:0]const u8,
     out_dir: ?[*:0]const u8,

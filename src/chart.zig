@@ -684,7 +684,12 @@ pub fn bakeChartsParallel(paths: []const []const u8, rules_dir: ?[]const u8, wor
 /// drive an import progress bar. It may be called CONCURRENTLY from worker threads (done arrives
 /// monotonically per fetch but can be delivered slightly out of order), so the callback must be
 /// thread-safe. Null to skip.
-pub const BakeProgress = ?*const fn (?*anyopaque, u32, u32) callconv(.c) void;
+///
+/// Returns true to continue, false to CANCEL the bake: no further cell is picked up, but the cells
+/// already in flight run to completion (a bake is not interruptible mid-cell), so the bake unwinds
+/// within ~one cell's bake time rather than instantly. Every archive already written is complete, so
+/// the incremental skip in bakeTree lets a later run resume. A host with no cancel returns true.
+pub const BakeProgress = ?*const fn (?*anyopaque, u32, u32) callconv(.c) bool;
 
 const BakeFileCtx = struct {
     next: std.atomic.Value(usize),
@@ -696,6 +701,8 @@ const BakeFileCtx = struct {
     progress: BakeProgress,
     progress_ctx: ?*anyopaque,
     done: std.atomic.Value(u32),
+    /// Set when a progress callback returned false; every worker drains out at its next cell.
+    cancel: std.atomic.Value(bool),
 };
 
 fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
@@ -714,11 +721,17 @@ fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
 
 fn bakeFileWorker(ctx: *BakeFileCtx) void {
     while (true) {
+        if (ctx.cancel.load(.monotonic)) return; // a peer's progress callback said stop
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.in_paths.len) return;
         bakeOneToFile(ctx, i);
         const d = ctx.done.fetchAdd(1, .monotonic) + 1; // attempted count (smooth progress)
-        if (ctx.progress) |cb| cb(ctx.progress_ctx, d, @intCast(ctx.in_paths.len));
+        if (ctx.progress) |cb| {
+            if (!cb(ctx.progress_ctx, d, @intCast(ctx.in_paths.len))) {
+                ctx.cancel.store(true, .monotonic);
+                return;
+            }
+        }
     }
 }
 
@@ -726,7 +739,8 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
 /// out_paths[i] (plus an <out_path>.sha content-hash sidecar), freeing each archive right after
 /// the write — so the host never holds N archives (peak memory ~ the worker count). The app owns
 /// the cache and names every out_path. `progress(progress_ctx, done, total)` fires (serialised)
-/// after each cell. Race-free (warms up first; each bake is independent). Returns the count written.
+/// after each cell and may CANCEL by returning false (see BakeProgress). Race-free (warms up first;
+/// each bake is independent). Returns the count written — fewer than in_paths.len when cancelled.
 pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) usize {
     std.debug.assert(out_paths.len == in_paths.len);
     if (in_paths.len == 0) return 0;
@@ -734,7 +748,7 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
     const ok = gpa.alloc(bool, in_paths.len) catch return 0;
     defer gpa.free(ok);
     @memset(ok, false);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0) };
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false) };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     if (n <= 1) {
@@ -758,9 +772,11 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
 /// plus an <out>.sha sidecar. Output subdirs are created as needed. `in_dir` is the source ENC data;
 /// `out_dir` is the caller's own cache (it owns the location + names, so consumers don't clash). The
 /// engine writes + frees each archive, so the host never holds N in memory. `progress` fires per
-/// cell (serialised) for an import progress bar. INCREMENTAL: a cell whose mirrored archive is
-/// already at least as new as its whole input (.000 + update chain) is skipped, so a re-run over an
-/// unchanged tree bakes nothing. Returns the count baked THIS run; errors if `in_dir` is unreadable.
+/// cell (serialised) for an import progress bar and may CANCEL by returning false (see
+/// BakeProgress). INCREMENTAL: a cell whose mirrored archive is already at least as new as its whole
+/// input (.000 + update chain) is skipped, so a re-run over an unchanged tree bakes nothing — and a
+/// run that resumes a cancelled one only bakes what the cancel left undone. Returns the count baked
+/// THIS run; errors if `in_dir` is unreadable.
 pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) !usize {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
