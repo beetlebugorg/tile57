@@ -79,6 +79,7 @@ fn surrogateObjl(class: []const u8) u16 {
 /// bridge for the code-keyed scene branches.
 fn surrogateAttr(name: []const u8) ?u16 {
     const eql = std.mem.eql;
+    if (eql(u8, name, "scaleMinimum")) return 133; // SCAMIN — S-52 scale-based feature culling
     if (eql(u8, name, "valueOfSounding")) return s57.ATTR_VALSOU; // 179 (danger depth)
     if (eql(u8, name, "valueOfDepthContour")) return s57.ATTR_VALDCO; // 174 (contour label)
     if (eql(u8, name, "depthRangeMinimumValue")) return s57.ATTR_DRVAL1; // 87

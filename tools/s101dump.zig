@@ -134,4 +134,31 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             break;
         }
     }
+
+    // --- Portrayal audit: run the rules and count ok / empty / ERROR streams -----
+    engine.portray.setQuiet(true);
+    const streams = engine.portray.portrayCellWithAdapted(a, &cell, loaded.adapted, "", .{}) catch {
+        std.debug.print("  portrayal FAILED to run\n", .{});
+        return;
+    };
+    var ok: usize = 0;
+    var empty: usize = 0;
+    var errored: usize = 0;
+    var err_by_class = std.StringHashMap(usize).init(a);
+    for (loaded.adapted) |ad| {
+        const s = if (ad.feature_index < streams.len) streams[ad.feature_index] else null;
+        if (s == null) {
+            empty += 1;
+        } else if (std.mem.startsWith(u8, s.?, "ERROR:")) {
+            errored += 1;
+            const gop = try err_by_class.getOrPut(ad.code);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        } else ok += 1;
+    }
+    std.debug.print("\n  portrayal: ok={d} empty={d} ERROR={d} (of {d} adapted)\n", .{ ok, empty, errored, loaded.adapted.len });
+    if (errored > 0) {
+        var eit = err_by_class.iterator();
+        while (eit.next()) |e| std.debug.print("    ERROR x{d}: {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
+    }
 }
