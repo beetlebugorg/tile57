@@ -907,7 +907,7 @@ pub fn renderComposeView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
 
 /// renderComposeView's GPU-vector twin: the SAME composed view emitted as a
 /// WORLD-SPACE tagged stream to the C surface callback (see render/vector.zig).
-pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -920,6 +920,7 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
     var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
     vs.store = store.asStore();
     vs.view_zoom = zoom; // scale at which labels/symbols declutter
+    vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
 
     var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
     const surf = vs.asSurface();
@@ -1596,7 +1597,7 @@ pub const Chart = struct {
     /// tiles, emitting a WORLD-SPACE tagged stream to the C surface callback
     /// (see render/vector.zig). Live for both a baked bundle (.reader tile
     /// replay) and a live cell (.cell portrayal). No bytes are produced.
-    pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+    pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1608,6 +1609,7 @@ pub const Chart = struct {
         var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
         vs.store = store.asStore();
         vs.view_zoom = zoom; // scale at which labels/symbols declutter
+        vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
         const surf = vs.asSurface();
 
         var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
