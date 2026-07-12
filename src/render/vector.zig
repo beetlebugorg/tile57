@@ -43,6 +43,13 @@ pub const CWorldPt = extern struct { x: f64, y: f64 }; // web-mercator [0,1], y 
 pub const CLocalPt = extern struct { x: f32, y: f32 }; // anchor-relative reference px
 pub const CColor = extern struct { r: u8, g: u8, b: u8, a: u8 };
 
+/// What a rotatable draw call's rotation is referenced to (MapLibre's
+/// rotation-alignment). `.viewport`: SCREEN-relative — the host leaves the mark
+/// upright under a rotated view. `.map`: CHART-relative (north / a line tangent)
+/// — the host ADDS its view rotation so the mark turns with the chart. This is
+/// the engine's `rot_north`.
+pub const CRotAlign = enum(c_int) { viewport = 0, map = 1 };
+
 /// Multi-ring path in world space (same layout as CRings but f64 world pts).
 pub const CWorldRings = extern struct {
     pts: [*]const CWorldPt,
@@ -78,25 +85,31 @@ pub const CSurface = extern struct {
     stroke_line: *const fn (?*anyopaque, *const CFeature, *const CWorldRings, f32, f32, f32, CColor) callconv(.c) void,
     /// Point symbol: world anchor + local outline (px). even_odd for compound
     /// glyphs; stroke_w > 0 means the rings are a polyline stroked that px wide.
-    draw_symbol: *const fn (?*anyopaque, *const CFeature, CWorldPt, *const CLocalRings, CColor, c_int, f32) callconv(.c) void,
+    /// The outline is already rotated; `align` says whether the host additionally
+    /// rotates it by the view rotation (.map) or leaves it upright (.viewport).
+    draw_symbol: *const fn (?*anyopaque, *const CFeature, CWorldPt, *const CLocalRings, CColor, c_int, f32, CRotAlign) callconv(.c) void,
     /// Text label: world anchor + local glyph outlines (px, even-odd) + halo
-    /// (halo.a == 0 => none).
-    draw_text: *const fn (?*anyopaque, *const CFeature, CWorldPt, *const CLocalRings, CColor, CColor, f32) callconv(.c) void,
+    /// (halo.a == 0 => none). The glyphs are already rotated; `align` says whether
+    /// the host additionally rotates by the view rotation (.map = follow the
+    /// chart, e.g. a contour value) or leaves the label upright (.viewport).
+    draw_text: *const fn (?*anyopaque, *const CFeature, CWorldPt, *const CLocalRings, CColor, CColor, f32, CRotAlign) callconv(.c) void,
     /// Point symbol as a sprite: name (ptr,len) to look up in the atlas, world
-    /// anchor, rotation (deg), and the symbol's un-rotated half-extent in
-    /// reference px (draw the atlas cell as a quad of that half-size, centred on
-    /// the anchor). Null => symbols tessellate via draw_symbol instead.
-    draw_sprite: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, CWorldPt, f32, f32, f32) callconv(.c) void = null,
+    /// anchor, rotation (deg), the rotation alignment (.map => host adds the view
+    /// rotation), and the symbol's un-rotated half-extent in reference px (draw
+    /// the atlas cell as a quad of that half-size, centred on the anchor). Null =>
+    /// symbols tessellate via draw_symbol instead.
+    draw_sprite: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, CWorldPt, f32, CRotAlign, f32, f32) callconv(.c) void = null,
     /// Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
     /// prefix) + the fill rings (world). Tile the pattern cell across the polygon
     /// at a constant screen size. Null => patterns fall back to a flat tint.
     draw_pattern: ?*const fn (?*anyopaque, *const CFeature, [*]const u8, usize, *const CWorldRings) callconv(.c) void = null,
     /// Text label as a STRING for the host's SDF glyph atlas: world anchor + the
     /// anchor-relative baseline-left origin in px (ox,oy, alignment already applied)
-    /// + UTF-8 text (ptr,len) + the glyph pixel size + colour + halo. The host lays
-    /// the string out from its glyph metrics and draws SDF quads. Null => text
+    /// + UTF-8 text (ptr,len) + the glyph pixel size + the run rotation (deg) + its
+    /// alignment (.map => host adds the view rotation) + colour + halo. The host
+    /// lays the string out from its glyph metrics and draws SDF quads. Null => text
     /// tessellates via draw_text instead. Must be the LAST field (ABI-appended).
-    draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, CColor, CColor) callconv(.c) void = null,
+    draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, f32, CRotAlign, CColor, CColor) callconv(.c) void = null,
 };
 
 /// Greedy screen-box occupancy for label/symbol declutter. Features arrive in
@@ -161,6 +174,13 @@ pub const VectorSurface = struct {
     /// Portray zoom (set by the driver) — the scale at which labels/symbols are
     /// decluttered, and the shared occupancy grid.
     view_zoom: f64 = 0,
+    /// View rotation (radians CW; 0 = north-up), set by the whole-view driver.
+    /// The host applies it to the GPU transform; the surface needs it for two
+    /// view-dependent decisions only — the upside-down flip on tangent-rotated
+    /// (MAP-aligned) contour labels, and decluttering labels in the SCREEN frame
+    /// the host actually draws them in. The per-tile path leaves it 0 (a tile is
+    /// tessellated once, north-up, and re-transformed on the GPU every frame).
+    view_rotation: f64 = 0,
     declutter: Declutter = .{},
 
     const vtable = rs.Surface.VTable{
@@ -248,6 +268,36 @@ pub const VectorSurface = struct {
             .x = @as(f64, @floatFromInt(self.tx)) * self.inv_n + @as(f64, @floatFromInt(p.x)) * self.inv_ne,
             .y = @as(f64, @floatFromInt(self.ty)) * self.inv_n + @as(f64, @floatFromInt(p.y)) * self.inv_ne,
         };
+    }
+
+    /// A symbol's rotation alignment: chart-relative (`.map`) when the rule asked
+    /// for north-referenced rotation (ORIENT symbols, all linestyle bricks), else
+    /// screen-upright (`.viewport`, the common navaid). Mirrors the style path's
+    /// icon-rotation-alignment switch on `rot_north`.
+    fn alignOf(rot_north: bool) CRotAlign {
+        return if (rot_north) .map else .viewport;
+    }
+
+    /// A world anchor's position in the world-pixel grid the declutter uses,
+    /// rotated into the SCREEN frame the host draws labels in. Under a rotated
+    /// view the upright label boxes live in screen space, so collision must be
+    /// tested there; rotating every centre about the origin by the view rotation
+    /// is a rigid transform that puts them in that frame (north-up => identity).
+    fn screenPx(self: *const VectorSurface, anchor: CWorldPt) [2]f64 {
+        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
+        const wx = anchor.x * scale_px;
+        const wy = anchor.y * scale_px;
+        if (self.view_rotation == 0) return .{ wx, wy };
+        const c = @cos(self.view_rotation);
+        const s = @sin(self.view_rotation);
+        return .{ wx * c - wy * s, wx * s + wy * c };
+    }
+
+    /// Normalise a CHART-relative run angle so tangent-rotated text never renders
+    /// upside down: if the run, once the host adds the view rotation, would point
+    /// into the left half-plane of the SCREEN, flip it 180°. Radians in and out.
+    fn uprightTangent(self: *const VectorSurface, tangent_rad: f64) f64 {
+        return if (@cos(tangent_rad + self.view_rotation) < 0) tangent_rad + std.math.pi else tangent_rad;
     }
 
     fn cur_feature(self: *const VectorSurface) CFeature {
@@ -346,7 +396,6 @@ pub const VectorSurface = struct {
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
-        _ = rot_north;
         _ = placement; // both .point and .line now draw at display size (refDev)
         const self = sp(ctx);
         const store = self.store orelse return;
@@ -365,7 +414,10 @@ pub const VectorSurface = struct {
         // scaled by size_scale (scene.walkComplexRun), so the brick must scale to
         // match — otherwise bricks would be native-sized at display-scaled spacing.
         const dev: f64 = self.refDev();
-        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null) else try self.emitSymbol(s, at, rot_deg, scale, dev);
+        // ORIENT symbols and every linestyle brick are north-referenced (rot_north)
+        // → chart-relative; the rest stay upright under a rotated view.
+        const rot_align = alignOf(rot_north);
+        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null, rot_align) else try self.emitSymbol(s, at, rot_deg, scale, dev, rot_align);
     }
 
     /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
@@ -377,7 +429,7 @@ pub const VectorSurface = struct {
     /// point symbols; 1.0 for line bricks, which must match the engine's native
     /// tile-space spacing so they tile). `declut` null = no declutter (line
     /// patterns), else place with that `force`.
-    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, declut: ?bool) void {
+    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, declut: ?bool, rot_align: CRotAlign) void {
         const k = scale * 100.0 * dev;
         var hw: f64 = 0;
         var hh: f64 = 0;
@@ -390,11 +442,11 @@ pub const VectorSurface = struct {
         if (hw <= 0 or hh <= 0) return;
         const anchor = self.worldOf(at);
         if (declut) |force| {
-            const scale_px = 256.0 * std.math.exp2(self.view_zoom);
-            if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, hw, hh, force)) return;
+            const sc = self.screenPx(anchor);
+            if (!self.declutter.place(self.a, sc[0], sc[1], hw, hh, force)) return;
         }
         const feat = self.cur_feature();
-        draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, anchor, @floatCast(rot_deg), @floatCast(hw), @floatCast(hh));
+        draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, anchor, @floatCast(rot_deg), rot_align, @floatCast(hw), @floatCast(hh));
     }
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
@@ -427,21 +479,22 @@ pub const VectorSurface = struct {
             }
         }
         if (uw > 0 and uh > 0) {
-            const scale_px = 256.0 * std.math.exp2(self.view_zoom);
-            const anchor = self.worldOf(at);
-            if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, uw, uh, false)) return;
+            const sc = self.screenPx(self.worldOf(at));
+            if (!self.declutter.place(self.a, sc[0], sc[1], uw, uh, false)) return;
         }
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), null) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev());
+            // Sounding digits read upright under a rotated view (screen-referenced),
+            // sized by soundingDev so digit + spacing scale together.
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), null, .viewport) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport);
         }
     }
 
     /// Emit one symbol: world anchor + each path's outline in anchor-local
     /// reference px (pivot-relative, scaled, rotated). Constant screen size.
-    fn emitSymbol(self: *VectorSurface, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64) !void {
+    fn emitSymbol(self: *VectorSurface, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_align: CRotAlign) !void {
         const anchor = self.worldOf(at);
         const feat = self.cur_feature();
         const k: f32 = @floatCast(scale * 100.0 * dev);
@@ -460,8 +513,8 @@ pub const VectorSurface = struct {
                 rings[i] = pts;
             }
             var lr = try self.localRings(rings);
-            if (p.fill) |color| self.cb.draw_symbol(self.cb.ctx, &feat, anchor, &lr, ccolor(color), 1, 0);
-            if (p.stroke) |st| self.cb.draw_symbol(self.cb.ctx, &feat, anchor, &lr, ccolor(st.color), 0, st.width * k);
+            if (p.fill) |color| self.cb.draw_symbol(self.cb.ctx, &feat, anchor, &lr, ccolor(color), 1, 0, rot_align);
+            if (p.stroke) |st| self.cb.draw_symbol(self.cb.ctx, &feat, anchor, &lr, ccolor(st.color), 0, st.width * k, rot_align);
         }
     }
 
@@ -469,8 +522,21 @@ pub const VectorSurface = struct {
         const self = sp(ctx);
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
-        const f = &(self.fnt orelse return);
         const font_css: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);
+        const halign = if (style.halign.len > 0) style.halign else "center";
+        const valign = if (style.valign.len > 0) style.valign else "middle";
+        // An ordinary label stays upright under a rotated view: no rotation, and
+        // screen-referenced so the host does not turn it with the chart.
+        try self.emitLabel(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), 0, .viewport, at);
+    }
+
+    /// Emit one label: text at a world anchor, shaped to anchor-local reference px
+    /// (an SDF string when the host supports it, else tessellated glyph outlines),
+    /// rotated `rot_deg` about the anchor with alignment `align`. `color` is
+    /// already resolved (the contour label uses a palette-specific neutral the
+    /// colortables do not name). Declutters as an axis-aligned advance-box.
+    fn emitLabel(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_deg: f64, rot_align: CRotAlign, at: rs.TilePoint) !void {
+        const f = &(self.fnt orelse return);
         const px = font_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
 
@@ -481,18 +547,16 @@ pub const VectorSurface = struct {
         if (pen <= 0) return;
 
         const anchor = self.worldOf(at);
-        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
-        if (!self.declutter.place(self.a, anchor.x * scale_px, anchor.y * scale_px, @as(f64, pen) * 0.5, @as(f64, px) * 0.6, false)) return;
+        const sc = self.screenPx(anchor);
+        if (!self.declutter.place(self.a, sc[0], sc[1], @as(f64, pen) * 0.5, @as(f64, px) * 0.6, false)) return;
 
-        const halign = if (style.halign.len > 0) style.halign else "center";
-        const valign = if (style.valign.len > 0) style.valign else "middle";
         // SDF glyph-atlas host: send the string + aligned baseline-left origin.
         if (self.cb.draw_text_str) |dts| {
             const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
-            var x0: f32 = @as(f32, @floatCast(style.offset_x)) * mm_px;
+            var x0: f32 = ox_mm * mm_px;
             if (std.mem.eql(u8, halign, "center")) x0 -= pen / 2;
             if (std.mem.eql(u8, halign, "right")) x0 -= pen;
-            var baseline: f32 = @as(f32, @floatCast(style.offset_y)) * mm_px;
+            var baseline: f32 = oy_mm * mm_px;
             if (std.mem.eql(u8, valign, "top")) {
                 baseline += f.ascent * px;
             } else if (std.mem.eql(u8, valign, "middle")) {
@@ -501,10 +565,10 @@ pub const VectorSurface = struct {
                 baseline -= f.descent * px;
             }
             const feat = self.cur_feature();
-            dts(self.cb.ctx, &feat, anchor, x0, baseline, text.ptr, text.len, px, ccolor(self.resolveColor(style.color)), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            dts(self.cb.ctx, &feat, anchor, x0, baseline, text.ptr, text.len, px, @floatCast(rot_deg), rot_align, ccolor(color), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
             return;
         }
-        try self.emitText(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), at);
+        try self.emitText(text, font_css, halign, valign, ox_mm, oy_mm, color, rot_deg, rot_align, at);
     }
 
     fn glyphOutline(self: *VectorSurface, gid: u16) ![]const []const cv.Point {
@@ -516,11 +580,16 @@ pub const VectorSurface = struct {
 
     /// Shape a label into anchor-local reference px glyph outlines (baseline at
     /// the origin, aligned per halign/valign with mm offsets) at a world anchor.
-    fn emitText(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, at: rs.TilePoint) !void {
+    fn emitText(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_deg: f64, rot_align: CRotAlign, at: rs.TilePoint) !void {
         const f = &(self.fnt orelse return);
         const px = font_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
         const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
+        // The run rotates about the anchor; the host adds the view rotation when
+        // rot_align == .map (see draw_text). Ordinary labels pass rot_deg 0 (identity).
+        const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
+        const cosr = @cos(rad);
+        const sinr = @sin(rad);
 
         var gids = std.ArrayList(struct { gid: u16, x: f32 }).empty;
         var pen: f32 = 0;
@@ -550,8 +619,11 @@ pub const VectorSurface = struct {
             for (contours) |contour| {
                 const pts = try self.a.alloc(cv.Point, contour.len);
                 for (contour, 0..) |p, i| {
-                    // em units, y up -> local px, y down (anchor-relative).
-                    pts[i] = .{ .x = x0 + g.x + p.x * px, .y = baseline - p.y * px };
+                    // em units, y up -> local px, y down (anchor-relative), then
+                    // rotated about the anchor.
+                    const lx = x0 + g.x + p.x * px;
+                    const ly = baseline - p.y * px;
+                    pts[i] = .{ .x = lx * cosr - ly * sinr, .y = lx * sinr + ly * cosr };
                 }
                 try rings.append(self.a, pts);
             }
@@ -559,6 +631,6 @@ pub const VectorSurface = struct {
         if (rings.items.len == 0) return;
         const feat = self.cur_feature();
         var lr = try self.localRings(rings.items);
-        self.cb.draw_text(self.cb.ctx, &feat, self.worldOf(at), &lr, ccolor(color), .{ .r = 0, .g = 0, .b = 0, .a = 0 }, 0);
+        self.cb.draw_text(self.cb.ctx, &feat, self.worldOf(at), &lr, ccolor(color), .{ .r = 0, .g = 0, .b = 0, .a = 0 }, 0, rot_align);
     }
 };

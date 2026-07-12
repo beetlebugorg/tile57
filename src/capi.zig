@@ -649,6 +649,7 @@ export fn tile57_chart_surface(
     lon: f64,
     lat: f64,
     zoom: f64,
+    rotation_rad: f64,
     width: u32,
     height: u32,
     m: ?*const CMariner,
@@ -660,7 +661,7 @@ export fn tile57_chart_surface(
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
-    c.renderSurfaceView(lon, lat, zoom, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    c.renderSurfaceView(lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
     return OK;
 }
 
@@ -866,6 +867,7 @@ export fn tile57_compose_surface(
     lon: f64,
     lat: f64,
     zoom: f64,
+    rotation_rad: f64,
     width: u32,
     height: u32,
     m: ?*const CMariner,
@@ -877,7 +879,7 @@ export fn tile57_compose_surface(
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
-    chart.renderComposeSurfaceView(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    chart.renderComposeSurfaceView(src, lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
     return OK;
 }
 

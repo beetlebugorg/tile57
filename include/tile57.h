@@ -505,6 +505,19 @@ typedef struct {
     const uint32_t *ring_starts;    uint32_t ring_count;
 } tile57_local_rings;
 
+/* What a rotatable draw call's rotation is referenced to (MapLibre's
+ * rotation-alignment — the same model tile57's own style output emits).
+ *
+ * VIEWPORT: the angle is SCREEN-relative. A host with a rotated view must NOT
+ *           add its view rotation — the mark stays upright on screen, so a buoy
+ *           stays the right way up and a label stays readable. The default for
+ *           anchored symbols and ordinary labels.
+ * MAP:      the angle is CHART-relative (referenced to north, or to a line
+ *           tangent). A host with a rotated view ADDS its view rotation, so the
+ *           mark turns with the chart. This is the engine's ORIENT / linestyle
+ *           `rot_north`, and it is what a depth-contour value must follow. */
+typedef enum { TILE57_ALIGN_VIEWPORT = 0, TILE57_ALIGN_MAP = 1 } tile57_rot_align;
+
 /* The feature the following draw calls belong to. `cls` is the S-57 object-class
  * acronym (NUL-terminated; "" if none); `scamin` is the SCAMIN 1:N denominator
  * (<= 0 => always visible); `plane` is the S-52 draw priority (paint hint). */
@@ -524,30 +537,42 @@ typedef struct {
     /* Stroked line (world); width in reference px, dash on/off px (0,0 solid). */
     void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines, float width_px, float dash_on, float dash_off, tile57_rgba color);
     /* Point symbol: world anchor + local outline (px). even_odd for compound
-     * glyphs; stroke_w > 0 => the rings are a polyline stroked stroke_w px wide. */
-    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_rgba color, int even_odd, float stroke_w);
+     * glyphs; stroke_w > 0 => the rings are a polyline stroked stroke_w px wide.
+     * The outline arrives ALREADY rotated to the symbol's angle; `align` says
+     * whether that angle is chart-relative — MAP => additionally rotate the
+     * outline by the view rotation (ORIENT symbols, linestyle bricks); VIEWPORT
+     * => leave it upright on screen (the common navaid case). */
+    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_rgba color, int even_odd, float stroke_w, tile57_rot_align align);
     /* Text: world anchor + local glyph outlines (px, even-odd) + halo
-     * (halo.a == 0 => none). */
-    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px);
+     * (halo.a == 0 => none). The glyphs arrive ALREADY rotated; `align` says
+     * whether that angle is chart-relative — MAP => additionally rotate by the
+     * view rotation (a depth-contour value follows its contour); VIEWPORT => the
+     * label stays upright on screen (the ordinary case). */
+    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px, tile57_rot_align align);
     /* Point symbol as a sprite: symbol name (ptr,len) to look up in the atlas
      * (tile57_bake_assets sprite_png/json), world anchor, rotation (deg), and the
      * symbol's un-rotated half-extent in reference px. Draw the atlas cell as a
-     * quad of that half-size, centred on the anchor. NULL => symbols tessellate
-     * via draw_symbol instead. (ABI-appended after the original vtable.) */
-    void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, float half_w_px, float half_h_px);
+     * quad of that half-size, centred on the anchor, at `rot_deg + (align == MAP
+     * ? view_rotation : 0)`. NULL => symbols tessellate via draw_symbol instead.
+     * (ABI-appended after the original vtable.) */
+    void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, tile57_rot_align align, float half_w_px, float half_h_px);
     /* Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
      * prefix) + the fill rings (world). Tile the cell across the polygon at a
      * constant screen size. NULL => flat tint. */
     void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, const tile57_world_rings *rings);
     /* Text as a STRING for the host's SDF glyph atlas (tile57_bake_glyph_sdf):
      * world anchor + the anchor-relative baseline-left origin in px (ox,oy, with
-     * alignment already applied) + UTF-8 text (ptr,len) + the glyph pixel size +
-     * colour + halo. The host lays the string out from its glyph metrics and draws
-     * SDF quads. NULL => text tessellates via draw_text. Must be the LAST field. */
-    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, tile57_rgba color, tile57_rgba halo);
+     * alignment already applied) + UTF-8 text (ptr,len) + the glyph pixel size.
+     * The host lays the string out from its glyph metrics and draws SDF quads,
+     * rotating the whole run about the anchor by `rot_deg + (align == MAP ?
+     * view_rotation : 0)` (a depth-contour value passes the tangent + MAP; an
+     * ordinary label passes 0 + VIEWPORT and stays upright). NULL => text
+     * tessellates via draw_text. Must be the LAST field. */
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_rgba color, tile57_rgba halo);
 } tile57_surface_cb;
 
 tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, double zoom,
+                             double rotation_rad, /* view rotation, radians CW; 0 = north-up */
                              uint32_t width, uint32_t height,
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
@@ -559,7 +584,14 @@ tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, 
  * the MapLibre tile model, reusing tile57's portrayal. World coordinates and SCAMIN
  * tags are identical to tile57_chart_surface, so the same callbacks/shaders apply.
  * Decluttering is PER-TILE (labels resolve within the tile); a host wanting
- * cross-tile label suppression keeps a separate view-level text pass. */
+ * cross-tile label suppression keeps a separate view-level text pass.
+ *
+ * There is deliberately NO rotation parameter: a tile is tessellated ONCE and
+ * re-transformed on the GPU every frame, so its geometry must stay north-up in
+ * world space and the host applies the view rotation. The per-feature `align`
+ * flags are what keep that invariant — a MAP-aligned mark turns with the chart
+ * without the tile being re-baked, so a course-up view that turns continuously
+ * never invalidates a cached tile. */
 tile57_status tile57_chart_tile_surface(tile57_chart *chart, uint8_t z, uint32_t x, uint32_t y,
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
@@ -637,6 +669,7 @@ tile57_status tile57_compose_canvas(tile57_compose *c, double lon, double lat, d
                                     const tile57_mariner *m,
                                     const tile57_canvas_cb *canvas, tile57_error *err);
 tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, double zoom,
+                                     double rotation_rad, /* view rotation, radians CW; 0 = north-up */
                                      uint32_t width, uint32_t height,
                                      const tile57_mariner *m,
                                      const tile57_surface_cb *surface, tile57_error *err);
