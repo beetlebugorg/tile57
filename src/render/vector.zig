@@ -339,7 +339,8 @@ pub const VectorSurface = struct {
     /// streamed out ahead of it.
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const self = sp(ctx);
-        var kept = try self.pool.resolve(self.a);
+        // Boxes are screen px at the view zoom, so the pixel spacing applies as-is.
+        var kept = try self.pool.resolve(self.a, dc.REPEAT_PX * self.refDev());
         defer kept.deinit(self.a);
         for (self.labels.items, 0..) |l, id| {
             if (kept.has(id)) try self.emitLabel(l);
@@ -587,7 +588,7 @@ pub const VectorSurface = struct {
         }
 
         const anchor = self.worldOf(at);
-        try self.pool.add(self.a, self.labels.items.len, group, self.labelBox(anchor, x0, baseline, pen, px, rot_deg, rot_align));
+        try self.pool.add(self.a, self.labels.items.len, group, self.cur.class, text, self.labelBox(anchor, x0, baseline, pen, px, rot_deg, rot_align));
         try self.labels.append(self.a, .{
             .feat = self.cur_feature(),
             .anchor = anchor,

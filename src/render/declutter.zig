@@ -30,6 +30,18 @@
 //!     criterion" to settle the arbitrary decision: the earlier-emitted label
 //!     wins, the engine's emission order being that sequence.
 //!
+//! The pool also settles REPETITION, which collision alone cannot. The engine
+//! walks a scene tile by tile and clips each feature to the tile it is drawn in,
+//! so one island, one depth contour, one sea area spanning several tiles is
+//! labelled once PER TILE — each copy anchored to its own clipped piece, so the
+//! copies never overlap and a collision test happily keeps them all. That is the
+//! "Rhode Island" printed six times, the 9 m contour printed forty-eight. S-52
+//! wants text kept to what the mariner needs to read: a feature is labelled, not
+//! labelled repeatedly because of how we cut the tiles. So a label also loses if
+//! the SAME text is already placed within `repeat_px` of it — the spacing below
+//! which a repeat is redundant rather than informative. A long contour still
+//! carries its value again further along, which is what a chart wants.
+//!
 //! What the pool deliberately does NOT do is let placement fall out of the
 //! order the engine happened to walk the cell. Every candidate is RANKED
 //! before any of them claims space. That is the whole point: a light
@@ -55,6 +67,13 @@ pub const Box = struct {
     }
 };
 
+/// The default repeat spacing for a pixel surface, in reference px: below this,
+/// a second copy of the same label is a tiling artefact or noise rather than a
+/// second thing worth reading. A long contour still re-states its value beyond
+/// it. Chosen at roughly one tile-and-a-half at the reference 256 px tile, so a
+/// feature cut across adjacent tiles is deduped whichever seam it straddles.
+pub const REPEAT_PX: f64 = 384.0;
+
 /// IMPORTANT text (groups 10-19) outranks Other text. Group 0 (a label the
 /// portrayal gave no group) is Other: only a group the spec lists as important
 /// gets the higher tier.
@@ -70,6 +89,10 @@ const Candidate = struct {
     tier: u8,
     seq: usize,
     box: Box,
+    /// What the label SAYS, hashed (class + text): two candidates with the same
+    /// key are the same label — the same feature cut across tiles, or a name so
+    /// close by that repeating it tells the mariner nothing.
+    key: u64,
 };
 
 /// Rank order: important text first, then the earlier-emitted label. A total
@@ -102,29 +125,64 @@ pub const Pool = struct {
         self.cands.deinit(a);
     }
 
-    pub fn add(self: *Pool, a: Allocator, id: usize, group: i64, box: Box) !void {
+    /// `class` + `text` identify the label for the repeat rule (see the header).
+    pub fn add(self: *Pool, a: Allocator, id: usize, group: i64, class: []const u8, text: []const u8, box: Box) !void {
+        var h = std.hash.Wyhash.init(0);
+        h.update(class);
+        h.update(text);
         try self.cands.append(a, .{
             .id = id,
             .tier = tier(group),
             .seq = self.cands.items.len,
             .box = box,
+            .key = h.final(),
         });
     }
 
-    /// Rank the pool, then greedily claim space from the top down: a kept
-    /// label's box blocks every lower-ranked label that overlaps it. Returns
-    /// the survivors.
-    pub fn resolve(self: *Pool, a: Allocator) !Kept {
+    /// Rank the pool, then claim space from the top down. A label loses if it
+    /// OVERLAPS one already placed, or if it REPEATS one already placed within
+    /// `repeat_px` (0 = allow every repeat). Distances are in the surface's own
+    /// units — canvas px, screen px, character cells. Returns the survivors.
+    pub fn resolve(self: *Pool, a: Allocator, repeat_px: f64) !Kept {
         std.mem.sort(Candidate, self.cands.items, {}, ranks);
 
         var grid = Occupancy{};
         defer grid.deinit(a);
+        // Where each distinct label text has already been placed.
+        var placed = std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged([2]f64)){};
+        defer {
+            var vit = placed.valueIterator();
+            while (vit.next()) |v| v.deinit(a);
+            placed.deinit(a);
+        }
         var kept = Kept{};
         errdefer kept.deinit(a);
+
         for (self.cands.items) |c| {
             if (grid.hits(c.box)) continue;
+            const cx = (c.box.x0 + c.box.x1) * 0.5;
+            const cy = (c.box.y0 + c.box.y1) * 0.5;
+            if (repeat_px > 0) {
+                if (placed.get(c.key)) |spots| {
+                    var repeats = false;
+                    for (spots.items) |s| {
+                        const dx = s[0] - cx;
+                        const dy = s[1] - cy;
+                        if (dx * dx + dy * dy < repeat_px * repeat_px) {
+                            repeats = true;
+                            break;
+                        }
+                    }
+                    if (repeats) continue;
+                }
+            }
             try grid.claim(a, c.box);
             try kept.ids.put(a, c.id, {});
+            if (repeat_px > 0) {
+                const gop = try placed.getOrPut(a, c.key);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(a, .{ cx, cy });
+            }
         }
         return kept;
     }
@@ -202,10 +260,10 @@ test "important text claims space over other text, whatever the emission order" 
     defer p.deinit(t.allocator);
     // The OTHER-text label is emitted FIRST (the cell encoded it first) and the
     // important one second, on the same spot. Rank, not order, must decide.
-    try p.add(t.allocator, 1, 26, bx(0, 0, 40, 10)); // geographic name
-    try p.add(t.allocator, 2, 11, bx(5, 0, 45, 10)); // vertical clearance
+    try p.add(t.allocator, 1, 26, "CLS", "t1", bx(0, 0, 40, 10)); // geographic name
+    try p.add(t.allocator, 2, 11, "CLS", "t2", bx(5, 0, 45, 10)); // vertical clearance
 
-    var kept = try p.resolve(t.allocator);
+    var kept = try p.resolve(t.allocator, 0);
     defer kept.deinit(t.allocator);
     try t.expect(kept.has(2));
     try t.expect(!kept.has(1));
@@ -216,9 +274,9 @@ test "peers within a tier fall to the SENC sequence — the first label wins" {
     defer p.deinit(t.allocator);
     // A light description and a geographic name are both Other text: peers. The
     // engine's emission order settles it, and nothing else may.
-    try p.add(t.allocator, 1, 26, bx(0, 0, 40, 10));
-    try p.add(t.allocator, 2, 23, bx(5, 0, 45, 10));
-    var kept = try p.resolve(t.allocator);
+    try p.add(t.allocator, 1, 26, "CLS", "t1", bx(0, 0, 40, 10));
+    try p.add(t.allocator, 2, 23, "CLS", "t2", bx(5, 0, 45, 10));
+    var kept = try p.resolve(t.allocator, 0);
     defer kept.deinit(t.allocator);
     try t.expect(kept.has(1));
     try t.expect(!kept.has(2));
@@ -227,10 +285,10 @@ test "peers within a tier fall to the SENC sequence — the first label wins" {
 test "a dropped label claims nothing: it never blocks a label it lost to" {
     var p = Pool{};
     defer p.deinit(t.allocator);
-    try p.add(t.allocator, 1, 26, bx(0, 0, 200, 10)); // wide Other-text banner
-    try p.add(t.allocator, 2, 11, bx(0, 0, 20, 10)); // important, both ends
-    try p.add(t.allocator, 3, 11, bx(180, 0, 200, 10));
-    var kept = try p.resolve(t.allocator);
+    try p.add(t.allocator, 1, 26, "CLS", "t1", bx(0, 0, 200, 10)); // wide Other-text banner
+    try p.add(t.allocator, 2, 11, "CLS", "t2", bx(0, 0, 20, 10)); // important, both ends
+    try p.add(t.allocator, 3, 11, "CLS", "t3", bx(180, 0, 200, 10));
+    var kept = try p.resolve(t.allocator, 0);
     defer kept.deinit(t.allocator);
     try t.expect(kept.has(2));
     try t.expect(kept.has(3));
@@ -242,11 +300,11 @@ test "non-overlapping labels all survive, and boxes are exact (bucket-independen
     defer p.deinit(t.allocator);
     // Adjacent-but-disjoint boxes inside ONE bucket, and a pair straddling a
     // bucket seam: all must survive — the bucket grid is an index, not the test.
-    try p.add(t.allocator, 1, 26, bx(0, 0, 10, 10));
-    try p.add(t.allocator, 2, 26, bx(11, 0, 20, 10));
-    try p.add(t.allocator, 3, 26, bx(60, 0, 63, 10)); // left of the seam at 64
-    try p.add(t.allocator, 4, 26, bx(65, 0, 80, 10)); // right of it
-    var kept = try p.resolve(t.allocator);
+    try p.add(t.allocator, 1, 26, "CLS", "t1", bx(0, 0, 10, 10));
+    try p.add(t.allocator, 2, 26, "CLS", "t2", bx(11, 0, 20, 10));
+    try p.add(t.allocator, 3, 26, "CLS", "t3", bx(60, 0, 63, 10)); // left of the seam at 64
+    try p.add(t.allocator, 4, 26, "CLS", "t4", bx(65, 0, 80, 10)); // right of it
+    var kept = try p.resolve(t.allocator, 0);
     defer kept.deinit(t.allocator);
     try t.expectEqual(@as(usize, 4), kept.ids.count());
 }
@@ -257,4 +315,37 @@ test "tier: only the spec's important groups outrank other text" {
     try t.expectEqual(@as(u8, 1), tier(23)); // light description
     try t.expectEqual(@as(u8, 1), tier(26)); // geographic names
     try t.expectEqual(@as(u8, 1), tier(0)); // ungrouped
+}
+
+test "the same label repeated by tiling is placed once; a genuine repeat further off survives" {
+    var p = Pool{};
+    defer p.deinit(t.allocator);
+    // One island cut across three tiles: three copies of the same name, each
+    // anchored to its own clipped piece, none of them overlapping. Collision
+    // cannot see the problem — the repeat rule must.
+    try p.add(t.allocator, 1, 26, "LNDARE", "Rhode Island", bx(0, 0, 80, 12));
+    try p.add(t.allocator, 2, 26, "LNDARE", "Rhode Island", bx(200, 0, 280, 12));
+    try p.add(t.allocator, 3, 26, "LNDARE", "Rhode Island", bx(0, 200, 80, 212));
+    // A DIFFERENT feature that happens to sit close by keeps its own label...
+    try p.add(t.allocator, 4, 26, "SEAARE", "Mount Hope Bay", bx(200, 200, 280, 212));
+    // ...and the same text far away is a second thing worth reading, not a repeat.
+    try p.add(t.allocator, 5, 26, "LNDARE", "Rhode Island", bx(900, 900, 980, 912));
+
+    var kept = try p.resolve(t.allocator, REPEAT_PX);
+    defer kept.deinit(t.allocator);
+    try t.expect(kept.has(1)); // the first copy wins the name
+    try t.expect(!kept.has(2)); // the tiling artefacts do not
+    try t.expect(!kept.has(3));
+    try t.expect(kept.has(4)); // a different label is untouched
+    try t.expect(kept.has(5)); // beyond the spacing, a repeat is informative again
+}
+
+test "repeat_px 0 keeps every repeat (the rule is opt-in)" {
+    var p = Pool{};
+    defer p.deinit(t.allocator);
+    try p.add(t.allocator, 1, 26, "LNDARE", "Maryland", bx(0, 0, 80, 12));
+    try p.add(t.allocator, 2, 26, "LNDARE", "Maryland", bx(100, 0, 180, 12));
+    var kept = try p.resolve(t.allocator, 0);
+    defer kept.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 2), kept.ids.count());
 }

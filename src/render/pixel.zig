@@ -44,7 +44,7 @@ const OpKind = union(enum) {
     /// A shaped label (outlines for raster + the glyph run for text-object
     /// canvases). `bbox` [minx,miny,maxx,maxy] and `group` (the S-52 text group)
     /// feed the collision pass.
-    text: struct { run: cv.GlyphRun, bbox: [4]f32, group: i64 },
+    text: struct { run: cv.GlyphRun, bbox: [4]f32, group: i64, class: []const u8 },
 };
 
 /// Paint class, mirroring the tile style's LAYER order (areas ->
@@ -458,6 +458,7 @@ pub const PixelSurface = struct {
             },
             .bbox = .{ bbox[0] - halo_w, bbox[1] - halo_w, bbox[2] + halo_w, bbox[3] + halo_w },
             .group = group,
+            .class = self.cur.class,
         } });
     }
 
@@ -536,9 +537,11 @@ pub const PixelSurface = struct {
         for (self.ops.items) |op| {
             if (op.kind != .text) continue;
             const b = op.kind.text.bbox;
-            try pool.add(self.a, op.seq, op.kind.text.group, .{ .x0 = b[0], .y0 = b[1], .x1 = b[2], .y1 = b[3] });
+            try pool.add(self.a, op.seq, op.kind.text.group, op.kind.text.class, op.kind.text.run.text, .{ .x0 = b[0], .y0 = b[1], .x1 = b[2], .y1 = b[3] });
         }
-        var kept = try pool.resolve(self.a);
+        // Canvas px include the device scale (supersample x physical), so the
+        // reference spacing scales with it.
+        var kept = try pool.resolve(self.a, dc.REPEAT_PX * self.devScale());
         defer kept.deinit(self.a);
 
         // Paint order = the tile style's layer stack: class-major (see

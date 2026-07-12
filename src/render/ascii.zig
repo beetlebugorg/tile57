@@ -84,7 +84,7 @@ const OpKind = union(enum) {
     pattern: struct { rings: []const []const Pt },
     stroke: struct { lines: []const []const Pt, dash: rs.Dash, color: ?u8 },
     glyph: struct { ch: u21, col: i64, row: i64, color: ?u8 },
-    label: struct { text: []const u8, col: i64, row: i64, w: i64, color: ?u8, group: i64 },
+    label: struct { text: []const u8, col: i64, row: i64, w: i64, color: ?u8, group: i64, class: []const u8 },
 };
 
 /// Paint class, the same class-major order as the pixel surface (pixel.zig
@@ -317,6 +317,7 @@ pub const AsciiSurface = struct {
                 .w = @intCast(label.len),
                 .color = self.resolveColor("CHGRD"),
                 .group = 0,
+                .class = self.cur.class,
             },
         });
     }
@@ -339,6 +340,7 @@ pub const AsciiSurface = struct {
             .w = @intCast(word.len),
             .color = self.resolveColor(style.color),
             .group = style.group,
+            .class = self.cur.class,
         } });
     }
 
@@ -470,14 +472,16 @@ pub const AsciiSurface = struct {
                 .label => |lb| lb,
                 else => continue,
             };
-            try pool.add(self.a, op.seq, l.group, .{
+            try pool.add(self.a, op.seq, l.group, l.class, l.text, .{
                 .x0 = @floatFromInt(l.col),
                 .y0 = @floatFromInt(l.row),
                 .x1 = @floatFromInt(l.col + l.w - 1),
                 .y1 = @floatFromInt(l.row),
             });
         }
-        var kept = try pool.resolve(self.a);
+        // The grid's unit is a CHARACTER, not a pixel: one column plays one CSS px,
+        // so the reference spacing converts at the surface's px-per-column.
+        var kept = try pool.resolve(self.a, declut.REPEAT_PX / @as(f64, @floatFromInt(ROW_PX)));
         defer kept.deinit(self.a);
 
         // Paint order = the pixel surface's exact sort: class-major (see
