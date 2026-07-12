@@ -147,6 +147,20 @@ edition, update, issue date, agency, bbox. `cell` summarises one chart.
 GeoJSON FeatureCollection. `catalog` decodes an exchange-set catalogue into
 its entries (file, title, bbox).
 
+### `s101`
+
+```
+tile57 s101 <file.000> [--features N]
+```
+
+Inspects a native S-101 (S-100 Part 10a) chart: confirms detection, prints the
+coordinate factors and record counts, the in-band code-table sizes, a
+feature-class histogram, and the assembled geometry summary. It then runs the
+portrayal rules and reports how many features drew, were empty, or errored. Use
+`--features N` to also dump the first N features with their attributes. Charts
+are auto-detected everywhere — `png`, `bake`, and the C API read a native S-101
+`.000` transparently — so this command is for inspection, not a separate load path.
+
 ### `inspect` / `tiledump`
 
 ```

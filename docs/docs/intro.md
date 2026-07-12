@@ -16,15 +16,16 @@ real-world navigation.** See [Known limitations](./limitations.md).
 
 :::
 
-**tile57** is a nautical chart engine. It reads IHO **S-57** ENC cells — each
-cell is one electronic navigational chart, compiled for one scale; NOAA and
-other hydrographic offices publish thousands — converts each chart's features
-to the newer **S-101** data model, and runs the official IHO **S-101
-Portrayal Catalogue** in embedded Lua to decide how each feature is drawn,
-producing **S-101 symbology** (the successor to S-52). The conversion is an
-interim step, and a best-effort one — S-57 has no perfect S-101 translation
-(see [Known limitations](./limitations.md)); the goal is S-101 throughout,
-reading native S-101 charts directly as hydrographic offices publish them.
+**tile57** is a nautical chart engine. It reads both native IHO **S-101** ENC
+charts — the S-100-based successor format hydrographic offices are beginning to
+publish — and legacy IHO **S-57** ENC cells (each cell is one electronic
+navigational chart, compiled for one scale; NOAA and others publish thousands).
+The format is detected from the chart file: a native S-101 dataset feeds the
+portrayal model directly, while an S-57 chart is first converted to the S-101
+data model — a best-effort step, since S-57 has no perfect S-101 translation
+(see [Known limitations](./limitations.md)). Either way, tile57 runs the
+official IHO **S-101 Portrayal Catalogue** in embedded Lua to decide how each
+feature is drawn, producing **S-101 symbology** (the successor to S-52).
 
 The primary output is **vector tiles**, fetched by `(z, x, y)`:
 [MapLibre Tiles](https://github.com/maplibre/maplibre-tile-spec) (MLT, the
