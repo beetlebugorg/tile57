@@ -147,9 +147,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             .full_light_lines = m.show_full_sector_lines,
         };
         // A native S-101 dataset (.000, S-100 Part 10a) assembles + portrays without
-        // the S-57 -> S-101 adapter; an S-57 cell parses with its .001.. updates.
+        // the S-57 -> S-101 adapter; either format applies its .001.. update chain.
         if (engine.s101.dataset.detect(data)) {
-            const loaded = try engine.s101.native.parseDataset(a, data);
+            const loaded = try engine.s101.native.parseDataset(a, data, readUpdates(io, a, path));
             cell = loaded.cell;
             streams = try engine.portray.portrayCellWithAdapted(a, &cell, loaded.adapted, resolveRulesDir(rules), pctx);
         } else {

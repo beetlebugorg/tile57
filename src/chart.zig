@@ -331,13 +331,12 @@ fn streamRead(ls: *LazySource, lc: *LazyCell) bool {
 /// pre-built portrayal records (so portray bypasses the S-57 -> S-101 adapter).
 const CellLoad = struct { cell: s57.Cell, adapted: ?[]const s101.adapter.Adapted = null };
 
-/// Parse a .000 chart, auto-detecting S-101 vs S-57 from the file itself. A native
-/// S-101 dataset (S-100 Part 10a) assembles via s101.native; an S-57 cell parses
-/// with its update chain applied (S-101 update-record merge is not yet modeled, so
-/// `updates` are ignored for a native base). Returns null on a parse failure.
+/// Parse a .000 chart, auto-detecting S-101 vs S-57 from the file itself, and apply
+/// its sequential `.001…` update chain. A native S-101 dataset (S-100 Part 10a)
+/// assembles via s101.native; an S-57 cell parses via s57. Returns null on failure.
 fn parseAnyCell(base: []const u8, updates: []const []const u8) ?CellLoad {
     if (s101.dataset.detect(base)) {
-        const l = s101.native.parseDataset(gpa, base) catch return null;
+        const l = s101.native.parseDataset(gpa, base, updates) catch return null;
         return .{ .cell = l.cell, .adapted = l.adapted };
     }
     const cell = s57.parseCellWithUpdates(gpa, base, updates) catch return null;

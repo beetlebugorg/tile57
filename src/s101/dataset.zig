@@ -109,7 +109,8 @@ pub const CodeTable = struct {
 /// (container) attributes carry an empty `val` and are referenced as a `paix` by
 /// their sub-attributes; simple attributes carry a value.
 pub const Attr = struct {
-    natc: u16, // numeric attribute code (resolve via the ATCS table -> name)
+    name: []const u8 = "", // resolved S-101 attribute name (from THIS file's ATCS)
+    natc: u16, // numeric attribute code (per the source file's table)
     atix: u16,
     paix: u16,
     atin: u8,
@@ -124,6 +125,7 @@ pub const SpatialAssoc = struct {
     ornt: u8, // 1=forward, 2=reverse, 255=null
     usag: u8 = 0, // 1=exterior, 2=interior, 3=truncated by data limit (from RIAS; SPAS carries none)
     mask: u8 = 0, // from the MASK field, joined by rrid
+    saui: u8 = 1, // Spatial Association Update Indicator: 1=insert, 2=delete (in a MODIFY update)
 };
 
 /// One FASC entry: a feature-to-feature association. `rrid` is the associated
@@ -136,35 +138,44 @@ pub const FeatureAssoc = struct {
 
 pub const Foid = struct { agen: u16 = 0, fidn: u32 = 0, fids: u16 = 0 };
 
+// Every record carries its RUIN (update instruction) + RVER (version). A base record
+// is RUIN=1 (insert) / RVER=1; an update record's RUIN drives the record-level merge.
 pub const FeatureRec = struct {
     rcid: u32,
-    nftc: u16, // feature type code -> FTCS name (the S-101 class)
+    class: []const u8 = "", // resolved S-101 feature class (from THIS file's FTCS)
+    nftc: u16, // feature type code (per the source file's table)
+    ruin: u8 = 1,
+    version: u16 = 1,
     foid: Foid = .{},
     attrs: []const Attr = &.{},
     spas: []SpatialAssoc = &.{},
     fasc: []const FeatureAssoc = &.{},
 };
 
-pub const PointRec = struct { rcid: u32, lon: f64, lat: f64 };
-pub const MultiRec = struct { rcid: u32, soundings: []const s57.Sounding };
+pub const PointRec = struct { rcid: u32, lon: f64, lat: f64, ruin: u8 = 1, version: u16 = 1 };
+pub const MultiRec = struct { rcid: u32, soundings: []const s57.Sounding, ruin: u8 = 1, version: u16 = 1 };
 pub const CurveRec = struct {
     rcid: u32,
     begin_rcid: u32 = 0, // referenced point record RCID (PTAS TOPI=1)
     end_rcid: u32 = 0, // PTAS TOPI=2
     interior: []const s57.LonLat = &.{}, // C2IL vertices between the begin and end nodes
+    ruin: u8 = 1,
+    version: u16 = 1,
 };
 pub const CompositeMember = struct { rrid: u32, ornt: u8 };
-pub const CompositeRec = struct { rcid: u32, members: []CompositeMember };
+pub const CompositeRec = struct { rcid: u32, members: []CompositeMember, ruin: u8 = 1, version: u16 = 1 };
 pub const RingRef = struct { rrnm: u8, rrid: u32, ornt: u8, usag: u8 };
-pub const SurfaceRec = struct { rcid: u32, rings: []RingRef };
+pub const SurfaceRec = struct { rcid: u32, rings: []RingRef, ruin: u8 = 1, version: u16 = 1 };
 
-pub const InfoRec = struct { rcid: u32, nitc: u16, attrs: []const Attr };
+pub const InfoRec = struct { rcid: u32, itype: []const u8 = "", nitc: u16, attrs: []const Attr = &.{}, ruin: u8 = 1, version: u16 = 1 };
 
 pub const Dataset = struct {
+    // All record bytes (names, values, geometry) are duped into this arena, so the
+    // per-file ISO 8211 readers are transient — none is retained. This lets records
+    // from several files (a base plus its updates) coexist after their sources close.
     arena: std.heap.ArenaAllocator,
-    iso_file: iso.File,
     params: Params = .{},
-    feature_codes: CodeTable = .{}, // FTCS
+    feature_codes: CodeTable = .{}, // FTCS (the base file's, for tooling; records carry resolved names)
     attr_codes: CodeTable = .{}, // ATCS
     info_codes: CodeTable = .{}, // ITCS
     assoc_codes: CodeTable = .{}, // ARCS (roles)
@@ -178,14 +189,17 @@ pub const Dataset = struct {
     infos: []InfoRec = &.{},
 
     pub fn deinit(self: *Dataset) void {
-        self.iso_file.deinit();
         self.arena.deinit();
     }
 
+    // Names resolved at decode time (via the source file's tables) so a merged
+    // dataset is consistent even though each file has its OWN numeric code space.
     pub fn featureName(self: Dataset, f: FeatureRec) ?[]const u8 {
+        if (f.class.len > 0) return f.class;
         return self.feature_codes.name(f.nftc);
     }
     pub fn attrName(self: Dataset, a: Attr) ?[]const u8 {
+        if (a.name.len > 0) return a.name;
         return self.attr_codes.name(a.natc);
     }
 };
@@ -238,84 +252,215 @@ fn digit(c: u8) ?u8 {
     return if (c >= '0' and c <= '9') c - '0' else null;
 }
 
-/// Parse a native S-101 dataset from in-memory bytes (borrowed; the returned
-/// `Dataset` owns an ISO 8211 file that references `bytes`, so keep `bytes` alive
-/// until `deinit`). Caller must `deinit` the result.
-pub fn parse(gpa: Allocator, bytes: []const u8) !Dataset {
-    var iso_file = try iso.parse(gpa, bytes);
-    errdefer iso_file.deinit();
+/// The header (coordinate factors + code tables) of one ISO 8211 file. Each file —
+/// a base cell OR one of its updates — has its OWN numeric code space, so its records
+/// resolve their class/attribute NAMES against ITS tables before merging.
+const Tables = struct {
+    params: Params = .{},
+    fc: CodeTable = .{}, // FTCS (feature classes)
+    ac: CodeTable = .{}, // ATCS (attributes)
+    ic: CodeTable = .{}, // ITCS (information types)
+    arc: CodeTable = .{}, // ARCS (association roles)
+};
 
+/// A record set being merged by (RCNM, RCID). `Idx(T)` keeps insertion order with a
+/// last-wins rcid index; a delete tombstones the slot, `flatten` drops tombstones.
+fn Idx(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        list: std.ArrayList(?T) = .empty,
+        idx: std.AutoHashMapUnmanaged(u32, usize) = .{},
+
+        fn upsert(self: *Self, a: Allocator, rcid: u32, rec: T) !void {
+            if (self.idx.get(rcid)) |i| {
+                self.list.items[i] = rec;
+            } else {
+                try self.list.append(a, rec);
+                try self.idx.put(a, rcid, self.list.items.len - 1);
+            }
+        }
+        fn remove(self: *Self, rcid: u32) void {
+            if (self.idx.fetchRemove(rcid)) |kv| self.list.items[kv.value] = null;
+        }
+        fn get(self: *Self, rcid: u32) ?*T {
+            const i = self.idx.get(rcid) orelse return null;
+            return if (self.list.items[i]) |*r| r else null;
+        }
+        fn flatten(self: *Self, a: Allocator) ![]T {
+            var out = std.ArrayList(T).empty;
+            for (self.list.items) |m| if (m) |x| try out.append(a, x);
+            return out.items;
+        }
+    };
+}
+
+const Merge = struct {
+    features: Idx(FeatureRec) = .{},
+    points: Idx(PointRec) = .{},
+    multis: Idx(MultiRec) = .{},
+    curves: Idx(CurveRec) = .{},
+    composites: Idx(CompositeRec) = .{},
+    surfaces: Idx(SurfaceRec) = .{},
+    infos: Idx(InfoRec) = .{},
+};
+
+/// Parse a native S-101 base cell (no updates). Caller must `deinit` the result.
+pub fn parse(gpa: Allocator, bytes: []const u8) !Dataset {
+    return parseWithUpdates(gpa, bytes, &.{});
+}
+
+/// Parse a native S-101 base cell and apply its sequential update files (`.001`,
+/// `.002`, … in order), merging records by (RCNM, RCID): RUIN 1=insert, 2=delete,
+/// 3=modify (S-100 Part 10a §4a-4.5). Names resolve per file (each carries its own
+/// code tables). All kept bytes are duped into the result's arena, so the base and
+/// update ISO readers are transient. Pass an empty `updates` for a plain base cell.
+pub fn parseWithUpdates(gpa: Allocator, base: []const u8, updates: []const []const u8) !Dataset {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // Parse into locals (the arena is MOVED into the returned Dataset only at the
-    // end, so its final state travels with the result — never snapshot it mid-parse).
-    var params: Params = .{};
-    var feature_codes: CodeTable = .{};
-    var attr_codes: CodeTable = .{};
-    var info_codes: CodeTable = .{};
-    var assoc_codes: CodeTable = .{};
+    var m: Merge = .{};
 
-    var features = std.ArrayList(FeatureRec).empty;
-    var points = std.ArrayList(PointRec).empty;
-    var multis = std.ArrayList(MultiRec).empty;
-    var curves = std.ArrayList(CurveRec).empty;
-    var composites = std.ArrayList(CompositeRec).empty;
-    var surfaces = std.ArrayList(SurfaceRec).empty;
-    var infos = std.ArrayList(InfoRec).empty;
+    var base_iso = try iso.parse(gpa, base);
+    defer base_iso.deinit();
+    const base_tables = try readHeader(a, base_iso);
+    try decodeInto(a, &m, base_iso, base_tables);
 
-    for (iso_file.records) |rec| {
-        if (rec.fields.len == 0) continue;
-        const lead = rec.fields[0].tag;
-        if (std.mem.eql(u8, lead, "DSID")) {
-            try parseDatasetRecord(a, rec, &params, &feature_codes, &attr_codes, &info_codes, &assoc_codes);
-        } else if (std.mem.eql(u8, lead, "PRID")) {
-            if (rec.field("C2IT")) |c| {
-                const p = rec.field("PRID").?;
-                try points.append(a, .{
-                    .rcid = u32le(p, 1),
-                    .lat = @as(f64, @floatFromInt(i32le(c, 0))) / params.cmfy,
-                    .lon = @as(f64, @floatFromInt(i32le(c, 4))) / params.cmfx,
-                });
-            }
-        } else if (std.mem.eql(u8, lead, "MRID")) {
-            const m = rec.field("MRID").?;
-            const snds = if (rec.field("C3IL")) |c| try parseSoundings(a, c, params) else &[_]s57.Sounding{};
-            try multis.append(a, .{ .rcid = u32le(m, 1), .soundings = snds });
-        } else if (std.mem.eql(u8, lead, "CRID")) {
-            try curves.append(a, try parseCurve(a, rec, params));
-        } else if (std.mem.eql(u8, lead, "CCID")) {
-            try composites.append(a, try parseComposite(a, rec));
-        } else if (std.mem.eql(u8, lead, "SRID")) {
-            try surfaces.append(a, try parseSurface(a, rec));
-        } else if (std.mem.eql(u8, lead, "FRID")) {
-            try features.append(a, try parseFeature(a, rec));
-        } else if (std.mem.eql(u8, lead, "IRID")) {
-            const ir = rec.field("IRID").?;
-            const attrs = if (rec.field("ATTR")) |at| try parseAttrs(a, at) else &[_]Attr{};
-            try infos.append(a, .{ .rcid = u32le(ir, 1), .nitc = u16le(ir, 5), .attrs = attrs });
-        }
-        // CSID/CRSH/CSAX/VDAT (CRS) are WGS84/EPSG:4326 for ENC; the whole engine
-        // already assumes geographic lon/lat, so nothing to carry.
+    for (updates) |u| {
+        var up_iso = iso.parse(gpa, u) catch break; // reject a corrupt update; keep prior state
+        defer up_iso.deinit();
+        const t = readHeader(a, up_iso) catch break;
+        decodeInto(a, &m, up_iso, t) catch break;
     }
 
     return .{
         .arena = arena,
-        .iso_file = iso_file,
-        .params = params,
-        .feature_codes = feature_codes,
-        .attr_codes = attr_codes,
-        .info_codes = info_codes,
-        .assoc_codes = assoc_codes,
-        .features = features.items,
-        .points = points.items,
-        .multis = multis.items,
-        .curves = curves.items,
-        .composites = composites.items,
-        .surfaces = surfaces.items,
-        .infos = infos.items,
+        .params = base_tables.params,
+        .feature_codes = base_tables.fc,
+        .attr_codes = base_tables.ac,
+        .info_codes = base_tables.ic,
+        .assoc_codes = base_tables.arc,
+        .features = try m.features.flatten(a),
+        .points = try m.points.flatten(a),
+        .multis = try m.multis.flatten(a),
+        .curves = try m.curves.flatten(a),
+        .composites = try m.composites.flatten(a),
+        .surfaces = try m.surfaces.flatten(a),
+        .infos = try m.infos.flatten(a),
     };
+}
+
+/// Decode one ISO file's data records into the merge set, applying each record's
+/// RUIN. A delete needs only the identity; insert/modify decode fully (resolving
+/// names via `t`'s tables). Spatial-record modify replaces; feature modify applies
+/// the SAUI-indicated spatial-association edits (see `modifyFeature`).
+fn decodeInto(a: Allocator, m: *Merge, iso_file: iso.File, t: Tables) !void {
+    for (iso_file.records) |rec| {
+        if (rec.fields.len == 0) continue;
+        const lead = rec.fields[0].tag;
+        if (std.mem.eql(u8, lead, "PRID")) {
+            const p = rec.field("PRID").?;
+            const rcid = u32le(p, 1);
+            if (u8at(p, 7) == 2) {
+                m.points.remove(rcid);
+            } else if (rec.field("C2IT")) |c| {
+                try m.points.upsert(a, rcid, .{
+                    .rcid = rcid,
+                    .lat = @as(f64, @floatFromInt(i32le(c, 0))) / t.params.cmfy,
+                    .lon = @as(f64, @floatFromInt(i32le(c, 4))) / t.params.cmfx,
+                    .ruin = u8at(p, 7),
+                    .version = u16le(p, 5),
+                });
+            }
+        } else if (std.mem.eql(u8, lead, "MRID")) {
+            const md = rec.field("MRID").?;
+            const rcid = u32le(md, 1);
+            if (u8at(md, 7) == 2) {
+                m.multis.remove(rcid);
+            } else {
+                const snds = if (rec.field("C3IL")) |c| try parseSoundings(a, c, t.params) else &[_]s57.Sounding{};
+                try m.multis.upsert(a, rcid, .{ .rcid = rcid, .soundings = snds, .ruin = u8at(md, 7), .version = u16le(md, 5) });
+            }
+        } else if (std.mem.eql(u8, lead, "CRID")) {
+            const c = rec.field("CRID").?;
+            if (u8at(c, 7) == 2) m.curves.remove(u32le(c, 1)) else try m.curves.upsert(a, u32le(c, 1), try parseCurve(a, rec, t.params));
+        } else if (std.mem.eql(u8, lead, "CCID")) {
+            const c = rec.field("CCID").?;
+            if (u8at(c, 7) == 2) m.composites.remove(u32le(c, 1)) else try m.composites.upsert(a, u32le(c, 1), try parseComposite(a, rec));
+        } else if (std.mem.eql(u8, lead, "SRID")) {
+            const s = rec.field("SRID").?;
+            if (u8at(s, 7) == 2) m.surfaces.remove(u32le(s, 1)) else try m.surfaces.upsert(a, u32le(s, 1), try parseSurface(a, rec));
+        } else if (std.mem.eql(u8, lead, "FRID")) {
+            const f = rec.field("FRID").?;
+            const rcid = u32le(f, 1);
+            if (u8at(f, 9) == 2) {
+                m.features.remove(rcid);
+            } else {
+                const decoded = try parseFeature(a, rec, t);
+                if (decoded.ruin == 3) {
+                    if (m.features.get(rcid)) |ex| {
+                        try modifyFeature(a, ex, decoded);
+                        continue;
+                    }
+                }
+                try m.features.upsert(a, rcid, decoded);
+            }
+        } else if (std.mem.eql(u8, lead, "IRID")) {
+            const ir = rec.field("IRID").?;
+            const rcid = u32le(ir, 1);
+            if (u8at(ir, 9) == 2) {
+                m.infos.remove(rcid);
+            } else {
+                const nitc = u16le(ir, 5);
+                const attrs = if (rec.field("ATTR")) |at| try parseAttrs(a, at, t.ac) else &[_]Attr{};
+                try m.infos.upsert(a, rcid, .{
+                    .rcid = rcid,
+                    .itype = try a.dupe(u8, t.ic.name(nitc) orelse ""),
+                    .nitc = nitc,
+                    .attrs = attrs,
+                    .ruin = u8at(ir, 9),
+                    .version = u16le(ir, 7),
+                });
+            }
+        }
+        // CSID/CRSH/CSAX/VDAT (CRS) are WGS84/EPSG:4326 for ENC; the whole engine
+        // already assumes geographic lon/lat, so nothing to carry.
+    }
+}
+
+/// Apply a feature MODIFY update to the existing record. Attributes/FASC are replaced
+/// when the update carries them (a MODIFY that omits a field leaves it unchanged);
+/// spatial associations are edited per-entry by SAUI (2=delete the matching RRID,
+/// 1=add), matching the S-164 reference behaviour (e.g. swap a surface for a re-cut one).
+fn modifyFeature(a: Allocator, ex: *FeatureRec, upd: FeatureRec) !void {
+    if (upd.attrs.len > 0) ex.attrs = upd.attrs;
+    if (upd.fasc.len > 0) ex.fasc = upd.fasc;
+    if (upd.foid.agen != 0 or upd.foid.fidn != 0 or upd.foid.fids != 0) ex.foid = upd.foid;
+    if (upd.spas.len > 0) {
+        var spas = std.ArrayList(SpatialAssoc).empty;
+        for (ex.spas) |sp| {
+            var deleted = false;
+            for (upd.spas) |usp| {
+                if (usp.saui == 2 and usp.rrnm == sp.rrnm and usp.rrid == sp.rrid) deleted = true;
+            }
+            if (!deleted) try spas.append(a, sp);
+        }
+        for (upd.spas) |usp| if (usp.saui != 2) try spas.append(a, usp);
+        ex.spas = spas.items;
+    }
+    ex.version = upd.version;
+}
+
+/// Read a file's coordinate factors + code tables from its DSID record (the first
+/// data record). Code-table names are duped into `a`, so they outlive the ISO reader.
+fn readHeader(a: Allocator, iso_file: iso.File) !Tables {
+    var t: Tables = .{};
+    for (iso_file.records) |rec| {
+        if (rec.fields.len == 0 or !std.mem.eql(u8, rec.fields[0].tag, "DSID")) continue;
+        try parseDatasetRecord(a, rec, &t.params, &t.fc, &t.ac, &t.ic, &t.arc);
+        break;
+    }
+    return t;
 }
 
 fn parseDatasetRecord(
@@ -357,9 +502,8 @@ fn parseCodeTable(a: Allocator, data: []const u8) !CodeTable {
     var i: usize = 0;
     while (i < data.len) {
         const ut = std.mem.indexOfScalarPos(u8, data, i, UT) orelse break;
-        const nm = data[i..ut];
         const code = u16le(data, ut + 1);
-        try t.by_code.put(a, code, nm);
+        try t.by_code.put(a, code, try a.dupe(u8, data[i..ut])); // dupe: the ISO reader is transient
         i = ut + 3;
     }
     return t;
@@ -367,7 +511,8 @@ fn parseCodeTable(a: Allocator, data: []const u8) !CodeTable {
 
 /// ATTR field: repeating `(3b12,b11,A)` = NATC,ATIX,PAIX (u16), ATIN (u8), then a
 /// UT-terminated ASCII value. Preserves order (PAIX references the 1-based position).
-fn parseAttrs(a: Allocator, data: []const u8) ![]const Attr {
+/// Resolves each NATC to its S-101 name via `ac` and dupes name + value into `a`.
+fn parseAttrs(a: Allocator, data: []const u8, ac: CodeTable) ![]const Attr {
     var out = std.ArrayList(Attr).empty;
     var i: usize = 0;
     while (i + 7 <= data.len) {
@@ -379,7 +524,14 @@ fn parseAttrs(a: Allocator, data: []const u8) ![]const Attr {
         const ut = std.mem.indexOfScalarPos(u8, data, i, UT) orelse data.len;
         const val = data[i..ut];
         i = ut + 1;
-        try out.append(a, .{ .natc = natc, .atix = atix, .paix = paix, .atin = atin, .val = val });
+        try out.append(a, .{
+            .name = try a.dupe(u8, ac.name(natc) orelse ""),
+            .natc = natc,
+            .atix = atix,
+            .paix = paix,
+            .atin = atin,
+            .val = try a.dupe(u8, val),
+        });
     }
     return out.items;
 }
@@ -463,23 +615,31 @@ fn parseSurface(a: Allocator, rec: iso.Record) !SurfaceRec {
     return .{ .rcid = u32le(s, 1), .rings = rings.items };
 }
 
-fn parseFeature(a: Allocator, rec: iso.Record) !FeatureRec {
+fn parseFeature(a: Allocator, rec: iso.Record, t: Tables) !FeatureRec {
     const f = rec.field("FRID").?;
-    var fr: FeatureRec = .{ .rcid = u32le(f, 1), .nftc = u16le(f, 5) };
+    const nftc = u16le(f, 5);
+    var fr: FeatureRec = .{
+        .rcid = u32le(f, 1),
+        .class = try a.dupe(u8, t.fc.name(nftc) orelse ""),
+        .nftc = nftc,
+        .ruin = u8at(f, 9),
+        .version = u16le(f, 7),
+    };
     if (rec.field("FOID")) |o| {
         fr.foid = .{ .agen = u16le(o, 0), .fidn = u32le(o, 2), .fids = u16le(o, 6) };
     }
-    if (rec.field("ATTR")) |at| fr.attrs = try parseAttrs(a, at);
+    if (rec.field("ATTR")) |at| fr.attrs = try parseAttrs(a, at, t.ac);
 
     // SPAS: repeating `(b11,b14,b11,2b14,b11)` = RRNM,RRID,ORNT,SMIN,SMAX,SAUI. A
     // feature may carry several (a surface plus a masked line, etc.), and the writer
-    // may split them across multiple SPAS fields, so collect every SPAS field.
+    // may split them across multiple SPAS fields, so collect every SPAS field. SAUI
+    // (last byte) drives association edits in a MODIFY update (see modifyFeature).
     var spas = std.ArrayList(SpatialAssoc).empty;
     for (rec.fields) |fld| {
         if (!std.mem.eql(u8, fld.tag, "SPAS")) continue;
         var o: usize = 0;
         while (o + 15 <= fld.data.len) : (o += 15) {
-            try spas.append(a, .{ .rrnm = u8at(fld.data, o), .rrid = u32le(fld.data, o + 1), .ornt = u8at(fld.data, o + 5) });
+            try spas.append(a, .{ .rrnm = u8at(fld.data, o), .rrid = u32le(fld.data, o + 1), .ornt = u8at(fld.data, o + 5), .saui = u8at(fld.data, o + 14) });
         }
     }
     fr.spas = spas.items;
@@ -537,4 +697,50 @@ test "detect distinguishes an S-101 DDR from an S-57 DDR" {
         try buf.appendSlice(a, dir);
         try std.testing.expectEqual(case[1], detect(buf.items));
     }
+}
+
+test "Idx merges records by rcid: upsert / delete / flatten" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ix: Idx(PointRec) = .{};
+    try ix.upsert(a, 10, .{ .rcid = 10, .lon = 0, .lat = 0 });
+    try ix.upsert(a, 11, .{ .rcid = 11, .lon = 1, .lat = 1 });
+    try ix.upsert(a, 12, .{ .rcid = 12, .lon = 2, .lat = 2 });
+    ix.remove(11); // delete 11
+    try ix.upsert(a, 10, .{ .rcid = 10, .lon = 9, .lat = 9 }); // modify-in-place 10
+    const out = try ix.flatten(a);
+    try std.testing.expectEqual(@as(usize, 2), out.len); // 11 tombstoned
+    try std.testing.expectEqual(@as(u32, 10), out[0].rcid);
+    try std.testing.expectEqual(@as(f64, 9), out[0].lon); // replaced value
+    try std.testing.expectEqual(@as(u32, 12), out[1].rcid);
+}
+
+test "modifyFeature applies SAUI spatial-association edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ex: FeatureRec = .{
+        .rcid = 1,
+        .nftc = 0,
+        .spas = try a.dupe(SpatialAssoc, &.{
+            .{ .rrnm = 130, .rrid = 10, .ornt = 1 },
+            .{ .rrnm = 130, .rrid = 11, .ornt = 1 },
+        }),
+    };
+    // A MODIFY that removes the association to surface 11 and adds surface 12.
+    const upd: FeatureRec = .{
+        .rcid = 1,
+        .nftc = 0,
+        .version = 2,
+        .spas = try a.dupe(SpatialAssoc, &.{
+            .{ .rrnm = 130, .rrid = 11, .ornt = 1, .saui = 2 }, // delete
+            .{ .rrnm = 130, .rrid = 12, .ornt = 1, .saui = 1 }, // insert
+        }),
+    };
+    try modifyFeature(a, &ex, upd);
+    try std.testing.expectEqual(@as(usize, 2), ex.spas.len);
+    try std.testing.expectEqual(@as(u32, 10), ex.spas[0].rrid); // kept
+    try std.testing.expectEqual(@as(u32, 12), ex.spas[1].rrid); // inserted (11 removed)
+    try std.testing.expectEqual(@as(u16, 2), ex.version);
 }

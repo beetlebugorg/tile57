@@ -39,11 +39,12 @@ pub const Loaded = struct {
     adapted: []const adapter.Adapted,
 };
 
-/// Detect + parse + assemble a native S-101 dataset. On a non-S-101 file returns
-/// `error.NotS101` so the caller can fall through to the S-57 reader.
-pub fn parseDataset(gpa: Allocator, bytes: []const u8) !Loaded {
-    if (!dataset.detect(bytes)) return error.NotS101;
-    var ds = try dataset.parse(gpa, bytes);
+/// Detect + parse + assemble a native S-101 dataset, applying its `.001…` update
+/// chain. On a non-S-101 base returns `error.NotS101` so the caller can fall through
+/// to the S-57 reader.
+pub fn parseDataset(gpa: Allocator, base: []const u8, updates: []const []const u8) !Loaded {
+    if (!dataset.detect(base)) return error.NotS101;
+    var ds = try dataset.parseWithUpdates(gpa, base, updates);
     defer ds.deinit(); // the shell dupes everything it keeps into its own arena
     return assemble(gpa, &ds);
 }
@@ -368,7 +369,7 @@ test "buildNode reconstructs the complex-attribute tree from PAIX links" {
     defer arena.deinit();
     const ar = arena.allocator();
 
-    var ds: dataset.Dataset = .{ .arena = undefined, .iso_file = undefined };
+    var ds: dataset.Dataset = .{ .arena = undefined };
     try ds.attr_codes.by_code.put(ar, 1, "simpleTop");
     try ds.attr_codes.by_code.put(ar, 2, "container");
     try ds.attr_codes.by_code.put(ar, 3, "childA");

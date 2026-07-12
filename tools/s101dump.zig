@@ -7,6 +7,21 @@ const std = @import("std");
 const engine = @import("engine");
 const s101 = engine.s101;
 
+/// The sequential `.001`, `.002`, … update files beside a `<stem>.000` base, read in
+/// order until the first gap. Returns an empty slice for a non-.000 path.
+fn readUpdates(io: std.Io, a: std.mem.Allocator, base_path: []const u8) []const []const u8 {
+    if (!std.mem.endsWith(u8, base_path, ".000")) return &.{};
+    const stem = base_path[0 .. base_path.len - 3];
+    var list = std.ArrayList([]const u8).empty;
+    var n: u32 = 1;
+    while (n < 1000) : (n += 1) {
+        const p = std.fmt.allocPrint(a, "{s}{d:0>3}", .{ stem, n }) catch break;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, a, .unlimited) catch break;
+        list.append(a, bytes) catch break;
+    }
+    return list.items;
+}
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
         std.debug.print("usage: tile57 s101 <file.000> [--features N]\n", .{});
@@ -25,7 +40,12 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     }
 
-    var ds = try s101.dataset.parse(a, data);
+    // Auto-apply the sequential .001.. update files beside the base (like the render
+    // path), so the inspection reflects the merged, up-to-date dataset.
+    const updates = readUpdates(io, a, path);
+    if (updates.len > 0) std.debug.print("  applied {d} update file(s)\n", .{updates.len});
+
+    var ds = try s101.dataset.parseWithUpdates(a, data, updates);
     defer ds.deinit();
     const p = ds.params;
     std.debug.print(
@@ -92,7 +112,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     // --- Geometry-shell assembly (the s57.Cell the renderer consumes) --------
-    var loaded = try s101.native.parseDataset(a, data);
+    var loaded = try s101.native.parseDataset(a, data, updates);
     defer loaded.cell.deinit();
     const cell = loaded.cell;
     std.debug.print("\n  assembled shell: features={d} adapted={d} vectors={d} nodes={d} edges={d} soundingVecs={d}\n", .{
