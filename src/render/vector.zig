@@ -68,13 +68,21 @@ pub const CLocalRings = extern struct {
     ring_count: u32,
 };
 
+/// The S-52 display category — the axis the mariner's display_base /
+/// display_standard / display_other settings select on. Display base is the
+/// never-hide set: SCAMIN is not applied to it.
+pub const CDispCat = enum(c_int) { base = 0, standard = 1, other = 2 };
+
 /// The feature the following draw calls belong to. `cls` is the S-57 object-class
 /// acronym (NUL-terminated, "" if none); `scamin` is the SCAMIN 1:N denominator
-/// (<=0 => always visible); `plane` is the S-52 draw priority (paint-order hint).
+/// (<=0 => always visible); `plane` is the S-52 draw priority (paint-order hint);
+/// `disp_cat` is the display category the feature came in on — a host applying
+/// SCAMIN itself must skip it for `.base`.
 pub const CFeature = extern struct {
     cls: [*:0]const u8,
     scamin: i64,
     plane: i32,
+    disp_cat: CDispCat,
 };
 
 /// The GPU paint table. Every call gets `ctx` back verbatim; pointers are valid
@@ -289,7 +297,19 @@ pub const VectorSurface = struct {
         // cur.class is a Zig slice; it is NUL-terminated in the meta (acronyms are
         // static strings), but guard by duping a sentinel-terminated copy.
         const cls = self.a.dupeZ(u8, self.cur.class) catch @as([:0]u8, @constCast(""));
-        return .{ .cls = cls.ptr, .scamin = self.cur.scamin orelse 0, .plane = @intCast(self.cur.draw_prio) };
+        return .{
+            .cls = cls.ptr,
+            .scamin = self.cur.scamin orelse 0,
+            .plane = @intCast(self.cur.draw_prio),
+            // Standard is the default for an unbanded feature (the baker's `cat < 0`
+            // fallback, and the style's coalesce) — any other value is already
+            // filtered out upstream by resolve.categoryVisible.
+            .disp_cat = switch (self.cur.cat) {
+                0 => .base,
+                2 => .other,
+                else => .standard,
+            },
+        };
     }
 
     // Flatten tile rings -> world CWorldRings (arena; valid for the call).
@@ -875,4 +895,81 @@ test "VectorSurface: important text outranks a name it overlaps, whatever the wa
 
     try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
     try testing.expectEqualStrings("clr 11", rec.texts.items[0].text);
+}
+
+/// Records the CFeature each draw call is tagged with.
+const FeatCb = struct {
+    a: Allocator,
+    feats: std.ArrayListUnmanaged(struct { cls: []const u8, scamin: i64, disp_cat: CDispCat }) = .empty,
+
+    fn onFill(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {
+        const self: *FeatCb = @ptrCast(@alignCast(ctx.?));
+        const cls = std.mem.span(f.cls);
+        self.feats.append(self.a, .{
+            .cls = self.a.dupe(u8, cls) catch return,
+            .scamin = f.scamin,
+            .disp_cat = f.disp_cat,
+        }) catch {};
+    }
+    fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
+    fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
+
+    fn surface(self: *FeatCb) CSurface {
+        return .{ .ctx = self, .fill_area = onFill, .stroke_line = noStroke, .draw_symbol = noSymbol, .draw_text = noText };
+    }
+};
+
+test "VectorSurface: every draw call carries its feature's display category" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    // "Other" is off by default (S-52's Standard display) — turn it on, or the
+    // cat-2 feature never reaches the surface to be tagged.
+    const settings = resolve.Settings{ .display_other = true };
+    var rec = FeatCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const ring = [_]rs.TilePoint{ .{ .x = 100, .y = 100 }, .{ .x = 900, .y = 100 }, .{ .x = 900, .y = 900 }, .{ .x = 100, .y = 900 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+
+    // Display base carries a SCAMIN: the engine reports both and leaves the S-52
+    // "SCAMIN shall not be applied to display base" call to the host.
+    const depare = rs.FeatureMeta{ .class = "DEPARE", .cat = 0, .scamin = 45000 };
+    try surf.beginFeature(&depare);
+    try surf.fillArea("DEPVS", &rings, null);
+    try surf.endFeature();
+
+    const dmpgrd = rs.FeatureMeta{ .class = "DMPGRD", .cat = 2 };
+    try surf.beginFeature(&dmpgrd);
+    try surf.fillArea("CHBRN", &rings, null);
+    try surf.endFeature();
+
+    // Unbanded (no ViewingGroup in the catalogue) defaults to Standard.
+    const seaare = rs.FeatureMeta{ .class = "SEAARE" };
+    try surf.beginFeature(&seaare);
+    try surf.fillArea("CHBLK", &rings, null);
+    try surf.endFeature();
+    _ = try surf.endScene(a);
+
+    try testing.expectEqual(@as(usize, 3), rec.feats.items.len);
+    try testing.expectEqual(CDispCat.base, rec.feats.items[0].disp_cat);
+    try testing.expectEqual(@as(i64, 45000), rec.feats.items[0].scamin);
+    try testing.expectEqual(CDispCat.other, rec.feats.items[1].disp_cat);
+    try testing.expectEqual(CDispCat.standard, rec.feats.items[2].disp_cat);
+}
+
+test "CFeature matches the C tile57_feature layout" {
+    // The header spells this struct out by hand; a silent size/offset drift here
+    // is a wrong read on the host side of the ABI, not a compile error.
+    try testing.expectEqual(@sizeOf(CFeature), @sizeOf(extern struct { cls: [*:0]const u8, scamin: i64, plane: c_int, disp_cat: c_int }));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(CFeature, "cls"));
+    try testing.expectEqual(@offsetOf(CFeature, "plane") + @sizeOf(c_int), @offsetOf(CFeature, "disp_cat"));
 }
