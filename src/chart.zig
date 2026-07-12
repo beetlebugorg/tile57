@@ -2340,6 +2340,7 @@ const BakeWork = struct {
         var portrayal_plain: ?[]const ?[]const u8 = null;
         var portrayal_simplified: ?[]const ?[]const u8 = null;
         var geo: ?scene.GeoParts = null;
+        var geo_world: ?scene.GeoWorld = null;
         const pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(gpa);
@@ -2355,6 +2356,13 @@ const BakeWork = struct {
             // the label-point cache. Skipping it left the pole-of-inaccessibility (polylabel)
             // search running per tile on huge coarse cells (US1GC09M: minutes).
             geo = scene.buildGeoCache(p.allocator(), &cell) catch null;
+            // The world-coordinate cache is what actually cheapens the reprojection above:
+            // lon/lat -> web-mercator costs a tan + cos + log per point, and a feature's
+            // points are re-projected into every tile at every zoom it touches. World
+            // coords are tile-invariant, so compute them ONCE per cell here and let the
+            // per-tile path reduce to worldToTile (multiply + round). Without this the
+            // per-tile loop falls back to the full transcendental projection.
+            if (geo) |g| geo_world = scene.buildGeoWorld(p.allocator(), g) catch null;
             // Per-feature label-point (polylabel) cache — tile-invariant, so compute it ONCE
             // per cell (only for Text/centred-symbol features) instead of re-running the search
             // for every tile a feature touches; the arena outlives the call via c.arenas.
@@ -2368,7 +2376,7 @@ const BakeWork = struct {
         // Sector-figure reach (exact, from the portrayal streams): buildTileMap
         // addresses the neighbouring tiles the cell's light legs/arcs cross.
         const lr = scene.collectLightReach(&cell, portrayal);
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .geo_world = geo_world, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
         c.arenas[i] = pa;
     }
 };
