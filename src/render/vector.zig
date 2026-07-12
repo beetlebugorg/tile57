@@ -382,7 +382,6 @@ pub const VectorSurface = struct {
     }
 
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
-        _ = valdco; // depth-contour value labels: host-side follow-up
         const self = sp(ctx);
         if (!self.cur_visible) return;
         const w: f32 = @floatCast(width_px * self.refDev());
@@ -393,6 +392,53 @@ pub const VectorSurface = struct {
         const feat = self.cur_feature();
         var wr = try self.worldRings(lines);
         self.cb.stroke_line(self.cb.ctx, &feat, &wr, w, on, off, ccolor(self.resolveColor(token)));
+        // Depth-contour value label, laid out ALONG the contour (see emitContourLabel).
+        if (valdco) |v| try self.emitContourLabel(v, lines);
+    }
+
+    /// Depth-contour value label (S-52 SAFCON01): the DEPCNT value in the mariner's
+    /// unit, placed at the midpoint of the longest segment (v1), rotated to that
+    /// segment's tangent and MAP-aligned so it follows the contour when the chart
+    /// turns — kept upright on screen. Mirrors pixel.zig's placement, mariner's
+    /// contourLabelField formatting (metres round, feet floor — a depth errs
+    /// shallow), and contourLabelColor (CHGRD by day, brighter neutrals at
+    /// dusk/night). The declutter culls the duplicates a contour spanning many
+    /// tiles produces.
+    fn emitContourLabel(self: *VectorSurface, v: f64, lines: []const []const rs.TilePoint) !void {
+        var best2: f64 = 0;
+        var mid: rs.TilePoint = .{ .x = 0, .y = 0 };
+        var tangent: f64 = 0;
+        for (lines) |line| {
+            for (0..line.len -| 1) |i| {
+                const dx: f64 = @floatFromInt(line[i + 1].x - line[i].x);
+                const dy: f64 = @floatFromInt(line[i + 1].y - line[i].y);
+                const len2 = dx * dx + dy * dy;
+                if (len2 > best2) {
+                    best2 = len2;
+                    mid = .{ .x = @divTrunc(line[i].x + line[i + 1].x, 2), .y = @divTrunc(line[i].y + line[i + 1].y, 2) };
+                    tangent = std.math.atan2(dy, dx);
+                }
+            }
+        }
+        // Too short a piece to carry a legible label at this zoom (screen px).
+        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
+        if (@sqrt(best2) * self.inv_ne * scale_px < 10) return;
+
+        var buf: [24]u8 = undefined;
+        const label = if (self.settings.depth_unit == .feet)
+            std.fmt.bufPrint(&buf, "{d}", .{@floor(v * sndfrm.M_TO_FT)}) catch return
+        else
+            std.fmt.bufPrint(&buf, "{d}", .{@round(v)}) catch return;
+
+        // CHGRD by day, bright neutral at dusk/night (mariner.contourLabelColor).
+        const color = switch (self.palette) {
+            .day => self.resolveColor("CHGRD"),
+            .dusk => cv.Color{ .r = 0xdd, .g = 0xe7, .b = 0xec },
+            .night => cv.Color{ .r = 0xaa, .g = 0xb7, .b = 0xbf },
+        };
+        // Follow the contour (MAP), flipped as needed so it never reads upside down.
+        const deg = self.uprightTangent(tangent) * 180.0 / std.math.pi;
+        try self.emitLabel(label, 10, "center", "middle", 0, 0, color, deg, .map, mid);
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -634,3 +680,124 @@ pub const VectorSurface = struct {
         self.cb.draw_text(self.cb.ctx, &feat, self.worldOf(at), &lr, ccolor(color), .{ .r = 0, .g = 0, .b = 0, .a = 0 }, 0, rot_align);
     }
 };
+
+// ---- tests -------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// A recording CSurface for the tests below: it captures every draw_text_str
+/// (the string + its rotation + alignment — all these tests assert). The four
+/// required draw callbacks are no-ops; supplying draw_text_str routes the label
+/// text through the SDF path so the run angle arrives verbatim (no outline).
+const RecordCb = struct {
+    a: Allocator,
+    texts: std.ArrayList(Text) = .empty,
+
+    const Text = struct { text: []const u8, rot_deg: f32, rot_align: CRotAlign };
+
+    fn noFill(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {}
+    fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
+    fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, rot_deg: f32, rot_align: CRotAlign, _: CColor, _: CColor) callconv(.c) void {
+        const self: *RecordCb = @ptrCast(@alignCast(ctx.?));
+        const dup = self.a.dupe(u8, text[0..len]) catch return;
+        self.texts.append(self.a, .{ .text = dup, .rot_deg = rot_deg, .rot_align = rot_align }) catch {};
+    }
+
+    fn surface(self: *RecordCb) CSurface {
+        return .{
+            .ctx = self,
+            .fill_area = noFill,
+            .stroke_line = noStroke,
+            .draw_symbol = noSymbol,
+            .draw_text = noText,
+            .draw_text_str = onTextStr,
+        };
+    }
+};
+
+test "VectorSurface: depth-contour value is emitted along the contour, MAP-aligned" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, ""); // empty palette: colours fall back, unasserted
+    const settings = resolve.Settings{};
+    var rec = RecordCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .dusk, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "DEPCNT" };
+    try surf.beginFeature(&meta);
+    // A long, VERTICAL contour piece (tangent 90°) that clears the length gate.
+    const line = [_]rs.TilePoint{ .{ .x = 2000, .y = 100 }, .{ .x = 2000, .y = 3900 } };
+    const lines = [_][]const rs.TilePoint{&line};
+    try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, 20.0); // 20 m contour
+    try surf.endFeature();
+
+    try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
+    const t = rec.texts.items[0];
+    try testing.expectEqualStrings("20", t.text); // metres, rounded
+    try testing.expectEqual(CRotAlign.map, t.rot_align); // follows the chart
+    try testing.expect(@abs(t.rot_deg - 90) < 0.5); // vertical tangent, upright at north-up
+}
+
+test "VectorSurface: depth in feet floors (a depth errs shallow)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    var settings = resolve.Settings{};
+    settings.depth_unit = .feet;
+    var rec = RecordCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "DEPCNT" };
+    try surf.beginFeature(&meta);
+    const line = [_]rs.TilePoint{ .{ .x = 2000, .y = 100 }, .{ .x = 2000, .y = 3900 } };
+    const lines = [_][]const rs.TilePoint{&line};
+    try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, 2.0); // 2 m = 6.56 ft
+    try surf.endFeature();
+
+    try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
+    try testing.expectEqualStrings("6", rec.texts.items[0].text); // floor(6.56), never "7"
+}
+
+test "VectorSurface: an ordinary label stays upright and viewport-aligned" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = RecordCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "SEAARE" };
+    try surf.beginFeature(&meta);
+    const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .halign = "center", .valign = "middle" };
+    try surf.drawText("Bay", &style, .{ .x = 2000, .y = 2000 });
+    try surf.endFeature();
+
+    try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
+    const t = rec.texts.items[0];
+    try testing.expectEqualStrings("Bay", t.text);
+    try testing.expectEqual(CRotAlign.viewport, t.rot_align); // never turns with the chart
+    try testing.expectEqual(@as(f32, 0), t.rot_deg);
+}
