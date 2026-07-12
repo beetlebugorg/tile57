@@ -1,0 +1,93 @@
+//! `tile57 s101 <file.000>` — inspect a native S-101 (S-100 Part 10a) dataset:
+//! detection, DSSI parameters, code-table sizes, record counts, a feature-class
+//! histogram, and a couple of sample features with their attributes. A ground-truth
+//! check for the native reader against real datasets.
+
+const std = @import("std");
+const engine = @import("engine");
+const s101 = engine.s101;
+
+pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (args.len < 3) {
+        std.debug.print("usage: tile57 s101 <file.000> [--features N]\n", .{});
+        return;
+    }
+    const path = args[2];
+    var want_features: usize = 3;
+    if (args.len >= 5 and std.mem.eql(u8, args[3], "--features")) {
+        want_features = std.fmt.parseInt(usize, args[4], 10) catch 3;
+    }
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited);
+    std.debug.print("{s}\n  detected S-101: {}\n", .{ path, s101.dataset.detect(data) });
+    if (!s101.dataset.detect(data)) {
+        std.debug.print("  (not a native S-101 dataset)\n", .{});
+        return;
+    }
+
+    var ds = try s101.dataset.parse(a, data);
+    defer ds.deinit();
+    const p = ds.params;
+    std.debug.print(
+        "  params: cmfx={d} cmfy={d} cmfz={d}\n  DSSI counts: point={d} multi={d} curve={d} composite={d} surface={d} feature={d} info={d}\n",
+        .{ p.cmfx, p.cmfy, p.cmfz, p.n_point, p.n_multipoint, p.n_curve, p.n_composite, p.n_surface, p.n_feature, p.n_info },
+    );
+    std.debug.print(
+        "  parsed: points={d} multis={d} curves={d} composites={d} surfaces={d} features={d} infos={d}\n",
+        .{ ds.points.len, ds.multis.len, ds.curves.len, ds.composites.len, ds.surfaces.len, ds.features.len, ds.infos.len },
+    );
+    std.debug.print("  code tables: feature={d} attr={d} info={d} assoc={d}\n", .{
+        ds.feature_codes.by_code.count(),
+        ds.attr_codes.by_code.count(),
+        ds.info_codes.by_code.count(),
+        ds.assoc_codes.by_code.count(),
+    });
+
+    // Feature-class histogram (by S-101 class name).
+    var hist = std.StringHashMap(usize).init(a);
+    var unresolved: usize = 0;
+    for (ds.features) |f| {
+        const nm = ds.featureName(f) orelse {
+            unresolved += 1;
+            continue;
+        };
+        const gop = try hist.getOrPut(nm);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+    std.debug.print("  feature classes: {d} distinct ({d} unresolved codes)\n", .{ hist.count(), unresolved });
+    // Print the histogram sorted by count desc.
+    const Entry = struct { name: []const u8, n: usize };
+    var entries = std.ArrayList(Entry).empty;
+    var it = hist.iterator();
+    while (it.next()) |e| try entries.append(a, .{ .name = e.key_ptr.*, .n = e.value_ptr.* });
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn lt(_: void, x: Entry, y: Entry) bool {
+            return x.n > y.n;
+        }
+    }.lt);
+    for (entries.items) |e| std.debug.print("    {d:>5}  {s}\n", .{ e.n, e.name });
+
+    // Sample features with attributes.
+    var shown: usize = 0;
+    for (ds.features) |f| {
+        if (shown >= want_features) break;
+        if (f.attrs.len < 3) continue;
+        const nm = ds.featureName(f) orelse continue;
+        var prim: []const u8 = "?";
+        if (f.spas.len > 0) prim = switch (f.spas[0].rrnm) {
+            s101.dataset.RCNM_POINT => "Point",
+            s101.dataset.RCNM_MULTIPOINT => "Multipoint",
+            s101.dataset.RCNM_CURVE, s101.dataset.RCNM_COMPOSITE => "Curve",
+            s101.dataset.RCNM_SURFACE => "Surface",
+            else => "?",
+        };
+        std.debug.print("\n  FEATURE rcid={d} class={s} primitive={s} attrs={d} spas={d} fasc={d}\n", .{ f.rcid, nm, prim, f.attrs.len, f.spas.len, f.fasc.len });
+        for (f.attrs) |at| {
+            const an = ds.attrName(at) orelse "?";
+            const v = if (at.val.len > 60) at.val[0..60] else at.val;
+            std.debug.print("      natc={d:>3}({s}) atix={d} paix={d} val={s}\n", .{ at.natc, an, at.atix, at.paix, v });
+        }
+        shown += 1;
+    }
+}

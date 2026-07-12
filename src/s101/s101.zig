@@ -6,13 +6,16 @@
 //!   * catalogue    — the distilled S-101 feature/attribute catalogue
 //!   * adapter      — S-57 cell features -> S-101 feature/attribute records
 //!   * instructions — the portrayal instruction stream (points, lines, text)
+//!   * dataset      — native S-101 (S-100 Part 10a) dataset reader (.000 files)
 
 pub const catalogue = @import("catalogue.zig");
 pub const adapter = @import("adapter.zig");
 pub const instructions = @import("instructions.zig");
+pub const dataset = @import("dataset.zig");
 
 test {
     _ = catalogue;
     _ = adapter;
     _ = instructions;
+    _ = dataset;
 }
