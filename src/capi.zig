@@ -350,7 +350,7 @@ export fn tile57_bake_tree(
     // Stand up a threaded std.Io for the tree walk + the workers' file writes.
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
-    const baked = chart.bakeTree(threaded.io(), in_d, out_d, null, workers, progress, progress_ctx) catch |e| return failCtx(err, e, in_d);
+    const baked = chart.bakeTree(threaded.io(), in_d, out_d, null, workers, progress, progress_ctx, null) catch |e| return failCtx(err, e, in_d);
     if (out_baked) |p| p.* = @intCast(baked);
     return OK;
 }

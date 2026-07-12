@@ -19,6 +19,63 @@ const Flags = common.Flags;
 const usageErr = common.usageErr;
 const resolveRulesDir = common.resolveRulesDir;
 
+// ---- overall bake progress --------------------------------------------------
+// Cells bake in parallel (bakeChartsToFiles), so the unit is charts-done, not
+// tiles. The engine's per-cell LABEL callback fires (ctx, index) as each chart
+// finishes — possibly CONCURRENTLY from worker threads and out of order — so we
+// map index -> name from our own `names` list, count completions with an atomic,
+// and format into a stack-local buffer (no shared mutable state, no lock). TTY
+// redraws one \r bar tagged with the chart that just finished; piped prints one
+// line per chart so a log names everything it baked.
+const BAR_W = 24;
+
+const Prog = struct {
+    io: std.Io,
+    tty: bool,
+    total: u32,
+    names: []const []const u8, // stems in in_paths index order
+    done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn put(self: *Prog, s: []const u8) void {
+        std.Io.File.stderr().writeStreamingAll(self.io, s) catch {};
+    }
+
+    fn cell(self: *Prog, idx: u32) void {
+        const d = self.done.fetchAdd(1, .monotonic) + 1; // completions counted here (order-free)
+        const name: []const u8 = if (idx < self.names.len) self.names[idx] else "?";
+        var buf: [256]u8 = undefined;
+        if (!self.tty) {
+            self.put(std.fmt.bufPrint(&buf, "  [{d}/{d}] {s}\n", .{ d, self.total, name }) catch return);
+            return;
+        }
+        const pct: u32 = if (self.total == 0) 0 else @min(100, d * 100 / self.total);
+        const filled = BAR_W * pct / 100;
+        var bar: [BAR_W * 3]u8 = undefined; // UTF-8 block glyphs are 3 bytes
+        var w: usize = 0;
+        for (0..BAR_W) |i| {
+            const g = if (i < filled) "█" else "░";
+            @memcpy(bar[w .. w + g.len], g);
+            w += g.len;
+        }
+        self.put(std.fmt.bufPrint(&buf, "\r\x1b[2K  {s} {d:>3}%  {d}/{d}  ·  {s}", .{ bar[0..w], pct, d, self.total, name }) catch return);
+    }
+
+    fn finish(self: *Prog, baked: usize) void {
+        var buf: [96]u8 = undefined;
+        const noun: []const u8 = if (baked == 1) "chart" else "charts";
+        const line = if (self.tty)
+            std.fmt.bufPrint(&buf, "\r\x1b[2K  \x1b[32m✓\x1b[0m baked {d} {s}\n", .{ baked, noun }) catch return
+        else
+            std.fmt.bufPrint(&buf, "  baked {d} {s}\n", .{ baked, noun }) catch return;
+        self.put(line);
+    }
+};
+
+fn onCell(ctx: ?*anyopaque, idx: u32) callconv(.c) void {
+    const self: *Prog = @ptrCast(@alignCast(ctx orelse return));
+    self.cell(idx);
+}
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
@@ -67,9 +124,17 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
         try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
 
-        var cell_paths = std.ArrayList([]const u8).empty;
+        // Enumerate the input cells (a single .000, or every .000 in an ENC_ROOT) and
+        // the mirrored <tiles>/<STEM>.pmtiles each bakes to. Same path for one file or
+        // many — a single cell is just a one-item batch.
+        var in_paths = std.ArrayList([]const u8).empty;
+        var out_paths = std.ArrayList([]const u8).empty;
+        var names = std.ArrayList([]const u8).empty; // chart stems, index-aligned with in_paths
         if (std.mem.endsWith(u8, base_path, ".000")) {
-            try cell_paths.append(a, base_path);
+            const stem = std.fs.path.stem(std.fs.path.basename(base_path));
+            try in_paths.append(a, base_path);
+            try out_paths.append(a, try std.fs.path.join(a, &.{ tiles_dir, try std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) }));
+            try names.append(a, stem);
         } else {
             var dir = std.Io.Dir.cwd().openDir(io, base_path, .{ .iterate = true }) catch return usageErr("cannot open ENC_ROOT");
             defer dir.close(io);
@@ -78,29 +143,35 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             defer walker.deinit();
             while (walker.next(io) catch null) |entry| {
                 if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
-                const stem = std.fs.path.stem(std.fs.path.basename(entry.path));
-                if (seen.contains(stem)) continue;
-                seen.put(a.dupe(u8, stem) catch continue, {}) catch {};
-                cell_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
+                const stem_t = std.fs.path.stem(std.fs.path.basename(entry.path));
+                if (seen.contains(stem_t)) continue;
+                const stem = a.dupe(u8, stem_t) catch continue; // entry.path is transient — own the stem
+                seen.put(stem, {}) catch {};
+                const in_path = std.fs.path.join(a, &.{ base_path, entry.path }) catch continue;
+                const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
+                in_paths.append(a, in_path) catch continue;
+                out_paths.append(a, std.fs.path.join(a, &.{ tiles_dir, name }) catch continue) catch continue;
+                names.append(a, stem) catch continue;
             }
         }
-        if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
+        if (in_paths.items.len == 0) return usageErr("no .000 cells found");
 
-        for (cell_paths.items) |cp| {
-            const arc = (chart.bakeChartBytes(cp, rules_dir) catch |err| {
-                std.debug.print("  warn: bake of {s} failed ({s}); skipping\n", .{ cp, @errorName(err) });
-                continue;
-            }) orelse continue; // no M_COVR coverage — not a composable cell
-            defer chart.freeBytes(arc);
-            const stem = std.fs.path.stem(std.fs.path.basename(cp));
-            const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
-            const arc_path = std.fs.path.join(a, &.{ tiles_dir, name }) catch continue;
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = arc_path, .data = arc }) catch |err| {
-                std.debug.print("  warn: could not write {s} ({s})\n", .{ arc_path, @errorName(err) });
-                continue;
-            };
-            archive_paths.append(a, arc_path) catch {};
-            if (archive_paths.items.len % 25 == 0) std.debug.print("  baked {d}/{d} cells…\n", .{ archive_paths.items.len, cell_paths.items.len });
+        // Bake every cell IN PARALLEL (one worker per core, memory-bounded), each writing
+        // its own archive; the label callback names each chart as it finishes.
+        var prog = Prog{ .io = io, .tty = std.Io.File.stderr().isTty(io) catch false, .total = @intCast(in_paths.items.len), .names = names.items };
+        const workers = std.Thread.getCpuCount() catch 1;
+        const baked = chart.bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, null, &prog, onCell);
+        prog.finish(baked);
+
+        // Collect the archives that actually landed (a cell with no M_COVR bakes nothing)
+        // by walking the tiles dir — the same *.pmtiles set the partition composes over.
+        var tdir = std.Io.Dir.cwd().openDir(io, tiles_dir, .{ .iterate = true }) catch return usageErr("cannot reopen tiles dir");
+        defer tdir.close(io);
+        var tw = tdir.walk(a) catch return usageErr("cannot walk tiles dir");
+        defer tw.deinit();
+        while (tw.next(io) catch null) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
+            archive_paths.append(a, std.fs.path.join(a, &.{ tiles_dir, entry.path }) catch continue) catch {};
         }
         if (archive_paths.items.len == 0) return usageErr("no cells baked (no .000 with M_COVR found)");
     }

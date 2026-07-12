@@ -686,6 +686,12 @@ pub fn bakeChartsParallel(paths: []const []const u8, rules_dir: ?[]const u8, wor
 /// thread-safe. Null to skip.
 pub const BakeProgress = ?*const fn (?*anyopaque, u32, u32) callconv(.c) void;
 
+/// Optional per-cell LABEL callback: invoked with (ctx, index) after cell `index` (into the
+/// in_paths passed to bakeChartsToFiles) finishes, so a caller that owns the input list can name
+/// the chart just baked. Same concurrency contract as BakeProgress — fired from worker threads,
+/// possibly out of order — so it must be thread-safe. Null to skip.
+pub const BakeLabel = ?*const fn (?*anyopaque, u32) callconv(.c) void;
+
 const BakeFileCtx = struct {
     next: std.atomic.Value(usize),
     in_paths: []const []const u8,
@@ -695,6 +701,7 @@ const BakeFileCtx = struct {
     ok: []bool,
     progress: BakeProgress,
     progress_ctx: ?*anyopaque,
+    label: BakeLabel,
     done: std.atomic.Value(u32),
 };
 
@@ -719,6 +726,7 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
         bakeOneToFile(ctx, i);
         const d = ctx.done.fetchAdd(1, .monotonic) + 1; // attempted count (smooth progress)
         if (ctx.progress) |cb| cb(ctx.progress_ctx, d, @intCast(ctx.in_paths.len));
+        if (ctx.label) |lb| lb(ctx.progress_ctx, @intCast(i)); // name the chart just finished
     }
 }
 
@@ -727,14 +735,14 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
 /// the write — so the host never holds N archives (peak memory ~ the worker count). The app owns
 /// the cache and names every out_path. `progress(progress_ctx, done, total)` fires (serialised)
 /// after each cell. Race-free (warms up first; each bake is independent). Returns the count written.
-pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) usize {
+pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel) usize {
     std.debug.assert(out_paths.len == in_paths.len);
     if (in_paths.len == 0) return 0;
     warmup();
     const ok = gpa.alloc(bool, in_paths.len) catch return 0;
     defer gpa.free(ok);
     @memset(ok, false);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0) };
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0) };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     if (n <= 1) {
@@ -761,7 +769,7 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
 /// cell (serialised) for an import progress bar. INCREMENTAL: a cell whose mirrored archive is
 /// already at least as new as its whole input (.000 + update chain) is skipped, so a re-run over an
 /// unchanged tree bakes nothing. Returns the count baked THIS run; errors if `in_dir` is unreadable.
-pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque) !usize {
+pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel) !usize {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -793,7 +801,7 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
         out_paths.append(a, out_path) catch continue;
     }
     if (in_paths.items.len == 0) return 0;
-    return bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx);
+    return bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx, label);
 }
 
 /// The file's modification time in nanoseconds, or null if it doesn't exist / can't be statted.
