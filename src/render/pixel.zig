@@ -226,6 +226,13 @@ pub const PixelSurface = struct {
         return self.settings.size_scale * @as(f64, @floatCast(self.px_per_tile)) / 256.0;
     }
 
+    /// devScale with the mariner's extra TEXT multiplier (mariner.text_size_scale) —
+    /// the one scale that sizes a label AND its declutter box, so enlarged labels
+    /// still collide correctly. 1.0 = no extra scale (byte-identical output).
+    fn textDev(self: *const PixelSurface) f64 {
+        return self.devScale() * self.settings.text_size_scale;
+    }
+
     /// Surface contract: the physical-size multiplier the engine uses to walk
     /// complex-linestyle periods (scene.walkComplexRun), so --scale widens the
     /// spacing AND enlarges the bricks together (matching drawSymbol's devScale).
@@ -330,7 +337,10 @@ pub const PixelSurface = struct {
     /// per 0.01 mm) x the device scale (supersample + physical multiplier),
     /// rotated, anchored at `at`.
     fn pushSymbol(self: *PixelSurface, layer: OpLayer, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64) !void {
-        const k: f32 = @floatCast(scale * 100.0 * self.devScale());
+        // Soundings get the mariner's extra sounding multiplier — enlarging each
+        // digit AND its pivot-baked spacing together; plain symbols do not.
+        const dev = if (layer == .sounding) self.devScale() * self.settings.sounding_size_scale else self.devScale();
+        const k: f32 = @floatCast(scale * 100.0 * dev);
         const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
         const cosr = @cos(rad);
         const sinr = @sin(rad);
@@ -384,9 +394,9 @@ pub const PixelSurface = struct {
     /// MILLIMETRE offsets (S-52 LocalOffset, +y down), optional halo.
     fn pushText(self: *PixelSurface, text: []const u8, font_px_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, haloed: bool, anchor: cv.Point) !void {
         const f = &(self.fnt orelse return);
-        const px = font_px_css * @as(f32, @floatCast(self.devScale()));
+        const px = font_px_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
-        const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.devScale());
+        const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
 
         // Shape: glyph ids + pen positions (+ the PDF 1000/em advances).
         var gids = std.ArrayList(cv.Glyph).empty;

@@ -1128,6 +1128,10 @@ const CMariner = extern struct {
     // drives the `overscale` layer's visibility. Appended for ABI-append-safety;
     // tile57_mariner_defaults sets true.
     show_overscale: bool,
+    // Per-category size multipliers for text / soundings, on top of size_scale.
+    // Appended for ABI-append-safety; marinerFromC reads 0 (an un-set field) as 1.0.
+    text_size_scale: f64,
+    sounding_size_scale: f64,
 };
 
 // "YYYYMMDD" or "" from the fixed char[9] field.
@@ -1173,6 +1177,11 @@ fn marinerFromC(cm: *const CMariner) mariner.Settings {
         .scamin_filter_gate = cm.scamin_filter_gate,
         .show_overscale = cm.show_overscale,
         .size_scale = cm.size_scale,
+        // Appended fields: an un-set (zero) multiplier means "no extra scale", so a
+        // host that zero-inits without tile57_mariner_defaults still gets 1.0 rather
+        // than invisible text/soundings.
+        .text_size_scale = if (cm.text_size_scale > 0) cm.text_size_scale else 1.0,
+        .sounding_size_scale = if (cm.sounding_size_scale > 0) cm.sounding_size_scale else 1.0,
         .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
             cm.viewing_groups_off[0..cm.viewing_groups_off_len]
         else
@@ -1345,6 +1354,8 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
         .viewing_groups_off_len = 0,
         .scamin_filter_gate = d.scamin_filter_gate,
         .show_overscale = d.show_overscale,
+        .text_size_scale = d.text_size_scale,
+        .sounding_size_scale = d.sounding_size_scale,
     };
 }
 

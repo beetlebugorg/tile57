@@ -221,6 +221,19 @@ pub const VectorSurface = struct {
         return self.settings.size_scale;
     }
 
+    /// refDev with the mariner's extra TEXT multiplier folded in — the one scale
+    /// that sizes a label AND (via px/pen) its declutter box, so enlarged labels
+    /// still collide correctly (mariner.text_size_scale, 1.0 = none).
+    fn textDev(self: *const VectorSurface) f64 {
+        return self.refDev() * self.settings.text_size_scale;
+    }
+    /// refDev with the mariner's extra SOUNDING multiplier folded in — sizes each
+    /// sounding digit AND its pivot-baked spacing together, so a 3-digit sounding
+    /// grows without colliding with itself (mariner.sounding_size_scale, 1.0 = none).
+    fn soundingDev(self: *const VectorSurface) f64 {
+        return self.refDev() * self.settings.sounding_size_scale;
+    }
+
     /// Surface contract: this render surface's display scale (settings.size_scale).
     /// The engine reads it to walk complex-linestyle periods display-scaled so a
     /// HiDPI display gets both wider spacing AND bigger bricks (baked tiles native).
@@ -352,7 +365,7 @@ pub const VectorSurface = struct {
         // scaled by size_scale (scene.walkComplexRun), so the brick must scale to
         // match — otherwise bricks would be native-sized at display-scaled spacing.
         const dev: f64 = self.refDev();
-        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null) else try self.emitSymbol(s, at, rot_deg, scale);
+        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null) else try self.emitSymbol(s, at, rot_deg, scale, dev);
     }
 
     /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
@@ -397,7 +410,7 @@ pub const VectorSurface = struct {
         // NUMBER as one box (the union of its digit glyphs), placed once — keep the
         // first-emitted (higher draw-priority) and drop later numbers it overlaps. The
         // digits themselves still draw ungated (below) so the kept number stays intact.
-        const k_decl = sndfrm.SYMBOL_SCALE * 100.0 * self.refDev();
+        const k_decl = sndfrm.SYMBOL_SCALE * 100.0 * self.soundingDev();
         var uw: f64 = 0;
         var uh: f64 = 0;
         {
@@ -422,16 +435,16 @@ pub const VectorSurface = struct {
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), null) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE);
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), null) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev());
         }
     }
 
     /// Emit one symbol: world anchor + each path's outline in anchor-local
     /// reference px (pivot-relative, scaled, rotated). Constant screen size.
-    fn emitSymbol(self: *VectorSurface, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64) !void {
+    fn emitSymbol(self: *VectorSurface, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64) !void {
         const anchor = self.worldOf(at);
         const feat = self.cur_feature();
-        const k: f32 = @floatCast(scale * 100.0 * self.refDev());
+        const k: f32 = @floatCast(scale * 100.0 * dev);
         const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
         const cosr = @cos(rad);
         const sinr = @sin(rad);
@@ -458,7 +471,7 @@ pub const VectorSurface = struct {
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
         const f = &(self.fnt orelse return);
         const font_css: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);
-        const px = font_css * @as(f32, @floatCast(self.refDev()));
+        const px = font_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
 
         // Real advance width — the declutter box and (SDF path) the alignment.
@@ -475,7 +488,7 @@ pub const VectorSurface = struct {
         const valign = if (style.valign.len > 0) style.valign else "middle";
         // SDF glyph-atlas host: send the string + aligned baseline-left origin.
         if (self.cb.draw_text_str) |dts| {
-            const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.refDev());
+            const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
             var x0: f32 = @as(f32, @floatCast(style.offset_x)) * mm_px;
             if (std.mem.eql(u8, halign, "center")) x0 -= pen / 2;
             if (std.mem.eql(u8, halign, "right")) x0 -= pen;
@@ -505,9 +518,9 @@ pub const VectorSurface = struct {
     /// the origin, aligned per halign/valign with mm offsets) at a world anchor.
     fn emitText(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, at: rs.TilePoint) !void {
         const f = &(self.fnt orelse return);
-        const px = font_css * @as(f32, @floatCast(self.refDev()));
+        const px = font_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
-        const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.refDev());
+        const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
 
         var gids = std.ArrayList(struct { gid: u16, x: f32 }).empty;
         var pen: f32 = 0;
