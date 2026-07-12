@@ -23,6 +23,7 @@ const raster = @import("raster.zig");
 const png = @import("png.zig");
 const sym = @import("symbols.zig");
 const sndfrm = @import("sndfrm.zig");
+const dc = @import("declutter.zig");
 const fontmod = @import("font.zig");
 const pdf = @import("pdf.zig");
 const cb_canvas = @import("cb_canvas.zig");
@@ -41,8 +42,9 @@ const OpKind = union(enum) {
     pattern: struct { rings: []const []const cv.Point, cell: *const cv.Pattern },
     stroke: struct { lines: []const []const cv.Point, width: f32, dash: ?[2]f32, color: cv.Color },
     /// A shaped label (outlines for raster + the glyph run for text-object
-    /// canvases). `bbox` [minx,miny,maxx,maxy] feeds the collision pass.
-    text: struct { run: cv.GlyphRun, bbox: [4]f32 },
+    /// canvases). `bbox` [minx,miny,maxx,maxy] and `group` (the S-52 text group)
+    /// feed the collision pass.
+    text: struct { run: cv.GlyphRun, bbox: [4]f32, group: i64, class: []const u8 },
 };
 
 /// Paint class, mirroring the tile style's LAYER order (areas ->
@@ -292,7 +294,8 @@ pub const PixelSurface = struct {
                 .dusk => cv.Color{ .r = 0xdd, .g = 0xe7, .b = 0xec },
                 .night => cv.Color{ .r = 0xaa, .g = 0xb7, .b = 0xbf },
             };
-            try self.pushText(label, 10, "center", "middle", 0, 0, color, false, mid);
+            // A contour value is not one of the spec's IMPORTANT text groups.
+            try self.pushText(label, 10, "center", "middle", 0, 0, color, false, 0, mid);
         }
     }
 
@@ -376,7 +379,7 @@ pub const PixelSurface = struct {
         // style deliberately renders no halo; match it. The GlyphRun halo plumbing
         // stays for a future opt-in legibility setting.
         const haloed = false;
-        try self.pushText(text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, .{
+        try self.pushText(text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, style.group, .{
             .x = self.origin.x + @as(f32, @floatFromInt(at.x)) * self.scale,
             .y = self.origin.y + @as(f32, @floatFromInt(at.y)) * self.scale,
         });
@@ -392,7 +395,7 @@ pub const PixelSurface = struct {
     /// Shape + buffer one label: glyphs advance left-to-right at `font_px`
     /// (CSS px; device scale applied here), anchored per halign/valign with
     /// MILLIMETRE offsets (S-52 LocalOffset, +y down), optional halo.
-    fn pushText(self: *PixelSurface, text: []const u8, font_px_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, haloed: bool, anchor: cv.Point) !void {
+    fn pushText(self: *PixelSurface, text: []const u8, font_px_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, haloed: bool, group: i64, anchor: cv.Point) !void {
         const f = &(self.fnt orelse return);
         const px = font_px_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
@@ -454,6 +457,8 @@ pub const PixelSurface = struct {
                 .text = try self.a.dupe(u8, text),
             },
             .bbox = .{ bbox[0] - halo_w, bbox[1] - halo_w, bbox[2] + halo_w, bbox[3] + halo_w },
+            .group = group,
+            .class = self.cur.class,
         } });
     }
 
@@ -461,13 +466,13 @@ pub const PixelSurface = struct {
 
     // Paint the sorted, decluttered op list onto any Canvas — the raster and
     // PDF outputs share this exactly (Gate 3's self-consistency by construction).
-    fn paintOps(self: *PixelSurface, canvas: cv.Canvas, dropped: *const std.AutoHashMapUnmanaged(usize, void)) !void {
+    fn paintOps(self: *PixelSurface, canvas: cv.Canvas, kept: *const dc.Kept) !void {
         for (self.ops.items) |op| switch (op.kind) {
             .fill => |f| try canvas.fillPath(f.rings, f.color, f.rule),
             .pattern => |p| try canvas.fillPattern(p.rings, p.cell),
             .stroke => |s| try canvas.strokePath(s.lines, s.width, s.dash, s.color),
             .text => |*t| {
-                if (dropped.contains(op.seq)) continue;
+                if (!kept.has(op.seq)) continue;
                 try canvas.drawGlyphRun(&t.run);
             },
         };
@@ -523,6 +528,22 @@ pub const PixelSurface = struct {
 
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const self = sp(ctx);
+        // Label declutter, through the shared pool (render/declutter.zig owns the
+        // whole policy). Only text competes: symbols and soundings all draw, and
+        // text is drawn last, over them. Candidates go in by EMISSION order — the
+        // SENC sequence the pool settles peers by — never by paint order.
+        var pool = dc.Pool{};
+        defer pool.deinit(self.a);
+        for (self.ops.items) |op| {
+            if (op.kind != .text) continue;
+            const b = op.kind.text.bbox;
+            try pool.add(self.a, op.seq, op.kind.text.group, op.kind.text.class, op.kind.text.run.text, .{ .x0 = b[0], .y0 = b[1], .x1 = b[2], .y1 = b[3] });
+        }
+        // Canvas px include the device scale (supersample x physical), so the
+        // reference spacing scales with it.
+        var kept = try pool.resolve(self.a, dc.REPEAT_PX * self.devScale());
+        defer kept.deinit(self.a);
+
         // Paint order = the tile style's layer stack: class-major (see
         // OpLayer), draw priority within a class, emission order for ties.
         std.mem.sort(Op, self.ops.items, {}, struct {
@@ -533,34 +554,6 @@ pub const PixelSurface = struct {
             }
         }.lt);
 
-        // Label declutter: greedy accept from the HIGHEST priority down — a
-        // kept label's box blocks lower-priority overlappers (S-52: higher
-        // draw priority wins). Symbols never collide (icon-allow-overlap, like
-        // the style); only text participates.
-        var kept = std.ArrayList([4]f32).empty;
-        defer kept.deinit(self.a);
-        var dropped = std.AutoHashMapUnmanaged(usize, void){};
-        defer dropped.deinit(self.a);
-        var ri = self.ops.items.len;
-        while (ri > 0) {
-            ri -= 1;
-            const op = self.ops.items[ri];
-            if (op.kind != .text) continue;
-            const b = op.kind.text.bbox;
-            var hit = false;
-            for (kept.items) |k| {
-                if (b[0] <= k[2] and b[2] >= k[0] and b[1] <= k[3] and b[3] >= k[1]) {
-                    hit = true;
-                    break;
-                }
-            }
-            if (hit) {
-                try dropped.put(self.a, op.seq, {});
-            } else {
-                try kept.append(self.a, b);
-            }
-        }
-
         switch (self.output) {
             .png => {
                 var rc = try raster.RasterCanvas.init(self.a, self.w_px, self.h_px);
@@ -568,7 +561,7 @@ pub const PixelSurface = struct {
                 // NODTA under everything (S-52 no-data); the palette picks the shade.
                 // The isolated-feature thumbnail overrides this via bg_token.
                 rc.clear(self.resolveColor(self.bg_token orelse "NODTA"));
-                try self.paintOps(rc.asCanvas(), &dropped);
+                try self.paintOps(rc.asCanvas(), &kept);
                 try self.drawHighlight(rc.asCanvas());
                 return png.encodeRgba(out, rc.px, rc.w, rc.h);
             },
@@ -585,7 +578,7 @@ pub const PixelSurface = struct {
                 };
                 const bg_rings = [_][]const cv.Point{&bg};
                 try canvas.fillPath(&bg_rings, self.resolveColor(self.bg_token orelse "NODTA"), .nonzero);
-                try self.paintOps(canvas, &dropped);
+                try self.paintOps(canvas, &kept);
                 try self.drawHighlight(canvas);
                 return pc.finish(out);
             },
@@ -603,7 +596,7 @@ pub const PixelSurface = struct {
                 };
                 const bg_rings = [_][]const cv.Point{&bg};
                 try canvas.fillPath(&bg_rings, self.resolveColor(self.bg_token orelse "NODTA"), .nonzero);
-                try self.paintOps(canvas, &dropped);
+                try self.paintOps(canvas, &kept);
                 return out.alloc(u8, 0);
             },
         }
@@ -792,7 +785,9 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     try std.testing.expect(t.bbox[2] > t.bbox[0] and t.bbox[3] > t.bbox[1]);
     try std.testing.expect(t.bbox[0] >= 99); // halign left: extends right of x=100
 
-    // Same spot, LOWER priority: collision drops it at endScene.
+    // Same spot, same text group (both Other text): peers, so the SENC sequence
+    // settles it and the label emitted FIRST keeps the space. The feature draw
+    // priority is deliberately not consulted — see declutter.zig.
     const lo = rs.FeatureMeta{ .draw_prio = 3 };
     try surf.beginFeature(&lo);
     try surf.drawText("Overlap", &style, .{ .x = 102, .y = 101 });
@@ -807,10 +802,9 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
 
     const bytes = try surf.endScene(a);
     try std.testing.expectEqualSlices(u8, &.{ 0x89, 'P', 'N', 'G' }, bytes[0..4]);
-    // The high-prio label survived; the overlapping low-prio one was dropped.
-    // (endScene sorted ops; find both text ops and check the drop happened by
-    // painting: the collision set is internal, so assert via op count + the
-    // deterministic sha of a scene where the drop changes pixels.)
+    // Both labels are BUFFERED (the collision set is internal to endScene, which
+    // paints only the survivor — "Reef 12", the earlier peer). declutter.zig's
+    // own tests pin the ranking; here we pin that text still buffers and paints.
     try std.testing.expectEqual(@as(usize, 2), ps.ops.items.len);
 }
 

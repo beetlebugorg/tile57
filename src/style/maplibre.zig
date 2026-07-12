@@ -128,7 +128,15 @@ const TEXT_ANCHOR = .{
     "bottom|right",  "bottom-right",
     "center",
 };
-const TEXT_SORT_KEY = .{ "-", .{ "match", .{ "coalesce", .{ "get", "tgrp" }, -1 }, 11, 0, .{ 21, 26, 29 }, 100, 23, 50, 150 }, .{ "coalesce", .{ "get", "font_size_px" }, 10 } };
+// S-52 splits text into IMPORTANT text (groups 10-19) and Other text, and that
+// split is the WHOLE collision ladder — a label carries display priority 8 like
+// every other label, so there is no second axis to rank text by. MapLibre gives
+// placement precedence to UPPER symbol layers, so the two tiers become two
+// layers, important on top; peers within a tier fall to feature order, which is
+// the SENC sequence S-52 nominates for the arbitrary decision. The native
+// surfaces resolve the identical ladder (render/declutter.zig).
+const FILT_TEXT_IMPORTANT = .{ "all", .{ ">=", .{ "coalesce", .{ "get", "tgrp" }, 0 }, 10 }, .{ "<=", .{ "coalesce", .{ "get", "tgrp" }, 0 }, 19 } };
+const FILT_TEXT_OTHER = .{ "any", .{ "<", .{ "coalesce", .{ "get", "tgrp" }, 0 }, 10 }, .{ ">", .{ "coalesce", .{ "get", "tgrp" }, 0 }, 19 } };
 
 // S-101 LocalOffset -> MapLibre text-offset (em): shifts a label clear of its symbol
 // (e.g. a buoy name one text-body above the point). MVT properties are scalar and
@@ -537,75 +545,50 @@ fn pointSymbolLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     try js.endObject();
 }
 
+// Light descriptions carry the rule's own placement — halign=left, valign=middle,
+// loff="2,0", i.e. 7.02 mm (two text bodies) RIGHT of the light, clear of the
+// flare. MapLibre offsets are ems OF THE TEXT SIZE, not bodies, so "2,0" em would
+// overshoot by 20% — emit the mm-exact 1.66em for the characteristics. A light's
+// NAME keeps the generic map, and so does everything else.
+const IS_LIGHT = .{ "==", .{ "get", "class" }, "LIGHTS" };
+const LIGHT_TEXT_OFFSET = .{ "match", .{ "coalesce", .{ "get", "loff" }, "0,0" }, "2,0", .{ "literal", .{ 1.66, 0 } }, TEXT_OFFSET };
+
+/// One text layer for a tier. The tiers are separate LAYERS because MapLibre
+/// resolves collisions layer by layer, top down — that is how the important tier
+/// gets first claim on the space. Inside a layer there is deliberately NO
+/// symbol-sort-key: peers are settled by feature order, the SENC sequence.
+fn textLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket, id: []const u8, filt: anytype) !void {
+    try js.beginObject();
+    try layerHead(js, id, "symbol", sl);
+    try applyBucket(js, filt, true, bkt, s, s.text_group); // SCAMIN text band-independent
+    try js.objectField("layout");
+    try js.beginObject();
+    try js.objectField("text-field");
+    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
+    try js.objectField("text-font");
+    try js.write(FONT);
+    try js.objectField("text-size");
+    try writeScaled(js, .{ "case", IS_LIGHT, .{ "coalesce", .{ "get", "font_size_px" }, 10 }, .{ "coalesce", .{ "get", "font_size_px" }, 11 } }, s.size_scale);
+    try js.objectField("text-anchor");
+    try js.write(TEXT_ANCHOR);
+    try js.objectField("text-offset");
+    try js.write(.{ "case", IS_LIGHT, LIGHT_TEXT_OFFSET, TEXT_OFFSET });
+    try js.objectField("text-allow-overlap");
+    try js.write(false);
+    try js.objectField("text-optional");
+    try js.write(true);
+    try js.endObject();
+    try textPaint(js, s.text_color, s.halo, 0); // S-52: solid black, no halo
+    try js.endObject();
+}
+
 fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
     var buf: [96]u8 = undefined;
-
-    // text — general collidable labels. Emitted BELOW light-text: MapLibre
-    // gives collision precedence to UPPER symbol layers, and S-52 wants the
-    // (high drawing-priority) light characteristics to win placement over
-    // names — the within-layer sort key already ranks tgrp 23 above names,
-    // but that only applies inside one layer.
     var buf2: [96]u8 = undefined;
-    const tid = try std.fmt.bufPrint(&buf2, "text{s}", .{bkt.suffix});
-    try js.beginObject();
-    try layerHead(js, tid, "symbol", sl);
-    try applyBucket(js, .{ "!=", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, s.text_group); // SCAMIN text band-independent
-    try js.objectField("layout");
-    try js.beginObject();
-    try js.objectField("text-field");
-    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
-    try js.objectField("text-font");
-    try js.write(FONT);
-    try js.objectField("text-size");
-    try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 11 }, s.size_scale);
-    try js.objectField("text-anchor");
-    try js.write(TEXT_ANCHOR);
-    try js.objectField("text-offset");
-    try js.write(TEXT_OFFSET);
-    try js.objectField("symbol-sort-key");
-    try js.write(TEXT_SORT_KEY);
-    try js.objectField("text-allow-overlap");
-    try js.write(false);
-    try js.objectField("text-optional");
-    try js.write(true);
-    try js.endObject();
-    try textPaint(js, s.text_color, s.halo, 0); // S-52: solid black, no halo
-    try js.endObject();
-
-    // light-text<sfx> — LIGHTS characteristics, top-anchored. Above `text`
-    // so light descriptions take collision precedence over names.
-    const lid = try std.fmt.bufPrint(&buf, "light-text{s}", .{bkt.suffix});
-    try js.beginObject();
-    try layerHead(js, lid, "symbol", sl);
-    try applyBucket(js, .{ "==", .{ "get", "class" }, "LIGHTS" }, true, bkt, s, s.text_group); // SCAMIN light-text band-independent
-    try js.objectField("layout");
-    try js.beginObject();
-    try js.objectField("text-field");
-    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
-    try js.objectField("text-font");
-    try js.write(FONT);
-    try js.objectField("text-size");
-    try writeScaled(js, .{ "coalesce", .{ "get", "font_size_px" }, 10 }, s.size_scale);
-    // The rule's OWN placement: light descriptions carry halign=left,
-    // valign=middle, loff="2,0" — 7.02 mm (two text bodies) RIGHT of the
-    // light, clear of the flare (LightAllAround.lua LocalOffset:7.02,0). The
-    // old hardcoded top/[0,0.4] dropped the label onto the flare. MapLibre
-    // offsets are ems OF THE TEXT SIZE (12px here), not bodies (10px), so
-    // "2,0" em would overshoot the spec by 20% — emit the mm-exact 1.66em
-    // for the characteristics; a light's NAME keeps the generic map.
-    try js.objectField("text-anchor");
-    try js.write(TEXT_ANCHOR);
-    try js.objectField("text-offset");
-    try js.write(.{ "match", .{ "coalesce", .{ "get", "loff" }, "0,0" }, "2,0", .{ "literal", .{ 1.66, 0 } }, TEXT_OFFSET });
-    try js.objectField("symbol-sort-key");
-    try js.write(.{ "-", 0, .{ "coalesce", .{ "get", "font_size_px" }, 10 } });
-    try js.objectField("text-allow-overlap");
-    try js.write(false);
-    try js.objectField("text-optional");
-    try js.write(true);
-    try js.endObject();
-    try textPaint(js, s.text_color, s.halo, 0); // S-52: solid black, no halo
-    try js.endObject();
+    // Other text FIRST, important text ABOVE it: the upper layer places first,
+    // so IMPORTANT text claims its space before anything else competes for it.
+    try textLayer(js, s, sl, bkt, try std.fmt.bufPrint(&buf, "text{s}", .{bkt.suffix}), FILT_TEXT_OTHER);
+    try textLayer(js, s, sl, bkt, try std.fmt.bufPrint(&buf2, "text-important{s}", .{bkt.suffix}), FILT_TEXT_IMPORTANT);
 }
 
 fn textPaint(js: *Stringify, text_color: std.json.Value, halo: std.json.Value, halo_width: f64) !void {
@@ -741,43 +724,27 @@ fn contourLabelLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     try js.endObject();
 }
 
-// The soundings source-layer splits into two style layers by feature class.
-// Spot soundings (SOUNDG) are collision-culled (icon-allow-overlap false): the
-// dense spot field thins under MapLibre placement, a legibility trade. A DANGER
-// depth — a wreck/obstruction/rock sounding the baker routed here — is PART of
-// its S-52 symbol (WRECKS05/OBSTRN07 draw the digits with the DANGER01/02 mark),
-// so it is NEVER culled and rides its own always-on layer. With one shared
-// culled layer, a dense wreck field dropped most danger depths (observed: 33 of
-// 140 wreck digits surviving one Jamaica Bay creek view) and the bare danger
-// ovals read as "unknown hazard".
+// Soundings are SYMBOLS: the Presentation Library draws a sounding as symbol
+// glyphs so it stays legible and correctly located, and every symbol must be
+// drawn — S-52 defines suppression only for coincident lines and area
+// boundaries. So a sounding layer never culls (icon-allow-overlap) and never
+// claims space from the labels above it (icon-ignore-placement): text is drawn
+// last, on top. The native surfaces hold the same line — nothing but text ever
+// enters the collision pool (render/declutter.zig).
+//
+// The soundings source-layer still splits into two style layers, but on PAINT
+// ORDER, not collision: a DANGER depth (a wreck/obstruction/rock sounding) is
+// part of its S-52 symbol — WRECKS05/OBSTRN07 draw the marker, then the digits
+// on top — and DANGER01/02 have an OPAQUE interior, so those digits must be
+// emitted ABOVE the danger markers or the oval hides them. Spot soundings sit
+// below the markers, where they belong.
 const FILT_SPOT_SND = .{ "==", .{ "coalesce", .{ "get", "class" }, "SOUNDG" }, "SOUNDG" };
 const FILT_DANGER_SND = .{ "!=", .{ "coalesce", .{ "get", "class" }, "SOUNDG" }, "SOUNDG" };
 
-// The spot-soundings symbol layer (sprite required) for a SCAMIN bucket.
-fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
-    var buf: [96]u8 = undefined;
+fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket, id: []const u8, filt: anytype) !void {
     try js.beginObject();
-    try layerHead(js, try std.fmt.bufPrint(&buf, "soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, FILT_SPOT_SND, true, bkt, s, null); // soundings
-    try js.objectField("layout");
-    try js.beginObject();
-    try js.objectField("icon-image");
-    try js.write(s.sound_img);
-    try js.objectField("icon-size");
-    try writeScaled(js, ICON_SIZE, s.size_scale);
-    try js.objectField("icon-allow-overlap");
-    try js.write(false);
-    try js.endObject();
-    try js.endObject();
-}
-
-// The danger-depths symbol layer (see the class split above): same glyph
-// expression as spot soundings, but never collision-culled.
-fn dangerSoundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket) !void {
-    var buf: [96]u8 = undefined;
-    try js.beginObject();
-    try layerHead(js, try std.fmt.bufPrint(&buf, "danger_soundings{s}", .{bkt.suffix}), "symbol", "soundings");
-    try applyBucket(js, FILT_DANGER_SND, true, bkt, s, null); // danger soundings stay as-is (band-quilted)
+    try layerHead(js, id, "symbol", "soundings");
+    try applyBucket(js, filt, true, bkt, s, null); // soundings (band-quilted)
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("icon-image");
@@ -967,15 +934,18 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
     //   set per SCAMIN bucket rides each pass.
     if (sprite_on) {
         for (scamin_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols", bkt, .base);
-        for (scamin_buckets) |bkt| try soundingsLayer(js, &s, bkt);
+        for (scamin_buckets) |bkt| {
+            var sbuf: [96]u8 = undefined;
+            try soundingsLayer(js, &s, bkt, try std.fmt.bufPrint(&sbuf, "soundings{s}", .{bkt.suffix}), FILT_SPOT_SND);
+        }
         // Over-soundings pass: high-priority symbols + the danger deviation (see PointMode).
         for (scamin_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols", bkt, .dangers_only);
-        // Danger depths ABOVE the danger markers: DANGER01/02 have an OPAQUE
-        // DEPVS-filled interior (the S-52 oval masks the chart under it), and the
-        // rules draw the marker FIRST then the digits on top (WRECKS05/OBSTRN07
-        // instruction order) — below the ovals the depths were invisible. Never
-        // collision-culled (see the soundings class split).
-        for (scamin_buckets) |bkt| try dangerSoundingsLayer(js, &s, bkt);
+        // Danger depths ABOVE the danger markers (see the soundings class split):
+        // below the opaque DANGER01/02 ovals the depths would be invisible.
+        for (scamin_buckets) |bkt| {
+            var dbuf: [96]u8 = undefined;
+            try soundingsLayer(js, &s, bkt, try std.fmt.bufPrint(&dbuf, "danger_soundings{s}", .{bkt.suffix}), FILT_DANGER_SND);
+        }
         // LIGHTS on top: emitted after every other point symbol so a light always draws
         // over a same-priority bridge that lives in a different scamin bucket layer.
         for (scamin_buckets) |bkt| try pointSymbolLayers(js, &s, "point_symbols", bkt, .lights_only);

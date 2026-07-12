@@ -15,6 +15,8 @@
 //!              (buffers ops, sorts by draw_prio, paints through a Canvas).
 //!   ascii    — AsciiSurface: the chart as a Unicode text grid (optional
 //!              ANSI-256 color). The worked example of adding a backend.
+//!   declutter— the label collision authority EVERY surface resolves through,
+//!              so a crowded chart declutters the same way on all of them.
 //!
 //! Rule: nothing in this module imports s57, s101, or portray. If a surface
 //! needs a fact the Surface calls don't carry, that's an engine bug — extend
@@ -37,10 +39,12 @@ pub const font = @import("font.zig");
 pub const pdf = @import("pdf.zig");
 pub const cb_canvas = @import("cb_canvas.zig");
 pub const vector = @import("vector.zig");
+pub const declutter = @import("declutter.zig");
 
 test {
     _ = surface;
     _ = vector;
+    _ = declutter;
     _ = noop;
     _ = inspect;
     _ = resolve;
