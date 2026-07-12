@@ -90,4 +90,45 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         shown += 1;
     }
+
+    // --- Geometry-shell assembly (the s57.Cell the renderer consumes) --------
+    var loaded = try s101.native.parseDataset(a, data);
+    defer loaded.cell.deinit();
+    const cell = loaded.cell;
+    std.debug.print("\n  assembled shell: features={d} adapted={d} vectors={d} nodes={d} edges={d} soundingVecs={d}\n", .{
+        cell.features.len, loaded.adapted.len, cell.vectors.len, cell.nodes.count(), cell.edges.count(), cell.sounding_vecs.count(),
+    });
+    if (cell.bounds()) |b| std.debug.print("  geometry bounds: lon [{d:.5}, {d:.5}]  lat [{d:.5}, {d:.5}]\n", .{ b[0], b[2], b[1], b[3] });
+    // Spot-check assembled geometry per primitive: pick the first area, line, point,
+    // and sounding feature and report the vertex/part counts the accessors return.
+    var did_area = false;
+    var did_line = false;
+    var did_pt = false;
+    var did_snd = false;
+    for (cell.features, loaded.adapted) |f, ad| {
+        if (f.prim == 3 and !did_area) {
+            const parts = cell.geometryParts(a, f) catch &[_][]engine.s57.LonLat{};
+            var verts: usize = 0;
+            for (parts) |pp| verts += pp.len;
+            std.debug.print("  area  {s}: {d} parts / {d} verts\n", .{ ad.code, parts.len, verts });
+            did_area = true;
+        } else if (f.prim == 2 and !did_line) {
+            const parts = cell.geometryParts(a, f) catch &[_][]engine.s57.LonLat{};
+            var verts: usize = 0;
+            for (parts) |pp| verts += pp.len;
+            std.debug.print("  line  {s}: {d} parts / {d} verts\n", .{ ad.code, parts.len, verts });
+            did_line = true;
+        } else if (f.prim == 1 and f.objl != 129 and !did_pt) {
+            if (cell.pointGeometry(f)) |pt| {
+                std.debug.print("  point {s}: lon={d:.5} lat={d:.5}\n", .{ ad.code, pt.lon(), pt.lat() });
+                did_pt = true;
+            }
+        } else if (f.objl == 129 and !did_snd) {
+            const snds = cell.soundingsFor(a, f) catch &[_]engine.s57.Sounding{};
+            if (snds.len > 0) {
+                std.debug.print("  sounding {s}: {d} depth pts, first depth={d:.1}m\n", .{ ad.code, snds.len, snds[0].depth });
+                did_snd = true;
+            }
+        }
+    }
 }
