@@ -17,8 +17,10 @@
 //!     cull per frame. Category / viewing-group / text-group / point / boundary
 //!     gates DO apply (they track mariner settings, not zoom). We evaluate the
 //!     combined gate at a high zoom so only SCAMIN is neutralised.
-//!   * No op buffer / sort / declutter: the host owns paint order (draw calls
-//!     arrive in Surface emission order) and label collision.
+//!   * No op buffer / sort: the host owns paint order (draw calls arrive in
+//!     Surface emission order). Labels are the ONE exception — they are held
+//!     back and resolved against the shared collision pool at endScene, because
+//!     which label survives cannot be known until the whole scene is walked.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -27,6 +29,7 @@ const resolve = @import("resolve.zig");
 const cv = @import("canvas.zig");
 const sym = @import("symbols.zig");
 const sndfrm = @import("sndfrm.zig");
+const dc = @import("declutter.zig");
 const fontmod = @import("font.zig");
 const tile = @import("tiles").tile;
 
@@ -112,40 +115,21 @@ pub const CSurface = extern struct {
     draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, f32, CRotAlign, CColor, CColor) callconv(.c) void = null,
 };
 
-/// Greedy screen-box occupancy for label/symbol declutter. Features arrive in
-/// draw-priority order, so placing the highest priority first and skipping
-/// lower-priority overlaps IS the S-52 collision rule. Boxes are screen px at
-/// the portray zoom. Shared so other surfaces can adopt it (dropping their own).
-pub const Declutter = struct {
-    cells: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    const CELL: f64 = 8.0;
-    fn cellKey(cx: i32, cy: i32) u64 {
-        return (@as(u64, @as(u32, @bitCast(cx))) << 32) | @as(u64, @as(u32, @bitCast(cy)));
-    }
-    /// Reserve a box centred at (sx,sy) px, half-extent (hw,hh). `force` places
-    /// unconditionally (and blocks later boxes); else returns false on a
-    /// collision (caller skips drawing) — the higher-priority box already there.
-    pub fn place(self: *Declutter, a: Allocator, sx: f64, sy: f64, hw: f64, hh: f64, force: bool) bool {
-        const x0: i32 = @intFromFloat(@floor((sx - hw) / CELL));
-        const x1: i32 = @intFromFloat(@floor((sx + hw) / CELL));
-        const y0: i32 = @intFromFloat(@floor((sy - hh) / CELL));
-        const y1: i32 = @intFromFloat(@floor((sy + hh) / CELL));
-        if (!force) {
-            var y = y0;
-            while (y <= y1) : (y += 1) {
-                var x = x0;
-                while (x <= x1) : (x += 1)
-                    if (self.cells.contains(cellKey(x, y))) return false;
-            }
-        }
-        var y = y0;
-        while (y <= y1) : (y += 1) {
-            var x = x0;
-            while (x <= x1) : (x += 1)
-                self.cells.put(a, cellKey(x, y), {}) catch {};
-        }
-        return true;
-    }
+/// One label held back from the stream until endScene. Text is the only thing
+/// that competes for space (declutter.zig documents why), and a label can only
+/// be ranked against the others once the whole scene has been walked — so it is
+/// SHAPED here and emitted only if it survives. Everything else (areas, lines,
+/// symbols, soundings) streams to the host as it is drawn.
+const Label = struct {
+    feat: CFeature,
+    anchor: CWorldPt,
+    text: []const u8,
+    px: f32, // glyph size, device px
+    x0: f32, // anchor-local baseline origin (alignment + LocalOffset applied)
+    baseline: f32,
+    color: cv.Color,
+    rot_deg: f64,
+    rot_align: CRotAlign,
 };
 
 // ---- the Surface implementation --------------------------------------------
@@ -181,7 +165,8 @@ pub const VectorSurface = struct {
     /// the host actually draws them in. The per-tile path leaves it 0 (a tile is
     /// tessellated once, north-up, and re-transformed on the GPU every frame).
     view_rotation: f64 = 0,
-    declutter: Declutter = .{},
+    pool: dc.Pool = .{},
+    labels: std.ArrayListUnmanaged(Label) = .empty,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -341,9 +326,24 @@ pub const VectorSurface = struct {
     }
 
     // ---- Surface impl ---------------------------------------------------------
-    fn beginScene(_: *anyopaque, _: u8) anyerror!void {}
+    fn beginScene(ctx: *anyopaque, _: u8) anyerror!void {
+        const self = sp(ctx);
+        self.pool.deinit(self.a);
+        self.pool = .{};
+        self.labels.clearRetainingCapacity();
+    }
     fn endFeature(_: *anyopaque) anyerror!void {}
-    fn endScene(_: *anyopaque, out: Allocator) anyerror![]u8 {
+
+    /// The scene is walked; now the labels can be ranked. Resolve the pool and
+    /// emit the survivors — text last, over the symbols and soundings that
+    /// streamed out ahead of it.
+    fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
+        const self = sp(ctx);
+        var kept = try self.pool.resolve(self.a);
+        defer kept.deinit(self.a);
+        for (self.labels.items, 0..) |l, id| {
+            if (kept.has(id)) try self.emitLabel(l);
+        }
         return out.alloc(u8, 0);
     }
 
@@ -402,7 +402,7 @@ pub const VectorSurface = struct {
     /// turns — kept upright on screen. Mirrors pixel.zig's placement, mariner's
     /// contourLabelField formatting (metres round, feet floor — a depth errs
     /// shallow), and contourLabelColor (CHGRD by day, brighter neutrals at
-    /// dusk/night). The declutter culls the duplicates a contour spanning many
+    /// dusk/night). The collision pool culls the duplicates a contour spanning many
     /// tiles produces.
     fn emitContourLabel(self: *VectorSurface, v: f64, lines: []const []const rs.TilePoint) !void {
         var best2: f64 = 0;
@@ -438,7 +438,8 @@ pub const VectorSurface = struct {
         };
         // Follow the contour (MAP), flipped as needed so it never reads upside down.
         const deg = self.uprightTangent(tangent) * 180.0 / std.math.pi;
-        try self.emitLabel(label, 10, "center", "middle", 0, 0, color, deg, .map, mid);
+        // A contour value is not one of the spec's IMPORTANT text groups (group 0).
+        try self.holdLabel(label, 10, "center", "middle", 0, 0, color, deg, .map, 0, mid);
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -463,7 +464,7 @@ pub const VectorSurface = struct {
         // ORIENT symbols and every linestyle brick are north-referenced (rot_north)
         // → chart-relative; the rest stay upright under a rotated view.
         const rot_align = alignOf(rot_north);
-        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, null, rot_align) else try self.emitSymbol(s, at, rot_deg, scale, dev, rot_align);
+        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, rot_align) else try self.emitSymbol(s, at, rot_deg, scale, dev, rot_align);
     }
 
     /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
@@ -473,9 +474,9 @@ pub const VectorSurface = struct {
     /// out the number.
     /// `dev` = the device scale for the symbol size (refDev for display-sized
     /// point symbols; 1.0 for line bricks, which must match the engine's native
-    /// tile-space spacing so they tile). `declut` null = no declutter (line
-    /// patterns), else place with that `force`.
-    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, declut: ?bool, rot_align: CRotAlign) void {
+    /// tile-space spacing so they tile). Symbols never collide — they all draw,
+    /// and they claim nothing from the labels above them (see declutter.zig).
+    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_align: CRotAlign) void {
         const k = scale * 100.0 * dev;
         var hw: f64 = 0;
         var hh: f64 = 0;
@@ -487,10 +488,6 @@ pub const VectorSurface = struct {
         };
         if (hw <= 0 or hh <= 0) return;
         const anchor = self.worldOf(at);
-        if (declut) |force| {
-            const sc = self.screenPx(anchor);
-            if (!self.declutter.place(self.a, sc[0], sc[1], hw, hh, force)) return;
-        }
         const feat = self.cur_feature();
         draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, anchor, @floatCast(rot_deg), rot_align, @floatCast(hw), @floatCast(hh));
     }
@@ -503,38 +500,18 @@ pub const VectorSurface = struct {
         const shown = if (feet) depth_m * sndfrm.M_TO_FT else depth_m;
         const prefix: []const u8 = if (depth_m <= self.settings.safety_depth) "SOUNDS" else "SOUNDG";
         const list = try sndfrm.syms(self.a, prefix, shown, swept, low_acc, feet);
-        // S-52 lets soundings overlap (icon-allow-overlap), but the HiDPI ×size_scale
-        // enlargement crowds them into an unreadable mass. Thin them: declutter each
-        // NUMBER as one box (the union of its digit glyphs), placed once — keep the
-        // first-emitted (higher draw-priority) and drop later numbers it overlaps. The
-        // digits themselves still draw ungated (below) so the kept number stays intact.
-        const k_decl = sndfrm.SYMBOL_SCALE * 100.0 * self.soundingDev();
-        var uw: f64 = 0;
-        var uh: f64 = 0;
-        {
-            var itb = std.mem.splitScalar(u8, list, ',');
-            while (itb.next()) |glyph| {
-                if (glyph.len == 0) continue;
-                const s = store.get(glyph) orelse continue;
-                for (s.paths) |p| for (p.contours) |contour| for (contour) |c| {
-                    const lx = @abs((c.x - s.pivot.x) * k_decl);
-                    const ly = @abs((c.y - s.pivot.y) * k_decl);
-                    if (lx > uw) uw = lx;
-                    if (ly > uh) uh = ly;
-                };
-            }
-        }
-        if (uw > 0 and uh > 0) {
-            const sc = self.screenPx(self.worldOf(at));
-            if (!self.declutter.place(self.a, sc[0], sc[1], uw, uh, false)) return;
-        }
+        // A sounding is a SYMBOL — the Presentation Library draws it as symbol
+        // glyphs so it stays legible and correctly located — and every symbol
+        // draws: S-52 suppresses only coincident lines and area boundaries. So a
+        // sounding never enters the collision pool. It neither drops a label nor
+        // is dropped by one; text simply draws on top of it (text is drawn last).
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
             // Sounding digits read upright under a rotated view (screen-referenced),
             // sized by soundingDev so digit + spacing scale together.
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), null, .viewport) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport);
+            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport);
         }
     }
 
@@ -573,80 +550,30 @@ pub const VectorSurface = struct {
         const valign = if (style.valign.len > 0) style.valign else "middle";
         // An ordinary label stays upright under a rotated view: no rotation, and
         // screen-referenced so the host does not turn it with the chart.
-        try self.emitLabel(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), 0, .viewport, at);
+        try self.holdLabel(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), 0, .viewport, style.group, at);
     }
 
-    /// Emit one label: text at a world anchor, shaped to anchor-local reference px
-    /// (an SDF string when the host supports it, else tessellated glyph outlines),
-    /// rotated `rot_deg` about the anchor with alignment `align`. `color` is
-    /// already resolved (the contour label uses a palette-specific neutral the
-    /// colortables do not name). Declutters as an axis-aligned advance-box.
-    fn emitLabel(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_deg: f64, rot_align: CRotAlign, at: rs.TilePoint) !void {
+    /// Shape a label and HOLD it: which labels survive is a property of the WHOLE
+    /// scene, not of the order the engine walked it (the engine walks a cell in
+    /// ENC record order), so nothing is emitted until endScene ranks the pool.
+    /// `color` is already resolved (the contour label uses a palette-specific
+    /// neutral the colortables do not name); `rot_deg`/`rot_align` carry the run's
+    /// rotation, and `group` is the S-52 text group the pool ranks on.
+    fn holdLabel(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_deg: f64, rot_align: CRotAlign, group: i64, at: rs.TilePoint) !void {
         const f = &(self.fnt orelse return);
         const px = font_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
 
-        // Real advance width — the declutter box and (SDF path) the alignment.
+        // Real advance width — the collision box and the alignment.
         var pen: f32 = 0;
         var it = (std.unicode.Utf8View.init(text) catch return).iterator();
         while (it.nextCodepoint()) |cp| pen += f.advance(f.glyphIndex(cp)) * px;
         if (pen <= 0) return;
 
-        const anchor = self.worldOf(at);
-        const sc = self.screenPx(anchor);
-        if (!self.declutter.place(self.a, sc[0], sc[1], @as(f64, pen) * 0.5, @as(f64, px) * 0.6, false)) return;
-
-        // SDF glyph-atlas host: send the string + aligned baseline-left origin.
-        if (self.cb.draw_text_str) |dts| {
-            const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
-            var x0: f32 = ox_mm * mm_px;
-            if (std.mem.eql(u8, halign, "center")) x0 -= pen / 2;
-            if (std.mem.eql(u8, halign, "right")) x0 -= pen;
-            var baseline: f32 = oy_mm * mm_px;
-            if (std.mem.eql(u8, valign, "top")) {
-                baseline += f.ascent * px;
-            } else if (std.mem.eql(u8, valign, "middle")) {
-                baseline += (f.ascent - f.descent) / 2 * px;
-            } else {
-                baseline -= f.descent * px;
-            }
-            const feat = self.cur_feature();
-            dts(self.cb.ctx, &feat, anchor, x0, baseline, text.ptr, text.len, px, @floatCast(rot_deg), rot_align, ccolor(color), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
-            return;
-        }
-        try self.emitText(text, font_css, halign, valign, ox_mm, oy_mm, color, rot_deg, rot_align, at);
-    }
-
-    fn glyphOutline(self: *VectorSurface, gid: u16) ![]const []const cv.Point {
-        if (self.glyph_cache.get(gid)) |hit| return hit;
-        const out = try self.fnt.?.outline(self.a, gid);
-        try self.glyph_cache.put(self.a, gid, out);
-        return out;
-    }
-
-    /// Shape a label into anchor-local reference px glyph outlines (baseline at
-    /// the origin, aligned per halign/valign with mm offsets) at a world anchor.
-    fn emitText(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_deg: f64, rot_align: CRotAlign, at: rs.TilePoint) !void {
-        const f = &(self.fnt orelse return);
-        const px = font_css * @as(f32, @floatCast(self.textDev()));
-        if (px <= 1) return;
+        // Alignment + S-52 LocalOffset -> the anchor-local baseline origin. Laid
+        // out ONCE: both host paths (SDF string, tessellated outline) draw from it,
+        // so a held label and a drawn label cannot disagree.
         const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
-        // The run rotates about the anchor; the host adds the view rotation when
-        // rot_align == .map (see draw_text). Ordinary labels pass rot_deg 0 (identity).
-        const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
-        const cosr = @cos(rad);
-        const sinr = @sin(rad);
-
-        var gids = std.ArrayList(struct { gid: u16, x: f32 }).empty;
-        var pen: f32 = 0;
-        var it = (std.unicode.Utf8View.init(text) catch return).iterator();
-        while (it.nextCodepoint()) |cp| {
-            const gid = f.glyphIndex(cp);
-            try gids.append(self.a, .{ .gid = gid, .x = pen });
-            pen += f.advance(gid) * px;
-        }
-        if (gids.items.len == 0) return;
-
         var x0: f32 = ox_mm * mm_px;
         if (std.mem.eql(u8, halign, "center")) x0 -= pen / 2;
         if (std.mem.eql(u8, halign, "right")) x0 -= pen;
@@ -659,25 +586,99 @@ pub const VectorSurface = struct {
             baseline -= f.descent * px;
         }
 
+        const anchor = self.worldOf(at);
+        try self.pool.add(self.a, self.labels.items.len, group, self.labelBox(anchor, x0, baseline, pen, px, rot_deg, rot_align));
+        try self.labels.append(self.a, .{
+            .feat = self.cur_feature(),
+            .anchor = anchor,
+            .text = try self.a.dupe(u8, text),
+            .px = px,
+            .x0 = x0,
+            .baseline = baseline,
+            .color = color,
+            .rot_deg = rot_deg,
+            .rot_align = rot_align,
+        });
+    }
+
+    /// A label's ink box in the SCREEN frame the host draws it in: the shaped run
+    /// (advance width by the font's ascent/descent) turned by the angle it will
+    /// actually appear at — its own rotation, plus the view rotation when the host
+    /// will add that (.map) — then bounded axis-aligned. A north-up view of an
+    /// unrotated label is the plain aligned box.
+    fn labelBox(self: *const VectorSurface, anchor: CWorldPt, x0: f32, baseline: f32, pen: f32, px: f32, rot_deg: f64, rot_align: CRotAlign) dc.Box {
+        const f = &(self.fnt.?);
+        const top = baseline - f.ascent * px;
+        const bot = baseline + f.descent * px;
+        const theta = rot_deg * std.math.pi / 180.0 + if (rot_align == .map) self.view_rotation else 0;
+        const c = @cos(theta);
+        const sn = @sin(theta);
+        const corners = [4][2]f64{
+            .{ x0, top },
+            .{ x0 + pen, top },
+            .{ x0 + pen, bot },
+            .{ x0, bot },
+        };
+        const sc = self.screenPx(anchor);
+        var box = dc.Box{ .x0 = std.math.floatMax(f64), .y0 = std.math.floatMax(f64), .x1 = -std.math.floatMax(f64), .y1 = -std.math.floatMax(f64) };
+        for (corners) |k| {
+            const rx = sc[0] + k[0] * c - k[1] * sn;
+            const ry = sc[1] + k[0] * sn + k[1] * c;
+            box.x0 = @min(box.x0, rx);
+            box.y0 = @min(box.y0, ry);
+            box.x1 = @max(box.x1, rx);
+            box.y1 = @max(box.y1, ry);
+        }
+        return box;
+    }
+
+    /// Emit one label that WON its space, through whichever text path the host
+    /// offers: its SDF glyph atlas, or tessellated glyph outlines.
+    fn emitLabel(self: *VectorSurface, l: Label) !void {
+        if (self.cb.draw_text_str) |dts| {
+            dts(self.cb.ctx, &l.feat, l.anchor, l.x0, l.baseline, l.text.ptr, l.text.len, l.px, @floatCast(l.rot_deg), l.rot_align, ccolor(l.color), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            return;
+        }
+        try self.emitText(l);
+    }
+
+    fn glyphOutline(self: *VectorSurface, gid: u16) ![]const []const cv.Point {
+        if (self.glyph_cache.get(gid)) |hit| return hit;
+        const out = try self.fnt.?.outline(self.a, gid);
+        try self.glyph_cache.put(self.a, gid, out);
+        return out;
+    }
+
+    /// Tessellate a label that won its space into anchor-local reference px glyph
+    /// outlines, walking from the baseline origin the layout already fixed and
+    /// rotated about the anchor (the host adds the view rotation when .map).
+    fn emitText(self: *VectorSurface, l: Label) !void {
+        const f = &(self.fnt orelse return);
+        const rad: f32 = @floatCast(l.rot_deg * std.math.pi / 180.0);
+        const cosr = @cos(rad);
+        const sinr = @sin(rad);
+
         var rings = std.ArrayList([]const cv.Point).empty;
-        for (gids.items) |g| {
-            const contours = try self.glyphOutline(g.gid);
-            for (contours) |contour| {
+        var pen: f32 = 0;
+        var it = (std.unicode.Utf8View.init(l.text) catch return).iterator();
+        while (it.nextCodepoint()) |cp| {
+            const gid = f.glyphIndex(cp);
+            for (try self.glyphOutline(gid)) |contour| {
                 const pts = try self.a.alloc(cv.Point, contour.len);
                 for (contour, 0..) |p, i| {
                     // em units, y up -> local px, y down (anchor-relative), then
                     // rotated about the anchor.
-                    const lx = x0 + g.x + p.x * px;
-                    const ly = baseline - p.y * px;
+                    const lx = l.x0 + pen + p.x * l.px;
+                    const ly = l.baseline - p.y * l.px;
                     pts[i] = .{ .x = lx * cosr - ly * sinr, .y = lx * sinr + ly * cosr };
                 }
                 try rings.append(self.a, pts);
             }
+            pen += f.advance(gid) * l.px;
         }
         if (rings.items.len == 0) return;
-        const feat = self.cur_feature();
         var lr = try self.localRings(rings.items);
-        self.cb.draw_text(self.cb.ctx, &feat, self.worldOf(at), &lr, ccolor(color), .{ .r = 0, .g = 0, .b = 0, .a = 0 }, 0, rot_align);
+        self.cb.draw_text(self.cb.ctx, &l.feat, l.anchor, &lr, ccolor(l.color), .{ .r = 0, .g = 0, .b = 0, .a = 0 }, 0, l.rot_align);
     }
 };
 
@@ -739,6 +740,7 @@ test "VectorSurface: depth-contour value is emitted along the contour, MAP-align
     const lines = [_][]const rs.TilePoint{&line};
     try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, 20.0); // 20 m contour
     try surf.endFeature();
+    _ = try surf.endScene(a); // labels are held until the scene closes and the pool ranks them
 
     try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
     const t = rec.texts.items[0];
@@ -769,6 +771,7 @@ test "VectorSurface: depth in feet floors (a depth errs shallow)" {
     const lines = [_][]const rs.TilePoint{&line};
     try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, 2.0); // 2 m = 6.56 ft
     try surf.endFeature();
+    _ = try surf.endScene(a);
 
     try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
     try testing.expectEqualStrings("6", rec.texts.items[0].text); // floor(6.56), never "7"
@@ -794,10 +797,81 @@ test "VectorSurface: an ordinary label stays upright and viewport-aligned" {
     const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .halign = "center", .valign = "middle" };
     try surf.drawText("Bay", &style, .{ .x = 2000, .y = 2000 });
     try surf.endFeature();
+    _ = try surf.endScene(a);
 
     try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
     const t = rec.texts.items[0];
     try testing.expectEqualStrings("Bay", t.text);
     try testing.expectEqual(CRotAlign.viewport, t.rot_align); // never turns with the chart
     try testing.expectEqual(@as(f32, 0), t.rot_deg);
+}
+
+test "VectorSurface: a sounding claims no space — a label on top of it survives" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = RecordCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    // The sounding is drawn FIRST, exactly where the light description lands —
+    // the shape of the bug this pool exists to kill. A sounding is a symbol: it
+    // claims nothing, so the label still wins its space. Toggling soundings can
+    // therefore never cost a chart its labels.
+    const meta = rs.FeatureMeta{ .class = "SOUNDG", .draw_prio = 5 };
+    try surf.beginFeature(&meta);
+    try surf.drawSounding(4.0, false, false, .{ .x = 2000, .y = 2000 });
+    try surf.endFeature();
+
+    const light = rs.FeatureMeta{ .class = "LIGHTS", .draw_prio = 5 };
+    try surf.beginFeature(&light);
+    const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 23 }; // light description
+    try surf.drawText("Fl R 4s", &style, .{ .x = 2000, .y = 2000 });
+    try surf.endFeature();
+    _ = try surf.endScene(a);
+
+    try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
+    try testing.expectEqualStrings("Fl R 4s", rec.texts.items[0].text);
+}
+
+test "VectorSurface: important text outranks a name it overlaps, whatever the walk order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = RecordCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    // The NAME is walked first (the cell encoded it first) and carries the higher
+    // feature draw priority. Neither buys it the space: the text group is the
+    // whole ladder, and a label's feature priority says nothing about the label.
+    const named = rs.FeatureMeta{ .class = "SEAARE", .draw_prio = 9 };
+    try surf.beginFeature(&named);
+    const name = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
+    try surf.drawText("Bay", &name, .{ .x = 2000, .y = 2000 });
+    try surf.endFeature();
+
+    const bridge = rs.FeatureMeta{ .class = "BRIDGE", .draw_prio = 3 };
+    try surf.beginFeature(&bridge);
+    const clearance = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 11 }; // vertical clearance
+    try surf.drawText("clr 11", &clearance, .{ .x = 2000, .y = 2000 });
+    try surf.endFeature();
+    _ = try surf.endScene(a);
+
+    try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
+    try testing.expectEqualStrings("clr 11", rec.texts.items[0].text);
 }

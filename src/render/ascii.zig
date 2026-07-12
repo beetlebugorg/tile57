@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
 const resolve = @import("resolve.zig");
 const sndfrm = @import("sndfrm.zig");
+const declut = @import("declutter.zig");
 
 /// Canvas px per character ROW. A terminal cell is ~twice as tall as it is
 /// wide, so the surface exposes a w_px x h_px canvas of cols x rows*2 px to
@@ -83,7 +84,7 @@ const OpKind = union(enum) {
     pattern: struct { rings: []const []const Pt },
     stroke: struct { lines: []const []const Pt, dash: rs.Dash, color: ?u8 },
     glyph: struct { ch: u21, col: i64, row: i64, color: ?u8 },
-    label: struct { text: []const u8, col: i64, row: i64, color: ?u8 },
+    label: struct { text: []const u8, col: i64, row: i64, w: i64, color: ?u8, group: i64 },
 };
 
 /// Paint class, the same class-major order as the pixel surface (pixel.zig
@@ -97,10 +98,11 @@ const Op = struct {
     kind: OpKind,
 };
 
-/// One character cell: the glyph, optional ANSI-256 fore/background, and
-/// whether a mark owns it (`solid` cells block later labels — the text-grid
-/// version of the pixel path's collision declutter).
-const Cell = struct { ch: u21 = ' ', fg: ?u8 = null, bg: ?u8 = null, solid: bool = false };
+/// One character cell: the glyph and optional ANSI-256 fore/background. Cells
+/// carry no occupancy flag: text is drawn LAST, over the marks beneath it, and
+/// a label competes only with other labels — through the shared collision pool,
+/// exactly like the pixel and vector surfaces.
+const Cell = struct { ch: u21 = ' ', fg: ?u8 = null, bg: ?u8 = null };
 
 pub const AsciiSurface = struct {
     a: Allocator,
@@ -305,12 +307,16 @@ pub const AsciiSurface = struct {
         var buf: [24]u8 = undefined;
         const label = std.fmt.bufPrint(&buf, "{d}", .{@round(shown)}) catch return;
         const cell = self.toCell(at);
+        // A sounding is a SYMBOL: it always draws and never enters the collision
+        // pool (see declutter.zig). Text simply draws on top of it.
         try self.push(.sounding, .{
             .label = .{
                 .text = try self.a.dupe(u8, label),
                 .col = cell.col - @as(i64, @intCast(label.len / 2)), // centred on the spot
                 .row = cell.row,
+                .w = @intCast(label.len),
                 .color = self.resolveColor("CHGRD"),
+                .group = 0,
             },
         });
     }
@@ -330,7 +336,9 @@ pub const AsciiSurface = struct {
             .text = try self.a.dupe(u8, word),
             .col = col,
             .row = cell.row,
+            .w = @intCast(word.len),
             .color = self.resolveColor(style.color),
+            .group = style.group,
         } });
     }
 
@@ -410,7 +418,6 @@ pub const AsciiSurface = struct {
                         if (self.cellAt(grid, c, r)) |cell| {
                             cell.ch = ch;
                             cell.fg = color;
-                            cell.solid = true;
                         }
                     }
                     if (c == c1 and r == r1) break;
@@ -428,16 +435,16 @@ pub const AsciiSurface = struct {
         }
     }
 
-    /// Write a label if the whole run fits on free (non-solid) cells — the
-    /// occupancy check IS the declutter: endScene paints labels from the
-    /// highest priority down, so a kept label blocks lower-priority overlap.
+    /// Write a run of characters into the grid, over whatever is under them —
+    /// text is drawn last. A run that would fall off the grid is skipped whole
+    /// (a half-written label is worse than none). WHICH labels get here is the
+    /// pool's decision, not the grid's.
     fn paintLabel(self: *AsciiSurface, grid: []Cell, text: []const u8, col: i64, row: i64, color: ?u8) void {
         var view = std.unicode.Utf8View.init(text) catch return;
         var n: i64 = 0;
         var it = view.iterator();
         while (it.nextCodepoint()) |_| : (n += 1) {
-            const cell = self.cellAt(grid, col + n, row) orelse return; // clipped: skip whole label
-            if (cell.solid) return; // occupied: skip whole label
+            _ = self.cellAt(grid, col + n, row) orelse return; // clipped: skip whole label
         }
         it = view.iterator();
         n = 0;
@@ -445,12 +452,34 @@ pub const AsciiSurface = struct {
             const cell = self.cellAt(grid, col + n, row).?;
             cell.ch = cp;
             cell.fg = color;
-            cell.solid = true;
         }
     }
 
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const self = sp(ctx);
+        // Label declutter, through the shared pool (render/declutter.zig owns the
+        // policy — see there for why only text competes). Candidates go in by
+        // EMISSION order, which is why this runs before the paint sort. Boxes are
+        // character cells: the medium differs from the raster's pixels, the
+        // ranking does not.
+        var pool = declut.Pool{};
+        defer pool.deinit(self.a);
+        for (self.ops.items) |op| {
+            if (op.layer != .text) continue;
+            const l = switch (op.kind) {
+                .label => |lb| lb,
+                else => continue,
+            };
+            try pool.add(self.a, op.seq, l.group, .{
+                .x0 = @floatFromInt(l.col),
+                .y0 = @floatFromInt(l.row),
+                .x1 = @floatFromInt(l.col + l.w - 1),
+                .y1 = @floatFromInt(l.row),
+            });
+        }
+        var kept = try pool.resolve(self.a);
+        defer kept.deinit(self.a);
+
         // Paint order = the pixel surface's exact sort: class-major (see
         // OpLayer), draw priority within a class, emission order for ties.
         std.mem.sort(Op, self.ops.items, {}, struct {
@@ -464,8 +493,9 @@ pub const AsciiSurface = struct {
         const grid = try self.a.alloc(Cell, @as(usize, self.cols) * self.rows);
         @memset(grid, .{});
 
-        // Fills, patterns, lines, symbols paint LOW to HIGH priority — later
-        // (higher) writes overwrite, exactly like painting pixels.
+        // Fills, patterns, lines, symbols and SOUNDINGS paint LOW to HIGH priority
+        // — later (higher) writes overwrite, exactly like painting pixels. A
+        // sounding is a symbol: it always draws, and blocks no label.
         for (self.ops.items) |op| switch (op.kind) {
             .fill => |f| try self.paintFill(grid, f.rings, f.ch, f.color, false),
             .pattern => |p| try self.paintFill(grid, p.rings, ' ', null, true),
@@ -473,20 +503,17 @@ pub const AsciiSurface = struct {
             .glyph => |g| if (self.cellAt(grid, g.col, g.row)) |cell| {
                 cell.ch = g.ch;
                 cell.fg = g.color;
-                cell.solid = true;
             },
-            .label => {}, // second pass
+            .label => |l| if (op.layer == .sounding) self.paintLabel(grid, l.text, l.col, l.row, l.color),
         };
-        // Labels paint HIGH to LOW priority into free cells only (see
-        // paintLabel) — the grid's version of the pixel collision pass.
-        var ri = self.ops.items.len;
-        while (ri > 0) {
-            ri -= 1;
-            const op = self.ops.items[ri];
-            if (op.kind != .label) continue;
-            const l = op.kind.label;
-            self.paintLabel(grid, l.text, l.col, l.row, l.color);
-        }
+        // Text paints LAST, over the marks beneath it, and only where the pool
+        // kept it — the grid's version of the pixel collision pass, resolving
+        // through the very same policy.
+        for (self.ops.items) |op| switch (op.kind) {
+            .label => |l| if (op.layer == .text and kept.has(op.seq))
+                self.paintLabel(grid, l.text, l.col, l.row, l.color),
+            else => {},
+        };
 
         // Encode: UTF-8 rows; in ANSI mode fore/background escapes are emitted
         // only on change, and every row ends reset so a pager can't bleed.
@@ -639,19 +666,52 @@ test "labels declutter: highest priority claims the cells, overlap is dropped" {
     var as = AsciiSurface.initView(a, &colors, .day, &settings, 14.0, 32, 16, 32, 32);
     const surf = as.asSurface();
 
-    const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
-    const lo = rs.FeatureMeta{ .draw_prio = 3 };
-    try surf.beginFeature(&lo);
-    try surf.drawText("loser", &style, .{ .x = 8, .y = 8 });
-    try surf.endFeature();
+    // IMPORTANT text (a bridge's vertical clearance, group 11) against Other
+    // text (a geographic name, group 26) on the same spot. The name is emitted
+    // FIRST and carries the HIGHER feature draw priority — neither buys it the
+    // space: the text group is the whole ladder, and a label's feature priority
+    // says nothing about the label (all text is drawn last, at priority 8).
+    const name = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
+    const clearance = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 11 };
     const hi = rs.FeatureMeta{ .draw_prio = 9 };
     try surf.beginFeature(&hi);
-    try surf.drawText("winner", &style, .{ .x = 8, .y = 8 });
+    try surf.drawText("loser", &name, .{ .x = 8, .y = 8 });
+    try surf.endFeature();
+    const lo = rs.FeatureMeta{ .draw_prio = 3 };
+    try surf.beginFeature(&lo);
+    try surf.drawText("winner", &clearance, .{ .x = 8, .y = 8 });
     try surf.endFeature();
 
     const text = try surf.endScene(a);
     try std.testing.expect(std.mem.indexOf(u8, text, "winner") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "loser") == null);
+}
+
+test "labels declutter: a sounding neither drops a label nor is dropped by one" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, test_profile);
+    const settings = resolve.Settings{};
+    var as = AsciiSurface.initView(a, &colors, .day, &settings, 14.0, 32, 16, 32, 32);
+    const surf = as.asSurface();
+
+    // The sounding is drawn FIRST, right where the light description lands. It
+    // is a symbol: it claims nothing, so the label survives — and the sounding
+    // still draws. Toggling soundings therefore cannot cost a chart its labels.
+    const meta = rs.FeatureMeta{ .draw_prio = 5 };
+    try surf.beginFeature(&meta);
+    try surf.drawSounding(4.0, false, false, .{ .x = 8, .y = 8 });
+    try surf.endFeature();
+    const light = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 23 };
+    try surf.beginFeature(&meta);
+    try surf.drawText("FlR", &light, .{ .x = 8, .y = 8 });
+    try surf.endFeature();
+
+    const text = try surf.endScene(a);
+    try std.testing.expect(std.mem.indexOf(u8, text, "FlR") != null);
 }
 
 test "ANSI mode: tokens quantize to xterm-256, rows reset, plain mode stays escape-free" {
