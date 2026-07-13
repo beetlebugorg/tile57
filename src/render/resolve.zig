@@ -94,6 +94,38 @@ fn collectItems(a: Allocator, block: []const u8, map: *std.StringHashMapUnmanage
     }
 }
 
+// ---- depth shading (SEABED01) ------------------------------------------------
+
+/// S-52 SEABED01: a depth area's DRVAL1/DRVAL2 against the mariner's contours ->
+/// a depth colour token. Mirrors mariner.seabedTokenExpr (the `case` the MapLibre
+/// client evaluates on the tile's drval1/drval2 props) — keep the two in step.
+///
+/// The rules bake the fill token against the FIXED bake context (portray.Context's
+/// defaults: safety/deep 30 m, shallow 2 m), because a baked tile must serve every
+/// mariner. So the baked token is NOT the mariner's shading, and a resolving surface
+/// has to redo this the way the style does: deepest band first, `>=` on DRVAL1 and
+/// `>` on DRVAL2 per spec, so an area whose range straddles a contour takes the
+/// SHALLOWER shade.
+pub fn seabedToken(d: rs.DepthRange, m: *const Settings) []const u8 {
+    const d1: f64 = d.d1;
+    const d2: f64 = d.d2;
+    const band = struct {
+        fn at(dd1: f64, dd2: f64, x: f64) bool {
+            return dd1 >= x and dd2 > x;
+        }
+    }.at;
+    if (!m.four_shade_water) {
+        if (band(d1, d2, m.safety_contour)) return "DEPDW";
+        if (band(d1, d2, 0)) return "DEPVS";
+        return "DEPIT";
+    }
+    if (band(d1, d2, m.deep_contour)) return "DEPDW";
+    if (band(d1, d2, m.safety_contour)) return "DEPMD";
+    if (band(d1, d2, m.shallow_contour)) return "DEPMS";
+    if (band(d1, d2, 0)) return "DEPVS";
+    return "DEPIT";
+}
+
 // ---- display gates ----------------------------------------------------------
 
 /// S-52 §10.3.4 display-category gate — mirrors mariner.categoryFilter:
@@ -249,6 +281,34 @@ test "soundings ride their own switch, not the OTHER category" {
     const legacy_other = Settings{ .display_other = true };
     try std.testing.expect(!categoryVisible(2, "SOUNDG", null, &legacy_std));
     try std.testing.expect(categoryVisible(2, "SOUNDG", null, &legacy_other));
+}
+
+test "seabedToken mirrors mariner.seabedTokenExpr" {
+    const four = Settings{ .shallow_contour = 2, .safety_contour = 10, .deep_contour = 30 };
+    const dr = struct {
+        fn r(d1: f32, d2: f32) rs.DepthRange {
+            return .{ .d1 = d1, .d2 = d2 };
+        }
+    }.r;
+    // The four bands + the drying/intertidal fallthrough.
+    try std.testing.expectEqualStrings("DEPDW", seabedToken(dr(30, 100), &four));
+    try std.testing.expectEqualStrings("DEPMD", seabedToken(dr(10, 30), &four));
+    try std.testing.expectEqualStrings("DEPMS", seabedToken(dr(2, 10), &four));
+    try std.testing.expectEqualStrings("DEPVS", seabedToken(dr(0, 2), &four));
+    try std.testing.expectEqualStrings("DEPIT", seabedToken(dr(-5, 0), &four));
+    // An area straddling a contour takes the SHALLOWER shade (DRVAL2 > x fails at
+    // the bound): 20..40 spans the 30 m deep contour, so DEPMD, not DEPDW.
+    try std.testing.expectEqualStrings("DEPMD", seabedToken(dr(20, 40), &four));
+    // Two-shade water: safety contour is the only split, and deep_contour is ignored.
+    const two = Settings{ .safety_contour = 10, .deep_contour = 30, .four_shade_water = false };
+    try std.testing.expectEqualStrings("DEPDW", seabedToken(dr(10, 30), &two));
+    try std.testing.expectEqualStrings("DEPVS", seabedToken(dr(0, 10), &two));
+    try std.testing.expectEqualStrings("DEPIT", seabedToken(dr(-2, 0), &two));
+    // The mariner's contours actually move the bands: a 12 m area is medium-deep at a
+    // 10 m safety contour, but DEEP once the mariner pulls the deep contour in to 10.
+    const shoal = Settings{ .shallow_contour = 2, .safety_contour = 5, .deep_contour = 10 };
+    try std.testing.expectEqualStrings("DEPDW", seabedToken(dr(12, 20), &shoal));
+    try std.testing.expectEqualStrings("DEPMD", seabedToken(dr(12, 20), &four));
 }
 
 test "categoryVisible mirrors mariner.categoryFilter" {

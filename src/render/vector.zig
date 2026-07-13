@@ -376,14 +376,17 @@ pub const VectorSurface = struct {
     }
 
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
-        _ = depth;
         const self = sp(ctx);
         if (!self.cur_visible) return;
         const feat = self.cur_feature();
         var wr = try self.worldRings(rings);
         // ColorFill "NAME[,transparency]": apply the S-101 fill transparency (alpha).
         const ft = rs.fillToken(token);
-        var col = self.resolveColor(ft.name);
+        // A depth area re-shades LIVE against the mariner's contours (SEABED01) — the
+        // baked token carries the bake context's contours, not this mariner's. Keep the
+        // baked transparency: the swap is of the colour, not of the fill's opacity.
+        const name = if (depth) |d| resolve.seabedToken(d, self.settings) else ft.name;
+        var col = self.resolveColor(name);
         col.a = ft.alpha;
         self.cb.fill_area(self.cb.ctx, &feat, &wr, ccolor(col), 0);
     }
