@@ -2450,6 +2450,12 @@ const BakeWork = struct {
             // per cell (only for Text/centred-symbol features) instead of re-running the search
             // for every tile a feature touches; the arena outlives the call via c.arenas.
             cell.label_cache = scene.buildLabelCache(p.allocator(), &cell, geo, portrayal) catch null;
+            // Per-feature drawn-boundary cache (masked/coast-clipped area boundaries):
+            // assemble the drawableLineParts subset + precompute its world coords ONCE, so
+            // the per-tile stroke reprojects with a linear map instead of the transcendental
+            // projection on every tile the area spans — the last per-tile projection hotspot
+            // on Inland-ENC river cells (long shared coast boundaries).
+            cell.drawn_boundary = scene.buildDrawnBoundary(p.allocator(), &cell) catch null;
         }
         // M_COVR coverage + scale for per-cell quilting (allocate into the cell's own
         // arena before the move, so it outlives with the backend).

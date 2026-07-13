@@ -1143,23 +1143,62 @@ pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, stre
     for (cell.features, 0..) |f, i| {
         // Polylabel (areaRepresentativePoint) is AREA-only — lines anchor at their mid-vertex.
         if (f.prim != 3) continue;
-        if (i >= ss.len) break;
-        const stream = ss[i] orelse continue; // portrayed at all (an unportrayed area never reaches labelPoint)
-        // Only an area that PLACES something at the representative point consults it: a centred
-        // label (TextInstruction), a centred symbol (PointInstruction), or the native INFORM01
-        // additional-info marker (hasAdditionalInfo). A plain fill/boundary area — the vast
-        // majority (DEPARE, LNDARE, SBDARE, DEPCNT, …) — anchors nothing there, and the pole-of-
-        // inaccessibility search is expensive, so skip it. QUESMRK1/SWPARE fallbacks carry a null
-        // stream (skipped above) and stay on the live path. The token test is a strict SUPERSET of
-        // what the per-tile path consults (an empty TextInstruction is dropped downstream), so a
-        // cached point is only ever spurious, never missing — labelPoint stays byte-identical and
-        // no per-tile recompute creeps back in.
-        if (!hasAdditionalInfo(f) and
-            std.mem.indexOf(u8, stream, "TextInstruction:") == null and
-            std.mem.indexOf(u8, stream, "PointInstruction:") == null) continue;
+        const stream: ?[]const u8 = if (i < ss.len) ss[i] else null;
+        // Cache exactly the areas whose per-tile emit anchors something at the representative
+        // point. A plain fill/boundary area — the vast majority (DEPARE, LNDARE, SBDARE, DEPCNT,
+        // …) — anchors nothing there, and the pole-of-inaccessibility search is expensive, so skip
+        // it. The set below is a strict SUPERSET of what the per-tile path consults, so a cached
+        // point is only ever spurious, never missing — labelPoint (which recomputes the SAME
+        // search from the SAME geometry on a miss) stays byte-identical either way:
+        //   • hasAdditionalInfo -> the §10.6.1.1 INFORM01 marker (stream-independent),
+        //   • an unmapped S-57 area -> the QUESMRK1 "?" fallback. It carries a NULL/errored
+        //     portrayal stream yet still runs featureAnchor for EVERY tile the polygon spans —
+        //     the per-tile pole-of-inaccessibility search that dominated Inland-ENC bakes (objl
+        //     17000+ area classes with no S-101 mapping, huge river/fairway polygons). Mirror the
+        //     emit-side QUESMRK1 guard exactly so this leaves the live path only when that fires.
+        //   • a portrayed area placing a centred label (TextInstruction) or symbol
+        //     (PointInstruction).
+        const unmapped_qmark = !cell.native and f.objl != s57.OBJL_TOPMAR and adapter.resolveClass(f) == null;
+        const places_symbol = if (stream) |s|
+            std.mem.indexOf(u8, s, "TextInstruction:") != null or
+                std.mem.indexOf(u8, s, "PointInstruction:") != null
+        else
+            false;
+        if (!hasAdditionalInfo(f) and !unmapped_qmark and !places_symbol) continue;
         const parts = featureParts(tmp.allocator(), cell.*, geo, i, f) catch continue;
         out[i] = s57.areaRepresentativePoint(tmp.allocator(), parts);
         _ = tmp.reset(.retain_capacity);
+    }
+    return out;
+}
+
+/// Per-feature DRAWN-boundary cache (cell.drawn_boundary), indexed by feature index.
+/// An area feature whose stroked boundary differs from its full fill ring
+/// (needsDrawableBoundary — MASK/USAG edge flags, or a coast-coincident edge on a
+/// non-coast-definer area) restrokes only the drawableLineParts SUBSET. That subset is
+/// tile-invariant, so assemble it ONCE here and precompute each vertex's web-mercator
+/// world coordinate — the per-tile emit then reprojects with a linear worldToTile instead
+/// of running the transcendental projection on the boundary for every tile the area spans
+/// (the dominant cost on Inland-ENC river cells: fairway/depth areas with long shared coast
+/// boundaries). A null slot leaves the feature on the live path (reconstruct + project),
+/// byte-identical since `world` holds exactly `tile.lonLatToWorld` and `tile.project` is
+/// `worldToTile ∘ lonLatToWorld`. Covers exactly the features the per-tile stroke path
+/// routes through drawableLineParts — ANY prim whose `needsDrawableBoundary` holds, not
+/// areas only: a LINE (prim 2) with MASK/USAG edge flags takes the same drawn-subset path
+/// and was the bulk of the uncached per-tile projection on Inland-ENC cells.
+pub fn buildDrawnBoundary(a: Allocator, cell: *const s57.Cell) ![]?s57.DrawnBoundary {
+    const out = try a.alloc(?s57.DrawnBoundary, cell.features.len);
+    @memset(out, null);
+    for (cell.features, 0..) |f, i| {
+        if (!cell.needsDrawableBoundary(f)) continue;
+        const parts = cell.drawableLineParts(a, f) catch continue;
+        const world = a.alloc([][2]f64, parts.len) catch continue;
+        for (parts, 0..) |part, pi| {
+            const wp = try a.alloc([2]f64, part.len);
+            for (part, 0..) |pt, j| wp[j] = tile.lonLatToWorld(pt.lon(), pt.lat());
+            world[pi] = wp;
+        }
+        out[i] = .{ .parts = parts, .world = world };
     }
     return out;
 }
@@ -1596,13 +1635,23 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     var stroke_proj: []const []const mvt.Point = projected.items;
     if (!opts.suppress_lines and p.lines.len > 0 and cell.needsDrawableBoundary(f)) {
         var stroke_storage = std.ArrayList([]mvt.Point).empty;
-        const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
+        // The baker's per-cell drawn-boundary cache: the drawableLineParts subset plus each
+        // vertex's precomputed world coord. Reproject the cached world with a linear
+        // worldToTile instead of the transcendental projection on every tile — the drawn
+        // boundary is tile-invariant. Live path (no cache / single tile) reconstructs and
+        // projects directly; byte-identical, since project == worldToTile ∘ lonLatToWorld.
+        const cached: ?s57.DrawnBoundary = if (cell.drawn_boundary) |db| (if (fi < db.len) db[fi] else null) else null;
+        const dparts: []const []s57.LonLat = if (cached) |c| c.parts else (cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{});
         stroke_geo = dparts;
-        for (dparts) |dp| {
+        for (dparts, 0..) |dp, pi| {
             if (dp.len < 2) continue;
             if (!overlaps(geomBounds(dp), tb)) continue;
             const proj = try a.alloc(mvt.Point, dp.len);
-            for (dp, 0..) |p2, i| proj[i] = tile.project(p2.lon(), p2.lat(), z, x, y, tile.EXTENT);
+            if (cached) |c| {
+                for (c.world[pi], 0..) |ww, i| proj[i] = tile.worldToTile(ww, z, x, y, tile.EXTENT);
+            } else {
+                for (dp, 0..) |p2, i| proj[i] = tile.project(p2.lon(), p2.lat(), z, x, y, tile.EXTENT);
+            }
             try stroke_storage.append(a, proj);
         }
         stroke_proj = stroke_storage.items;
