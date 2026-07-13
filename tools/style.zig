@@ -50,6 +50,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         try std.Io.Dir.cwd().readFileAlloc(io, ctf, a, .unlimited)
     else
         try colorTablesBytes(io, a, resolveCatalogDir(catalog));
+    // Complex-linestyle decoration layers (per-id dasharray + line-placed symbols) come
+    // from the analysed linestyles.json — the same catalogue as the colours. Absent →
+    // the un-tessellated ls_style runs draw as plain solid lines.
+    opts.linestyles_json = common.linestylesBytes(io, a, resolveCatalogDir(catalog)) catch null;
     const style_json = try style.json(a, opts);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = style_json });
     std.debug.print("wrote {s} ({s}, {d} bytes)\n", .{ out_path, scheme, style_json.len });
