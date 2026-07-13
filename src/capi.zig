@@ -1134,7 +1134,26 @@ const CMariner = extern struct {
     // Appended for ABI-append-safety; marinerFromC reads 0 (an un-set field) as 1.0.
     text_size_scale: f64,
     sounding_size_scale: f64,
+    // Spot soundings, independent of the display category. S-52 files SOUNDG under OTHER, but
+    // every ECDIS gives soundings their own switch and the everyday setting is STANDARD +
+    // soundings ON; without this a host must enable the whole OTHER category to get them, and
+    // takes the seabed, the cables and the rest of the low-priority clutter with it.
+    //
+    // TRI-STATE, so a zeroed struct keeps the old meaning (Appended for ABI-append-safety):
+    //   0 = follow the display category (what every existing host gets)
+    //   1 = show soundings, whatever the category says
+    //   2 = hide soundings, whatever the category says
+    soundings: u8,
 };
+
+/// The tri-state `soundings` field as the engine's optional bool.
+fn soundingsOf(v: u8) ?bool {
+    return switch (v) {
+        1 => true,
+        2 => false,
+        else => null, // 0 / unknown: follow the display category
+    };
+}
 
 // "YYYYMMDD" or "" from the fixed char[9] field.
 fn dateViewSlice(buf: *const [9]u8) []const u8 {
@@ -1177,6 +1196,7 @@ fn marinerFromC(cm: *const CMariner) mariner.Settings {
         .date_view = dateViewSlice(&cm.date_view),
         .ignore_scamin = cm.ignore_scamin,
         .scamin_filter_gate = cm.scamin_filter_gate,
+        .show_soundings = soundingsOf(cm.soundings),
         .show_overscale = cm.show_overscale,
         .size_scale = cm.size_scale,
         // Appended fields: an un-set (zero) multiplier means "no extra scale", so a
@@ -1337,6 +1357,7 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
         .display_base = d.display_base,
         .display_standard = d.display_standard,
         .display_other = d.display_other,
+        .soundings = if (d.show_soundings) |on| (if (on) @as(u8, 1) else @as(u8, 2)) else 0,
         .data_quality = d.data_quality,
         .show_inform_callouts = d.show_inform_callouts,
         .show_meta_bounds = d.show_meta_bounds,
