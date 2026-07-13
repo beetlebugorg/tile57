@@ -148,6 +148,10 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
     // --- Features -> shell features + native Adapted ----------------------
     var features = std.ArrayList(s57.Feature).empty;
     var adapted = std.ArrayList(adapter.Adapted).empty;
+    // Per-feature pick-report data (parallel to `features`): S-101 class + a JSON of
+    // the S-101 attribute tree, so the cursor-pick report serves real S-101 data.
+    var pick_classes = std.ArrayList([]const u8).empty;
+    var pick_jsons = std.ArrayList([]const u8).empty;
 
     for (ds.features) |fr| {
         const class = ds.featureName(fr) orelse continue; // unresolved code: skip
@@ -205,6 +209,14 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
             .attrs = s57attrs.items,
         });
 
+        // The S-101 attribute tree, reused for the pick report (all features) and the
+        // portrayal Adapted (non-SOUNDG). Class + attribute JSON feed the cursor pick.
+        const root = try buildNode(a, ds.*, fr.attrs, 0);
+        var jbuf = std.ArrayList(u8).empty;
+        try cnodeJson(a, &jbuf, root);
+        try pick_classes.append(a, try a.dupe(u8, class));
+        try pick_jsons.append(a, jbuf.items);
+
         // Native Adapted: class name + CNode tree from ATTR (no adapter). SOUNDG
         // (objl 129) is emitted directly as a multipoint by scene, and a feature with
         // no spatial primitive can't portray — neither goes through the rules (the
@@ -223,7 +235,7 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
                 .feature_index = fi,
                 .code = try a.dupe(u8, class),
                 .primitive = primitive,
-                .root = try buildNode(a, ds.*, fr.attrs, 0),
+                .root = root,
                 .points = points,
             });
         }
@@ -252,9 +264,58 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
         .coast_edges = coast_edges,
         .foid_index = foid_index,
         .native = true,
+        .pick_class = pick_classes.items,
+        .pick_json = pick_jsons.items,
         .arena = arena,
     };
     return .{ .cell = cell, .adapted = adapted.items };
+}
+
+/// Serialize a `CNode` attribute tree to a JSON object for the pick report: simple
+/// sub-attributes as `"name":"value"` and each complex sub-attribute as
+/// `"name":[ {…}, … ]` (its ordered instances). Values are emitted verbatim except
+/// for the JSON-mandatory escapes — UTF-8 bytes pass through, so accented text
+/// (e.g. a French leading-line note) survives intact.
+fn cnodeJson(a: Allocator, buf: *std.ArrayList(u8), node: CNode) !void {
+    try buf.append(a, '{');
+    var n: usize = 0;
+    for (node.simple) |nv| {
+        if (n > 0) try buf.append(a, ',');
+        try jsonString(a, buf, nv.name);
+        try buf.append(a, ':');
+        try jsonString(a, buf, nv.value);
+        n += 1;
+    }
+    for (node.children) |ch| {
+        if (n > 0) try buf.append(a, ',');
+        try jsonString(a, buf, ch.code);
+        try buf.appendSlice(a, ":[");
+        for (ch.nodes, 0..) |sub, i| {
+            if (i > 0) try buf.append(a, ',');
+            try cnodeJson(a, buf, sub);
+        }
+        try buf.append(a, ']');
+        n += 1;
+    }
+    try buf.append(a, '}');
+}
+
+/// Append `s` as a JSON string (quotes included): escape `"`, `\`, and C0 control
+/// characters; every other byte — including UTF-8 continuation bytes — passes through.
+fn jsonString(a: Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(a, '"');
+    for (s) |c| switch (c) {
+        '"' => try buf.appendSlice(a, "\\\""),
+        '\\' => try buf.appendSlice(a, "\\\\"),
+        '\n' => try buf.appendSlice(a, "\\n"),
+        '\r' => try buf.appendSlice(a, "\\r"),
+        '\t' => try buf.appendSlice(a, "\\t"),
+        else => if (c < 0x20) {
+            var hb: [6]u8 = undefined;
+            try buf.appendSlice(a, std.fmt.bufPrint(&hb, "\\u{x:0>4}", .{c}) catch unreachable);
+        } else try buf.append(a, c),
+    };
+    try buf.append(a, '"');
 }
 
 /// The MASK indicator (1=mask/not-drawn, else 0) a feature applies to boundary

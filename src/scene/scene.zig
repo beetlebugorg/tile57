@@ -1374,9 +1374,23 @@ fn appendDepthVals(a: Allocator, props: *std.ArrayList(mvt.Prop), f: s57.Feature
 /// every primitive with the pass's meta (draw_prio/cat/vg/scamin/bnd/pts + pick
 /// attrs). The engine work happens here — geometry assembly, projection, tile
 /// clipping/simplification, anchoring — so surfaces only ever see draw calls.
+/// The cursor-pick report's class name for a feature. A native S-101 cell serves
+/// its S-101 class; an S-57 cell serves the S-57 acronym.
+fn pickClass(cell: s57.Cell, f: s57.Feature, fi: usize) []const u8 {
+    if (cell.native) return if (cell.pick_class) |pc| (if (fi < pc.len) pc[fi] else "") else "";
+    return catalogue.acronymByObjl(f.objl) orelse "";
+}
+/// The cursor-pick report's attribute JSON for a feature. A native S-101 cell serves
+/// its S-101 attribute tree (UTF-8 preserved); an S-57 cell serves `encodeS57Attrs`.
+/// Empty unless `pick` (the pick-enabled path); never fails (report metadata).
+fn pickJson(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, pick: bool) []const u8 {
+    if (!pick) return "";
+    if (cell.native) return if (cell.pick_json) |pj| (if (fi < pj.len) pj[fi] else "") else "";
+    return encodeS57Attrs(a, f) catch "";
+}
+
 fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: instructions.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const scamin = effScamin(f, opts);
-    const s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "";
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
         .draw_prio = p.draw_prio,
@@ -1385,8 +1399,8 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         .vg = p.vg,
         .scamin = scamin,
         .oscl = opts.oscl,
-        .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57_json = s57_json,
+        .class = pickClass(cell, f, fi),
+        .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = cell_name,
         .band = opts.band,
         .date_start = p.date_start,
@@ -1629,8 +1643,8 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const fmeta = rs.FeatureMeta{
         .draw_prio = 6,
         .scamin = effScamin(f, opts),
-        .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .class = pickClass(cell, f, fi),
+        .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
     };
@@ -1692,8 +1706,8 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     const fmeta = rs.FeatureMeta{
         .draw_prio = 12,
         .scamin = effScamin(f, opts),
-        .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .class = pickClass(cell, f, fi),
+        .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
     };
@@ -1785,8 +1799,8 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
     const fmeta = rs.FeatureMeta{
         .draw_prio = 6,
         .scamin = effScamin(f, opts),
-        .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .class = pickClass(cell, f, fi),
+        .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
     };
@@ -2079,8 +2093,8 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
         .draw_prio = prio,
         .cat = cat,
         .scamin = effScamin(f, opts),
-        .class = catalogue.acronymByObjl(f.objl) orelse "",
-        .s57_json = if (opts.pick_attrs) try encodeS57Attrs(a, f) else "",
+        .class = pickClass(cell, f, fi),
+        .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
     };
@@ -2209,8 +2223,8 @@ fn appendCellFeatures(
             const smeta = rs.FeatureMeta{
                 .draw_prio = 18,
                 .cat = 2,
-                .class = "SOUNDG",
-                .s57_json = if (fopts.pick_attrs) try encodeS57Attrs(a, f) else "",
+                .class = if (cell.native) pickClass(cell.*, f, fi) else "SOUNDG",
+                .s57_json = pickJson(a, cell.*, f, fi, fopts.pick_attrs),
                 .cell_name = if (fopts.pick_attrs) cell.name else "",
                 .scamin = effScamin(f, opts),
                 .band = fopts.band,

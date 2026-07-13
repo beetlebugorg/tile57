@@ -625,6 +625,13 @@ pub const Cell = struct {
     /// feature has a valid S-101 class. Downstream code that would treat "no S-57
     /// class" as "unknown feature" must exempt native cells.
     native: bool = false,
+    /// Native S-101 pick-report data, indexed by feature index (native cells only;
+    /// null otherwise): the feature's S-101 class name and a JSON object of its
+    /// S-101 attributes (the CNode tree, UTF-8 preserved). The cursor-pick report
+    /// serves these for a native cell in place of the S-57 acronym + `encodeS57Attrs`,
+    /// which would report only the surrogate attributes. Arena-backed (freed with the cell).
+    pick_class: ?[]const []const u8 = null,
+    pick_json: ?[]const []const u8 = null,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Cell) void {

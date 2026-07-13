@@ -181,4 +181,22 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         var eit = err_by_class.iterator();
         while (eit.next()) |e| std.debug.print("    ERROR x{d}: {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
     }
+
+    // Pick-report spot check: the first feature whose S-101 attribute JSON carries
+    // non-ASCII (UTF-8) text — verifies the pick report surfaces native attributes
+    // with the encoding intact.
+    if (loaded.cell.pick_json) |pjs| {
+        for (pjs, 0..) |pj, fi| {
+            var non_ascii = false;
+            for (pj) |c| if (c >= 0x80) {
+                non_ascii = true;
+                break;
+            };
+            if (non_ascii and pj.len > 40) {
+                const cls = if (loaded.cell.pick_class) |pc| pc[fi] else "?";
+                std.debug.print("\n  pick report (feature {d}, class {s}) — UTF-8 attrs:\n    {s}\n", .{ fi, cls, pj });
+                break;
+            }
+        }
+    }
 }
