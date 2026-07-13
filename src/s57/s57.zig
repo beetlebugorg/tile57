@@ -1112,8 +1112,29 @@ fn isDelMarker(v: []const u8) bool {
     return true;
 }
 
-/// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are
-/// copied into `a` (the source field bytes are not retained).
+/// S-57 attribute text is ISO 8859-1 (Latin-1) at the standard lexical level — a
+/// French chart's "La Crabière Est" carries a lone 0xE8 for 'è'. Everything
+/// downstream (tiles, pick report, rendered labels) is UTF-8, so passing those bytes
+/// through verbatim yields invalid UTF-8 (the renderer shows the replacement char).
+/// Transcode here: a value already valid UTF-8 (ASCII, or a producer that emitted
+/// UTF-8) is duped unchanged; otherwise each byte is taken as a Latin-1 codepoint and
+/// UTF-8-encoded (0xE8 -> C3 A8). (UCS-2 lexical level 2 is rare in ENC; not handled.)
+fn toUtf8(a: Allocator, s: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(s)) return a.dupe(u8, s);
+    var out = std.ArrayList(u8).empty;
+    for (s) |c| {
+        if (c < 0x80) {
+            try out.append(a, c);
+        } else {
+            try out.append(a, 0xC0 | (c >> 6));
+            try out.append(a, 0x80 | (c & 0x3F));
+        }
+    }
+    return out.items;
+}
+
+/// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are copied
+/// into `a` (the source field bytes are not retained) and transcoded to UTF-8.
 fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
     var list = std.ArrayList(Attr).empty;
     var off: usize = 0;
@@ -1131,7 +1152,7 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
         // verbatim made the S-101 framework build a malformed ScaledDecimal{Value=nil}
         // that crashed the rule -> QUESMRK1. Either way attr()/attrFloat() see it absent.
         if (val.len > 0 and !isDelMarker(val))
-            try list.append(a, .{ .code = code, .value = try a.dupe(u8, val) });
+            try list.append(a, .{ .code = code, .value = try toUtf8(a, val) });
         off = end + 1; // skip UT
     }
     return list.items;
