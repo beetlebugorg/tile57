@@ -251,17 +251,20 @@ pub const AsciiSurface = struct {
     }
 
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
-        _ = depth; // the rule already picked the depth-shade token
         const self = sp(ctx);
         if (!self.cur_visible) return;
+        // A depth area re-shades LIVE against the mariner's contours (SEABED01) — the
+        // baked token carries the bake context's contours, not this mariner's. The
+        // depth shade is most of what this backend draws, so it must swap here too.
+        const tok = if (depth) |d| resolve.seabedToken(d, self.settings) else token;
         // In ANSI mode land reads as a solid background wash, not a wall of
         // '#'/'@' — the color alone carries it, and marks/labels on land stay
         // legible. Plain text keeps the glyphs (no color to carry the fill).
-        const ch = if (self.ansi and (std.mem.eql(u8, token, "LANDA") or std.mem.eql(u8, token, "CHBRN")))
+        const ch = if (self.ansi and (std.mem.eql(u8, tok, "LANDA") or std.mem.eql(u8, tok, "CHBRN")))
             ' '
         else
-            fillChar(token);
-        try self.push(.area, .{ .fill = .{ .rings = try self.toGrid(rings), .ch = ch, .color = self.resolveColor(token) } });
+            fillChar(tok);
+        try self.push(.area, .{ .fill = .{ .rings = try self.toGrid(rings), .ch = ch, .color = self.resolveColor(tok) } });
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {

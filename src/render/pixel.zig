@@ -209,12 +209,14 @@ pub const PixelSurface = struct {
     }
 
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
-        _ = depth; // the rule resolved the depth token against the real context
         const self = sp(ctx);
         if (!self.cur_visible) return;
         // ColorFill "NAME[,transparency]": apply the S-101 fill transparency (alpha).
         const ft = rs.fillToken(token);
-        var col = self.resolveColor(ft.name);
+        // A depth area re-shades LIVE against the mariner's contours (SEABED01) — the
+        // baked token carries the bake context's contours, not this mariner's.
+        const name = if (depth) |d| resolve.seabedToken(d, self.settings) else ft.name;
+        var col = self.resolveColor(name);
         col.a = ft.alpha;
         try self.push(.area, .{ .fill = .{ .rings = try self.toCanvas(rings), .color = col } });
     }
@@ -612,6 +614,67 @@ const test_profile =
     \\ <item token="CHBLK"><srgb><red>0</red><green>0</green><blue>0</blue></srgb></item>
     \\</palette>
 ;
+
+// Every depth shade, so a swapped band is distinguishable from the baked token.
+const depth_profile =
+    \\<palette name="Day">
+    \\ <item token="DEPIT"><srgb><red>1</red><green>1</green><blue>1</blue></srgb></item>
+    \\ <item token="DEPVS"><srgb><red>2</red><green>2</green><blue>2</blue></srgb></item>
+    \\ <item token="DEPMS"><srgb><red>3</red><green>3</green><blue>3</blue></srgb></item>
+    \\ <item token="DEPMD"><srgb><red>4</red><green>4</green><blue>4</blue></srgb></item>
+    \\ <item token="DEPDW"><srgb><red>5</red><green>5</green><blue>5</blue></srgb></item>
+    \\</palette>
+;
+
+// The bug this pins: the S-101 rules bake a depth area's fill token against the
+// FIXED bake context (safety/deep 30 m), so the surface was painting that shade no
+// matter what the mariner's contours were — deep water never reached DEPDW, and
+// moving a contour did nothing. A depth area must re-shade from the DRVAL range the
+// scene hands fillArea. (VectorSurface does the same swap for GPU hosts.)
+test "PixelSurface: a depth area shades from the MARINER's contours, not the baked token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, depth_profile);
+    const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 64, .y = 0 }, .{ .x = 64, .y = 64 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+
+    // One 12–20 m area, portrayed by the rules as DEPMS (the bake context's 2/30/30
+    // bands put every depth under 30 m in the middle shade). The mariner decides.
+    const fillOnce = struct {
+        fn go(al: Allocator, cols: *const resolve.Colors, m: *const resolve.Settings, rr: []const []const rs.TilePoint, depth: ?rs.DepthRange) !cv.Color {
+            var ps = PixelSurface.init(al, cols, .day, m, 14.0, 64, 64);
+            const surf = ps.asSurface();
+            try surf.beginScene(14);
+            const meta = rs.FeatureMeta{ .class = "DEPARE", .cat = 0 };
+            try surf.beginFeature(&meta);
+            try surf.fillArea("DEPMS", rr, depth);
+            try surf.endFeature();
+            try std.testing.expectEqual(@as(usize, 1), ps.ops.items.len);
+            return ps.ops.items[0].kind.fill.color;
+        }
+    }.go;
+
+    const dr = rs.DepthRange{ .d1 = 12, .d2 = 20 };
+
+    // Default contours (shallow 2 / safety 10 / deep 30): 12 m is past the safety
+    // contour but not the deep one -> medium-deep, NOT the baked DEPMS.
+    const std_m = resolve.Settings{ .shallow_contour = 2, .safety_contour = 10, .deep_contour = 30 };
+    try std.testing.expectEqual(@as(u8, 4), (try fillOnce(a, &colors, &std_m, &rings, dr)).r); // DEPMD
+
+    // The mariner pulls the deep contour in to 10 m: the SAME area is now deep
+    // water. This is the shade that could never appear before.
+    const deep_m = resolve.Settings{ .shallow_contour = 2, .safety_contour = 5, .deep_contour = 10 };
+    try std.testing.expectEqual(@as(u8, 5), (try fillOnce(a, &colors, &deep_m, &rings, dr)).r); // DEPDW
+
+    // Two-shade water: the safety contour is the only split, so 12 m reads deep.
+    const two_m = resolve.Settings{ .safety_contour = 10, .deep_contour = 30, .four_shade_water = false };
+    try std.testing.expectEqual(@as(u8, 5), (try fillOnce(a, &colors, &two_m, &rings, dr)).r); // DEPDW
+
+    // A non-depth area (no DRVAL range) still takes its baked token, untouched.
+    try std.testing.expectEqual(@as(u8, 3), (try fillOnce(a, &colors, &std_m, &rings, null)).r); // DEPMS
+}
 
 test "PixelSurface: resolves tokens, gates SCAMIN, sorts by draw_prio" {
     const gpa = std.testing.allocator;
