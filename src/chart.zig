@@ -27,6 +27,7 @@ const scene = @import("scene");
 const portray = @import("portray");
 const bake_enc = @import("scene").bake_enc;
 const catalogue = @import("s101").catalogue;
+const s101 = @import("s101");
 const tile = @import("tiles").tile;
 const render = @import("render");
 const sprite = @import("sprite");
@@ -326,6 +327,29 @@ fn streamRead(ls: *LazySource, lc: *LazyCell) bool {
     return true;
 }
 
+/// A parsed .000 chart: the geometry cell plus, for a NATIVE S-101 dataset, its
+/// pre-built portrayal records (so portray bypasses the S-57 -> S-101 adapter).
+const CellLoad = struct { cell: s57.Cell, adapted: ?[]const s101.adapter.Adapted = null };
+
+/// Parse a .000 chart, auto-detecting S-101 vs S-57 from the file itself, and apply
+/// its sequential `.001…` update chain. A native S-101 dataset (S-100 Part 10a)
+/// assembles via s101.native; an S-57 cell parses via s57. Returns null on failure.
+fn parseAnyCell(base: []const u8, updates: []const []const u8) ?CellLoad {
+    if (s101.dataset.detect(base)) {
+        const l = s101.native.parseDataset(gpa, base, updates) catch return null;
+        return .{ .cell = l.cell, .adapted = l.adapted };
+    }
+    const cell = s57.parseCellWithUpdates(gpa, base, updates) catch return null;
+    return .{ .cell = cell };
+}
+
+/// Portray a cell three ways, using the native adapted set (S-101) when present,
+/// else the S-57 adapter.
+fn portrayVariantsAny(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: ?[]const s101.adapter.Adapted, dir: []const u8) !portray.CellPortrayal {
+    if (adapted) |ad| return portray.portrayCellVariantsAdapted(arena, cell, ad, dir);
+    return portray.portrayCellVariants(arena, cell, dir);
+}
+
 // Parse + portray a lazy cell if not already loaded, and stamp its LRU tick.
 fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
     ls.tick += 1;
@@ -334,11 +358,12 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
     if (lc.streaming and lc.base.len == 0) {
         if (!streamRead(ls, lc)) return;
     }
-    var cell = s57.parseCellWithUpdates(gpa, lc.base, lc.updates) catch return;
+    const loaded = parseAnyCell(lc.base, lc.updates) orelse return;
+    var cell = loaded.cell;
     cell.name = lc.name; // pick-report source-cell badge (gpa-owned, lives with the source)
     if (gpa.create(std.heap.ArenaAllocator)) |p| {
         p.* = std.heap.ArenaAllocator.init(gpa);
-        if (portray.portrayCellVariants(p.allocator(), &cell, ls.rules_dir)) |cp| {
+        if (portrayVariantsAny(p.allocator(), &cell, loaded.adapted, ls.rules_dir)) |cp| {
             lc.portrayal = cp.base;
             lc.portrayal_plain = cp.plain;
             lc.portrayal_simplified = cp.simplified;
@@ -492,14 +517,17 @@ pub fn openPmtilesPath(io: std.Io, path: []const u8) !*Chart {
 // Parse (+ apply updates) + portray one cell into a CellBackend. Reads the bytes
 // but does not take ownership. Portrayal failure is non-fatal (classify() fallback).
 fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const u8) ?CellBackend {
-    const cell = s57.parseCellWithUpdates(gpa, base, updates) catch return null;
-    var cb = CellBackend{ .cell = cell, .cscl = s57.peekScale(gpa, base) orelse 0 };
+    const loaded = parseAnyCell(base, updates) orelse return null;
+    // Use the parsed cell's compilation scale (S-57 DSPM CSCL, or a native S-101
+    // chart's DataCoverage display scale) — `peekScale` reads only the S-57 DSPM and
+    // returns 0 for native, which would mis-band a native chart in the live compositor.
+    var cb = CellBackend{ .cell = loaded.cell, .cscl = loaded.cell.params.cscl };
     const pa = gpa.create(std.heap.ArenaAllocator) catch return cb;
     pa.* = std.heap.ArenaAllocator.init(gpa);
     cb.portray_arena = pa;
     // Real M_COVR data-coverage polygons for the host to report as chart coverage.
     cb.coverage = cb.cell.mcovrCoverage(pa.allocator());
-    if (portray.portrayCellVariants(pa.allocator(), &cb.cell, dir)) |cp| {
+    if (portrayVariantsAny(pa.allocator(), &cb.cell, loaded.adapted, dir)) |cp| {
         cb.portrayal = cp.base;
         cb.portrayal_plain = cp.plain;
         cb.portrayal_simplified = cp.simplified;
@@ -604,16 +632,19 @@ pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     var cov_arena = std.heap.ArenaAllocator.init(gpa);
     defer cov_arena.deinit();
     var coverage_json: ?[]const u8 = null;
+    // Parse native-aware (S-101 or S-57): the band scale + the archive's coverage
+    // sidecar both come from the real cell, so a native S-101 chart bands by its
+    // DataCoverage display scale (not the S-57-misparsed cscl=0 approach default).
     var cscl: i32 = s57.peekScale(gpa, cf.base) orelse 0;
-    if (s57.parseCellWithUpdates(gpa, cf.base, cf.updates)) |parsed| {
-        var cell = parsed;
+    if (parseAnyCell(cf.base, cf.updates)) |loaded| {
+        var cell = loaded.cell;
         defer cell.deinit();
         cscl = cell.params.cscl;
         const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
         const band: u8 = @intFromEnum(bake_enc.bandOf(cscl));
         const cc = scene.coverage.fromCell(cov_arena.allocator(), &cell, stem, band);
         coverage_json = scene.coverage.encodeJson(cov_arena.allocator(), cc) catch null;
-    } else |_| {}
+    }
 
     // The cell's band window, plus the extend_min fill DOWN to z0: sub-band tiles
     // (scamin-thinned by the scene cull) let the compositor pull this cell up into
@@ -2348,7 +2379,8 @@ const BakeWork = struct {
         _ = scratch; // owns persistent backends via its own arenas / `gpa`
         const c: *BakeWork = @ptrCast(@alignCast(uptr));
         const src = c.sources[i];
-        var cell = s57.parseCellWithUpdates(gpa, src.base, src.updates) catch return;
+        const loaded = parseAnyCell(src.base, src.updates) orelse return;
+        var cell = loaded.cell;
         cell.name = src.name; // pick-report badge (borrowed for the bake call)
         const b = cell.bounds() orelse {
             cell.deinit();
@@ -2363,7 +2395,7 @@ const BakeWork = struct {
         const pa: ?*std.heap.ArenaAllocator = gpa.create(std.heap.ArenaAllocator) catch null;
         if (pa) |p| {
             p.* = std.heap.ArenaAllocator.init(gpa);
-            if (portray.portrayCellVariants(p.allocator(), &cell, c.rules_dir)) |cp| {
+            if (portrayVariantsAny(p.allocator(), &cell, loaded.adapted, c.rules_dir)) |cp| {
                 portrayal = cp.base;
                 portrayal_plain = cp.plain;
                 portrayal_simplified = cp.simplified;

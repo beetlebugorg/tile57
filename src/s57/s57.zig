@@ -618,6 +618,20 @@ pub const Cell = struct {
     /// single-tile path falls back to an on-demand search). Allocated in the baker's
     /// geometry arena, not the cell arena.
     label_cache: ?[]const ?LonLat = null,
+    /// True when this cell was assembled from a NATIVE S-101 dataset (s101.native)
+    /// rather than parsed from an S-57 source. It carries the S-57 geometry model
+    /// but its features draw their portrayal from S-101-native `adapter.Adapted`
+    /// (not `adaptCell`), so an `objl` may be a surrogate or 0 even though the
+    /// feature has a valid S-101 class. Downstream code that would treat "no S-57
+    /// class" as "unknown feature" must exempt native cells.
+    native: bool = false,
+    /// Native S-101 pick-report data, indexed by feature index (native cells only;
+    /// null otherwise): the feature's S-101 class name and a JSON object of its
+    /// S-101 attributes (the CNode tree, UTF-8 preserved). The cursor-pick report
+    /// serves these for a native cell in place of the S-57 acronym + `encodeS57Attrs`,
+    /// which would report only the surrogate attributes. Arena-backed (freed with the cell).
+    pick_class: ?[]const []const u8 = null,
+    pick_json: ?[]const []const u8 = null,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Cell) void {
@@ -1098,8 +1112,29 @@ fn isDelMarker(v: []const u8) bool {
     return true;
 }
 
-/// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are
-/// copied into `a` (the source field bytes are not retained).
+/// S-57 attribute text is ISO 8859-1 (Latin-1) at the standard lexical level — a
+/// French chart's "La Crabière Est" carries a lone 0xE8 for 'è'. Everything
+/// downstream (tiles, pick report, rendered labels) is UTF-8, so passing those bytes
+/// through verbatim yields invalid UTF-8 (the renderer shows the replacement char).
+/// Transcode here: a value already valid UTF-8 (ASCII, or a producer that emitted
+/// UTF-8) is duped unchanged; otherwise each byte is taken as a Latin-1 codepoint and
+/// UTF-8-encoded (0xE8 -> C3 A8). (UCS-2 lexical level 2 is rare in ENC; not handled.)
+fn toUtf8(a: Allocator, s: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(s)) return a.dupe(u8, s);
+    var out = std.ArrayList(u8).empty;
+    for (s) |c| {
+        if (c < 0x80) {
+            try out.append(a, c);
+        } else {
+            try out.append(a, 0xC0 | (c >> 6));
+            try out.append(a, 0x80 | (c & 0x3F));
+        }
+    }
+    return out.items;
+}
+
+/// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are copied
+/// into `a` (the source field bytes are not retained) and transcoded to UTF-8.
 fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
     var list = std.ArrayList(Attr).empty;
     var off: usize = 0;
@@ -1117,7 +1152,7 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
         // verbatim made the S-101 framework build a malformed ScaledDecimal{Value=nil}
         // that crashed the rule -> QUESMRK1. Either way attr()/attrFloat() see it absent.
         if (val.len > 0 and !isDelMarker(val))
-            try list.append(a, .{ .code = code, .value = try a.dupe(u8, val) });
+            try list.append(a, .{ .code = code, .value = try toUtf8(a, val) });
         off = end + 1; // skip UT
     }
     return list.items;

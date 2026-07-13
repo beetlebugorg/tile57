@@ -22,14 +22,31 @@ See the warning on the [introduction](./intro.md). NOAA ENC charts are U.S. publ
 domain and not for navigation; this renderer adds its own gaps on top.
 :::
 
+## Native S-101 charts
+
+A native S-101 (S-100 Part 10a) chart is read directly into the S-101 portrayal
+model with no conversion — the format is auto-detected from the file, so `png`,
+`bake`, and the C API accept a native S-101 `.000` transparently, and its
+sequential `.001…` update files are applied (record-level insert / delete /
+modify by identity). On the SHOM France test datasets and the S-164 update
+conformance set every feature portrays (no errors), including complex attributes
+such as light sectors and buoy topmarks. The cursor-pick report serves each
+feature's S-101 class and full attribute tree (nested complex attributes
+included), with text preserved as UTF-8. One area is not yet wired for native
+S-101:
+
+- **Feature-to-feature associations.** `FASC`/`INAS` records are parsed but the
+  StructureEquipment relationship (e.g. a light *supportedBy* its beacon) is not
+  yet resolved for the query report's related-feature grouping. It carries no
+  portrayal weight for the test charts, so rendering is unaffected.
+
 ## S-57 → S-101 conversion
 
-tile57's input is S-57 but its portrayal rules are S-101, so every chart passes
-through an S-57 → S-101 adapter (`src/s101/adapter.zig`) before the rules run.
-The adapter is an interim solution — the goal is S-101 throughout, reading
-native S-101 charts directly as hydrographic offices publish them. S-57 has no
-perfect S-101 translation; the adapter follows the IHO S-65 conversion
-guidance, and the result is **best effort**:
+An S-57 chart's portrayal rules are S-101, so an S-57 chart passes through an
+S-57 → S-101 adapter (`src/s101/adapter.zig`) before the rules run (a native
+S-101 chart skips this — it is already in the S-101 model). S-57 has no perfect
+S-101 translation; the adapter follows the IHO S-65 conversion guidance, and the
+result is **best effort**:
 
 - **Missing S-101 content stays missing.** S-101 attributes and features with
   no S-57 source are never invented; rules that test them take their fallback

@@ -330,7 +330,7 @@ fn dedupKey(arena: std.mem.Allocator, ad: adapter.Adapted, f: s57.Feature, refer
     return kb.items;
 }
 
-fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []adapter.Adapted, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
+fn runAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []const adapter.Adapted, rules_dir: []const u8, pctx: Context) ![]?[]const u8 {
     // Portrayal dedup: a Curve/Surface feature with no FFPT relationship portrays as a
     // pure function of (class, primitive, attributes) — see dedupKey. Run the S-101
     // rules ONCE per distinct key and fan the instruction stream out to the rest, so a
@@ -404,7 +404,12 @@ pub fn portrayCell(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: [
 /// boundary + point styles evaluate inside the rules, so the output needs none
 /// of the tile path's live-swap props. One pass, one context.
 pub fn portrayCellWith(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8, ctx: Context) ![]?[]const u8 {
-    const adapted = try adapter.adaptCell(arena, cell);
+    return portrayCellWithAdapted(arena, cell, try adapter.adaptCell(arena, cell), rules_dir, ctx);
+}
+
+/// Like `portrayCellWith` but over a PRE-BUILT adapted set — the native-S-101 entry
+/// point (skips `adapter.adaptCell`; see `portrayCellVariantsAdapted`).
+pub fn portrayCellWithAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []const adapter.Adapted, rules_dir: []const u8, ctx: Context) ![]?[]const u8 {
     return runAdapted(arena, cell, adapted, rules_dir, ctx);
 }
 
@@ -427,7 +432,14 @@ pub const CellPortrayal = struct {
 /// vary (areas for bnd, points for pts) — lines/soundings never read either
 /// override — so the extra rule evaluation is bounded to the relevant features.
 pub fn portrayCellVariants(arena: std.mem.Allocator, cell: *const s57.Cell, rules_dir: []const u8) !CellPortrayal {
-    const adapted = try adapter.adaptCell(arena, cell);
+    return portrayCellVariantsAdapted(arena, cell, try adapter.adaptCell(arena, cell), rules_dir);
+}
+
+/// Like `portrayCellVariants` but over a PRE-BUILT adapted set — the native-S-101
+/// entry point. A native cell's features already carry S-101 class + attribute
+/// records (`s101.native`), so this bypasses `adapter.adaptCell` entirely: the
+/// dedup / three-variant machinery is identical, only the adaptation source differs.
+pub fn portrayCellVariantsAdapted(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: []const adapter.Adapted, rules_dir: []const u8) !CellPortrayal {
     const base = try runAdapted(arena, cell, adapted, rules_dir, .{});
 
     // Partition the adapted features by the variant they can contribute. "Surface"

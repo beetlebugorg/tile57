@@ -230,37 +230,65 @@ fn parseFieldControls(a: Allocator, ddr: Record, field_control_length: usize) ![
     return list.items;
 }
 
-/// Parse format controls like "(A,I(4),B(40))" into subfield defs.
+/// Parse format controls like "(A,I(4),B(40))" into subfield defs. ISO 8211 allows
+/// nested parenthesized groups with an optional leading repeat count — e.g. UKHO's
+/// "(b11,b14,7A,A(8),3A,(b11))" and "(b11,(3b24))" — where the group's formats repeat
+/// `repeat` times. (These defs are informational: s57/s101 decode records by their
+/// fixed schema, so the value here is that a legal DDR parses; a group must NOT be
+/// mistaken for a `(width)` and fed to the integer parser — SHOM cells lack nesting,
+/// UKHO cells have it.)
 pub fn parseSubfields(a: Allocator, fmt_in: []const u8) ![]SubfieldDef {
     var list = std.ArrayList(SubfieldDef).empty;
     var fmt = std.mem.trim(u8, fmt_in, " ");
     if (fmt.len == 0) return list.items;
     if (fmt[0] == '(') fmt = fmt[1..];
     if (fmt.len > 0 and fmt[fmt.len - 1] == ')') fmt = fmt[0 .. fmt.len - 1];
+    try parseFmtList(a, &list, fmt);
+    return list.items;
+}
 
+/// Parse one comma-separated format list into `list`, recursing into parenthesized
+/// groups. Each recursion consumes a shorter (parens-stripped) slice, so it terminates.
+fn parseFmtList(a: Allocator, list: *std.ArrayList(SubfieldDef), fmt: []const u8) !void {
     var i: usize = 0;
     while (i < fmt.len) {
-        // optional leading repeat count, e.g. "2A(3)" or "3I"
+        // optional leading repeat count, e.g. "2A(3)", "3I", "2(A,I)"
         var repeat: usize = 1;
         const rstart = i;
         while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') i += 1;
-        if (i > rstart) repeat = try asciiInt(fmt[rstart..i]);
+        if (i > rstart) repeat = asciiInt(fmt[rstart..i]) catch 1;
         if (i >= fmt.len) break;
-        const ftype = fmt[i];
-        i += 1;
-        var width: usize = 0;
-        if (i < fmt.len and fmt[i] == '(') {
+
+        if (fmt[i] == '(') {
+            // A nested group: find its balanced ')' and expand its contents `repeat` times.
+            const gstart = i + 1;
+            var depth: usize = 1;
+            var j = gstart;
+            while (j < fmt.len and depth > 0) : (j += 1) {
+                if (fmt[j] == '(') depth += 1 else if (fmt[j] == ')') depth -= 1;
+            }
+            const inner = fmt[gstart .. j - @intFromBool(depth == 0)]; // drop the closing ')'
+            var k: usize = 0;
+            while (k < repeat) : (k += 1) try parseFmtList(a, list, inner);
+            i = j;
+        } else {
+            const ftype = fmt[i];
             i += 1;
-            const wstart = i;
-            while (i < fmt.len and fmt[i] != ')') i += 1;
-            width = try asciiInt(fmt[wstart..i]);
-            if (i < fmt.len) i += 1; // skip ')'
+            var width: usize = 0;
+            if (i < fmt.len and fmt[i] == '(') {
+                i += 1;
+                const wstart = i;
+                while (i < fmt.len and fmt[i] != ')') i += 1;
+                // Tolerant: a width is informational and unused; a mis-aligned scan
+                // over binary notation ("b24") must not abort the whole DDR parse.
+                width = asciiInt(fmt[wstart..i]) catch 0;
+                if (i < fmt.len) i += 1; // skip ')'
+            }
+            var k: usize = 0;
+            while (k < repeat) : (k += 1) try list.append(a, .{ .format_type = ftype, .width = width });
         }
-        var k: usize = 0;
-        while (k < repeat) : (k += 1) try list.append(a, .{ .format_type = ftype, .width = width });
         if (i < fmt.len and fmt[i] == ',') i += 1;
     }
-    return list.items;
 }
 
 /// Parse a whole ISO 8211 file from in-memory bytes (borrowed; keep alive).

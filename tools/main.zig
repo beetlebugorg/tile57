@@ -42,6 +42,7 @@ const audit_holes = @import("audit_holes.zig");
 const audit_pairs = @import("audit_pairs.zig");
 const objlcount = @import("objlcount.zig");
 const cell = @import("cell.zig");
+const s101dump = @import("s101dump.zig");
 const partdbg_png = @import("partdbg_png.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -135,6 +136,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "cell")) {
         return cell.run(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "s101")) {
+        return s101dump.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "version") or std.mem.eql(u8, sub, "--version")) {

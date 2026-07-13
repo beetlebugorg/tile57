@@ -6,21 +6,26 @@ sidebar_position: 7
 
 # Architecture
 
-This page explains how tile57 turns an S-57 chart — an ENC *cell*, in the
-spec's vocabulary — into vector tiles, how the codebase is layered, and the
-memory design that keeps it small.
+This page explains how tile57 turns an ENC chart — a *cell*, in the spec's
+vocabulary — into vector tiles, how the codebase is layered, and the memory
+design that keeps it small.
 
 ## The pipeline
 
-A chart flows through these stages, all inside the engine:
+A chart flows through these stages, all inside the engine. Both source formats
+converge on the same S-101 feature + attribute records — a native S-101 dataset
+produces them directly; an S-57 chart is adapted into them:
 
 ```
-S-57 ENC cell (.000)
-   │  decode the binary container     src/iso8211/   (module: iso8211)
-   ▼
-S-57 feature + geometry model         src/s57/       (module: s57)
-   │  adapt S-57 → S-101 features     src/s101/ adapter.zig
-   ▼
+S-101 ENC (.000)          S-57 ENC cell (.000)
+   │ decode 8211             │ decode 8211            src/iso8211/  (iso8211)
+   ▼                         ▼
+S-100 spatial + feature   S-57 feature + geometry     src/s57/      (s57)
+   records                   model
+   │ assemble to the         │ adapt S-57 → S-101      src/s101/ native.zig
+   │ S-101 model             │ features                          / adapter.zig
+   └───────────┬─────────────┘
+               ▼
 S-101 feature + attribute records
    │  apply S-101 portrayal           src/portray/ + embedded Lua 5.4
    ▼                            (vendor/S-101_Portrayal-Catalogue)
@@ -35,11 +40,16 @@ render Surface                        src/render/surface.zig
    └─► pixel surfaces: PNG raster · vector PDF · terminal text (src/render/)
 ```
 
-1. **Decode (ISO 8211).** S-57 charts use the ISO 8211 binary container format;
-   the decoder reads its raw records and fields.
-2. **Build the S-57 model.** Features (depth areas, buoys, coastlines, …), their
-   attributes, and their geometry (assembled from the vector topology) become a
-   queryable in-memory model.
+1. **Decode (ISO 8211).** Both S-101 and S-57 charts use the ISO 8211 binary
+   container format; the decoder reads its raw records and fields. The chart
+   format is detected from the file's own record schema.
+2. **Build the S-101 model.** A native S-101 dataset (S-100 Part 10a) is read
+   straight into S-101 feature + attribute records — its own in-band code tables
+   already carry the S-101 class and attribute names, and its complex attributes
+   are explicit, so no conversion is needed. An S-57 chart instead builds the
+   S-57 feature + geometry model (depth areas, buoys, coastlines, …) and adapts
+   it into the same S-101 records. Geometry (assembled from the vector topology)
+   and attributes become a queryable in-memory model either way.
 3. **Apply S-101 portrayal.** The official IHO S-101 Portrayal Catalogue — the
    real Lua rule files — runs in embedded Lua 5.4 and decides how to draw each
    feature: symbol, colour, line style, conditional symbology. Zig implements the
@@ -102,7 +112,7 @@ libc/Lua) and target-agnostic:
 |--------|------|
 | `iso8211` | the ISO/IEC 8211 container reader (the bottom layer; std-only) |
 | `s57` | the S-57 chart parser + geometry model (reads 8211 records through `iso8211`) |
-| `s101` | the S-101 catalogue, the S-57 → S-101 adapter, and the portrayal instruction stream |
+| `s101` | the S-101 catalogue, the native S-101 dataset reader, the S-57 → S-101 adapter, and the portrayal instruction stream |
 | `portray` | the embedded-Lua S-101 runner (links libc) |
 | `tiles` | MVT + MLT encoders, gzip, the PMTiles container, web-mercator tile math |
 | `render` | the Surface contract, the resolver (colours, display gates), and the pixel machinery (Canvas, PNG, PDF, ASCII) |
