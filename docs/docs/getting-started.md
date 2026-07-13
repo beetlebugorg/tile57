@@ -13,7 +13,9 @@ uses the engine from Zig and C. It assumes you have finished
 ## 1. Bake a chart with the CLI
 
 The `tile57` binary is the offline tool. It bakes ENC charts to PMTiles and emits
-the portrayal assets a renderer needs:
+the portrayal assets a renderer needs. Every `CELL.000` below can be a native S-101
+chart or an S-57 cell — the format is detected from the file, so the same commands
+work on either:
 
 ```sh
 zig build                          # builds zig-out/bin/tile57
@@ -39,6 +41,7 @@ $T pdf CELL.000 --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
 # Inspect / summarise
 $T inspect out/tiles/US5MD1MC.pmtiles  # zoom range + tile counts for one chart
 $T cell    CELL.000                    # summarise an S-57 chart
+$T s101    CELL.000                    # inspect a native S-101 dataset
 $T version
 ```
 
