@@ -1172,6 +1172,37 @@ pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, stre
     return out;
 }
 
+/// Per-feature DRAWN-boundary cache (cell.drawn_boundary), indexed by feature index.
+/// An area feature whose stroked boundary differs from its full fill ring
+/// (needsDrawableBoundary — MASK/USAG edge flags, or a coast-coincident edge on a
+/// non-coast-definer area) restrokes only the drawableLineParts SUBSET. That subset is
+/// tile-invariant, so assemble it ONCE here and precompute each vertex's web-mercator
+/// world coordinate — the per-tile emit then reprojects with a linear worldToTile instead
+/// of running the transcendental projection on the boundary for every tile the area spans
+/// (the dominant cost on Inland-ENC river cells: fairway/depth areas with long shared coast
+/// boundaries). A null slot leaves the feature on the live path (reconstruct + project),
+/// byte-identical since `world` holds exactly `tile.lonLatToWorld` and `tile.project` is
+/// `worldToTile ∘ lonLatToWorld`. Covers exactly the features the per-tile stroke path
+/// routes through drawableLineParts — ANY prim whose `needsDrawableBoundary` holds, not
+/// areas only: a LINE (prim 2) with MASK/USAG edge flags takes the same drawn-subset path
+/// and was the bulk of the uncached per-tile projection on Inland-ENC cells.
+pub fn buildDrawnBoundary(a: Allocator, cell: *const s57.Cell) ![]?s57.DrawnBoundary {
+    const out = try a.alloc(?s57.DrawnBoundary, cell.features.len);
+    @memset(out, null);
+    for (cell.features, 0..) |f, i| {
+        if (!cell.needsDrawableBoundary(f)) continue;
+        const parts = cell.drawableLineParts(a, f) catch continue;
+        const world = a.alloc([][2]f64, parts.len) catch continue;
+        for (parts, 0..) |part, pi| {
+            const wp = try a.alloc([2]f64, part.len);
+            for (part, 0..) |pt, j| wp[j] = tile.lonLatToWorld(pt.lon(), pt.lat());
+            world[pi] = wp;
+        }
+        out[i] = .{ .parts = parts, .world = world };
+    }
+    return out;
+}
+
 /// One assembled line/area part: its tile-independent web-mercator coords plus its
 /// static lon/lat bbox [w,s,e,n] and the matching normalised world bbox
 /// [min_wx,min_wy,max_wx,max_wy]. Both are computed ONCE here so the baker's
@@ -1604,13 +1635,23 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     var stroke_proj: []const []const mvt.Point = projected.items;
     if (!opts.suppress_lines and p.lines.len > 0 and cell.needsDrawableBoundary(f)) {
         var stroke_storage = std.ArrayList([]mvt.Point).empty;
-        const dparts = cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{};
+        // The baker's per-cell drawn-boundary cache: the drawableLineParts subset plus each
+        // vertex's precomputed world coord. Reproject the cached world with a linear
+        // worldToTile instead of the transcendental projection on every tile — the drawn
+        // boundary is tile-invariant. Live path (no cache / single tile) reconstructs and
+        // projects directly; byte-identical, since project == worldToTile ∘ lonLatToWorld.
+        const cached: ?s57.DrawnBoundary = if (cell.drawn_boundary) |db| (if (fi < db.len) db[fi] else null) else null;
+        const dparts: []const []s57.LonLat = if (cached) |c| c.parts else (cell.drawableLineParts(a, f) catch &[_][]s57.LonLat{});
         stroke_geo = dparts;
-        for (dparts) |dp| {
+        for (dparts, 0..) |dp, pi| {
             if (dp.len < 2) continue;
             if (!overlaps(geomBounds(dp), tb)) continue;
             const proj = try a.alloc(mvt.Point, dp.len);
-            for (dp, 0..) |p2, i| proj[i] = tile.project(p2.lon(), p2.lat(), z, x, y, tile.EXTENT);
+            if (cached) |c| {
+                for (c.world[pi], 0..) |ww, i| proj[i] = tile.worldToTile(ww, z, x, y, tile.EXTENT);
+            } else {
+                for (dp, 0..) |p2, i| proj[i] = tile.project(p2.lon(), p2.lat(), z, x, y, tile.EXTENT);
+            }
             try stroke_storage.append(a, proj);
         }
         stroke_proj = stroke_storage.items;

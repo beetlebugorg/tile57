@@ -35,6 +35,18 @@ pub const LonLat = struct {
         return .{ .lon_e7 = degToE7(lon_deg), .lat_e7 = degToE7(lat_deg) };
     }
 };
+/// One area feature's DRAWN boundary: the parts left after §8.6.2 masking drops the
+/// masked / data-limit / coast-coincident edges (`Cell.drawableLineParts`), together
+/// with each vertex's precomputed normalised web-mercator world coordinate parallel to
+/// `parts` (`world[i].len == parts[i].len`). The baker fills `world` once per cell
+/// (scene.buildDrawnBoundary via `tile.lonLatToWorld`) so the per-tile stroke path
+/// reprojects with a linear `worldToTile` instead of the transcendental projection. The
+/// coords are opaque f64 pairs to the Cell — only the renderer interprets them; the pair
+/// is exactly what `tile.project` would recompute inline, so the cache stays byte-identical.
+pub const DrawnBoundary = struct {
+    parts: [][]LonLat,
+    world: [][][2]f64,
+};
 pub const Sounding = struct {
     lon_e7: i32,
     lat_e7: i32,
@@ -618,6 +630,17 @@ pub const Cell = struct {
     /// single-tile path falls back to an on-demand search). Allocated in the baker's
     /// geometry arena, not the cell arena.
     label_cache: ?[]const ?LonLat = null,
+    /// Per-feature DRAWN-boundary cache (area features whose stroked boundary differs
+    /// from the full fill ring — `needsDrawableBoundary`), built once per cell by the
+    /// baker (scene.buildDrawnBoundary). A null slot means "stroke the full ring" (no
+    /// masked/coast edges to drop). See `DrawnBoundary`: it carries the drawn parts plus
+    /// each vertex's precomputed web-mercator world coord, so the per-tile emit reprojects
+    /// the boundary with a cheap linear map instead of the transcendental projection on
+    /// every tile the area spans — the dominant cost on Inland-ENC cells whose fairway /
+    /// depth areas share long coast boundaries. Allocated in the baker's geometry arena,
+    /// not the cell arena; null = not built (the live single-tile path reconstructs +
+    /// projects on demand, byte-identical).
+    drawn_boundary: ?[]const ?DrawnBoundary = null,
     /// True when this cell was assembled from a NATIVE S-101 dataset (s101.native)
     /// rather than parsed from an S-57 source. It carries the S-57 geometry model
     /// but its features draw their portrayal from S-101-native `adapter.Adapted`
