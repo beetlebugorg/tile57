@@ -471,6 +471,7 @@ pub const TileSurface = struct {
         .endScene = endScene,
         // Bake path: store complex runs un-tessellated (no size_scale set — bake is
         // native; replay re-walks the period display-scaled).
+        .store_complex_run = storeComplexRun,
     };
 
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
@@ -597,6 +598,29 @@ pub const TileSurface = struct {
         single[0] = at;
         parts[0] = single;
         try s.pointsL().append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+    }
+
+    /// BAKE: store one clipped complex-linestyle run UN-TESSELLATED, tagged with its style id
+    /// and its phase (arc0), so replay can re-walk the period at the DISPLAY's size_scale.
+    ///
+    /// Without this the baker falls through to drawComplexRun and freezes the period at
+    /// size_scale = 1. The bricks then scale with the display at render time while their
+    /// SPACING does not, so on a HiDPI display (size_scale ~3) the symbols swell into each
+    /// other and the linestyle reads as a smashed-up sawtooth. The whole point of storing the
+    /// run is that spacing and brick size scale TOGETHER, and the baked tile stays
+    /// display-independent — replay.zig has always known how to read this; only the baker
+    /// never wrote it.
+    fn storeComplexRun(ctx: *anyopaque, ls_id: []const u8, color: rs.ColorToken, width_px: f64, arc0: f64, run: []const rs.TilePoint) anyerror!void {
+        const s = sp(ctx);
+        var props = std.ArrayList(mvt.Prop).empty;
+        try props.append(s.a, .{ .key = "ls_style", .value = .{ .string = ls_id } });
+        try props.append(s.a, .{ .key = "ls_arc0", .value = .{ .double = arc0 } });
+        try props.append(s.a, .{ .key = "color_token", .value = .{ .string = color } });
+        try props.append(s.a, .{ .key = "width_px", .value = .{ .double = width_px } });
+        try appendMeta(s.a, &props, s.cur);
+        const parts = try s.a.alloc([]const mvt.Point, 1);
+        parts[0] = run;
+        try s.linesL().append(s.a, .{ .geom_type = .linestring, .parts = parts, .properties = props.items });
     }
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
