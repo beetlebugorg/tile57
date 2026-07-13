@@ -111,6 +111,12 @@ pub fn categoryVisible(cat: ?i64, class: []const u8, symbol_name: ?[]const u8, m
             if (std.mem.eql(u8, class, mc)) return false;
         }
     }
+    // Spot soundings ride their own switch when the host set one: S-52 files SOUNDG under the
+    // OTHER category, but a mariner asking for soundings is not asking for the seabed and the
+    // cables too. `show_soundings == null` keeps the old behaviour (follow the category).
+    if (std.mem.eql(u8, class, "SOUNDG")) {
+        if (m.show_soundings) |on| return on;
+    }
     var c = cat orelse 1;
     if (symbol_name) |sn| {
         if (std.mem.eql(u8, sn, "ISODGR01")) c = if (m.show_isolated_dangers_shallow) 1 else 0;
@@ -223,6 +229,26 @@ test "Colors: token -> RGB per palette, unknown -> null" {
     try std.testing.expectEqual(Rgb{ .r = 25, .g = 35, .b = 40 }, c.get(.night, "DEPMS").?);
     try std.testing.expectEqual(@as(?Rgb, null), c.get(.dusk, "CHBLK")); // dusk fixture lacks it
     try std.testing.expectEqual(@as(?Rgb, null), c.get(.day, "NOSUCH"));
+}
+
+test "soundings ride their own switch, not the OTHER category" {
+    // The everyday ECDIS setting: STANDARD category, soundings ON. Before the switch existed a
+    // host had to turn OTHER on for this, and got the seabed/cables/clutter with it.
+    const std_plus_soundings = Settings{ .display_other = false, .show_soundings = true };
+    try std.testing.expect(categoryVisible(2, "SOUNDG", null, &std_plus_soundings));
+    try std.testing.expect(!categoryVisible(2, "OBSTRN", null, &std_plus_soundings)); // rest of OTHER stays off
+    try std.testing.expect(categoryVisible(1, "DEPCNT", null, &std_plus_soundings)); // standard unaffected
+
+    // ...and the reverse: the whole OTHER category on, but soundings explicitly off.
+    const other_no_soundings = Settings{ .display_other = true, .show_soundings = false };
+    try std.testing.expect(!categoryVisible(2, "SOUNDG", null, &other_no_soundings));
+    try std.testing.expect(categoryVisible(2, "OBSTRN", null, &other_no_soundings));
+
+    // null (a host that never set it) = the old behaviour: soundings follow the category.
+    const legacy_std = Settings{ .display_other = false };
+    const legacy_other = Settings{ .display_other = true };
+    try std.testing.expect(!categoryVisible(2, "SOUNDG", null, &legacy_std));
+    try std.testing.expect(categoryVisible(2, "SOUNDG", null, &legacy_other));
 }
 
 test "categoryVisible mirrors mariner.categoryFilter" {

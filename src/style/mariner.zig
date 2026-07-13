@@ -48,6 +48,13 @@ pub const Settings = struct {
     display_standard: bool = true,
     display_other: bool = false,
 
+    // Spot soundings, independent of the category above (S-52 files SOUNDG under OTHER, but
+    // every ECDIS — OpenCPN included — offers soundings as their own switch, and the everyday
+    // setting is STANDARD + soundings ON). Without this a host that wants soundings has to
+    // turn the whole OTHER category on and take the seabed, the cables and the rest of the
+    // low-priority clutter with them. `null` = follow the display category, as before.
+    show_soundings: ?bool = null,
+
     // -- overlays / opt-in markers (off by default) --
     data_quality: bool = false,
     show_inform_callouts: bool = false,

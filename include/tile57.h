@@ -423,6 +423,17 @@ typedef struct tile57_mariner {
                          * (soundings arrive as one sprite per digit, so a host cannot
                          * do this itself). NOT an S-52 setting. Appended for
                          * ABI-append-safety; 0 is read as 1.0. */
+    uint8_t soundings; /* spot soundings, INDEPENDENT of the display category.
+                         * S-52 files SOUNDG under OTHER, but every ECDIS gives
+                         * soundings their own switch and the everyday setting is
+                         * STANDARD + soundings ON. Without this a host has to enable
+                         * the whole OTHER category just to see soundings, and takes
+                         * the seabed, the cables and the rest of the low-priority
+                         * clutter with it.
+                         *   0 = follow the display category (the old behaviour)
+                         *   1 = show soundings whatever the category says
+                         *   2 = hide soundings whatever the category says
+                         * Appended for ABI-append-safety: a zeroed struct means 0. */
 } tile57_mariner;
 
 /* Fill *m with the canonical default mariner settings (so a host needn't
