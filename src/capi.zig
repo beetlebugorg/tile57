@@ -1338,6 +1338,15 @@ export fn tile57_style_template(
     opts.minzoom = minzoom;
     if (maxzoom != 0) opts.maxzoom = maxzoom;
     if (tile_encoding == TILE_TYPE_MLT) opts.encoding = "mlt";
+    // Analysed complex linestyles from the embedded catalogue: the template gains the
+    // ls_style decoration layers + the "tile57:linestyles" metadata carrier (tile57_style_build
+    // rebuilds them from that carrier on every mariner change). bundle.linestylesBytes does
+    // filesystem I/O for an on-disk catalogue, so stand up a threaded std.Io; "" = embedded.
+    var ls_arena = std.heap.ArenaAllocator.init(gpa);
+    defer ls_arena.deinit();
+    var ls_threaded: std.Io.Threaded = .init(gpa, .{});
+    defer ls_threaded.deinit();
+    opts.linestyles_json = bundle.linestylesBytes(ls_threaded.io(), ls_arena.allocator(), "") catch null;
     const style_json = style.json(gpa, opts) catch |e| return fail(err, e);
     return exportOut(err, o, n, style_json);
 }

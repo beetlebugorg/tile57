@@ -108,7 +108,10 @@ test "displayDenom is the exact inverse of scaminDisplayZoom" {
 // S-52 DrawingPriority fill order: draw_prio*1000 - drval1.
 const FILL_SORT = .{ "-", .{ "*", .{ "coalesce", .{ "get", "draw_prio" }, 0 }, 1000 }, .{ "coalesce", .{ "get", "drval1" }, 0 } };
 
-const FILT_SOLID = .{ "==", .{ "coalesce", .{ "get", "dash" }, "solid" }, "solid" };
+// solid lines EXCLUDE the un-tessellated complex-linestyle runs (tagged ls_style):
+// those get their own dasharray + line-placed symbol layers (linestyleLayers), so a
+// run must not also paint as a plain solid stroke here.
+const FILT_SOLID = .{ "all", .{ "==", .{ "coalesce", .{ "get", "dash" }, "solid" }, "solid" }, .{ "!", .{ "has", "ls_style" } } };
 const FILT_DASHED = .{ "==", .{ "get", "dash" }, "dashed" };
 const FILT_DOTTED = .{ "==", .{ "get", "dash" }, "dotted" };
 
@@ -217,6 +220,14 @@ pub const Options = struct {
     // The SCAMIN denominator baked into the filter-gate clause. The live client overwrites
     // it via setFilter; this is only the standalone default (0 = show all, client-owned).
     scamin_cur_denom: f64 = 0,
+    // Analysed complex-linestyle patterns (the linestyles.json emitted for clients:
+    // id -> {period_px, dash[], color_token, width_px, symbols[]}). When present the
+    // style gains one dasharray line layer per id (+ a line-placed symbol layer per
+    // embedded symbol when a sprite is wired) decorating the un-tessellated ls_style
+    // runs the tiles carry, and the JSON rides the style's "tile57:linestyles" metadata
+    // so a mariner rebuild from the template keeps the layers. null = ls_style runs
+    // draw as plain solid lines.
+    linestyles_json: ?[]const u8 = null,
 };
 
 // Precomputed, mariner-aware style expressions shared by every layer of one
@@ -676,15 +687,103 @@ fn overscaleLayer(js: *Stringify, s: *const SCtx) !void {
     try js.endObject();
 }
 
-// One complex (symbolised) line layer for a source-layer + SCAMIN bucket.
-fn complexLineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void {
-    var buf: [96]u8 = undefined;
-    try js.beginObject();
-    try layerHead(js, try std.fmt.bufPrint(&buf, "complex-{s}{s}", .{ sl, bkt.suffix }), "line", sl);
-    try js.objectField("paint");
-    try linePaint(js, s.line_color, null, s.size_scale);
-    try applyBucket(js, .{}, false, bkt, s, null); // complex (symbolised) scamin lines band-independent
-    try js.endObject();
+// Linestyle-embedded symbols draw at the engine's SYMBOL_SCALE (0.028346…, see
+// scene/linestyle.zig drawComplexLine), not the 0.08 point-symbol default the sprite
+// atlas is sized for. Un-tessellated ls_style runs carry no per-symbol `scale` tile
+// property, so ICON_SIZE would coalesce to 0.08/0.08 = 1.0 (full atlas size, ~2.8x
+// too large); this fixed ratio makes the style-placed symbols match the tessellated
+// ones exactly.
+const LS_ICON_SIZE: f64 = 0.02834627777338028 / 0.08;
+
+// One decorated layer set for one analysed complex linestyle: a line layer whose
+// line-dasharray is the pattern's on/off runs in line-width units, and (sprite
+// permitting) a line-placed symbol layer per embedded symbol, spaced one period
+// apart. Colour/width ride the run's own color_token/width_px tile properties, so
+// the palette resolves exactly like every other line. The tiles carry each run
+// UN-tessellated (tagged ls_style); MapLibre walks the dash rhythm + symbol
+// placement at render time — the web analogue of replay.zig's drawComplexRun, and
+// it scales uniformly with zoom/DPR so spacing and glyph size stay locked together.
+fn linestyleLayers(js: *Stringify, s: *const SCtx, ls: std.json.Value, bkt: Bucket, sprite_on: bool) !void {
+    if (ls != .object) return;
+    var it = ls.object.iterator();
+    while (it.next()) |e| {
+        const id = e.key_ptr.*;
+        const v = e.value_ptr.*;
+        if (v != .object) continue;
+        const period = jsonNum(v.object.get("period_px")) orelse continue;
+        const width = jsonNum(v.object.get("width_px")) orelse 1;
+        const w = if (width > 0.05) width else 1.0;
+        const dash_v = v.object.get("dash") orelse continue;
+        if (dash_v != .array or dash_v.array.items.len == 0) continue;
+
+        var buf: [96]u8 = undefined;
+        try js.beginObject();
+        try layerHead(js, try std.fmt.bufPrint(&buf, "lines-ls-{s}{s}", .{ id, bkt.suffix }), "line", "lines");
+        try applyBucket(js, .{ "==", .{ "get", "ls_style" }, id }, true, bkt, s, null);
+        try js.objectField("layout");
+        try js.beginObject();
+        try js.objectField("line-sort-key");
+        try js.write(.{ "coalesce", .{ "get", "draw_prio" }, 0 });
+        try js.endObject();
+        try js.objectField("paint");
+        try js.beginObject();
+        try js.objectField("line-color");
+        try js.write(s.line_color);
+        try js.objectField("line-width");
+        try writeScaled(js, .{ "coalesce", .{ "get", "width_px" }, 1 }, s.size_scale);
+        // MapLibre dasharray units are multiples of the line width.
+        try js.objectField("line-dasharray");
+        try js.beginArray();
+        for (dash_v.array.items) |dv| {
+            const px = jsonNumV(dv) orelse 0;
+            try js.write(px / w);
+        }
+        try js.endArray();
+        try js.endObject(); // paint
+        try js.endObject(); // layer
+
+        if (!sprite_on) continue;
+        const syms_v = v.object.get("symbols") orelse continue;
+        if (syms_v != .array) continue;
+        for (syms_v.array.items, 0..) |sv, si| {
+            if (sv != .object) continue;
+            const name_v = sv.object.get("n") orelse continue;
+            if (name_v != .string) continue;
+            try js.beginObject();
+            try layerHead(js, try std.fmt.bufPrint(&buf, "lines-ls-{s}-sym{d}{s}", .{ id, si, bkt.suffix }), "symbol", "lines");
+            try applyBucket(js, .{ "==", .{ "get", "ls_style" }, id }, true, bkt, s, null);
+            try js.objectField("layout");
+            try js.beginObject();
+            try js.objectField("symbol-placement");
+            try js.write("line");
+            try js.objectField("symbol-spacing");
+            try js.write(@max(period * s.size_scale, 1.0));
+            try js.objectField("icon-image");
+            try js.write(name_v.string);
+            try js.objectField("icon-size");
+            try writeScaled(js, LS_ICON_SIZE, s.size_scale);
+            try js.objectField("icon-rotation-alignment");
+            try js.write("map");
+            try js.objectField("icon-allow-overlap");
+            try js.write(true);
+            try js.objectField("icon-ignore-placement");
+            try js.write(true);
+            try js.endObject(); // layout
+            try js.endObject(); // layer
+        }
+    }
+}
+
+fn jsonNum(v: ?std.json.Value) ?f64 {
+    return jsonNumV(v orelse return null);
+}
+
+fn jsonNumV(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => null,
+    };
 }
 
 // One DEPCNT contour value-label layer (glyphs required) for a source-layer + bucket.
@@ -792,6 +891,13 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
     var barena = std.heap.ArenaAllocator.init(alloc);
     defer barena.deinit();
     const ba = barena.allocator();
+    // Analysed complex-linestyle patterns for the ls_style decoration layers (kept in
+    // the bucket arena; malformed input just drops the decoration — ls_style runs then
+    // fall through to lines-solid as plain strokes rather than aborting the style).
+    const ls_parsed: ?std.json.Value = if (opts.linestyles_json) |lsj| blk: {
+        const pv = std.json.parseFromSliceLeaky(std.json.Value, ba, lsj, .{}) catch break :blk null;
+        break :blk if (pv == .object) pv else null;
+    } else null;
     const gate: Bucket = if (opts.ignore_scamin)
         .{}
     else if (opts.scamin_filter_gate)
@@ -918,10 +1024,19 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
     }
 
     // 4. lines: solid/dashed/dotted over the merged `lines` layer, one gated set per
-    // SCAMIN bucket. Complex (symbolised) lines and light sector figures fold into
-    // `lines` too (scene.zig endScene), so there are NO complex_lines / sector_lines
-    // source-layers to draw.
+    // SCAMIN bucket. Light sector figures fold into `lines` too (scene.zig endScene),
+    // so there is NO sector_lines source-layer to draw.
     for (scamin_buckets) |bkt| try lineLayers(js, &s, "lines", bkt);
+
+    // 4b. complex (symbolised) linestyles: the tiles carry each run UN-tessellated,
+    // tagged ls_style + color_token + width_px (scene.zig storeComplexRun), and
+    // lines-solid excludes ls_style so nothing double-draws. One dasharray line layer
+    // per analysed LineStyles id decorates the runs, plus a line-placed symbol layer
+    // per embedded symbol when a sprite is wired — MapLibre walks them at render time
+    // (the OpenCPN plugin re-walks the same runs natively via replay.zig).
+    if (ls_parsed) |lsv| {
+        for (scamin_buckets) |bkt| try linestyleLayers(js, &s, lsv, bkt, sprite_on);
+    }
 
     // 5. point symbols + soundings (sprite required) over the merged `point_symbols`
     // layer, stacked by z-order — draw_prio is the SOLE axis, partitioned at the
@@ -974,6 +1089,15 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
         try js.objectField("sprite");
         try js.write(sp);
     }
+    // Carry the analysed linestyles in the style itself, so a mariner rebuild from this
+    // style-as-template (buildFromTemplateScamin) re-emits the ls_style decoration layers.
+    if (ls_parsed) |lsv| {
+        try js.objectField("metadata");
+        try js.beginObject();
+        try js.objectField("tile57:linestyles");
+        try js.write(lsv);
+        try js.endObject();
+    }
     try js.endObject();
     return aw.toOwnedSlice();
 }
@@ -1017,6 +1141,10 @@ pub fn buildFromTemplateScamin(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, template_json, .{}) catch
         return alloc.dupe(u8, template_json);
     defer parsed.deinit();
+    // Re-serialised "tile57:linestyles" carrier lifted from the template (see json's
+    // metadata block); alloc-owned so it outlives `parsed` through the json() call below.
+    var lifted_ls: ?[]u8 = null;
+    defer if (lifted_ls) |b| alloc.free(b);
     var opts = Options{
         .scheme = switch (m.scheme) {
             .dusk => "dusk",
@@ -1040,6 +1168,12 @@ pub fn buildFromTemplateScamin(
         }
         if (root.get("glyphs")) |v| {
             if (v == .string) opts.glyphs = v.string;
+        }
+        if (root.get("metadata")) |mv| {
+            if (mv == .object) if (mv.object.get("tile57:linestyles")) |lv| {
+                lifted_ls = std.json.Stringify.valueAlloc(alloc, lv, .{}) catch null;
+                opts.linestyles_json = lifted_ls;
+            };
         }
         if (root.get("sources")) |sv| {
             if (sv == .object) if (sv.object.get("chart")) |cv| {
