@@ -148,6 +148,13 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
     // --- Features -> shell features + native Adapted ----------------------
     var features = std.ArrayList(s57.Feature).empty;
     var adapted = std.ArrayList(adapter.Adapted).empty;
+    // The chart's compilation-scale denominator (S-57 CSCL analog), read from the
+    // DataCoverage feature's display-scale metadata — WITHOUT it every native cell
+    // defaults to the approach band [z11,13], so a small-scale overview chart with
+    // a huge coverage bakes an enormous z13 tile pyramid. The optimum display scale
+    // is the intended viewing scale (the natural band); fall back to the max/min.
+    // Finest (smallest denominator) across the chart's coverages preserves detail.
+    var chart_cscl: i32 = 0;
     // Per-feature pick-report data (parallel to `features`): S-101 class + a JSON of
     // the S-101 attribute tree, so the cursor-pick report serves real S-101 data.
     var pick_classes = std.ArrayList([]const u8).empty;
@@ -217,6 +224,18 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
         try pick_classes.append(a, try a.dupe(u8, class));
         try pick_jsons.append(a, jbuf.items);
 
+        // The chart's band scale, from a DataCoverage's display-scale metadata.
+        if (std.mem.eql(u8, class, "DataCoverage")) {
+            const sv = root.simpleValue("optimumDisplayScale") orelse
+                root.simpleValue("maximumDisplayScale") orelse
+                root.simpleValue("minimumDisplayScale");
+            if (sv) |s| {
+                if (std.fmt.parseInt(i32, std.mem.trim(u8, s, " "), 10)) |n| {
+                    if (n > 0 and (chart_cscl == 0 or n < chart_cscl)) chart_cscl = n;
+                } else |_| {}
+            }
+        }
+
         // Native Adapted: class name + CNode tree from ATTR (no adapter). SOUNDG
         // (objl 129) is emitted directly as a multipoint by scene, and a feature with
         // no spatial primitive can't portray — neither goes through the rules (the
@@ -255,7 +274,7 @@ fn assemble(gpa: Allocator, ds: *dataset.Dataset) !Loaded {
     }
 
     const cell = s57.Cell{
-        .params = .{ .comf = @intFromFloat(ds.params.cmfx), .somf = @intFromFloat(ds.params.cmfz) },
+        .params = .{ .comf = @intFromFloat(ds.params.cmfx), .somf = @intFromFloat(ds.params.cmfz), .cscl = chart_cscl },
         .vectors = vectors.items,
         .features = features.items,
         .nodes = nodes,

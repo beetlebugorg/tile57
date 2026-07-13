@@ -518,7 +518,10 @@ pub fn openPmtilesPath(io: std.Io, path: []const u8) !*Chart {
 // but does not take ownership. Portrayal failure is non-fatal (classify() fallback).
 fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const u8) ?CellBackend {
     const loaded = parseAnyCell(base, updates) orelse return null;
-    var cb = CellBackend{ .cell = loaded.cell, .cscl = s57.peekScale(gpa, base) orelse 0 };
+    // Use the parsed cell's compilation scale (S-57 DSPM CSCL, or a native S-101
+    // chart's DataCoverage display scale) — `peekScale` reads only the S-57 DSPM and
+    // returns 0 for native, which would mis-band a native chart in the live compositor.
+    var cb = CellBackend{ .cell = loaded.cell, .cscl = loaded.cell.params.cscl };
     const pa = gpa.create(std.heap.ArenaAllocator) catch return cb;
     pa.* = std.heap.ArenaAllocator.init(gpa);
     cb.portray_arena = pa;
@@ -629,16 +632,19 @@ pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     var cov_arena = std.heap.ArenaAllocator.init(gpa);
     defer cov_arena.deinit();
     var coverage_json: ?[]const u8 = null;
+    // Parse native-aware (S-101 or S-57): the band scale + the archive's coverage
+    // sidecar both come from the real cell, so a native S-101 chart bands by its
+    // DataCoverage display scale (not the S-57-misparsed cscl=0 approach default).
     var cscl: i32 = s57.peekScale(gpa, cf.base) orelse 0;
-    if (s57.parseCellWithUpdates(gpa, cf.base, cf.updates)) |parsed| {
-        var cell = parsed;
+    if (parseAnyCell(cf.base, cf.updates)) |loaded| {
+        var cell = loaded.cell;
         defer cell.deinit();
         cscl = cell.params.cscl;
         const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
         const band: u8 = @intFromEnum(bake_enc.bandOf(cscl));
         const cc = scene.coverage.fromCell(cov_arena.allocator(), &cell, stem, band);
         coverage_json = scene.coverage.encodeJson(cov_arena.allocator(), cc) catch null;
-    } else |_| {}
+    }
 
     // The cell's band window, plus the extend_min fill DOWN to z0: sub-band tiles
     // (scamin-thinned by the scene cull) let the compositor pull this cell up into

@@ -118,6 +118,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     std.debug.print("\n  assembled shell: features={d} adapted={d} vectors={d} nodes={d} edges={d} soundingVecs={d}\n", .{
         cell.features.len, loaded.adapted.len, cell.vectors.len, cell.nodes.count(), cell.edges.count(), cell.sounding_vecs.count(),
     });
+    const band = engine.bake_enc.bandOf(cell.params.cscl);
+    const zr = engine.bake_enc.bandZooms(band);
+    std.debug.print("  band scale: cscl=1:{d} -> {s} band, bake z{d}..{d}\n", .{ cell.params.cscl, @tagName(band), zr.min, zr.max });
     if (cell.bounds()) |b| std.debug.print("  geometry bounds: lon [{d:.5}, {d:.5}]  lat [{d:.5}, {d:.5}]\n", .{ b[0], b[2], b[1], b[3] });
     // Spot-check assembled geometry per primitive: pick the first area/line/point
     // adapted feature and report the vertex/part counts the accessors return.
