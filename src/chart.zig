@@ -41,6 +41,35 @@ const compose_mod = @import("compose"); // the runtime compositor (compose-backe
 // lists); page_allocator would mmap each one. Matches the bake CLI + C ABI.
 const gpa = std.heap.smp_allocator;
 
+// The S-52 colour tables, parsed once per process from the embedded profile (see
+// Chart.viewColorsRef). Immutable after init — every chart shares these, so the
+// parse cannot be charged to a chart open. gpa is thread-safe and the tables live
+// for the process, so they are deliberately never freed.
+// One-shot: 0 = unparsed, 1 = a thread is parsing, 2 = ready. Zig 0.16 puts mutexes
+// behind an Io (which the engine deliberately does not take), so the guard is a CAS
+// plus a spin — and it can only ever contend on the very first tile of the first
+// chart. After that this is one acquire load.
+var colors_state: std.atomic.Value(u8) = .init(0);
+var shared_colors: render.resolve.Colors = undefined;
+var shared_colors_err: ?anyerror = null;
+
+fn sharedColors() !*render.resolve.Colors {
+    while (colors_state.load(.acquire) != 2) {
+        if (colors_state.cmpxchgStrong(@as(u8, 0), @as(u8, 1), .acquire, .monotonic) == null) {
+            if (render.resolve.Colors.init(gpa, embedded_assets.colorprofile[0].bytes)) |c| {
+                shared_colors = c;
+            } else |e| {
+                shared_colors_err = e;
+            }
+            colors_state.store(2, .release);
+            break;
+        }
+        std.atomic.spinLoopHint();
+    }
+    if (shared_colors_err) |e| return e;
+    return &shared_colors;
+}
+
 // Env access lives in C (Zig 0.16 puts env behind Io); returns the S-101 rules
 // dir from TILE57_S101_RULES or null. Provided by the portrayal C shim.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
@@ -913,12 +942,12 @@ pub fn renderComposeView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     defer arena.deinit();
     const a = arena.allocator();
 
-    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const colors = try sharedColors();
     const store = try viewSymbolStore(a, palette);
     defer store.deinit();
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-    var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, tile.EXTENT);
+    var ps = render.pixel.PixelSurface.initView(a, colors, palette, settings, zoom, w, h, pt, tile.EXTENT);
     ps.store = store.asStore();
     ps.output = output;
     ps.cb = cb_table;
@@ -943,12 +972,12 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
     defer arena.deinit();
     const a = arena.allocator();
 
-    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const colors = try sharedColors();
     const store = try viewSymbolStore(a, palette);
     defer store.deinit();
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-    var vs = render.vector.VectorSurface.init(a, &colors, palette, settings, cb);
+    var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
     vs.store = store.asStore();
     vs.view_zoom = zoom; // scale at which labels/symbols declutter
     vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
@@ -1114,7 +1143,6 @@ pub const Chart = struct {
     view_gen: u64 = 0,
     view_tiles_max: usize = 192, // > the ~96 tiles of one 2560px view: never evicts mid-render
     view_arena: ?*std.heap.ArenaAllocator = null,
-    view_colors: ?*render.resolve.Colors = null,
     view_stores: [3]?*sprite.CatalogStore = .{ null, null, null },
 
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
@@ -1341,14 +1369,14 @@ pub const Chart = struct {
         return self.view_arena.?.allocator();
     }
 
-    /// The palette colour tables, parsed once per handle (all three palettes).
-    fn viewColorsRef(self: *Chart) !*render.resolve.Colors {
-        if (self.view_colors) |c| return c;
-        const va = try self.viewArena();
-        const c = try va.create(render.resolve.Colors);
-        c.* = try render.resolve.Colors.init(va, embedded_assets.colorprofile[0].bytes);
-        self.view_colors = c;
-        return c;
+    /// The palette colour tables (all three palettes). Parsed once per PROCESS, not
+    /// once per handle: they are a pure function of the embedded colour profile — the
+    /// same bytes for every chart — and read-only once parsed. A host that opens and
+    /// purges chart handles as it walks a quilt (a large chart set makes that constant)
+    /// was re-parsing the whole profile on every open, which showed up as a visible
+    /// slice of frame time under the tile path.
+    fn viewColorsRef(_: *Chart) !*render.resolve.Colors {
+        return sharedColors();
     }
 
     /// The palette's symbol store, built once per handle per palette (the SVG
@@ -1786,9 +1814,9 @@ pub const Chart = struct {
         // and no complex-linestyle table: the ASCII surface lowers symbol
         // NAMES to glyphs itself, and complex linestyles degrading to the
         // generic dashed stroke is exactly the fidelity a text grid carries.
-        var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+        const colors = try sharedColors();
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-        var as = render.ascii.AsciiSurface.initView(a, &colors, palette, settings, zoom, cols, rows, pt, @import("tiles").tile.EXTENT);
+        var as = render.ascii.AsciiSurface.initView(a, colors, palette, settings, zoom, cols, rows, pt, @import("tiles").tile.EXTENT);
         as.ansi = ansi;
 
         switch (self.backend) {
@@ -2024,7 +2052,7 @@ pub fn renderFeature(
     defer arena.deinit();
     const a = arena.allocator();
 
-    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const colors = try sharedColors();
     const css_name = switch (palette) {
         .day => "daySvgStyle",
         .dusk => "duskSvgStyle",
@@ -2052,7 +2080,7 @@ pub fn renderFeature(
     s.ignore_scamin = true;
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-    var ps = render.pixel.PixelSurface.initView(a, &colors, palette, &s, zoom, w, h, pt, tile.EXTENT);
+    var ps = render.pixel.PixelSurface.initView(a, colors, palette, &s, zoom, w, h, pt, tile.EXTENT);
     ps.store = store.asStore();
     ps.output = output;
     ps.bg_token = bg;
@@ -2101,7 +2129,7 @@ pub fn renderCellView(
     defer arena.deinit();
     const a = arena.allocator();
 
-    var colors = try render.resolve.Colors.init(a, embedded_assets.colorprofile[0].bytes);
+    const colors = try sharedColors();
     const css_name = switch (palette) {
         .day => "daySvgStyle",
         .dusk => "duskSvgStyle",
@@ -2125,7 +2153,7 @@ pub fn renderCellView(
     scene.linestyle.registerLinestylesXml(gpa, ls_srcs.items);
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-    var ps = render.pixel.PixelSurface.initView(a, &colors, palette, settings, zoom, w, h, pt, tile.EXTENT);
+    var ps = render.pixel.PixelSurface.initView(a, colors, palette, settings, zoom, w, h, pt, tile.EXTENT);
     ps.store = store.asStore();
     ps.output = output;
 
