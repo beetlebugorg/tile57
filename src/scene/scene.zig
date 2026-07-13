@@ -1143,20 +1143,28 @@ pub fn buildLabelCache(a: Allocator, cell: *const s57.Cell, geo: ?GeoParts, stre
     for (cell.features, 0..) |f, i| {
         // Polylabel (areaRepresentativePoint) is AREA-only — lines anchor at their mid-vertex.
         if (f.prim != 3) continue;
-        if (i >= ss.len) break;
-        const stream = ss[i] orelse continue; // portrayed at all (an unportrayed area never reaches labelPoint)
-        // Only an area that PLACES something at the representative point consults it: a centred
-        // label (TextInstruction), a centred symbol (PointInstruction), or the native INFORM01
-        // additional-info marker (hasAdditionalInfo). A plain fill/boundary area — the vast
-        // majority (DEPARE, LNDARE, SBDARE, DEPCNT, …) — anchors nothing there, and the pole-of-
-        // inaccessibility search is expensive, so skip it. QUESMRK1/SWPARE fallbacks carry a null
-        // stream (skipped above) and stay on the live path. The token test is a strict SUPERSET of
-        // what the per-tile path consults (an empty TextInstruction is dropped downstream), so a
-        // cached point is only ever spurious, never missing — labelPoint stays byte-identical and
-        // no per-tile recompute creeps back in.
-        if (!hasAdditionalInfo(f) and
-            std.mem.indexOf(u8, stream, "TextInstruction:") == null and
-            std.mem.indexOf(u8, stream, "PointInstruction:") == null) continue;
+        const stream: ?[]const u8 = if (i < ss.len) ss[i] else null;
+        // Cache exactly the areas whose per-tile emit anchors something at the representative
+        // point. A plain fill/boundary area — the vast majority (DEPARE, LNDARE, SBDARE, DEPCNT,
+        // …) — anchors nothing there, and the pole-of-inaccessibility search is expensive, so skip
+        // it. The set below is a strict SUPERSET of what the per-tile path consults, so a cached
+        // point is only ever spurious, never missing — labelPoint (which recomputes the SAME
+        // search from the SAME geometry on a miss) stays byte-identical either way:
+        //   • hasAdditionalInfo -> the §10.6.1.1 INFORM01 marker (stream-independent),
+        //   • an unmapped S-57 area -> the QUESMRK1 "?" fallback. It carries a NULL/errored
+        //     portrayal stream yet still runs featureAnchor for EVERY tile the polygon spans —
+        //     the per-tile pole-of-inaccessibility search that dominated Inland-ENC bakes (objl
+        //     17000+ area classes with no S-101 mapping, huge river/fairway polygons). Mirror the
+        //     emit-side QUESMRK1 guard exactly so this leaves the live path only when that fires.
+        //   • a portrayed area placing a centred label (TextInstruction) or symbol
+        //     (PointInstruction).
+        const unmapped_qmark = !cell.native and f.objl != s57.OBJL_TOPMAR and adapter.resolveClass(f) == null;
+        const places_symbol = if (stream) |s|
+            std.mem.indexOf(u8, s, "TextInstruction:") != null or
+                std.mem.indexOf(u8, s, "PointInstruction:") != null
+        else
+            false;
+        if (!hasAdditionalInfo(f) and !unmapped_qmark and !places_symbol) continue;
         const parts = featureParts(tmp.allocator(), cell.*, geo, i, f) catch continue;
         out[i] = s57.areaRepresentativePoint(tmp.allocator(), parts);
         _ = tmp.reset(.retain_capacity);
