@@ -30,12 +30,15 @@ model with no conversion — the format is auto-detected from the file, so `png`
 sequential `.001…` update files are applied (record-level insert / delete /
 modify by identity). On the SHOM France test datasets and the S-164 update
 conformance set every feature portrays (no errors), including complex attributes
-such as light sectors and buoy topmarks. One area is not yet wired for native
+such as light sectors and buoy topmarks. The cursor-pick report serves each
+feature's S-101 class and full attribute tree (nested complex attributes
+included), with text preserved as UTF-8. One area is not yet wired for native
 S-101:
 
-- **Feature and information associations.** `FASC`/`INAS` records are parsed but
-  not yet surfaced in the feature-query / pick report. They carry no portrayal
-  weight for the test charts, so rendering is unaffected.
+- **Feature-to-feature associations.** `FASC`/`INAS` records are parsed but the
+  StructureEquipment relationship (e.g. a light *supportedBy* its beacon) is not
+  yet resolved for the query report's related-feature grouping. It carries no
+  portrayal weight for the test charts, so rendering is unaffected.
 
 ## S-57 → S-101 conversion
 
