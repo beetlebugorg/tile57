@@ -8,6 +8,10 @@ const catalog_embed = @import("catalog"); // embedded portrayal assets (colour p
 const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
+
+// TILE57_COLORPROFILE override via the portrayal C shim (mirrors the decl in
+// src/chart.zig — env/IO live in C). NULL -> the embedded profile.
+extern fn tg_colorprofile_override(len: *usize) callconv(.c) ?[*]const u8;
 const resolveRulesDir = common.resolveRulesDir;
 
 // tile57 png|pdf <cell.000 | bundle.pmtiles> <z> <x> <y> -o <out> [flags]  (one tile)
@@ -159,7 +163,14 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     }
     defer if (!from_bundle) cell.deinit();
 
-    var colors = try render.resolve.Colors.init(a, catalog_embed.colorprofile[0].bytes);
+    // Honour the TILE57_COLORPROFILE override (same knob the viewer's render path
+    // uses via chart.zig sharedColors) so `tile57 png` previews a custom profile.
+    var ov_len: usize = 0;
+    const profile_xml: []const u8 = if (tg_colorprofile_override(&ov_len)) |p|
+        p[0..ov_len]
+    else
+        catalog_embed.colorprofile[0].bytes;
+    var colors = try render.resolve.Colors.init(a, profile_xml);
     m.data_quality = dq;
     m.size_scale = size_scale;
     const settings = m;
