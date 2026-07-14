@@ -685,6 +685,29 @@ export fn tile57_chart_tile_surface(
     return OK;
 }
 
+/// Portray ONE MLT tile from CALLER-SUPPLIED bytes to a surface — the archive-less
+/// twin of tile57_chart_tile_surface. For a host that fetched a tile (e.g. over
+/// HTTP from a tile server) and wants it painted with no chart open: `mlt`/`mlt_len`
+/// are the raw (decompressed) MLT tile bytes, (z,x,y) place it, decluttering is
+/// per-tile. Same WORLD-SPACE tagged draw calls as tile57_chart_tile_surface. The
+/// colour profile + symbol catalogue are the ones baked into the library. See tile57.h.
+export fn tile57_render_mlt_tile(
+    mlt: ?[*]const u8,
+    mlt_len: usize,
+    z: u8,
+    x: u32,
+    y: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const b = mlt orelse return failWith(err, .badarg, "mlt bytes must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    chart.renderMltTileSurface(b[0..mlt_len], z, x, y, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
 /// Release a chart and all cached tiles. Must not be called while any borrower
 /// (a compositor, a renderer) may still read from it. See tile57.h.
 export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {
