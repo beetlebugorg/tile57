@@ -77,6 +77,80 @@ fn sharedColors() !*render.resolve.Colors {
     return &shared_colors;
 }
 
+// Process-global per-palette symbol stores — the handle-less twin of
+// Chart.viewStoreFor, for a renderer that has tile bytes but no chart handle
+// (renderMltTileSurface / tile57_render_mlt_tile). The SVG-catalogue parse is
+// costly, so build each palette once, gpa-owned for the process lifetime. Same
+// one-shot CAS+spin as sharedColors; contends only on the first tile per palette.
+var store_state: [3]std.atomic.Value(u8) = .{ .init(0), .init(0), .init(0) };
+var shared_stores: [3]?*sprite.CatalogStore = .{ null, null, null };
+var shared_store_err: [3]?anyerror = .{ null, null, null };
+
+fn sharedStore(palette: render.resolve.PaletteId) !*sprite.CatalogStore {
+    const i: usize = @intFromEnum(palette);
+    while (store_state[i].load(.acquire) != 2) {
+        if (store_state[i].cmpxchgStrong(@as(u8, 0), @as(u8, 1), .acquire, .monotonic) == null) {
+            if (viewSymbolStore(gpa, palette)) |st| {
+                shared_stores[i] = st;
+            } else |e| {
+                shared_store_err[i] = e;
+            }
+            store_state[i].store(2, .release);
+            break;
+        }
+        std.atomic.spinLoopHint();
+    }
+    if (shared_store_err[i]) |e| return e;
+    return shared_stores[i].?;
+}
+
+/// Portray ONE MLT tile from CALLER-SUPPLIED bytes to a surface — the handle-less
+/// twin of Chart.renderSurfaceTile, for a host holding tile bytes (e.g. fetched
+/// over HTTP from a tile server) but with no chart archive open. Colours and the
+/// per-palette symbol store come from the process-global caches; decluttering is
+/// per-tile (as with renderSurfaceTile). `bytes` are raw (decompressed) MLT.
+pub fn renderMltTileSurface(bytes: []const u8, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const colors = try sharedColors();
+    const store = try sharedStore(palette);
+
+    var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
+    vs.store = store.asStore();
+    vs.view_zoom = @floatFromInt(z); // declutter at the tile's native zoom
+    const surf = vs.asSurface();
+
+    try surf.beginScene(z);
+    if (mlt.decode(a, bytes)) |layers| {
+        vs.setTile(z, x, y);
+        scene.replayTile(a, surf, layers) catch {};
+    } else |_| {} // an undecodable tile paints nothing, not an error
+    _ = try surf.endScene(a);
+}
+
+test "renderMltTileSurface: handle-less colour/store/surface setup; undecodable tile is a no-op" {
+    const V = render.vector;
+    const noop = struct {
+        fn fill(_: ?*anyopaque, _: *const V.CFeature, _: *const V.CWorldRings, _: V.CColor, _: c_int) callconv(.c) void {}
+        fn stroke(_: ?*anyopaque, _: *const V.CFeature, _: *const V.CWorldRings, _: f32, _: f32, _: f32, _: V.CColor) callconv(.c) void {}
+        fn symbol(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: c_int, _: f32, _: V.CRotAlign) callconv(.c) void {}
+        fn text(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: V.CColor, _: f32, _: V.CRotAlign) callconv(.c) void {}
+    };
+    const cb = V.CSurface{
+        .ctx = null,
+        .fill_area = noop.fill,
+        .stroke_line = noop.stroke,
+        .draw_symbol = noop.symbol,
+        .draw_text = noop.text,
+    };
+    const settings = render.resolve.Settings{};
+    // No chart handle: this drives sharedColors + sharedStore + the whole surface
+    // lifecycle. Garbage bytes fail to decode and paint nothing — still success.
+    try renderMltTileSurface(&[_]u8{ 0, 1, 2, 3 }, 14, 4680, 6260, .day, &settings, &cb);
+}
+
 // Env access lives in C (Zig 0.16 puts env behind Io); returns the S-101 rules
 // dir from TILE57_S101_RULES or null. Provided by the portrayal C shim.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;

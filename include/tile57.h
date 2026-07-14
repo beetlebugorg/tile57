@@ -619,6 +619,18 @@ tile57_status tile57_chart_tile_surface(tile57_chart *chart, uint8_t z, uint32_t
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
 
+/* Portray ONE MLT tile from CALLER-SUPPLIED bytes to a surface — the archive-less
+ * twin of tile57_chart_tile_surface. For a host that fetched a tile (e.g. over HTTP
+ * from a tile server) and wants it painted with NO chart open: `mlt`/`mlt_len` are
+ * the raw (DECOMPRESSED) MLT tile bytes; (z,x,y) place it. Same WORLD-SPACE tagged
+ * draw calls, callbacks, and PER-TILE decluttering as tile57_chart_tile_surface;
+ * the colour profile + symbol catalogue are the ones baked into the library. An
+ * undecodable tile paints nothing (still TILE57_OK). */
+tile57_status tile57_render_mlt_tile(const uint8_t *mlt, size_t mlt_len,
+                             uint8_t z, uint32_t x, uint32_t y,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
+
 /* Release a chart and all cached tiles. Must not be called while any borrower
  * (a compositor, a renderer thread) may still read from it. */
 void tile57_chart_close(tile57_chart *chart);
