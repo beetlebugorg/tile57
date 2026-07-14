@@ -56,7 +56,14 @@ var shared_colors_err: ?anyerror = null;
 fn sharedColors() !*render.resolve.Colors {
     while (colors_state.load(.acquire) != 2) {
         if (colors_state.cmpxchgStrong(@as(u8, 0), @as(u8, 1), .acquire, .monotonic) == null) {
-            if (render.resolve.Colors.init(gpa, embedded_assets.colorprofile[0].bytes)) |c| {
+            // TILE57_COLORPROFILE (via the C shim) overrides the embedded profile —
+            // its bytes are process-lifetime, so the Colors' token keys may slice in.
+            var ov_len: usize = 0;
+            const profile_xml: []const u8 = if (tg_colorprofile_override(&ov_len)) |p|
+                p[0..ov_len]
+            else
+                embedded_assets.colorprofile[0].bytes;
+            if (render.resolve.Colors.init(gpa, profile_xml)) |c| {
                 shared_colors = c;
             } else |e| {
                 shared_colors_err = e;
@@ -73,6 +80,12 @@ fn sharedColors() !*render.resolve.Colors {
 // Env access lives in C (Zig 0.16 puts env behind Io); returns the S-101 rules
 // dir from TILE57_S101_RULES or null. Provided by the portrayal C shim.
 extern fn tg_env_rules() callconv(.c) ?[*:0]const u8;
+
+// TILE57_COLORPROFILE override, also via the C shim: a colorProfile.xml the host
+// points at to recolour the chart (e.g. a monochrome "ink" profile) without a
+// rebuild. Returns the file's bytes (process-lifetime; NULL -> use the embedded
+// profile). See sharedColors().
+extern fn tg_colorprofile_override(len: *usize) callconv(.c) ?[*]const u8;
 
 /// Backend / on-disk format. `auto` sniffs PMTiles first, then S-57.
 pub const Format = enum { auto, pmtiles, s57 };

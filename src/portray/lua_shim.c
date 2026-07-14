@@ -80,6 +80,29 @@ const char *tile57_diag_lua_version(void) { return LUA_VERSION; }
  * Used only as a fallback when a caller's rules_dir argument is NULL. */
 const char *tg_env_rules(void) { return getenv("TILE57_S101_RULES"); }
 
+/* TILE57_COLORPROFILE override: if the env var names a readable colorProfile.xml,
+ * slurp it whole and return its bytes with *len set; NULL when unset/unreadable so
+ * the caller falls back to the embedded profile. Mirrors the TILE57_S101_RULES
+ * on-disk rules override, but hands back BYTES (Zig's Colors.init parses a slice).
+ * The buffer is intentionally never freed: it backs a process-lifetime colour table
+ * whose token keys slice INTO it, so it must outlive every render (one leak/process). */
+const char *tg_colorprofile_override(size_t *len) {
+    const char *path = getenv("TILE57_COLORPROFILE");
+    if (!path || !*path) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long n = ftell(f);
+    if (n <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *buf = (char *)malloc((size_t)n);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    if (got != (size_t)n) { free(buf); return NULL; }
+    *len = got;
+    return buf;
+}
+
 /* Suppress the per-cell "[s101] portrayed …" stderr summary. Set once before a
  * parallel bake (many threads would otherwise garble the progress output); read
  * read-only by tg_portray_run thereafter. */
