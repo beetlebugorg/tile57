@@ -12,10 +12,10 @@ extern void tile57GoSurfLine(void *ctx, tile57_feature *f, tile57_world_rings *l
                              float width_px, float dash_on, float dash_off, tile57_rgba color);
 extern void tile57GoSurfSymbol(void *ctx, tile57_feature *f, tile57_world_point anchor,
                                tile57_local_rings *rings, tile57_rgba color, int even_odd,
-                               float stroke_w);
+                               float stroke_w, int align);
 extern void tile57GoSurfText(void *ctx, tile57_feature *f, tile57_world_point anchor,
                              tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo,
-                             float halo_px);
+                             float halo_px, int align);
 
 static void surf_fill_thunk(void *ctx, const tile57_feature *f, const tile57_world_rings *r,
                             tile57_rgba c, int eo) {
@@ -26,36 +26,38 @@ static void surf_line_thunk(void *ctx, const tile57_feature *f, const tile57_wor
 	tile57GoSurfLine(ctx, (tile57_feature *)f, (tile57_world_rings *)l, w, don, doff, c);
 }
 static void surf_symbol_thunk(void *ctx, const tile57_feature *f, tile57_world_point a,
-                              const tile57_local_rings *r, tile57_rgba c, int eo, float sw) {
-	tile57GoSurfSymbol(ctx, (tile57_feature *)f, a, (tile57_local_rings *)r, c, eo, sw);
+                              const tile57_local_rings *r, tile57_rgba c, int eo, float sw,
+                              tile57_rot_align al) {
+	tile57GoSurfSymbol(ctx, (tile57_feature *)f, a, (tile57_local_rings *)r, c, eo, sw, al);
 }
 static void surf_text_thunk(void *ctx, const tile57_feature *f, tile57_world_point a,
-                            const tile57_local_rings *g, tile57_rgba c, tile57_rgba h, float hp) {
-	tile57GoSurfText(ctx, (tile57_feature *)f, a, (tile57_local_rings *)g, c, h, hp);
+                            const tile57_local_rings *g, tile57_rgba c, tile57_rgba h, float hp,
+                            tile57_rot_align al) {
+	tile57GoSurfText(ctx, (tile57_feature *)f, a, (tile57_local_rings *)g, c, h, hp, al);
 }
 
 // sprite / pattern / text_str stay NULL: the engine then tessellates symbols and
 // text as vector outlines (draw_symbol / draw_text) and flat-tints patterned
 // areas — the whole chart arrives as fillable rings.
 static tile57_status tile57_go_compose_surface(tile57_compose *c, double lon, double lat,
-                                               double zoom, uint32_t w, uint32_t h,
+                                               double zoom, double rot, uint32_t w, uint32_t h,
                                                const tile57_mariner *m, void *ctx,
                                                tile57_error *err) {
 	tile57_surface_cb cb = {
 	    ctx, surf_fill_thunk, surf_line_thunk, surf_symbol_thunk, surf_text_thunk,
 	    NULL, NULL, NULL,
 	};
-	return tile57_compose_surface(c, lon, lat, zoom, w, h, m, &cb, err);
+	return tile57_compose_surface(c, lon, lat, zoom, rot, w, h, m, &cb, err);
 }
 static tile57_status tile57_go_chart_surface(tile57_chart *ch, double lon, double lat,
-                                             double zoom, uint32_t w, uint32_t h,
+                                             double zoom, double rot, uint32_t w, uint32_t h,
                                              const tile57_mariner *m, void *ctx,
                                              tile57_error *err) {
 	tile57_surface_cb cb = {
 	    ctx, surf_fill_thunk, surf_line_thunk, surf_symbol_thunk, surf_text_thunk,
 	    NULL, NULL, NULL,
 	};
-	return tile57_chart_surface(ch, lon, lat, zoom, w, h, m, &cb, err);
+	return tile57_chart_surface(ch, lon, lat, zoom, rot, w, h, m, &cb, err);
 }
 static tile57_status tile57_go_chart_tile_surface(tile57_chart *ch, uint8_t z, uint32_t x,
                                                   uint32_t y, const tile57_mariner *m,
@@ -84,6 +86,30 @@ import (
 // RGBA is a resolved straight-alpha colour from the active palette.
 type RGBA struct{ R, G, B, A uint8 }
 
+// RotAlign says what a mark's rotation is referenced to. Geometry arrives
+// ALREADY rotated to its own angle; the flag tells a host with a rotated view
+// (course-up/head-up) whether to ADD the view rotation.
+type RotAlign uint8
+
+const (
+	// AlignViewport: screen-relative — the mark stays upright on screen; a
+	// rotated view must NOT add its rotation (buoys, ordinary labels).
+	AlignViewport RotAlign = 0
+	// AlignMap: chart-relative — a rotated view ADDS its rotation so the mark
+	// turns with the chart (ORIENT symbols, depth-contour values).
+	AlignMap RotAlign = 1
+)
+
+// DispCat is the S-52 display category a feature arrived on. A host applying
+// SCAMIN itself must skip it for DispBase (the never-hide safety minimum).
+type DispCat uint8
+
+const (
+	DispBase     DispCat = 0
+	DispStandard DispCat = 1
+	DispOther    DispCat = 2
+)
+
 // WorldPoint is a web-mercator [0,1] position (y down).
 type WorldPoint struct{ X, Y float64 }
 
@@ -92,9 +118,10 @@ type LocalPoint struct{ X, Y float32 }
 
 // SurfaceFeature tags the draw calls that belong to one S-57 feature.
 type SurfaceFeature struct {
-	Class  string // object-class acronym ("" if none)
-	Scamin int64  // SCAMIN 1:N denominator (<= 0 → always visible)
-	Plane  int32  // S-52 draw priority (paint hint)
+	Class   string  // object-class acronym ("" if none)
+	Scamin  int64   // SCAMIN 1:N denominator (<= 0 → always visible)
+	Plane   int32   // S-52 draw priority (paint hint)
+	DispCat DispCat // the display category the feature came in on
 }
 
 // WorldRings is a multi-ring path in world space: ring k spans
@@ -119,16 +146,20 @@ type SurfaceFuncs struct {
 	// StrokeLine strokes world polylines widthPx wide; dashes in px (0,0 solid).
 	StrokeLine func(f SurfaceFeature, lines WorldRings, widthPx, dashOn, dashOff float32, color RGBA)
 	// DrawSymbol draws a point symbol: world anchor + local outline. strokeW > 0
-	// means the rings are a polyline stroked that wide (px), else filled.
-	DrawSymbol func(f SurfaceFeature, anchor WorldPoint, rings LocalRings, color RGBA, evenOdd bool, strokeW float32)
+	// means the rings are a polyline stroked that wide (px), else filled. The
+	// outline arrives already rotated; align says whether that angle is
+	// chart-relative (a rotated view additionally rotates AlignMap outlines).
+	DrawSymbol func(f SurfaceFeature, anchor WorldPoint, rings LocalRings, color RGBA, evenOdd bool, strokeW float32, align RotAlign)
 	// DrawText draws shaped label glyphs as local outline rings (even-odd), with
-	// an optional halo (halo.A == 0 → none).
-	DrawText func(f SurfaceFeature, anchor WorldPoint, glyphs LocalRings, color, halo RGBA, haloPx float32)
+	// an optional halo (halo.A == 0 → none). align as in DrawSymbol.
+	DrawText func(f SurfaceFeature, anchor WorldPoint, glyphs LocalRings, color, halo RGBA, haloPx float32, align RotAlign)
 }
 
 // Surface emits the composed view centred on (lon, lat) at zoom for a width×height
 // viewport as a vector draw stream — the primitive for a host that renders on the
-// GPU and re-portrays nothing on pan/zoom.
+// GPU and re-portrays nothing on pan/zoom. The portrayal is north-up (view
+// rotation 0); a rotating host rotates the world geometry itself and applies
+// the per-call RotAlign flags to its marks.
 func (c *ComposeSource) Surface(lon, lat, zoom float64, width, height uint32, m Mariner, cb *SurfaceFuncs) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -142,7 +173,7 @@ func (c *ComposeSource) Surface(lon, lat, zoom float64, width, height uint32, m 
 	defer h.Delete()
 	var cerr C.tile57_error
 	if st := C.tile57_go_compose_surface(c.ptr, C.double(lon), C.double(lat), C.double(zoom),
-		C.uint32_t(width), C.uint32_t(height), &cm, unsafe.Pointer(&h), &cerr); st != C.TILE57_OK {
+		0, C.uint32_t(width), C.uint32_t(height), &cm, unsafe.Pointer(&h), &cerr); st != C.TILE57_OK {
 		return statusError(st, &cerr)
 	}
 	return nil
@@ -162,7 +193,7 @@ func (s *Source) Surface(lon, lat, zoom float64, width, height uint32, m Mariner
 	defer h.Delete()
 	var cerr C.tile57_error
 	if st := C.tile57_go_chart_surface(s.ptr, C.double(lon), C.double(lat), C.double(zoom),
-		C.uint32_t(width), C.uint32_t(height), &cm, unsafe.Pointer(&h), &cerr); st != C.TILE57_OK {
+		0, C.uint32_t(width), C.uint32_t(height), &cm, unsafe.Pointer(&h), &cerr); st != C.TILE57_OK {
 		return statusError(st, &cerr)
 	}
 	return nil
@@ -197,7 +228,8 @@ func surfCB(ctx unsafe.Pointer) *SurfaceFuncs {
 }
 
 func goFeature(f *C.tile57_feature) SurfaceFeature {
-	return SurfaceFeature{Class: C.GoString(f.cls), Scamin: int64(f.scamin), Plane: int32(f.plane)}
+	return SurfaceFeature{Class: C.GoString(f.cls), Scamin: int64(f.scamin),
+		Plane: int32(f.plane), DispCat: DispCat(f.disp_cat)}
 }
 
 func goRGBA(c C.tile57_rgba) RGBA { return RGBA{uint8(c.r), uint8(c.g), uint8(c.b), uint8(c.a)} }
@@ -252,22 +284,22 @@ func tile57GoSurfLine(ctx unsafe.Pointer, f *C.tile57_feature, lines *C.tile57_w
 
 //export tile57GoSurfSymbol
 func tile57GoSurfSymbol(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57_world_point,
-	rings *C.tile57_local_rings, color C.tile57_rgba, evenOdd C.int, strokeW C.float) {
+	rings *C.tile57_local_rings, color C.tile57_rgba, evenOdd C.int, strokeW C.float, align C.int) {
 	cb := surfCB(ctx)
 	if cb.DrawSymbol == nil {
 		return
 	}
 	cb.DrawSymbol(goFeature(f), WorldPoint{float64(anchor.x), float64(anchor.y)},
-		goLocalRings(rings), goRGBA(color), evenOdd != 0, float32(strokeW))
+		goLocalRings(rings), goRGBA(color), evenOdd != 0, float32(strokeW), RotAlign(align))
 }
 
 //export tile57GoSurfText
 func tile57GoSurfText(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57_world_point,
-	glyphs *C.tile57_local_rings, color, halo C.tile57_rgba, haloPx C.float) {
+	glyphs *C.tile57_local_rings, color, halo C.tile57_rgba, haloPx C.float, align C.int) {
 	cb := surfCB(ctx)
 	if cb.DrawText == nil {
 		return
 	}
 	cb.DrawText(goFeature(f), WorldPoint{float64(anchor.x), float64(anchor.y)},
-		goLocalRings(glyphs), goRGBA(color), goRGBA(halo), float32(haloPx))
+		goLocalRings(glyphs), goRGBA(color), goRGBA(halo), float32(haloPx), RotAlign(align))
 }
