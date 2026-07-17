@@ -321,16 +321,19 @@ pub fn parseWithUpdates(gpa: Allocator, base: []const u8, updates: []const []con
 
     var m: Merge = .{};
 
-    var base_iso = try iso.parse(gpa, base);
-    defer base_iso.deinit();
-    const base_tables = try readHeader(a, base_iso);
-    try decodeInto(a, &m, base_iso, base_tables);
+    // Lazy: pre-validate each file with the eager parser's acceptance rules
+    // (allocation-free), then decode straight out of the bytes — no arena-built
+    // record model. Validating up front keeps the eager semantics: a malformed
+    // BASE fails the parse, and a corrupt UPDATE is rejected whole (keep prior
+    // state) rather than half-applied.
+    try iso.validate(base);
+    const base_tables = try readHeader(a, base);
+    try decodeInto(a, &m, base, base_tables);
 
     for (updates) |u| {
-        var up_iso = iso.parse(gpa, u) catch break; // reject a corrupt update; keep prior state
-        defer up_iso.deinit();
-        const t = readHeader(a, up_iso) catch break;
-        decodeInto(a, &m, up_iso, t) catch break;
+        iso.validate(u) catch break; // reject a corrupt update; keep prior state
+        const t = readHeader(a, u) catch break;
+        decodeInto(a, &m, u, t) catch break;
     }
 
     return .{
@@ -354,10 +357,13 @@ pub fn parseWithUpdates(gpa: Allocator, base: []const u8, updates: []const []con
 /// RUIN. A delete needs only the identity; insert/modify decode fully (resolving
 /// names via `t`'s tables). Spatial-record modify replaces; feature modify applies
 /// the SAUI-indicated spatial-association edits (see `modifyFeature`).
-fn decodeInto(a: Allocator, m: *Merge, iso_file: iso.File, t: Tables) !void {
-    for (iso_file.records) |rec| {
-        if (rec.fields.len == 0) continue;
-        const lead = rec.fields[0].tag;
+fn decodeInto(a: Allocator, m: *Merge, bytes: []const u8, t: Tables) !void {
+    // The caller pre-validated `bytes` (iso.validate), so the tolerant walk
+    // sees exactly the records the eager parse built.
+    var it = iso.iterate(bytes);
+    _ = it.next(); // skip the DDR (its directory declares the same tags)
+    while (it.next()) |rec| {
+        const lead = rec.firstTag() orelse continue;
         if (std.mem.eql(u8, lead, "PRID")) {
             const p = rec.field("PRID").?;
             const rcid = u32le(p, 1);
@@ -453,10 +459,13 @@ fn modifyFeature(a: Allocator, ex: *FeatureRec, upd: FeatureRec) !void {
 
 /// Read a file's coordinate factors + code tables from its DSID record (the first
 /// data record). Code-table names are duped into `a`, so they outlive the ISO reader.
-fn readHeader(a: Allocator, iso_file: iso.File) !Tables {
+fn readHeader(a: Allocator, bytes: []const u8) !Tables {
     var t: Tables = .{};
-    for (iso_file.records) |rec| {
-        if (rec.fields.len == 0 or !std.mem.eql(u8, rec.fields[0].tag, "DSID")) continue;
+    var it = iso.iterate(bytes);
+    _ = it.next(); // skip the DDR (its directory declares a DSID schema entry)
+    while (it.next()) |rec| {
+        const lead = rec.firstTag() orelse continue;
+        if (!std.mem.eql(u8, lead, "DSID")) continue;
         try parseDatasetRecord(a, rec, &t.params, &t.fc, &t.ac, &t.ic, &t.arc);
         break;
     }
@@ -465,7 +474,7 @@ fn readHeader(a: Allocator, iso_file: iso.File) !Tables {
 
 fn parseDatasetRecord(
     a: Allocator,
-    rec: iso.Record,
+    rec: iso.RecordView,
     params: *Params,
     feature_codes: *CodeTable,
     attr_codes: *CodeTable,
@@ -553,7 +562,7 @@ fn parseSoundings(a: Allocator, data: []const u8, params: Params) ![]const s57.S
     return out;
 }
 
-fn parseCurve(a: Allocator, rec: iso.Record, params: Params) !CurveRec {
+fn parseCurve(a: Allocator, rec: iso.RecordView, params: Params) !CurveRec {
     const c = rec.field("CRID").?;
     var cr: CurveRec = .{ .rcid = u32le(c, 1) };
     // PTAS: repeating `(b11,b14,b11)` = RRNM,RRID,TOPI. TOPI 1=begin node, 2=end.
@@ -584,7 +593,7 @@ fn parseCurve(a: Allocator, rec: iso.Record, params: Params) !CurveRec {
     return cr;
 }
 
-fn parseComposite(a: Allocator, rec: iso.Record) !CompositeRec {
+fn parseComposite(a: Allocator, rec: iso.RecordView) !CompositeRec {
     const c = rec.field("CCID").?;
     var members = std.ArrayList(CompositeMember).empty;
     // CUCO: repeating `(b11,b14,b11)` = RRNM(curve),RRID,ORNT.
@@ -597,7 +606,7 @@ fn parseComposite(a: Allocator, rec: iso.Record) !CompositeRec {
     return .{ .rcid = u32le(c, 1), .members = members.items };
 }
 
-fn parseSurface(a: Allocator, rec: iso.Record) !SurfaceRec {
+fn parseSurface(a: Allocator, rec: iso.RecordView) !SurfaceRec {
     const s = rec.field("SRID").?;
     var rings = std.ArrayList(RingRef).empty;
     // RIAS: repeating `(b11,b14,3b11)` = RRNM,RRID,ORNT,USAG,RAUI.
@@ -615,7 +624,7 @@ fn parseSurface(a: Allocator, rec: iso.Record) !SurfaceRec {
     return .{ .rcid = u32le(s, 1), .rings = rings.items };
 }
 
-fn parseFeature(a: Allocator, rec: iso.Record, t: Tables) !FeatureRec {
+fn parseFeature(a: Allocator, rec: iso.RecordView, t: Tables) !FeatureRec {
     const f = rec.field("FRID").?;
     const nftc = u16le(f, 5);
     var fr: FeatureRec = .{
@@ -635,7 +644,8 @@ fn parseFeature(a: Allocator, rec: iso.Record, t: Tables) !FeatureRec {
     // may split them across multiple SPAS fields, so collect every SPAS field. SAUI
     // (last byte) drives association edits in a MODIFY update (see modifyFeature).
     var spas = std.ArrayList(SpatialAssoc).empty;
-    for (rec.fields) |fld| {
+    var spas_it = rec.fields();
+    while (spas_it.next()) |fld| {
         if (!std.mem.eql(u8, fld.tag, "SPAS")) continue;
         var o: usize = 0;
         while (o + 15 <= fld.data.len) : (o += 15) {
@@ -646,7 +656,8 @@ fn parseFeature(a: Allocator, rec: iso.Record, t: Tables) !FeatureRec {
 
     // MASK: repeating `(b11,b14,2b11)` = RRNM,RRID,MIND,MUIN. Join by rrid onto the
     // matching spatial association so the masking survives into the geometry shell.
-    for (rec.fields) |fld| {
+    var mask_it = rec.fields();
+    while (mask_it.next()) |fld| {
         if (!std.mem.eql(u8, fld.tag, "MASK")) continue;
         var o: usize = 0;
         while (o + 7 <= fld.data.len) : (o += 7) {
@@ -661,7 +672,8 @@ fn parseFeature(a: Allocator, rec: iso.Record, t: Tables) !FeatureRec {
     // FASC: repeating `(b11,b14,2b12,b11)` group head = RRNM,RRID,NFAC,NARC,FAUI
     // (a nested ATTR block may follow per S-100, ignored here — role + target suffice).
     var fasc = std.ArrayList(FeatureAssoc).empty;
-    for (rec.fields) |fld| {
+    var fasc_it = rec.fields();
+    while (fasc_it.next()) |fld| {
         if (!std.mem.eql(u8, fld.tag, "FASC")) continue;
         // Only the fixed head is decoded; if the field packs multiple heads they are
         // 11 bytes each up to the first ATTR sub-structure. Decode the leading head.
