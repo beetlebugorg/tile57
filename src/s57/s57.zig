@@ -1092,6 +1092,16 @@ fn parseDSPM(data: []const u8) DatasetParams {
 fn parseSG2D(a: Allocator, data: []const u8, comf: f64) ![]LonLat {
     const n = data.len / 8;
     const pts = try a.alloc(LonLat, n);
+    if (comf == E7) {
+        // COMF == 1e7 (every NOAA cell): degToE7(x / 1e7) == x exactly — the
+        // f64 divide/multiply round-trip error on an i32 is < 2^-20, far below
+        // the 0.5 rounding threshold, and the ±2^31 clamp can't engage — so
+        // the decode is a straight raw-int copy with the Y/X order swap.
+        for (pts, 0..) |*p, i| {
+            p.* = .{ .lon_e7 = i32le(data, i * 8 + 4), .lat_e7 = i32le(data, i * 8) };
+        }
+        return pts;
+    }
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const y = i32le(data, i * 8); // YCOO = latitude
@@ -1160,6 +1170,10 @@ fn toUtf8(a: Allocator, s: []const u8) ![]const u8 {
 /// into `a` (the source field bytes are not retained) and transcoded to UTF-8.
 fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
     var list = std.ArrayList(Attr).empty;
+    // One attribute per UT terminator, so size the list once up front (absent /
+    // DEL-marker values are skipped below, making this an upper bound) instead
+    // of growth-reallocating inside the arena.
+    try list.ensureTotalCapacity(a, std.mem.count(u8, data, &[_]u8{iso.UT}));
     var off: usize = 0;
     while (off + 2 <= data.len) {
         const code = u16le(data, off);
@@ -1248,6 +1262,18 @@ fn parseFFPT(a: Allocator, data: []const u8) ![]FeatureRef {
 fn parseSG3D(a: Allocator, data: []const u8, comf: f64, somf: f64) ![]Sounding {
     const n = data.len / 12;
     const out = try a.alloc(Sounding, n);
+    if (comf == E7) {
+        // See parseSG2D: COMF == 1e7 makes the lon/lat round-trip an identity.
+        // The depth stays the same f64 division as the general path.
+        for (out, 0..) |*s, i| {
+            s.* = .{
+                .lon_e7 = i32le(data, i * 12 + 4),
+                .lat_e7 = i32le(data, i * 12),
+                .depth = @as(f64, @floatFromInt(i32le(data, i * 12 + 8))) / somf,
+            };
+        }
+        return out;
+    }
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const y = i32le(data, i * 12);
@@ -1568,6 +1594,35 @@ fn applyControl(a: Allocator, comptime T: type, existing: []const T, upd: []cons
     return out.items;
 }
 
+/// An S-57 field tag as one little-endian u32 word (tags are always 4 chars,
+/// §7.4), so the merge's per-record tag dispatch is one integer compare per
+/// directory entry instead of a byte-wise name match.
+inline fn tagWord(tag: *const [4]u8) u32 {
+    return std.mem.readInt(u32, tag, .little);
+}
+
+/// The fields the record-level merge reads from one data record, collected in
+/// a single directory walk (null = tag absent, last match wins — the same
+/// semantics as calling RecordView.field per tag, without re-walking the
+/// directory for each of the up-to-9 tags a record is asked for).
+const MergeFields = struct {
+    vrid: ?[]const u8 = null,
+    frid: ?[]const u8 = null,
+    sg2d: ?[]const u8 = null,
+    sg3d: ?[]const u8 = null,
+    vrpt: ?[]const u8 = null,
+    attv: ?[]const u8 = null,
+    sgcc: ?[]const u8 = null,
+    vrpc: ?[]const u8 = null,
+    foid: ?[]const u8 = null,
+    fspt: ?[]const u8 = null,
+    ffpt: ?[]const u8 = null,
+    attf: ?[]const u8 = null,
+    natf: ?[]const u8 = null,
+    fspc: ?[]const u8 = null,
+    ffpc: ?[]const u8 = null,
+};
+
 // Merge one ISO 8211 file (base or update) into the record lists, keyed by FOID
 // (features) / (RCNM,RCID) (vectors). Insertion order is preserved (deterministic
 // output); deletes tombstone the slot (null). For the base, every record inserts.
@@ -1591,7 +1646,30 @@ fn mergeFile(
     if (ddr.leader.leader_id != 'L') return error.NotADDR;
 
     while (try it.next()) |rec| {
-        if (rec.field("VRID")) |vrid| {
+        var flds: MergeFields = .{};
+        var fit = rec.fields();
+        while (fit.next()) |fld| {
+            if (fld.tag.len != 4) continue; // a non-4 tag size can't match an S-57 tag
+            switch (tagWord(fld.tag[0..4])) {
+                tagWord("VRID") => flds.vrid = fld.data,
+                tagWord("FRID") => flds.frid = fld.data,
+                tagWord("SG2D") => flds.sg2d = fld.data,
+                tagWord("SG3D") => flds.sg3d = fld.data,
+                tagWord("VRPT") => flds.vrpt = fld.data,
+                tagWord("ATTV") => flds.attv = fld.data,
+                tagWord("SGCC") => flds.sgcc = fld.data,
+                tagWord("VRPC") => flds.vrpc = fld.data,
+                tagWord("FOID") => flds.foid = fld.data,
+                tagWord("FSPT") => flds.fspt = fld.data,
+                tagWord("FFPT") => flds.ffpt = fld.data,
+                tagWord("ATTF") => flds.attf = fld.data,
+                tagWord("NATF") => flds.natf = fld.data,
+                tagWord("FSPC") => flds.fspc = fld.data,
+                tagWord("FFPC") => flds.ffpc = fld.data,
+                else => {},
+            }
+        }
+        if (flds.vrid) |vrid| {
             if (vrid.len < 8) continue;
             const rcnm = vrid[0];
             const rcid = u32le(vrid, 1);
@@ -1607,10 +1685,10 @@ fn mergeFile(
                 continue;
             }
             var v = VectorRecord{ .rcnm = rcnm, .rcid = rcid, .points = &.{}, .soundings = &.{} };
-            if (rec.field("SG2D")) |sg| v.points = try parseSG2D(a, sg, comf);
-            if (rec.field("SG3D")) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
-            if (rec.field("VRPT")) |vp| parseVRPT(a, &v, vp);
-            if (rec.field("ATTV")) |av| v.quapos = quaposFromAttv(a, av);
+            if (flds.sg2d) |sg| v.points = try parseSG2D(a, sg, comf);
+            if (flds.sg3d) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
+            if (flds.vrpt) |vp| parseVRPT(a, &v, vp);
+            if (flds.attv) |av| v.quapos = quaposFromAttv(a, av);
 
             if (ruin == 3) { // modify in place
                 // The oracle errors on a MODIFY whose target is absent (updates.go:291),
@@ -1625,27 +1703,27 @@ fn mergeFile(
                     // and the SG2D list otherwise (a coordinate DELETE ships SGCC with no
                     // SG2D/SG3D, so fall back to whichever existing list is populated). A
                     // bare SG2D/SG3D with no SGCC is a full replacement.
-                    const sgcc = rec.field("SGCC");
+                    const sgcc = flds.sgcc;
                     if (sgcc != null and sgcc.?.len >= 5) {
-                        if (rec.field("SG3D") != null or (rec.field("SG2D") == null and ex.soundings.len > 0)) {
+                        if (flds.sg3d != null or (flds.sg2d == null and ex.soundings.len > 0)) {
                             ex.soundings = try applyControl(a, Sounding, ex.soundings, v.soundings, sgcc.?);
                         } else {
                             ex.points = try applyControl(a, LonLat, ex.points, v.points, sgcc.?);
                         }
-                    } else if (rec.field("SG2D") != null) {
+                    } else if (flds.sg2d != null) {
                         ex.points = v.points;
-                    } else if (rec.field("SG3D") != null) {
+                    } else if (flds.sg3d != null) {
                         ex.soundings = v.soundings;
                     }
                     // VRPC = indexed insert/delete/modify of the VRPT list (§8.4.3.2):
                     // a single-endpoint modify ships VRPC{modify,idx,count=1} + ONE
                     // VRPT, so editing the list (not replacing it) preserves the other
                     // endpoint. A bare VRPT with no VRPC is a full replace.
-                    const vrpc = rec.field("VRPC");
+                    const vrpc = flds.vrpc;
                     if (vrpc != null and vrpc.?.len >= 5) {
                         ex.vptrs = try applyControl(a, VPtr, ex.vptrs, v.vptrs, vrpc.?);
                         deriveEndpoints(ex);
-                    } else if (rec.field("VRPT") != null) {
+                    } else if (flds.vrpt != null) {
                         ex.vptrs = v.vptrs;
                         deriveEndpoints(ex);
                     }
@@ -1659,13 +1737,14 @@ fn mergeFile(
             // insert (1) — upsert. RUIN values other than insert/delete/modify are
             // invalid; the oracle errors (updates.go:351), dropping the cell.
             if (is_update and ruin != 1) return error.UnknownRUIN;
-            if (vidx.get(key)) |i| {
-                vecs.items[i] = v;
+            const gop = try vidx.getOrPut(key);
+            if (gop.found_existing) {
+                vecs.items[gop.value_ptr.*] = v;
             } else {
                 try vecs.append(a, v);
-                try vidx.put(key, vecs.items.len - 1);
+                gop.value_ptr.* = vecs.items.len - 1;
             }
-        } else if (rec.field("FRID")) |frid| {
+        } else if (flds.frid) |frid| {
             if (frid.len < 12) continue;
             // RCNM(1) RCID(4) PRIM(1)@5 GRUP(1)@6 OBJL(2)@7 RVER(2)@9 RUIN(1)@11
             // FRID byte[0] (RCNM) must be 100 for a feature record (§7.6.1). The oracle
@@ -1686,7 +1765,7 @@ fn mergeFile(
             // on the record as the OBJECT identity (LNAM/FFPT resolve post-flatten)
             // but never keys the update index.
             const key = vkey.of(f.rcnm, f.rcid);
-            if (rec.field("FOID")) |fo| f.foid = foidKey(fo);
+            if (flds.foid) |fo| f.foid = foidKey(fo);
 
             if (ruin == 2) {
                 // See the spatial-delete note: drop the index entry so re-INSERT
@@ -1694,28 +1773,28 @@ fn mergeFile(
                 if (fidx.fetchRemove(key)) |kv| feats.items[kv.value] = null;
                 continue;
             }
-            if (rec.field("FSPT")) |fp| f.refs = try parseFSPT(a, fp);
-            if (rec.field("FFPT")) |ff| f.frefs = try parseFFPT(a, ff);
-            if (rec.field("ATTF")) |at| f.attrs = try parseATTF(a, at);
-            if (rec.field("NATF")) |nt| f.attrs = try mergeNatf(a, f.attrs, nt);
+            if (flds.fspt) |fp| f.refs = try parseFSPT(a, fp);
+            if (flds.ffpt) |ff| f.frefs = try parseFFPT(a, ff);
+            if (flds.attf) |at| f.attrs = try parseATTF(a, at);
+            if (flds.natf) |nt| f.attrs = try mergeNatf(a, f.attrs, nt);
 
             if (ruin == 3) {
                 // MODIFY of an absent feature errors (updates.go:202) -> cell dropped.
                 const i = fidx.get(key) orelse return error.ModifyMissingFeature;
                 if (feats.items[i]) |*ex| {
-                    const fspc = rec.field("FSPC");
+                    const fspc = flds.fspc;
                     if (fspc != null and fspc.?.len >= 5) {
                         ex.refs = try applyControl(a, SpatialRef, ex.refs, f.refs, fspc.?);
-                    } else if (rec.field("FSPT") != null) {
+                    } else if (flds.fspt != null) {
                         ex.refs = f.refs;
                     }
                     // FFPC = indexed insert/delete/modify of the FFPT list (§8.4.2.2,
                     // identical structure to FSPC); a bare FFPT with no FFPC is a full
                     // replace of the feature-to-feature pointers.
-                    const ffpc = rec.field("FFPC");
+                    const ffpc = flds.ffpc;
                     if (ffpc != null and ffpc.?.len >= 5) {
                         ex.frefs = try applyControl(a, FeatureRef, ex.frefs, f.frefs, ffpc.?);
-                    } else if (rec.field("FFPT") != null) {
+                    } else if (flds.ffpt != null) {
                         ex.frefs = f.frefs;
                     }
                     // Gate on the PARSED attribute count, not ATTF field presence: the
@@ -1736,11 +1815,14 @@ fn mergeFile(
             if (!is_update) {
                 try feats.append(a, f);
                 try fidx.put(key, feats.items.len - 1);
-            } else if (fidx.get(key)) |i| {
-                feats.items[i] = f;
             } else {
-                try feats.append(a, f);
-                try fidx.put(key, feats.items.len - 1);
+                const gop = try fidx.getOrPut(key);
+                if (gop.found_existing) {
+                    feats.items[gop.value_ptr.*] = f;
+                } else {
+                    try feats.append(a, f);
+                    gop.value_ptr.* = feats.items.len - 1;
+                }
             }
         }
     }
@@ -1760,6 +1842,8 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     // update's DSID revises the non-empty identity fields below.
     var params = DatasetParams{};
     var dsid = Dsid{};
+    var nfeat_hint: usize = 0; // DSSI record counts, to pre-size the merge indices
+    var nvec_hint: usize = 0;
     {
         // Lazy: DSPM + DSID sit in the first data records, so walk them in
         // place instead of arena-building the whole record model. Strict walk
@@ -1779,6 +1863,19 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
         while (try it2.next()) |rec| {
             if (rec.field("DSID")) |d| {
                 if (parseDSID(a, d)) |pd| dsid = pd;
+                // DSSI (same record, §7.3.1.2) carries the record counts:
+                // DSTR AALL NALL then NOMR NOCR NOGR NOLR (feature records)
+                // and NOIN NOCN NOED NOFA (spatial records), b14 each. Use
+                // them as sizing HINTS for the merge indices — clamped by the
+                // 24-byte-per-record floor so a corrupt count can't balloon
+                // the allocation, and correctness never depends on them.
+                if (rec.field("DSSI")) |ds| {
+                    if (ds.len >= 35) {
+                        const cap = base_bytes.len / 24;
+                        nfeat_hint = @min(@as(usize, u32le(ds, 3)) + u32le(ds, 7) + u32le(ds, 11) + u32le(ds, 15), cap);
+                        nvec_hint = @min(@as(usize, u32le(ds, 19)) + u32le(ds, 23) + u32le(ds, 27) + u32le(ds, 31), cap);
+                    }
+                }
                 break;
             }
         }
@@ -1786,13 +1883,22 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     const comf: f64 = @floatFromInt(params.comf);
     const somf: f64 = @floatFromInt(params.somf);
 
-    // Record lists (insertion order) + FOID/(RCNM,RCID) indices for the merge.
+    // Record lists (insertion order) + FOID/(RCNM,RCID) indices for the merge,
+    // pre-sized from the DSSI counts so the base pass never growth-rehashes.
     var feats = std.ArrayList(?Feature).empty;
     var vecs = std.ArrayList(?VectorRecord).empty;
     var fidx = std.AutoHashMap(u64, usize).init(gpa);
     defer fidx.deinit();
     var vidx = std.AutoHashMap(u64, usize).init(gpa);
     defer vidx.deinit();
+    if (nfeat_hint > 0) {
+        try fidx.ensureTotalCapacity(@intCast(nfeat_hint));
+        try feats.ensureTotalCapacity(a, nfeat_hint);
+    }
+    if (nvec_hint > 0) {
+        try vidx.ensureTotalCapacity(@intCast(nvec_hint));
+        try vecs.ensureTotalCapacity(a, nvec_hint);
+    }
 
     try mergeFile(a, &feats, &fidx, &vecs, &vidx, base_bytes, comf, somf, false);
     for (updates) |u| {
@@ -1816,15 +1922,29 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
 
     // Flatten the surviving records (skip tombstones) into the final arrays.
     var vectors = std.ArrayList(VectorRecord).empty;
+    try vectors.ensureTotalCapacity(a, vecs.items.len);
     for (vecs.items) |mv| if (mv) |v| try vectors.append(a, v);
     var features = std.ArrayList(Feature).empty;
+    try features.ensureTotalCapacity(a, feats.items.len);
     for (feats.items) |mf| if (mf) |f| try features.append(a, f);
 
     // Build node + edge indices for topology assembly, plus an index of the
     // VI records that carry SG3D soundings (multipoint geometry for SOUNDG).
+    // Counted first and sized exactly: the maps are retained for the chart's
+    // lifetime, so neither growth-rehashing nor over-allocation is welcome.
+    var n_nodes: u32 = 0;
+    var n_edges: u32 = 0;
+    var n_snds: u32 = 0;
+    for (vectors.items) |v| {
+        if ((v.rcnm == RCNM_VI or v.rcnm == RCNM_VC) and v.points.len > 0) n_nodes += 1 else if (v.rcnm == RCNM_VE) n_edges += 1;
+        if (v.soundings.len > 0) n_snds += 1;
+    }
     var nodes = std.AutoHashMap(u64, LonLat).init(gpa);
     var edges = std.AutoHashMap(u32, usize).init(gpa);
     var sounding_vecs = std.AutoHashMap(u64, usize).init(gpa);
+    try nodes.ensureTotalCapacity(n_nodes);
+    try edges.ensureTotalCapacity(n_edges);
+    try sounding_vecs.ensureTotalCapacity(n_snds);
     for (vectors.items, 0..) |v, i| {
         if ((v.rcnm == RCNM_VI or v.rcnm == RCNM_VC) and v.points.len > 0) {
             try nodes.put(vkey.of(v.rcnm, v.rcid), v.points[0]);
@@ -1848,7 +1968,10 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
 
     // FOID -> flat feature index, so FFPT feature-to-feature pointers resolve to the
     // features they reference (post-flatten indices differ from the merge-time fidx).
+    var n_foids: u32 = 0;
+    for (features.items) |f| n_foids += @intFromBool(f.foid != 0);
     var foid_index: std.AutoHashMapUnmanaged(u64, usize) = .{};
+    try foid_index.ensureTotalCapacity(a, n_foids);
     for (features.items, 0..) |f, i| {
         if (f.foid != 0) try foid_index.put(a, f.foid, i);
     }
