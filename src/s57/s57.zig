@@ -1572,7 +1572,6 @@ fn applyControl(a: Allocator, comptime T: type, existing: []const T, upd: []cons
 // (features) / (RCNM,RCID) (vectors). Insertion order is preserved (deterministic
 // output); deletes tombstone the slot (null). For the base, every record inserts.
 fn mergeFile(
-    gpa: Allocator,
     a: Allocator,
     feats: *std.ArrayList(?Feature),
     fidx: *std.AutoHashMap(u64, usize),
@@ -1583,10 +1582,15 @@ fn mergeFile(
     somf: f64,
     is_update: bool,
 ) !void {
-    var file = try iso.parse(gpa, bytes);
-    defer file.deinit(); // kept data is copied into arena `a`
+    // Lazy strict walk: same records and same accept/reject behaviour as the
+    // eager `iso.parse` (a malformed record still fails the whole file, which
+    // drops the cell), but no arena and no per-record field model — fields are
+    // resolved on demand out of `bytes`; kept data is copied into arena `a`.
+    var it = iso.iterateStrict(bytes);
+    const ddr = (try it.next()) orelse return error.NotADDR;
+    if (ddr.leader.leader_id != 'L') return error.NotADDR;
 
-    for (file.records) |rec| {
+    while (try it.next()) |rec| {
         if (rec.field("VRID")) |vrid| {
             if (vrid.len < 8) continue;
             const rcnm = vrid[0];
@@ -1757,15 +1761,22 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     var params = DatasetParams{};
     var dsid = Dsid{};
     {
-        var bf = try iso.parse(gpa, base_bytes);
-        defer bf.deinit();
-        for (bf.records) |rec| {
+        // Lazy: DSPM + DSID sit in the first data records, so walk them in
+        // place instead of arena-building the whole record model. Strict walk
+        // (eager error surface) so a malformed base still fails the cell —
+        // though mergeFile below strict-walks the same bytes and would too.
+        var it = iso.iterateStrict(base_bytes);
+        const ddr = (try it.next()) orelse return error.NotADDR;
+        if (ddr.leader.leader_id != 'L') return error.NotADDR;
+        while (try it.next()) |rec| {
             if (rec.field("DSPM")) |d| {
                 params = parseDSPM(d);
                 break; // use the FIRST DSPM found (oracle extractDatasetParams)
             }
         }
-        for (bf.records) |rec| {
+        var it2 = iso.iterateStrict(base_bytes);
+        _ = try it2.next(); // skip the DDR (its directory carries a DSID schema entry)
+        while (try it2.next()) |rec| {
             if (rec.field("DSID")) |d| {
                 if (parseDSID(a, d)) |pd| dsid = pd;
                 break;
@@ -1783,13 +1794,15 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     var vidx = std.AutoHashMap(u64, usize).init(gpa);
     defer vidx.deinit();
 
-    try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, base_bytes, comf, somf, false);
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, base_bytes, comf, somf, false);
     for (updates) |u| {
-        try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true);
+        try mergeFile(a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true);
         // Merge the update's DSID: non-empty identity fields revise the base.
-        var uf = iso.parse(gpa, u) catch continue;
-        defer uf.deinit();
-        for (uf.records) |rec| {
+        // The update just strict-parsed cleanly in mergeFile, so the tolerant
+        // walk here sees the same records.
+        var uit = iso.iterate(u);
+        _ = uit.next(); // skip the DDR (its directory carries a DSID schema entry)
+        while (uit.next()) |rec| {
             if (rec.field("DSID")) |d| {
                 if (parseDSID(a, d)) |pd| {
                     if (pd.edtn.len > 0) dsid.edtn = pd.edtn;
@@ -1958,11 +1971,11 @@ test "update DELETE by bare FRID (no FOID) removes the base feature" {
     var vidx = std.AutoHashMap(u64, usize).init(gpa);
     defer vidx.deinit();
 
-    try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, base.items, 1, 1, false);
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, base.items, 1, 1, false);
     try std.testing.expectEqual(@as(usize, 1), feats.items.len);
     try std.testing.expect(feats.items[0] != null);
 
-    try mergeFile(gpa, a, &feats, &fidx, &vecs, &vidx, upd.items, 1, 1, true);
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd.items, 1, 1, true);
     try std.testing.expect(feats.items[0] == null); // deleted — must not survive
 }
 
