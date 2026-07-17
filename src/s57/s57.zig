@@ -1272,10 +1272,12 @@ pub fn parseCell(gpa: Allocator, bytes: []const u8) !Cell {
 /// geometry — just the ISO-8211 records and the DSPM field. Used to band cells for
 /// the streaming baker so it can group them before the expensive full parse +
 /// portrayal. Returns null if the scale is absent/unparseable.
-pub fn peekScale(gpa: Allocator, bytes: []const u8) ?i32 {
-    var file = iso.parse(gpa, bytes) catch return null;
-    defer file.deinit();
-    for (file.records) |rec| {
+pub fn peekScale(_: Allocator, bytes: []const u8) ?i32 {
+    // Allocation-free: walk records in place and read just DSPM. No arena, no
+    // per-field model -- the ENC_ROOT index scans thousands of cells for scale.
+    var it = iso.iterate(bytes);
+    while (it.next()) |rec| {
+        if (rec.leader.leader_id != 'D') continue; // skip the DDR (schema) record
         if (rec.field("DSPM")) |dspm| {
             const p = parseDSPM(dspm);
             if (p.cscl != 0) return p.cscl;
@@ -1291,12 +1293,14 @@ pub const CellMeta = struct { cscl: i32 = 0, bounds: ?[4]f64 = null };
 /// records, DSPM, and the raw SG2D coordinates. For the lazy ENC_ROOT index
 /// (band + bbox per cell), so the source can decide which cells a tile needs
 /// before paying for a full parse + portrayal. Returns null if unparseable.
-pub fn peekMeta(gpa: Allocator, bytes: []const u8) ?CellMeta {
-    var file = iso.parse(gpa, bytes) catch return null;
-    defer file.deinit();
+pub fn peekMeta(_: Allocator, bytes: []const u8) ?CellMeta {
+    // Allocation-free twin of the eager path: two lazy passes (DSPM, then SG2D
+    // bounds) straight over the bytes -- no arena, no per-field model.
     var m = CellMeta{};
     var comf: f64 = 10_000_000;
-    for (file.records) |rec| {
+    var it = iso.iterate(bytes);
+    while (it.next()) |rec| {
+        if (rec.leader.leader_id != 'D') continue;
         if (rec.field("DSPM")) |dspm| {
             const p = parseDSPM(dspm);
             m.cscl = p.cscl;
@@ -1309,7 +1313,9 @@ pub fn peekMeta(gpa: Allocator, bytes: []const u8) ?CellMeta {
     var e: f64 = -1e18;
     var n: f64 = -1e18;
     var have = false;
-    for (file.records) |rec| {
+    var it2 = iso.iterate(bytes);
+    while (it2.next()) |rec| {
+        if (rec.leader.leader_id != 'D') continue;
         const sg = rec.field("SG2D") orelse continue;
         const cnt = sg.len / 8;
         var i: usize = 0;

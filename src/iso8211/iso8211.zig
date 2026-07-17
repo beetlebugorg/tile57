@@ -291,6 +291,95 @@ fn parseFmtList(a: Allocator, list: *std.ArrayList(SubfieldDef), fmt: []const u8
     }
 }
 
+// ---- allocation-free lazy reader ---------------------------------------
+// A streaming view over the same records `parse` builds, but WITHOUT an arena:
+// nothing is allocated, and each field is resolved on demand straight out of
+// the input bytes. Use it for the peek / ENC_ROOT-index path, where only a
+// field or two per cell is read and a full parse (+ its arena) is pure waste.
+// Semantics match the eager path: the same leader validation, the same
+// "length not stored" (record_length==0) recovery, FT-stripped field data, and
+// last-match-wins on a duplicate tag. It is tolerant of a malformed directory
+// entry (returns what it has) rather than failing the whole record -- which is
+// exactly what a best-effort peek wants. Portable Zig: no target-specific code,
+// so it runs the same on native and wasm.
+
+/// Directory extent (max position+length) of a record, allocation-free -- the
+/// raw-bytes twin of `fieldAreaSizeFromDirectory`, for the length==0 recovery.
+fn directoryExtent(rec: []const u8, leader: Leader) usize {
+    const entry_len = @as(usize, leader.size_of_field_tag) + leader.size_of_field_length + leader.size_of_field_position;
+    const dir_end = leader.field_area_start;
+    var pos: usize = 24;
+    var extent: usize = 0;
+    while (pos + entry_len <= dir_end) : (pos += entry_len) {
+        if (rec[pos] == FT) break;
+        var o = pos + leader.size_of_field_tag;
+        const length = asciiInt(rec[o .. o + leader.size_of_field_length]) catch break;
+        o += leader.size_of_field_length;
+        const position = asciiInt(rec[o .. o + leader.size_of_field_position]) catch break;
+        if (position + length > extent) extent = position + length;
+    }
+    return extent;
+}
+
+/// One record, viewed in place. `field` walks the directory each call; that is
+/// cheaper than allocating an entries+fields model when only a few tags are read.
+pub const RecordView = struct {
+    base: []const u8, // the record's bytes, base[0..record_length]
+    leader: Leader,
+
+    pub fn field(self: RecordView, tag: []const u8) ?[]const u8 {
+        const L = self.leader;
+        if (tag.len != L.size_of_field_tag) return null;
+        const entry_len = @as(usize, L.size_of_field_tag) + L.size_of_field_length + L.size_of_field_position;
+        const dir_end = L.field_area_start;
+        if (dir_end <= 24 or dir_end > self.base.len) return null;
+        const field_area = self.base[L.field_area_start..];
+        var result: ?[]const u8 = null;
+        var pos: usize = 24;
+        while (pos + entry_len <= dir_end) : (pos += entry_len) {
+            if (self.base[pos] == FT) break; // directory terminator
+            const etag = self.base[pos .. pos + L.size_of_field_tag];
+            var o = pos + L.size_of_field_tag;
+            const length = asciiInt(self.base[o .. o + L.size_of_field_length]) catch return result;
+            o += L.size_of_field_length;
+            const position = asciiInt(self.base[o .. o + L.size_of_field_position]) catch return result;
+            if (std.mem.eql(u8, etag, tag) and position + length <= field_area.len) {
+                var data = field_area[position .. position + length];
+                if (data.len > 0 and data[data.len - 1] == FT) data = data[0 .. data.len - 1];
+                result = data; // last match wins
+            }
+        }
+        return result;
+    }
+};
+
+/// Iterate the records of an ISO 8211 file with no allocation. `next` returns
+/// null at the trailing zero-fill padding (clean end of records) or on the first
+/// malformed leader.
+pub const RecordIterator = struct {
+    bytes: []const u8,
+    off: usize = 0,
+
+    pub fn next(self: *RecordIterator) ?RecordView {
+        if (self.off + 24 > self.bytes.len) return null;
+        const rest = self.bytes[self.off..];
+        var leader = Leader.parse(rest) catch return null;
+        if (leader.leader_id != 'D' and leader.leader_id != 'L') return null; // padding / malformed
+        if (leader.field_area_start < 24 or self.off + leader.field_area_start > self.bytes.len) return null;
+        if (leader.record_length == 0)
+            leader.record_length = leader.field_area_start + directoryExtent(rest, leader);
+        if (leader.record_length < 24 or self.off + leader.record_length > self.bytes.len) return null;
+        const base = rest[0..leader.record_length];
+        self.off += leader.record_length;
+        return .{ .base = base, .leader = leader };
+    }
+};
+
+/// Start an allocation-free record iteration over an ISO 8211 file's bytes.
+pub fn iterate(bytes: []const u8) RecordIterator {
+    return .{ .bytes = bytes };
+}
+
 /// Parse a whole ISO 8211 file from in-memory bytes (borrowed; keep alive).
 pub fn parse(gpa: Allocator, bytes: []const u8) !File {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -441,4 +530,32 @@ pub fn writeRecord(a: Allocator, out: *std.ArrayList(u8), leader_id: u8, fields:
     try out.appendSlice(a, &leader);
     try out.appendSlice(a, dir.items);
     try out.appendSlice(a, area.items);
+}
+
+test "lazy iterate/RecordView.field matches the eager parse (allocation-free)" {
+    const a = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try writeRecord(a, &buf, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try writeRecord(a, &buf, 'D', &.{ .{ .tag = "FOO1", .data = "AAA" }, .{ .tag = "BAR2", .data = "HELLO" } });
+    try writeRecord(a, &buf, 'D', &.{.{ .tag = "BAR2", .data = "WORLD" }});
+
+    // Lazy view: no allocator; walk records and fields straight out of the bytes.
+    var it = iterate(buf.items);
+    const ddr = it.next().?;
+    try std.testing.expectEqual(@as(u8, 'L'), ddr.leader.leader_id);
+    const dr0 = it.next().?;
+    try std.testing.expectEqual(@as(u8, 'D'), dr0.leader.leader_id);
+    try std.testing.expectEqualStrings("AAA", dr0.field("FOO1").?);
+    try std.testing.expectEqualStrings("HELLO", dr0.field("BAR2").?);
+    try std.testing.expect(dr0.field("NOPE") == null);
+    const dr1 = it.next().?;
+    try std.testing.expectEqualStrings("WORLD", dr1.field("BAR2").?);
+    try std.testing.expect(it.next() == null); // clean end of records
+
+    // Same fields as the eager path, field-for-field.
+    var file = try parse(a, buf.items);
+    defer file.deinit();
+    try std.testing.expectEqualStrings(file.records[0].field("BAR2").?, dr0.field("BAR2").?);
+    try std.testing.expectEqualStrings(file.records[1].field("BAR2").?, dr1.field("BAR2").?);
 }
