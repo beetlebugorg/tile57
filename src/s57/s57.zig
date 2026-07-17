@@ -1174,12 +1174,37 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
     // DEL-marker values are skipped below, making this an upper bound) instead
     // of growth-reallocating inside the arena.
     try list.ensureTotalCapacity(a, std.mem.count(u8, data, &[_]u8{iso.UT}));
+    // Pure-ASCII fast path (all NOAA base data): every value is already valid
+    // UTF-8 and toUtf8 would dupe it verbatim, so copy the WHOLE field into
+    // the arena once and slice the values out of that copy — one dupe instead
+    // of a validate+dupe per attribute value. Any byte >= 0x80 (national /
+    // Latin-1 text needing transcoding) falls through to the per-value path.
+    const all_ascii = blk: {
+        for (data) |c| {
+            if (c >= 0x80) break :blk false;
+        }
+        break :blk true;
+    };
+    if (all_ascii) {
+        const copy = try a.dupe(u8, data);
+        var off: usize = 0;
+        while (off + 2 <= copy.len) {
+            const code = u16le(copy, off);
+            off += 2;
+            const end = std.mem.indexOfScalarPos(u8, copy, off, iso.UT) orelse copy.len;
+            const val = copy[off..end];
+            // Same absent-value skip as below (empty ATVL / DEL marker).
+            if (val.len > 0 and !isDelMarker(val))
+                try list.append(a, .{ .code = code, .value = val });
+            off = end + 1; // skip UT
+        }
+        return list.items;
+    }
     var off: usize = 0;
     while (off + 2 <= data.len) {
         const code = u16le(data, off);
         off += 2;
-        var end = off;
-        while (end < data.len and data[end] != iso.UT) end += 1;
+        const end = std.mem.indexOfScalarPos(u8, data, off, iso.UT) orelse data.len;
         const val = data[off..end];
         // Skip an ABSENT attribute value. Two forms: (1) an empty ATVL (UT right after
         // the 2-byte code) — the oracle's `if valueEnd > offset` (feature.go
@@ -1621,6 +1646,28 @@ const MergeFields = struct {
     natf: ?[]const u8 = null,
     fspc: ?[]const u8 = null,
     ffpc: ?[]const u8 = null,
+
+    fn collect(self: *MergeFields, fld: iso.Field) void {
+        if (fld.tag.len != 4) return; // a non-4 tag size can't match an S-57 tag
+        switch (tagWord(fld.tag[0..4])) {
+            tagWord("VRID") => self.vrid = fld.data,
+            tagWord("FRID") => self.frid = fld.data,
+            tagWord("SG2D") => self.sg2d = fld.data,
+            tagWord("SG3D") => self.sg3d = fld.data,
+            tagWord("VRPT") => self.vrpt = fld.data,
+            tagWord("ATTV") => self.attv = fld.data,
+            tagWord("SGCC") => self.sgcc = fld.data,
+            tagWord("VRPC") => self.vrpc = fld.data,
+            tagWord("FOID") => self.foid = fld.data,
+            tagWord("FSPT") => self.fspt = fld.data,
+            tagWord("FFPT") => self.ffpt = fld.data,
+            tagWord("ATTF") => self.attf = fld.data,
+            tagWord("NATF") => self.natf = fld.data,
+            tagWord("FSPC") => self.fspc = fld.data,
+            tagWord("FFPC") => self.ffpc = fld.data,
+            else => {},
+        }
+    }
 };
 
 // Merge one ISO 8211 file (base or update) into the record lists, keyed by FOID
@@ -1645,29 +1692,16 @@ fn mergeFile(
     const ddr = (try it.next()) orelse return error.NotADDR;
     if (ddr.leader.leader_id != 'L') return error.NotADDR;
 
-    while (try it.next()) |rec| {
+    var fbuf: iso.FieldBuf = .{};
+    while (try it.nextFields(&fbuf)) |rec| {
         var flds: MergeFields = .{};
-        var fit = rec.fields();
-        while (fit.next()) |fld| {
-            if (fld.tag.len != 4) continue; // a non-4 tag size can't match an S-57 tag
-            switch (tagWord(fld.tag[0..4])) {
-                tagWord("VRID") => flds.vrid = fld.data,
-                tagWord("FRID") => flds.frid = fld.data,
-                tagWord("SG2D") => flds.sg2d = fld.data,
-                tagWord("SG3D") => flds.sg3d = fld.data,
-                tagWord("VRPT") => flds.vrpt = fld.data,
-                tagWord("ATTV") => flds.attv = fld.data,
-                tagWord("SGCC") => flds.sgcc = fld.data,
-                tagWord("VRPC") => flds.vrpc = fld.data,
-                tagWord("FOID") => flds.foid = fld.data,
-                tagWord("FSPT") => flds.fspt = fld.data,
-                tagWord("FFPT") => flds.ffpt = fld.data,
-                tagWord("ATTF") => flds.attf = fld.data,
-                tagWord("NATF") => flds.natf = fld.data,
-                tagWord("FSPC") => flds.fspc = fld.data,
-                tagWord("FFPC") => flds.ffpc = fld.data,
-                else => {},
-            }
+        if (fbuf.truncated) {
+            // More fields than the buffer holds (never on real S-57 data):
+            // the per-record re-walk keeps exact last-match-wins semantics.
+            var fit = rec.fields();
+            while (fit.next()) |fld| flds.collect(fld);
+        } else {
+            for (fbuf.entries[0..fbuf.len]) |fld| flds.collect(fld);
         }
         if (flds.vrid) |vrid| {
             if (vrid.len < 8) continue;

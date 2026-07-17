@@ -427,6 +427,20 @@ pub fn iterate(bytes: []const u8) RecordIterator {
     return .{ .bytes = bytes };
 }
 
+/// Caller-owned output buffer for `StrictIterator.nextFields`: the record's
+/// fields (tag + FT-stripped data), collected during the SAME directory walk
+/// that validates the record — a hot caller reading several tags per record
+/// pays for one ascii directory parse instead of one per tag. `truncated` is
+/// set when the record has more than `cap` fields (never on real S-57 data);
+/// the buffer then holds the first `cap` and the caller must fall back to
+/// `RecordView.fields()` for exact semantics.
+pub const FieldBuf = struct {
+    pub const cap = 64;
+    entries: [cap]Field = undefined,
+    len: usize = 0,
+    truncated: bool = false,
+};
+
 /// Validate + view one record, allocation-free — the raw-bytes twin of
 /// `parseRecord`, with its exact error surface: the same leader checks, the
 /// EndOfRecords padding sentinel, a terminated directory with numeric entries
@@ -434,7 +448,8 @@ pub fn iterate(bytes: []const u8) RecordIterator {
 /// bounds (`parseFields` checks position+length per entry; the max entry end
 /// covers them all). One added guard: a stored record_length shorter than the
 /// directory is rejected here (the eager path would trip a bounds panic).
-fn validateRecord(bytes: []const u8, offset: usize) !struct { view: RecordView, next: usize } {
+/// With `fields_out`, the walk also collects the record's fields (see FieldBuf).
+fn validateRecord(bytes: []const u8, offset: usize, fields_out: ?*FieldBuf) !struct { view: RecordView, next: usize } {
     var leader = try Leader.parse(bytes[offset..]);
     // record_length 0 on a non-'D'/'L' leader is trailing padding => end of records.
     if (leader.record_length == 0 and leader.leader_id != 'D' and leader.leader_id != 'L') return error.EndOfRecords;
@@ -444,19 +459,42 @@ fn validateRecord(bytes: []const u8, offset: usize) !struct { view: RecordView, 
     const entry_len = @as(usize, leader.size_of_field_tag) + leader.size_of_field_length + leader.size_of_field_position;
     const dir_end = leader.field_area_start;
     if (dir_end <= 24 or dir[dir_end - 1] != FT) return error.MissingFieldTerminator;
+    var dirents: [FieldBuf.cap]DirectoryEntry = undefined;
+    var nent: usize = 0;
+    var truncated = false;
     var extent: usize = 0;
     var pos: usize = 24;
     while (pos + entry_len <= dir_end) : (pos += entry_len) {
         if (dir[pos] == FT) break; // directory terminator
+        const tag = dir[pos .. pos + leader.size_of_field_tag];
         var o = pos + leader.size_of_field_tag;
         const length = try asciiInt(dir[o .. o + leader.size_of_field_length]);
         o += leader.size_of_field_length;
         const position = try asciiInt(dir[o .. o + leader.size_of_field_position]);
         if (position + length > extent) extent = position + length;
+        if (fields_out != null) {
+            if (nent < FieldBuf.cap) {
+                dirents[nent] = .{ .tag = tag, .length = length, .position = position };
+                nent += 1;
+            } else truncated = true;
+        }
     }
     if (leader.record_length == 0) leader.record_length = leader.field_area_start + extent;
     if (leader.record_length < leader.field_area_start or offset + leader.record_length > bytes.len) return error.BadRecordLength;
     if (extent > leader.record_length - leader.field_area_start) return error.FieldOutOfBounds;
+    if (fields_out) |fb| {
+        // Materialize the field slices now that the record length (and with it
+        // the field area) is resolved; the extent check above already proved
+        // every entry in bounds. Same FT strip as parseFields/RecordView.field.
+        fb.len = nent;
+        fb.truncated = truncated;
+        const field_area = bytes[offset + leader.field_area_start .. offset + leader.record_length];
+        for (dirents[0..nent], fb.entries[0..nent]) |e, *out| {
+            var data = field_area[e.position .. e.position + e.length];
+            if (data.len > 0 and data[data.len - 1] == FT) data = data[0 .. data.len - 1];
+            out.* = .{ .tag = e.tag, .data = data };
+        }
+    }
     return .{ .view = .{ .base = bytes[offset..][0..leader.record_length], .leader = leader }, .next = offset + leader.record_length };
 }
 
@@ -476,7 +514,20 @@ pub const StrictIterator = struct {
         // errors there, not a clean end); after that, <24 remaining bytes or
         // the padding sentinel end the walk.
         if (self.off != 0 and self.off + 24 > self.bytes.len) return null;
-        const r = validateRecord(self.bytes, self.off) catch |e| {
+        const r = validateRecord(self.bytes, self.off, null) catch |e| {
+            if (e == error.EndOfRecords and self.off != 0) return null;
+            return e;
+        };
+        self.off = r.next;
+        return r.view;
+    }
+
+    /// `next`, but also collecting the record's fields into `buf` during the
+    /// validating walk — for hot callers that read several tags per record.
+    /// Check `buf.truncated` (see FieldBuf) before trusting the collection.
+    pub fn nextFields(self: *StrictIterator, buf: *FieldBuf) !?RecordView {
+        if (self.off != 0 and self.off + 24 > self.bytes.len) return null;
+        const r = validateRecord(self.bytes, self.off, buf) catch |e| {
             if (e == error.EndOfRecords and self.off != 0) return null;
             return e;
         };
