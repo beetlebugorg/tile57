@@ -1393,9 +1393,11 @@ pub fn peekCellInfo(a: Allocator, base: []const u8, updates: []const []const u8)
     const m = peekMeta(a, base) orelse return null;
     var info = CellInfo{ .scale = m.cscl, .bounds = m.bounds };
     {
-        var file = iso.parse(a, base) catch return null;
-        defer file.deinit();
-        for (file.records) |rec| {
+        // Lazy: locate DSID without a full parse. parseDSID still owns its
+        // strings (a), but no per-record model is built.
+        var it = iso.iterate(base);
+        while (it.next()) |rec| {
+            if (rec.leader.leader_id != 'D') continue;
             if (rec.field("DSID")) |raw| {
                 if (parseDSID(a, raw)) |d| {
                     const ext = std.fs.path.extension(d.dsnm);
@@ -1410,9 +1412,9 @@ pub fn peekCellInfo(a: Allocator, base: []const u8, updates: []const []const u8)
         }
     }
     for (updates) |ub| {
-        var file = iso.parse(a, ub) catch continue;
-        defer file.deinit();
-        for (file.records) |rec| {
+        var it = iso.iterate(ub);
+        while (it.next()) |rec| {
+            if (rec.leader.leader_id != 'D') continue;
             if (rec.field("DSID")) |raw| {
                 if (parseDSID(a, raw)) |d| {
                     if (d.edtn.len > 0) info.edition = d.edtn;
@@ -1499,10 +1501,13 @@ fn decodeCATD(a: Allocator, raw_in: []const u8) ?CatalogEntry {
 /// whole set's inventory + per-cell extents from this ONE file instead of parsing
 /// every cell. Entries + their strings are allocated in `a`; null if unparseable.
 pub fn parseCatalog(a: Allocator, bytes: []const u8) ?[]CatalogEntry {
-    var file = iso.parse(a, bytes) catch return null;
-    defer file.deinit();
+    // Lazy: a catalogue has one CATD data record per cell -- read them straight
+    // out of the bytes instead of building the whole file's field model. Only
+    // the kept entries' strings are allocated (in `a`), by decodeCATD.
     var out = std.ArrayList(CatalogEntry).empty;
-    for (file.records) |rec| {
+    var it = iso.iterate(bytes);
+    while (it.next()) |rec| {
+        if (rec.leader.leader_id != 'D') continue; // skip the DDR (schema) record
         const raw = rec.field("CATD") orelse continue;
         if (decodeCATD(a, raw)) |e| out.append(a, e) catch {};
     }
