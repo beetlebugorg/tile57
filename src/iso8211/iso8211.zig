@@ -291,6 +291,268 @@ fn parseFmtList(a: Allocator, list: *std.ArrayList(SubfieldDef), fmt: []const u8
     }
 }
 
+// ---- allocation-free lazy reader ---------------------------------------
+// A streaming view over the same records `parse` builds, but WITHOUT an arena:
+// nothing is allocated, and each field is resolved on demand straight out of
+// the input bytes. Use it for the peek / ENC_ROOT-index path, where only a
+// field or two per cell is read and a full parse (+ its arena) is pure waste.
+// Semantics match the eager path: the same leader validation, the same
+// "length not stored" (record_length==0) recovery, FT-stripped field data, and
+// last-match-wins on a duplicate tag. It is tolerant of a malformed directory
+// entry (returns what it has) rather than failing the whole record -- which is
+// exactly what a best-effort peek wants. Portable Zig: no target-specific code,
+// so it runs the same on native and wasm.
+
+/// Directory extent (max position+length) of a record, allocation-free -- the
+/// raw-bytes twin of `fieldAreaSizeFromDirectory`, for the length==0 recovery.
+fn directoryExtent(rec: []const u8, leader: Leader) usize {
+    const entry_len = @as(usize, leader.size_of_field_tag) + leader.size_of_field_length + leader.size_of_field_position;
+    const dir_end = leader.field_area_start;
+    var pos: usize = 24;
+    var extent: usize = 0;
+    while (pos + entry_len <= dir_end) : (pos += entry_len) {
+        if (rec[pos] == FT) break;
+        var o = pos + leader.size_of_field_tag;
+        const length = asciiInt(rec[o .. o + leader.size_of_field_length]) catch break;
+        o += leader.size_of_field_length;
+        const position = asciiInt(rec[o .. o + leader.size_of_field_position]) catch break;
+        if (position + length > extent) extent = position + length;
+    }
+    return extent;
+}
+
+/// One record, viewed in place. `field` walks the directory each call; that is
+/// cheaper than allocating an entries+fields model when only a few tags are read.
+pub const RecordView = struct {
+    base: []const u8, // the record's bytes, base[0..record_length]
+    leader: Leader,
+
+    /// The first directory entry's tag — the record discriminator (e.g. "FRID"
+    /// vs "VRID") — or null for an empty directory. The lazy, allocation-free
+    /// twin of the eager `rec.fields[0].tag`.
+    pub fn firstTag(self: RecordView) ?[]const u8 {
+        const L = self.leader;
+        const entry_len = @as(usize, L.size_of_field_tag) + L.size_of_field_length + L.size_of_field_position;
+        if (24 + entry_len > L.field_area_start or self.base[24] == FT) return null;
+        return self.base[24 .. 24 + L.size_of_field_tag];
+    }
+
+    /// Walk the record's fields in directory order, allocation-free — the lazy
+    /// twin of the eager `rec.fields` slice (same FT-stripped data). Tolerant
+    /// like `field`: a malformed directory entry ends the walk, an
+    /// out-of-bounds one is skipped.
+    pub const FieldIterator = struct {
+        view: RecordView,
+        pos: usize = 24,
+
+        pub fn next(self: *FieldIterator) ?Field {
+            const L = self.view.leader;
+            const base = self.view.base;
+            const entry_len = @as(usize, L.size_of_field_tag) + L.size_of_field_length + L.size_of_field_position;
+            const dir_end = L.field_area_start;
+            if (dir_end <= 24 or dir_end > base.len) return null;
+            const field_area = base[dir_end..];
+            while (self.pos + entry_len <= dir_end) {
+                const pos = self.pos;
+                self.pos += entry_len;
+                if (base[pos] == FT) return null; // directory terminator
+                const tag = base[pos .. pos + L.size_of_field_tag];
+                var o = pos + L.size_of_field_tag;
+                const length = asciiInt(base[o .. o + L.size_of_field_length]) catch return null;
+                o += L.size_of_field_length;
+                const position = asciiInt(base[o .. o + L.size_of_field_position]) catch return null;
+                if (position + length > field_area.len) continue;
+                var data = field_area[position .. position + length];
+                if (data.len > 0 and data[data.len - 1] == FT) data = data[0 .. data.len - 1];
+                return .{ .tag = tag, .data = data };
+            }
+            return null;
+        }
+    };
+
+    pub fn fields(self: RecordView) FieldIterator {
+        return .{ .view = self };
+    }
+
+    pub fn field(self: RecordView, tag: []const u8) ?[]const u8 {
+        const L = self.leader;
+        if (tag.len != L.size_of_field_tag) return null;
+        const entry_len = @as(usize, L.size_of_field_tag) + L.size_of_field_length + L.size_of_field_position;
+        const dir_end = L.field_area_start;
+        if (dir_end <= 24 or dir_end > self.base.len) return null;
+        const field_area = self.base[L.field_area_start..];
+        var result: ?[]const u8 = null;
+        var pos: usize = 24;
+        while (pos + entry_len <= dir_end) : (pos += entry_len) {
+            if (self.base[pos] == FT) break; // directory terminator
+            const etag = self.base[pos .. pos + L.size_of_field_tag];
+            var o = pos + L.size_of_field_tag;
+            const length = asciiInt(self.base[o .. o + L.size_of_field_length]) catch return result;
+            o += L.size_of_field_length;
+            const position = asciiInt(self.base[o .. o + L.size_of_field_position]) catch return result;
+            if (std.mem.eql(u8, etag, tag) and position + length <= field_area.len) {
+                var data = field_area[position .. position + length];
+                if (data.len > 0 and data[data.len - 1] == FT) data = data[0 .. data.len - 1];
+                result = data; // last match wins
+            }
+        }
+        return result;
+    }
+};
+
+/// Iterate the records of an ISO 8211 file with no allocation. `next` returns
+/// null at the trailing zero-fill padding (clean end of records) or on the first
+/// malformed leader.
+pub const RecordIterator = struct {
+    bytes: []const u8,
+    off: usize = 0,
+
+    pub fn next(self: *RecordIterator) ?RecordView {
+        if (self.off + 24 > self.bytes.len) return null;
+        const rest = self.bytes[self.off..];
+        var leader = Leader.parse(rest) catch return null;
+        if (leader.leader_id != 'D' and leader.leader_id != 'L') return null; // padding / malformed
+        if (leader.field_area_start < 24 or self.off + leader.field_area_start > self.bytes.len) return null;
+        if (leader.record_length == 0)
+            leader.record_length = leader.field_area_start + directoryExtent(rest, leader);
+        if (leader.record_length < 24 or self.off + leader.record_length > self.bytes.len) return null;
+        const base = rest[0..leader.record_length];
+        self.off += leader.record_length;
+        return .{ .base = base, .leader = leader };
+    }
+};
+
+/// Start an allocation-free record iteration over an ISO 8211 file's bytes.
+pub fn iterate(bytes: []const u8) RecordIterator {
+    return .{ .bytes = bytes };
+}
+
+/// Caller-owned output buffer for `StrictIterator.nextFields`: the record's
+/// fields (tag + FT-stripped data), collected during the SAME directory walk
+/// that validates the record — a hot caller reading several tags per record
+/// pays for one ascii directory parse instead of one per tag. `truncated` is
+/// set when the record has more than `cap` fields (never on real S-57 data);
+/// the buffer then holds the first `cap` and the caller must fall back to
+/// `RecordView.fields()` for exact semantics.
+pub const FieldBuf = struct {
+    pub const cap = 64;
+    entries: [cap]Field = undefined,
+    len: usize = 0,
+    truncated: bool = false,
+};
+
+/// Validate + view one record, allocation-free — the raw-bytes twin of
+/// `parseRecord`, with its exact error surface: the same leader checks, the
+/// EndOfRecords padding sentinel, a terminated directory with numeric entries
+/// (`parseDirectory`), the length==0 recovery, and every entry's field-area
+/// bounds (`parseFields` checks position+length per entry; the max entry end
+/// covers them all). One added guard: a stored record_length shorter than the
+/// directory is rejected here (the eager path would trip a bounds panic).
+/// With `fields_out`, the walk also collects the record's fields (see FieldBuf).
+fn validateRecord(bytes: []const u8, offset: usize, fields_out: ?*FieldBuf) !struct { view: RecordView, next: usize } {
+    var leader = try Leader.parse(bytes[offset..]);
+    // record_length 0 on a non-'D'/'L' leader is trailing padding => end of records.
+    if (leader.record_length == 0 and leader.leader_id != 'D' and leader.leader_id != 'L') return error.EndOfRecords;
+    if (leader.leader_id != 'D' and leader.leader_id != 'L') return error.BadLeader;
+    if (leader.field_area_start < 24 or offset + leader.field_area_start > bytes.len) return error.BadRecordLength;
+    const dir = bytes[offset .. offset + leader.field_area_start];
+    const entry_len = @as(usize, leader.size_of_field_tag) + leader.size_of_field_length + leader.size_of_field_position;
+    const dir_end = leader.field_area_start;
+    if (dir_end <= 24 or dir[dir_end - 1] != FT) return error.MissingFieldTerminator;
+    var dirents: [FieldBuf.cap]DirectoryEntry = undefined;
+    var nent: usize = 0;
+    var truncated = false;
+    var extent: usize = 0;
+    var pos: usize = 24;
+    while (pos + entry_len <= dir_end) : (pos += entry_len) {
+        if (dir[pos] == FT) break; // directory terminator
+        const tag = dir[pos .. pos + leader.size_of_field_tag];
+        var o = pos + leader.size_of_field_tag;
+        const length = try asciiInt(dir[o .. o + leader.size_of_field_length]);
+        o += leader.size_of_field_length;
+        const position = try asciiInt(dir[o .. o + leader.size_of_field_position]);
+        if (position + length > extent) extent = position + length;
+        if (fields_out != null) {
+            if (nent < FieldBuf.cap) {
+                dirents[nent] = .{ .tag = tag, .length = length, .position = position };
+                nent += 1;
+            } else truncated = true;
+        }
+    }
+    if (leader.record_length == 0) leader.record_length = leader.field_area_start + extent;
+    if (leader.record_length < leader.field_area_start or offset + leader.record_length > bytes.len) return error.BadRecordLength;
+    if (extent > leader.record_length - leader.field_area_start) return error.FieldOutOfBounds;
+    if (fields_out) |fb| {
+        // Materialize the field slices now that the record length (and with it
+        // the field area) is resolved; the extent check above already proved
+        // every entry in bounds. Same FT strip as parseFields/RecordView.field.
+        fb.len = nent;
+        fb.truncated = truncated;
+        const field_area = bytes[offset + leader.field_area_start .. offset + leader.record_length];
+        for (dirents[0..nent], fb.entries[0..nent]) |e, *out| {
+            var data = field_area[e.position .. e.position + e.length];
+            if (data.len > 0 and data[data.len - 1] == FT) data = data[0 .. data.len - 1];
+            out.* = .{ .tag = e.tag, .data = data };
+        }
+    }
+    return .{ .view = .{ .base = bytes[offset..][0..leader.record_length], .leader = leader }, .next = offset + leader.record_length };
+}
+
+/// Strict record walk: the same allocation-free `RecordView`s as `iterate`, but
+/// with the EAGER `parse` error surface — `next` returns null only at a clean
+/// end of records (the padding sentinel, or fewer than 24 bytes left), and
+/// errors on any input `parse` would reject, so an eager call site can go lazy
+/// without changing which files are accepted. Callers replicate `parse`'s DDR
+/// check themselves (first record must exist and be leader id 'L' => NotADDR),
+/// or use `validate` for the whole file at once.
+pub const StrictIterator = struct {
+    bytes: []const u8,
+    off: usize = 0,
+
+    pub fn next(self: *StrictIterator) !?RecordView {
+        // `parse` reads offset 0 unconditionally (a short or padding-only file
+        // errors there, not a clean end); after that, <24 remaining bytes or
+        // the padding sentinel end the walk.
+        if (self.off != 0 and self.off + 24 > self.bytes.len) return null;
+        const r = validateRecord(self.bytes, self.off, null) catch |e| {
+            if (e == error.EndOfRecords and self.off != 0) return null;
+            return e;
+        };
+        self.off = r.next;
+        return r.view;
+    }
+
+    /// `next`, but also collecting the record's fields into `buf` during the
+    /// validating walk — for hot callers that read several tags per record.
+    /// Check `buf.truncated` (see FieldBuf) before trusting the collection.
+    pub fn nextFields(self: *StrictIterator, buf: *FieldBuf) !?RecordView {
+        if (self.off != 0 and self.off + 24 > self.bytes.len) return null;
+        const r = validateRecord(self.bytes, self.off, buf) catch |e| {
+            if (e == error.EndOfRecords and self.off != 0) return null;
+            return e;
+        };
+        self.off = r.next;
+        return r.view;
+    }
+};
+
+/// Start a strict (eager-error-surface) allocation-free record iteration.
+pub fn iterateStrict(bytes: []const u8) StrictIterator {
+    return .{ .bytes = bytes };
+}
+
+/// Accept or reject a whole file by the eager parser's rules — the same leader,
+/// directory, and field-extent checks as `parse`, including first-record-is-DDR
+/// — without allocating. A file that validates iterates cleanly through
+/// `StrictIterator` (and `iterate`), so a caller can pre-validate once and then
+/// decode with the tolerant walk.
+pub fn validate(bytes: []const u8) !void {
+    var it = iterateStrict(bytes);
+    const first = (try it.next()) orelse return error.NotADDR;
+    if (first.leader.leader_id != 'L') return error.NotADDR;
+    while (try it.next()) |_| {}
+}
+
 /// Parse a whole ISO 8211 file from in-memory bytes (borrowed; keep alive).
 pub fn parse(gpa: Allocator, bytes: []const u8) !File {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -441,4 +703,70 @@ pub fn writeRecord(a: Allocator, out: *std.ArrayList(u8), leader_id: u8, fields:
     try out.appendSlice(a, &leader);
     try out.appendSlice(a, dir.items);
     try out.appendSlice(a, area.items);
+}
+
+test "lazy iterate/RecordView.field matches the eager parse (allocation-free)" {
+    const a = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try writeRecord(a, &buf, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try writeRecord(a, &buf, 'D', &.{ .{ .tag = "FOO1", .data = "AAA" }, .{ .tag = "BAR2", .data = "HELLO" } });
+    try writeRecord(a, &buf, 'D', &.{.{ .tag = "BAR2", .data = "WORLD" }});
+
+    // Lazy view: no allocator; walk records and fields straight out of the bytes.
+    var it = iterate(buf.items);
+    const ddr = it.next().?;
+    try std.testing.expectEqual(@as(u8, 'L'), ddr.leader.leader_id);
+    const dr0 = it.next().?;
+    try std.testing.expectEqual(@as(u8, 'D'), dr0.leader.leader_id);
+    try std.testing.expectEqualStrings("AAA", dr0.field("FOO1").?);
+    try std.testing.expectEqualStrings("HELLO", dr0.field("BAR2").?);
+    try std.testing.expect(dr0.field("NOPE") == null);
+    const dr1 = it.next().?;
+    try std.testing.expectEqualStrings("WORLD", dr1.field("BAR2").?);
+    try std.testing.expect(it.next() == null); // clean end of records
+
+    // Same fields as the eager path, field-for-field.
+    var file = try parse(a, buf.items);
+    defer file.deinit();
+    try std.testing.expectEqualStrings(file.records[0].field("BAR2").?, dr0.field("BAR2").?);
+    try std.testing.expectEqualStrings(file.records[1].field("BAR2").?, dr1.field("BAR2").?);
+}
+
+test "strict iterate matches the eager parse's accept/reject behaviour" {
+    const a = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try writeRecord(a, &buf, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try writeRecord(a, &buf, 'D', &.{ .{ .tag = "FOO1", .data = "AAA" }, .{ .tag = "BAR2", .data = "HELLO" } });
+    try writeRecord(a, &buf, 'D', &.{.{ .tag = "BAR2", .data = "WORLD" }});
+
+    // Clean file: same records + fields as the tolerant walk, plus firstTag.
+    try validate(buf.items);
+    var it = iterateStrict(buf.items);
+    const ddr = (try it.next()).?;
+    try std.testing.expectEqual(@as(u8, 'L'), ddr.leader.leader_id);
+    const dr0 = (try it.next()).?;
+    try std.testing.expectEqualStrings("FOO1", dr0.firstTag().?);
+    try std.testing.expectEqualStrings("HELLO", dr0.field("BAR2").?);
+    const dr1 = (try it.next()).?;
+    try std.testing.expectEqualStrings("BAR2", dr1.firstTag().?);
+    try std.testing.expect((try it.next()) == null); // clean end of records
+
+    // A corrupted directory entry (non-numeric length) mid-file: the eager parse
+    // rejects the whole file; the strict walk must error on that record too.
+    var bad = try a.dupe(u8, buf.items);
+    defer a.free(bad);
+    const last_off = @intFromPtr(dr1.base.ptr) - @intFromPtr(buf.items.ptr);
+    bad[last_off + 24 + 4] = 'X'; // clobber its first directory entry's length
+    try std.testing.expectError(error.BadAsciiInt, parse(a, bad));
+    try std.testing.expectError(error.BadAsciiInt, validate(bad));
+    var itb = iterateStrict(bad);
+    _ = try itb.next();
+    _ = try itb.next();
+    try std.testing.expectError(error.BadAsciiInt, itb.next());
+
+    // Padding-only / non-DDR-first input: validate mirrors parse's errors.
+    try std.testing.expectError(error.EndOfRecords, validate("00000" ++ "     " ++ "00" ++ "00024" ++ "   " ++ "11 1"));
+    try std.testing.expectError(error.NotADDR, validate(buf.items[ddr.base.len..])); // starts at a 'D' record
 }
