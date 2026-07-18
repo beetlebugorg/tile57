@@ -308,6 +308,10 @@ pub const PixelSurface = struct {
         const store = self.store orelse return;
         // Re-gate with the symbol name: ISODGR01 rides its own toggle.
         if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
+        // The style path gates INFORM01 information callouts behind
+        // show_inform_callouts (mariner.zig); mirror it here like the vector
+        // surface does, so all three portrayal paths agree.
+        if (!self.settings.show_inform_callouts and std.mem.eql(u8, name, "INFORM01")) return;
         // Live danger swap (mirrors mariner.pointSymbolImage): a danger lying
         // DEEPER than the mariner's safety contour draws the subdued DANGER02.
         var eff = name;
