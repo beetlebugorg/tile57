@@ -750,6 +750,14 @@ pub const VectorSurface = struct {
     /// the same result either way, because none of the three inputs it applies were
     /// ever baked into the candidate.
     pub fn pushCandidate(self: *VectorSurface, c: Candidate) !void {
+        // SCAMIN, at the zoom this pass is FOR. Geometry deliberately reaches the
+        // host ungated (beginFeature evaluates at GATE_ZOOM) so it can gate live
+        // per frame without a rebuild — but a label cannot be left to that. The
+        // pool ranks candidates AGAINST EACH OTHER, so a set that still holds
+        // every over-zoom detail label declutters as though the view were far
+        // deeper than it is: the survivors pack the screen, and zooming out never
+        // thins them. Gate before the pool sees it, not after.
+        if (!self.settings.ignore_scamin and !resolve.scaminVisible(c.scamin, self.view_zoom)) return;
         // Too short a piece to carry a legible label at this zoom (screen px).
         if (c.gate_world_len > 0 and c.gate_world_len * 256.0 * std.math.exp2(self.view_zoom) < LEGIBLE_PX) return;
         const rot_deg = (if (c.upright) self.uprightTangent(c.rot_rad) else c.rot_rad) * 180.0 / std.math.pi;
