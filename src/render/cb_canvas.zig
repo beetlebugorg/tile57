@@ -13,7 +13,8 @@ const cv = @import("canvas.zig");
 
 // ---- extern C ABI (mirrored in include/tile57.h) ---------------------------
 pub const CPoint = extern struct { x: f32, y: f32 };
-pub const CColor = extern struct { r: u8, g: u8, b: u8, a: u8 };
+/// Packed 0xRRGGBBAA — see tile57_color in tile57.h.
+pub const CColor = u32;
 
 /// Multi-ring path: flat vertex array `pts` + `ring_starts[k]` = first vertex
 /// index of ring k (ring k spans [ring_starts[k], ring_starts[k+1]), last runs
@@ -60,7 +61,7 @@ pub const CbCanvas = struct {
     };
 
     fn color(c: cv.Color) CColor {
-        return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+        return (@as(u32, c.r) << 24) | (@as(u32, c.g) << 16) | (@as(u32, c.b) << 8) | @as(u32, c.a);
     }
 
     // Flatten []const []const Point -> (pts, ring_starts). Arena-allocated;
@@ -113,7 +114,7 @@ pub const CbCanvas = struct {
         const self: *CbCanvas = @ptrCast(@alignCast(ptr));
         const built = try self.build(run.rings);
         var cr = built[0];
-        const halo: CColor = if (run.halo) |h| color(h) else .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+        const halo: CColor = if (run.halo) |h| color(h) else 0;
         self.c.draw_glyphs(self.c.ctx, &cr, color(run.color), halo, run.halo_w);
     }
 };

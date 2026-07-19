@@ -339,15 +339,15 @@ typedef enum { TILE57_ALIGN_VIEWPORT = 0, TILE57_ALIGN_MAP = 1 } tile57_rot_alig
 typedef struct {
     void *ctx;                                 /* handed back to every call */
     void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings,
-                        tile57_rgba color, int even_odd);
+                        tile57_color color, int even_odd);
     void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines,
-                        float width_px, float dash_on, float dash_off, tile57_rgba color);
+                        float width_px, float dash_on, float dash_off, tile57_color color);
     /* rings arrive already rotated; align says whether to also add the view rotation. */
     void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
-                        const tile57_local_rings *rings, tile57_rgba color, int even_odd,
+                        const tile57_local_rings *rings, tile57_color color, int even_odd,
                         float stroke_w, tile57_rot_align align);
     void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor,
-                        const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo,
+                        const tile57_local_rings *glyphs, tile57_color color, tile57_color halo,
                         float halo_px, tile57_rot_align align);
     /* Optional. Leave NULL to get vector outlines from the two calls above; set them
      * to draw point symbols and area patterns from the sprite atlas as textured quads.
@@ -363,7 +363,7 @@ typedef struct {
     void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
                           float ox_px, float oy_px, const char *text, size_t text_len,
                           float size_px, float rot_deg, tile57_rot_align align,
-                          tile57_rgba color, tile57_rgba halo);
+                          tile57_color color, tile57_color halo);
 } tile57_surface_cb;
 
 /* Portray the view once and drive the callbacks. rotation_rad is the view rotation

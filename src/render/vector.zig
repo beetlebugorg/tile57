@@ -44,7 +44,15 @@ const GATE_ZOOM = 30.0;
 // ---- extern C ABI (mirrored in include/tile57.h) ---------------------------
 pub const CWorldPt = extern struct { x: f64, y: f64 }; // web-mercator [0,1], y down
 pub const CLocalPt = extern struct { x: f32, y: f32 }; // anchor-relative reference px
-pub const CColor = extern struct { r: u8, g: u8, b: u8, a: u8 };
+/// Packed 0xRRGGBBAA. A SCALAR, not a struct — see tile57_color in tile57.h:
+/// a small extern struct by value across callconv(.c) is miscompiled by zig
+/// 0.16 on aarch64 in every optimized mode.
+pub const CColor = u32;
+
+/// cv.Color -> packed 0xRRGGBBAA.
+pub fn packColor(c: cv.Color) CColor {
+    return (@as(u32, c.r) << 24) | (@as(u32, c.g) << 16) | (@as(u32, c.b) << 8) | @as(u32, c.a);
+}
 
 /// What a rotatable draw call's rotation is referenced to (MapLibre's
 /// rotation-alignment). `.viewport`: SCREEN-relative — the host leaves the mark
@@ -286,7 +294,7 @@ pub const VectorSurface = struct {
     }
 
     fn ccolor(c: cv.Color) CColor {
-        return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+        return packColor(c);
     }
 
     fn resolveColor(self: *const VectorSurface, token: []const u8) cv.Color {
@@ -469,7 +477,7 @@ pub const VectorSurface = struct {
         if (self.cb.draw_pattern) |dp| {
             dp(self.cb.ctx, &feat, name.ptr, name.len, &wr);
         } else {
-            self.cb.fill_area(self.cb.ctx, &feat, &wr, .{ .r = 160, .g = 160, .b = 170, .a = 140 }, 0);
+            self.cb.fill_area(self.cb.ctx, &feat, &wr, 0xA0A0AA8C, 0);
         }
     }
 
@@ -794,7 +802,7 @@ pub const VectorSurface = struct {
     /// offers: its SDF glyph atlas, or tessellated glyph outlines.
     fn emitLabel(self: *VectorSurface, l: Label) !void {
         if (self.cb.draw_text_str) |dts| {
-            dts(self.cb.ctx, &l.feat, l.anchor, l.x0, l.baseline, l.text.ptr, l.text.len, l.px, @floatCast(l.rot_deg), l.rot_align, ccolor(l.color), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+            dts(self.cb.ctx, &l.feat, l.anchor, l.x0, l.baseline, l.text.ptr, l.text.len, l.px, @floatCast(l.rot_deg), l.rot_align, ccolor(l.color), 0);
             return;
         }
         try self.emitText(l);
@@ -836,7 +844,7 @@ pub const VectorSurface = struct {
         }
         if (rings.items.len == 0) return;
         var lr = try self.localRings(rings.items);
-        self.cb.draw_text(self.cb.ctx, &l.feat, l.anchor, &lr, ccolor(l.color), .{ .r = 0, .g = 0, .b = 0, .a = 0 }, 0, l.rot_align);
+        self.cb.draw_text(self.cb.ctx, &l.feat, l.anchor, &lr, ccolor(l.color), 0, 0, l.rot_align);
     }
 };
 
@@ -1125,13 +1133,13 @@ test "VectorSurface: labels_only emits decluttered text but no area/line/symbol 
 /// is the point: a memo that got the anchor or the run angle subtly wrong while
 /// keeping the text right would be the dangerous failure.
 ///
-/// The label's COLOUR is compared on the candidate instead (see the colour
-/// assertions below), not here: on aarch64 this toolchain miscompiles a
-/// callconv(.c) call that passes CWorldPt by value ahead of a CColor by value,
-/// so the colour the host receives through draw_text_str is not the colour the
-/// engine sent. That is a pre-existing ABI defect in the callback table, not
-/// something the memo can observe or affect.
+/// COLOUR is part of the record. It is carried as a packed 0xRRGGBBAA scalar
+/// (CColor), not a 4-byte struct: passing a small extern struct by value across
+/// callconv(.c) is miscompiled by zig 0.16 on aarch64 in every optimized build
+/// mode, which silently delivered transparent fills, lines and text to hosts.
+/// Asserting colour here guards that regression through a real callback.
 const EmittedLabel = struct {
+    color: CColor,
     cls: []const u8,
     text: []const u8,
     anchor: CWorldPt,
@@ -1150,9 +1158,10 @@ const LabelRec = struct {
     fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
     fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
     fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
-    fn onTextStr(ctx: ?*anyopaque, f: *const CFeature, anchor: CWorldPt, ox: f32, oy: f32, text: [*]const u8, len: usize, px: f32, rot_deg: f32, rot_align: CRotAlign, _: CColor, _: CColor) callconv(.c) void {
+    fn onTextStr(ctx: ?*anyopaque, f: *const CFeature, anchor: CWorldPt, ox: f32, oy: f32, text: [*]const u8, len: usize, px: f32, rot_deg: f32, rot_align: CRotAlign, color: CColor, _: CColor) callconv(.c) void {
         const self: *LabelRec = @ptrCast(@alignCast(ctx.?));
         self.out.append(self.a, .{
+            .color = color,
             .cls = self.a.dupe(u8, std.mem.span(f.cls)) catch return,
             .text = self.a.dupe(u8, text[0..len]) catch return,
             .anchor = anchor,
@@ -1271,6 +1280,12 @@ fn captureCandidates(a: Allocator, colors: *const resolve.Colors, settings: *con
 fn expectSameLabels(want: []const EmittedLabel, got: []const EmittedLabel) !void {
     try testing.expectEqual(want.len, got.len);
     for (want, got) |w, g| {
+        try testing.expectEqual(w.color, g.color);
+        // The colour must also SURVIVE the callconv(.c) boundary: a 4-byte
+        // struct by value is miscompiled here in optimized builds (zeroed under
+        // ReleaseFast/ReleaseSafe), which shipped invisible text to hosts.
+        // CHBLK is opaque, so a zero alpha means the ABI ate it.
+        try testing.expect(w.color & 0xFF != 0);
         try testing.expectEqualStrings(w.cls, g.cls);
         try testing.expectEqualStrings(w.text, g.text);
         try testing.expectEqual(w.anchor.x, g.anchor.x);

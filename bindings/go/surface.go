@@ -7,30 +7,30 @@ package tile57
 #include "tile57.h"
 
 extern void tile57GoSurfFill(void *ctx, tile57_feature *f, tile57_world_rings *rings,
-                             tile57_rgba color, int even_odd);
+                             tile57_color color, int even_odd);
 extern void tile57GoSurfLine(void *ctx, tile57_feature *f, tile57_world_rings *lines,
-                             float width_px, float dash_on, float dash_off, tile57_rgba color);
+                             float width_px, float dash_on, float dash_off, tile57_color color);
 extern void tile57GoSurfSymbol(void *ctx, tile57_feature *f, tile57_world_point anchor,
-                               tile57_local_rings *rings, tile57_rgba color, int even_odd,
+                               tile57_local_rings *rings, tile57_color color, int even_odd,
                                float stroke_w);
 extern void tile57GoSurfText(void *ctx, tile57_feature *f, tile57_world_point anchor,
-                             tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo,
+                             tile57_local_rings *glyphs, tile57_color color, tile57_color halo,
                              float halo_px);
 
 static void surf_fill_thunk(void *ctx, const tile57_feature *f, const tile57_world_rings *r,
-                            tile57_rgba c, int eo) {
+                            tile57_color c, int eo) {
 	tile57GoSurfFill(ctx, (tile57_feature *)f, (tile57_world_rings *)r, c, eo);
 }
 static void surf_line_thunk(void *ctx, const tile57_feature *f, const tile57_world_rings *l,
-                            float w, float don, float doff, tile57_rgba c) {
+                            float w, float don, float doff, tile57_color c) {
 	tile57GoSurfLine(ctx, (tile57_feature *)f, (tile57_world_rings *)l, w, don, doff, c);
 }
 static void surf_symbol_thunk(void *ctx, const tile57_feature *f, tile57_world_point a,
-                              const tile57_local_rings *r, tile57_rgba c, int eo, float sw) {
+                              const tile57_local_rings *r, tile57_color c, int eo, float sw) {
 	tile57GoSurfSymbol(ctx, (tile57_feature *)f, a, (tile57_local_rings *)r, c, eo, sw);
 }
 static void surf_text_thunk(void *ctx, const tile57_feature *f, tile57_world_point a,
-                            const tile57_local_rings *g, tile57_rgba c, tile57_rgba h, float hp) {
+                            const tile57_local_rings *g, tile57_color c, tile57_color h, float hp) {
 	tile57GoSurfText(ctx, (tile57_feature *)f, a, (tile57_local_rings *)g, c, h, hp);
 }
 
@@ -200,7 +200,11 @@ func goFeature(f *C.tile57_feature) SurfaceFeature {
 	return SurfaceFeature{Class: C.GoString(f.cls), Scamin: int64(f.scamin), Plane: int32(f.plane)}
 }
 
-func goRGBA(c C.tile57_rgba) RGBA { return RGBA{uint8(c.r), uint8(c.g), uint8(c.b), uint8(c.a)} }
+// tile57_color is packed 0xRRGGBBAA (a scalar, not a struct — see tile57_color
+// in tile57.h). Go hosts still see an RGBA struct.
+func goRGBA(c C.tile57_color) RGBA {
+	return RGBA{uint8(c >> 24), uint8(c >> 16), uint8(c >> 8), uint8(c)}
+}
 
 func goWorldRings(r *C.tile57_world_rings) WorldRings {
 	n, rc := int(r.n), int(r.ring_count)
@@ -232,7 +236,7 @@ func goLocalRings(r *C.tile57_local_rings) LocalRings {
 
 //export tile57GoSurfFill
 func tile57GoSurfFill(ctx unsafe.Pointer, f *C.tile57_feature, rings *C.tile57_world_rings,
-	color C.tile57_rgba, evenOdd C.int) {
+	color C.tile57_color, evenOdd C.int) {
 	cb := surfCB(ctx)
 	if cb.FillArea == nil {
 		return
@@ -242,7 +246,7 @@ func tile57GoSurfFill(ctx unsafe.Pointer, f *C.tile57_feature, rings *C.tile57_w
 
 //export tile57GoSurfLine
 func tile57GoSurfLine(ctx unsafe.Pointer, f *C.tile57_feature, lines *C.tile57_world_rings,
-	widthPx, dashOn, dashOff C.float, color C.tile57_rgba) {
+	widthPx, dashOn, dashOff C.float, color C.tile57_color) {
 	cb := surfCB(ctx)
 	if cb.StrokeLine == nil {
 		return
@@ -252,7 +256,7 @@ func tile57GoSurfLine(ctx unsafe.Pointer, f *C.tile57_feature, lines *C.tile57_w
 
 //export tile57GoSurfSymbol
 func tile57GoSurfSymbol(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57_world_point,
-	rings *C.tile57_local_rings, color C.tile57_rgba, evenOdd C.int, strokeW C.float) {
+	rings *C.tile57_local_rings, color C.tile57_color, evenOdd C.int, strokeW C.float) {
 	cb := surfCB(ctx)
 	if cb.DrawSymbol == nil {
 		return
@@ -263,7 +267,7 @@ func tile57GoSurfSymbol(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57
 
 //export tile57GoSurfText
 func tile57GoSurfText(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57_world_point,
-	glyphs *C.tile57_local_rings, color, halo C.tile57_rgba, haloPx C.float) {
+	glyphs *C.tile57_local_rings, color, halo C.tile57_color, haloPx C.float) {
 	cb := surfCB(ctx)
 	if cb.DrawText == nil {
 		return

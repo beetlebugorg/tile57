@@ -467,7 +467,21 @@ tile57_status tile57_chart_pdf(tile57_chart *chart, double lon, double lat, doub
  * own renderer. Geometry is emitted in canvas PIXEL space (y down), in final
  * paint order; colours are fully resolved for the active palette. */
 typedef struct { float x, y; } tile57_point;   /* canvas pixels */
-typedef struct { uint8_t r, g, b, a; } tile57_rgba;  /* resolved straight-alpha */
+/* A resolved straight-alpha colour, packed 0xRRGGBBAA.
+ *
+ * Deliberately a SCALAR, not a 4-byte struct. Passing a small extern struct BY
+ * VALUE across a callconv(.c) boundary is miscompiled by zig 0.16 on aarch64 in
+ * every optimized build mode (ReleaseFast/ReleaseSafe zero the argument,
+ * ReleaseSmall passes garbage; Debug is correct), which silently reached hosts
+ * as fully transparent fills, lines and text. A uint32_t is passed in a
+ * register and is correct in every mode. */
+typedef uint32_t tile57_color;
+#define TILE57_COLOR_R(c) ((uint8_t)((c) >> 24))
+#define TILE57_COLOR_G(c) ((uint8_t)((c) >> 16))
+#define TILE57_COLOR_B(c) ((uint8_t)((c) >>  8))
+#define TILE57_COLOR_A(c) ((uint8_t)((c) & 0xFFu))
+#define TILE57_COLOR(r, g, b, a) \
+    (((uint32_t)(r) << 24) | ((uint32_t)(g) << 16) | ((uint32_t)(b) << 8) | (uint32_t)(a))
 /* A multi-ring path: flat vertex array `pts`; ring k spans
  * [ring_starts[k], ring_starts[k+1]) (last runs to `n`). Rings closed implicitly. */
 typedef struct {
@@ -479,17 +493,17 @@ typedef struct {
 typedef struct {
     void *ctx;
     /* Fill closed rings; even_odd != 0 selects the even-odd rule. */
-    void (*fill_path)   (void *ctx, const tile57_rings *rings, tile57_rgba color, int even_odd);
+    void (*fill_path)   (void *ctx, const tile57_rings *rings, tile57_color color, int even_odd);
     /* Stroke polylines width_px wide; dash on/off in px (0,0 = solid). */
     void (*stroke_path) (void *ctx, const tile57_rings *rings, float width_px,
-                         float dash_on, float dash_off, tile57_rgba color);
+                         float dash_on, float dash_off, tile57_color color);
     /* Fill rings with a repeating RGBA8 pattern cell (pw*ph*4 bytes). */
     void (*fill_pattern)(void *ctx, const tile57_rings *rings, uint32_t pw, uint32_t ph,
                          const uint8_t *rgba);
     /* Draw a shaped label as flattened outline rings (px), optional halo
      * (halo.a == 0 => none). */
-    void (*draw_glyphs) (void *ctx, const tile57_rings *outline, tile57_rgba color,
-                         tile57_rgba halo, float halo_px);
+    void (*draw_glyphs) (void *ctx, const tile57_rings *outline, tile57_color color,
+                         tile57_color halo, float halo_px);
 } tile57_canvas_cb;
 tile57_status tile57_chart_canvas(tile57_chart *chart, double lon, double lat, double zoom,
                             uint32_t width, uint32_t height,
@@ -556,22 +570,22 @@ typedef struct {
 typedef struct {
     void *ctx;
     /* Filled area (world). even_odd != 0 selects the even-odd rule. */
-    void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings, tile57_rgba color, int even_odd);
+    void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings, tile57_color color, int even_odd);
     /* Stroked line (world); width in reference px, dash on/off px (0,0 solid). */
-    void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines, float width_px, float dash_on, float dash_off, tile57_rgba color);
+    void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines, float width_px, float dash_on, float dash_off, tile57_color color);
     /* Point symbol: world anchor + local outline (px). even_odd for compound
      * glyphs; stroke_w > 0 => the rings are a polyline stroked stroke_w px wide.
      * The outline arrives ALREADY rotated to the symbol's angle; `align` says
      * whether that angle is chart-relative — MAP => additionally rotate the
      * outline by the view rotation (ORIENT symbols, linestyle bricks); VIEWPORT
      * => leave it upright on screen (the common navaid case). */
-    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_rgba color, int even_odd, float stroke_w, tile57_rot_align align);
+    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_color color, int even_odd, float stroke_w, tile57_rot_align align);
     /* Text: world anchor + local glyph outlines (px, even-odd) + halo
      * (halo.a == 0 => none). The glyphs arrive ALREADY rotated; `align` says
      * whether that angle is chart-relative — MAP => additionally rotate by the
      * view rotation (a depth-contour value follows its contour); VIEWPORT => the
      * label stays upright on screen (the ordinary case). */
-    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px, tile57_rot_align align);
+    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_color color, tile57_color halo, float halo_px, tile57_rot_align align);
     /* Point symbol as a sprite: symbol name (ptr,len) to look up in the atlas
      * (tile57_bake_assets sprite_png/json), world anchor, rotation (deg), and the
      * symbol's un-rotated half-extent in reference px. Draw the atlas cell as a
@@ -591,7 +605,7 @@ typedef struct {
      * view_rotation : 0)` (a depth-contour value passes the tangent + MAP; an
      * ordinary label passes 0 + VIEWPORT and stays upright). NULL => text
      * tessellates via draw_text. Must be the LAST field. */
-    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_rgba color, tile57_rgba halo);
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo);
 } tile57_surface_cb;
 
 tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, double zoom,
