@@ -813,6 +813,68 @@ export fn tile57_compose_open(
     return OK;
 }
 
+/// Walk `dir` recursively for baked *.pmtiles archives, open each (mmap'd, so the
+/// cell set is never fully resident) and compose them into one compositor that OWNS
+/// the archives it opened — the caller holds no chart handles and frees everything
+/// with tile57_compose_close. `partition_path` (or NULL) behaves exactly as in
+/// tile57_compose_open. *out_chart_count (NULL to ignore) = archives composed. No
+/// *.pmtiles under `dir` (or none carrying coverage) is TILE57_ERR_UNSUPPORTED, with
+/// *out = NULL. An unreadable `dir` errors. See tile57.h.
+export fn tile57_compose_tree(
+    dir: ?[*:0]const u8,
+    partition_path: ?[*:0]const u8,
+    out: ?*?*compose.ComposeSource,
+    out_chart_count: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    if (out_chart_count) |p| p.* = 0;
+    const d = spanOpt(dir) orelse return failWith(err, .badarg, "dir must not be null");
+
+    // The lib has no std.process.Init; stand up a threaded std.Io for the tree walk,
+    // the per-archive mmaps and the optional partition-sidecar read.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Collect every *.pmtiles path under `dir` — the SAME walk tile57_bake_tree uses,
+    // matching *.pmtiles instead of *.000. Arena-owned; only live for the open below.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var paths = std.ArrayList([]const u8).empty;
+
+    var wd = std.Io.Dir.cwd().openDir(io, d, .{ .iterate = true }) catch |e| return failCtx(err, e, d);
+    defer wd.close(io);
+    var walker = wd.walk(a) catch |e| return fail(err, e);
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
+        const p = std.fs.path.join(a, &.{ d, entry.path }) catch continue;
+        paths.append(a, p) catch continue;
+    }
+    if (paths.items.len == 0) return failWith(err, .unsupported, "no .pmtiles archive under dir");
+
+    // Optional partition sidecar; a missing/stale one falls back to building — exactly
+    // as tile57_compose_open.
+    var owned: ?[]u8 = null;
+    defer if (owned) |b| gpa.free(b);
+    if (spanOpt(partition_path)) |pp| {
+        if (readSidecar(io, pp)) |b| {
+            owned = b;
+        } else |_| {}
+    }
+
+    // openFiles mmaps + opens each path and the compositor OWNS them (deinit closes
+    // them), so tile57_compose_close alone releases the whole set.
+    const src = (compose.ComposeSource.openFiles(io, gpa, paths.items, owned) catch |e| return failCtx(err, e, d)) orelse
+        return failWith(err, .unsupported, "no archive carries per-cell coverage");
+    o.* = src;
+    if (out_chart_count) |p| p.* = @intCast(src.readers.len);
+    return OK;
+}
+
 /// Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out / *out_len
 /// (free with tile57_free) — the HTTP layer gzips on the wire. NULL/0 out with OK =
 /// no bytes; *out_owned (NULL to ignore) then distinguishes true empty ocean (false,

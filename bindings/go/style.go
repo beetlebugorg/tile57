@@ -69,8 +69,22 @@ type Mariner struct {
 	ScaminFilterGate                                        bool    // one live-filtered *_scamin layer per render-type instead of per-value buckets
 	ShowOverscale                                           bool    // S-52 §10.1.10 AP(OVERSC01) overscale indication (default true)
 	SizeScale                                               float64 // physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
+	TextSizeScale                                           float64 // extra multiplier for TEXT labels on top of SizeScale (0 reads as 1.0)
+	SoundingSizeScale                                       float64 // extra multiplier for SOUNDINGS on top of SizeScale (0 reads as 1.0)
+	Soundings                                               SoundingsMode
 	ViewingGroupsOff                                        []int32 // S-52 §14.5 DENY-LIST: vg ids turned OFF (nil/empty = show all)
 }
+
+// SoundingsMode gives spot soundings their own switch, independent of the
+// display category (S-52 files SOUNDG under OTHER, but the everyday ECDIS
+// setting is STANDARD + soundings ON).
+type SoundingsMode uint8
+
+const (
+	SoundingsFollowCategory SoundingsMode = 0 // the old behaviour: OTHER controls them
+	SoundingsShow           SoundingsMode = 1 // show whatever the category says
+	SoundingsHide           SoundingsMode = 2 // hide whatever the category says
+)
 
 // MarinerDefaults returns the canonical default mariner settings from libtile57.
 func MarinerDefaults() Mariner {
@@ -232,6 +246,9 @@ func (m Mariner) toC(arena *cArena) C.tile57_mariner {
 	c.scamin_filter_gate = C.bool(m.ScaminFilterGate)
 	c.show_overscale = C.bool(m.ShowOverscale)
 	c.size_scale = C.double(m.SizeScale)
+	c.text_size_scale = C.double(m.TextSizeScale)
+	c.sounding_size_scale = C.double(m.SoundingSizeScale)
+	c.soundings = C.uint8_t(m.Soundings)
 	// Viewing-group deny-list: arena-owned C array so no Go pointer crosses into C.
 	vgOffPtr, vgOffN := arena.int32Array(m.ViewingGroupsOff)
 	c.viewing_groups_off = vgOffPtr
@@ -268,6 +285,9 @@ func marinerFromC(c *C.tile57_mariner) Mariner {
 		ScaminFilterGate:           bool(c.scamin_filter_gate),
 		ShowOverscale:              bool(c.show_overscale),
 		SizeScale:                  float64(c.size_scale),
+		TextSizeScale:              float64(c.text_size_scale),
+		SoundingSizeScale:          float64(c.sounding_size_scale),
+		Soundings:                  SoundingsMode(c.soundings),
 	}
 	var dv []byte
 	for i := 0; i < len(c.date_view); i++ {

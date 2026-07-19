@@ -722,6 +722,23 @@ tile57_status tile57_compose_open(tile57_chart *const *charts, size_t n,
                                   const char *partition_path,
                                   tile57_compose **out, tile57_error *err);
 
+/* Open a WHOLE baked tree in one call: recursively walk `dir` for the *.pmtiles
+ * archives a bake produced, mmap and open each (the cell set is never fully
+ * resident), and compose them — the one-call form of enumerating the directory,
+ * tile57_chart_open on each, then tile57_compose_open. Unlike tile57_compose_open,
+ * the returned compositor OWNS the archives it opened: the caller holds no chart
+ * handles and tile57_compose_close alone releases the whole set. `partition_path`
+ * (NULL to skip) behaves exactly as in tile57_compose_open — a partition sidecar
+ * (tile57_compose_save_partition; the `tile57 bake` CLI emits partition.tpart) to
+ * load and skip the build, with a missing/stale one falling back to building.
+ * *out_chart_count (NULL to ignore) receives the number of archives composed. No
+ * *.pmtiles under `dir`, or none carrying coverage, is TILE57_ERR_UNSUPPORTED with
+ * *out = NULL; an unreadable `dir` errors. TILE57_OK with *out set (close with
+ * tile57_compose_close). */
+tile57_status tile57_compose_tree(const char *dir, const char *partition_path,
+                                  tile57_compose **out, uint32_t *out_chart_count,
+                                  tile57_error *err);
+
 /* Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out /
  * *out_len (free with tile57_free) — the HTTP layer gzips on the wire. NULL/0
  * out with TILE57_OK means no bytes for this tile; *out_owned (NULL to ignore)
