@@ -15,7 +15,7 @@ extern void tile57GoSurfSymbol(void *ctx, tile57_feature *f, tile57_world_point 
                                float stroke_w, int align);
 extern void tile57GoSurfText(void *ctx, tile57_feature *f, tile57_world_point anchor,
                              tile57_local_rings *glyphs, tile57_color color, tile57_color halo,
-                             float halo_px, int align);
+                             float halo_px, int align, int32_t text_group);
 
 static void surf_fill_thunk(void *ctx, const tile57_feature *f, const tile57_world_rings *r,
                             tile57_color c, int eo) {
@@ -32,8 +32,8 @@ static void surf_symbol_thunk(void *ctx, const tile57_feature *f, tile57_world_p
 }
 static void surf_text_thunk(void *ctx, const tile57_feature *f, tile57_world_point a,
                             const tile57_local_rings *g, tile57_color c, tile57_color h, float hp,
-                            tile57_rot_align al) {
-	tile57GoSurfText(ctx, (tile57_feature *)f, a, (tile57_local_rings *)g, c, h, hp, al);
+                            tile57_rot_align al, int32_t tg) {
+	tile57GoSurfText(ctx, (tile57_feature *)f, a, (tile57_local_rings *)g, c, h, hp, al, tg);
 }
 
 // sprite / pattern / text_str stay NULL: the engine then tessellates symbols and
@@ -151,8 +151,12 @@ type SurfaceFuncs struct {
 	// chart-relative (a rotated view additionally rotates AlignMap outlines).
 	DrawSymbol func(f SurfaceFeature, anchor WorldPoint, rings LocalRings, color RGBA, evenOdd bool, strokeW float32, align RotAlign)
 	// DrawText draws shaped label glyphs as local outline rings (even-odd), with
-	// an optional halo (halo.A == 0 → none). align as in DrawSymbol.
-	DrawText func(f SurfaceFeature, anchor WorldPoint, glyphs LocalRings, color, halo RGBA, haloPx float32, align RotAlign)
+	// an optional halo (halo.A == 0 → none). align as in DrawSymbol. textGroup is
+	// the label's S-52 text group (§14.5) — a property of the LABEL, not the
+	// feature, since one feature can carry several. Group 11 is important text
+	// (it ignores the mariner's text switches); 21/26/29 names, 23 light
+	// descriptions, 0 none.
+	DrawText func(f SurfaceFeature, anchor WorldPoint, glyphs LocalRings, color, halo RGBA, haloPx float32, align RotAlign, textGroup int)
 }
 
 // Surface emits the composed view centred on (lon, lat) at zoom for a width×height
@@ -299,11 +303,13 @@ func tile57GoSurfSymbol(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57
 
 //export tile57GoSurfText
 func tile57GoSurfText(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57_world_point,
-	glyphs *C.tile57_local_rings, color, halo C.tile57_color, haloPx C.float, align C.int) {
+	glyphs *C.tile57_local_rings, color, halo C.tile57_color, haloPx C.float, align C.int,
+	textGroup C.int32_t) {
 	cb := surfCB(ctx)
 	if cb.DrawText == nil {
 		return
 	}
 	cb.DrawText(goFeature(f), WorldPoint{float64(anchor.x), float64(anchor.y)},
-		goLocalRings(glyphs), goRGBA(color), goRGBA(halo), float32(haloPx), RotAlign(align))
+		goLocalRings(glyphs), goRGBA(color), goRGBA(halo), float32(haloPx), RotAlign(align),
+		int(textGroup))
 }

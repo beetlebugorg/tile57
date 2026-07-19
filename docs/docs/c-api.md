@@ -346,9 +346,13 @@ typedef struct {
     void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
                         const tile57_local_rings *rings, tile57_color color, int even_odd,
                         float stroke_w, tile57_rot_align align);
+    /* text_group is the LABEL's S-52 text group (§14.5): 11 = important text (always
+     * shown — it ignores the mariner's text switches), 21/26/29 names, 23 light
+     * descriptions, 0 none. It rides the callback rather than tile57_feature because
+     * one feature can carry several labels in different groups. */
     void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor,
                         const tile57_local_rings *glyphs, tile57_color color, tile57_color halo,
-                        float halo_px, tile57_rot_align align);
+                        float halo_px, tile57_rot_align align, int32_t text_group);
     /* Optional. Leave NULL to get vector outlines from the two calls above; set them
      * to draw point symbols and area patterns from the sprite atlas as textured quads.
      * Draw the sprite at rot_deg + (align == MAP ? view_rotation : 0). */
@@ -363,7 +367,7 @@ typedef struct {
     void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
                           float ox_px, float oy_px, const char *text, size_t text_len,
                           float size_px, float rot_deg, tile57_rot_align align,
-                          tile57_color color, tile57_color halo);
+                          tile57_color color, tile57_color halo, int32_t text_group);
 } tile57_surface_cb;
 
 /* Portray the view once and drive the callbacks. rotation_rad is the view rotation
@@ -385,6 +389,12 @@ tile57 also declutters overlapping text for you before it makes the calls (symbo
 and soundings always draw, per S-52), so you don't repeat that work — and it lays
 out depth-contour values along their contours, so you get the same labelled contours
 as the raster and MapLibre outputs.
+
+Both text callbacks carry the label's `text_group`, so a host can style text by its
+S-52 role rather than by its feature — draw group 11 (important text: vertical
+clearances, bridge and cable legends) larger or bold, and leave ordinary names at
+their normal weight. The group is per-LABEL, not per-feature: the same feature can
+emit a name in group 26 and a clearance in group 11 on consecutive calls.
 
 The per-tile form `tile57_chart_tile_surface` takes no rotation: a tile is
 tessellated once, north-up, and re-transformed on the GPU each frame, so a

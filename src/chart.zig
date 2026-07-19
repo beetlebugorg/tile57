@@ -136,7 +136,7 @@ test "renderMltTileSurface: handle-less colour/store/surface setup; undecodable 
         fn fill(_: ?*anyopaque, _: *const V.CFeature, _: *const V.CWorldRings, _: V.CColor, _: c_int) callconv(.c) void {}
         fn stroke(_: ?*anyopaque, _: *const V.CFeature, _: *const V.CWorldRings, _: f32, _: f32, _: f32, _: V.CColor) callconv(.c) void {}
         fn symbol(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: c_int, _: f32, _: V.CRotAlign) callconv(.c) void {}
-        fn text(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: V.CColor, _: f32, _: V.CRotAlign) callconv(.c) void {}
+        fn text(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: V.CColor, _: f32, _: V.CRotAlign, _: i32) callconv(.c) void {}
     };
     const cb = V.CSurface{
         .ctx = null,

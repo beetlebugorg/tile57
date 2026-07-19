@@ -116,8 +116,11 @@ pub const CSurface = extern struct {
     /// Text label: world anchor + local glyph outlines (px, even-odd) + halo
     /// (halo.a == 0 => none). The glyphs are already rotated; `align` says whether
     /// the host additionally rotates by the view rotation (.map = follow the
-    /// chart, e.g. a contour value) or leaves the label upright (.viewport).
-    draw_text: *const fn (?*anyopaque, *const CFeature, CWorldPt, *const CLocalRings, CColor, CColor, f32, CRotAlign) callconv(.c) void,
+    /// chart, e.g. a contour value) or leaves the label upright (.viewport). The
+    /// trailing i32 is the label's S-52 text group (§14.5) — a property of the
+    /// LABEL, not the feature (one feature can carry several groups). 11 is
+    /// IMPORTANT TEXT, which ignores the mariner's text switches; 0 = none.
+    draw_text: *const fn (?*anyopaque, *const CFeature, CWorldPt, *const CLocalRings, CColor, CColor, f32, CRotAlign, i32) callconv(.c) void,
     /// Point symbol as a sprite: name (ptr,len) to look up in the atlas, world
     /// anchor, rotation (deg), the rotation alignment (.map => host adds the view
     /// rotation), and the symbol's un-rotated half-extent in reference px (draw
@@ -131,10 +134,11 @@ pub const CSurface = extern struct {
     /// Text label as a STRING for the host's SDF glyph atlas: world anchor + the
     /// anchor-relative baseline-left origin in px (ox,oy, alignment already applied)
     /// + UTF-8 text (ptr,len) + the glyph pixel size + the run rotation (deg) + its
-    /// alignment (.map => host adds the view rotation) + colour + halo. The host
-    /// lays the string out from its glyph metrics and draws SDF quads. Null => text
-    /// tessellates via draw_text instead. Must be the LAST field (ABI-appended).
-    draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, f32, CRotAlign, CColor, CColor) callconv(.c) void = null,
+    /// alignment (.map => host adds the view rotation) + colour + halo + the S-52
+    /// text group (as on draw_text; 11 = important text). The host lays the string
+    /// out from its glyph metrics and draws SDF quads. Null => text tessellates
+    /// via draw_text instead. Must be the LAST field (ABI-appended).
+    draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, f32, CRotAlign, CColor, CColor, i32) callconv(.c) void = null,
 };
 
 /// One label held back from the stream until endScene. Text is the only thing
@@ -152,6 +156,8 @@ const Label = struct {
     color: cv.Color,
     rot_deg: f64,
     rot_align: CRotAlign,
+    /// The candidate's S-52 text group, carried through to the host callback.
+    group: i32,
 };
 
 /// A label BEFORE the view is known: everything about it the TILE decides, and
@@ -804,6 +810,9 @@ pub const VectorSurface = struct {
             .color = c.color,
             .rot_deg = rot_deg,
             .rot_align = c.rot_align,
+            // Groups are small §14.5 codes; a nonsense one degrades to "no group"
+            // rather than trapping on the cast.
+            .group = std.math.cast(i32, c.group) orelse 0,
         });
     }
 
@@ -842,7 +851,7 @@ pub const VectorSurface = struct {
     /// offers: its SDF glyph atlas, or tessellated glyph outlines.
     fn emitLabel(self: *VectorSurface, l: Label) !void {
         if (self.cb.draw_text_str) |dts| {
-            dts(self.cb.ctx, &l.feat, l.anchor, l.x0, l.baseline, l.text.ptr, l.text.len, l.px, @floatCast(l.rot_deg), l.rot_align, ccolor(l.color), 0);
+            dts(self.cb.ctx, &l.feat, l.anchor, l.x0, l.baseline, l.text.ptr, l.text.len, l.px, @floatCast(l.rot_deg), l.rot_align, ccolor(l.color), 0, l.group);
             return;
         }
         try self.emitText(l);
@@ -884,7 +893,7 @@ pub const VectorSurface = struct {
         }
         if (rings.items.len == 0) return;
         var lr = try self.localRings(rings.items);
-        self.cb.draw_text(self.cb.ctx, &l.feat, l.anchor, &lr, ccolor(l.color), 0, 0, l.rot_align);
+        self.cb.draw_text(self.cb.ctx, &l.feat, l.anchor, &lr, ccolor(l.color), 0, 0, l.rot_align, l.group);
     }
 };
 
@@ -893,23 +902,24 @@ pub const VectorSurface = struct {
 const testing = std.testing;
 
 /// A recording CSurface for the tests below: it captures every draw_text_str
-/// (the string + its rotation + alignment — all these tests assert). The four
-/// required draw callbacks are no-ops; supplying draw_text_str routes the label
-/// text through the SDF path so the run angle arrives verbatim (no outline).
+/// (the string + its rotation + alignment + text group — all these tests
+/// assert). The four required draw callbacks are no-ops; supplying draw_text_str
+/// routes the label text through the SDF path so the run angle arrives verbatim
+/// (no outline).
 const RecordCb = struct {
     a: Allocator,
     texts: std.ArrayList(Text) = .empty,
 
-    const Text = struct { text: []const u8, rot_deg: f32, rot_align: CRotAlign };
+    const Text = struct { text: []const u8, rot_deg: f32, rot_align: CRotAlign, group: i32 };
 
     fn noFill(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {}
     fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
     fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
-    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
-    fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, rot_deg: f32, rot_align: CRotAlign, _: CColor, _: CColor) callconv(.c) void {
+    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
+    fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, rot_deg: f32, rot_align: CRotAlign, _: CColor, _: CColor, group: i32) callconv(.c) void {
         const self: *RecordCb = @ptrCast(@alignCast(ctx.?));
         const dup = self.a.dupe(u8, text[0..len]) catch return;
-        self.texts.append(self.a, .{ .text = dup, .rot_deg = rot_deg, .rot_align = rot_align }) catch {};
+        self.texts.append(self.a, .{ .text = dup, .rot_deg = rot_deg, .rot_align = rot_align, .group = group }) catch {};
     }
 
     fn surface(self: *RecordCb) CSurface {
@@ -1082,6 +1092,41 @@ test "VectorSurface: important text outranks a name it overlaps, whatever the wa
     try testing.expectEqualStrings("clr 11", rec.texts.items[0].text);
 }
 
+test "VectorSurface: each label carries its OWN S-52 text group to the callback" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = RecordCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    // ONE feature, TWO labels in different groups — the case that keeps the group
+    // off tile57_feature: a bridge's name is an ordinary name (26), its vertical
+    // clearance is IMPORTANT TEXT (11), and a host drawing 11 bold has to tell
+    // them apart within the same feature. Anchored far enough apart to both place.
+    const bridge = rs.FeatureMeta{ .class = "BRIDGE" };
+    try surf.beginFeature(&bridge);
+    const name = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
+    try surf.drawText("Narrows Br", &name, .{ .x = 1000, .y = 1000 });
+    const clearance = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 11 };
+    try surf.drawText("clr 24m", &clearance, .{ .x = 3000, .y = 3000 });
+    try surf.endFeature();
+    _ = try surf.endScene(a);
+
+    try testing.expectEqual(@as(usize, 2), rec.texts.items.len);
+    for (rec.texts.items) |t| {
+        const want: i32 = if (std.mem.eql(u8, t.text, "clr 24m")) 11 else 26;
+        try testing.expectEqual(want, t.group);
+    }
+}
+
 test "VectorSurface: labels_only emits decluttered text but no area/line/symbol geometry" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1108,8 +1153,8 @@ test "VectorSurface: labels_only emits decluttered text but no area/line/symbol 
             const s: *@This() = @ptrCast(@alignCast(ctx.?));
             s.symbols += 1;
         }
-        fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
-        fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, _: f32, _: CRotAlign, _: CColor, _: CColor) callconv(.c) void {
+        fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
+        fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, _: f32, _: CRotAlign, _: CColor, _: CColor, _: i32) callconv(.c) void {
             const s: *@This() = @ptrCast(@alignCast(ctx.?));
             const dup = s.a.dupe(u8, text[0..len]) catch return;
             s.texts.append(s.a, dup) catch {};
@@ -1197,8 +1242,8 @@ const LabelRec = struct {
     fn noFill(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {}
     fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
     fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
-    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
-    fn onTextStr(ctx: ?*anyopaque, f: *const CFeature, anchor: CWorldPt, ox: f32, oy: f32, text: [*]const u8, len: usize, px: f32, rot_deg: f32, rot_align: CRotAlign, color: CColor, _: CColor) callconv(.c) void {
+    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
+    fn onTextStr(ctx: ?*anyopaque, f: *const CFeature, anchor: CWorldPt, ox: f32, oy: f32, text: [*]const u8, len: usize, px: f32, rot_deg: f32, rot_align: CRotAlign, color: CColor, _: CColor, _: i32) callconv(.c) void {
         const self: *LabelRec = @ptrCast(@alignCast(ctx.?));
         self.out.append(self.a, .{
             .color = color,
@@ -1448,7 +1493,7 @@ const FeatCb = struct {
     }
     fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
     fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
-    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
 
     fn surface(self: *FeatCb) CSurface {
         return .{ .ctx = self, .fill_area = onFill, .stroke_line = noStroke, .draw_symbol = noSymbol, .draw_text = noText };

@@ -176,7 +176,10 @@ resolved, flattened paths, patterns, and glyph outlines in pixel space, in
 paint order (the Canvas seat). `tile57_chart_surface` drives a `tile57_surface_cb` —
 the world-space, semantically tagged stream (per-feature class + SCAMIN, world
 anchors, reference-pixel outlines) a GPU host tessellates once and transforms
-per frame (the Surface seat). Both have composed twins on the compositor
+per frame (the Surface seat). Its two text callbacks also carry the label's S-52
+text group, so a host can draw group 11 (important text) larger or bold and
+ordinary names normally — that group belongs to the label, not the feature.
+Both have composed twins on the compositor
 (`tile57_compose_canvas` / `tile57_compose_surface`). A custom output format in
 Zig is still one small file in `src/render/`.
 

@@ -584,8 +584,13 @@ typedef struct {
      * (halo.a == 0 => none). The glyphs arrive ALREADY rotated; `align` says
      * whether that angle is chart-relative — MAP => additionally rotate by the
      * view rotation (a depth-contour value follows its contour); VIEWPORT => the
-     * label stays upright on screen (the ordinary case). */
-    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_color color, tile57_color halo, float halo_px, tile57_rot_align align);
+     * label stays upright on screen (the ordinary case).
+     * `text_group` is the label's S-52 text group (§14.5) — a property of the
+     * LABEL, not the feature, since one feature can carry several labels in
+     * different groups. Group 11 is IMPORTANT TEXT: it ignores the mariner's
+     * text switches and always shows, so a host wanting it larger/bold keys on
+     * this. 21/26/29 are names, 23 light descriptions; 0 = none. */
+    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_color color, tile57_color halo, float halo_px, tile57_rot_align align, int32_t text_group);
     /* Point symbol as a sprite: symbol name (ptr,len) to look up in the atlas
      * (tile57_bake_assets sprite_png/json), world anchor, rotation (deg), and the
      * symbol's un-rotated half-extent in reference px. Draw the atlas cell as a
@@ -603,9 +608,10 @@ typedef struct {
      * The host lays the string out from its glyph metrics and draws SDF quads,
      * rotating the whole run about the anchor by `rot_deg + (align == MAP ?
      * view_rotation : 0)` (a depth-contour value passes the tangent + MAP; an
-     * ordinary label passes 0 + VIEWPORT and stays upright). NULL => text
-     * tessellates via draw_text. Must be the LAST field. */
-    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo);
+     * ordinary label passes 0 + VIEWPORT and stays upright). `text_group` is the
+     * label's S-52 text group, exactly as on draw_text (11 = important text).
+     * NULL => text tessellates via draw_text. Must be the LAST field. */
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo, int32_t text_group);
 } tile57_surface_cb;
 
 tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, double zoom,
