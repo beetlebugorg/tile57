@@ -140,6 +140,61 @@ const Label = struct {
     rot_align: CRotAlign,
 };
 
+/// A label BEFORE the view is known: everything about it the TILE decides, and
+/// nothing the VIEW does. This is the unit the per-tile label memo stores
+/// (labelcache.zig) — shaping (glyph px, advance width, the aligned baseline
+/// origin), the world anchor, the resolved colour, and the pool's ranking
+/// inputs, all of which depend only on the tile's portrayal at the mariner's
+/// settings and palette.
+///
+/// Exactly three things about a label are view-dependent, and all three derive
+/// per call in `pushCandidate` rather than being stored: the screen-frame
+/// collision box (view zoom + rotation), the depth-contour legibility gate
+/// (view zoom), and the upside-down flip on a tangent-rotated run (view
+/// rotation). That split is what lets a pan or a zoom re-resolve the SAME
+/// candidates instead of re-portraying the tiles.
+pub const Candidate = struct {
+    /// NUL-terminated so CFeature can point straight at it — the candidate's
+    /// storage outlives the call that emits it.
+    cls: [:0]const u8,
+    scamin: i64,
+    plane: i32,
+    disp_cat: CDispCat,
+    anchor: CWorldPt,
+    text: []const u8,
+    px: f32, // glyph size, device px
+    pen: f32, // shaped advance width, device px (the box's length)
+    x0: f32, // anchor-local baseline origin (alignment + LocalOffset applied)
+    baseline: f32,
+    color: cv.Color,
+    /// The S-52 text group the pool ranks on.
+    group: i64,
+    /// The run's own angle, radians (a contour's tangent; 0 for plain text).
+    rot_rad: f64,
+    rot_align: CRotAlign,
+    /// Flip the run 180° when the view rotation would otherwise leave it
+    /// reading upside down. Only a tangent-rotated (MAP-aligned) run does.
+    upright: bool = false,
+    /// The on-screen legibility gate's carrier length, in WORLD units: the
+    /// label is dropped when `len × 256·2^zoom` falls below LEGIBLE_PX at the
+    /// view zoom. 0 = no gate (an ordinary label always places).
+    gate_world_len: f64 = 0,
+};
+
+/// Below this many screen px a depth contour's visible piece is too short to
+/// carry a legible value (S-52 SAFCON01 placement, mirrored from pixel.zig).
+const LEGIBLE_PX: f64 = 10;
+
+/// Where a labels-only walk PARKS its candidates instead of resolving them: the
+/// driver hands the surface one of these per tile, backed by that tile's cache
+/// arena, so the shaped labels outlive the render and can be re-resolved at the
+/// next view. Candidates park in walk order — the order the pool's tie-break
+/// (the SENC sequence) rides on — so replaying them reproduces it exactly.
+pub const Capture = struct {
+    a: Allocator,
+    list: std.ArrayListUnmanaged(Candidate) = .empty,
+};
+
 // ---- the Surface implementation --------------------------------------------
 pub const VectorSurface = struct {
     a: Allocator,
@@ -179,6 +234,11 @@ pub const VectorSurface = struct {
     /// Set by the driver; the collision pool, holdLabel and endScene are untouched,
     /// so the survivors are exactly the ones the full surface view would emit.
     labels_only: bool = false,
+    /// Capture mode (labels-only): PARK each shaped label as a view-independent
+    /// Candidate here instead of adding it to the pool. Set by the driver around
+    /// the portrayal of a tile whose candidates are not memoized yet; cleared
+    /// again before the driver replays candidates through `pushCandidate`.
+    capture: ?*Capture = null,
     pool: dc.Pool = .{},
     labels: std.ArrayListUnmanaged(Label) = .empty,
 
@@ -458,9 +518,10 @@ pub const VectorSurface = struct {
                 }
             }
         }
-        // Too short a piece to carry a legible label at this zoom (screen px).
-        const scale_px = 256.0 * std.math.exp2(self.view_zoom);
-        if (@sqrt(best2) * self.inv_ne * scale_px < 10) return;
+        // The visible piece's length in WORLD units — the legibility gate is
+        // applied against the view zoom when the candidate is resolved, so a
+        // memoized contour label re-gates itself as the mariner zooms.
+        const gate_world_len = @sqrt(best2) * self.inv_ne;
 
         var buf: [24]u8 = undefined;
         const label = if (self.settings.depth_unit == .feet)
@@ -474,10 +535,10 @@ pub const VectorSurface = struct {
             .dusk => cv.Color{ .r = 0xdd, .g = 0xe7, .b = 0xec },
             .night => cv.Color{ .r = 0xaa, .g = 0xb7, .b = 0xbf },
         };
-        // Follow the contour (MAP), flipped as needed so it never reads upside down.
-        const deg = self.uprightTangent(tangent) * 180.0 / std.math.pi;
+        // Follow the contour (MAP), flipped as needed so it never reads upside
+        // down — the flip depends on the view rotation, so it is deferred too.
         // A contour value is not one of the spec's IMPORTANT text groups (group 0).
-        try self.holdLabel(label, 10, "center", "middle", 0, 0, color, deg, .map, 0, mid);
+        try self.holdLabel(label, 10, "center", "middle", 0, 0, color, tangent, .map, true, gate_world_len, 0, mid);
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -589,26 +650,47 @@ pub const VectorSurface = struct {
         const halign = if (style.halign.len > 0) style.halign else "center";
         const valign = if (style.valign.len > 0) style.valign else "middle";
         // An ordinary label stays upright under a rotated view: no rotation, and
-        // screen-referenced so the host does not turn it with the chart.
-        try self.holdLabel(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), 0, .viewport, style.group, at);
+        // screen-referenced so the host does not turn it with the chart. It carries
+        // no legibility gate — a point label places at every zoom.
+        try self.holdLabel(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), 0, .viewport, false, 0, style.group, at);
     }
 
     /// Shape a label and HOLD it: which labels survive is a property of the WHOLE
     /// scene, not of the order the engine walked it (the engine walks a cell in
     /// ENC record order), so nothing is emitted until endScene ranks the pool.
     /// `color` is already resolved (the contour label uses a palette-specific
-    /// neutral the colortables do not name); `rot_deg`/`rot_align` carry the run's
-    /// rotation, and `group` is the S-52 text group the pool ranks on.
-    fn holdLabel(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_deg: f64, rot_align: CRotAlign, group: i64, at: rs.TilePoint) !void {
-        const f = &(self.fnt orelse return);
+    /// neutral the colortables do not name); `rot_rad`/`rot_align`/`upright` carry
+    /// the run's rotation, `gate_world_len` its legibility gate (0 = none), and
+    /// `group` is the S-52 text group the pool ranks on.
+    ///
+    /// In CAPTURE mode the shaped candidate parks in the driver's list instead —
+    /// the whole point of the split: shaping is a property of the tile, and only
+    /// the resolution below it is a property of the view.
+    fn holdLabel(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_rad: f64, rot_align: CRotAlign, upright: bool, gate_world_len: f64, group: i64, at: rs.TilePoint) !void {
+        const a = if (self.capture) |cap| cap.a else self.a;
+        const c = (try self.shapeCandidate(a, text, font_css, halign, valign, ox_mm, oy_mm, color, rot_rad, rot_align, upright, gate_world_len, group, at)) orelse return;
+        if (self.capture) |cap| {
+            try cap.list.append(cap.a, c);
+            return;
+        }
+        try self.pushCandidate(c);
+    }
+
+    /// Lay a label out into its view-independent Candidate — glyph size, real
+    /// advance width, the aligned baseline origin, the world anchor. Null when
+    /// there is nothing to place (no font, sub-pixel type, empty run). Every
+    /// slice it keeps is duped into `a`, which for a captured candidate is the
+    /// tile cache entry's arena, not the render arena.
+    fn shapeCandidate(self: *VectorSurface, a: Allocator, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_rad: f64, rot_align: CRotAlign, upright: bool, gate_world_len: f64, group: i64, at: rs.TilePoint) !?Candidate {
+        const f = &(self.fnt orelse return null);
         const px = font_css * @as(f32, @floatCast(self.textDev()));
-        if (px <= 1) return;
+        if (px <= 1) return null;
 
         // Real advance width — the collision box and the alignment.
         var pen: f32 = 0;
-        var it = (std.unicode.Utf8View.init(text) catch return).iterator();
+        var it = (std.unicode.Utf8View.init(text) catch return null).iterator();
         while (it.nextCodepoint()) |cp| pen += f.advance(f.glyphIndex(cp)) * px;
-        if (pen <= 0) return;
+        if (pen <= 0) return null;
 
         // Alignment + S-52 LocalOffset -> the anchor-local baseline origin. Laid
         // out ONCE: both host paths (SDF string, tessellated outline) draw from it,
@@ -626,18 +708,54 @@ pub const VectorSurface = struct {
             baseline -= f.descent * px;
         }
 
-        const anchor = self.worldOf(at);
-        try self.pool.add(self.a, self.labels.items.len, group, self.cur.class, text, self.labelBox(anchor, x0, baseline, pen, px, rot_deg, rot_align));
-        try self.labels.append(self.a, .{
-            .feat = self.cur_feature(),
-            .anchor = anchor,
-            .text = try self.a.dupe(u8, text),
+        return .{
+            // cur.class is a slice into the decoded tile, which a cache eviction
+            // can free out from under a memoized candidate — dupe it.
+            .cls = a.dupeZ(u8, self.cur.class) catch @as([:0]u8, @constCast("")),
+            .scamin = self.cur.scamin orelse 0,
+            .plane = @intCast(self.cur.draw_prio),
+            // Standard is the default for an unbanded feature (see cur_feature).
+            .disp_cat = switch (self.cur.cat) {
+                0 => .base,
+                2 => .other,
+                else => .standard,
+            },
+            .anchor = self.worldOf(at),
+            .text = try a.dupe(u8, text),
             .px = px,
+            .pen = pen,
             .x0 = x0,
             .baseline = baseline,
             .color = color,
-            .rot_deg = rot_deg,
+            .group = group,
+            .rot_rad = rot_rad,
             .rot_align = rot_align,
+            .upright = upright,
+            .gate_world_len = gate_world_len,
+        };
+    }
+
+    /// Resolve a candidate AGAINST THIS VIEW and enter it in the shared pool: apply
+    /// the zoom's legibility gate, turn the run upright for the view rotation, and
+    /// box it in the screen frame the host will draw it in. Called once per
+    /// candidate per view — over freshly shaped labels or over memoized ones, with
+    /// the same result either way, because none of the three inputs it applies were
+    /// ever baked into the candidate.
+    pub fn pushCandidate(self: *VectorSurface, c: Candidate) !void {
+        // Too short a piece to carry a legible label at this zoom (screen px).
+        if (c.gate_world_len > 0 and c.gate_world_len * 256.0 * std.math.exp2(self.view_zoom) < LEGIBLE_PX) return;
+        const rot_deg = (if (c.upright) self.uprightTangent(c.rot_rad) else c.rot_rad) * 180.0 / std.math.pi;
+        try self.pool.add(self.a, self.labels.items.len, c.group, c.cls, c.text, self.labelBox(c.anchor, c.x0, c.baseline, c.pen, c.px, rot_deg, c.rot_align));
+        try self.labels.append(self.a, .{
+            .feat = .{ .cls = c.cls.ptr, .scamin = c.scamin, .plane = c.plane, .disp_cat = c.disp_cat },
+            .anchor = c.anchor,
+            .text = c.text,
+            .px = c.px,
+            .x0 = c.x0,
+            .baseline = c.baseline,
+            .color = c.color,
+            .rot_deg = rot_deg,
+            .rot_align = c.rot_align,
         });
     }
 
@@ -992,6 +1110,271 @@ test "VectorSurface: labels_only emits decluttered text but no area/line/symbol 
     try testing.expectEqual(@as(usize, 0), rec.strokes);
     try testing.expectEqual(@as(usize, 0), rec.symbols);
     try testing.expectEqual(@as(usize, 2), rec.texts.items.len); // "Bay" + the "20" contour value
+}
+
+// ---- the per-tile candidate memo ---------------------------------------------
+//
+// The memo's whole correctness claim is that a view resolved from CAPTURED
+// candidates is indistinguishable from one portrayed from scratch — same
+// survivors, same order, same geometry — at ANY view, not just the one the
+// candidates happened to be captured at. These tests pin exactly that, by
+// running both paths over the same scene and comparing the emitted label
+// stream field by field.
+
+/// Everything the host is told about one emitted label. Comparing whole records
+/// is the point: a memo that got the anchor or the run angle subtly wrong while
+/// keeping the text right would be the dangerous failure.
+///
+/// The label's COLOUR is compared on the candidate instead (see the colour
+/// assertions below), not here: on aarch64 this toolchain miscompiles a
+/// callconv(.c) call that passes CWorldPt by value ahead of a CColor by value,
+/// so the colour the host receives through draw_text_str is not the colour the
+/// engine sent. That is a pre-existing ABI defect in the callback table, not
+/// something the memo can observe or affect.
+const EmittedLabel = struct {
+    cls: []const u8,
+    text: []const u8,
+    anchor: CWorldPt,
+    ox: f32,
+    oy: f32,
+    px: f32,
+    rot_deg: f32,
+    rot_align: CRotAlign,
+};
+
+const LabelRec = struct {
+    a: Allocator,
+    out: std.ArrayListUnmanaged(EmittedLabel) = .empty,
+
+    fn noFill(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {}
+    fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
+    fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn onTextStr(ctx: ?*anyopaque, f: *const CFeature, anchor: CWorldPt, ox: f32, oy: f32, text: [*]const u8, len: usize, px: f32, rot_deg: f32, rot_align: CRotAlign, _: CColor, _: CColor) callconv(.c) void {
+        const self: *LabelRec = @ptrCast(@alignCast(ctx.?));
+        self.out.append(self.a, .{
+            .cls = self.a.dupe(u8, std.mem.span(f.cls)) catch return,
+            .text = self.a.dupe(u8, text[0..len]) catch return,
+            .anchor = anchor,
+            .ox = ox,
+            .oy = oy,
+            .px = px,
+            .rot_deg = rot_deg,
+            .rot_align = rot_align,
+        }) catch {};
+    }
+
+    fn surface(self: *LabelRec) CSurface {
+        return .{
+            .ctx = self,
+            .fill_area = noFill,
+            .stroke_line = noStroke,
+            .draw_symbol = noSymbol,
+            .draw_text = noText,
+            .draw_text_str = onTextStr,
+        };
+    }
+};
+
+/// The two-tile scene both halves of the memo tests walk. Tile 0 carries a sea
+/// area's name and a long depth contour (the one label whose placement re-derives
+/// per view — it re-gates on zoom and flips upright on rotation); tile 1 carries a
+/// light description, so the walk crosses a tile seam the way a real view does.
+fn walkLabelTile(surf: rs.Surface, vs: *VectorSurface, which: u32, settings: *const resolve.Settings) !void {
+    _ = settings;
+    vs.setTile(12, which, 0);
+    if (which == 0) {
+        const sea = rs.FeatureMeta{ .class = "SEAARE" };
+        try surf.beginFeature(&sea);
+        const name = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
+        try surf.drawText("Mount Hope Bay", &name, .{ .x = 400, .y = 400 });
+        try surf.endFeature();
+
+        const dep = rs.FeatureMeta{ .class = "DEPCNT" };
+        try surf.beginFeature(&dep);
+        const line = [_]rs.TilePoint{ .{ .x = 2000, .y = 100 }, .{ .x = 2000, .y = 3900 } };
+        const lines = [_][]const rs.TilePoint{&line};
+        try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, 20.0);
+        try surf.endFeature();
+    } else {
+        const light = rs.FeatureMeta{ .class = "LIGHTS" };
+        try surf.beginFeature(&light);
+        const desc = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 23 };
+        try surf.drawText("Fl R 4s", &desc, .{ .x = 1000, .y = 2000 });
+        try surf.endFeature();
+    }
+}
+
+/// Walk the scene the way the UNCACHED pass does: portray straight into the pool.
+fn labelsPortrayed(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings, zoom: f64, rot: f64) ![]const EmittedLabel {
+    const rec = try a.create(LabelRec);
+    rec.* = .{ .a = a };
+    const cb = try a.create(CSurface);
+    cb.* = rec.surface();
+
+    var vs = VectorSurface.init(a, colors, .day, settings, cb);
+    vs.view_zoom = zoom;
+    vs.view_rotation = rot;
+    vs.labels_only = true;
+    const surf = vs.asSurface();
+    try surf.beginScene(12);
+    for (0..2) |i| try walkLabelTile(surf, &vs, @intCast(i), settings);
+    _ = try surf.endScene(a);
+    return rec.out.items;
+}
+
+/// Walk it the way the CACHED pass does: capture each tile's candidates once,
+/// then resolve the view from those candidates alone.
+fn labelsFromCandidates(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings, cands: []const []const Candidate, zoom: f64, rot: f64) ![]const EmittedLabel {
+    const rec = try a.create(LabelRec);
+    rec.* = .{ .a = a };
+    const cb = try a.create(CSurface);
+    cb.* = rec.surface();
+
+    var vs = VectorSurface.init(a, colors, .day, settings, cb);
+    vs.view_zoom = zoom;
+    vs.view_rotation = rot;
+    vs.labels_only = true;
+    const surf = vs.asSurface();
+    try surf.beginScene(12);
+    for (cands) |tile_cands| {
+        for (tile_cands) |c| try vs.pushCandidate(c);
+    }
+    _ = try surf.endScene(a);
+    return rec.out.items;
+}
+
+/// Capture each tile's candidates, exactly as the driver does on a cache miss.
+fn captureCandidates(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings, palette: resolve.PaletteId) ![]const []const Candidate {
+    const cb = try a.create(CSurface);
+    var throwaway = LabelRec{ .a = a };
+    cb.* = throwaway.surface();
+
+    var vs = VectorSurface.init(a, colors, palette, settings, cb);
+    vs.view_zoom = 12; // the capture-time view must not reach the candidates
+    vs.view_rotation = 0;
+    vs.labels_only = true;
+    const surf = vs.asSurface();
+    try surf.beginScene(12);
+
+    const out = try a.alloc([]const Candidate, 2);
+    for (0..2) |i| {
+        var cap = Capture{ .a = a };
+        vs.capture = &cap;
+        try walkLabelTile(surf, &vs, @intCast(i), settings);
+        vs.capture = null;
+        out[i] = cap.list.items;
+    }
+    return out;
+}
+
+fn expectSameLabels(want: []const EmittedLabel, got: []const EmittedLabel) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        try testing.expectEqualStrings(w.cls, g.cls);
+        try testing.expectEqualStrings(w.text, g.text);
+        try testing.expectEqual(w.anchor.x, g.anchor.x);
+        try testing.expectEqual(w.anchor.y, g.anchor.y);
+        try testing.expectEqual(w.ox, g.ox);
+        try testing.expectEqual(w.oy, g.oy);
+        try testing.expectEqual(w.px, g.px);
+        try testing.expectEqual(w.rot_deg, g.rot_deg);
+        try testing.expectEqual(w.rot_align, g.rot_align);
+    }
+}
+
+test "label memo: a view resolved from cached candidates emits exactly the portrayed view" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+
+    const cands = try captureCandidates(a, &colors, &settings, .day);
+    // The candidates were captured ONCE, at z12 north-up. Every view below resolves
+    // from that same set and must match a walk portrayed fresh at that view — the
+    // memo's entire contract, and the reason zoom and rotation are not in its key.
+    const views = [_][2]f64{
+        .{ 12, 0 }, // the capture view itself (the "second call, same view" case)
+        .{ 12.7, 0 }, // a fractional zoom mid-pinch
+        .{ 8, 0.4 }, // zoomed way out and rotated
+        .{ 14, -1.9 }, // rotated past vertical: the contour value flips upright
+        .{ 7, 0 }, // far enough out that the contour's piece is illegible and drops
+    };
+    for (views) |v| {
+        const want = try labelsPortrayed(a, &colors, &settings, v[0], v[1]);
+        const got = try labelsFromCandidates(a, &colors, &settings, cands, v[0], v[1]);
+        try expectSameLabels(want, got);
+    }
+
+    // The views above must actually exercise the ZOOM-dependent parts, or matching
+    // proves nothing. The contour value carries the legibility gate: its piece is
+    // long enough to read at z12 and too short at z7, and the memo re-gates the
+    // same candidate both ways.
+    const has = struct {
+        fn depcnt(ls: []const EmittedLabel) bool {
+            for (ls) |l| {
+                if (std.mem.eql(u8, l.cls, "DEPCNT")) return true;
+            }
+            return false;
+        }
+    }.depcnt;
+    try testing.expect(has(try labelsFromCandidates(a, &colors, &settings, cands, 12, 0)));
+    try testing.expect(!has(try labelsFromCandidates(a, &colors, &settings, cands, 7, 0)));
+
+    // ...and the ROTATION-dependent one: the contour value is MAP-aligned, so its
+    // run angle is flipped 180° for a view rotation that would leave it upside
+    // down. Same candidate, two different emitted angles.
+    const upright = try labelsFromCandidates(a, &colors, &settings, cands, 12, 0);
+    const flipped = try labelsFromCandidates(a, &colors, &settings, cands, 12, 2.0);
+    for (upright, flipped) |u, fl| {
+        if (!std.mem.eql(u8, u.cls, "DEPCNT")) continue;
+        try testing.expectEqual(CRotAlign.map, u.rot_align);
+        try testing.expect(@abs(@abs(u.rot_deg - fl.rot_deg) - 180) < 0.001);
+    }
+}
+
+test "label memo: a mariner text-group switch changes the candidates it must be re-keyed on" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+
+    // Default: the name (group 26), the light description (group 23) and the
+    // contour value all place.
+    const all = resolve.Settings{};
+    const base = try captureCandidates(a, &colors, &all, .day);
+    try testing.expectEqual(@as(usize, 2), base[0].len); // name + contour
+    try testing.expectEqual(@as(usize, 1), base[1].len); // light description
+
+    // text_names off drops the geographic name from the CANDIDATES, not merely from
+    // the survivors — so a memo keyed without it would serve a label the mariner
+    // switched off. labelcache.epochOf hashes it (and every other setting).
+    const no_names = resolve.Settings{ .text_names = false };
+    const without = try captureCandidates(a, &colors, &no_names, .day);
+    try testing.expectEqual(@as(usize, 1), without[0].len); // contour value only
+    try testing.expectEqualStrings("DEPCNT", without[0][0].cls);
+
+    // ...and the same for the light descriptions switch.
+    const no_lights = resolve.Settings{ .show_light_descriptions = false };
+    const dark = try captureCandidates(a, &colors, &no_lights, .day);
+    try testing.expectEqual(@as(usize, 0), dark[1].len);
+
+    // Depth unit rewrites the contour value's TEXT (20 m -> 65 ft), which is why it
+    // is in the key too.
+    const feet = resolve.Settings{ .depth_unit = .feet };
+    const ft = try captureCandidates(a, &colors, &feet, .day);
+    try testing.expectEqualStrings("20", base[0][1].text);
+    try testing.expectEqualStrings("65", ft[0][1].text);
+
+    // And the palette: a candidate carries a RESOLVED colour, so the same tile at
+    // dusk is a different candidate set. Asserted on the candidate — the only place
+    // a label's colour is observable (see EmittedLabel for why not through the
+    // callback). Capture is otherwise deterministic: same inputs, same colour.
+    const again = try captureCandidates(a, &colors, &all, .day);
+    const dusk = try captureCandidates(a, &colors, &all, .dusk);
+    try testing.expectEqual(base[0][1].color, again[0][1].color);
+    try testing.expect(!std.meta.eql(base[0][1].color, dusk[0][1].color));
 }
 
 /// Records the CFeature each draw call is tagged with.

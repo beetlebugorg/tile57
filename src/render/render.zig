@@ -40,11 +40,13 @@ pub const pdf = @import("pdf.zig");
 pub const cb_canvas = @import("cb_canvas.zig");
 pub const vector = @import("vector.zig");
 pub const declutter = @import("declutter.zig");
+pub const labelcache = @import("labelcache.zig"); // per-tile label-candidate memo (the view label pass)
 
 test {
     _ = surface;
     _ = vector;
     _ = declutter;
+    _ = labelcache;
     _ = noop;
     _ = inspect;
     _ = resolve;

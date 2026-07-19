@@ -400,9 +400,18 @@ surviving text — through the same `draw_text_str` / `draw_text` callbacks, at 
 same world anchors as `tile57_chart_surface` — and draws no fills, lines, symbols, or
 soundings. So the host draws geometry + symbols from its per-tile cache and calls
 this once per frame (or per view change) to overlay the globally-decluttered text
-last (text is drawn on top). It re-portrays the covering tiles (only the decoded /
-composed tiles are cached, not their labels) but skips all geometry tessellation, so
-it is markedly cheaper than a full `tile57_chart_surface`.
+last (text is drawn on top).
+
+It is cheap enough to call on every view change. Each covering tile is portrayed
+once and its label *candidates* — what a label says, how it is shaped, where it is
+anchored — memoize on the chart or compositor. Neither zoom nor rotation is part of
+that memo: the collision box, the depth-contour legibility gate and the upright flip
+on a tangent-rotated run all derive per call, so a pan, zoom or rotation over tiles
+already seen does no portrayal work and settles in well under a millisecond. Only
+the first view of a region pays, and changing the palette or any mariner setting
+retires the memo (a candidate carries a resolved colour and the text the mariner's
+settings selected). The memo is bounded at a few hundred tiles and released with the
+handle.
 
 ```c
 /* View-level, globally-decluttered TEXT pass: emits only surviving labels

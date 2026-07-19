@@ -187,8 +187,9 @@ resolved against one collision pool across every covering tile, so labels no
 longer collide or repeat at tile seams the way the per-tile pass leaves them.
 It reuses the same `tile57_surface_cb` text callbacks and world anchors and draws
 no geometry, so the host paints cached tiles then overlays this decluttered text
-last. It re-portrays the covering tiles (only decoded tiles are memoized, not
-their labels) but skips all geometry tessellation.
+last. Each covering tile's label candidates memoize on the chart (or compositor),
+so only the first view of a region portrays: a pan, zoom or rotation over tiles
+already seen re-resolves the cached candidates against the new view instead.
 
 ## What's deliberately not here (yet)
 

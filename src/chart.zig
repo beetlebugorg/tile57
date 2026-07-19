@@ -234,6 +234,21 @@ const CellBackend = struct {
     feat_bbox: ?[]const ?[4]f64 = null, // per-feature lon/lat bbox (spatial cull)
 };
 
+/// The live-cell backend as the scene engine's one-cell reference: the cell plus
+/// the open-time portrayal streams and per-cell geometry caches the view paths
+/// replay from.
+fn cellRef(cb: *CellBackend) scene.CellRef {
+    return .{
+        .cell = &cb.cell,
+        .portrayal = cb.portrayal,
+        .portrayal_plain = cb.portrayal_plain,
+        .portrayal_simplified = cb.portrayal_simplified,
+        .geo = cb.geo,
+        .geo_world = cb.geo_world,
+        .feat_bbox = cb.feat_bbox,
+    };
+}
+
 // One cell in the lazy ENC_ROOT index: its owned bytes + cheap metadata (bbox +
 // navigational band), parsed + portrayed ON DEMAND the first time a requested tile
 // needs it, then kept until evicted by the LRU.
@@ -1052,27 +1067,109 @@ pub fn renderComposeView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     return surf.endScene(gpa) catch error.TileGen;
 }
 
+/// The VIEW-level, GLOBALLY-decluttered TEXT pass over a compositor: gather the
+/// label candidates of every covering tile into ONE shared declutter pool and emit
+/// ONLY the survivors (via draw_text_str / draw_text) — no fills, lines, symbols or
+/// soundings. For a tile-renderer host that already draws geometry + symbols from
+/// its own per-tile cache (tile57_compose_tile / a per-tile surface) but needs
+/// labels decluttered ACROSS tile and CHART seams, which a per-tile pass cannot do.
+/// World anchors + coordinate space are identical to renderComposeSurfaceView, so
+/// text overlays the cached geometry with no re-projection.
+///
+/// Candidates memoize per tile (render/labelcache.zig), so a tile is composed,
+/// decoded and portrayed ONCE per portrayal identity: a repeat call at any centre,
+/// zoom or rotation over tiles already seen does no portrayal work at all — it
+/// re-resolves the memoized candidates against the new view. Changing the palette
+/// or any mariner setting retires the memo.
+pub fn renderComposeLabels(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const colors = try sharedColors();
+    var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
+    vs.view_zoom = zoom; // scale at which labels declutter
+    vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
+    vs.labels_only = true; // the view-level text pass draws no geometry
+    const surf = vs.asSurface();
+
+    const cache = try composeLabelCache(src);
+    cache.retarget(gpa, render.labelcache.epochOf(palette, settings));
+
+    // The symbol store is built on the FIRST cache miss and not at all when the
+    // view is fully memoized — for a compositor it is a per-call parse of the whole
+    // SVG catalogue, which on a settled view is the largest cost left. A labels-only
+    // walk never draws a symbol, but the store's init also registers the complex
+    // linestyle catalogue the portrayal walk reads, so a MISS must still have it.
+    var store: ?*sprite.CatalogStore = null;
+    defer if (store) |s| s.deinit();
+
+    const Portray = struct {
+        src: *compose_mod.ComposeSource,
+        a: std.mem.Allocator,
+        surf: render.surface.Surface,
+        vs: *render.vector.VectorSurface,
+        store: *?*sprite.CatalogStore,
+        palette: render.resolve.PaletteId,
+
+        fn portray(self: *const @This(), z: u8, x: u32, y: u32) !void {
+            if (self.store.* == null) {
+                self.store.* = try viewSymbolStore(self.a, self.palette);
+                self.vs.store = self.store.*.?.asStore();
+            }
+            const res = try self.src.tile(self.a, z, x, y);
+            const bytes = res.tile orelse return;
+            const layers = try mlt.decode(self.a, bytes);
+            try scene.replayTile(self.a, self.surf, layers);
+        }
+    };
+    const ctx = Portray{ .src = src, .a = a, .surf = surf, .vs = &vs, .store = &store, .palette = palette };
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    try surf.beginScene(vt.z);
+    while (vt.next()) |t| {
+        for (tileCandidates(cache, &vs, t.z, t.x, t.y, &ctx)) |c| try vs.pushCandidate(c);
+    }
+    _ = try surf.endScene(a);
+}
+
+/// The label-candidate memo hung off a compositor, created on first use and
+/// released when the source closes (compose.ComposeSource.render_cache).
+fn composeLabelCache(src: *compose_mod.ComposeSource) !*render.labelcache.Cache {
+    if (src.render_cache) |p| return @ptrCast(@alignCast(p));
+    const c = try gpa.create(render.labelcache.Cache);
+    c.* = .{};
+    src.render_cache = c;
+    src.render_cache_free = freeComposeLabelCache;
+    return c;
+}
+
+fn freeComposeLabelCache(p: *anyopaque) void {
+    const c: *render.labelcache.Cache = @ptrCast(@alignCast(p));
+    c.deinit(gpa);
+    gpa.destroy(c);
+}
+
+/// One tile's label candidates for a labels-only walk: the memo's, or — on a miss —
+/// the ones `ctx.portray` shapes, captured into the new cache entry's own arena so
+/// they outlive this call. An empty result is cached like any other (a tile with no
+/// labels must not be re-portrayed either), and a tile that cannot be stored simply
+/// contributes nothing, mirroring the decoded-tile memo's OOM behaviour.
+fn tileCandidates(cache: *render.labelcache.Cache, vs: *render.vector.VectorSurface, z: u8, x: u32, y: u32, ctx: anytype) []const render.vector.Candidate {
+    if (cache.get(z, x, y)) |hit| return hit;
+    const e = cache.newEntry(gpa) orelse return &.{};
+    var cap = render.vector.Capture{ .a = e.arena.allocator() };
+    vs.capture = &cap;
+    defer vs.capture = null;
+    vs.setTile(z, x, y);
+    ctx.portray(z, x, y) catch {};
+    return cache.store(gpa, z, x, y, e, cap.list.items) orelse &.{};
+}
+
 /// renderComposeView's GPU-vector twin: the SAME composed view emitted as a
 /// WORLD-SPACE tagged stream to the C surface callback (see render/vector.zig).
 pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
-    return composeSurfaceImpl(src, lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, false);
-}
-
-/// The VIEW-level, GLOBALLY-decluttered TEXT pass over a compositor: walk the same
-/// covering tiles as renderComposeSurfaceView into ONE shared declutter pool and
-/// emit ONLY the surviving labels (via draw_text_str / draw_text) — no fills, lines,
-/// symbols or soundings. For a tile-renderer host that already draws geometry +
-/// symbols from its own per-tile cache (tile57_compose_tile / a per-tile surface)
-/// but needs labels decluttered ACROSS tile seams. World anchors + coordinate space
-/// are identical to renderComposeSurfaceView, so text overlays the cached geometry
-/// with no re-projection. This re-portrays the view's tiles (there is no memoized
-/// per-tile label set to reuse — only decoded/composed tiles are cached), but skips
-/// all geometry tessellation, so it is markedly cheaper than the full surface view.
-pub fn renderComposeLabels(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
-    return composeSurfaceImpl(src, lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, true);
-}
-
-fn composeSurfaceImpl(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface, labels_only: bool) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1086,7 +1183,6 @@ fn composeSurfaceImpl(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom:
     vs.store = store.asStore();
     vs.view_zoom = zoom; // scale at which labels/symbols declutter
     vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
-    vs.labels_only = labels_only; // the view-level text pass draws no geometry
 
     var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
     const surf = vs.asSurface();
@@ -1250,6 +1346,10 @@ pub const Chart = struct {
     view_tiles_max: usize = 192, // > the ~96 tiles of one 2560px view: never evicts mid-render
     view_arena: ?*std.heap.ArenaAllocator = null,
     view_stores: [3]?*sprite.CatalogStore = .{ null, null, null },
+    // The view label pass's per-tile candidate memo (render/labelcache.zig): what
+    // lets renderSurfaceLabels run on every view-settle instead of re-portraying
+    // the covering tiles each time. Bounded and released with the handle.
+    label_cache: render.labelcache.Cache = .{},
 
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
@@ -1524,6 +1624,7 @@ pub const Chart = struct {
             }
             self.view_tiles.deinit(gpa);
         }
+        self.label_cache.deinit(gpa);
         if (self.view_arena) |va| {
             va.deinit();
             gpa.destroy(va);
@@ -1763,25 +1864,6 @@ pub const Chart = struct {
     /// (see render/vector.zig). Live for both a baked bundle (.reader tile
     /// replay) and a live cell (.cell portrayal). No bytes are produced.
     pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
-        return self.surfaceViewImpl(lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, false);
-    }
-
-    /// The VIEW-level, GLOBALLY-decluttered TEXT pass — renderSurfaceView's twin
-    /// that emits ONLY the surviving labels (draw_text_str / draw_text), no fills,
-    /// lines, symbols or soundings. For a tile-renderer host that draws geometry +
-    /// symbols from its own per-tile cache (renderSurfaceTile / tile57_chart_tile_surface)
-    /// but needs labels decluttered ACROSS tile seams, which the per-tile pass cannot
-    /// do. Same world anchors + coordinate space as renderSurfaceView, so the text
-    /// overlays the cached geometry directly. It re-portrays the view's tiles into
-    /// one shared pool (no per-tile label set is memoized — only decoded tiles /
-    /// per-cell geometry are), but skips every geometry tessellation, so it is far
-    /// cheaper than a full surface view. Live for a baked bundle (.reader) and a live
-    /// cell (.cell); .cells is unsupported (bake, then compose).
-    pub fn renderSurfaceLabels(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
-        return self.surfaceViewImpl(lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, true);
-    }
-
-    fn surfaceViewImpl(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface, labels_only: bool) !void {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1794,7 +1876,6 @@ pub const Chart = struct {
         vs.store = store.asStore();
         vs.view_zoom = zoom; // scale at which labels/symbols declutter
         vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
-        vs.labels_only = labels_only; // the view-level text pass draws no geometry
         const surf = vs.asSurface();
 
         var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
@@ -1808,18 +1889,82 @@ pub const Chart = struct {
                 }
             },
             .cell => |*cb2| {
-                const one = [_]scene.CellRef{.{
-                    .cell = &cb2.cell,
-                    .portrayal = cb2.portrayal,
-                    .portrayal_plain = cb2.portrayal_plain,
-                    .portrayal_simplified = cb2.portrayal_simplified,
-                    .geo = cb2.geo,
-                    .geo_world = cb2.geo_world,
-                    .feat_bbox = cb2.feat_bbox,
-                }};
+                const one = [_]scene.CellRef{cellRef(cb2)};
                 while (vt.next()) |t| {
                     vs.setTile(t.z, t.x, t.y);
                     scene.appendTile(surf, a, &one, t.z, t.x, t.y, self.pick_attrs) catch continue;
+                }
+            },
+            .cells => return error.Unsupported,
+        }
+        _ = try surf.endScene(a);
+    }
+
+    /// The VIEW-level, GLOBALLY-decluttered TEXT pass — renderSurfaceView's twin
+    /// that emits ONLY the surviving labels (draw_text_str / draw_text), no fills,
+    /// lines, symbols or soundings. For a tile-renderer host that draws geometry +
+    /// symbols from its own per-tile cache (renderSurfaceTile / tile57_chart_tile_surface)
+    /// but needs labels decluttered ACROSS tile seams, which the per-tile pass cannot
+    /// do. Same world anchors + coordinate space as renderSurfaceView, so the text
+    /// overlays the cached geometry directly.
+    ///
+    /// Label candidates memoize per tile (render/labelcache.zig): a tile is portrayed
+    /// ONCE per portrayal identity, and a repeat call at any centre, zoom or rotation
+    /// over tiles already seen only re-resolves those candidates against the new view.
+    /// Changing the palette or any mariner setting retires the memo. Live for a baked
+    /// bundle (.reader) and a live cell (.cell); .cells is unsupported (bake, then
+    /// compose).
+    pub fn renderSurfaceLabels(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const colors = try self.viewColorsRef();
+        var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
+        vs.view_zoom = zoom; // scale at which labels declutter
+        vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
+        vs.labels_only = true; // the view-level text pass draws no geometry
+        const surf = vs.asSurface();
+        // A labels-only walk draws no symbol, but the store's init also registers the
+        // complex-linestyle catalogue the portrayal walk reads. It is memoized per
+        // handle, so this is a hash lookup after the first view.
+        vs.store = (try self.viewStoreFor(palette)).asStore();
+
+        self.label_cache.retarget(gpa, render.labelcache.epochOf(palette, settings));
+
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+        try surf.beginScene(vt.z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                const Portray = struct {
+                    self: *Chart,
+                    rd: *pmtiles.Reader,
+                    a: std.mem.Allocator,
+                    surf: render.surface.Surface,
+                    fn portray(p: *const @This(), z: u8, x: u32, y: u32) !void {
+                        const layers = p.self.viewTileLayers(p.rd, z, x, y) orelse return;
+                        try scene.replayTile(p.a, p.surf, layers);
+                    }
+                };
+                const ctx = Portray{ .self = self, .rd = rd, .a = a, .surf = surf };
+                while (vt.next()) |t| {
+                    for (tileCandidates(&self.label_cache, &vs, t.z, t.x, t.y, &ctx)) |c| try vs.pushCandidate(c);
+                }
+            },
+            .cell => |*cb2| {
+                const Portray = struct {
+                    one: [1]scene.CellRef,
+                    a: std.mem.Allocator,
+                    surf: render.surface.Surface,
+                    pick_attrs: bool,
+                    fn portray(p: *const @This(), z: u8, x: u32, y: u32) !void {
+                        try scene.appendTile(p.surf, p.a, &p.one, z, x, y, p.pick_attrs);
+                    }
+                };
+                const ctx = Portray{ .one = .{cellRef(cb2)}, .a = a, .surf = surf, .pick_attrs = self.pick_attrs };
+                while (vt.next()) |t| {
+                    for (tileCandidates(&self.label_cache, &vs, t.z, t.x, t.y, &ctx)) |c| try vs.pushCandidate(c);
                 }
             },
             .cells => return error.Unsupported,

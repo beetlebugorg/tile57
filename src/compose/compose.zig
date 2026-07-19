@@ -304,6 +304,15 @@ pub const ComposeSource = struct {
     loop_max: u8, // deepest zoom the sources can serve (native windows + one fill-up overscale zoom)
     bounds: [4]f64, // union coverage [west, south, east, north] in degrees
 
+    // A RENDER-layer cache hung off this source for its lifetime — today the per-tile
+    // label-candidate memo the view label pass resolves from (render/labelcache.zig).
+    // The compositor reads baked archives and nothing else — it sits below the render
+    // path as a dependency leaf — so it cannot NAME that type: it holds the slot
+    // opaquely and releases it at deinit through the free function the render layer
+    // installs alongside it. Set both fields together or neither.
+    render_cache: ?*anyopaque = null,
+    render_cache_free: ?*const fn (*anyopaque) void = null,
+
     /// Compose one tile → raw (decompressed) MLT + the ownership flag (gpa-owned bytes; null when
     /// nothing rendered — `owned` then says whether a cell SHOULD have). This is what a live tile
     /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
@@ -317,6 +326,9 @@ pub const ComposeSource = struct {
     }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
+        if (self.render_cache) |p| {
+            if (self.render_cache_free) |f| f(p);
+        }
         self.part.deinit();
         if (self.owns_archives) {
             for (self.readers) |rp| rp.deinit();

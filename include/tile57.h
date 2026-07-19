@@ -648,9 +648,15 @@ tile57_status tile57_render_mlt_tile(const uint8_t *mlt, size_t mlt_len,
  * re-projection — draw it LAST (text is drawn on top). `rotation_rad` matters: labels
  * declutter in the SCREEN frame the host draws them in.
  *
- * Cost: this RE-PORTRAYS the view's covering tiles (there is no memoized per-tile
- * label set to reuse — only decoded/composed tiles are cached), but it skips ALL
- * geometry tessellation, so it is markedly cheaper than a full tile57_chart_surface.
+ * Cost: each covering tile is portrayed ONCE and its label candidates are memoized
+ * on the chart, so a repeat call over tiles already seen does NO portrayal work — it
+ * only re-resolves those candidates against the new view. Zoom and rotation are NOT
+ * part of the memo (a candidate holds what a label says, how it is shaped and where
+ * it is anchored; the collision box, the contour legibility gate and the upright
+ * flip all derive per call), so a continuous pan / zoom / rotate settles in well
+ * under a millisecond. Only the first view of a region — or a change to the palette
+ * or ANY mariner setting, which retires the memo — pays portrayal again. The memo is
+ * bounded (a few hundred tiles, a couple of MB) and released with the chart.
  * Cell/bundle sources; a lazy multi-cell ENC_ROOT is TILE57_ERR_UNSUPPORTED (bake,
  * then compose). */
 tile57_status tile57_chart_labels(tile57_chart *chart, double lon, double lat, double zoom,
@@ -745,10 +751,12 @@ tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, 
  * / a per-tile surface) but needs labels decluttered across BOTH tile and chart
  * seams. World anchors, per-feature tags and the align convention are identical to
  * tile57_compose_surface, so the text overlays the cached geometry with no
- * re-projection — draw it last. Re-portrays the covering tiles (only composed tiles
- * are cached, not their labels) but skips all geometry tessellation, so it is far
- * cheaper than tile57_compose_surface. See tile57_chart_labels for the details and
- * the intended per-frame loop. */
+ * re-projection — draw it last. Label candidates memoize per tile on the compositor
+ * (released with it), so each covering tile is composed, decoded and portrayed once
+ * and a repeat call at any centre, zoom or rotation over tiles already seen only
+ * re-resolves them — the composed set's first view of a region is the only one that
+ * pays. See tile57_chart_labels for the memo's terms and the intended per-frame
+ * loop. */
 tile57_status tile57_compose_labels(tile57_compose *c, double lon, double lat, double zoom,
                                     double rotation_rad, /* view rotation, radians CW; 0 = north-up */
                                     uint32_t width, uint32_t height,
