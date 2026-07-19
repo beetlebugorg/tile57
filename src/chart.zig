@@ -1055,6 +1055,24 @@ pub fn renderComposeView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
 /// renderComposeView's GPU-vector twin: the SAME composed view emitted as a
 /// WORLD-SPACE tagged stream to the C surface callback (see render/vector.zig).
 pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+    return composeSurfaceImpl(src, lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, false);
+}
+
+/// The VIEW-level, GLOBALLY-decluttered TEXT pass over a compositor: walk the same
+/// covering tiles as renderComposeSurfaceView into ONE shared declutter pool and
+/// emit ONLY the surviving labels (via draw_text_str / draw_text) — no fills, lines,
+/// symbols or soundings. For a tile-renderer host that already draws geometry +
+/// symbols from its own per-tile cache (tile57_compose_tile / a per-tile surface)
+/// but needs labels decluttered ACROSS tile seams. World anchors + coordinate space
+/// are identical to renderComposeSurfaceView, so text overlays the cached geometry
+/// with no re-projection. This re-portrays the view's tiles (there is no memoized
+/// per-tile label set to reuse — only decoded/composed tiles are cached), but skips
+/// all geometry tessellation, so it is markedly cheaper than the full surface view.
+pub fn renderComposeLabels(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+    return composeSurfaceImpl(src, lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, true);
+}
+
+fn composeSurfaceImpl(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface, labels_only: bool) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1068,6 +1086,7 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
     vs.store = store.asStore();
     vs.view_zoom = zoom; // scale at which labels/symbols declutter
     vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
+    vs.labels_only = labels_only; // the view-level text pass draws no geometry
 
     var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
     const surf = vs.asSurface();
@@ -1744,6 +1763,25 @@ pub const Chart = struct {
     /// (see render/vector.zig). Live for both a baked bundle (.reader tile
     /// replay) and a live cell (.cell portrayal). No bytes are produced.
     pub fn renderSurfaceView(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+        return self.surfaceViewImpl(lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, false);
+    }
+
+    /// The VIEW-level, GLOBALLY-decluttered TEXT pass — renderSurfaceView's twin
+    /// that emits ONLY the surviving labels (draw_text_str / draw_text), no fills,
+    /// lines, symbols or soundings. For a tile-renderer host that draws geometry +
+    /// symbols from its own per-tile cache (renderSurfaceTile / tile57_chart_tile_surface)
+    /// but needs labels decluttered ACROSS tile seams, which the per-tile pass cannot
+    /// do. Same world anchors + coordinate space as renderSurfaceView, so the text
+    /// overlays the cached geometry directly. It re-portrays the view's tiles into
+    /// one shared pool (no per-tile label set is memoized — only decoded tiles /
+    /// per-cell geometry are), but skips every geometry tessellation, so it is far
+    /// cheaper than a full surface view. Live for a baked bundle (.reader) and a live
+    /// cell (.cell); .cells is unsupported (bake, then compose).
+    pub fn renderSurfaceLabels(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+        return self.surfaceViewImpl(lon, lat, zoom, rotation_rad, w, h, palette, settings, cb, true);
+    }
+
+    fn surfaceViewImpl(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface, labels_only: bool) !void {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1756,6 +1794,7 @@ pub const Chart = struct {
         vs.store = store.asStore();
         vs.view_zoom = zoom; // scale at which labels/symbols declutter
         vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
+        vs.labels_only = labels_only; // the view-level text pass draws no geometry
         const surf = vs.asSurface();
 
         var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);

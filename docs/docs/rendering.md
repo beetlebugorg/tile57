@@ -180,6 +180,16 @@ per frame (the Surface seat). Both have composed twins on the compositor
 (`tile57_compose_canvas` / `tile57_compose_surface`). A custom output format in
 Zig is still one small file in `src/render/`.
 
+For a tile-renderer host that caches geometry per tile (via the per-tile
+`tile57_chart_tile_surface`), a companion `tile57_chart_labels`
+(`tile57_compose_labels` on the compositor) emits **only** the view's text —
+resolved against one collision pool across every covering tile, so labels no
+longer collide or repeat at tile seams the way the per-tile pass leaves them.
+It reuses the same `tile57_surface_cb` text callbacks and world anchors and draws
+no geometry, so the host paints cached tiles then overlays this decluttered text
+last. It re-portrays the covering tiles (only decoded tiles are memoized, not
+their labels) but skips all geometry tessellation.
+
 ## What's deliberately not here (yet)
 
 - Contour labels render horizontal (not rotated along the line).

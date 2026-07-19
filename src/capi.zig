@@ -665,6 +665,32 @@ export fn tile57_chart_surface(
     return OK;
 }
 
+/// The VIEW-level, globally-decluttered TEXT pass — emits ONLY labels (through the
+/// surface's draw_text_str / draw_text), decluttered across the whole view, and no
+/// geometry. For a tile-renderer host that draws geometry + symbols from its own
+/// per-tile cache (tile57_chart_tile_surface) but needs labels resolved across tile
+/// seams. Same world anchors + coordinate space as tile57_chart_surface. See tile57.h.
+export fn tile57_chart_labels(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    rotation_rad: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    c.renderSurfaceLabels(lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
 /// Portray ONE tile (z, x, y) to a surface — the per-tile twin of
 /// tile57_chart_surface. Same WORLD-SPACE tagged draw calls, for a single tile, so
 /// a host can portray+tessellate each tile once, cache it, and compose the view
@@ -903,6 +929,33 @@ export fn tile57_compose_surface(
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     chart.renderComposeSurfaceView(src, lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
+    return OK;
+}
+
+/// The composed VIEW-level, globally-decluttered TEXT pass — emits ONLY labels
+/// (through the surface's draw_text_str / draw_text), decluttered across the whole
+/// composed view, and no geometry. For a tile-renderer host that draws geometry +
+/// symbols from its own per-tile cache (tile57_compose_tile / a per-tile surface)
+/// but needs labels resolved across tile seams. Same world anchors + coordinate
+/// space as tile57_compose_surface. See tile57_chart_labels for the single-chart form.
+export fn tile57_compose_labels(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    rotation_rad: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    surface: ?*const CSurface,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    chart.renderComposeLabels(src, lon, lat, zoom, rotation_rad, width, height, paletteOf(&settings), &settings, sfc) catch |e| return fail(err, e);
     return OK;
 }
 

@@ -391,6 +391,30 @@ tessellated once, north-up, and re-transformed on the GPU each frame, so a
 continuously-turning course-up view never re-portrays or re-tessellates it — the
 `align` flags carry everything the host needs to turn the right marks with the chart.
 
+Because `tile57_chart_tile_surface` declutters **within** each tile, a label that
+straddles a tile seam collides or repeats across the join. When you cache geometry
+per tile but want labels resolved across the whole view, add a single
+`tile57_chart_labels` pass (`tile57_compose_labels` for the composed set). It walks
+the view's covering tiles into **one** collision pool and emits **only** the
+surviving text — through the same `draw_text_str` / `draw_text` callbacks, at the
+same world anchors as `tile57_chart_surface` — and draws no fills, lines, symbols, or
+soundings. So the host draws geometry + symbols from its per-tile cache and calls
+this once per frame (or per view change) to overlay the globally-decluttered text
+last (text is drawn on top). It re-portrays the covering tiles (only the decoded /
+composed tiles are cached, not their labels) but skips all geometry tessellation, so
+it is markedly cheaper than a full `tile57_chart_surface`.
+
+```c
+/* View-level, globally-decluttered TEXT pass: emits only surviving labels
+ * (draw_text_str / draw_text), no geometry. Same anchors/space as
+ * tile57_chart_surface; rotation_rad declutters in the screen frame. */
+tile57_status tile57_chart_labels(tile57_chart *chart, double lon, double lat, double zoom,
+                             double rotation_rad,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
+```
+
 There is a pixel-space twin, `tile57_chart_canvas` with a `tile57_canvas_cb` vtable,
 that emits the SAME portrayal as resolved paint-order draw calls in canvas
 pixels — for a host that wants the engine's own paint pipeline without the PNG
@@ -456,6 +480,13 @@ tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, 
                                      double rotation_rad,
                                      uint32_t width, uint32_t height, const tile57_mariner *m,
                                      const tile57_surface_cb *surface, tile57_error *err);
+/* The composed view-level, globally-decluttered TEXT pass (tile57_chart_labels
+ * across the composed set): only surviving labels, decluttered across tile AND
+ * chart seams, no geometry. */
+tile57_status tile57_compose_labels(tile57_compose *c, double lon, double lat, double zoom,
+                                    double rotation_rad,
+                                    uint32_t width, uint32_t height, const tile57_mariner *m,
+                                    const tile57_surface_cb *surface, tile57_error *err);
 tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, double zoom,
                                    const tile57_query_cb *cb, tile57_error *err);
 

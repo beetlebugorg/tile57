@@ -173,6 +173,12 @@ pub const VectorSurface = struct {
     /// the host actually draws them in. The per-tile path leaves it 0 (a tile is
     /// tessellated once, north-up, and re-transformed on the GPU every frame).
     view_rotation: f64 = 0,
+    /// Labels-only mode (the view-level text pass): shape and declutter TEXT, but
+    /// emit no area/line/symbol/sounding geometry — a host draws those from its own
+    /// per-tile cache and takes only the globally-decluttered text from this walk.
+    /// Set by the driver; the collision pool, holdLabel and endScene are untouched,
+    /// so the survivors are exactly the ones the full surface view would emit.
+    labels_only: bool = false,
     pool: dc.Pool = .{},
     labels: std.ArrayListUnmanaged(Label) = .empty,
 
@@ -377,6 +383,7 @@ pub const VectorSurface = struct {
 
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
         const self = sp(ctx);
+        if (self.labels_only) return; // areas carry no label; skip the tessellation
         if (!self.cur_visible) return;
         const feat = self.cur_feature();
         var wr = try self.worldRings(rings);
@@ -393,6 +400,7 @@ pub const VectorSurface = struct {
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
         const self = sp(ctx);
+        if (self.labels_only) return; // no label; skip the pattern fill
         if (!self.cur_visible) return;
         const feat = self.cur_feature();
         var wr = try self.worldRings(rings);
@@ -408,6 +416,12 @@ pub const VectorSurface = struct {
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
         const self = sp(ctx);
         if (!self.cur_visible) return;
+        // Labels-only: emit no stroke geometry, but a depth contour still carries a
+        // value label — hold it so it competes in the shared pool like any other.
+        if (self.labels_only) {
+            if (valdco) |v| try self.emitContourLabel(v, lines);
+            return;
+        }
         const w: f32 = @floatCast(width_px * self.refDev());
         const on: f32, const off: f32 = switch (dash) {
             .solid => .{ 0, 0 },
@@ -469,6 +483,7 @@ pub const VectorSurface = struct {
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
         _ = placement; // both .point and .line now draw at display size (refDev)
         const self = sp(ctx);
+        if (self.labels_only) return; // a symbol is not text and never enters the pool
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, GATE_ZOOM, self.settings)) return;
         // The style path gates INFORM01 information callouts behind
@@ -518,6 +533,7 @@ pub const VectorSurface = struct {
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
         const self = sp(ctx);
+        if (self.labels_only) return; // a sounding is a symbol, not text — never in the pool
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, null, GATE_ZOOM, self.settings)) return;
         const feet = self.settings.depth_unit == .feet;
@@ -898,6 +914,84 @@ test "VectorSurface: important text outranks a name it overlaps, whatever the wa
 
     try testing.expectEqual(@as(usize, 1), rec.texts.items.len);
     try testing.expectEqualStrings("clr 11", rec.texts.items[0].text);
+}
+
+test "VectorSurface: labels_only emits decluttered text but no area/line/symbol geometry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    // Count every geometry callback; the text goes through the SDF path (recorded).
+    const Counting = struct {
+        a: Allocator,
+        fills: usize = 0,
+        strokes: usize = 0,
+        symbols: usize = 0,
+        texts: std.ArrayList([]const u8) = .empty,
+        fn onFill(ctx: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            s.fills += 1;
+        }
+        fn onStroke(ctx: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            s.strokes += 1;
+        }
+        fn onSymbol(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            s.symbols += 1;
+        }
+        fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign) callconv(.c) void {}
+        fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, _: f32, _: CRotAlign, _: CColor, _: CColor) callconv(.c) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            const dup = s.a.dupe(u8, text[0..len]) catch return;
+            s.texts.append(s.a, dup) catch {};
+        }
+    };
+    var rec = Counting{ .a = a };
+    const cb = CSurface{
+        .ctx = &rec,
+        .fill_area = Counting.onFill,
+        .stroke_line = Counting.onStroke,
+        .draw_symbol = Counting.onSymbol,
+        .draw_text = Counting.noText,
+        .draw_text_str = Counting.onTextStr,
+    };
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.labels_only = true;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+    try surf.beginScene(12);
+
+    // An area fill: no geometry in labels-only mode.
+    const ring = [_]rs.TilePoint{ .{ .x = 100, .y = 100 }, .{ .x = 900, .y = 100 }, .{ .x = 900, .y = 900 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+    const sea = rs.FeatureMeta{ .class = "SEAARE" };
+    try surf.beginFeature(&sea);
+    try surf.fillArea("DEPVS", &rings, null);
+    // ...but the sea area's NAME still competes and is emitted. Anchored well clear
+    // of the contour's midpoint below so both labels win their space.
+    const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
+    try surf.drawText("Bay", &style, .{ .x = 400, .y = 400 });
+    try surf.endFeature();
+
+    // A depth contour: no stroke geometry, but its value label is emitted (midpoint
+    // of the longest segment, well away from "Bay").
+    const dep = rs.FeatureMeta{ .class = "DEPCNT" };
+    try surf.beginFeature(&dep);
+    const line = [_]rs.TilePoint{ .{ .x = 2000, .y = 100 }, .{ .x = 2000, .y = 3900 } };
+    const lines = [_][]const rs.TilePoint{&line};
+    try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, 20.0);
+    try surf.endFeature();
+    _ = try surf.endScene(a);
+
+    try testing.expectEqual(@as(usize, 0), rec.fills);
+    try testing.expectEqual(@as(usize, 0), rec.strokes);
+    try testing.expectEqual(@as(usize, 0), rec.symbols);
+    try testing.expectEqual(@as(usize, 2), rec.texts.items.len); // "Bay" + the "20" contour value
 }
 
 /// Records the CFeature each draw call is tagged with.

@@ -631,6 +631,34 @@ tile57_status tile57_render_mlt_tile(const uint8_t *mlt, size_t mlt_len,
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
 
+/* The VIEW-level, GLOBALLY-decluttered TEXT pass — the companion to
+ * tile57_chart_tile_surface for a tile-renderer host. That per-tile call declutters
+ * labels WITHIN each tile, so a name straddling a tile seam collides or repeats
+ * across the join; this call resolves the WHOLE view's labels against one collision
+ * pool and emits ONLY the survivors, through the SAME surface `draw_text_str`
+ * (preferred) / `draw_text` callbacks. It draws NO fill_area / stroke_line /
+ * draw_symbol / draw_sprite — the host draws geometry + symbols from its per-tile
+ * cache and takes text from here.
+ *
+ * The intended loop: cache each (z,x,y) tile's geometry + symbols once via
+ * tile57_chart_tile_surface, draw those cached tiles every frame, and call this once
+ * per frame (or per view change) to overlay the text. World anchors, local px
+ * offsets, per-feature tags and the MAP/VIEWPORT `align` convention are identical to
+ * tile57_chart_surface, so the text sits over the cached geometry with no
+ * re-projection — draw it LAST (text is drawn on top). `rotation_rad` matters: labels
+ * declutter in the SCREEN frame the host draws them in.
+ *
+ * Cost: this RE-PORTRAYS the view's covering tiles (there is no memoized per-tile
+ * label set to reuse — only decoded/composed tiles are cached), but it skips ALL
+ * geometry tessellation, so it is markedly cheaper than a full tile57_chart_surface.
+ * Cell/bundle sources; a lazy multi-cell ENC_ROOT is TILE57_ERR_UNSUPPORTED (bake,
+ * then compose). */
+tile57_status tile57_chart_labels(tile57_chart *chart, double lon, double lat, double zoom,
+                             double rotation_rad, /* view rotation, radians CW; 0 = north-up */
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
+
 /* Release a chart and all cached tiles. Must not be called while any borrower
  * (a compositor, a renderer thread) may still read from it. */
 void tile57_chart_close(tile57_chart *chart);
@@ -708,6 +736,24 @@ tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, 
                                      uint32_t width, uint32_t height,
                                      const tile57_mariner *m,
                                      const tile57_surface_cb *surface, tile57_error *err);
+
+/* The composed VIEW-level, globally-decluttered TEXT pass — tile57_chart_labels
+ * across the WHOLE composed set. Emits ONLY the surviving labels (through the
+ * surface's draw_text_str / draw_text) resolved against one collision pool spanning
+ * every covering tile and every chart seam; draws NO geometry. For a tile-renderer
+ * host that draws geometry + symbols from its own per-tile cache (tile57_compose_tile
+ * / a per-tile surface) but needs labels decluttered across BOTH tile and chart
+ * seams. World anchors, per-feature tags and the align convention are identical to
+ * tile57_compose_surface, so the text overlays the cached geometry with no
+ * re-projection — draw it last. Re-portrays the covering tiles (only composed tiles
+ * are cached, not their labels) but skips all geometry tessellation, so it is far
+ * cheaper than tile57_compose_surface. See tile57_chart_labels for the details and
+ * the intended per-frame loop. */
+tile57_status tile57_compose_labels(tile57_compose *c, double lon, double lat, double zoom,
+                                    double rotation_rad, /* view rotation, radians CW; 0 = north-up */
+                                    uint32_t width, uint32_t height,
+                                    const tile57_mariner *m,
+                                    const tile57_surface_cb *surface, tile57_error *err);
 
 /* The composed cursor pick (S-52 §10.8, across chart boundaries): tile57_chart_query across
  * the whole composed set. */

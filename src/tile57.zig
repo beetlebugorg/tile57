@@ -80,6 +80,9 @@ pub const compose = struct {
     pub const renderView = chart.renderComposeView;
     /// The composed world-space surface stream (the GPU vector twin).
     pub const renderSurfaceView = chart.renderComposeSurfaceView;
+    /// The composed view-level, globally-decluttered TEXT-only pass (draws no
+    /// geometry — the host draws that from its per-tile cache).
+    pub const renderLabels = chart.renderComposeLabels;
     /// The composed cursor pick (S-52 §10.8, across chart boundaries).
     pub const queryPoint = chart.composeQueryPoint;
 };
