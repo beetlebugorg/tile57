@@ -229,6 +229,10 @@ pub const VectorSurface = struct {
     /// Portray zoom (set by the driver) — the scale at which labels/symbols are
     /// decluttered, and the shared occupancy grid.
     view_zoom: f64 = 0,
+    // Label-pass diagnostics (TILE57_LABEL_DEBUG=1): where candidates go.
+    dbg_seen: usize = 0,
+    dbg_scamin: usize = 0,
+    dbg_legible: usize = 0,
     /// View rotation (radians CW; 0 = north-up), set by the whole-view driver.
     /// The host applies it to the GPU transform; the surface needs it for two
     /// view-dependent decisions only — the upside-down flip on tangent-rotated
@@ -436,6 +440,21 @@ pub const VectorSurface = struct {
         // Boxes are screen px at the view zoom, so the pixel spacing applies as-is.
         var kept = try self.pool.resolve(self.a, dc.REPEAT_PX * self.refDev());
         defer kept.deinit(self.a);
+        if (std.c.getenv("TILE57_LABEL_DEBUG") != null) {
+            var emitted: usize = 0;
+            for (0..self.labels.items.len) |id| {
+                if (kept.has(id)) emitted += 1;
+            }
+            std.debug.print("[labels] z{d:.2} seen={d} scamin_dropped={d} short_dropped={d} pooled={d} pool_dropped={d} emitted={d}\n", .{
+                self.view_zoom,
+                self.dbg_seen,
+                self.dbg_scamin,
+                self.dbg_legible,
+                self.labels.items.len,
+                self.labels.items.len - emitted,
+                emitted,
+            });
+        }
         for (self.labels.items, 0..) |l, id| {
             if (kept.has(id)) try self.emitLabel(l);
         }
@@ -757,9 +776,16 @@ pub const VectorSurface = struct {
         // every over-zoom detail label declutters as though the view were far
         // deeper than it is: the survivors pack the screen, and zooming out never
         // thins them. Gate before the pool sees it, not after.
-        if (!self.settings.ignore_scamin and !resolve.scaminVisible(c.scamin, self.view_zoom)) return;
+        self.dbg_seen += 1;
+        if (!self.settings.ignore_scamin and !resolve.scaminVisible(c.scamin, self.view_zoom)) {
+            self.dbg_scamin += 1;
+            return;
+        }
         // Too short a piece to carry a legible label at this zoom (screen px).
-        if (c.gate_world_len > 0 and c.gate_world_len * 256.0 * std.math.exp2(self.view_zoom) < LEGIBLE_PX) return;
+        if (c.gate_world_len > 0 and c.gate_world_len * 256.0 * std.math.exp2(self.view_zoom) < LEGIBLE_PX) {
+            self.dbg_legible += 1;
+            return;
+        }
         const rot_deg = (if (c.upright) self.uprightTangent(c.rot_rad) else c.rot_rad) * 180.0 / std.math.pi;
         try self.pool.add(self.a, self.labels.items.len, c.group, c.cls, c.text, self.labelBox(c.anchor, c.x0, c.baseline, c.pen, c.px, rot_deg, c.rot_align));
         try self.labels.append(self.a, .{
