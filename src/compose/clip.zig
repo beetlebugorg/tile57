@@ -257,7 +257,7 @@ test "clipFeatureToFace: a masked meta-bounds outline is kept whole, not clipped
     line[0] = .{ .x = 0, .y = 2000 };
     line[1] = .{ .x = 4096, .y = 2000 };
     var feat = try decoded(a, .linestring, &.{line});
-    feat.properties = &.{.{ .key = "masked", .value = .{ .int = 1 } }};
+    feat.properties = try a.dupe(mvt.Prop, &.{.{ .key = "masked", .value = .{ .int = 1 } }});
     const face = try boxFace(a, 1000, 1000, 3000, 3000);
 
     var out = std.ArrayList(mvt.Feature).empty;

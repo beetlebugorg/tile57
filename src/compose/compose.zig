@@ -607,3 +607,145 @@ fn readMetaJson(a: std.mem.Allocator, r: *pmtiles.Reader) ?[]const u8 {
         else => null,
     };
 }
+
+// A one-tile in-memory archive carrying `feats` in `point_symbols` at (z,tx,ty) —
+// the fixture the SCAMIN passthrough test composes over. gpa-owned bytes.
+fn testArchiveBytes(gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32, feats: []const mvt.Feature) ![]u8 {
+    const layers = [_]mvt.Layer{.{ .name = "point_symbols", .features = feats }};
+    const enc = try mlt.encode(gpa, .{ .layers = &layers });
+    defer gpa.free(enc);
+    var w = pmtiles.StreamWriter.init(gpa);
+    defer w.deinit();
+    try w.add(z, tx, ty, enc);
+    return w.finishBytes(.{ .tile_type = .mlt });
+}
+
+// A rectangular CATCOV=1 coverage feature (one ring) over [w,s]..[e,n] degrees.
+fn testCovRect(a: std.mem.Allocator, w: f64, s: f64, e: f64, n: f64) ![]const []const []const s57.LonLat {
+    const ring = try a.alloc(s57.LonLat, 5);
+    const corners = [5][2]f64{ .{ w, s }, .{ e, s }, .{ e, n }, .{ w, n }, .{ w, s } };
+    for (corners, 0..) |c, i| ring[i] = .{
+        .lon_e7 = @intFromFloat(@round(c[0] * 1e7)),
+        .lat_e7 = @intFromFloat(@round(c[1] * 1e7)),
+    };
+    const rings = try a.alloc([]const s57.LonLat, 1);
+    rings[0] = ring;
+    const feat = try a.alloc([]const []const s57.LonLat, 1);
+    feat[0] = rings;
+    return feat;
+}
+
+// A composed tile must carry the per-feature `scamin` property through UNCHANGED.
+// SCAMIN is a plain per-feature MVT/MLT property (scene.zig emits it; replay.zig
+// reads it back as FeatureMeta.scamin), NOT something encoded in the layer name —
+// the scamin BUCKET layers are folded into the base layers at emit, so the layer
+// name carries nothing and the property is the only channel. The compositor is
+// therefore only correct if decode -> clip -> re-encode is property-transparent:
+// drop it and every scale-based thinning downstream (geometry cull AND label
+// declutter, which gates candidates on it before the collision pool) silently
+// stops working, with no error anywhere. Two cells split this tile, so the
+// VERBATIM byte-copy fast path cannot fire and the real seam path runs.
+test "composeTile carries per-feature SCAMIN through the seam clip + re-encode" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const z: u8 = 13; // harbor band (cscl 20k) native window is z13..16
+    const tx: u32 = 2355;
+    const ty: u32 = 3131;
+    const cscl: i32 = 20_000;
+
+    // The tile's ground box, and its mid meridian: cell A owns the west half,
+    // cell B the east. Mercator x is linear in lon, so a tile-pixel x of 1000 /
+    // 3000 (of EXTENT 4096) lands west / east of the split.
+    const tb = tile.tileBoundsLonLat(z, tx, ty); // [min_lon, min_lat, max_lon, max_lat]
+    const mid_lon = (tb[0] + tb[2]) / 2;
+    const pad = (tb[3] - tb[1]) * 0.25; // latitude margin so the faces span the tile
+
+    // One point per cell, each well inside its owner's half, each carrying a
+    // DISTINCT scamin the assertions below match by geometry.
+    const west_pt = [_]mvt.Point{.{ .x = 1000, .y = 2000 }};
+    const east_pt = [_]mvt.Point{.{ .x = 3000, .y = 2000 }};
+    const west_parts = [_][]const mvt.Point{&west_pt};
+    const east_parts = [_][]const mvt.Point{&east_pt};
+    const west_props = [_]mvt.Prop{
+        .{ .key = "class", .value = .{ .string = "BOYLAT" } },
+        .{ .key = "scamin", .value = .{ .int = 22_000 } },
+    };
+    const east_props = [_]mvt.Prop{
+        .{ .key = "class", .value = .{ .string = "BCNLAT" } },
+        .{ .key = "scamin", .value = .{ .int = 45_000 } },
+    };
+    const west_feat = [_]mvt.Feature{.{ .geom_type = .point, .parts = &west_parts, .properties = &west_props }};
+    const east_feat = [_]mvt.Feature{.{ .geom_type = .point, .parts = &east_parts, .properties = &east_props }};
+
+    const arc_w = try testArchiveBytes(gpa, z, tx, ty, &west_feat);
+    defer gpa.free(arc_w);
+    const arc_e = try testArchiveBytes(gpa, z, tx, ty, &east_feat);
+    defer gpa.free(arc_e);
+
+    var rd_w = try pmtiles.Reader.init(gpa, arc_w);
+    defer rd_w.deinit();
+    var rd_e = try pmtiles.Reader.init(gpa, arc_e);
+    defer rd_e.deinit();
+    const readers = [_]*pmtiles.Reader{ &rd_w, &rd_e };
+
+    const loaded = [_]LoadedCov{
+        .{
+            .name = "TESTW",
+            .date = "20240101",
+            .cscl = cscl,
+            .coverage = try testCovRect(a, tb[0], tb[1] - pad, mid_lon, tb[3] + pad),
+            .bounds = .{ tb[0], tb[1] - pad, mid_lon, tb[3] + pad },
+        },
+        .{
+            .name = "TESTE",
+            .date = "20240101",
+            .cscl = cscl,
+            .coverage = try testCovRect(a, mid_lon, tb[1] - pad, tb[2], tb[3] + pad),
+            .bounds = .{ mid_lon, tb[1] - pad, tb[2], tb[3] + pad },
+        },
+    };
+    const cells = try toPlaneCells(a, &loaded);
+    for (cells) |*c| c.reach = bandReach(cscl);
+    var part = try geometry.partition.build(gpa, cells);
+    defer part.deinit();
+
+    const res = try composeTile(gpa, &part, &readers, z, tx, ty, false);
+    const bytes = res.tile orelse return error.NothingComposed;
+    defer gpa.free(bytes);
+    try std.testing.expect(res.owned);
+
+    // Both cells' points must be in the composed tile, each still carrying ITS
+    // OWN scamin — the property survives the clip AND the concat/re-encode.
+    const out = try mlt.decode(a, bytes);
+    var seen_west = false;
+    var seen_east = false;
+    for (out) |layer| {
+        if (!std.mem.eql(u8, layer.name, "point_symbols")) continue;
+        for (layer.features) |f| {
+            try std.testing.expect(f.parts.len == 1 and f.parts[0].len == 1);
+            const sc = propInt(f.properties, "scamin") orelse return error.ScaminDropped;
+            if (f.parts[0][0].x == 1000) {
+                try std.testing.expectEqual(@as(i64, 22_000), sc);
+                seen_west = true;
+            } else if (f.parts[0][0].x == 3000) {
+                try std.testing.expectEqual(@as(i64, 45_000), sc);
+                seen_east = true;
+            }
+        }
+    }
+    try std.testing.expect(seen_west);
+    try std.testing.expect(seen_east);
+}
+
+// The integer value of `key` on a decoded feature, or null if absent.
+fn propInt(props: []const mvt.Prop, key: []const u8) ?i64 {
+    for (props) |p| if (std.mem.eql(u8, p.key, key)) return switch (p.value) {
+        .int => |v| v,
+        .uint => |v| @intCast(v),
+        else => null,
+    };
+    return null;
+}
