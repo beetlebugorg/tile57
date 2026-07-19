@@ -640,6 +640,16 @@ export fn tile57_chart_canvas(
 
 const CSurface = @import("render").vector.CSurface;
 
+// TILE57_LABEL_DEBUG -> render.vector.debug_labels. Read HERE rather than in the
+// render module: only libc-linked artifacts include this file, while the package
+// tests compile render/ without libc.
+var label_debug_synced = false;
+fn syncLabelDebug() void {
+    if (label_debug_synced) return;
+    label_debug_synced = true;
+    @import("render").vector.debug_labels = std.c.getenv("TILE57_LABEL_DEBUG") != null;
+}
+
 /// The GPU vector twin: the SAME view emitted as a WORLD-SPACE tagged stream
 /// (areas/lines in web-mercator [0,1]; symbols/text as a world anchor + local
 /// reference-px outline; per-feature class + SCAMIN) to the C surface callback
@@ -656,6 +666,7 @@ export fn tile57_chart_surface(
     surface: ?*const CSurface,
     err: ?*CError,
 ) callconv(.c) c_int {
+    syncLabelDebug();
     const c = handle orelse return failWith(err, .badarg, "chart must not be null");
     const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
@@ -682,6 +693,7 @@ export fn tile57_chart_labels(
     surface: ?*const CSurface,
     err: ?*CError,
 ) callconv(.c) c_int {
+    syncLabelDebug();
     const c = handle orelse return failWith(err, .badarg, "chart must not be null");
     const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
@@ -985,6 +997,7 @@ export fn tile57_compose_surface(
     surface: ?*const CSurface,
     err: ?*CError,
 ) callconv(.c) c_int {
+    syncLabelDebug();
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
     const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
@@ -1012,6 +1025,7 @@ export fn tile57_compose_labels(
     surface: ?*const CSurface,
     err: ?*CError,
 ) callconv(.c) c_int {
+    syncLabelDebug();
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
     const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)

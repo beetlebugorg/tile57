@@ -41,6 +41,12 @@ const DASH_OFF = 3.0;
 /// and the host culls by the per-feature scamin we pass through.
 const GATE_ZOOM = 30.0;
 
+/// Print per-pass label accounting (candidates seen, what each gate dropped,
+/// what the pool dropped, what survived). A plain flag, NOT an env read: this
+/// module is compiled without libc by the package tests, so it cannot call
+/// getenv. The C ABI flips it from TILE57_LABEL_DEBUG (see capi.zig).
+pub var debug_labels: bool = false;
+
 // ---- extern C ABI (mirrored in include/tile57.h) ---------------------------
 pub const CWorldPt = extern struct { x: f64, y: f64 }; // web-mercator [0,1], y down
 pub const CLocalPt = extern struct { x: f32, y: f32 }; // anchor-relative reference px
@@ -440,7 +446,7 @@ pub const VectorSurface = struct {
         // Boxes are screen px at the view zoom, so the pixel spacing applies as-is.
         var kept = try self.pool.resolve(self.a, dc.REPEAT_PX * self.refDev());
         defer kept.deinit(self.a);
-        if (std.c.getenv("TILE57_LABEL_DEBUG") != null) {
+        if (debug_labels) {
             var emitted: usize = 0;
             for (0..self.labels.items.len) |id| {
                 if (kept.has(id)) emitted += 1;
