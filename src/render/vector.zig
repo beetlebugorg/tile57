@@ -17,10 +17,14 @@
 //!     cull per frame. Category / viewing-group / text-group / point / boundary
 //!     gates DO apply (they track mariner settings, not zoom). We evaluate the
 //!     combined gate at a high zoom so only SCAMIN is neutralised.
-//!   * No op buffer / sort: the host owns paint order (draw calls arrive in
-//!     Surface emission order). Labels are the ONE exception — they are held
-//!     back and resolved against the shared collision pool at endScene, because
-//!     which label survives cannot be known until the whole scene is walked.
+//!   * Draw calls are BUFFERED and sorted into S-52 paint order at endScene, the
+//!     same class-major rule PixelSurface paints by (see OpLayer), so a host that
+//!     draws in callback order is correct without re-sorting. The engine walks
+//!     tile by tile, so only the finished scene can be ordered. Labels are held
+//!     back for a second reason as well — which label SURVIVES cannot be known
+//!     until the whole scene is walked and the collision pool is resolved.
+//!     Callback order only survives to the screen if the host preserves it: a
+//!     host that batches by draw type must sort its own batches by `plane`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -215,6 +219,35 @@ pub const Capture = struct {
     list: std.ArrayListUnmanaged(Candidate) = .empty,
 };
 
+/// Paint class, mirroring PixelSurface's OpLayer and the tile style's LAYER order
+/// (areas -> area_patterns -> lines -> point_symbols -> soundings -> text): the
+/// class is the major sort key and draw priority orders WITHIN a class, so a fill
+/// never paints over a line whatever its priority, exactly like the layer stack.
+/// Keeping the two surfaces on ONE rule is the point — the same scene through the
+/// pixel path and the GPU path must not disagree about what covers what.
+const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4, text = 5 };
+
+/// What a buffered call will hand the host — one variant per CSurface entry.
+const OpKind = union(enum) {
+    fill: struct { rings: CWorldRings, color: CColor, even_odd: c_int },
+    pattern: struct { name: []const u8, rings: CWorldRings },
+    stroke: struct { rings: CWorldRings, w: f32, on: f32, off: f32, color: CColor },
+    symbol: struct { anchor: CWorldPt, rings: CLocalRings, color: CColor, even_odd: c_int, stroke_w: f32, rot_align: CRotAlign },
+    sprite: struct { name: []const u8, anchor: CWorldPt, rot_deg: f32, rot_align: CRotAlign, hw: f32, hh: f32 },
+};
+
+/// One buffered draw call, held until endScene can sort the scene into paint
+/// order. Every slice/ring inside points into the render arena, which outlives
+/// the whole scene, so a buffered op stays valid until it is emitted.
+const Op = struct {
+    layer: OpLayer,
+    prio: i64,
+    /// Emission (walk) order — the stable tie-break within a layer+priority.
+    seq: usize,
+    feat: CFeature,
+    kind: OpKind,
+};
+
 // ---- the Surface implementation --------------------------------------------
 pub const VectorSurface = struct {
     a: Allocator,
@@ -265,6 +298,10 @@ pub const VectorSurface = struct {
     capture: ?*Capture = null,
     pool: dc.Pool = .{},
     labels: std.ArrayListUnmanaged(Label) = .empty,
+    /// Buffered draw calls, sorted into paint order at endScene (see OpLayer).
+    /// Geometry was already arena-allocated per call before it was buffered, so
+    /// holding it costs one Op header per call, not a second copy of the scene.
+    ops: std.ArrayListUnmanaged(Op) = .empty,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -318,10 +355,17 @@ pub const VectorSurface = struct {
         return .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
     }
 
-    /// Reference device scale: physical multiplier only (px_per_tile fixed at the
-    /// 256 baseline), so symbol/text px are a constant screen size.
+    /// Reference device scale: the mariner's physical multiplier times the host's
+    /// framebuffer density (px_per_tile fixed at the 256 baseline), so symbol/text
+    /// px are a constant screen size.
+    ///
+    /// device_scale is the host's, size_scale the mariner's, and they multiply: the
+    /// engine hands this path reference-px sizes that the HOST draws, so unless it
+    /// is told the density it sizes collision boxes in units the host does not draw
+    /// in — labels the engine decluttered cleanly then overlap on screen. Both
+    /// default to 1.0, so a host that sets neither is unchanged.
     fn refDev(self: *const VectorSurface) f64 {
-        return self.settings.size_scale;
+        return self.settings.size_scale * self.settings.device_scale;
     }
 
     /// refDev with the mariner's extra TEXT multiplier folded in — the one scale
@@ -402,6 +446,18 @@ pub const VectorSurface = struct {
         };
     }
 
+    /// Buffer one draw call at the current feature's priority. Nothing reaches the
+    /// host until endScene has put the whole scene in paint order.
+    fn push(self: *VectorSurface, layer: OpLayer, kind: OpKind) !void {
+        try self.ops.append(self.a, .{
+            .layer = layer,
+            .prio = self.cur.draw_prio,
+            .seq = self.ops.items.len,
+            .feat = self.cur_feature(),
+            .kind = kind,
+        });
+    }
+
     // Flatten tile rings -> world CWorldRings (arena; valid for the call).
     fn worldRings(self: *VectorSurface, parts: []const []const rs.TilePoint) !CWorldRings {
         var total: usize = 0;
@@ -441,14 +497,16 @@ pub const VectorSurface = struct {
         self.pool.deinit(self.a);
         self.pool = .{};
         self.labels.clearRetainingCapacity();
+        self.ops.clearRetainingCapacity();
     }
     fn endFeature(_: *anyopaque) anyerror!void {}
 
-    /// The scene is walked; now the labels can be ranked. Resolve the pool and
-    /// emit the survivors — text last, over the symbols and soundings that
-    /// streamed out ahead of it.
+    /// The scene is walked; now it can be PAINTED. Sort the buffered draw calls
+    /// into S-52 paint order and emit them, then rank the labels and emit the
+    /// survivors — text last, over the symbols and soundings below it.
     fn endScene(ctx: *anyopaque, out: Allocator) anyerror![]u8 {
         const self = sp(ctx);
+        try self.emitOps();
         // Boxes are screen px at the view zoom, so the pixel spacing applies as-is.
         var kept = try self.pool.resolve(self.a, dc.REPEAT_PX * self.refDev());
         defer kept.deinit(self.a);
@@ -467,10 +525,52 @@ pub const VectorSurface = struct {
                 emitted,
             });
         }
-        for (self.labels.items, 0..) |l, id| {
-            if (kept.has(id)) try self.emitLabel(l);
+        // The pool ranked the survivors; PAINT them in draw-priority order (the
+        // ranking rides on the walk sequence and must not be disturbed — see
+        // pushCandidate — so the survivors are re-ordered only for emission).
+        var kept_ids = std.ArrayListUnmanaged(usize).empty;
+        defer kept_ids.deinit(self.a);
+        for (0..self.labels.items.len) |id| {
+            if (kept.has(id)) try kept_ids.append(self.a, id);
         }
+        const labels = self.labels.items;
+        std.mem.sort(usize, kept_ids.items, labels, struct {
+            fn lt(ls: []const Label, l: usize, r: usize) bool {
+                if (ls[l].feat.plane != ls[r].feat.plane) return ls[l].feat.plane < ls[r].feat.plane;
+                return l < r;
+            }
+        }.lt);
+        for (kept_ids.items) |id| try self.emitLabel(labels[id]);
         return out.alloc(u8, 0);
+    }
+
+    /// Sort the scene's buffered draw calls into S-52 paint order and hand them to
+    /// the host, so a host that simply draws in callback order is correct without
+    /// re-sorting. Class-major, draw priority within a class, walk order for ties
+    /// (see OpLayer) — the same rule PixelSurface paints by.
+    ///
+    /// The sort is why the calls are buffered at all: the engine walks tile by tile
+    /// and feature by feature, so a high-priority buoy in the first tile is walked
+    /// long before a low-priority depth area in the second. Only the whole scene
+    /// can be put in order, and the scene is not known until it has been walked.
+    fn emitOps(self: *VectorSurface) !void {
+        std.mem.sort(Op, self.ops.items, {}, struct {
+            fn lt(_: void, l: Op, r: Op) bool {
+                if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer);
+                if (l.prio != r.prio) return l.prio < r.prio;
+                return l.seq < r.seq;
+            }
+        }.lt);
+        for (self.ops.items) |*op| {
+            const f = &op.feat;
+            switch (op.kind) {
+                .fill => |*k| self.cb.fill_area(self.cb.ctx, f, &k.rings, k.color, k.even_odd),
+                .pattern => |*k| self.cb.draw_pattern.?(self.cb.ctx, f, k.name.ptr, k.name.len, &k.rings),
+                .stroke => |*k| self.cb.stroke_line(self.cb.ctx, f, &k.rings, k.w, k.on, k.off, k.color),
+                .symbol => |*k| self.cb.draw_symbol(self.cb.ctx, f, k.anchor, &k.rings, k.color, k.even_odd, k.stroke_w, k.rot_align),
+                .sprite => |*k| self.cb.draw_sprite.?(self.cb.ctx, f, k.name.ptr, k.name.len, k.anchor, k.rot_deg, k.rot_align, k.hw, k.hh),
+            }
+        }
     }
 
     fn beginFeature(ctx: *anyopaque, meta: *const rs.FeatureMeta) anyerror!void {
@@ -484,8 +584,7 @@ pub const VectorSurface = struct {
         const self = sp(ctx);
         if (self.labels_only) return; // areas carry no label; skip the tessellation
         if (!self.cur_visible) return;
-        const feat = self.cur_feature();
-        var wr = try self.worldRings(rings);
+        const wr = try self.worldRings(rings);
         // ColorFill "NAME[,transparency]": apply the S-101 fill transparency (alpha).
         const ft = rs.fillToken(token);
         // A depth area re-shades LIVE against the mariner's contours (SEABED01) — the
@@ -494,21 +593,22 @@ pub const VectorSurface = struct {
         const name = if (depth) |d| resolve.seabedToken(d, self.settings) else ft.name;
         var col = self.resolveColor(name);
         col.a = ft.alpha;
-        self.cb.fill_area(self.cb.ctx, &feat, &wr, ccolor(col), 0);
+        try self.push(.area, .{ .fill = .{ .rings = wr, .color = ccolor(col), .even_odd = 0 } });
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
         const self = sp(ctx);
         if (self.labels_only) return; // no label; skip the pattern fill
         if (!self.cur_visible) return;
-        const feat = self.cur_feature();
-        var wr = try self.worldRings(rings);
+        const wr = try self.worldRings(rings);
         // Tile the real S-101 pattern cell when the host supports it; else fall
         // back to a flat translucent tint.
-        if (self.cb.draw_pattern) |dp| {
-            dp(self.cb.ctx, &feat, name.ptr, name.len, &wr);
+        if (self.cb.draw_pattern != null) {
+            // The name is a slice into the decoded tile, which a cache eviction can
+            // free before endScene emits this op — dupe it into the render arena.
+            try self.push(.pattern, .{ .pattern = .{ .name = try self.a.dupe(u8, name), .rings = wr } });
         } else {
-            self.cb.fill_area(self.cb.ctx, &feat, &wr, 0xA0A0AA8C, 0);
+            try self.push(.pattern, .{ .fill = .{ .rings = wr, .color = 0xA0A0AA8C, .even_odd = 0 } });
         }
     }
 
@@ -526,9 +626,8 @@ pub const VectorSurface = struct {
             .solid => .{ 0, 0 },
             .dashed => .{ DASH_ON * w, DASH_OFF * w },
         };
-        const feat = self.cur_feature();
-        var wr = try self.worldRings(lines);
-        self.cb.stroke_line(self.cb.ctx, &feat, &wr, w, on, off, ccolor(self.resolveColor(token)));
+        const wr = try self.worldRings(lines);
+        try self.push(.line, .{ .stroke = .{ .rings = wr, .w = w, .on = on, .off = off, .color = ccolor(self.resolveColor(token)) } });
         // Depth-contour value label, laid out ALONG the contour (see emitContourLabel).
         if (valdco) |v| try self.emitContourLabel(v, lines);
     }
@@ -603,7 +702,7 @@ pub const VectorSurface = struct {
         // ORIENT symbols and every linestyle brick are north-referenced (rot_north)
         // → chart-relative; the rest stay upright under a rotated view.
         const rot_align = alignOf(rot_north);
-        if (self.cb.draw_sprite) |ds| self.emitSprite(ds, eff, s, at, rot_deg, scale, dev, rot_align) else try self.emitSymbol(s, at, rot_deg, scale, dev, rot_align);
+        if (self.cb.draw_sprite != null) try self.emitSprite(.symbol, eff, s, at, rot_deg, scale, dev, rot_align) else try self.emitSymbol(.symbol, s, at, rot_deg, scale, dev, rot_align);
     }
 
     /// Emit a symbol as an atlas sprite: pass its un-rotated pivot-relative
@@ -615,7 +714,7 @@ pub const VectorSurface = struct {
     /// point symbols; 1.0 for line bricks, which must match the engine's native
     /// tile-space spacing so they tile). Symbols never collide — they all draw,
     /// and they claim nothing from the labels above them (see declutter.zig).
-    fn emitSprite(self: *VectorSurface, draw_sprite: anytype, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_align: CRotAlign) void {
+    fn emitSprite(self: *VectorSurface, layer: OpLayer, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_align: CRotAlign) !void {
         const k = scale * 100.0 * dev;
         var hw: f64 = 0;
         var hh: f64 = 0;
@@ -626,9 +725,16 @@ pub const VectorSurface = struct {
             if (ly > hh) hh = ly;
         };
         if (hw <= 0 or hh <= 0) return;
-        const anchor = self.worldOf(at);
-        const feat = self.cur_feature();
-        draw_sprite(self.cb.ctx, &feat, name.ptr, name.len, anchor, @floatCast(rot_deg), rot_align, @floatCast(hw), @floatCast(hh));
+        // The name is a slice into the decoded tile; buffered ops outlive it (see
+        // fillPattern), so dupe into the render arena.
+        try self.push(layer, .{ .sprite = .{
+            .name = try self.a.dupe(u8, name),
+            .anchor = self.worldOf(at),
+            .rot_deg = @floatCast(rot_deg),
+            .rot_align = rot_align,
+            .hw = @floatCast(hw),
+            .hh = @floatCast(hh),
+        } });
     }
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
@@ -651,15 +757,14 @@ pub const VectorSurface = struct {
             const s = store.get(glyph) orelse continue;
             // Sounding digits read upright under a rotated view (screen-referenced),
             // sized by soundingDev so digit + spacing scale together.
-            if (self.cb.draw_sprite) |ds| self.emitSprite(ds, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport) else try self.emitSymbol(s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport);
+            if (self.cb.draw_sprite != null) try self.emitSprite(.sounding, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport) else try self.emitSymbol(.sounding, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport);
         }
     }
 
     /// Emit one symbol: world anchor + each path's outline in anchor-local
     /// reference px (pivot-relative, scaled, rotated). Constant screen size.
-    fn emitSymbol(self: *VectorSurface, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_align: CRotAlign) !void {
+    fn emitSymbol(self: *VectorSurface, layer: OpLayer, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_align: CRotAlign) !void {
         const anchor = self.worldOf(at);
-        const feat = self.cur_feature();
         const k: f32 = @floatCast(scale * 100.0 * dev);
         const rad: f32 = @floatCast(rot_deg * std.math.pi / 180.0);
         const cosr = @cos(rad);
@@ -675,9 +780,9 @@ pub const VectorSurface = struct {
                 }
                 rings[i] = pts;
             }
-            var lr = try self.localRings(rings);
-            if (p.fill) |color| self.cb.draw_symbol(self.cb.ctx, &feat, anchor, &lr, ccolor(color), 1, 0, rot_align);
-            if (p.stroke) |st| self.cb.draw_symbol(self.cb.ctx, &feat, anchor, &lr, ccolor(st.color), 0, st.width * k, rot_align);
+            const lr = try self.localRings(rings);
+            if (p.fill) |color| try self.push(layer, .{ .symbol = .{ .anchor = anchor, .rings = lr, .color = ccolor(color), .even_odd = 1, .stroke_w = 0, .rot_align = rot_align } });
+            if (p.stroke) |st| try self.push(layer, .{ .symbol = .{ .anchor = anchor, .rings = lr, .color = ccolor(st.color), .even_odd = 0, .stroke_w = st.width * k, .rot_align = rot_align } });
         }
     }
 
@@ -1544,6 +1649,136 @@ test "VectorSurface: every draw call carries its feature's display category" {
     try testing.expectEqual(@as(i64, 45000), rec.feats.items[0].scamin);
     try testing.expectEqual(CDispCat.other, rec.feats.items[1].disp_cat);
     try testing.expectEqual(CDispCat.standard, rec.feats.items[2].disp_cat);
+}
+
+/// Records the KIND and draw priority of every geometry call, in the order the
+/// host is handed them — the paint order the surface promises.
+const OrderCb = struct {
+    a: Allocator,
+    calls: std.ArrayListUnmanaged(Call) = .empty,
+
+    const Kind = enum { fill, stroke };
+    const Call = struct { kind: Kind, plane: i32 };
+
+    fn onFill(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {
+        const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
+        self.calls.append(self.a, .{ .kind = .fill, .plane = f.plane }) catch {};
+    }
+    fn onStroke(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {
+        const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
+        self.calls.append(self.a, .{ .kind = .stroke, .plane = f.plane }) catch {};
+    }
+    fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
+
+    fn surface(self: *OrderCb) CSurface {
+        return .{ .ctx = self, .fill_area = onFill, .stroke_line = onStroke, .draw_symbol = noSymbol, .draw_text = noText };
+    }
+};
+
+test "VectorSurface: draws are emitted in paint order, not walk order" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = OrderCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+    const line = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const lines = [_][]const rs.TilePoint{&line};
+
+    // Walk order is deliberately NOT paint order — the high-priority fill is
+    // walked FIRST, exactly as a real scene emits a tile's buoys before the next
+    // tile's depth areas.
+    const hi = rs.FeatureMeta{ .class = "BOYLAT", .draw_prio = 24 };
+    try surf.beginFeature(&hi);
+    try surf.fillArea("CHBLK", &rings, null);
+    try surf.endFeature();
+
+    const contour = rs.FeatureMeta{ .class = "DEPCNT", .draw_prio = 18 };
+    try surf.beginFeature(&contour);
+    try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, null);
+    try surf.endFeature();
+
+    const lo = rs.FeatureMeta{ .class = "DEPARE", .draw_prio = 3 };
+    try surf.beginFeature(&lo);
+    try surf.fillArea("DEPVS", &rings, null);
+    try surf.endFeature();
+
+    _ = try surf.endScene(a);
+
+    // Class-major, draw priority within the class: the plane-3 fill overtakes the
+    // plane-24 fill walked ahead of it, and the line paints over both despite
+    // ranking below plane 24 — a fill never covers a line, as in the layer stack.
+    try testing.expectEqual(@as(usize, 3), rec.calls.items.len);
+    try testing.expectEqual(OrderCb.Kind.fill, rec.calls.items[0].kind);
+    try testing.expectEqual(@as(i32, 3), rec.calls.items[0].plane);
+    try testing.expectEqual(OrderCb.Kind.fill, rec.calls.items[1].kind);
+    try testing.expectEqual(@as(i32, 24), rec.calls.items[1].plane);
+    try testing.expectEqual(OrderCb.Kind.stroke, rec.calls.items[2].kind);
+    try testing.expectEqual(@as(i32, 18), rec.calls.items[2].plane);
+}
+
+/// Portray one stack of labels at a given framebuffer density and report how many
+/// survived the collision pool.
+fn survivingLabels(a: Allocator, device_scale: f64) !usize {
+    var colors = try resolve.Colors.init(a, "");
+    var settings = resolve.Settings{};
+    settings.device_scale = device_scale;
+    var rec = RecordCb{ .a = a };
+    const cb = rec.surface();
+
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "SEAARE" };
+    const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .halign = "center", .valign = "middle" };
+    // Distinct names (so the repeat rule plays no part), stacked 288 tile units
+    // apart — 18 screen px at z12, where a 4096-unit tile spans 256 px. A 12 px
+    // line clears that; the 24 px line the same labels become at 2x does not.
+    const names = [_][]const u8{ "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot" };
+    try surf.beginFeature(&meta);
+    for (names, 0..) |n, i| {
+        try surf.drawText(n, &style, .{ .x = 2000, .y = @intCast(400 + i * 288) });
+    }
+    try surf.endFeature();
+    _ = try surf.endScene(a);
+    return rec.texts.items.len;
+}
+
+test "VectorSurface: the device scale decides how many labels fit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Same view, same labels, same mariner — only the framebuffer density differs.
+    // At 2x the engine sizes each glyph AND its collision box for the pixels the
+    // host actually paints, so labels that cleared each other at 1x now collide
+    // and lose. A host that draws at 2x while claiming 1x gets the 1x count and
+    // paints them overlapping, which is the bug this input exists to remove.
+    const at1x = try survivingLabels(a, 1.0);
+    const at2x = try survivingLabels(a, 2.0);
+    try testing.expectEqual(@as(usize, 6), at1x); // all of them clear at 1x
+    try testing.expect(at2x < at1x);
+}
+
+test "VectorSurface: an unset device scale is 1.0 (today's behaviour)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const unset = resolve.Settings{};
+    try testing.expectEqual(try survivingLabels(a, 1.0), try survivingLabels(a, unset.device_scale));
 }
 
 test "CFeature matches the C tile57_feature layout" {

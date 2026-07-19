@@ -147,8 +147,18 @@ composes every covering tile through the ownership partition first. See the
 [C API](./c-api.md).
 
 `m.size_scale` calibrates physical size (so 1 S-52 millimetre is a true
-millimetre on your display) and doubles as the @2x knob. Every field of
-`tile57_mariner` — categories, text groups, contours, units — evaluates live.
+millimetre on your display). Every field of `tile57_mariner` — categories, text
+groups, contours, units — evaluates live.
+
+HiDPI is a separate input, `m.device_scale`: the device pixels per reference
+pixel your framebuffer has. `size_scale` is the mariner's size preference,
+`device_scale` is the display's density, and the two multiply. The pixel outputs
+ignore it — there the engine rasterizes at the width and height you asked for, so
+the density is already stated. It matters on the **surface** paths, where the
+engine sizes text and symbols in reference px and *you* draw them: a host that
+draws at 2x without saying so gets collision boxes sized for glyphs half the size
+it paints, and a view the engine decluttered cleanly arrives on screen
+overlapping.
 
 ### From Zig
 
@@ -176,7 +186,19 @@ resolved, flattened paths, patterns, and glyph outlines in pixel space, in
 paint order (the Canvas seat). `tile57_chart_surface` drives a `tile57_surface_cb` —
 the world-space, semantically tagged stream (per-feature class + SCAMIN, world
 anchors, reference-pixel outlines) a GPU host tessellates once and transforms
-per frame (the Surface seat). Its two text callbacks also carry the label's S-52
+per frame (the Surface seat).
+
+That stream arrives in S-52 paint order too: the engine buffers the scene and
+sorts it (areas → patterns → lines → symbols → soundings → text, by draw priority
+within each class) before calling you, so drawing in callback order is correct
+and no host needs its own sort. The catch is that only an order you *preserve*
+survives. A GPU renderer that batches by draw type — all fills, then all sprites,
+then all text — to minimise pipeline switches has reordered the stream by
+construction, and global paint order breaks again. If you batch, sort each batch
+by the per-feature `plane` and draw the batches in the class order above; that is
+what `plane` is still exposed for.
+
+Its two text callbacks also carry the label's S-52
 text group, so a host can draw group 11 (important text) larger or bold and
 ordinary names normally — that group belongs to the label, not the feature.
 Both have composed twins on the compositor

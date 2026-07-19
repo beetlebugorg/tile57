@@ -390,6 +390,30 @@ and soundings always draw, per S-52), so you don't repeat that work — and it l
 out depth-contour values along their contours, so you get the same labelled contours
 as the raster and MapLibre outputs.
 
+Tell it your framebuffer density with `m.device_scale` (2.0 on a Retina backing
+store). The engine sizes text and symbols in reference pixels and you draw them, so
+it needs the density to size a label's collision box in the pixels you actually
+paint. Draw at 2x while leaving `device_scale` at 1.0 and the declutter reserves
+space for glyphs half the size that land on screen; the view comes out overlapping
+even though the engine decluttered it correctly for the size it was told.
+
+#### Paint order
+
+The calls arrive in S-52 paint order. The engine buffers the scene and sorts it
+before calling you — class-major (areas, then area patterns, then lines, then point
+symbols, then soundings, then text, so a fill never covers a line whatever its
+priority) and by the feature's S-52 draw priority within each class. Draw them in
+the order you receive them and the picture is right; you need no sort of your own.
+
+That holds only as long as you *preserve* the order. A GPU renderer usually batches
+by draw type — all fills, then all sprites, then all text — to keep pipeline
+switches down, and batching reorders the stream by construction: it lifts every call
+of one type out of the sequence the engine placed it in. Global paint order is then
+broken again, and broken in the way that looks fine on an empty stretch of water and
+wrong in a harbour. If you batch, sort each batch by `f->plane` (the feature's draw
+priority) and draw the batches in the class order above. That is what `plane` is
+still exposed for.
+
 Both text callbacks carry the label's `text_group`, so a host can style text by its
 S-52 role rather than by its feature — draw group 11 (important text: vertical
 clearances, bridge and cable legends) larger or bold, and leave ordinary names at
@@ -608,6 +632,15 @@ typedef struct tile57_mariner {
     double sounding_size_scale;     /* extra size multiplier for SOUNDINGS, on top of
                                      * size_scale (scales each digit + spacing together).
                                      * 1.0 = none; 0 reads as 1.0. */
+    double device_scale;            /* device px per reference px — the HiDPI density the
+                                     * SURFACE paths are drawn at (2.0 on a Retina backing
+                                     * store). Describes the DISPLAY where size_scale
+                                     * describes the mariner; the two multiply. Sizes text
+                                     * and symbols AND their collision boxes in the units
+                                     * the host actually draws in. The pixel outputs ignore
+                                     * it (that density is already in the requested
+                                     * width/height). 1.0 = a 1x framebuffer; 0 reads as
+                                     * 1.0. */
 } tile57_mariner;
 
 void tile57_mariner_defaults(tile57_mariner *m);   /* canonical defaults, date_view = "" */

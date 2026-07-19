@@ -434,6 +434,27 @@ typedef struct tile57_mariner {
                          *   1 = show soundings whatever the category says
                          *   2 = hide soundings whatever the category says
                          * Appended for ABI-append-safety: a zeroed struct means 0. */
+    double device_scale; /* device pixels per reference pixel — the HiDPI framebuffer
+                         * density the SURFACE paths are drawn at (2.0 on a Retina
+                         * backing store). NOT an S-52 setting, and NOT a mariner
+                         * preference: it describes the DISPLAY, where size_scale
+                         * describes the mariner's taste. The two multiply.
+                         *
+                         * State it whenever you draw at anything but 1x. The surface
+                         * callbacks hand you reference-px sizes for text and symbols
+                         * and let YOU draw them; if you then draw at 2x without saying
+                         * so, the engine has sized every label's collision box for
+                         * glyphs half the size you actually paint, and a view it
+                         * decluttered cleanly arrives overlapping. Setting this sizes
+                         * the glyph AND its collision box in the units you draw in.
+                         * Do NOT fold the density into size_scale instead: that also
+                         * works, but it conflates the display with the mariner's own
+                         * size preference and the two need to stay separable.
+                         *
+                         * The pixel outputs (_png / _pdf / _canvas) IGNORE this: the
+                         * engine rasterizes those itself, so the density is already in
+                         * the width/height asked for.
+                         * Appended for ABI-append-safety; 0 is read as 1.0. */
 } tile57_mariner;
 
 /* Fill *m with the canonical default mariner settings (so a host needn't
@@ -554,9 +575,11 @@ typedef enum {
 
 /* The feature the following draw calls belong to. `cls` is the S-57 object-class
  * acronym (NUL-terminated; "" if none); `scamin` is the SCAMIN 1:N denominator
- * (<= 0 => always visible); `plane` is the S-52 draw priority (paint hint);
- * `disp_cat` is the feature's display category. A host that applies SCAMIN
- * itself must skip it when disp_cat == TILE57_DISP_BASE. */
+ * (<= 0 => always visible); `plane` is the S-52 draw priority — the engine has
+ * ALREADY sorted the call stream by it, so it is there for a host that re-buckets
+ * the stream into its own batches and has to restore the order (see the draw
+ * table below); `disp_cat` is the feature's display category. A host that applies
+ * SCAMIN itself must skip it when disp_cat == TILE57_DISP_BASE. */
 typedef struct {
     const char *cls;
     int64_t scamin;
@@ -565,8 +588,23 @@ typedef struct {
 } tile57_feature;
 
 /* Draw table. Pointers are valid only for the duration of the call; ctx is
- * passed back verbatim. Calls arrive in Surface emission order (the host owns
- * final paint order + label collision). */
+ * passed back verbatim.
+ *
+ * CALLS ARRIVE IN S-52 PAINT ORDER. The engine buffers the scene and sorts it
+ * before calling you: class-major (areas, then area patterns, then lines, then
+ * point symbols, then soundings, then text — a fill never covers a line whatever
+ * its priority), and by S-52 draw priority within a class. Draw them in the order
+ * you receive them and the result is correct; you do not need to sort.
+ *
+ * BUT ONLY IF YOU PRESERVE THAT ORDER. A GPU renderer normally batches by DRAW
+ * TYPE — all fills, then all sprites, then all text — to minimise pipeline
+ * switches, and batching REORDERS the stream: it lifts every call of one type out
+ * of the sequence the engine put it in. That silently breaks global paint order
+ * again (an area pattern jumps over the lines drawn above it, a tessellated
+ * symbol and an atlas sprite swap places), and it breaks it in a way that looks
+ * plausible on a sparse chart and wrong on a dense one. If you batch, sort each
+ * batch by `plane` yourself and draw the batches in the class order above. That
+ * is what `plane` is still there for. */
 typedef struct {
     void *ctx;
     /* Filled area (world). even_odd != 0 selects the even-odd rule. */
@@ -599,8 +637,15 @@ typedef struct {
      * (ABI-appended after the original vtable.) */
     void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, tile57_rot_align align, float half_w_px, float half_h_px);
     /* Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
-     * prefix) + the fill rings (world). Tile the cell across the polygon at a
-     * constant screen size. NULL => flat tint. */
+     * prefix) + the fill rings (world). Tile the cell across the polygon.
+     *
+     * Only the cell's SIZE is screen-referenced (a constant number of device px,
+     * like a symbol); its ORIGIN is not. Anchor the tiling to WORLD space — derive
+     * the pattern coordinate from the fragment's world position, never from its
+     * screen position — so the pattern translates with the chart. A pattern phased
+     * off screen coordinates stays nailed to the viewport while the seabed slides
+     * underneath it, which reads as the chart moving and the fill not.
+     * NULL => flat tint. */
     void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, const tile57_world_rings *rings);
     /* Text as a STRING for the host's SDF glyph atlas (tile57_bake_glyph_sdf):
      * world anchor + the anchor-relative baseline-left origin in px (ox,oy, with

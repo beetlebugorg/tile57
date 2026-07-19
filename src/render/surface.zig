@@ -109,8 +109,11 @@ pub const FeatureMeta = struct {
 /// The render engine Surface vtable.
 ///
 /// Lifecycle per scene: beginScene → (beginFeature → draw calls → endFeature)* → endScene.
-/// The engine emits features in draw-priority order; geometry is already
-/// projected, clipped, and simplified into the scene's coordinate space.
+/// The engine walks features in WALK order — tile by tile, then cell record order
+/// — NOT draw-priority order; `meta.draw_prio` carries the priority and it is the
+/// surface's job to order by it (the pixel, ascii and vector surfaces each buffer
+/// the scene and sort at endScene). Geometry is already projected, clipped, and
+/// simplified into the scene's coordinate space.
 ///
 /// Adding an output format = one file implementing this vtable; no engine edits.
 pub const Surface = struct {

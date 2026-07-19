@@ -1296,6 +1296,11 @@ const CMariner = extern struct {
     //   1 = show soundings, whatever the category says
     //   2 = hide soundings, whatever the category says
     soundings: u8,
+    // Device pixels per reference pixel — the HiDPI framebuffer density the SURFACE
+    // paths are drawn at. Describes the display, not the mariner; multiplies with
+    // size_scale. Appended for ABI-append-safety; marinerFromC reads 0 (an un-set
+    // field) as 1.0 = a 1x framebuffer.
+    device_scale: f64,
 };
 
 /// The tri-state `soundings` field as the engine's optional bool.
@@ -1356,6 +1361,7 @@ fn marinerFromC(cm: *const CMariner) mariner.Settings {
         // than invisible text/soundings.
         .text_size_scale = if (cm.text_size_scale > 0) cm.text_size_scale else 1.0,
         .sounding_size_scale = if (cm.sounding_size_scale > 0) cm.sounding_size_scale else 1.0,
+        .device_scale = if (cm.device_scale > 0) cm.device_scale else 1.0,
         .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
             cm.viewing_groups_off[0..cm.viewing_groups_off_len]
         else
@@ -1540,6 +1546,7 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
         .show_overscale = d.show_overscale,
         .text_size_scale = d.text_size_scale,
         .sounding_size_scale = d.sounding_size_scale,
+        .device_scale = d.device_scale,
     };
 }
 
