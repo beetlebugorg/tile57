@@ -16,6 +16,19 @@ const mariner = @import("mariner.zig");
 
 const FALLBACK = "#ff00ff";
 const FONT = .{"Noto Sans Regular"};
+const FONT_BOLD = .{"Noto Sans Bold"};
+const FONT_ITALIC = .{"Noto Sans Italic"};
+// Geographic-name text-font, data-driven by the label-tier props (render.labeltier):
+// bold for populated-place names, italic for hydrography, else the regular face.
+// The client's glyphs endpoint serves all three Noto Sans fontstacks. Each font
+// stack is wrapped in ["literal", …]: inside an expression a bare ["Noto Sans
+// Bold"] parses as a function call (crashing symbol placement), not a font array.
+const TEXT_FONT = .{
+    "case",
+    .{ "==", .{ "get", "font_weight" }, "bold" }, .{ "literal", FONT_BOLD },
+    .{ "==", .{ "get", "font_slant" }, "italic" }, .{ "literal", FONT_ITALIC },
+    .{ "literal", FONT },
+};
 
 // ---- MapLibre expressions, as comptime tuples ----------------------------
 // SEABED01 depth shading, the danger-symbol swap, and the sounding bold/faint split
@@ -577,7 +590,7 @@ fn textLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket, id: []
     try js.objectField("text-field");
     try js.write(.{ "coalesce", .{ "get", "text" }, "" });
     try js.objectField("text-font");
-    try js.write(FONT);
+    try js.write(TEXT_FONT);
     try js.objectField("text-size");
     try writeScaled(js, .{ "case", IS_LIGHT, .{ "coalesce", .{ "get", "font_size_px" }, 10 }, .{ "coalesce", .{ "get", "font_size_px" }, 11 } }, s.size_scale);
     try js.objectField("text-anchor");

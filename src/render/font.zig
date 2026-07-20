@@ -350,10 +350,28 @@ pub const Font = struct {
 
 // ---- tests -------------------------------------------------------------------
 
-/// The embedded label face (Noto Sans Regular, OFL 1.1) — the render engine's
-/// single font.
+/// The embedded label faces (Noto Sans, OFL 1.1 — see THIRD_PARTY_LICENSES.md).
+/// Regular is the base face; Bold and Italic give the label-tier resolver
+/// (src/style/labeltier.zig) real weight and slant rather than synthesizing them.
 pub const notosans = @embedFile("font_ttf");
+pub const notosans_bold = @embedFile("font_ttf_bold");
+pub const notosans_italic = @embedFile("font_ttf_italic");
 const noto = notosans;
+
+/// S-52 CHARS text weight, restrained to the two the label tiers use. S-52's
+/// "light" collapses to regular so no label drops below the readable-from-1m floor.
+pub const Weight = enum { regular, bold };
+/// S-52 CHARS text slant: upright, or italic for hydrographic (water) names.
+pub const Slant = enum { upright, italic };
+
+/// The embedded face bytes for a (weight, slant) pair. The tiers never combine
+/// bold with italic (land names are bold-upright, water names regular-italic), so
+/// no BoldItalic face is embedded; bold takes precedence if both are ever asked.
+pub fn face(w: Weight, s: Slant) []const u8 {
+    if (w == .bold) return notosans_bold;
+    if (s == .italic) return notosans_italic;
+    return notosans;
+}
 
 test "Font: parses Noto Sans, maps ASCII, sane metrics" {
     const f = try Font.init(noto);

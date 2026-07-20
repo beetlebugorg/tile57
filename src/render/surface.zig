@@ -12,6 +12,7 @@
 //! Mirrors the original Go RenderSurface interface (internal/s52render).
 
 const std = @import("std");
+const font = @import("font.zig");
 const Allocator = std.mem.Allocator;
 const mvt = @import("tiles").mvt;
 
@@ -65,6 +66,8 @@ pub fn fillToken(token: ColorToken) struct { name: []const u8, alpha: u8 } {
 pub const TextStyle = struct {
     color: ColorToken,
     font_size: f64,
+    weight: font.Weight = .regular, // CHARS weight (regular/bold); picks the face
+    slant: font.Slant = .upright, // CHARS slant (upright/italic); picks the face
     halign: []const u8 = "", // "left" | "center" | "right" ("" = minimal label)
     valign: []const u8 = "", // "top" | "middle" | "bottom"
     offset_x: f64 = 0, // S-52 LocalOffset in mm (+x right / +y down)

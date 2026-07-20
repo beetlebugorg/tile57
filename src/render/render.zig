@@ -39,6 +39,7 @@ pub const kitty = @import("kitty.zig");
 pub const symbols = @import("symbols.zig");
 pub const sndfrm = @import("sndfrm.zig");
 pub const font = @import("font.zig");
+pub const labeltier = @import("labeltier.zig");
 pub const pdf = @import("pdf.zig");
 pub const cb_canvas = @import("cb_canvas.zig");
 pub const vector = @import("vector.zig");

@@ -906,6 +906,43 @@ fn stripNameTag(text: []const u8) []const u8 {
     return text;
 }
 
+/// Build the TextStyle for one parsed label, applying the label-tier resolver
+/// (render.labeltier): a geographic-name class (city, bay, point…) is sized and
+/// weighted by its S-57 class + SCAMIN + category, so a major place reads bolder
+/// than a creek. Non-name labels keep the portrayal rule's own font-size / weight
+/// / slant. The rule's halign/valign/offset/group always carry through.
+fn textStyleFor(t: instructions.Text, f: s57.Feature, fmeta: rs.FeatureMeta) rs.TextStyle {
+    var size = t.font_size;
+    var weight: render.font.Weight = switch (t.weight) {
+        .regular => .regular,
+        .bold => .bold,
+    };
+    var slant: render.font.Slant = switch (t.slant) {
+        .upright => .upright,
+        .italic => .italic,
+    };
+    const cat: ?i64 = if (render.labeltier.categoryCode(fmeta.class)) |cc|
+        (if (f.attrFloat(cc)) |x| @as(i64, @intFromFloat(x)) else null)
+    else
+        null;
+    if (render.labeltier.resolve(fmeta.class, fmeta.scamin, cat)) |tier| {
+        size = tier.size_px;
+        weight = tier.weight;
+        slant = tier.slant;
+    }
+    return .{
+        .color = t.color,
+        .font_size = size,
+        .weight = weight,
+        .slant = slant,
+        .halign = t.halign,
+        .valign = t.valign,
+        .offset_x = t.offset_x,
+        .offset_y = t.offset_y,
+        .group = t.group,
+    };
+}
+
 /// Serialize a text label's props in the tile schema order. `text` arrives already
 /// shortened/resolved by the engine. A minimal label (empty halign — see
 /// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
@@ -916,6 +953,11 @@ fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const 
     try props.append(a, .{ .key = "text", .value = .{ .string = text } });
     try props.append(a, .{ .key = "color_token", .value = .{ .string = text_style.color } });
     try props.append(a, .{ .key = "font_size_px", .value = .{ .double = font_px } });
+    // Label-tier weight/slant (render.labeltier): emit only the non-default face so
+    // the common regular/upright label keeps its byte-identical prop set. A reader
+    // that omits the key renders regular/upright.
+    if (text_style.weight == .bold) try props.append(a, .{ .key = "font_weight", .value = .{ .string = "bold" } });
+    if (text_style.slant == .italic) try props.append(a, .{ .key = "font_slant", .value = .{ .string = "italic" } });
     if (text_style.halign.len == 0) return; // minimal label: no alignment/halo/group spec
     try props.append(a, .{ .key = "halign", .value = .{ .string = text_style.halign } });
     try props.append(a, .{ .key = "valign", .value = .{ .string = text_style.valign } });
@@ -1559,15 +1601,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 try surf.endFeature();
             }
             for (p.texts) |t| {
-                const ts = rs.TextStyle{
-                    .color = t.color,
-                    .font_size = t.font_size,
-                    .halign = t.halign,
-                    .valign = t.valign,
-                    .offset_x = t.offset_x,
-                    .offset_y = t.offset_y,
-                    .group = t.group,
-                };
+                const ts = textStyleFor(t, f, fmeta);
                 try surf.beginFeature(&fmeta);
                 try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, pt);
                 try surf.endFeature();
@@ -1697,15 +1731,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 for (p.texts) |t| {
-                    const ts = rs.TextStyle{
-                        .color = t.color,
-                        .font_size = t.font_size,
-                        .halign = t.halign,
-                        .valign = t.valign,
-                        .offset_x = t.offset_x,
-                        .offset_y = t.offset_y,
-                        .group = t.group,
-                    };
+                    const ts = textStyleFor(t, f, fmeta);
                     try surf.beginFeature(&fmeta);
                     try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, cpt);
                     try surf.endFeature();
