@@ -566,14 +566,17 @@ pub const GpuSurface = struct {
         const px: f32 = @floatCast((if (style.font_size > 0) style.font_size else 12) * self.textDev());
         if (px <= 1) return;
 
-        // Shape: pen advances left to right, in local reference px.
+        // Shape: pen advances left to right, in local reference px. Advances come
+        // from the label font (fontmod), the same metrics the pixel/vector paths
+        // use, so the collision box below matches theirs and the pool declutters
+        // identically whichever surface draws.
         var pen: f32 = 0;
-        var gids = std.ArrayList(struct { gid: u16, x: f32 }).empty;
+        var gids = std.ArrayList(ShapedGlyph).empty;
         defer gids.deinit(self.a);
         var it = (std.unicode.Utf8View.init(text) catch return).iterator();
         while (it.nextCodepoint()) |cp| {
             const gid = f.glyphIndex(cp);
-            try gids.append(self.a, .{ .gid = gid, .x = pen });
+            try gids.append(self.a, .{ .gid = gid, .cp = cp, .x = pen });
             pen += f.advance(gid) * px;
         }
         if (pen <= 0) return;
@@ -596,23 +599,20 @@ pub const GpuSurface = struct {
             baseline -= f.descent * px;
         }
 
-        var rings = std.ArrayList([]const [2]f32).empty;
-        for (gids.items) |g| {
-            for (try self.glyphOutline(g.gid)) |contour| {
-                if (contour.len < 3) continue;
-                const pts = try self.a.alloc([2]f32, contour.len);
-                // em units, y UP -> local reference px, y DOWN.
-                for (contour, 0..) |p, i| pts[i] = .{ x0 + g.x + p.x * px, baseline - p.y * px };
-                try rings.append(self.a, pts);
-            }
-        }
-        if (rings.items.len == 0) return; // all-whitespace run: nothing to place
+        // The run becomes either SDF glyph quads (crisp at any zoom, the whole
+        // point of the atlas) or — when no glyph atlas is loaded — filled outline
+        // triangles, so a host without the SDF asset still gets text.
+        const geom = (try self.sdfRun(gids.items, x0, baseline, px, at)) orelse
+            (try self.outlineRun(gids.items, x0, baseline, px, at)) orelse
+            return; // all-whitespace run: nothing to place
 
         // The collision box, in the screen frame this scene is for. The host owns
         // the camera, but a pan only translates every box alike and so cannot
         // change which labels collide; the zoom is what sets their relative size,
         // and that is known. Ordinary labels are screen-upright, so no rotation
-        // enters the box either.
+        // enters the box either. The box uses the font metrics, not the atlas, so
+        // it matches the pixel/vector paths' declutter regardless of which
+        // geometry the run above produced.
         const sc = self.screenPx(at);
         const box = dc.Box{
             .x0 = sc[0] + x0,
@@ -631,14 +631,58 @@ pub const GpuSurface = struct {
             .scamin = if (self.cur.scamin) |s| @floatFromInt(s) else 0,
             .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
             .map_align = 0,
-            .geom = .{ .mark = .{
-                .anchor = at,
-                .rings = try rings.toOwnedSlice(self.a),
-                // TrueType contours wind for the nonzero rule; even-odd would
-                // punch the bowl of every 'o' back out.
-                .rule = .nonzero,
-            } },
+            .geom = geom,
         });
+    }
+
+    const ShapedGlyph = struct { gid: u16, cp: u21, x: f32 };
+
+    /// Lay a shaped run out as SDF glyph quads against the glyph atlas, at the
+    /// anchor-local baseline origin (`x0`, `baseline`) in reference px. Null when
+    /// there is no glyph atlas (caller falls back to outlines) or the run yields
+    /// no glyph (all whitespace / all missing from the atlas).
+    fn sdfRun(self: *GpuSurface, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
+        const atlas = self.glyphs orelse return null;
+        var quads = std.ArrayList(SpriteQuad).empty;
+        for (glyphs_in) |g| {
+            const gi = atlas.get(g.cp) orelse continue; // space, or a glyph the atlas lacks
+            if (gi.w <= 0 or gi.h <= 0) continue;
+            // Atlas metrics are EM units, y DOWN, relative to the pen. The pen is
+            // the font-shaped x0 + g.x, so the bitmap sits where the box expects.
+            const gx = x0 + g.x + gi.off_x * px;
+            const gy = baseline + gi.off_y * px;
+            const gw = gi.w * px;
+            const gh = gi.h * px;
+            try quads.append(self.a, .{
+                .corners = .{ .{ gx, gy }, .{ gx + gw, gy }, .{ gx + gw, gy + gh }, .{ gx, gy + gh } },
+                .uv = .{ .{ gi.u0, gi.v0 }, .{ gi.u1, gi.v0 }, .{ gi.u1, gi.v1 }, .{ gi.u0, gi.v1 } },
+            });
+        }
+        if (quads.items.len == 0) return null;
+        return .{ .sprite = .{ .anchor = at, .quads = try quads.toOwnedSlice(self.a), .atlas = .glyph } };
+    }
+
+    /// The outline-triangle fallback: filled glyph contours, wound nonzero. Null
+    /// for an all-whitespace run.
+    fn outlineRun(self: *GpuSurface, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
+        var rings = std.ArrayList([]const [2]f32).empty;
+        for (glyphs_in) |g| {
+            for (try self.glyphOutline(g.gid)) |contour| {
+                if (contour.len < 3) continue;
+                const pts = try self.a.alloc([2]f32, contour.len);
+                // em units, y UP -> local reference px, y DOWN.
+                for (contour, 0..) |p, i| pts[i] = .{ x0 + g.x + p.x * px, baseline - p.y * px };
+                try rings.append(self.a, pts);
+            }
+        }
+        if (rings.items.len == 0) return null;
+        return .{ .mark = .{
+            .anchor = at,
+            .rings = try rings.toOwnedSlice(self.a),
+            // TrueType contours wind for the nonzero rule; even-odd would punch
+            // the bowl of every 'o' back out.
+            .rule = .nonzero,
+        } };
     }
 
     /// World position in screen px at this scene's zoom — the frame the pool
@@ -1351,6 +1395,60 @@ const TextFixture = struct {
         return fx.gs.build(a);
     }
 };
+
+/// A glyph atlas covering printable ASCII — every glyph a fixed EM cell, enough
+/// for the SDF layout to place one quad per non-space character.
+fn fakeGlyphs(a: Allocator) !GlyphAtlas {
+    var at = GlyphAtlas{ .em_px = 32 };
+    var cp: u21 = 0x21; // skip space (0x20): the layout emits no quad for it
+    while (cp <= 0x7E) : (cp += 1) {
+        try at.glyphs.put(a, cp, .{
+            .u0 = 0, .v0 = 0, .u1 = 0.1, .v1 = 0.1,
+            .off_x = 0.05, .off_y = -0.7, .w = 0.5, .h = 0.7, .advance = 0.6,
+        });
+    }
+    return at;
+}
+
+test "gpu: a label with a glyph atlas draws as one SDF quad run, not triangles" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var fx = try TextFixture.init(a, &colors, &settings);
+    var glyphs = try fakeGlyphs(a);
+    fx.gs.glyphs = &glyphs;
+    try fx.label("Annapolis", 2000, 2000); // 9 non-space glyphs
+
+    const scene = try fx.gs.build(a);
+    // One text range, sampling the GLYPH atlas as quads — crisp SDF, not filled
+    // outline triangles. 9 glyphs * 6 verts, and nothing tessellated.
+    try testing.expectEqual(@as(usize, 1), scene.ranges.len);
+    try testing.expectEqual(Kind.text, scene.ranges[0].kind);
+    try testing.expectEqual(Prim.quads, scene.ranges[0].prim);
+    try testing.expectEqual(AtlasId.glyph, scene.ranges[0].atlas);
+    try testing.expectEqual(@as(u32, 9 * 6), scene.ranges[0].count);
+    try testing.expectEqual(@as(usize, 0), scene.indices.len);
+    // The glyph is tinted by the resolved text colour (SDF), and every vertex
+    // rides the label's one world anchor.
+    for (scene.quads) |q| try testing.expectEqual(scene.quads[0].x, q.x);
+}
+
+test "gpu: without a glyph atlas a label still draws, as outline triangles" {
+    // The fallback: a host missing the SDF asset must not lose its labels.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    const scene = try TextFixture.one(a, &colors, &settings, "Baltimore");
+    try testing.expectEqual(@as(usize, 1), scene.ranges.len);
+    try testing.expectEqual(Kind.text, scene.ranges[0].kind);
+    try testing.expectEqual(Prim.triangles, scene.ranges[0].prim);
+    try testing.expect(scene.indices.len > 0);
+    try testing.expectEqual(@as(usize, 0), scene.quads.len);
+}
 
 test "gpu: a label becomes text-kind geometry that paints last" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
