@@ -30,6 +30,8 @@ const sym = @import("symbols.zig");
 const sndfrm = @import("sndfrm.zig");
 const cv = @import("canvas.zig");
 const paint = @import("paint.zig");
+const fontmod = @import("font.zig");
+const dc = @import("declutter.zig");
 
 /// What a range draws — the host picks a pipeline from this, nothing more. It is
 /// NOT a paint-order key: ordering is `paint_key` and only `paint_key`. Shared
@@ -150,6 +152,14 @@ pub const GpuSurface = struct {
     /// them. One density per scene, so the name alone is the key.
     patterns: std.ArrayList(PatternCell) = .empty,
     pattern_ix: std.StringHashMapUnmanaged(u32) = .empty,
+    fnt: ?fontmod.Font = null,
+    /// Shaped labels and the pool that ranks them. Held apart from `ops` because
+    /// which labels survive is a property of the WHOLE scene, not of the order
+    /// the engine walked it — so none may be admitted until `build` resolves the
+    /// pool.
+    labels: std.ArrayList(Op) = .empty,
+    pool: dc.Pool = .{},
+    glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -173,6 +183,7 @@ pub const GpuSurface = struct {
             .settings = settings,
             .zoom = zoom,
             .tessellator = try tess.Tessellator.init(a),
+            .fnt = fontmod.Font.init(fontmod.notosans) catch null,
         };
     }
 
@@ -181,6 +192,9 @@ pub const GpuSurface = struct {
         self.ops.deinit(self.a);
         self.patterns.deinit(self.a);
         self.pattern_ix.deinit(self.a);
+        self.labels.deinit(self.a);
+        self.pool.deinit(self.a);
+        self.glyph_cache.deinit(self.a);
     }
 
     pub fn asSurface(self: *GpuSurface) rs.Surface {
@@ -211,6 +225,13 @@ pub const GpuSurface = struct {
     /// without colliding with itself (mariner.sounding_size_scale, 1.0 = none).
     fn soundingDev(self: *const GpuSurface) f64 {
         return self.refDev() * self.settings.sounding_size_scale;
+    }
+
+    /// refDev with the mariner's extra TEXT multiplier — the one scale that sizes
+    /// a label AND its collision box, so enlarged labels still declutter
+    /// correctly (mariner.text_size_scale, 1.0 = none).
+    fn textDev(self: *const GpuSurface) f64 {
+        return self.refDev() * self.settings.text_size_scale;
     }
 
     /// Surface contract: this surface's display scale, so the engine walks
@@ -344,9 +365,110 @@ pub const GpuSurface = struct {
         }
     }
 
-    fn drawText(_: *anyopaque, _: []const u8, _: *const rs.TextStyle, _: rs.TilePoint) anyerror!void {
-        // Text needs the shaped glyph run and the declutter pool, which resolve
-        // at endScene. Not yet emitted.
+    /// A label: shaped into outline rings now, admitted only if it wins its space.
+    ///
+    /// The glyphs become an ordinary mark — world anchor plus local reference-px
+    /// rings — so a label rides the chart, stays screen-upright and keeps its size
+    /// under zoom by exactly the machinery symbols already use. What it does NOT
+    /// get is the host's own text pipeline: these are filled outlines, not an SDF
+    /// atlas, and no halo is emitted (the style carries none; the pixel path
+    /// resolves its own).
+    fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
+        if (!resolve.textGroupVisible(style.group, self.settings)) return;
+        const f = &(self.fnt orelse return);
+        const px: f32 = @floatCast((if (style.font_size > 0) style.font_size else 12) * self.textDev());
+        if (px <= 1) return;
+
+        // Shape: pen advances left to right, in local reference px.
+        var pen: f32 = 0;
+        var gids = std.ArrayList(struct { gid: u16, x: f32 }).empty;
+        defer gids.deinit(self.a);
+        var it = (std.unicode.Utf8View.init(text) catch return).iterator();
+        while (it.nextCodepoint()) |cp| {
+            const gid = f.glyphIndex(cp);
+            try gids.append(self.a, .{ .gid = gid, .x = pen });
+            pen += f.advance(gid) * px;
+        }
+        if (pen <= 0) return;
+
+        // Alignment + the S-52 LocalOffset (mm, +y down) -> the baseline origin,
+        // anchor-local. Same arithmetic as the pixel and vector paths, so a label
+        // sits in the same place whichever surface draws it.
+        const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
+        const halign = if (style.halign.len > 0) style.halign else "center";
+        const valign = if (style.valign.len > 0) style.valign else "middle";
+        var x0: f32 = @as(f32, @floatCast(style.offset_x)) * mm_px;
+        if (std.mem.eql(u8, halign, "center")) x0 -= pen / 2;
+        if (std.mem.eql(u8, halign, "right")) x0 -= pen;
+        var baseline: f32 = @as(f32, @floatCast(style.offset_y)) * mm_px;
+        if (std.mem.eql(u8, valign, "top")) {
+            baseline += f.ascent * px;
+        } else if (std.mem.eql(u8, valign, "middle")) {
+            baseline += (f.ascent - f.descent) / 2 * px;
+        } else {
+            baseline -= f.descent * px;
+        }
+
+        var rings = std.ArrayList([]const [2]f32).empty;
+        for (gids.items) |g| {
+            for (try self.glyphOutline(g.gid)) |contour| {
+                if (contour.len < 3) continue;
+                const pts = try self.a.alloc([2]f32, contour.len);
+                // em units, y UP -> local reference px, y DOWN.
+                for (contour, 0..) |p, i| pts[i] = .{ x0 + g.x + p.x * px, baseline - p.y * px };
+                try rings.append(self.a, pts);
+            }
+        }
+        if (rings.items.len == 0) return; // all-whitespace run: nothing to place
+
+        // The collision box, in the screen frame this scene is for. The host owns
+        // the camera, but a pan only translates every box alike and so cannot
+        // change which labels collide; the zoom is what sets their relative size,
+        // and that is known. Ordinary labels are screen-upright, so no rotation
+        // enters the box either.
+        const sc = self.screenPx(at);
+        const box = dc.Box{
+            .x0 = sc[0] + x0,
+            .y0 = sc[1] + baseline - f.ascent * px,
+            .x1 = sc[0] + x0 + pen,
+            .y1 = sc[1] + baseline + f.descent * px,
+        };
+        try self.pool.add(self.a, self.labels.items.len, style.group, self.cur.class, text, box);
+        try self.labels.append(self.a, .{
+            .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+            // Labels sort among themselves by emission order, which is the SENC
+            // sequence the pool already used to break its own ties.
+            .seq = self.labels.items.len,
+            .kind = .text,
+            .color = self.rgba(style.color),
+            .scamin = if (self.cur.scamin) |s| @floatFromInt(s) else 0,
+            .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
+            .map_align = 0,
+            .geom = .{ .mark = .{
+                .anchor = at,
+                .rings = try rings.toOwnedSlice(self.a),
+                // TrueType contours wind for the nonzero rule; even-odd would
+                // punch the bowl of every 'o' back out.
+                .rule = .nonzero,
+            } },
+        });
+    }
+
+    /// World position in screen px at this scene's zoom — the frame the pool
+    /// measures collisions and repeat distances in.
+    fn screenPx(self: *const GpuSurface, at: rs.TilePoint) [2]f64 {
+        const w = self.worldOf(at);
+        const s = 256.0 * std.math.exp2(self.zoom);
+        return .{ @as(f64, w[0]) * s, @as(f64, w[1]) * s };
+    }
+
+    fn glyphOutline(self: *GpuSurface, gid: u16) ![]const []const cv.Point {
+        if (self.glyph_cache.get(gid)) |hit| return hit;
+        const out = try self.fnt.?.outline(self.a, gid);
+        try self.glyph_cache.put(self.a, gid, out);
+        return out;
     }
 
     /// Flatten a symbol's paths into local reference-px rings, rotated.
@@ -400,6 +522,15 @@ pub const GpuSurface = struct {
     /// Order the scene and pack it into draw-ready buffers. Everything returned
     /// is allocated from `arena`.
     pub fn build(self: *GpuSurface, arena: Allocator) !Scene {
+        // Rank the whole label set BEFORE any of it becomes geometry, then admit
+        // only the survivors. Text sorts last by paint_key either way, so this
+        // costs the ops sort nothing.
+        var kept = try self.pool.resolve(self.a, dc.REPEAT_PX);
+        defer kept.deinit(self.a);
+        for (self.labels.items, 0..) |label, i| {
+            if (kept.has(i)) try self.ops.append(self.a, label);
+        }
+
         std.mem.sort(Op, self.ops.items, {}, opLt);
 
         var verts = std.ArrayList(Vertex).empty;
@@ -869,4 +1000,151 @@ test "gpu: a pattern cell survives the store evicting its pixels" {
     FakeStore.cell_a.rgba = &([_]u8{0xAA} ** 16); // restore for other tests
     try testing.expectEqual(@as(usize, 1), scene.patterns.len);
     try testing.expectEqual(@as(u8, 0xAA), scene.patterns[0].rgba[0]);
+}
+
+/// A scene holding `n` labels placed by the caller.
+const TextFixture = struct {
+    gs: GpuSurface,
+    /// Zoom 4 against a 4096 extent puts one tile unit on exactly one screen px
+    /// (world * 256 * 2^4 == the tile coordinate), so the distances below read
+    /// directly against REPEAT_PX and the font metrics.
+    fn init(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings) !TextFixture {
+        var gs = try GpuSurface.init(a, colors, .day, settings, 4.0);
+        gs.tile_scale = 1.0 / 4096.0;
+        return .{ .gs = gs };
+    }
+    fn label(self: *TextFixture, text: []const u8, x: i32, y: i32) !void {
+        const surf = self.gs.asSurface();
+        const meta = rs.FeatureMeta{ .class = "SEAARE", .display_priority = 3 };
+        try surf.beginFeature(&meta);
+        const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
+        try surf.drawText(text, &style, .{ .x = x, .y = y });
+        try surf.endFeature();
+    }
+    /// One label alone: the baseline a crowded scene is measured against.
+    fn one(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings, text: []const u8) !Scene {
+        var fx = try TextFixture.init(a, colors, settings);
+        try fx.label(text, 2000, 2000);
+        return fx.gs.build(a);
+    }
+};
+
+test "gpu: a label becomes text-kind geometry that paints last" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var fx = try TextFixture.init(a, &colors, &settings);
+    const surf = fx.gs.asSurface();
+
+    // A label on a LOW-priority feature and geometry on a much higher one: text
+    // is drawn last whatever its feature's priority (S-52 §10.3.4.1), so the
+    // label must still land on top.
+    const hi = rs.FeatureMeta{ .class = "LIGHTS", .display_priority = 30 };
+    const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+    try surf.beginFeature(&hi);
+    try surf.fillArea("DEPVS", &rings, null);
+    try surf.endFeature();
+    try fx.label("Rhode Island", 2000, 2000);
+
+    const scene = try fx.gs.build(a);
+    try testing.expectEqual(@as(usize, 2), scene.ranges.len);
+    try testing.expectEqual(Kind.text, scene.ranges[scene.ranges.len - 1].kind);
+    try testing.expect(scene.ranges[1].index_count > 0);
+    // The glyphs ride the anchor: one world position, outlines as local px.
+    const first = scene.ranges[1].first_index;
+    const v0 = scene.vertices[scene.indices[first]];
+    for (scene.indices[first .. first + scene.ranges[1].index_count]) |i| {
+        try testing.expectEqual(v0.x, scene.vertices[i].x);
+        try testing.expectEqual(v0.y, scene.vertices[i].y);
+    }
+    try testing.expect(@abs(v0.ox) > 0 or @abs(v0.oy) > 0);
+}
+
+test "gpu: colliding labels resolve to one, and the loser emits no geometry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+
+    // Baselines: what one of each label costs on its own. Counting RANGES would
+    // not do — two labels that survive coalesce into a single draw call, which is
+    // the point of the range packing.
+    const alpha = (try TextFixture.one(a, &colors, &settings, "Alpha")).vertices.len;
+    const bravo = (try TextFixture.one(a, &colors, &settings, "Bravo")).vertices.len;
+    try testing.expect(alpha > 0 and bravo > 0);
+
+    var apart = try TextFixture.init(a, &colors, &settings);
+    try apart.label("Alpha", 0, 0);
+    try apart.label("Bravo", 5000, 5000); // thousands of px away
+    try testing.expectEqual(alpha + bravo, (try apart.gs.build(a)).vertices.len);
+
+    var stacked = try TextFixture.init(a, &colors, &settings);
+    try stacked.label("Alpha", 2000, 2000);
+    try stacked.label("Bravo", 2000, 2000); // same spot, different text
+    // The loser is dropped outright — not emitted transparent, not emitted
+    // behind. Alpha wins: peers tie-break on emission order, the SENC sequence.
+    try testing.expectEqual(alpha, (try stacked.gs.build(a)).vertices.len);
+}
+
+test "gpu: the same label repeated close by is dropped, far away is kept" {
+    // The tile-clipping artefact declutter.zig exists to settle: one sea area
+    // spanning several tiles is labelled once per tile, and the copies never
+    // overlap, so collision alone would happily keep them all.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    const one = (try TextFixture.one(a, &colors, &settings, "Rhode Island")).vertices.len;
+
+    // 200 screen px apart: no overlap, but inside REPEAT_PX (384).
+    var near = try TextFixture.init(a, &colors, &settings);
+    try near.label("Rhode Island", 2000, 2000);
+    try near.label("Rhode Island", 2200, 2000);
+    try testing.expectEqual(one, (try near.gs.build(a)).vertices.len);
+
+    // 600 px apart: far enough that the repeat is informative, not redundant.
+    var far = try TextFixture.init(a, &colors, &settings);
+    try far.label("Rhode Island", 2000, 2000);
+    try far.label("Rhode Island", 2600, 2000);
+    try testing.expectEqual(one * 2, (try far.gs.build(a)).vertices.len);
+}
+
+test "gpu: text_size_scale grows the label and its collision box together" {
+    // The property that makes the mariner's text slider safe: if the glyphs grew
+    // but the box did not, enlarged labels would overlap on screen while the pool
+    // still believed they were clear.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const plain = resolve.Settings{};
+    const big = resolve.Settings{ .text_size_scale = 2.0 };
+
+    const sp_ = try TextFixture.one(a, &colors, &plain, "Annapolis");
+    const sb = try TextFixture.one(a, &colors, &big, "Annapolis");
+    try testing.expectEqual(sp_.vertices.len, sb.vertices.len);
+    for (sp_.vertices, sb.vertices) |v1, v2| {
+        try testing.expectApproxEqAbs(v1.ox * 2.0, v2.ox, 1e-4);
+        try testing.expectApproxEqAbs(v1.oy * 2.0, v2.oy, 1e-4);
+    }
+
+    // And the box scaled with them. A label box is (ascent + descent) * px tall
+    // — about 16 px at font 12, 33 px at 2x — so a pair 20 px apart clears at 1x
+    // and collides at 2x. Had the box not grown, both would survive at both.
+    const ann = sp_.vertices.len;
+    const bal = (try TextFixture.one(a, &colors, &plain, "Baltimore")).vertices.len;
+    var small = try TextFixture.init(a, &colors, &plain);
+    try small.label("Annapolis", 2000, 2000);
+    try small.label("Baltimore", 2000, 2020);
+    try testing.expectEqual(ann + bal, (try small.gs.build(a)).vertices.len);
+
+    var grown = try TextFixture.init(a, &colors, &big);
+    try grown.label("Annapolis", 2000, 2000);
+    try grown.label("Baltimore", 2000, 2020);
+    try testing.expectEqual(ann, (try grown.gs.build(a)).vertices.len);
 }
