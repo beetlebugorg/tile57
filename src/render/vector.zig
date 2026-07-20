@@ -108,6 +108,10 @@ pub const CFeature = extern struct {
     display_priority: i32,
     display_plane: CDisplayPlane,
     display_category: CDisplayCategory,
+    /// Opaque paint-order key (see paintKey): bucket by it and draw ascending.
+    /// Do NOT decode it — the packing is the engine's to change. Meaningful only
+    /// within one scene.
+    paint_key: u32,
 };
 
 /// The GPU paint table. Every call gets `ctx` back verbatim; pointers are valid
@@ -192,6 +196,9 @@ pub const Candidate = struct {
     display_priority: i32,
     display_plane: CDisplayPlane,
     display_category: CDisplayCategory,
+    /// Paint key for the label, computed when the candidate is made (labels are
+    /// resolved after the op sort, so they never pass through paintKey there).
+    paint_key: u32,
     anchor: CWorldPt,
     text: []const u8,
     px: f32, // glyph size, device px
@@ -260,6 +267,30 @@ const Op = struct {
 /// `radar` is whether a RADAR overlay is present — the condition §10.3.4.2 puts
 /// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
 /// all and priority leads.
+/// The engine's paint order folded into ONE comparable integer per draw call.
+///
+/// This is the whole of S-52 PresLib §10.3.4.1/.2 as the engine applies it: text
+/// last, then DisplayPlane (only under a radar overlay, §10.3.4.2), then display
+/// priority, then geometry class. Emission order breaks the remaining ties and is
+/// preserved by handing the calls over in order, so it needs no bits here.
+///
+/// A GPU host must batch by draw type, which destroys the stream order and forces
+/// it to rebuild paint order itself. Without this it had to rebuild the RULE —
+/// a copy of the class taxonomy, the priority range and the radar gate, living in
+/// the host and drifting from the engine (they drifted, and the same spec bug had
+/// to be fixed twice). With it the host buckets on an integer it never decodes.
+fn paintKey(op: Op, radar: bool) u32 {
+    const is_text: u32 = if (op.layer == .text) 1 else 0;
+    const plane: u32 = if (radar and op.display_plane != 0) 1 else 0;
+    const prio: u32 = @intCast(std.math.clamp(op.prio, 0, @as(i64, PRIO_MAX)));
+    return ((is_text * 2 + plane) * (PRIO_MAX + 1) + prio) * CLASS_COUNT + @intFromEnum(op.layer);
+}
+
+const PRIO_MAX: u32 = 30; // S-101 DrawingPriority range
+const CLASS_COUNT: u32 = 6; // OpLayer cardinality
+/// One past the largest paintKey — a host sizes its bucket array with it.
+pub const PAINT_KEY_MAX: u32 = 4 * (PRIO_MAX + 1) * CLASS_COUNT;
+
 fn orderLt(radar: bool, l: Op, r: Op) bool {
     const lt_text = l.layer == .text;
     const rt_text = r.layer == .text;
@@ -466,6 +497,7 @@ pub const VectorSurface = struct {
                 2 => .other,
                 else => .standard,
             },
+            .paint_key = 0, // per draw call — stamped in emitOps
         };
     }
 
@@ -581,6 +613,7 @@ pub const VectorSurface = struct {
         std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
         for (self.ops.items) |*op| {
             const f = &op.feat;
+            f.paint_key = paintKey(op.*, self.settings.radar_overlay);
             switch (op.kind) {
                 .fill => |*k| self.cb.fill_area(self.cb.ctx, f, &k.rings, k.color, k.even_odd),
                 .pattern => |*k| self.cb.draw_pattern.?(self.cb.ctx, f, k.name.ptr, k.name.len, &k.rings),
@@ -883,6 +916,8 @@ pub const VectorSurface = struct {
                 2 => .other,
                 else => .standard,
             },
+            // Labels are resolved after the op sort and always paint last.
+            .paint_key = paintKey(.{ .layer = .text, .prio = self.cur.display_priority, .display_plane = self.cur.display_plane, .seq = 0, .feat = undefined, .kind = undefined }, self.settings.radar_overlay),
             .anchor = self.worldOf(at),
             .text = try a.dupe(u8, text),
             .px = px,
@@ -925,7 +960,7 @@ pub const VectorSurface = struct {
         const rot_deg = (if (c.upright) self.uprightTangent(c.rot_rad) else c.rot_rad) * 180.0 / std.math.pi;
         try self.pool.add(self.a, self.labels.items.len, c.group, c.cls, c.text, self.labelBox(c.anchor, c.x0, c.baseline, c.pen, c.px, rot_deg, c.rot_align));
         try self.labels.append(self.a, .{
-            .feat = .{ .cls = c.cls.ptr, .scamin = c.scamin, .display_priority = c.display_priority, .display_plane = c.display_plane, .display_category = c.display_category },
+            .feat = .{ .cls = c.cls.ptr, .scamin = c.scamin, .display_priority = c.display_priority, .display_plane = c.display_plane, .display_category = c.display_category, .paint_key = c.paint_key },
             .anchor = c.anchor,
             .text = c.text,
             .px = c.px,
@@ -1677,19 +1712,19 @@ const OrderCb = struct {
     calls: std.ArrayListUnmanaged(Call) = .empty,
 
     const Kind = enum { fill, stroke, symbol };
-    const Call = struct { kind: Kind, display_priority: i32 };
+    const Call = struct { kind: Kind, display_priority: i32, paint_key: u32 = 0 };
 
     fn onFill(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {
         const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
-        self.calls.append(self.a, .{ .kind = .fill, .display_priority = f.display_priority }) catch {};
+        self.calls.append(self.a, .{ .kind = .fill, .display_priority = f.display_priority, .paint_key = f.paint_key }) catch {};
     }
     fn onStroke(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {
         const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
-        self.calls.append(self.a, .{ .kind = .stroke, .display_priority = f.display_priority }) catch {};
+        self.calls.append(self.a, .{ .kind = .stroke, .display_priority = f.display_priority, .paint_key = f.paint_key }) catch {};
     }
     fn onSymbol(ctx: ?*anyopaque, f: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {
         const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
-        self.calls.append(self.a, .{ .kind = .symbol, .display_priority = f.display_priority }) catch {};
+        self.calls.append(self.a, .{ .kind = .symbol, .display_priority = f.display_priority, .paint_key = f.paint_key }) catch {};
     }
     fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
 
@@ -1815,6 +1850,60 @@ test "surface: a light sector arc paints over a wreck symbol (display_priority, 
     try testing.expectEqual(@as(i32, 12), rec.calls.items[0].display_priority);
     try testing.expectEqual(OrderCb.Kind.stroke, rec.calls.items[1].kind);
     try testing.expectEqual(@as(i32, 24), rec.calls.items[1].display_priority);
+}
+
+test "surface: paint_key is non-decreasing and matches the emitted order" {
+    // The contract a batching host relies on: bucket by paint_key, draw ascending,
+    // get the engine's order back. If the key ever disagreed with the sort, a host
+    // rebuilding order from it would paint a different chart than the engine.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = OrderCb{ .a = a };
+    const cb = rec.surface();
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    var fake = FakeStore.make();
+    vs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+    const line = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const lines = [_][]const rs.TilePoint{&line};
+
+    // Walked in the wrong order on purpose: a high-priority line first, then a
+    // low-priority symbol and a mid-priority fill.
+    const arc = rs.FeatureMeta{ .class = "LIGHTS", .display_priority = 24 };
+    try surf.beginFeature(&arc);
+    try surf.strokeLine("LITRD", 1.0, .solid, &lines, null);
+    try surf.endFeature();
+
+    const wreck = rs.FeatureMeta{ .class = "WRECKS", .display_priority = 12 };
+    try surf.beginFeature(&wreck);
+    try surf.drawSymbol("BOYLAT13", .{ .x = 50, .y = 50 }, 0, sndfrm.SYMBOL_SCALE, false, .point, null);
+    try surf.endFeature();
+
+    const depare = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 15 };
+    try surf.beginFeature(&depare);
+    try surf.fillArea("DEPVS", &rings, null);
+    try surf.endFeature();
+
+    _ = try surf.endScene(a);
+
+    try testing.expect(rec.calls.items.len >= 3);
+    var prev: u32 = 0;
+    for (rec.calls.items) |c| {
+        try testing.expect(c.paint_key >= prev); // never goes backwards
+        try testing.expect(c.paint_key < PAINT_KEY_MAX); // fits a host's bucket array
+        prev = c.paint_key;
+    }
+    // And the keys order the classes the way the priorities demand.
+    try testing.expectEqual(@as(i32, 12), rec.calls.items[0].display_priority);
+    try testing.expectEqual(@as(i32, 24), rec.calls.items[rec.calls.items.len - 1].display_priority);
 }
 
 test "surface: DisplayPlane orders only when a radar overlay is present" {

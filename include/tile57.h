@@ -601,7 +601,20 @@ typedef struct {
     int32_t display_priority;
     tile57_display_plane display_plane;
     tile57_display_category display_category;
+    /* Paint-order key for THIS draw call — the engine's own ordering, folded into
+     * one comparable integer: text last, then DisplayPlane (radar overlay only),
+     * then display priority, then geometry class. Strictly non-decreasing across
+     * the call stream.
+     *
+     * This is what a batching host should bucket on. Do NOT decode it — the
+     * packing is the engine's to change; compare it and nothing else. It is
+     * meaningful only within one scene, and bounded by TILE57_PAINT_KEY_MAX so a
+     * host can size a bucket array. */
+    uint32_t paint_key;
 } tile57_feature;
+
+/* One past the largest tile57_feature.paint_key. */
+#define TILE57_PAINT_KEY_MAX 744u
 
 /* Draw table. Pointers are valid only for the duration of the call; ctx is
  * passed back verbatim.
