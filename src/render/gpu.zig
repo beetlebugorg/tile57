@@ -169,6 +169,9 @@ pub const AtlasId = enum(u8) {
     glyph = 2, // the SDF label-glyph atlas
 };
 
+/// What a surface pass emits — see GpuSurface.mode.
+pub const Mode = enum { all, geometry, labels };
+
 /// A contiguous slice of one buffer that draws with one pipeline. Ranges come
 /// out sorted by `paint_key`; draw them in order and the chart is correct.
 pub const Range = extern struct {
@@ -293,6 +296,10 @@ pub const GpuSurface = struct {
     ops: std.ArrayList(Op) = .empty,
     cur: rs.FeatureMeta = .{},
     store: ?sym.SymbolStore = null,
+    /// What this pass emits. tile57 caches GEOMETRY per tile but declutters LABELS
+    /// across the whole view, so the two are portrayed by separate passes: a
+    /// geometry pass skips text, a labels pass skips everything else.
+    mode: Mode = .all,
     /// The atlases the host will upload. When `sprites` has a symbol's cell it
     /// draws as a quad; without it, the outline-triangle fallback keeps the mark
     /// visible. `glyphs` is required for SDF text (no atlas -> no labels).
@@ -454,6 +461,7 @@ pub const GpuSurface = struct {
 
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, _: ?rs.DepthRange) anyerror!void {
         const self = sp(ctx);
+        if (self.mode == .labels) return;
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
         try self.push(.area, self.rgba(token), .{ .fill = .{ .rings = rings, .rule = .nonzero } });
     }
@@ -470,6 +478,7 @@ pub const GpuSurface = struct {
     /// derive that phase, so nothing extra rides the vertex.
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
         const self = sp(ctx);
+        if (self.mode == .labels) return;
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
         // Same density the pixel path rasterizes at, so a pattern repeats at the
@@ -499,6 +508,7 @@ pub const GpuSurface = struct {
 
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, _: ?f64) anyerror!void {
         const self = sp(ctx);
+        if (self.mode == .labels) return;
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
         try self.push(.line, self.rgba(token), .{ .stroke = .{
             .lines = lines,
@@ -509,6 +519,7 @@ pub const GpuSurface = struct {
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, _: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
         const self = sp(ctx);
+        if (self.mode == .labels) return;
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
         var eff = name;
@@ -519,6 +530,7 @@ pub const GpuSurface = struct {
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
         const self = sp(ctx);
+        if (self.mode == .labels) return;
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
         // Bold/faint split at the mariner's LIVE safety depth (metres), value in
@@ -579,6 +591,7 @@ pub const GpuSurface = struct {
     /// resolves its own).
     fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
         const self = sp(ctx);
+        if (self.mode == .geometry) return;
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
         const f = &(self.fnt orelse return);
@@ -975,6 +988,52 @@ pub const GpuSurface = struct {
         for (tri.indices) |idx| try indices.append(arena, base + idx);
     }
 };
+
+/// Concatenate several already-built scenes into one, re-sorted into a single
+/// paint order. This is how a whole-view scene is assembled from CACHED per-tile
+/// geometry scenes without re-tessellating: the expensive work (portray +
+/// tessellate) happened once per tile; this is memcpy + an offset fixup + a sort.
+/// Everything is copied into `arena`, so the result is independent of the input
+/// scenes' lifetimes (a cached tile may be evicted after).
+pub fn assemble(arena: Allocator, scenes: []const Scene) !Scene {
+    var verts = std.ArrayList(Vertex).empty;
+    var indices = std.ArrayList(u32).empty;
+    var quads = std.ArrayList(Quad).empty;
+    var ranges = std.ArrayList(Range).empty;
+    var patterns = std.ArrayList(PatternCell).empty;
+    for (scenes) |s| {
+        const vbase: u32 = @intCast(verts.items.len);
+        const ibase: u32 = @intCast(indices.items.len);
+        const qbase: u32 = @intCast(quads.items.len);
+        const pbase: u32 = @intCast(patterns.items.len);
+        try verts.appendSlice(arena, s.vertices);
+        for (s.indices) |idx| try indices.append(arena, idx + vbase);
+        try quads.appendSlice(arena, s.quads);
+        // Pattern pixels live in the source scene's arena; copy them so the result
+        // outlives it.
+        for (s.patterns) |cell| try patterns.append(arena, .{ .w = cell.w, .h = cell.h, .rgba = try arena.dupe(u8, cell.rgba) });
+        for (s.ranges) |r| {
+            var nr = r;
+            nr.first = r.first + (if (r.prim == .triangles) ibase else qbase);
+            if (r.pattern != NO_PATTERN) nr.pattern = r.pattern + pbase;
+            try ranges.append(arena, nr);
+        }
+    }
+    // Cross-tile paint order: one global sort by the engine's key. Ties (same
+    // class/priority in different tiles) draw in any order — same paint band.
+    std.mem.sort(Range, ranges.items, {}, struct {
+        fn lt(_: void, a: Range, b: Range) bool {
+            return a.paint_key < b.paint_key;
+        }
+    }.lt);
+    return .{
+        .vertices = try verts.toOwnedSlice(arena),
+        .indices = try indices.toOwnedSlice(arena),
+        .quads = try quads.toOwnedSlice(arena),
+        .ranges = try ranges.toOwnedSlice(arena),
+        .patterns = try patterns.toOwnedSlice(arena),
+    };
+}
 
 const testing = std.testing;
 

@@ -876,6 +876,7 @@ tile57_status tile57_compose_gpu_scene(tile57_compose *compose, double lon, doub
                              const tile57_mariner *m,
                              tile57_gpu_scene *out, tile57_error *err);
 
+
 /* Release a scene and zero the struct. Every pointer it handed out dies here,
  * so the host must have finished uploading first. Null-safe, and safe to call
  * twice. */

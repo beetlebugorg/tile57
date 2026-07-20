@@ -1204,7 +1204,10 @@ export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CCompo
 
 /// Release a compositor. Its charts stay open (and stay the caller's to close).
 export fn tile57_compose_close(handle: ?*compose.ComposeSource) callconv(.c) void {
-    if (handle) |src| src.deinit();
+    if (handle) |src| {
+        chart.geomDropHandle(@intFromPtr(src));
+        src.deinit();
+    }
 }
 
 // ===========================================================================
