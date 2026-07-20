@@ -904,17 +904,17 @@ test "decode round-trips the encoder's model (geometry + props, dict + plain + n
 
     const poly_props = [_]mvt.Prop{
         .{ .key = "color_token", .value = .{ .string = "DEPMS" } },
-        .{ .key = "draw_prio", .value = .{ .int = 3 } },
+        .{ .key = "display_priority", .value = .{ .int = 3 } },
         .{ .key = "drval1", .value = .{ .float = 5.5 } },
     };
     const line_props = [_]mvt.Prop{
         .{ .key = "color_token", .value = .{ .string = "CHBLK" } },
-        .{ .key = "draw_prio", .value = .{ .int = 6 } },
+        .{ .key = "display_priority", .value = .{ .int = 6 } },
         .{ .key = "width_px", .value = .{ .double = 1.5 } },
     };
     const pt_props = [_]mvt.Prop{
         .{ .key = "color_token", .value = .{ .string = "DEPMS" } }, // repeats -> dict
-        .{ .key = "draw_prio", .value = .{ .int = 9 } },
+        .{ .key = "display_priority", .value = .{ .int = 9 } },
         .{ .key = "symbol_name", .value = .{ .string = "BOYLAT13" } }, // nullable col
     };
     const feats = [_]mvt.Feature{
@@ -956,7 +956,7 @@ test "decode round-trips the encoder's model (geometry + props, dict + plain + n
         }
     }.f;
     try std.testing.expectEqualStrings("DEPMS", find(poly.properties, "color_token").?.string);
-    try std.testing.expectEqual(@as(i64, 3), find(poly.properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(i64, 3), find(poly.properties, "display_priority").?.int);
     try std.testing.expectEqual(@as(f32, 5.5), find(poly.properties, "drval1").?.float);
     try std.testing.expectEqual(@as(f64, 1.5), find(line.properties, "width_px").?.double);
     try std.testing.expectEqualStrings("BOYLAT13", find(p.properties, "symbol_name").?.string);

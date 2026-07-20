@@ -12,7 +12,7 @@
 //!   raster   — RasterCanvas: scanline-AA software rasterizer (RGBA8).
 //!   png      — RGBA8 -> PNG encoder (pure std, deterministic bytes).
 //!   pixel    — PixelSurface: the resolve-and-draw Surface implementation
-//!              (buffers ops, sorts by draw_prio, paints through a Canvas).
+//!              (buffers ops, sorts by display_priority, paints through a Canvas).
 //!   ascii    — AsciiSurface: the chart as a Unicode text grid (optional
 //!              ANSI-256 color). The worked example of adding a backend.
 //!   declutter— the label collision authority EVERY surface resolves through,
@@ -32,6 +32,9 @@ pub const raster = @import("raster.zig");
 pub const png = @import("png.zig");
 pub const pixel = @import("pixel.zig");
 pub const ascii = @import("ascii.zig");
+pub const tess = @import("tess.zig");
+pub const paint = @import("paint.zig");
+pub const gpu = @import("gpu.zig");
 pub const kitty = @import("kitty.zig");
 pub const symbols = @import("symbols.zig");
 pub const sndfrm = @import("sndfrm.zig");
@@ -40,11 +43,16 @@ pub const pdf = @import("pdf.zig");
 pub const cb_canvas = @import("cb_canvas.zig");
 pub const vector = @import("vector.zig");
 pub const declutter = @import("declutter.zig");
+pub const labelcache = @import("labelcache.zig"); // per-tile label-candidate memo (the view label pass)
 
 test {
+    _ = paint;
+    _ = gpu;
     _ = surface;
+    _ = tess;
     _ = vector;
     _ = declutter;
+    _ = labelcache;
     _ = noop;
     _ = inspect;
     _ = resolve;

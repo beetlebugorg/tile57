@@ -7,33 +7,33 @@ package tile57
 #include "tile57.h"
 
 extern void tile57GoSurfFill(void *ctx, tile57_feature *f, tile57_world_rings *rings,
-                             tile57_rgba color, int even_odd);
+                             tile57_color color, int even_odd);
 extern void tile57GoSurfLine(void *ctx, tile57_feature *f, tile57_world_rings *lines,
-                             float width_px, float dash_on, float dash_off, tile57_rgba color);
+                             float width_px, float dash_on, float dash_off, tile57_color color);
 extern void tile57GoSurfSymbol(void *ctx, tile57_feature *f, tile57_world_point anchor,
-                               tile57_local_rings *rings, tile57_rgba color, int even_odd,
+                               tile57_local_rings *rings, tile57_color color, int even_odd,
                                float stroke_w, int align);
 extern void tile57GoSurfText(void *ctx, tile57_feature *f, tile57_world_point anchor,
-                             tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo,
-                             float halo_px, int align);
+                             tile57_local_rings *glyphs, tile57_color color, tile57_color halo,
+                             float halo_px, int align, int32_t text_group);
 
 static void surf_fill_thunk(void *ctx, const tile57_feature *f, const tile57_world_rings *r,
-                            tile57_rgba c, int eo) {
+                            tile57_color c, int eo) {
 	tile57GoSurfFill(ctx, (tile57_feature *)f, (tile57_world_rings *)r, c, eo);
 }
 static void surf_line_thunk(void *ctx, const tile57_feature *f, const tile57_world_rings *l,
-                            float w, float don, float doff, tile57_rgba c) {
+                            float w, float don, float doff, tile57_color c) {
 	tile57GoSurfLine(ctx, (tile57_feature *)f, (tile57_world_rings *)l, w, don, doff, c);
 }
 static void surf_symbol_thunk(void *ctx, const tile57_feature *f, tile57_world_point a,
-                              const tile57_local_rings *r, tile57_rgba c, int eo, float sw,
+                              const tile57_local_rings *r, tile57_color c, int eo, float sw,
                               tile57_rot_align al) {
 	tile57GoSurfSymbol(ctx, (tile57_feature *)f, a, (tile57_local_rings *)r, c, eo, sw, al);
 }
 static void surf_text_thunk(void *ctx, const tile57_feature *f, tile57_world_point a,
-                            const tile57_local_rings *g, tile57_rgba c, tile57_rgba h, float hp,
-                            tile57_rot_align al) {
-	tile57GoSurfText(ctx, (tile57_feature *)f, a, (tile57_local_rings *)g, c, h, hp, al);
+                            const tile57_local_rings *g, tile57_color c, tile57_color h, float hp,
+                            tile57_rot_align al, int32_t tg) {
+	tile57GoSurfText(ctx, (tile57_feature *)f, a, (tile57_local_rings *)g, c, h, hp, al, tg);
 }
 
 // sprite / pattern / text_str stay NULL: the engine then tessellates symbols and
@@ -100,14 +100,23 @@ const (
 	AlignMap RotAlign = 1
 )
 
-// DispCat is the S-52 display category a feature arrived on. A host applying
-// SCAMIN itself must skip it for DispBase (the never-hide safety minimum).
-type DispCat uint8
+// DisplayCategory is the S-52 display category a feature arrived on. A host applying
+// SCAMIN itself must skip it for DisplayBase (the never-hide safety minimum).
+// DisplayPlane is the S-101 DisplayPlane. It outranks DisplayPriority in paint
+// order (S-52 PresLib §10.3.4.2).
+type DisplayPlane uint8
 
 const (
-	DispBase     DispCat = 0
-	DispStandard DispCat = 1
-	DispOther    DispCat = 2
+	PlaneUnderRadar DisplayPlane = 0
+	PlaneOverRadar  DisplayPlane = 1
+)
+
+type DisplayCategory uint8
+
+const (
+	DisplayBase     DisplayCategory = 0
+	DisplayStandard DisplayCategory = 1
+	DisplayOther    DisplayCategory = 2
 )
 
 // WorldPoint is a web-mercator [0,1] position (y down).
@@ -120,8 +129,9 @@ type LocalPoint struct{ X, Y float32 }
 type SurfaceFeature struct {
 	Class   string  // object-class acronym ("" if none)
 	Scamin  int64   // SCAMIN 1:N denominator (<= 0 → always visible)
-	Plane   int32   // S-52 draw priority (paint hint)
-	DispCat DispCat // the display category the feature came in on
+	DisplayPriority int32   // S-52 draw priority (S-101 DrawingPriority, 0..30)
+	DisplayPlane    DisplayPlane    // S-101 DisplayPlane; outranks DisplayPriority in paint order
+	DisplayCategory DisplayCategory // the display category the feature came in on
 }
 
 // WorldRings is a multi-ring path in world space: ring k spans
@@ -151,8 +161,12 @@ type SurfaceFuncs struct {
 	// chart-relative (a rotated view additionally rotates AlignMap outlines).
 	DrawSymbol func(f SurfaceFeature, anchor WorldPoint, rings LocalRings, color RGBA, evenOdd bool, strokeW float32, align RotAlign)
 	// DrawText draws shaped label glyphs as local outline rings (even-odd), with
-	// an optional halo (halo.A == 0 → none). align as in DrawSymbol.
-	DrawText func(f SurfaceFeature, anchor WorldPoint, glyphs LocalRings, color, halo RGBA, haloPx float32, align RotAlign)
+	// an optional halo (halo.A == 0 → none). align as in DrawSymbol. textGroup is
+	// the label's S-52 text group (§14.5) — a property of the LABEL, not the
+	// feature, since one feature can carry several. Group 11 is important text
+	// (it ignores the mariner's text switches); 21/26/29 names, 23 light
+	// descriptions, 0 none.
+	DrawText func(f SurfaceFeature, anchor WorldPoint, glyphs LocalRings, color, halo RGBA, haloPx float32, align RotAlign, textGroup int)
 }
 
 // Surface emits the composed view centred on (lon, lat) at zoom for a width×height
@@ -229,10 +243,15 @@ func surfCB(ctx unsafe.Pointer) *SurfaceFuncs {
 
 func goFeature(f *C.tile57_feature) SurfaceFeature {
 	return SurfaceFeature{Class: C.GoString(f.cls), Scamin: int64(f.scamin),
-		Plane: int32(f.plane), DispCat: DispCat(f.disp_cat)}
+		DisplayPriority: int32(f.display_priority), DisplayPlane: DisplayPlane(f.display_plane),
+		DisplayCategory: DisplayCategory(f.display_category)}
 }
 
-func goRGBA(c C.tile57_rgba) RGBA { return RGBA{uint8(c.r), uint8(c.g), uint8(c.b), uint8(c.a)} }
+// tile57_color is packed 0xRRGGBBAA (a scalar, not a struct — see tile57_color
+// in tile57.h). Go hosts still see an RGBA struct.
+func goRGBA(c C.tile57_color) RGBA {
+	return RGBA{uint8(c >> 24), uint8(c >> 16), uint8(c >> 8), uint8(c)}
+}
 
 func goWorldRings(r *C.tile57_world_rings) WorldRings {
 	n, rc := int(r.n), int(r.ring_count)
@@ -264,7 +283,7 @@ func goLocalRings(r *C.tile57_local_rings) LocalRings {
 
 //export tile57GoSurfFill
 func tile57GoSurfFill(ctx unsafe.Pointer, f *C.tile57_feature, rings *C.tile57_world_rings,
-	color C.tile57_rgba, evenOdd C.int) {
+	color C.tile57_color, evenOdd C.int) {
 	cb := surfCB(ctx)
 	if cb.FillArea == nil {
 		return
@@ -274,7 +293,7 @@ func tile57GoSurfFill(ctx unsafe.Pointer, f *C.tile57_feature, rings *C.tile57_w
 
 //export tile57GoSurfLine
 func tile57GoSurfLine(ctx unsafe.Pointer, f *C.tile57_feature, lines *C.tile57_world_rings,
-	widthPx, dashOn, dashOff C.float, color C.tile57_rgba) {
+	widthPx, dashOn, dashOff C.float, color C.tile57_color) {
 	cb := surfCB(ctx)
 	if cb.StrokeLine == nil {
 		return
@@ -284,7 +303,7 @@ func tile57GoSurfLine(ctx unsafe.Pointer, f *C.tile57_feature, lines *C.tile57_w
 
 //export tile57GoSurfSymbol
 func tile57GoSurfSymbol(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57_world_point,
-	rings *C.tile57_local_rings, color C.tile57_rgba, evenOdd C.int, strokeW C.float, align C.int) {
+	rings *C.tile57_local_rings, color C.tile57_color, evenOdd C.int, strokeW C.float, align C.int) {
 	cb := surfCB(ctx)
 	if cb.DrawSymbol == nil {
 		return
@@ -295,11 +314,13 @@ func tile57GoSurfSymbol(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57
 
 //export tile57GoSurfText
 func tile57GoSurfText(ctx unsafe.Pointer, f *C.tile57_feature, anchor C.tile57_world_point,
-	glyphs *C.tile57_local_rings, color, halo C.tile57_rgba, haloPx C.float, align C.int) {
+	glyphs *C.tile57_local_rings, color, halo C.tile57_color, haloPx C.float, align C.int,
+	textGroup C.int32_t) {
 	cb := surfCB(ctx)
 	if cb.DrawText == nil {
 		return
 	}
 	cb.DrawText(goFeature(f), WorldPoint{float64(anchor.x), float64(anchor.y)},
-		goLocalRings(glyphs), goRGBA(color), goRGBA(halo), float32(haloPx), RotAlign(align))
+		goLocalRings(glyphs), goRGBA(color), goRGBA(halo), float32(haloPx), RotAlign(align),
+		int(textGroup))
 }

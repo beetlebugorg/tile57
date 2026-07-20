@@ -147,8 +147,18 @@ composes every covering tile through the ownership partition first. See the
 [C API](./c-api.md).
 
 `m.size_scale` calibrates physical size (so 1 S-52 millimetre is a true
-millimetre on your display) and doubles as the @2x knob. Every field of
-`tile57_mariner` — categories, text groups, contours, units — evaluates live.
+millimetre on your display). Every field of `tile57_mariner` — categories, text
+groups, contours, units — evaluates live.
+
+HiDPI is a separate input, `m.device_scale`: the device pixels per reference
+pixel your framebuffer has. `size_scale` is the mariner's size preference,
+`device_scale` is the display's density, and the two multiply. The pixel outputs
+ignore it — there the engine rasterizes at the width and height you asked for, so
+the density is already stated. It matters on the **surface** paths, where the
+engine sizes text and symbols in reference px and *you* draw them: a host that
+draws at 2x without saying so gets collision boxes sized for glyphs half the size
+it paints, and a view the engine decluttered cleanly arrives on screen
+overlapping.
 
 ### From Zig
 
@@ -176,9 +186,35 @@ resolved, flattened paths, patterns, and glyph outlines in pixel space, in
 paint order (the Canvas seat). `tile57_chart_surface` drives a `tile57_surface_cb` —
 the world-space, semantically tagged stream (per-feature class + SCAMIN, world
 anchors, reference-pixel outlines) a GPU host tessellates once and transforms
-per frame (the Surface seat). Both have composed twins on the compositor
+per frame (the Surface seat).
+
+That stream arrives in S-52 paint order too: the engine buffers the scene and
+sorts it (areas → patterns → lines → symbols → soundings → text, by draw priority
+within each class) before calling you, so drawing in callback order is correct
+and no host needs its own sort. The catch is that only an order you *preserve*
+survives. A GPU renderer that batches by draw type — all fills, then all sprites,
+then all text — to minimise pipeline switches has reordered the stream by
+construction, and global paint order breaks again. If you batch, sort each batch
+by the per-feature `display_priority` and draw the batches in the class order above; that is
+what `display_priority` is still exposed for.
+
+Its two text callbacks also carry the label's S-52
+text group, so a host can draw group 11 (important text) larger or bold and
+ordinary names normally — that group belongs to the label, not the feature.
+Both have composed twins on the compositor
 (`tile57_compose_canvas` / `tile57_compose_surface`). A custom output format in
 Zig is still one small file in `src/render/`.
+
+For a tile-renderer host that caches geometry per tile (via the per-tile
+`tile57_chart_tile_surface`), a companion `tile57_chart_labels`
+(`tile57_compose_labels` on the compositor) emits **only** the view's text —
+resolved against one collision pool across every covering tile, so labels no
+longer collide or repeat at tile seams the way the per-tile pass leaves them.
+It reuses the same `tile57_surface_cb` text callbacks and world anchors and draws
+no geometry, so the host paints cached tiles then overlays this decluttered text
+last. Each covering tile's label candidates memoize on the chart (or compositor),
+so only the first view of a region portrays: a pan, zoom or rotation over tiles
+already seen re-resolves the cached candidates against the new view instead.
 
 ## What's deliberately not here (yet)
 

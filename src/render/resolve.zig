@@ -212,7 +212,7 @@ pub fn textGroupVisible(group: i64, m: *const Settings) bool {
 /// group + SCAMIN at the scene zoom. `symbol_name` is the symbol about to be
 /// drawn (null for fills/lines/text) — only consulted for the ISODGR01 case.
 pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64, m: *const Settings) bool {
-    if (!categoryVisible(meta.cat, meta.class, symbol_name, m)) return false;
+    if (!categoryVisible(meta.display_category, meta.class, symbol_name, m)) return false;
     if (!viewingGroupVisible(meta.vg, m.viewing_groups_off)) return false;
     if (!m.ignore_scamin and !scaminVisible(meta.scamin, zoom)) return false;
     // The AP(OVERSC01) overscale hatch (S-52 §10.1.10): the mariner toggle, plus
@@ -363,7 +363,7 @@ test "visible: the overscale hatch honours show_overscale + the oscl gate" {
     const m = Settings{};
     // Baked X2 gate denom for a 1:260000 cell (cscl/OVERSCALE_FACTOR = 130000).
     // z_2x ~= log2(279541132/130000) ~= 11.07 — grossly overscale past there.
-    const hatch = rs.FeatureMeta{ .cat = 0, .oscl = 130000, .overscale = true };
+    const hatch = rs.FeatureMeta{ .display_category = 0, .oscl = 130000, .overscale = true };
     try std.testing.expect(!visible(&hatch, null, 10.5, &m)); // < 2x: no hatch
     try std.testing.expect(visible(&hatch, null, 12.0, &m)); // grossly overscale: hatch shows
     const off = Settings{ .show_overscale = false };
@@ -371,7 +371,7 @@ test "visible: the overscale hatch honours show_overscale + the oscl gate" {
     const ign = Settings{ .ignore_scamin = true };
     try std.testing.expect(!visible(&hatch, null, 12.0, &ign)); // debug view: no hatch
     // An ordinary fill carrying the oscl TAG (not the hatch) is never oscl-gated.
-    const fill = rs.FeatureMeta{ .cat = 0, .oscl = 130000 };
+    const fill = rs.FeatureMeta{ .display_category = 0, .oscl = 130000 };
     try std.testing.expect(visible(&fill, null, 10.5, &m));
     try std.testing.expect(visible(&fill, null, 12.0, &m));
 }
@@ -386,7 +386,7 @@ test "viewingGroupVisible: deny-list, vg 0 always shows" {
 
 test "visible combines gates + honours ignore_scamin" {
     const m = Settings{};
-    const meta = rs.FeatureMeta{ .cat = 1, .vg = 0, .scamin = 30000, .class = "BOYLAT" };
+    const meta = rs.FeatureMeta{ .display_category = 1, .vg = 0, .scamin = 30000, .class = "BOYLAT" };
     try std.testing.expect(!visible(&meta, "BOYLAT01", 12.0, &m)); // SCAMIN gates it
     try std.testing.expect(visible(&meta, "BOYLAT01", 14.0, &m));
     const ig = Settings{ .ignore_scamin = true };

@@ -534,7 +534,7 @@ fn exFormatDetail12(a: std.mem.Allocator, out: *std.ArrayList(u8), row: ExRow) !
         try out.appendSlice(a, "     raw: (class unmapped, or emitted nothing)\n");
     }
     if (row.parsed) |p| {
-        try out.print(a, "     parsed: prio={d} cat={s} vg={d}", .{ p.draw_prio, exCatName(p.cat), p.vg });
+        try out.print(a, "     parsed: prio={d} cat={s} vg={d}", .{ p.display_priority, exCatName(p.cat), p.vg });
         if (p.date_start.len > 0 or p.date_end.len > 0) try out.print(a, " date=[{s}..{s}]", .{ p.date_start, p.date_end });
         try out.append(a, '\n');
         if (p.fill_token) |t| try out.print(a, "       fill:   AC({s})\n", .{t});
@@ -604,7 +604,7 @@ fn exWriteJsonRow(a: std.mem.Allocator, out: *std.ArrayList(u8), row: ExRow) !vo
     try out.appendSlice(a, ",\"portrayal_raw\":");
     if (row.raw) |raw| try exJsonStr(a, out, raw) else try out.appendSlice(a, "null");
     if (row.parsed) |p| {
-        try out.print(a, ",\"portrayal\":{{\"prio\":{d},\"cat\":\"{s}\",\"vg\":{d},\"fill\":", .{ p.draw_prio, exCatName(p.cat), p.vg });
+        try out.print(a, ",\"portrayal\":{{\"prio\":{d},\"cat\":\"{s}\",\"vg\":{d},\"fill\":", .{ p.display_priority, exCatName(p.cat), p.vg });
         if (p.fill_token) |t| try exJsonStr(a, out, t) else try out.appendSlice(a, "null");
         try out.appendSlice(a, ",\"symbols\":[");
         for (p.points, 0..) |pt, j| {

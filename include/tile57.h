@@ -291,6 +291,10 @@ tile57_status tile57_bake_partition_debug(const char *enc_root, const char *out_
 /* Opaque chart handle: one open baked archive. */
 typedef struct tile57_chart tile57_chart;
 
+/* Opaque runtime-compositor handle (a chart library). Forward-declared here so
+ * the draw-ready view calls can name it; opened via tile57_compose_open below. */
+typedef struct tile57_compose tile57_compose;
+
 /* Open a baked PMTiles archive from a file path, mmap'd (never fully
  * resident). The file must stay in place while the chart is open. TILE57_OK
  * with *out set (close with tile57_chart_close). */
@@ -434,6 +438,27 @@ typedef struct tile57_mariner {
                          *   1 = show soundings whatever the category says
                          *   2 = hide soundings whatever the category says
                          * Appended for ABI-append-safety: a zeroed struct means 0. */
+    double device_scale; /* device pixels per reference pixel — the HiDPI framebuffer
+                         * density the SURFACE paths are drawn at (2.0 on a Retina
+                         * backing store). NOT an S-52 setting, and NOT a mariner
+                         * preference: it describes the DISPLAY, where size_scale
+                         * describes the mariner's taste. The two multiply.
+                         *
+                         * State it whenever you draw at anything but 1x. The surface
+                         * callbacks hand you reference-px sizes for text and symbols
+                         * and let YOU draw them; if you then draw at 2x without saying
+                         * so, the engine has sized every label's collision box for
+                         * glyphs half the size you actually paint, and a view it
+                         * decluttered cleanly arrives overlapping. Setting this sizes
+                         * the glyph AND its collision box in the units you draw in.
+                         * Do NOT fold the density into size_scale instead: that also
+                         * works, but it conflates the display with the mariner's own
+                         * size preference and the two need to stay separable.
+                         *
+                         * The pixel outputs (_png / _pdf / _canvas) IGNORE this: the
+                         * engine rasterizes those itself, so the density is already in
+                         * the width/height asked for.
+                         * Appended for ABI-append-safety; 0 is read as 1.0. */
 } tile57_mariner;
 
 /* Fill *m with the canonical default mariner settings (so a host needn't
@@ -467,7 +492,21 @@ tile57_status tile57_chart_pdf(tile57_chart *chart, double lon, double lat, doub
  * own renderer. Geometry is emitted in canvas PIXEL space (y down), in final
  * paint order; colours are fully resolved for the active palette. */
 typedef struct { float x, y; } tile57_point;   /* canvas pixels */
-typedef struct { uint8_t r, g, b, a; } tile57_rgba;  /* resolved straight-alpha */
+/* A resolved straight-alpha colour, packed 0xRRGGBBAA.
+ *
+ * Deliberately a SCALAR, not a 4-byte struct. Passing a small extern struct BY
+ * VALUE across a callconv(.c) boundary is miscompiled by zig 0.16 on aarch64 in
+ * every optimized build mode (ReleaseFast/ReleaseSafe zero the argument,
+ * ReleaseSmall passes garbage; Debug is correct), which silently reached hosts
+ * as fully transparent fills, lines and text. A uint32_t is passed in a
+ * register and is correct in every mode. */
+typedef uint32_t tile57_color;
+#define TILE57_COLOR_R(c) ((uint8_t)((c) >> 24))
+#define TILE57_COLOR_G(c) ((uint8_t)((c) >> 16))
+#define TILE57_COLOR_B(c) ((uint8_t)((c) >>  8))
+#define TILE57_COLOR_A(c) ((uint8_t)((c) & 0xFFu))
+#define TILE57_COLOR(r, g, b, a) \
+    (((uint32_t)(r) << 24) | ((uint32_t)(g) << 16) | ((uint32_t)(b) << 8) | (uint32_t)(a))
 /* A multi-ring path: flat vertex array `pts`; ring k spans
  * [ring_starts[k], ring_starts[k+1]) (last runs to `n`). Rings closed implicitly. */
 typedef struct {
@@ -479,17 +518,17 @@ typedef struct {
 typedef struct {
     void *ctx;
     /* Fill closed rings; even_odd != 0 selects the even-odd rule. */
-    void (*fill_path)   (void *ctx, const tile57_rings *rings, tile57_rgba color, int even_odd);
+    void (*fill_path)   (void *ctx, const tile57_rings *rings, tile57_color color, int even_odd);
     /* Stroke polylines width_px wide; dash on/off in px (0,0 = solid). */
     void (*stroke_path) (void *ctx, const tile57_rings *rings, float width_px,
-                         float dash_on, float dash_off, tile57_rgba color);
+                         float dash_on, float dash_off, tile57_color color);
     /* Fill rings with a repeating RGBA8 pattern cell (pw*ph*4 bytes). */
     void (*fill_pattern)(void *ctx, const tile57_rings *rings, uint32_t pw, uint32_t ph,
                          const uint8_t *rgba);
     /* Draw a shaped label as flattened outline rings (px), optional halo
      * (halo.a == 0 => none). */
-    void (*draw_glyphs) (void *ctx, const tile57_rings *outline, tile57_rgba color,
-                         tile57_rgba halo, float halo_px);
+    void (*draw_glyphs) (void *ctx, const tile57_rings *outline, tile57_color color,
+                         tile57_color halo, float halo_px);
 } tile57_canvas_cb;
 tile57_status tile57_chart_canvas(tile57_chart *chart, double lon, double lat, double zoom,
                             uint32_t width, uint32_t height,
@@ -535,43 +574,99 @@ typedef enum { TILE57_ALIGN_VIEWPORT = 0, TILE57_ALIGN_MAP = 1 } tile57_rot_alig
  * enabled categories it came in on. Display base is the never-hide set (the
  * safety-of-navigation minimum): SCAMIN is not applied to it. */
 typedef enum {
-    TILE57_DISP_BASE = 0, TILE57_DISP_STANDARD = 1, TILE57_DISP_OTHER = 2
-} tile57_disp_cat;
+    TILE57_DISPLAY_BASE = 0, TILE57_DISPLAY_STANDARD = 1, TILE57_DISPLAY_OTHER = 2
+} tile57_display_category;
+
+/* S-101 DisplayPlane. Outranks display_priority in paint order — S-52 PresLib
+ * §10.3.4.2: "the OVERRADAR flag takes precedence over the objects display
+ * priority". */
+typedef enum {
+    TILE57_PLANE_UNDER_RADAR = 0, TILE57_PLANE_OVER_RADAR = 1
+} tile57_display_plane;
 
 /* The feature the following draw calls belong to. `cls` is the S-57 object-class
  * acronym (NUL-terminated; "" if none); `scamin` is the SCAMIN 1:N denominator
- * (<= 0 => always visible); `plane` is the S-52 draw priority (paint hint);
- * `disp_cat` is the feature's display category. A host that applies SCAMIN
- * itself must skip it when disp_cat == TILE57_DISP_BASE. */
+ * (<= 0 => always visible); `display_category` is the feature's display category
+ * — a host that applies SCAMIN itself must skip it when display_category ==
+ * TILE57_DISPLAY_BASE.
+ *
+ * `display_plane` and `display_priority` are the two paint-order axes, in that
+ * order of precedence (see the draw table below). `display_priority` is the
+ * S-101 catalogue DrawingPriority, 0..30. The engine has ALREADY sorted the call
+ * stream by both, so they are here for a host that re-buckets the stream into
+ * its own batches and has to rebuild the order.
+ *
+ * NOTE: `display_priority` was called `plane` before, then `draw_prio`. The
+ * original name was simply wrong — it never carried DisplayPlane. That axis is
+ * now transmitted properly, as `display_plane`. */
 typedef struct {
     const char *cls;
     int64_t scamin;
-    int32_t plane;
-    tile57_disp_cat disp_cat;
+    int32_t display_priority;
+    tile57_display_plane display_plane;
+    tile57_display_category display_category;
+    /* Paint-order key for THIS draw call — the engine's own ordering, folded into
+     * one comparable integer: text last, then DisplayPlane (radar overlay only),
+     * then display priority, then geometry class. Strictly non-decreasing across
+     * the call stream.
+     *
+     * This is what a batching host should bucket on. Do NOT decode it — the
+     * packing is the engine's to change; compare it and nothing else. It is
+     * meaningful only within one scene, and bounded by TILE57_PAINT_KEY_MAX so a
+     * host can size a bucket array. */
+    uint32_t paint_key;
 } tile57_feature;
 
+/* One past the largest tile57_feature.paint_key. */
+#define TILE57_PAINT_KEY_MAX 744u
+
 /* Draw table. Pointers are valid only for the duration of the call; ctx is
- * passed back verbatim. Calls arrive in Surface emission order (the host owns
- * final paint order + label collision). */
+ * passed back verbatim.
+ *
+ * CALLS ARRIVE IN S-52 PAINT ORDER. The engine buffers the scene and sorts it
+ * before calling you: class-major (areas, then area patterns, then lines, then
+ * point symbols, then soundings, then text — a fill never covers a line whatever
+ * its priority), and by S-52 draw priority within a class. Draw them in the order
+ * you receive them and the result is correct; you do not need to sort.
+ *
+ * BUT ONLY IF YOU PRESERVE THAT ORDER. A GPU renderer normally batches by DRAW
+ * TYPE — all fills, then all sprites, then all text — to minimise pipeline
+ * switches, and batching REORDERS the stream: it lifts every call of one type out
+ * of the sequence the engine put it in. That silently breaks global paint order
+ * again (an area pattern jumps over the lines drawn above it, a tessellated
+ * symbol and an atlas sprite swap places), and it breaks it in a way that looks
+ * plausible on a sparse chart and wrong on a dense one. If you batch, sort each
+ * batch by `display_priority` yourself and draw the batches in the class order above.
+ * That is what `display_priority` is still there for.
+ *
+ * A host that batches PER TILE must go further: sorting within a tile still
+ * leaves paint order broken across tiles, because the tiles are drawn one after
+ * another. Walk the priority bands OUTSIDE the tile loop, or a low-priority
+ * symbol in one tile will cover a high-priority one in its neighbour. */
 typedef struct {
     void *ctx;
     /* Filled area (world). even_odd != 0 selects the even-odd rule. */
-    void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings, tile57_rgba color, int even_odd);
+    void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings, tile57_color color, int even_odd);
     /* Stroked line (world); width in reference px, dash on/off px (0,0 solid). */
-    void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines, float width_px, float dash_on, float dash_off, tile57_rgba color);
+    void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines, float width_px, float dash_on, float dash_off, tile57_color color);
     /* Point symbol: world anchor + local outline (px). even_odd for compound
      * glyphs; stroke_w > 0 => the rings are a polyline stroked stroke_w px wide.
      * The outline arrives ALREADY rotated to the symbol's angle; `align` says
      * whether that angle is chart-relative — MAP => additionally rotate the
      * outline by the view rotation (ORIENT symbols, linestyle bricks); VIEWPORT
      * => leave it upright on screen (the common navaid case). */
-    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_rgba color, int even_odd, float stroke_w, tile57_rot_align align);
+    void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *rings, tile57_color color, int even_odd, float stroke_w, tile57_rot_align align);
     /* Text: world anchor + local glyph outlines (px, even-odd) + halo
      * (halo.a == 0 => none). The glyphs arrive ALREADY rotated; `align` says
      * whether that angle is chart-relative — MAP => additionally rotate by the
      * view rotation (a depth-contour value follows its contour); VIEWPORT => the
-     * label stays upright on screen (the ordinary case). */
-    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo, float halo_px, tile57_rot_align align);
+     * label stays upright on screen (the ordinary case).
+     * `text_group` is the label's S-52 text group (§14.5) — a property of the
+     * LABEL, not the feature, since one feature can carry several labels in
+     * different groups. Group 11 is IMPORTANT TEXT: it ignores the mariner's
+     * text switches and always shows, so a host wanting it larger/bold keys on
+     * this. 21/26/29 are names, 23 light descriptions; 0 = none. */
+    void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor, const tile57_local_rings *glyphs, tile57_color color, tile57_color halo, float halo_px, tile57_rot_align align, int32_t text_group);
     /* Point symbol as a sprite: symbol name (ptr,len) to look up in the atlas
      * (tile57_bake_assets sprite_png/json), world anchor, rotation (deg), and the
      * symbol's un-rotated half-extent in reference px. Draw the atlas cell as a
@@ -580,8 +675,15 @@ typedef struct {
      * (ABI-appended after the original vtable.) */
     void (*draw_sprite)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, tile57_world_point anchor, float rot_deg, tile57_rot_align align, float half_w_px, float half_h_px);
     /* Area fill pattern: pattern name (ptr,len) to look up in the atlas ("pat:"
-     * prefix) + the fill rings (world). Tile the cell across the polygon at a
-     * constant screen size. NULL => flat tint. */
+     * prefix) + the fill rings (world). Tile the cell across the polygon.
+     *
+     * Only the cell's SIZE is screen-referenced (a constant number of device px,
+     * like a symbol); its ORIGIN is not. Anchor the tiling to WORLD space — derive
+     * the pattern coordinate from the fragment's world position, never from its
+     * screen position — so the pattern translates with the chart. A pattern phased
+     * off screen coordinates stays nailed to the viewport while the seabed slides
+     * underneath it, which reads as the chart moving and the fill not.
+     * NULL => flat tint. */
     void (*draw_pattern)(void *ctx, const tile57_feature *f, const char *name, size_t name_len, const tile57_world_rings *rings);
     /* Text as a STRING for the host's SDF glyph atlas (tile57_bake_glyph_sdf):
      * world anchor + the anchor-relative baseline-left origin in px (ox,oy, with
@@ -589,9 +691,10 @@ typedef struct {
      * The host lays the string out from its glyph metrics and draws SDF quads,
      * rotating the whole run about the anchor by `rot_deg + (align == MAP ?
      * view_rotation : 0)` (a depth-contour value passes the tangent + MAP; an
-     * ordinary label passes 0 + VIEWPORT and stays upright). NULL => text
-     * tessellates via draw_text. Must be the LAST field. */
-    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_rgba color, tile57_rgba halo);
+     * ordinary label passes 0 + VIEWPORT and stays upright). `text_group` is the
+     * label's S-52 text group, exactly as on draw_text (11 = important text).
+     * NULL => text tessellates via draw_text. Must be the LAST field. */
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo, int32_t text_group);
 } tile57_surface_cb;
 
 tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, double zoom,
@@ -599,6 +702,185 @@ tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, 
                              uint32_t width, uint32_t height,
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
+
+/* ---- draw-ready GPU scenes -------------------------------------------------
+ *
+ * The callback surface above hands a host a STREAM of draw calls, in paint
+ * order. A GPU host cannot draw that stream as it arrives: it has to batch by
+ * pipeline, and batching destroys the order. So it ends up sorting the calls
+ * back into order itself — which means owning a tessellator, a copy of the
+ * geometry-class taxonomy, and a copy of the S-52 ordering rule. That is a
+ * second scene, free to drift from the engine's, and it did drift: the same
+ * spec bug (applying OVERRADAR precedence with no radar overlay present) had to
+ * be found and fixed on both sides.
+ *
+ * tile57_chart_gpu_scene exists so that a host owns no scene and knows no S-52.
+ * It hands over geometry ALREADY triangulated, ALREADY in paint order, and
+ * ALREADY split into ranges that draw one pipeline at a time. Upload the three
+ * buffers, then walk the ranges in order and draw each one. That is the whole
+ * host obligation.
+ *
+ * What the host still owns: the camera, the shaders, and what to do with the
+ * per-vertex `scamin` / `disp_cat` gates — those are per-frame, and baking them
+ * in would force a rebuild on every zoom or category toggle. */
+
+/* One vertex. (x, y) is WORLD position (web-mercator, [0,1], y down) — the
+ * camera transforms it. (ox, oy) is an offset in REFERENCE PIXELS added in
+ * SCREEN space after projection: zero for area interiors, +/- half-width for
+ * line edges, and the glyph or symbol outline for marks. Keeping the two apart
+ * is what lets a symbol hold a constant on-screen size while its anchor moves
+ * with the chart, with no re-tessellation on zoom. */
+typedef struct {
+    float x, y;      /* world position, [0,1] */
+    float ox, oy;    /* screen-space offset, reference px */
+    float scamin;    /* SCAMIN 1:N denominator; 0 = always visible */
+    uint8_t disp_cat;  /* S-52 display category: 0 base, 1 standard, 2 other */
+    uint8_t map_align; /* nonzero = chart-relative: a rotated view must turn it */
+    uint8_t _pad[2];
+} tile57_gpu_vertex;
+
+/* What a range draws. The host picks a pipeline from this and nothing more —
+ * it is NOT the paint order. Ordering is paint_key and only paint_key. */
+typedef enum {
+    TILE57_GPU_AREA = 0,
+    TILE57_GPU_PATTERN = 1,
+    TILE57_GPU_LINE = 2,
+    TILE57_GPU_SYMBOL = 3,
+    TILE57_GPU_SOUNDING = 4,
+    TILE57_GPU_TEXT = 5
+} tile57_gpu_kind;
+
+/* Sentinel for tile57_gpu_range.pattern on every range that is not a pattern. */
+#define TILE57_GPU_NO_PATTERN 0xFFFFFFFFu
+
+/* Which buffer + primitive a range draws from. Fills, lines and pattern
+ * interiors are indexed triangles; symbols, soundings and text are textured
+ * quads — a symbol is antialiased artwork and a label is an SDF glyph, neither
+ * of which a flat triangle gives. */
+typedef enum {
+    TILE57_GPU_TRIANGLES = 0, /* range.first/count index the index buffer   */
+    TILE57_GPU_QUADS     = 1  /* range.first/count are quad-buffer vertices */
+} tile57_gpu_prim;
+
+/* Which atlas texture a QUADS range samples. */
+typedef enum {
+    TILE57_GPU_ATLAS_NONE   = 0,
+    TILE57_GPU_ATLAS_SPRITE = 1, /* the S-101 symbol atlas (tile57_bake_sprite_mln) */
+    TILE57_GPU_ATLAS_GLYPH  = 2  /* the SDF label-glyph atlas (tile57_bake_glyph_sdf) */
+} tile57_gpu_atlas;
+
+/* One textured-quad vertex — a symbol sprite or an SDF glyph. (x, y) is the
+ * WORLD anchor (camera-transformed, like tile57_gpu_vertex); (ox, oy) the
+ * corner offset in reference px, already rotated; (u, v) the atlas UV. Six per
+ * quad (two triangles), non-indexed. Anchor and offset stay split so the anchor
+ * rides the chart while the artwork holds a fixed screen size under zoom. */
+typedef struct {
+    float x, y;      /* world anchor, [0,1] */
+    float ox, oy;    /* screen-space corner offset, reference px */
+    float u, v;      /* atlas UV, [0,1] */
+    uint8_t color[4];/* straight-alpha; a sprite ignores it, an SDF glyph is tinted */
+    float weight;    /* SDF sharpen: 0 for a sprite, >0 emboldens a glyph */
+    float scamin;    /* as tile57_gpu_vertex */
+    uint8_t disp_cat;
+    uint8_t map_align;
+    uint8_t _pad[2];
+} tile57_gpu_quad;
+
+/* One area-fill pattern cell: RGBA8, w * h * 4 bytes, row-major. It is
+ * rasterized at the scene's own screen density, so w and h ARE the on-screen
+ * tiling period in device px — there is no separate period to apply.
+ *
+ * The host tiles it: sample the cell 1:1 in device px, PHASE-ANCHORED TO THE
+ * WORLD ORIGIN rather than to the screen, so the pattern stays fixed to the
+ * chart under a pan instead of swimming across it. The vertex (x, y) is all
+ * that is needed to derive that phase. Tiling is left to the host because it
+ * resolves per-fragment at the live camera scale; baking it into geometry would
+ * mean re-tessellating on every zoom. */
+typedef struct {
+    uint32_t w, h;
+    const uint8_t *rgba;
+    size_t rgba_len;
+} tile57_gpu_pattern;
+
+/* A contiguous slice of ONE buffer drawing with ONE pipeline. Ranges arrive
+ * already sorted by paint_key: draw them in order and the chart is correct.
+ * `prim` says which buffer `first`/`count` address (indices vs quads); `atlas`
+ * says which texture a QUADS range samples. */
+typedef struct {
+    /* Into the index buffer when prim==TRIANGLES, else the first vertex in the
+     * quad buffer (6 per quad). */
+    uint32_t first;
+    uint32_t count;
+    /* The engine's paint-order key. Already sorted by it; exposed so a host
+     * batching ACROSS scenes can interleave them. Opaque — compare, never
+     * decode. */
+    uint32_t paint_key;
+    /* Index into tile57_gpu_scene.patterns, or TILE57_GPU_NO_PATTERN. Set only
+     * on TILE57_GPU_PATTERN ranges. */
+    uint32_t pattern;
+    /* Resolved RGBA for the palette the scene was built with. A sprite range
+     * ignores it (the artwork is coloured); an SDF text range tints the glyph;
+     * a pattern range's cell carries its own colours. */
+    uint8_t color[4];
+    uint8_t kind;  /* tile57_gpu_kind */
+    uint8_t prim;  /* tile57_gpu_prim */
+    uint8_t atlas; /* tile57_gpu_atlas (QUADS only) */
+    uint8_t _pad;
+} tile57_gpu_range;
+
+/* Draw-ready buffers for one view. Every pointer is BORROWED and stays valid
+ * until tile57_gpu_scene_free; `owner` is opaque and must not be touched.
+ *
+ * The host uploads `vertices`+`indices` (the triangle buffers) and `quads` (the
+ * sprite/SDF buffer) plus the two atlas textures it baked once
+ * (tile57_bake_sprite_mln, tile57_bake_glyph_sdf), then walks `ranges` in order:
+ * a TRIANGLES range draws indexed from the flat-colour pipeline (or, when
+ * pattern != NO_PATTERN, the pattern pipeline with that cell); a QUADS range
+ * draws 6*N vertices from the sprite or SDF pipeline per `atlas`. */
+typedef struct {
+    const tile57_gpu_vertex *vertices;
+    size_t vertex_count;
+    const uint32_t *indices;
+    size_t index_count;
+    const tile57_gpu_quad *quads;
+    size_t quad_count;
+    const tile57_gpu_range *ranges;
+    size_t range_count;
+    const tile57_gpu_pattern *patterns;
+    size_t pattern_count;
+    void *owner;
+} tile57_gpu_scene;
+
+/* Portray a view into the buffers above — the draw-ready twin of
+ * tile57_chart_surface. The WHOLE view builds into ONE scene, so labels
+ * declutter across it and a name cannot collide with itself over a tile seam.
+ *
+ * There is deliberately NO rotation parameter, for the same reason
+ * tile57_chart_tile_surface has none: geometry stays north-up in world space
+ * and the host applies the view rotation, so a course-up view that turns
+ * continuously never has to have its scene rebuilt. The per-vertex map_align
+ * flag is what keeps that invariant for marks that must turn with the chart.
+ *
+ * On OK the caller owns the scene and MUST release it with
+ * tile57_gpu_scene_free. On failure *out is zeroed and nothing needs freeing. */
+tile57_status tile57_chart_gpu_scene(tile57_chart *chart, double lon, double lat, double zoom,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             tile57_gpu_scene *out, tile57_error *err);
+
+/* The composed twin of tile57_chart_gpu_scene: a whole chart LIBRARY (opened via
+ * tile57_compose_open) portrayed into one draw-ready scene, seams stitched across
+ * cells. Same buffers and the same tile57_gpu_scene_free. */
+tile57_status tile57_compose_gpu_scene(tile57_compose *compose, double lon, double lat, double zoom,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             tile57_gpu_scene *out, tile57_error *err);
+
+
+/* Release a scene and zero the struct. Every pointer it handed out dies here,
+ * so the host must have finished uploading first. Null-safe, and safe to call
+ * twice. */
+void tile57_gpu_scene_free(tile57_gpu_scene *scene);
 
 /* Portray ONE tile (z, x, y) through the SAME S-52 portrayal and the SAME
  * tile57_surface_cb, but for a single tile instead of a whole view. Lets a host
@@ -631,6 +913,40 @@ tile57_status tile57_render_mlt_tile(const uint8_t *mlt, size_t mlt_len,
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
 
+/* The VIEW-level, GLOBALLY-decluttered TEXT pass — the companion to
+ * tile57_chart_tile_surface for a tile-renderer host. That per-tile call declutters
+ * labels WITHIN each tile, so a name straddling a tile seam collides or repeats
+ * across the join; this call resolves the WHOLE view's labels against one collision
+ * pool and emits ONLY the survivors, through the SAME surface `draw_text_str`
+ * (preferred) / `draw_text` callbacks. It draws NO fill_area / stroke_line /
+ * draw_symbol / draw_sprite — the host draws geometry + symbols from its per-tile
+ * cache and takes text from here.
+ *
+ * The intended loop: cache each (z,x,y) tile's geometry + symbols once via
+ * tile57_chart_tile_surface, draw those cached tiles every frame, and call this once
+ * per frame (or per view change) to overlay the text. World anchors, local px
+ * offsets, per-feature tags and the MAP/VIEWPORT `align` convention are identical to
+ * tile57_chart_surface, so the text sits over the cached geometry with no
+ * re-projection — draw it LAST (text is drawn on top). `rotation_rad` matters: labels
+ * declutter in the SCREEN frame the host draws them in.
+ *
+ * Cost: each covering tile is portrayed ONCE and its label candidates are memoized
+ * on the chart, so a repeat call over tiles already seen does NO portrayal work — it
+ * only re-resolves those candidates against the new view. Zoom and rotation are NOT
+ * part of the memo (a candidate holds what a label says, how it is shaped and where
+ * it is anchored; the collision box, the contour legibility gate and the upright
+ * flip all derive per call), so a continuous pan / zoom / rotate settles in well
+ * under a millisecond. Only the first view of a region — or a change to the palette
+ * or ANY mariner setting, which retires the memo — pays portrayal again. The memo is
+ * bounded (a few hundred tiles, a couple of MB) and released with the chart.
+ * Cell/bundle sources; a lazy multi-cell ENC_ROOT is TILE57_ERR_UNSUPPORTED (bake,
+ * then compose). */
+tile57_status tile57_chart_labels(tile57_chart *chart, double lon, double lat, double zoom,
+                             double rotation_rad, /* view rotation, radians CW; 0 = north-up */
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
+
 /* Release a chart and all cached tiles. Must not be called while any borrower
  * (a compositor, a renderer thread) may still read from it. */
 void tile57_chart_close(tile57_chart *chart);
@@ -651,8 +967,7 @@ void tile57_chart_close(tile57_chart *chart);
  * not call those charts' own methods from other threads.
  * ======================================================================== */
 
-/* Opaque runtime-compositor handle. */
-typedef struct tile57_compose tile57_compose;
+/* (tile57_compose is forward-declared near tile57_chart at the top.) */
 
 /* Coverage/zoom summary filled by tile57_compose_get_meta. */
 typedef struct {
@@ -665,13 +980,12 @@ typedef struct {
 /* Open a compositor over `n` open charts (each a per-chart archive from the
  * bake, opened with tile57_chart_open). Charts whose archives embed no coverage are
  * skipped — they can own no ground; if none carries coverage the open is
- * TILE57_ERR_UNSUPPORTED. `partition_path` (NULL to skip) names a partition
- * sidecar — written by tile57_compose_save_partition (the `tile57 bake` CLI
- * emits one as partition.tpart) — to load and skip the build; a missing/stale
- * one falls back to building. TILE57_OK with *out set (close with
- * tile57_compose_close — BEFORE closing the charts). */
+ * TILE57_ERR_UNSUPPORTED. The ownership partition is an internal detail: it is
+ * found beside the archives, reused when it still matches the cell set, and
+ * rebuilt (and refreshed on disk) when it does not. Nothing to pass, nothing to
+ * manage. TILE57_OK with *out set (close with tile57_compose_close — BEFORE
+ * closing the charts). */
 tile57_status tile57_compose_open(tile57_chart *const *charts, size_t n,
-                                  const char *partition_path,
                                   tile57_compose **out, tile57_error *err);
 
 /* Open a WHOLE baked tree in one call: recursively walk `dir` for the *.pmtiles
@@ -687,7 +1001,7 @@ tile57_status tile57_compose_open(tile57_chart *const *charts, size_t n,
  * *.pmtiles under `dir`, or none carrying coverage, is TILE57_ERR_UNSUPPORTED with
  * *out = NULL; an unreadable `dir` errors. TILE57_OK with *out set (close with
  * tile57_compose_close). */
-tile57_status tile57_compose_tree(const char *dir, const char *partition_path,
+tile57_status tile57_compose_tree(const char *dir,
                                   tile57_compose **out, uint32_t *out_chart_count,
                                   tile57_error *err);
 
@@ -726,6 +1040,26 @@ tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, 
                                      const tile57_mariner *m,
                                      const tile57_surface_cb *surface, tile57_error *err);
 
+/* The composed VIEW-level, globally-decluttered TEXT pass — tile57_chart_labels
+ * across the WHOLE composed set. Emits ONLY the surviving labels (through the
+ * surface's draw_text_str / draw_text) resolved against one collision pool spanning
+ * every covering tile and every chart seam; draws NO geometry. For a tile-renderer
+ * host that draws geometry + symbols from its own per-tile cache (tile57_compose_tile
+ * / a per-tile surface) but needs labels decluttered across BOTH tile and chart
+ * seams. World anchors, per-feature tags and the align convention are identical to
+ * tile57_compose_surface, so the text overlays the cached geometry with no
+ * re-projection — draw it last. Label candidates memoize per tile on the compositor
+ * (released with it), so each covering tile is composed, decoded and portrayed once
+ * and a repeat call at any centre, zoom or rotation over tiles already seen only
+ * re-resolves them — the composed set's first view of a region is the only one that
+ * pays. See tile57_chart_labels for the memo's terms and the intended per-frame
+ * loop. */
+tile57_status tile57_compose_labels(tile57_compose *c, double lon, double lat, double zoom,
+                                    double rotation_rad, /* view rotation, radians CW; 0 = north-up */
+                                    uint32_t width, uint32_t height,
+                                    const tile57_mariner *m,
+                                    const tile57_surface_cb *surface, tile57_error *err);
+
 /* The composed cursor pick (S-52 §10.8, across chart boundaries): tile57_chart_query across
  * the whole composed set. */
 tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, double zoom,
@@ -734,10 +1068,6 @@ tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, do
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_get_meta(tile57_compose *c, tile57_compose_meta *out);
 
-/* Serialize the compositor's ownership partition to the file `path` (a sidecar
- * a later tile57_compose_open can load to skip the build). */
-tile57_status tile57_compose_save_partition(tile57_compose *c, const char *path,
-                                            tile57_error *err);
 
 /* Release a compositor. Its charts stay open (and stay yours to close). */
 void tile57_compose_close(tile57_compose *c);

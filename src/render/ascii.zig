@@ -3,7 +3,7 @@
 //! cheap a new backend is: one file, no engine edits (surface.zig's promise).
 //!
 //!   Surface calls ─► lowering (S-52 token/symbol-name -> a character)
-//!                ─► op buffer ─► endScene: sort by draw_prio ─► char grid
+//!                ─► op buffer ─► endScene: sort by display_priority ─► char grid
 //!
 //! Lowering happens HERE, like the pixel surfaces resolve through resolve.zig:
 //! fills pick a shade character per color token (LANDA '#', DEPVS '▒' …),
@@ -22,6 +22,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
+const paint = @import("paint.zig");
 const resolve = @import("resolve.zig");
 const sndfrm = @import("sndfrm.zig");
 const declut = @import("declutter.zig");
@@ -87,16 +88,28 @@ const OpKind = union(enum) {
     label: struct { text: []const u8, col: i64, row: i64, w: i64, color: ?u8, group: i64, class: []const u8 },
 };
 
-/// Paint class, the same class-major order as the pixel surface (pixel.zig
-/// OpLayer): a fill never paints over a line, whatever its priority.
-const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4, text = 5 };
+/// Paint class, the same as the pixel surface (pixel.zig OpLayer). NOT the major
+/// sort key — it is the S-52 §10.3.4.1 tiebreak used only at equal priority.
+const OpLayer = paint.Layer;
 
 const Op = struct {
     layer: OpLayer,
     prio: i64,
+    display_plane: i64 = 0,
     seq: usize,
     kind: OpKind,
 };
+
+/// See pixel.zig orderLt — this must stay byte-identical in behaviour.
+/// `radar` is whether a RADAR overlay is present — the condition §10.3.4.2 puts
+/// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
+/// all and priority leads.
+fn orderLt(radar: bool, l: Op, r: Op) bool {
+    const lk = paint.key(l.layer, l.prio, l.display_plane, radar);
+    const rk = paint.key(r.layer, r.prio, r.display_plane, radar);
+    if (lk != rk) return lk < rk;
+    return l.seq < r.seq; // equal key: emission order (SENC sequence)
+}
 
 /// One character cell: the glyph and optional ANSI-256 fore/background. Cells
 /// carry no occupancy flag: text is drawn LAST, over the marks beneath it, and
@@ -217,7 +230,7 @@ pub const AsciiSurface = struct {
     }
 
     fn push(self: *AsciiSurface, layer: OpLayer, kind: OpKind) !void {
-        try self.ops.append(self.a, .{ .layer = layer, .prio = self.cur.draw_prio, .seq = self.ops.items.len, .kind = kind });
+        try self.ops.append(self.a, .{ .layer = layer, .prio = self.cur.display_priority, .display_plane = self.cur.display_plane, .seq = self.ops.items.len, .kind = kind });
     }
 
     // ---- Surface impl ---------------------------------------------------------
@@ -487,15 +500,10 @@ pub const AsciiSurface = struct {
         var kept = try pool.resolve(self.a, declut.REPEAT_PX / @as(f64, @floatFromInt(ROW_PX)));
         defer kept.deinit(self.a);
 
-        // Paint order = the pixel surface's exact sort: class-major (see
-        // OpLayer), draw priority within a class, emission order for ties.
-        std.mem.sort(Op, self.ops.items, {}, struct {
-            fn lt(_: void, l: Op, r: Op) bool {
-                if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer);
-                if (l.prio != r.prio) return l.prio < r.prio;
-                return l.seq < r.seq;
-            }
-        }.lt);
+        // Paint order = the pixel surface's exact sort: (DrawingPriority,
+        // emission order), text last. See pixel.zig OpLayer for why geometry
+        // class is not a key.
+        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
 
         const grid = try self.a.alloc(Cell, @as(usize, self.cols) * self.rows);
         @memset(grid, .{});
@@ -619,7 +627,7 @@ test "AsciiSurface: fills shade by token, strokes pick slope chars, glyphs and l
 
     const full = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 32, .y = 0 }, .{ .x = 32, .y = 32 }, .{ .x = 0, .y = 32 } };
     const rings = [_][]const rs.TilePoint{&full};
-    const water = rs.FeatureMeta{ .draw_prio = 1 };
+    const water = rs.FeatureMeta{ .display_priority = 1 };
     try surf.beginFeature(&water);
     try surf.fillArea("DEPVS", &rings, .{ .d1 = 0, .d2 = 5 });
     try surf.endFeature();
@@ -627,7 +635,7 @@ test "AsciiSurface: fills shade by token, strokes pick slope chars, glyphs and l
     // A horizontal line across the middle, a mark, a sounding, and a name.
     const line = [_]rs.TilePoint{ .{ .x = 0, .y = 16 }, .{ .x = 32, .y = 16 } };
     const lines = [_][]const rs.TilePoint{&line};
-    const feat = rs.FeatureMeta{ .draw_prio = 6 };
+    const feat = rs.FeatureMeta{ .display_priority = 6 };
     try surf.beginFeature(&feat);
     try surf.strokeLine("CHBLK", 1, .solid, &lines, null);
     try surf.drawSymbol("BOYLAT24", .{ .x = 4, .y = 4 }, 0, 1, false, .point, null);
@@ -639,7 +647,7 @@ test "AsciiSurface: fills shade by token, strokes pick slope chars, glyphs and l
 
     // A SCAMIN 1:30000 feature at zoom 10 (gate ~13.19): dropped entirely.
     var as_low = AsciiSurface.initView(a, &colors, .day, &settings, 10.0, 32, 16, 32, 32);
-    const gated = rs.FeatureMeta{ .draw_prio = 9, .scamin = 30000 };
+    const gated = rs.FeatureMeta{ .display_priority = 9, .scamin = 30000 };
     try as_low.asSurface().beginFeature(&gated);
     try as_low.asSurface().fillArea("LANDA", &rings, null);
     try std.testing.expectEqual(@as(usize, 0), as_low.ops.items.len);
@@ -680,11 +688,11 @@ test "labels declutter: highest priority claims the cells, overlap is dropped" {
     // says nothing about the label (all text is drawn last, at priority 8).
     const name = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
     const clearance = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 11 };
-    const hi = rs.FeatureMeta{ .draw_prio = 9 };
+    const hi = rs.FeatureMeta{ .display_priority = 9 };
     try surf.beginFeature(&hi);
     try surf.drawText("loser", &name, .{ .x = 8, .y = 8 });
     try surf.endFeature();
-    const lo = rs.FeatureMeta{ .draw_prio = 3 };
+    const lo = rs.FeatureMeta{ .display_priority = 3 };
     try surf.beginFeature(&lo);
     try surf.drawText("winner", &clearance, .{ .x = 8, .y = 8 });
     try surf.endFeature();
@@ -708,7 +716,7 @@ test "labels declutter: a sounding neither drops a label nor is dropped by one" 
     // The sounding is drawn FIRST, right where the light description lands. It
     // is a symbol: it claims nothing, so the label survives — and the sounding
     // still draws. Toggling soundings therefore cannot cost a chart its labels.
-    const meta = rs.FeatureMeta{ .draw_prio = 5 };
+    const meta = rs.FeatureMeta{ .display_priority = 5 };
     try surf.beginFeature(&meta);
     try surf.drawSounding(4.0, false, false, .{ .x = 8, .y = 8 });
     try surf.endFeature();
@@ -740,7 +748,7 @@ test "ANSI mode: tokens quantize to xterm-256, rows reset, plain mode stays esca
     const surf = as.asSurface();
     const full = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 0 }, .{ .x = 8, .y = 8 }, .{ .x = 0, .y = 8 } };
     const rings = [_][]const rs.TilePoint{&full};
-    const meta = rs.FeatureMeta{ .draw_prio = 1 };
+    const meta = rs.FeatureMeta{ .display_priority = 1 };
     try surf.beginFeature(&meta);
     try surf.fillArea("DEPVS", &rings, null);
     try surf.endFeature();

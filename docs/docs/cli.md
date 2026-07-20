@@ -22,7 +22,7 @@ automatically); `ENC_ROOT` is a whole catalogue directory.
 ### `bake`
 
 ```
-tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]
+tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]
 ```
 
 Produces the **live-composite structure** every other output is served from:
@@ -33,8 +33,13 @@ There is no merged archive — a runtime compositor serves any tile on demand �
 and re-runs are incremental: an archive already newer than its whole input
 (`.000` + update chain) is skipped.
 
-`--from-archives` treats the input as an existing directory of per-chart
-archives and only (re)builds `partition.tpart` over them.
+`-j`/`--workers` sets the bake thread count (default `min(cores/2, 8)`). Each
+worker holds a whole cell's parse + portray + raster working set, so this is a
+memory bound rather than a core count.
+
+The ownership partition (`partition.tpart`) is written alongside the archives and
+is an internal detail — it is discovered, reused, and regenerated automatically
+whenever a compositor opens the structure. Nothing consumes it by hand.
 
 ### `compose-tile`
 

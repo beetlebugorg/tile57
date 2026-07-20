@@ -136,7 +136,7 @@ test "renderMltTileSurface: handle-less colour/store/surface setup; undecodable 
         fn fill(_: ?*anyopaque, _: *const V.CFeature, _: *const V.CWorldRings, _: V.CColor, _: c_int) callconv(.c) void {}
         fn stroke(_: ?*anyopaque, _: *const V.CFeature, _: *const V.CWorldRings, _: f32, _: f32, _: f32, _: V.CColor) callconv(.c) void {}
         fn symbol(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: c_int, _: f32, _: V.CRotAlign) callconv(.c) void {}
-        fn text(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: V.CColor, _: f32, _: V.CRotAlign) callconv(.c) void {}
+        fn text(_: ?*anyopaque, _: *const V.CFeature, _: V.CWorldPt, _: *const V.CLocalRings, _: V.CColor, _: V.CColor, _: f32, _: V.CRotAlign, _: i32) callconv(.c) void {}
     };
     const cb = V.CSurface{
         .ctx = null,
@@ -233,6 +233,37 @@ const CellBackend = struct {
     geo_world: ?scene.GeoWorld = null, // its web-mercator projection
     feat_bbox: ?[]const ?[4]f64 = null, // per-feature lon/lat bbox (spatial cull)
 };
+
+/// A built GPU scene and the arena its buffers live in. Handed out by
+/// `renderGpuScene`, which is the only thing that constructs one; the caller
+/// holds it for as long as it draws from the buffers, then deinits.
+pub const GpuScene = struct {
+    arena: std.heap.ArenaAllocator,
+    scene: render.gpu.Scene,
+    /// A cached tile's shaped label candidates (empty on assembled/label scenes),
+    /// decluttered per view into the final label geometry. Arena-owned.
+    candidates: []render.gpu.LabelCandidate = &.{},
+
+    pub fn deinit(self: *GpuScene) void {
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// The live-cell backend as the scene engine's one-cell reference: the cell plus
+/// the open-time portrayal streams and per-cell geometry caches the view paths
+/// replay from.
+fn cellRef(cb: *CellBackend) scene.CellRef {
+    return .{
+        .cell = &cb.cell,
+        .portrayal = cb.portrayal,
+        .portrayal_plain = cb.portrayal_plain,
+        .portrayal_simplified = cb.portrayal_simplified,
+        .geo = cb.geo,
+        .geo_world = cb.geo_world,
+        .feat_bbox = cb.feat_bbox,
+    };
+}
 
 // One cell in the lazy ENC_ROOT index: its owned bytes + cheap metadata (bbox +
 // navigational band), parsed + portrayed ON DEMAND the first time a requested tile
@@ -626,6 +657,7 @@ pub fn openPmtilesPath(io: std.Io, path: []const u8) !*Chart {
         return error.OutOfMemory;
     };
     src.* = .{ .backend = .{ .reader = reader }, .data_map = map, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    src.source_path = gpa.dupe(u8, path) catch null;
     attachEmbeddedCoverage(src);
     return src;
 }
@@ -1014,6 +1046,183 @@ fn viewSymbolStore(a: std.mem.Allocator, palette: render.resolve.PaletteId) !*sp
     return store;
 }
 
+/// Build the GPU-scene atlases into `a`: the sprite-symbol cell map (same
+/// deterministic pack the host uploads) and the SDF glyph map. Cell SIZES are
+/// geometry, palette-independent, so the day stylesheet gives UVs that match the
+/// host's DEFAULT_CSS atlas PNG.
+fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtlas, glyphs: render.gpu.GlyphAtlas } {
+    var css_data: []const u8 = "";
+    for (embedded_assets.css) |e| {
+        if (std.mem.eql(u8, e.name, "daySvgStyle")) css_data = e.bytes;
+    }
+    const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+    for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+    const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+    for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+
+    // sprite atlas: reuse the same builder tile57_bake_sprite_mln does, so the
+    // cell rects are byte-for-byte the layout the host's PNG carries.
+    var atlas = try sprite.spriteMln(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{});
+    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height };
+    var cit = atlas.cells.iterator();
+    while (cit.next()) |e| {
+        const r = e.value_ptr.*;
+        try sprites.cells.put(a, e.key_ptr.*, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
+    }
+
+    // SDF glyph atlas: the same em_px/pad tile57_bake_glyph_sdf bakes.
+    const cps = try sprite.glyph.defaultCodepoints(a);
+    const gatlas = try sprite.glyph.build(a, render.font.notosans, cps, 32.0, 6);
+    var glyphs = render.gpu.GlyphAtlas{ .em_px = gatlas.em_px };
+    var git = gatlas.glyphs.iterator();
+    while (git.next()) |e| {
+        const g = e.value_ptr.*;
+        try glyphs.glyphs.put(a, e.key_ptr.*, .{
+            .u0 = g.u0,
+            .v0 = g.v0,
+            .u1 = g.u1,
+            .v1 = g.v1,
+            .off_x = g.off_x,
+            .off_y = g.off_y,
+            .w = g.w,
+            .h = g.h,
+            .advance = g.advance,
+        });
+    }
+    return .{ .sprites = sprites, .glyphs = glyphs };
+}
+
+// ---- per-tile GEOMETRY cache (internal; the host never sees tiles) ----------
+//
+// The GPU scene is portray-once-then-translate: the host asks for a whole view
+// and just uploads + draws it, but a pan/zoom that re-asks must not re-tessellate
+// every tile. So tile57 caches each tile's built GEOMETRY (fills, lines, sprites,
+// soundings — NO text) keyed by (handle, z, x, y), and assembles a view by
+// concatenating cached tiles, portraying only the newly-exposed ones. LABELS are
+// NOT cached here: they declutter across the whole view every call (see the label
+// pass in renderGpuScene), so a name never repeats across a tile seam.
+const GeomKey = struct { handle: usize, z: u8, x: u32, y: u32 };
+const GeomEntry = struct { scene: *GpuScene, gen: u64 };
+var g_geom: std.AutoHashMapUnmanaged(GeomKey, GeomEntry) = .empty;
+var g_geom_gen: u64 = 0;
+var g_geom_hash: u64 = 0;
+var g_geom_hash_set = false;
+const GEOM_CACHE_MAX = 1024;
+
+/// Content hash of the geometry-affecting settings. A byte hash won't do —
+/// Settings has slice fields (whose pointers move per call) and floats (whose
+/// padding is undefined) — so hash field by field, slices by content.
+fn settingsHash(s: *const render.resolve.Settings) u64 {
+    var h = std.hash.Wyhash.init(0);
+    inline for (@typeInfo(render.resolve.Settings).@"struct".fields) |f| hashVal(&h, @field(s.*, f.name));
+    return h.final();
+}
+fn hashVal(h: *std.hash.Wyhash, v: anytype) void {
+    switch (@typeInfo(@TypeOf(v))) {
+        // A float's bit pattern is well-defined for a given value; only the
+        // struct's PADDING was the byte-hash hazard, and this walks fields.
+        .float => h.update(std.mem.asBytes(&v)),
+        .optional => if (v) |vv| {
+            h.update(&[_]u8{1});
+            hashVal(h, vv);
+        } else h.update(&[_]u8{0}),
+        .pointer => |p| if (p.size == .slice) h.update(std.mem.sliceAsBytes(v)) else h.update(std.mem.asBytes(&v)),
+        .@"enum" => h.update(std.mem.asBytes(&@intFromEnum(v))),
+        .bool => h.update(&[_]u8{@intFromBool(v)}),
+        else => h.update(std.mem.asBytes(&v)), // ints, packed structs, int arrays
+    }
+}
+
+/// Drop the whole geometry cache when the geometry-affecting settings change —
+/// contours, units, size scales, palette (via scheme) all rebake a tile.
+fn geomInvalidate(s: *const render.resolve.Settings) void {
+    const hh = settingsHash(s);
+    if (g_geom_hash_set and hh == g_geom_hash) return;
+    var it = g_geom.valueIterator();
+    while (it.next()) |e| e.scene.deinit();
+    g_geom.clearRetainingCapacity();
+    g_geom_hash = hh;
+    g_geom_hash_set = true;
+}
+
+/// Drop every cached tile belonging to a handle — called when it closes, so a
+/// later handle reusing the address never reads its geometry.
+pub fn geomDropHandle(handle: usize) void {
+    var doomed = std.ArrayList(GeomKey).empty;
+    defer doomed.deinit(gpa);
+    var it = g_geom.iterator();
+    while (it.next()) |kv| {
+        if (kv.key_ptr.handle == handle) doomed.append(gpa, kv.key_ptr.*) catch {};
+    }
+    for (doomed.items) |k| {
+        if (g_geom.fetchRemove(k)) |kv| kv.value.scene.deinit();
+    }
+}
+
+fn geomGet(key: GeomKey) ?*GpuScene {
+    if (g_geom.getPtr(key)) |e| {
+        g_geom_gen += 1;
+        e.gen = g_geom_gen;
+        return e.scene;
+    }
+    return null;
+}
+
+fn geomPut(key: GeomKey, sc: *GpuScene) void {
+    g_geom_gen += 1;
+    g_geom.put(gpa, key, .{ .scene = sc, .gen = g_geom_gen }) catch {
+        sc.deinit();
+        return;
+    };
+    if (g_geom.count() <= GEOM_CACHE_MAX) return;
+    // Evict the least-recently-used (linear scan; the map is bounded).
+    var oldest_key: ?GeomKey = null;
+    var oldest_gen: u64 = std.math.maxInt(u64);
+    var it = g_geom.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.gen < oldest_gen) {
+            oldest_gen = kv.value_ptr.gen;
+            oldest_key = kv.key_ptr.*;
+        }
+    }
+    if (oldest_key) |ok| {
+        if (g_geom.fetchRemove(ok)) |kv| kv.value.scene.deinit();
+    }
+}
+
+// The GPU-scene atlases are static (per catalogue + font), so they build ONCE per
+// process and every render — single chart or composed — shares them, rather than
+// each Chart rasterizing its own. Process-lifetime; never freed.
+var g_atlas_state: std.atomic.Value(u8) = .init(0);
+var g_atlas_sprites: render.gpu.SpriteAtlas = .{ .width = 0, .height = 0 };
+var g_atlas_glyphs: render.gpu.GlyphAtlas = .{};
+var g_atlas_ok = false;
+
+fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gpu.GlyphAtlas } {
+    while (g_atlas_state.load(.acquire) != 2) {
+        if (g_atlas_state.cmpxchgStrong(@as(u8, 0), @as(u8, 1), .acquire, .monotonic) == null) {
+            const aa = gpa.create(std.heap.ArenaAllocator) catch {
+                g_atlas_state.store(2, .release);
+                break;
+            };
+            aa.* = std.heap.ArenaAllocator.init(gpa);
+            if (buildGpuAtlases(aa.allocator())) |built| {
+                g_atlas_sprites = built.sprites;
+                g_atlas_glyphs = built.glyphs;
+                g_atlas_ok = true;
+            } else |_| {
+                aa.deinit();
+                gpa.destroy(aa);
+            }
+            g_atlas_state.store(2, .release);
+            break;
+        }
+        std.atomic.spinLoopHint();
+    }
+    if (!g_atlas_ok) return .{ null, null };
+    return .{ &g_atlas_sprites, &g_atlas_glyphs };
+}
+
 // ---- compose-backed view renders --------------------------------------------
 //
 // The compositor is the tile source; these are its VIEW backends: compose every
@@ -1052,6 +1261,106 @@ pub fn renderComposeView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     return surf.endScene(gpa) catch error.TileGen;
 }
 
+/// The VIEW-level, GLOBALLY-decluttered TEXT pass over a compositor: gather the
+/// label candidates of every covering tile into ONE shared declutter pool and emit
+/// ONLY the survivors (via draw_text_str / draw_text) — no fills, lines, symbols or
+/// soundings. For a tile-renderer host that already draws geometry + symbols from
+/// its own per-tile cache (tile57_compose_tile / a per-tile surface) but needs
+/// labels decluttered ACROSS tile and CHART seams, which a per-tile pass cannot do.
+/// World anchors + coordinate space are identical to renderComposeSurfaceView, so
+/// text overlays the cached geometry with no re-projection.
+///
+/// Candidates memoize per tile (render/labelcache.zig), so a tile is composed,
+/// decoded and portrayed ONCE per portrayal identity: a repeat call at any centre,
+/// zoom or rotation over tiles already seen does no portrayal work at all — it
+/// re-resolves the memoized candidates against the new view. Changing the palette
+/// or any mariner setting retires the memo.
+pub fn renderComposeLabels(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const colors = try sharedColors();
+    var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
+    vs.view_zoom = zoom; // scale at which labels declutter
+    vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
+    vs.labels_only = true; // the view-level text pass draws no geometry
+    const surf = vs.asSurface();
+
+    const cache = try composeLabelCache(src);
+    cache.retarget(gpa, render.labelcache.epochOf(palette, settings));
+
+    // The symbol store is built on the FIRST cache miss and not at all when the
+    // view is fully memoized — for a compositor it is a per-call parse of the whole
+    // SVG catalogue, which on a settled view is the largest cost left. A labels-only
+    // walk never draws a symbol, but the store's init also registers the complex
+    // linestyle catalogue the portrayal walk reads, so a MISS must still have it.
+    var store: ?*sprite.CatalogStore = null;
+    defer if (store) |s| s.deinit();
+
+    const Portray = struct {
+        src: *compose_mod.ComposeSource,
+        a: std.mem.Allocator,
+        surf: render.surface.Surface,
+        vs: *render.vector.VectorSurface,
+        store: *?*sprite.CatalogStore,
+        palette: render.resolve.PaletteId,
+
+        fn portray(self: *const @This(), z: u8, x: u32, y: u32) !void {
+            if (self.store.* == null) {
+                self.store.* = try viewSymbolStore(self.a, self.palette);
+                self.vs.store = self.store.*.?.asStore();
+            }
+            const res = try self.src.tile(self.a, z, x, y);
+            const bytes = res.tile orelse return;
+            const layers = try mlt.decode(self.a, bytes);
+            try scene.replayTile(self.a, self.surf, layers);
+        }
+    };
+    const ctx = Portray{ .src = src, .a = a, .surf = surf, .vs = &vs, .store = &store, .palette = palette };
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    try surf.beginScene(vt.z);
+    while (vt.next()) |t| {
+        for (tileCandidates(cache, &vs, t.z, t.x, t.y, &ctx)) |c| try vs.pushCandidate(c);
+    }
+    _ = try surf.endScene(a);
+}
+
+/// The label-candidate memo hung off a compositor, created on first use and
+/// released when the source closes (compose.ComposeSource.render_cache).
+fn composeLabelCache(src: *compose_mod.ComposeSource) !*render.labelcache.Cache {
+    if (src.render_cache) |p| return @ptrCast(@alignCast(p));
+    const c = try gpa.create(render.labelcache.Cache);
+    c.* = .{};
+    src.render_cache = c;
+    src.render_cache_free = freeComposeLabelCache;
+    return c;
+}
+
+fn freeComposeLabelCache(p: *anyopaque) void {
+    const c: *render.labelcache.Cache = @ptrCast(@alignCast(p));
+    c.deinit(gpa);
+    gpa.destroy(c);
+}
+
+/// One tile's label candidates for a labels-only walk: the memo's, or — on a miss —
+/// the ones `ctx.portray` shapes, captured into the new cache entry's own arena so
+/// they outlive this call. An empty result is cached like any other (a tile with no
+/// labels must not be re-portrayed either), and a tile that cannot be stored simply
+/// contributes nothing, mirroring the decoded-tile memo's OOM behaviour.
+fn tileCandidates(cache: *render.labelcache.Cache, vs: *render.vector.VectorSurface, z: u8, x: u32, y: u32, ctx: anytype) []const render.vector.Candidate {
+    if (cache.get(z, x, y)) |hit| return hit;
+    const e = cache.newEntry(gpa) orelse return &.{};
+    var cap = render.vector.Capture{ .a = e.arena.allocator() };
+    vs.capture = &cap;
+    defer vs.capture = null;
+    vs.setTile(z, x, y);
+    ctx.portray(z, x, y) catch {};
+    return cache.store(gpa, z, x, y, e, cap.list.items) orelse &.{};
+}
+
 /// renderComposeView's GPU-vector twin: the SAME composed view emitted as a
 /// WORLD-SPACE tagged stream to the C surface callback (see render/vector.zig).
 pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
@@ -1080,6 +1389,79 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
         scene.replayTile(a, surf, layers) catch continue;
     }
     _ = try surf.endScene(a);
+}
+
+/// The composed DRAW-READY twin: geometry cached per tile, labels decluttered
+/// across the whole view — see Chart.renderGpuScene, with the compositor as the
+/// tile source so a host draws a chart LIBRARY without owning a scene. Result
+/// owns its arena (GpuScene.deinit).
+pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+    geomInvalidate(settings);
+    const out = try gpa.create(GpuScene);
+    errdefer gpa.destroy(out);
+    out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
+    errdefer out.arena.deinit();
+
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var parts = std.ArrayList(render.gpu.Scene).empty;
+    var cands = std.ArrayList(render.gpu.LabelCandidate).empty;
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    while (vt.next()) |t| {
+        const key = GeomKey{ .handle = @intFromPtr(src), .z = t.z, .x = t.x, .y = t.y };
+        if (geomGet(key) == null) {
+            const built = renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings) catch continue;
+            geomPut(key, built);
+        }
+        if (geomGet(key)) |g| {
+            parts.append(sa, g.scene) catch {};
+            cands.appendSlice(sa, g.candidates) catch {};
+        }
+    }
+
+    parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
+
+    out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
+    return out;
+}
+
+/// ONE composed tile into a draw-ready scene — the per-tile twin of
+/// renderComposeGpuScene, for a host that caches tiles (see Chart.renderTileGpuScene).
+pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+    const out = try gpa.create(GpuScene);
+    errdefer gpa.destroy(out);
+    out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
+    errdefer out.arena.deinit();
+
+    const colors = try sharedColors();
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const store = try viewSymbolStore(sa, palette);
+    defer store.deinit();
+
+    var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, @floatFromInt(z));
+    defer gs.deinit();
+    gs.store = store.asStore();
+    const atl = sharedGpuAtlases();
+    gs.sprites = atl[0];
+    gs.glyphs = atl[1];
+    gs.setTile(z, x, y);
+    const surf = gs.asSurface();
+    try surf.beginScene(z);
+    if (src.tile(sa, z, x, y) catch null) |res| {
+        if (res.tile) |bytes| {
+            if (mlt.decode(sa, bytes)) |layers| {
+                scene.replayTile(sa, surf, layers) catch {};
+            } else |_| {}
+        }
+    }
+    out.scene = try gs.build(out.arena.allocator());
+    out.candidates = try gs.takeCandidates(out.arena.allocator());
+    return out;
 }
 
 /// Cursor object-query over a runtime compositor (the S-52 §10.8 pick across the
@@ -1197,6 +1579,11 @@ const OpenWork = struct {
 pub const Chart = struct {
     backend: Backend,
     data: ?[]u8 = null, // owned archive bytes (PMTiles backend only)
+    /// Where this chart was opened from, when it came from a path (owned; null
+    /// for byte-backed opens). The compositor uses it to find the ownership
+    /// partition sidecar the bake wrote next to the archives, so a host never
+    /// has to know that file exists.
+    source_path: ?[]u8 = null,
     cache: std.AutoHashMap(u64, []u8), // tile key -> MVT bytes (owned)
     cache_max: usize = 8192,
     // Emit the per-feature pick-report attrs (s57/cell) on live-generated tiles.
@@ -1231,6 +1618,10 @@ pub const Chart = struct {
     view_tiles_max: usize = 192, // > the ~96 tiles of one 2560px view: never evicts mid-render
     view_arena: ?*std.heap.ArenaAllocator = null,
     view_stores: [3]?*sprite.CatalogStore = .{ null, null, null },
+    // The view label pass's per-tile candidate memo (render/labelcache.zig): what
+    // lets renderSurfaceLabels run on every view-settle instead of re-portraying
+    // the covering tiles each time. Bounded and released with the handle.
+    label_cache: render.labelcache.Cache = .{},
 
     /// Open a source from in-memory bytes. `fmt` selects the backend (`.auto`
     /// sniffs PMTiles then S-57); `rules_dir` is the S-101 rules dir for cells
@@ -1478,6 +1869,7 @@ pub const Chart = struct {
     }
 
     pub fn deinit(self: *Chart) void {
+        geomDropHandle(@intFromPtr(self));
         switch (self.backend) {
             .reader => |*r| r.deinit(),
             .cell => |*cb| freeCellBackend(cb),
@@ -1492,6 +1884,7 @@ pub const Chart = struct {
         while (it.next()) |v| gpa.free(v.*);
         self.cache.deinit();
         if (self.data) |d| gpa.free(d);
+        if (self.source_path) |sp| gpa.free(sp);
         if (self.data_map) |m| filemap.unmap(m);
         if (self.coverage_arena) |ca| {
             ca.deinit();
@@ -1505,6 +1898,7 @@ pub const Chart = struct {
             }
             self.view_tiles.deinit(gpa);
         }
+        self.label_cache.deinit(gpa);
         if (self.view_arena) |va| {
             va.deinit();
             gpa.destroy(va);
@@ -1769,18 +2163,185 @@ pub const Chart = struct {
                 }
             },
             .cell => |*cb2| {
-                const one = [_]scene.CellRef{.{
-                    .cell = &cb2.cell,
-                    .portrayal = cb2.portrayal,
-                    .portrayal_plain = cb2.portrayal_plain,
-                    .portrayal_simplified = cb2.portrayal_simplified,
-                    .geo = cb2.geo,
-                    .geo_world = cb2.geo_world,
-                    .feat_bbox = cb2.feat_bbox,
-                }};
+                const one = [_]scene.CellRef{cellRef(cb2)};
                 while (vt.next()) |t| {
                     vs.setTile(t.z, t.x, t.y);
                     scene.appendTile(surf, a, &one, t.z, t.x, t.y, self.pick_attrs) catch continue;
+                }
+            },
+            .cells => return error.Unsupported,
+        }
+        _ = try surf.endScene(a);
+    }
+
+    /// renderSurfaceView's DRAW-READY twin: instead of calling back per draw, it
+    /// returns triangulated geometry already in S-52 paint order, packed into
+    /// ranges a host draws one pipeline at a time (render/gpu.zig).
+    ///
+    /// A GPU host must batch by pipeline, which destroys the order the engine
+    /// emitted in — so a callback host has to rebuild paint order, and to do that
+    /// it grows a tessellator, a class taxonomy and a copy of the S-52 ordering
+    /// rule. That is a second scene, free to drift from this one, and it did: the
+    /// same OVERRADAR bug had to be fixed on both sides. This call exists so a
+    /// host owns no scene and knows no S-52.
+    ///
+    /// PORTRAY ONCE, TRANSLATE. Geometry is cached per tile (see the geometry
+    /// cache above), so a pan/zoom that re-asks re-tessellates only the newly
+    /// exposed tiles and memcpys the rest. LABELS are the exception: they
+    /// declutter across the WHOLE view every call — a name must not repeat across
+    /// a tile seam — so they are portrayed fresh (cheap: shape + box, no
+    /// tessellation) and assembled on top. The result owns its arena; release it
+    /// with `GpuScene.deinit`.
+    ///
+    /// No rotation parameter, deliberately: geometry stays north-up in absolute
+    /// world coordinates and the host applies the view rotation, so a course-up
+    /// view that turns continuously never rebuilds.
+    pub fn renderGpuScene(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+        geomInvalidate(settings);
+        const out = try gpa.create(GpuScene);
+        errdefer gpa.destroy(out);
+        out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
+        errdefer out.arena.deinit();
+
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        // Each covering tile's cached geometry scene + its cached label candidates.
+        var parts = std.ArrayList(render.gpu.Scene).empty;
+        var cands = std.ArrayList(render.gpu.LabelCandidate).empty;
+
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+        while (vt.next()) |t| {
+            const key = GeomKey{ .handle = @intFromPtr(self), .z = t.z, .x = t.x, .y = t.y };
+            if (geomGet(key) == null) {
+                const built = self.renderTileGpuScene(t.z, t.x, t.y, palette, settings) catch continue;
+                geomPut(key, built);
+            }
+            if (geomGet(key)) |g| {
+                parts.append(sa, g.scene) catch {};
+                cands.appendSlice(sa, g.candidates) catch {};
+            }
+        }
+
+        // Labels: box every candidate at the view zoom and declutter across the
+        // WHOLE view at once, so a name never repeats across a seam. Cheap — no
+        // re-shaping (that was cached per tile).
+        parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
+
+        out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
+        return out;
+    }
+
+    /// ONE tile portrayed into a draw-ready scene — the per-tile twin of
+    /// renderGpuScene, so a host CACHES each tile's buffers and pan/zoom becomes a
+    /// pure GPU transform of cached tiles, portraying only newly-exposed ones. The
+    /// scene is in absolute-world coordinates (the host draws every cached tile
+    /// with one camera), and declutter is PER-TILE at the tile's native zoom, so a
+    /// label may repeat across a seam — a host wanting cross-tile text runs the
+    /// view-level label pass on top. Result owns its arena (GpuScene.deinit).
+    pub fn renderTileGpuScene(self: *Chart, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+        const out = try gpa.create(GpuScene);
+        errdefer gpa.destroy(out);
+        out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
+        errdefer out.arena.deinit();
+
+        const colors = try self.viewColorsRef();
+        const store = try self.viewStoreFor(palette);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, @floatFromInt(z));
+        defer gs.deinit();
+        gs.store = store.asStore();
+        const atl = sharedGpuAtlases();
+        gs.sprites = atl[0];
+        gs.glyphs = atl[1];
+        gs.setTile(z, x, y);
+        const surf = gs.asSurface();
+        try surf.beginScene(z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                if (self.viewTileLayers(rd, z, x, y)) |layers| scene.replayTile(sa, surf, layers) catch {};
+            },
+            .cell => |*cb2| {
+                const one = [_]scene.CellRef{cellRef(cb2)};
+                scene.appendTile(surf, sa, &one, z, x, y, self.pick_attrs) catch {};
+            },
+            .cells => return error.Unsupported,
+        }
+        out.scene = try gs.build(out.arena.allocator());
+        out.candidates = try gs.takeCandidates(out.arena.allocator());
+        return out;
+    }
+
+    /// The VIEW-level, GLOBALLY-decluttered TEXT pass — renderSurfaceView's twin
+    /// that emits ONLY the surviving labels (draw_text_str / draw_text), no fills,
+    /// lines, symbols or soundings. For a tile-renderer host that draws geometry +
+    /// symbols from its own per-tile cache (renderSurfaceTile / tile57_chart_tile_surface)
+    /// but needs labels decluttered ACROSS tile seams, which the per-tile pass cannot
+    /// do. Same world anchors + coordinate space as renderSurfaceView, so the text
+    /// overlays the cached geometry directly.
+    ///
+    /// Label candidates memoize per tile (render/labelcache.zig): a tile is portrayed
+    /// ONCE per portrayal identity, and a repeat call at any centre, zoom or rotation
+    /// over tiles already seen only re-resolves those candidates against the new view.
+    /// Changing the palette or any mariner setting retires the memo. Live for a baked
+    /// bundle (.reader) and a live cell (.cell); .cells is unsupported (bake, then
+    /// compose).
+    pub fn renderSurfaceLabels(self: *Chart, lon: f64, lat: f64, zoom: f64, rotation_rad: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, cb: *const render.vector.CSurface) !void {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const colors = try self.viewColorsRef();
+        var vs = render.vector.VectorSurface.init(a, colors, palette, settings, cb);
+        vs.view_zoom = zoom; // scale at which labels declutter
+        vs.view_rotation = rotation_rad; // contour-label uprightness + screen-frame declutter
+        vs.labels_only = true; // the view-level text pass draws no geometry
+        const surf = vs.asSurface();
+        // A labels-only walk draws no symbol, but the store's init also registers the
+        // complex-linestyle catalogue the portrayal walk reads. It is memoized per
+        // handle, so this is a hash lookup after the first view.
+        vs.store = (try self.viewStoreFor(palette)).asStore();
+
+        self.label_cache.retarget(gpa, render.labelcache.epochOf(palette, settings));
+
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+        try surf.beginScene(vt.z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                const Portray = struct {
+                    self: *Chart,
+                    rd: *pmtiles.Reader,
+                    a: std.mem.Allocator,
+                    surf: render.surface.Surface,
+                    fn portray(p: *const @This(), z: u8, x: u32, y: u32) !void {
+                        const layers = p.self.viewTileLayers(p.rd, z, x, y) orelse return;
+                        try scene.replayTile(p.a, p.surf, layers);
+                    }
+                };
+                const ctx = Portray{ .self = self, .rd = rd, .a = a, .surf = surf };
+                while (vt.next()) |t| {
+                    for (tileCandidates(&self.label_cache, &vs, t.z, t.x, t.y, &ctx)) |c| try vs.pushCandidate(c);
+                }
+            },
+            .cell => |*cb2| {
+                const Portray = struct {
+                    one: [1]scene.CellRef,
+                    a: std.mem.Allocator,
+                    surf: render.surface.Surface,
+                    pick_attrs: bool,
+                    fn portray(p: *const @This(), z: u8, x: u32, y: u32) !void {
+                        try scene.appendTile(p.surf, p.a, &p.one, z, x, y, p.pick_attrs);
+                    }
+                };
+                const ctx = Portray{ .one = .{cellRef(cb2)}, .a = a, .surf = surf, .pick_attrs = self.pick_attrs };
+                while (vt.next()) |t| {
+                    for (tileCandidates(&self.label_cache, &vs, t.z, t.x, t.y, &ctx)) |c| try vs.pushCandidate(c);
                 }
             },
             .cells => return error.Unsupported,

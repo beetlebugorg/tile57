@@ -29,6 +29,21 @@ pub const Symbol = struct {
     pivot: cv.Point,
 };
 
+/// Half-extent of a symbol's outline about its pivot, scaled by `k` (the same
+/// `scale * 100 * dev` a mark is drawn at). A sprite quad spans ±this around the
+/// anchor, and the pivot-centred atlas cell drawn onto it reproduces the vector
+/// placement. ONE definition, so the callback path (VectorSurface.emitSprite)
+/// and the GPU-scene path size a symbol identically.
+pub fn halfExtent(s: *const Symbol, k: f64) [2]f32 {
+    var hw: f64 = 0;
+    var hh: f64 = 0;
+    for (s.paths) |p| for (p.contours) |contour| for (contour) |c| {
+        hw = @max(hw, @abs((c.x - s.pivot.x) * k));
+        hh = @max(hh, @abs((c.y - s.pivot.y) * k));
+    };
+    return .{ @floatCast(hw), @floatCast(hh) };
+}
+
 /// The lookup seam: name -> parsed symbol / rendered pattern cell (null =
 /// unknown; the caller decides the fallback). Implementations own caching and
 /// the returned memory.

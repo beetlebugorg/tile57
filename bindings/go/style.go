@@ -71,6 +71,7 @@ type Mariner struct {
 	SizeScale                                               float64 // physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
 	TextSizeScale                                           float64 // extra multiplier for TEXT labels on top of SizeScale (0 reads as 1.0)
 	SoundingSizeScale                                       float64 // extra multiplier for SOUNDINGS on top of SizeScale (0 reads as 1.0)
+	DeviceScale                                             float64 // device px per reference px: the HiDPI density the SURFACE paths are drawn at (0 reads as 1.0)
 	Soundings                                               SoundingsMode
 	ViewingGroupsOff                                        []int32 // S-52 §14.5 DENY-LIST: vg ids turned OFF (nil/empty = show all)
 }
@@ -248,6 +249,7 @@ func (m Mariner) toC(arena *cArena) C.tile57_mariner {
 	c.size_scale = C.double(m.SizeScale)
 	c.text_size_scale = C.double(m.TextSizeScale)
 	c.sounding_size_scale = C.double(m.SoundingSizeScale)
+	c.device_scale = C.double(m.DeviceScale)
 	c.soundings = C.uint8_t(m.Soundings)
 	// Viewing-group deny-list: arena-owned C array so no Go pointer crosses into C.
 	vgOffPtr, vgOffN := arena.int32Array(m.ViewingGroupsOff)
@@ -287,6 +289,7 @@ func marinerFromC(c *C.tile57_mariner) Mariner {
 		SizeScale:                  float64(c.size_scale),
 		TextSizeScale:              float64(c.text_size_scale),
 		SoundingSizeScale:          float64(c.sounding_size_scale),
+		DeviceScale:                float64(c.device_scale),
 		Soundings:                  SoundingsMode(c.soundings),
 	}
 	var dv []byte

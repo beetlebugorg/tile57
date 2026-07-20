@@ -5,6 +5,27 @@ const std = @import("std");
 // into the binary so tile57 portrays + styles charts with no on-disk catalogue.
 const PORTRAYAL_CATALOG = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog";
 
+// libtess2 (vendored, SGI Free Software License B — vendor/libtess2/LICENSE.txt).
+// The polygon tessellator behind the GPU surface: contours in, triangles out,
+// with the winding rules S-52 needs (even-odd for glyph/symbol outlines with
+// counters, nonzero for area fills). Vendored as C for now; a Zig port is its
+// own change, and once it lands it is also a candidate to replace the
+// hand-rolled sweep in src/geometry.
+const tess_sources = [_][]const u8{
+    "bucketalloc.c", "dict.c", "geom.c", "mesh.c", "priorityq.c", "sweep.c", "tess.c",
+};
+
+fn addTess(b: *std.Build, mod: *std.Build.Module) void {
+    mod.link_libc = true; // libtess2 uses assert.h/stdio.h/stdlib.h
+    mod.addIncludePath(b.path("vendor/libtess2/Include"));
+    mod.addIncludePath(b.path("vendor/libtess2/Source"));
+    mod.addCSourceFiles(.{
+        .root = b.path("vendor/libtess2/Source"),
+        .files = &tess_sources,
+        .flags = &.{ "-std=gnu99", "-O2" },
+    });
+}
+
 // Lua 5.4 core sources (vendored from lua.org), minus the standalone mains.
 const lua_sources = [_][]const u8{
     "lapi.c",    "lauxlib.c",  "lbaselib.c", "lcode.c",    "lcorolib.c", "lctype.c",
@@ -206,6 +227,7 @@ pub fn build(b: *std.Build) void {
         }
     }.f;
     addFont(b, render_mod);
+    addTess(b, render_mod);
 
     // Integer computational geometry (src/geometry/): the Martinez polygon boolean +
     // the coverage-clipped best-available partition. Pure (std-only); the scene
@@ -662,6 +684,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "style", .module = style_mod },
     });
     addFont(b, render_test);
+    addTess(b, render_test);
     // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
     // rules end-to-end. It rides its own artifact because `portray` links libc + Lua +
     // the rule registry (those settings + C sources propagate from portray_mod), unlike

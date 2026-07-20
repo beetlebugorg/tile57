@@ -456,7 +456,7 @@ pub const TileSurface = struct {
     // glyphs (coalesced from the portrayal via drawSounding) both land here.
     soundings: std.ArrayList(mvt.Feature) = .empty,
     /// Current feature meta, set by beginFeature; the draw methods read it.
-    cur: Meta = .{ .prio = 0 },
+    cur: Meta = .{ .display_priority = 0 },
 
     const mvt_vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -507,9 +507,9 @@ pub const TileSurface = struct {
     fn beginFeature(ctx: *anyopaque, meta: *const rs.FeatureMeta) anyerror!void {
         const s = sp(ctx);
         s.cur = .{
-            .prio = meta.draw_prio,
-            .plane = meta.plane,
-            .cat = meta.cat,
+            .display_priority = meta.display_priority,
+            .display_plane = meta.display_plane,
+            .display_category = meta.display_category,
             .vg = meta.vg,
             .scamin = meta.scamin,
             .oscl = meta.oscl,
@@ -820,9 +820,9 @@ pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u
 /// Feature-level metadata shared by every primitive a feature emits, so the
 /// client's S-52 mariner filters can select on it.
 const Meta = struct {
-    prio: i64,
-    plane: i64 = 0, // S-101 DisplayPlane (0 UnderRadar default, 1 OverRadar)
-    cat: i64 = 1, // display-category rank (0 base, 1 standard, 2 other)
+    display_priority: i64,
+    display_plane: i64 = 0, // S-101 DisplayPlane (0 UnderRadar default, 1 OverRadar)
+    display_category: i64 = 1, // display-category rank (0 base, 1 standard, 2 other)
     vg: i64 = 0, // raw S-101 viewing-group number of the feature's primary draw (0 = none)
     scamin: ?i64 = null,
     // The source cell's compilation scale quantized up the scamin ladder (0 =
@@ -1017,11 +1017,11 @@ test "encodeS57Attrs: acronym->value JSON; skips blank + unknown; escapes" {
 }
 
 fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
-    try props.append(a, .{ .key = "draw_prio", .value = .{ .int = m.prio } });
+    try props.append(a, .{ .key = "display_priority", .value = .{ .int = m.display_priority } });
     // S-101 DisplayPlane: emitted only for OverRadar (plane=1); the style's sort-key
     // coalesces an absent plane to 0 (UnderRadar), so the common case stays untagged.
-    if (m.plane != 0) try props.append(a, .{ .key = "plane", .value = .{ .int = m.plane } });
-    try props.append(a, .{ .key = "cat", .value = .{ .int = m.cat } });
+    if (m.display_plane != 0) try props.append(a, .{ .key = "display_plane", .value = .{ .int = m.display_plane } });
+    try props.append(a, .{ .key = "display_category", .value = .{ .int = m.display_category } });
     // Raw viewing group (§14.5): emitted only when the feature has a banded draw VG,
     // so undated/unbanded features keep their tile footprint unchanged.
     if (m.vg != 0) try props.append(a, .{ .key = "vg", .value = .{ .int = m.vg } });
@@ -1479,7 +1479,7 @@ fn appendDepthVals(a: Allocator, props: *std.ArrayList(mvt.Prop), f: s57.Feature
 }
 
 /// Emit one parsed portrayal pass `p` through the Surface interface, stamping
-/// every primitive with the pass's meta (draw_prio/cat/vg/scamin/bnd/pts + pick
+/// every primitive with the pass's meta (display_priority/cat/vg/scamin/bnd/pts + pick
 /// attrs). The engine work happens here — geometry assembly, projection, tile
 /// clipping/simplification, anchoring — so surfaces only ever see draw calls.
 /// The cursor-pick report's class name for a feature. A native S-101 cell serves
@@ -1501,9 +1501,9 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     const scamin = effScamin(f, opts);
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
-        .draw_prio = p.draw_prio,
-        .plane = p.plane,
-        .cat = p.cat,
+        .display_priority = p.display_priority,
+        .display_plane = p.plane,
+        .display_category = p.cat,
         .vg = p.vg,
         .scamin = scamin,
         .oscl = opts.oscl,
@@ -1759,7 +1759,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
     if (geo_parts.len == 0) return;
 
     const fmeta = rs.FeatureMeta{
-        .draw_prio = 6,
+        .display_priority = 6,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
@@ -1822,7 +1822,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         featureParts(a, cell, geo, fi, f) catch return;
 
     const fmeta = rs.FeatureMeta{
-        .draw_prio = 12,
+        .display_priority = 12,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
@@ -1915,7 +1915,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
     if (geo_parts.len == 0) return;
 
     const fmeta = rs.FeatureMeta{
-        .draw_prio = 6,
+        .display_priority = 6,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
@@ -1973,8 +1973,8 @@ fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         // S-52 §10.1.10.2: the overscale pattern draws at display priority 3 in
         // DISPLAY BASE (the indication is never optional content). No class/pick
         // payload — the hatch is an indication, not a chartable feature.
-        .draw_prio = 3,
-        .cat = 0,
+        .display_priority = 3,
+        .display_category = 0,
         .band = opts.band,
         .oscl = opts.oscl,
         .overscale = true,
@@ -2216,8 +2216,8 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
     if (p.lon() < tb[0] or p.lon() > tb[2] or p.lat() < tb[1] or p.lat() > tb[3]) return;
     const pt = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
     const fmeta = rs.FeatureMeta{
-        .draw_prio = prio,
-        .cat = cat,
+        .display_priority = prio,
+        .display_category = cat,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
@@ -2347,8 +2347,8 @@ fn appendCellFeatures(
         }
         if (f.objl == 129) {
             const smeta = rs.FeatureMeta{
-                .draw_prio = 18,
-                .cat = 2,
+                .display_priority = 18,
+                .display_category = 2,
                 .class = if (cell.native) pickClass(cell.*, f, fi) else "SOUNDG",
                 .s57_json = pickJson(a, cell.*, f, fi, fopts.pick_attrs),
                 .cell_name = if (fopts.pick_attrs) cell.name else "",
@@ -2597,7 +2597,7 @@ test "featureScamin reads s57 attr 133" {
     try std.testing.expectEqual(@as(?i64, null), featureScamin(without));
 }
 
-test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/scamin" {
+test "processFeatureInstr routes SCAMIN point to the bucket + carries display_priority/scamin" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -2621,7 +2621,7 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
     // SCAMIN-carrying point -> the internal scamin bucket (folded into `point_symbols`
-    // at emit), with draw_prio=7 + scamin=22000.
+    // at emit), with display_priority=7 + scamin=22000.
     const f_sc = s57.Feature{
         .rcnm = 0,
         .rcid = 1,
@@ -2633,10 +2633,10 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
     try processFeatureInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 0), ms.points.items.len);
     try std.testing.expectEqual(@as(usize, 1), ms.points_scamin.items.len);
-    try std.testing.expectEqual(@as(i64, 7), findProp(ms.points_scamin.items[0].properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(i64, 7), findProp(ms.points_scamin.items[0].properties, "display_priority").?.int);
     try std.testing.expectEqual(@as(i64, 22000), findProp(ms.points_scamin.items[0].properties, "scamin").?.int);
 
-    // No SCAMIN -> base point_symbols layer, draw_prio default 0, no scamin.
+    // No SCAMIN -> base point_symbols layer, display_priority default 0, no scamin.
     const f_base = s57.Feature{
         .rcnm = 0,
         .rcid = 2,
@@ -2646,7 +2646,7 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries draw_prio/
     };
     try processFeatureInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 1), ms.points.items.len);
-    try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "draw_prio").?.int);
+    try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "display_priority").?.int);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "scamin"));
     // No point-style variant -> common pass: no `pts` tag (client coalesces to 2).
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "pts"));

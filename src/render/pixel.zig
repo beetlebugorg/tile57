@@ -3,10 +3,10 @@
 //! format below it is just a Canvas (RasterCanvas now, PDF later).
 //!
 //!   Surface calls ─► resolver (token->RGB @ palette, display gates @ zoom)
-//!                ─► op buffer ─► endScene: stable sort by draw_prio ─► Canvas
+//!                ─► op buffer ─► endScene: stable sort by display_priority ─► Canvas
 //!
 //! Buffering exists because the engine emits features in CELL order (the tile
-//! path routes by layer and lets the client sort on the draw_prio prop);
+//! path routes by layer and lets the client sort on the display_priority prop);
 //! pixels must PAINT in S-52 priority order, and the P4 collision pass needs
 //! the whole scene anyway.
 //!
@@ -17,6 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
+const paint = @import("paint.zig");
 const resolve = @import("resolve.zig");
 const cv = @import("canvas.zig");
 const raster = @import("raster.zig");
@@ -47,15 +48,79 @@ const OpKind = union(enum) {
     text: struct { run: cv.GlyphRun, bbox: [4]f32, group: i64, class: []const u8 },
 };
 
-/// Paint class, mirroring the tile style's LAYER order (areas ->
-/// area_patterns -> lines -> point_symbols -> soundings -> text): the class
-/// is the major sort key, draw priority orders WITHIN a class — a fill never
-/// paints over a line, whatever its priority, exactly like the layer stack.
-const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4, text = 5 };
+/// Paint class. This is a TAG, not a sort key — the ONE thing it still orders
+/// is text (see orderLt).
+///
+/// It used to be the major sort key, class-major, mirroring the tile style's
+/// layer stack (areas -> patterns -> lines -> symbols -> soundings -> text).
+/// That was wrong. S-101 orders portrayal by DisplayPlane, then DrawingPriority,
+/// then emission order; the portrayal catalogue encodes NO geometry-class axis
+/// at all, and the tile style's layer array exists to REALISE display_priority as the
+/// sole axis under MapLibre's constraint that a layer cannot interleave line and
+/// symbol geometry (see maplibre.zig SYMBOL_SORT: "display_priority is the SOLE axis
+/// ... not a class tier"). Sorting class-major inverted the catalogue wherever a
+/// line outranks a symbol — a LightSectored arc (DrawingPriority 24) sank under
+/// a Wreck symbol (12), so wrecks painted over light sectors.
+///
+/// The real defect the class key was introduced for (332e5db) was narrower: a
+/// symbol's own fill/stroke ops leaked into the global sort and interleaved with
+/// area fills. A stable (prio, seq) sort already prevents that — every op a
+/// symbol pushes shares its parent feature's priority and takes consecutive seq,
+/// so the group stays contiguous on its own.
+const OpLayer = paint.Layer;
+
+/// Paint order, straight out of S-52 PresLib Ed 4.0.0 §10.3.4.1 (p.70):
+///
+///   "The display priority applies irrespective of whether an object is a point,
+///    line or area. If the display priority is equal among objects, line objects
+///    have to be drawn on top of area objects whereas point objects have to be
+///    drawn on top of both. If the display priority is still equal among objects
+///    of the same type of geometry ... the given sequence in the data structure
+///    of the SENC ... must be used."
+///
+/// Above priority sits DisplayPlane, per §10.3.4.2 (p.72) — but CONDITIONALLY:
+/// "When the RADAR overlay is present on the ECDIS chart display the OVERRADAR
+/// flag takes precedence over the objects display priority." Read the condition,
+/// not just the rule. With no radar overlay there is nothing for OverRadar to be
+/// over, and applying it anyway hoists those features above every higher-priority
+/// one — a built-up area at priority 24 climbing over a light sector arc at 24.
+/// So the axis is gated on Settings.radar_overlay.
+///
+/// So the levels, in this order:
+///   1. DisplayPlane     — 0 UnderRadar, 1 OverRadar; ONLY with a radar overlay
+///   2. display priority — class-independent
+///   3. geometry class   — tiebreak ONLY at equal priority (area < line < point)
+///   4. emission order   — tiebreak at equal priority AND class
+///
+/// OpLayer's relative order is already the spec's tiebreak order; the old bug was
+/// applying it at level 2 instead of level 3. Level 4 is load-bearing, not
+/// incidental: the catalogue emits fill-then-boundary (Gate.lua:127-129) and the
+/// light arc's casing-then-core (LightSectored.lua:141-143) at one priority and
+/// relies on the second landing on top.
+///
+/// Text is exempt and drawn last, also per §10.3.4.1 ("Text must be drawn last
+/// ... in priority 8") and §16 rule 3 ("Text must always have display priority 8
+/// ... independent of the object it applies to"). That matters because
+/// AddTextInstruction inherits its feature's priority (LandArea.lua:49 passes 3),
+/// so honouring it would sink labels under the fills they annotate.
+///
+/// The DisplayPlane value is still carried on every feature and over the ABI —
+/// a host compositing a radar picture needs it. It just does not order the
+/// chart on its own.
+/// `radar` is whether a RADAR overlay is present — the condition §10.3.4.2 puts
+/// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
+/// all and priority leads.
+fn orderLt(radar: bool, l: Op, r: Op) bool {
+    const lk = paint.key(l.layer, l.prio, l.display_plane, radar);
+    const rk = paint.key(r.layer, r.prio, r.display_plane, radar);
+    if (lk != rk) return lk < rk;
+    return l.seq < r.seq; // equal key: emission order (SENC sequence)
+}
 
 const Op = struct {
     layer: OpLayer,
     prio: i64,
+    display_plane: i64 = 0,
     seq: usize,
     kind: OpKind,
 };
@@ -193,7 +258,7 @@ pub const PixelSurface = struct {
     }
 
     fn push(self: *PixelSurface, layer: OpLayer, kind: OpKind) !void {
-        try self.ops.append(self.a, .{ .layer = layer, .prio = self.cur.draw_prio, .seq = self.ops.items.len, .kind = kind });
+        try self.ops.append(self.a, .{ .layer = layer, .prio = self.cur.display_priority, .display_plane = self.cur.display_plane, .seq = self.ops.items.len, .kind = kind });
     }
 
     // ---- Surface impl ---------------------------------------------------------
@@ -550,15 +615,9 @@ pub const PixelSurface = struct {
         var kept = try pool.resolve(self.a, dc.REPEAT_PX * self.devScale());
         defer kept.deinit(self.a);
 
-        // Paint order = the tile style's layer stack: class-major (see
-        // OpLayer), draw priority within a class, emission order for ties.
-        std.mem.sort(Op, self.ops.items, {}, struct {
-            fn lt(_: void, l: Op, r: Op) bool {
-                if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer);
-                if (l.prio != r.prio) return l.prio < r.prio;
-                return l.seq < r.seq;
-            }
-        }.lt);
+        // Paint order = (DrawingPriority, emission order). See OpLayer for why
+        // geometry class is NOT a key.
+        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
 
         switch (self.output) {
             .png => {
@@ -651,7 +710,7 @@ test "PixelSurface: a depth area shades from the MARINER's contours, not the bak
             var ps = PixelSurface.init(al, cols, .day, m, 14.0, 64, 64);
             const surf = ps.asSurface();
             try surf.beginScene(14);
-            const meta = rs.FeatureMeta{ .class = "DEPARE", .cat = 0 };
+            const meta = rs.FeatureMeta{ .class = "DEPARE", .display_category = 0 };
             try surf.beginFeature(&meta);
             try surf.fillArea("DEPMS", rr, depth);
             try surf.endFeature();
@@ -680,7 +739,7 @@ test "PixelSurface: a depth area shades from the MARINER's contours, not the bak
     try std.testing.expectEqual(@as(u8, 3), (try fillOnce(a, &colors, &std_m, &rings, null)).r); // DEPMS
 }
 
-test "PixelSurface: resolves tokens, gates SCAMIN, sorts by draw_prio" {
+test "PixelSurface: resolves tokens, gates SCAMIN, sorts by display_priority" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -699,12 +758,12 @@ test "PixelSurface: resolves tokens, gates SCAMIN, sorts by draw_prio" {
     const big = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 64, .y = 0 }, .{ .x = 64, .y = 64 }, .{ .x = 0, .y = 64 } };
     const rings = [_][]const rs.TilePoint{&big};
 
-    const hi = rs.FeatureMeta{ .draw_prio = 8 };
+    const hi = rs.FeatureMeta{ .display_priority = 8 };
     try surf.beginFeature(&hi);
     try surf.fillArea("DEPVS", &rings, null);
     try surf.endFeature();
 
-    const lo = rs.FeatureMeta{ .draw_prio = 2 };
+    const lo = rs.FeatureMeta{ .display_priority = 2 };
     try surf.beginFeature(&lo);
     try surf.fillArea("CHBLK", &rings, null);
     try surf.endFeature();
@@ -712,7 +771,7 @@ test "PixelSurface: resolves tokens, gates SCAMIN, sorts by draw_prio" {
     // A SCAMIN 1:30000 feature at zoom 10 (gate ~13.19): dropped entirely.
     var ps_low = PixelSurface.init(a, &colors, .day, &settings, 10.0, 64, 64);
     const surf_low = ps_low.asSurface();
-    const gated = rs.FeatureMeta{ .draw_prio = 9, .scamin = 30000 };
+    const gated = rs.FeatureMeta{ .display_priority = 9, .scamin = 30000 };
     try surf_low.beginFeature(&gated);
     try surf_low.fillArea("CHBLK", &rings, null);
     try std.testing.expectEqual(@as(usize, 0), ps_low.ops.items.len);
@@ -738,7 +797,7 @@ test "PixelSurface: unknown token falls back magenta, dashed maps to [4w,3w]" {
 
     const line = [_]rs.TilePoint{ .{ .x = 0, .y = 2048 }, .{ .x = 4096, .y = 2048 } };
     const lines = [_][]const rs.TilePoint{&line};
-    const meta = rs.FeatureMeta{ .draw_prio = 5 };
+    const meta = rs.FeatureMeta{ .display_priority = 5 };
     try surf.beginFeature(&meta);
     try surf.strokeLine("NOSUCH", 2, .dashed, &lines, null);
     try surf.endFeature();
@@ -793,7 +852,7 @@ test "drawSymbol: pivot/scale/rotate transform, even-odd fill, danger swap, soun
     ps.store = .{ .ptr = &fake, .vtable = &Fake.vt };
     const surf = ps.asSurface();
 
-    const meta = rs.FeatureMeta{ .draw_prio = 9 };
+    const meta = rs.FeatureMeta{ .display_priority = 9 };
     try surf.beginFeature(&meta);
     // scale 0.02835 px per 0.01mm -> k = 2.835 px/mm at 256px; 90° rotation.
     try surf.drawSymbol("BOYLAT13", .{ .x = 128, .y = 128 }, 90, sndfrm.SYMBOL_SCALE, false, .point, null);
@@ -839,7 +898,7 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     const surf = ps.asSurface();
 
     // A named label (group 26, text_names on) at prio 9.
-    const hi = rs.FeatureMeta{ .draw_prio = 9 };
+    const hi = rs.FeatureMeta{ .display_priority = 9 };
     try surf.beginFeature(&hi);
     const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .halign = "left", .valign = "bottom", .offset_x = 0, .offset_y = 0, .group = 26 };
     try surf.drawText("Reef 12", &style, .{ .x = 100, .y = 100 });
@@ -855,7 +914,7 @@ test "drawText: shaping, group gate, halo, and collision declutter" {
     // Same spot, same text group (both Other text): peers, so the SENC sequence
     // settles it and the label emitted FIRST keeps the space. The feature draw
     // priority is deliberately not consulted — see declutter.zig.
-    const lo = rs.FeatureMeta{ .draw_prio = 3 };
+    const lo = rs.FeatureMeta{ .display_priority = 3 };
     try surf.beginFeature(&lo);
     try surf.drawText("Overlap", &style, .{ .x = 102, .y = 101 });
     try surf.endFeature();

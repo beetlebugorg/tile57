@@ -56,6 +56,13 @@ pub const Settings = struct {
     show_soundings: ?bool = null,
 
     // -- overlays / opt-in markers (off by default) --
+    /// A RADAR overlay is being drawn under/over the chart. This is what gates
+    /// the S-101 DisplayPlane axis: S-52 PresLib §10.3.4.2 gives the OVERRADAR
+    /// flag precedence over display priority "when the RADAR overlay is present
+    /// on the ECDIS chart display" — and ONLY then. With no radar, DisplayPlane
+    /// must not reorder anything, or an OverRadar feature climbs above every
+    /// higher-priority one (a built-up area burying a light sector arc).
+    radar_overlay: bool = false,
     data_quality: bool = false,
     show_inform_callouts: bool = false,
     show_meta_bounds: bool = false,
@@ -118,6 +125,23 @@ pub const Settings = struct {
     // that declutters it. 1.0 = no extra scale (byte-identical output).
     text_size_scale: f64 = 1.0,
     sounding_size_scale: f64 = 1.0,
+
+    // -- device pixels per reference pixel (HiDPI framebuffer density) — NOT an S-52
+    // setting, and NOT a mariner preference: it describes the DISPLAY, where
+    // size_scale describes the mariner's taste. The two multiply.
+    //
+    // It exists because the surface paths hand a host reference-px sizes for text and
+    // symbols and let the host draw them; if the host then draws at 2x, the engine has
+    // sized the collision boxes for glyphs half the size it actually paints, and a view
+    // the engine decluttered cleanly comes out overlapping. Stating the density here
+    // makes the engine size the glyph AND its declutter box in the SAME units the host
+    // draws in, which is the only way the two can agree.
+    //
+    // The pixel outputs (png/pdf/canvas) do NOT read this: there the engine rasterizes
+    // the pixels itself, so the density is already in the requested pixel dimensions
+    // (PixelSurface.devScale folds in px_per_tile) and applying it again would
+    // double-count. 1.0 = a 1x framebuffer (byte-identical output).
+    device_scale: f64 = 1.0,
 };
 
 // ---- expression DSL ---------------------------------------------------------

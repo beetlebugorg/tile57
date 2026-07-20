@@ -329,7 +329,7 @@ typedef struct { const tile57_world_point *pts; uint32_t n;
 /* The S-52 display category the feature came in on. */
 typedef enum { TILE57_DISP_BASE=0, TILE57_DISP_STANDARD=1, TILE57_DISP_OTHER=2 } tile57_disp_cat;
 
-typedef struct { const char *cls; int64_t scamin; int32_t plane;
+typedef struct { const char *cls; int64_t scamin; int32_t display_priority;
                  tile57_disp_cat disp_cat; } tile57_feature;
 
 /* What a rotatable call's angle is referenced to: VIEWPORT = screen (stay upright),
@@ -339,16 +339,20 @@ typedef enum { TILE57_ALIGN_VIEWPORT = 0, TILE57_ALIGN_MAP = 1 } tile57_rot_alig
 typedef struct {
     void *ctx;                                 /* handed back to every call */
     void (*fill_area)  (void *ctx, const tile57_feature *f, const tile57_world_rings *rings,
-                        tile57_rgba color, int even_odd);
+                        tile57_color color, int even_odd);
     void (*stroke_line)(void *ctx, const tile57_feature *f, const tile57_world_rings *lines,
-                        float width_px, float dash_on, float dash_off, tile57_rgba color);
+                        float width_px, float dash_on, float dash_off, tile57_color color);
     /* rings arrive already rotated; align says whether to also add the view rotation. */
     void (*draw_symbol)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
-                        const tile57_local_rings *rings, tile57_rgba color, int even_odd,
+                        const tile57_local_rings *rings, tile57_color color, int even_odd,
                         float stroke_w, tile57_rot_align align);
+    /* text_group is the LABEL's S-52 text group (§14.5): 11 = important text (always
+     * shown — it ignores the mariner's text switches), 21/26/29 names, 23 light
+     * descriptions, 0 none. It rides the callback rather than tile57_feature because
+     * one feature can carry several labels in different groups. */
     void (*draw_text)  (void *ctx, const tile57_feature *f, tile57_world_point anchor,
-                        const tile57_local_rings *glyphs, tile57_rgba color, tile57_rgba halo,
-                        float halo_px, tile57_rot_align align);
+                        const tile57_local_rings *glyphs, tile57_color color, tile57_color halo,
+                        float halo_px, tile57_rot_align align, int32_t text_group);
     /* Optional. Leave NULL to get vector outlines from the two calls above; set them
      * to draw point symbols and area patterns from the sprite atlas as textured quads.
      * Draw the sprite at rot_deg + (align == MAP ? view_rotation : 0). */
@@ -363,7 +367,7 @@ typedef struct {
     void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor,
                           float ox_px, float oy_px, const char *text, size_t text_len,
                           float size_px, float rot_deg, tile57_rot_align align,
-                          tile57_rgba color, tile57_rgba halo);
+                          tile57_color color, tile57_color halo, int32_t text_group);
 } tile57_surface_cb;
 
 /* Portray the view once and drive the callbacks. rotation_rad is the view rotation
@@ -386,10 +390,90 @@ and soundings always draw, per S-52), so you don't repeat that work — and it l
 out depth-contour values along their contours, so you get the same labelled contours
 as the raster and MapLibre outputs.
 
+Tell it your framebuffer density with `m.device_scale` (2.0 on a Retina backing
+store). The engine sizes text and symbols in reference pixels and you draw them, so
+it needs the density to size a label's collision box in the pixels you actually
+paint. Draw at 2x while leaving `device_scale` at 1.0 and the declutter reserves
+space for glyphs half the size that land on screen; the view comes out overlapping
+even though the engine decluttered it correctly for the size it was told.
+
+#### Paint order
+
+The calls arrive in S-52 paint order. The engine buffers the scene and sorts it
+before calling you, per S-52 Presentation Library §10.3.4.1:
+
+1. **`display_priority`** — the dominant key, and it "applies irrespective of whether an
+   object is a point, line or area". A light sector arc at priority 24 paints over
+   a wreck symbol at 12, even though one is a line and the other a point.
+2. **geometry class** — a tiebreak used *only* where `display_priority` is equal:
+   areas, then area patterns, then lines, then point symbols, then soundings.
+3. **emission order** — the tiebreak where both of the above are equal.
+
+Text is drawn last regardless of priority (§10.3.4.1, §16 rule 3). Draw the calls
+in the order you receive them and the picture is right; you need no sort of your own.
+
+That holds only as long as you *preserve* the order. A GPU renderer usually batches
+by draw type — all fills, then all sprites, then all text — to keep pipeline
+switches down, and batching reorders the stream by construction: it lifts every call
+of one type out of the sequence the engine placed it in. Global paint order is then
+broken again, and broken in the way that looks fine on an empty stretch of water and
+wrong in a harbour.
+
+**Do not batch by draw type and then sort each batch by `display_priority`.** That
+reproduces the exact inversion this ordering exists to prevent — it makes geometry
+class dominant and `display_priority` subordinate, so every sprite covers every line
+whatever the priorities say. If you must batch, batch by `display_priority` *band* and
+draw the bands in ascending order, switching pipelines within a band as the class
+tiebreak requires. `display_priority` is exposed so you can rebuild the real order, not so
+you can sort inside a per-type bucket.
+
+A host that batches per tile must go further: sorting within a tile still leaves
+paint order broken across tiles, because tiles are drawn one after another. Walk
+the priority bands *outside* the tile loop.
+
+Both text callbacks carry the label's `text_group`, so a host can style text by its
+S-52 role rather than by its feature — draw group 11 (important text: vertical
+clearances, bridge and cable legends) larger or bold, and leave ordinary names at
+their normal weight. The group is per-LABEL, not per-feature: the same feature can
+emit a name in group 26 and a clearance in group 11 on consecutive calls.
+
 The per-tile form `tile57_chart_tile_surface` takes no rotation: a tile is
 tessellated once, north-up, and re-transformed on the GPU each frame, so a
 continuously-turning course-up view never re-portrays or re-tessellates it — the
 `align` flags carry everything the host needs to turn the right marks with the chart.
+
+Because `tile57_chart_tile_surface` declutters **within** each tile, a label that
+straddles a tile seam collides or repeats across the join. When you cache geometry
+per tile but want labels resolved across the whole view, add a single
+`tile57_chart_labels` pass (`tile57_compose_labels` for the composed set). It walks
+the view's covering tiles into **one** collision pool and emits **only** the
+surviving text — through the same `draw_text_str` / `draw_text` callbacks, at the
+same world anchors as `tile57_chart_surface` — and draws no fills, lines, symbols, or
+soundings. So the host draws geometry + symbols from its per-tile cache and calls
+this once per frame (or per view change) to overlay the globally-decluttered text
+last (text is drawn on top).
+
+It is cheap enough to call on every view change. Each covering tile is portrayed
+once and its label *candidates* — what a label says, how it is shaped, where it is
+anchored — memoize on the chart or compositor. Neither zoom nor rotation is part of
+that memo: the collision box, the depth-contour legibility gate and the upright flip
+on a tangent-rotated run all derive per call, so a pan, zoom or rotation over tiles
+already seen does no portrayal work and settles in well under a millisecond. Only
+the first view of a region pays, and changing the palette or any mariner setting
+retires the memo (a candidate carries a resolved colour and the text the mariner's
+settings selected). The memo is bounded at a few hundred tiles and released with the
+handle.
+
+```c
+/* View-level, globally-decluttered TEXT pass: emits only surviving labels
+ * (draw_text_str / draw_text), no geometry. Same anchors/space as
+ * tile57_chart_surface; rotation_rad declutters in the screen frame. */
+tile57_status tile57_chart_labels(tile57_chart *chart, double lon, double lat, double zoom,
+                             double rotation_rad,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             const tile57_surface_cb *surface, tile57_error *err);
+```
 
 There is a pixel-space twin, `tile57_chart_canvas` with a `tile57_canvas_cb` vtable,
 that emits the SAME portrayal as resolved paint-order draw calls in canvas
@@ -456,6 +540,13 @@ tile57_status tile57_compose_surface(tile57_compose *c, double lon, double lat, 
                                      double rotation_rad,
                                      uint32_t width, uint32_t height, const tile57_mariner *m,
                                      const tile57_surface_cb *surface, tile57_error *err);
+/* The composed view-level, globally-decluttered TEXT pass (tile57_chart_labels
+ * across the composed set): only surviving labels, decluttered across tile AND
+ * chart seams, no geometry. */
+tile57_status tile57_compose_labels(tile57_compose *c, double lon, double lat, double zoom,
+                                    double rotation_rad,
+                                    uint32_t width, uint32_t height, const tile57_mariner *m,
+                                    const tile57_surface_cb *surface, tile57_error *err);
 tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, double zoom,
                                    const tile57_query_cb *cb, tile57_error *err);
 
@@ -558,6 +649,15 @@ typedef struct tile57_mariner {
     double sounding_size_scale;     /* extra size multiplier for SOUNDINGS, on top of
                                      * size_scale (scales each digit + spacing together).
                                      * 1.0 = none; 0 reads as 1.0. */
+    double device_scale;            /* device px per reference px — the HiDPI density the
+                                     * SURFACE paths are drawn at (2.0 on a Retina backing
+                                     * store). Describes the DISPLAY where size_scale
+                                     * describes the mariner; the two multiply. Sizes text
+                                     * and symbols AND their collision boxes in the units
+                                     * the host actually draws in. The pixel outputs ignore
+                                     * it (that density is already in the requested
+                                     * width/height). 1.0 = a 1x framebuffer; 0 reads as
+                                     * 1.0. */
 } tile57_mariner;
 
 void tile57_mariner_defaults(tile57_mariner *m);   /* canonical defaults, date_view = "" */

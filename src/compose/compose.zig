@@ -88,7 +88,7 @@ pub fn worldAxisToTile(w: f64, scale: f64) u32 {
 // each owning cell's decoded features are clipped to the ground it OWNS (partition.ownedFace,
 // projected into the tile) and concatenated per layer. The faces are a disjoint partition, so
 // there is no double-draw at a seam and no z-order re-sort — S-52 draw priority rides the
-// per-feature `draw_prio` property, which the style sorts client-side (so feature order within
+// per-feature `display_priority` property, which the style sorts client-side (so feature order within
 // a tile is cosmetic). This retires the streaming in-bake cross-cell combiner: the per-cell
 // bakes stay dumb + cacheable, and all cross-cell logic is precomputed as the partition.
 
@@ -299,10 +299,23 @@ pub const ComposeSource = struct {
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
     part: geometry.partition.Partition,
+    /// False when the partition had to be BUILT (no sidecar, or one that no
+    /// longer matches this cell set). The C layer uses it to refresh the cache
+    /// on disk, so a stale sidecar heals itself instead of costing every open.
+    part_loaded: bool = false,
     minz: u8,
     maxz: u8,
     loop_max: u8, // deepest zoom the sources can serve (native windows + one fill-up overscale zoom)
     bounds: [4]f64, // union coverage [west, south, east, north] in degrees
+
+    // A RENDER-layer cache hung off this source for its lifetime — today the per-tile
+    // label-candidate memo the view label pass resolves from (render/labelcache.zig).
+    // The compositor reads baked archives and nothing else — it sits below the render
+    // path as a dependency leaf — so it cannot NAME that type: it holds the slot
+    // opaquely and releases it at deinit through the free function the render layer
+    // installs alongside it. Set both fields together or neither.
+    render_cache: ?*anyopaque = null,
+    render_cache_free: ?*const fn (*anyopaque) void = null,
 
     /// Compose one tile → raw (decompressed) MLT + the ownership flag (gpa-owned bytes; null when
     /// nothing rendered — `owned` then says whether a cell SHOULD have). This is what a live tile
@@ -317,6 +330,9 @@ pub const ComposeSource = struct {
     }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
+        if (self.render_cache) |p| {
+            if (self.render_cache_free) |f| f(p);
+        }
         self.part.deinit();
         if (self.owns_archives) {
             for (self.readers) |rp| rp.deinit();
@@ -450,6 +466,55 @@ fn covDegBounds(cc: coverage.ChartCoverage) [4]f64 {
 // partition, derive the zoom range + union bounds, and finish `src`. The arrays
 // already live in src.arena; on error the caller's errdefer tears down whatever
 // it owns per `owns_archives`.
+/// Put the cell set in ONE canonical order, whatever order the caller handed the
+/// archives over in.
+///
+/// The partition's input key (geometry.partition.inputKey) hashes the cells in
+/// sequence, and its ownership tie-break falls back to input order — so the order
+/// is part of the artifact's identity. That used to make the sidecar depend on the
+/// CALLER: `tile57 bake` sorted its archive paths, while a host that walked a
+/// directory handed them over in readdir order, and the two disagreed. The bake's
+/// partition then failed to load with StalePartition and every open rebuilt an
+/// identical copy from scratch.
+///
+/// Sorting on the coverage NAME (the file basename stem — already the ownership
+/// tie-break name) rather than on the path makes this independent of the caller's
+/// order AND of the directory layout, so a flat `<out>/tiles/*.pmtiles` bake and a
+/// host mirroring `d1/`, `d5/` subdirs produce the same key. `date` breaks ties
+/// between two archives of the same cell.
+///
+/// readers/maps/shims are index-aligned (cell index == reader index, relied on by
+/// composeTile), so all three are permuted together. maps is empty when the
+/// archives are borrowed from open charts.
+fn canonicalizeCellOrder(
+    readers: []const *pmtiles.Reader,
+    maps: []const []align(std.heap.page_size_min) const u8,
+    shims: []const LoadedCov,
+) void {
+    const n = shims.len;
+    if (n < 2) return;
+    // Insertion sort: the arrays are index-aligned and small (a library is
+    // hundreds of cells), and it is stable, so equal (name, date) keeps arrival
+    // order rather than shuffling.
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        var j = i;
+        while (j > 0 and cellOrderLt(shims[j], shims[j - 1])) : (j -= 1) {
+            std.mem.swap(LoadedCov, @constCast(&shims[j]), @constCast(&shims[j - 1]));
+            std.mem.swap(*pmtiles.Reader, @constCast(&readers[j]), @constCast(&readers[j - 1]));
+            if (maps.len == n) std.mem.swap([]align(std.heap.page_size_min) const u8, @constCast(&maps[j]), @constCast(&maps[j - 1]));
+        }
+    }
+}
+
+fn cellOrderLt(x: LoadedCov, y: LoadedCov) bool {
+    return switch (std.mem.order(u8, x.name, y.name)) {
+        .lt => true,
+        .gt => false,
+        .eq => std.mem.order(u8, x.date, y.date) == .lt,
+    };
+}
+
 fn finishOpen(
     gpa: std.mem.Allocator,
     src: *ComposeSource,
@@ -460,6 +525,7 @@ fn finishOpen(
     owns_archives: bool,
 ) !*ComposeSource {
     const a = src.arena.allocator();
+    canonicalizeCellOrder(readers, maps, shims);
     var minz: u8 = 255;
     var maxz: u8 = 0;
     var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 }; // union coverage [w, s, e, n]
@@ -487,6 +553,7 @@ fn finishOpen(
         } else |err| std.debug.print("  partition sidecar unusable ({s}); building\n", .{@errorName(err)});
     }
     if (!loaded) src.part = try geometry.partition.build(gpa, cells);
+    src.part_loaded = loaded;
 
     const fill_max = @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
     src.maps = maps;
@@ -571,7 +638,7 @@ fn scaleUpTile(layers: []mvt.DecodedLayer, shift: u5, tx: u32, ty: u32) void {
 }
 
 // Re-orient each polygon feature's rings (the sole MVT winding authority). Non-area features
-// pass through; the input `properties` are borrowed unchanged (draw_prio et al. survive).
+// pass through; the input `properties` are borrowed unchanged (display_priority et al. survive).
 fn orientPolys(a: std.mem.Allocator, feats: []const mvt.Feature) ![]const mvt.Feature {
     const out = try a.alloc(mvt.Feature, feats.len);
     for (feats, 0..) |f, i| {
@@ -594,4 +661,146 @@ fn readMetaJson(a: std.mem.Allocator, r: *pmtiles.Reader) ?[]const u8 {
         .gzip => gzip.decompress(a, raw) catch return null,
         else => null,
     };
+}
+
+// A one-tile in-memory archive carrying `feats` in `point_symbols` at (z,tx,ty) —
+// the fixture the SCAMIN passthrough test composes over. gpa-owned bytes.
+fn testArchiveBytes(gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32, feats: []const mvt.Feature) ![]u8 {
+    const layers = [_]mvt.Layer{.{ .name = "point_symbols", .features = feats }};
+    const enc = try mlt.encode(gpa, .{ .layers = &layers });
+    defer gpa.free(enc);
+    var w = pmtiles.StreamWriter.init(gpa);
+    defer w.deinit();
+    try w.add(z, tx, ty, enc);
+    return w.finishBytes(.{ .tile_type = .mlt });
+}
+
+// A rectangular CATCOV=1 coverage feature (one ring) over [w,s]..[e,n] degrees.
+fn testCovRect(a: std.mem.Allocator, w: f64, s: f64, e: f64, n: f64) ![]const []const []const s57.LonLat {
+    const ring = try a.alloc(s57.LonLat, 5);
+    const corners = [5][2]f64{ .{ w, s }, .{ e, s }, .{ e, n }, .{ w, n }, .{ w, s } };
+    for (corners, 0..) |c, i| ring[i] = .{
+        .lon_e7 = @intFromFloat(@round(c[0] * 1e7)),
+        .lat_e7 = @intFromFloat(@round(c[1] * 1e7)),
+    };
+    const rings = try a.alloc([]const s57.LonLat, 1);
+    rings[0] = ring;
+    const feat = try a.alloc([]const []const s57.LonLat, 1);
+    feat[0] = rings;
+    return feat;
+}
+
+// A composed tile must carry the per-feature `scamin` property through UNCHANGED.
+// SCAMIN is a plain per-feature MVT/MLT property (scene.zig emits it; replay.zig
+// reads it back as FeatureMeta.scamin), NOT something encoded in the layer name —
+// the scamin BUCKET layers are folded into the base layers at emit, so the layer
+// name carries nothing and the property is the only channel. The compositor is
+// therefore only correct if decode -> clip -> re-encode is property-transparent:
+// drop it and every scale-based thinning downstream (geometry cull AND label
+// declutter, which gates candidates on it before the collision pool) silently
+// stops working, with no error anywhere. Two cells split this tile, so the
+// VERBATIM byte-copy fast path cannot fire and the real seam path runs.
+test "composeTile carries per-feature SCAMIN through the seam clip + re-encode" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const z: u8 = 13; // harbor band (cscl 20k) native window is z13..16
+    const tx: u32 = 2355;
+    const ty: u32 = 3131;
+    const cscl: i32 = 20_000;
+
+    // The tile's ground box, and its mid meridian: cell A owns the west half,
+    // cell B the east. Mercator x is linear in lon, so a tile-pixel x of 1000 /
+    // 3000 (of EXTENT 4096) lands west / east of the split.
+    const tb = tile.tileBoundsLonLat(z, tx, ty); // [min_lon, min_lat, max_lon, max_lat]
+    const mid_lon = (tb[0] + tb[2]) / 2;
+    const pad = (tb[3] - tb[1]) * 0.25; // latitude margin so the faces span the tile
+
+    // One point per cell, each well inside its owner's half, each carrying a
+    // DISTINCT scamin the assertions below match by geometry.
+    const west_pt = [_]mvt.Point{.{ .x = 1000, .y = 2000 }};
+    const east_pt = [_]mvt.Point{.{ .x = 3000, .y = 2000 }};
+    const west_parts = [_][]const mvt.Point{&west_pt};
+    const east_parts = [_][]const mvt.Point{&east_pt};
+    const west_props = [_]mvt.Prop{
+        .{ .key = "class", .value = .{ .string = "BOYLAT" } },
+        .{ .key = "scamin", .value = .{ .int = 22_000 } },
+    };
+    const east_props = [_]mvt.Prop{
+        .{ .key = "class", .value = .{ .string = "BCNLAT" } },
+        .{ .key = "scamin", .value = .{ .int = 45_000 } },
+    };
+    const west_feat = [_]mvt.Feature{.{ .geom_type = .point, .parts = &west_parts, .properties = &west_props }};
+    const east_feat = [_]mvt.Feature{.{ .geom_type = .point, .parts = &east_parts, .properties = &east_props }};
+
+    const arc_w = try testArchiveBytes(gpa, z, tx, ty, &west_feat);
+    defer gpa.free(arc_w);
+    const arc_e = try testArchiveBytes(gpa, z, tx, ty, &east_feat);
+    defer gpa.free(arc_e);
+
+    var rd_w = try pmtiles.Reader.init(gpa, arc_w);
+    defer rd_w.deinit();
+    var rd_e = try pmtiles.Reader.init(gpa, arc_e);
+    defer rd_e.deinit();
+    const readers = [_]*pmtiles.Reader{ &rd_w, &rd_e };
+
+    const loaded = [_]LoadedCov{
+        .{
+            .name = "TESTW",
+            .date = "20240101",
+            .cscl = cscl,
+            .coverage = try testCovRect(a, tb[0], tb[1] - pad, mid_lon, tb[3] + pad),
+            .bounds = .{ tb[0], tb[1] - pad, mid_lon, tb[3] + pad },
+        },
+        .{
+            .name = "TESTE",
+            .date = "20240101",
+            .cscl = cscl,
+            .coverage = try testCovRect(a, mid_lon, tb[1] - pad, tb[2], tb[3] + pad),
+            .bounds = .{ mid_lon, tb[1] - pad, tb[2], tb[3] + pad },
+        },
+    };
+    const cells = try toPlaneCells(a, &loaded);
+    for (cells) |*c| c.reach = bandReach(cscl);
+    var part = try geometry.partition.build(gpa, cells);
+    defer part.deinit();
+
+    const res = try composeTile(gpa, &part, &readers, z, tx, ty, false);
+    const bytes = res.tile orelse return error.NothingComposed;
+    defer gpa.free(bytes);
+    try std.testing.expect(res.owned);
+
+    // Both cells' points must be in the composed tile, each still carrying ITS
+    // OWN scamin — the property survives the clip AND the concat/re-encode.
+    const out = try mlt.decode(a, bytes);
+    var seen_west = false;
+    var seen_east = false;
+    for (out) |layer| {
+        if (!std.mem.eql(u8, layer.name, "point_symbols")) continue;
+        for (layer.features) |f| {
+            try std.testing.expect(f.parts.len == 1 and f.parts[0].len == 1);
+            const sc = propInt(f.properties, "scamin") orelse return error.ScaminDropped;
+            if (f.parts[0][0].x == 1000) {
+                try std.testing.expectEqual(@as(i64, 22_000), sc);
+                seen_west = true;
+            } else if (f.parts[0][0].x == 3000) {
+                try std.testing.expectEqual(@as(i64, 45_000), sc);
+                seen_east = true;
+            }
+        }
+    }
+    try std.testing.expect(seen_west);
+    try std.testing.expect(seen_east);
+}
+
+// The integer value of `key` on a decoded feature, or null if absent.
+fn propInt(props: []const mvt.Prop, key: []const u8) ?i64 {
+    for (props) |p| if (std.mem.eql(u8, p.key, key)) return switch (p.value) {
+        .int => |v| v,
+        .uint => |v| @intCast(v),
+        else => null,
+    };
+    return null;
 }

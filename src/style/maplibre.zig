@@ -105,8 +105,8 @@ test "displayDenom is the exact inverse of scaminDisplayZoom" {
     try std.testing.expectEqual(displayDenom(0.0, 0.0), displayDenomZ(0, 0.0));
 }
 
-// S-52 DrawingPriority fill order: draw_prio*1000 - drval1.
-const FILL_SORT = .{ "-", .{ "*", .{ "coalesce", .{ "get", "draw_prio" }, 0 }, 1000 }, .{ "coalesce", .{ "get", "drval1" }, 0 } };
+// S-52 DrawingPriority fill order: display_priority*1000 - drval1.
+const FILL_SORT = .{ "-", .{ "*", .{ "coalesce", .{ "get", "display_priority" }, 0 }, 1000 }, .{ "coalesce", .{ "get", "drval1" }, 0 } };
 
 // solid lines EXCLUDE the un-tessellated complex-linestyle runs (tagged ls_style):
 // those get their own dasharray + line-placed symbol layers (linestyleLayers), so a
@@ -429,10 +429,10 @@ fn lineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, name: []const u8, f
     try applyBucket(js, filt, true, bkt, s, null); // line: scamin line variants band-independent
     try js.objectField("layout");
     try js.beginObject();
-    // draw_prio as the sole intra-layer z-order axis (mirrors fill-/symbol-sort-key),
+    // display_priority as the sole intra-layer z-order axis (mirrors fill-/symbol-sort-key),
     // so a higher-priority line paints over a lower one within a dash class.
     try js.objectField("line-sort-key");
-    try js.write(.{ "coalesce", .{ "get", "draw_prio" }, 0 });
+    try js.write(.{ "coalesce", .{ "get", "display_priority" }, 0 });
     try js.endObject();
     try js.objectField("paint");
     try linePaint(js, s.line_color, dash, s.size_scale);
@@ -459,9 +459,9 @@ fn pointLayout(js: *Stringify, alignment: []const u8, icon: std.json.Value, scal
     try js.objectField("icon-ignore-placement");
     try js.write(true);
     // Draw point symbols in S-101 DrawingPriority order (SYMBOL_SORT: effective
-    // draw_prio, higher = on top), not raw tile/source order — so e.g. a light
+    // display_priority, higher = on top), not raw tile/source order — so e.g. a light
     // (DrawingPriority 24) draws over an obstruction (12). Sorts ascending (lower drawn
-    // first = underneath). draw_prio is the SOLE axis; the danger-over-sounding
+    // first = underneath). display_priority is the SOLE axis; the danger-over-sounding
     // deviation is a sort VALUE (effective 19), not a class tier. z-order "auto" makes
     // the sort-key take effect. Mirrors fill-sort-key on the fill layers. NOTE: this
     // orders WITHIN one layer only; LIGHTS get their own top layer set (see json).
@@ -487,25 +487,25 @@ const SOUNDINGS_PRIO = 18;
 // `class in DANGER_CLASSES` — the danger-over-sounding deviation (see DANGER_CLASSES).
 const IN_DANGER = .{ "in", .{ "get", "class" }, .{ "literal", DANGER_CLASSES } };
 
-// Effective DrawingPriority = draw_prio (the honest catalogue 0..30 tile property,
+// Effective DrawingPriority = display_priority (the honest catalogue 0..30 tile property,
 // NEVER bucketed) offset by the display plane (plane*64 most-significant; +1 OverRadar
 // / -1 UnderRadar, inert today -> coalesce 0). This is the SOLE point z-order axis:
 // no base/danger/light class TIERS. Used both as the partition threshold and, via
 // SYMBOL_SORT, as the intra-layer sort key.
-const EFF_PRIO = .{ "+", .{ "*", .{ "coalesce", .{ "get", "plane" }, 0 }, 64 }, .{ "coalesce", .{ "get", "draw_prio" }, 0 } };
+const EFF_PRIO = .{ "+", .{ "*", .{ "coalesce", .{ "get", "display_plane" }, 0 }, 64 }, .{ "coalesce", .{ "get", "display_priority" }, 0 } };
 
-// symbol-sort-key: draw_prio is the sole axis, EXCEPT the S-52 danger deviation is
+// symbol-sort-key: display_priority is the sole axis, EXCEPT the S-52 danger deviation is
 // expressed here as a sort VALUE — a danger (OBSTRN/WRECKS/UWTROC) sorts at an
-// effective 19 so it draws just above soundings (18) WITHOUT baking a fake draw_prio
+// effective 19 so it draws just above soundings (18) WITHOUT baking a fake display_priority
 // into the tile (the tile keeps the honest 12, so pick/spec stay correct). A base at
-// draw_prio 30 still sorts above the danger's 19; a base at 5 stays under soundings.
+// display_priority 30 still sorts above the danger's 19; a base at 5 stays under soundings.
 const SYMBOL_SORT = .{ "case", IN_DANGER, 19, EFF_PRIO };
 
-// Which slice of the point family a layer carries. z-order is draw_prio ALONE: `base`
+// Which slice of the point family a layer carries. z-order is display_priority ALONE: `base`
 // = effective-prio under soundings (< 18), `dangers_only` = effective-prio at/over
 // soundings (>= 18) PLUS the danger deviation, `lights_only` = the paramount navaid on
 // top. Dangers ride the over-soundings pass via the class-membership OR (their honest
-// draw_prio 12 is < 18); LIGHTS keep their own top pass so the marker<digit<light
+// display_priority 12 is < 18); LIGHTS keep their own top pass so the marker<digit<light
 // legibility order survives across SCAMIN buckets (separate layers painted in emit order).
 const PointMode = enum { base, dangers_only, lights_only };
 
@@ -723,7 +723,7 @@ fn linestyleLayers(js: *Stringify, s: *const SCtx, ls: std.json.Value, bkt: Buck
         try js.objectField("layout");
         try js.beginObject();
         try js.objectField("line-sort-key");
-        try js.write(.{ "coalesce", .{ "get", "draw_prio" }, 0 });
+        try js.write(.{ "coalesce", .{ "get", "display_priority" }, 0 });
         try js.endObject();
         try js.objectField("paint");
         try js.beginObject();
@@ -1039,12 +1039,12 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
     }
 
     // 5. point symbols + soundings (sprite required) over the merged `point_symbols`
-    // layer, stacked by z-order — draw_prio is the SOLE axis, partitioned at the
+    // layer, stacked by z-order — display_priority is the SOLE axis, partitioned at the
     // soundings boundary (18):
     //   under-soundings symbols (effective-prio < 18) UNDER soundings,
     //   then soundings, then over-soundings symbols (effective-prio >= 18, plus the
     //   DANGER markers at effective 19 so a hazard stays on top of its own depth
-    //   number), then LIGHTS on top. A base at draw_prio 30 lands in the over pass and
+    //   number), then LIGHTS on top. A base at display_priority 30 lands in the over pass and
     //   sorts above a danger's 19; a base at 5 stays under soundings. One gated layer
     //   set per SCAMIN bucket rides each pass.
     if (sprite_on) {
@@ -1442,7 +1442,7 @@ fn layerIndexById(layers: []std.json.Value, id: []const u8) ?usize {
     return null;
 }
 
-test "json: point z-order = draw_prio alone (threshold partition + danger sort-value)" {
+test "json: point z-order = display_priority alone (threshold partition + danger sort-value)" {
     const a = std.testing.allocator;
     const ct =
         \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
@@ -1456,20 +1456,20 @@ test "json: point z-order = draw_prio alone (threshold partition + danger sort-v
     });
     defer a.free(out);
 
-    // symbol-sort-key = draw_prio (via plane*64 + draw_prio), with dangers mapped to an
-    // effective 19 as a sort VALUE — NOT a baked tile draw_prio, NOT a class tier.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"symbol-sort-key\":[\"case\",[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]],19,[\"+\",[\"*\",[\"coalesce\",[\"get\",\"plane\"],0],64],[\"coalesce\",[\"get\",\"draw_prio\"],0]]]") != null);
+    // symbol-sort-key = display_priority (via plane*64 + display_priority), with dangers mapped to an
+    // effective 19 as a sort VALUE — NOT a baked tile display_priority, NOT a class tier.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"symbol-sort-key\":[\"case\",[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]],19,[\"+\",[\"*\",[\"coalesce\",[\"get\",\"display_plane\"],0],64],[\"coalesce\",[\"get\",\"display_priority\"],0]]]") != null);
     // The under-soundings pass filters on effective-prio < 18 (the threshold), not class.
-    try std.testing.expect(std.mem.indexOf(u8, out, "[\"<\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"plane\"],0],64],[\"coalesce\",[\"get\",\"draw_prio\"],0]],18]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"<\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"display_plane\"],0],64],[\"coalesce\",[\"get\",\"display_priority\"],0]],18]") != null);
     // The over-soundings pass = effective-prio >= 18 OR a danger class.
-    try std.testing.expect(std.mem.indexOf(u8, out, "[\"any\",[\">=\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"plane\"],0],64],[\"coalesce\",[\"get\",\"draw_prio\"],0]],18],[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]]]") != null);
-    // Lines gained a draw_prio sort key.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"line-sort-key\":[\"coalesce\",[\"get\",\"draw_prio\"],0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"any\",[\">=\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"display_plane\"],0],64],[\"coalesce\",[\"get\",\"display_priority\"],0]],18],[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]]]") != null);
+    // Lines gained a display_priority sort key.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"line-sort-key\":[\"coalesce\",[\"get\",\"display_priority\"],0]") != null);
 
     // z-order (emit order): under-symbols < soundings < over-symbols < lights. So a
-    // base at draw_prio 30 (over pass, sorts 30) draws above a danger (over pass, sorts
+    // base at display_priority 30 (over pass, sorts 30) draws above a danger (over pass, sorts
     // 19) above soundings (18) above a base at 5 (under pass). Layer array position +
-    // sort key together realise draw_prio as the sole axis.
+    // sort key together realise display_priority as the sole axis.
     var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
     defer parsed.deinit();
     const layers = parsed.value.object.get("layers").?.array.items;
