@@ -240,6 +240,9 @@ const CellBackend = struct {
 pub const GpuScene = struct {
     arena: std.heap.ArenaAllocator,
     scene: render.gpu.Scene,
+    /// A cached tile's shaped label candidates (empty on assembled/label scenes),
+    /// decluttered per view into the final label geometry. Arena-owned.
+    candidates: []render.gpu.LabelCandidate = &.{},
 
     pub fn deinit(self: *GpuScene) void {
         self.arena.deinit();
@@ -1392,8 +1395,11 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
     out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
     errdefer out.arena.deinit();
 
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
     var parts = std.ArrayList(render.gpu.Scene).empty;
-    defer parts.deinit(gpa);
+    var cands = std.ArrayList(render.gpu.LabelCandidate).empty;
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
     var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
@@ -1403,51 +1409,15 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
             const built = renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings) catch continue;
             geomPut(key, built);
         }
-        if (geomGet(key)) |g| parts.append(gpa, g.scene) catch {};
+        if (geomGet(key)) |g| {
+            parts.append(sa, g.scene) catch {};
+            cands.appendSlice(sa, g.candidates) catch {};
+        }
     }
 
-    const label = composeViewLabelScene(src, lon, lat, zoom, w, h, palette, settings) catch null;
-    defer if (label) |l| l.deinit();
-    if (label) |l| parts.append(gpa, l.scene) catch {};
+    parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
     out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
-    return out;
-}
-
-/// The composed view's labels, decluttered across every covering tile at once.
-fn composeViewLabelScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
-    const out = try gpa.create(GpuScene);
-    errdefer gpa.destroy(out);
-    out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
-    errdefer out.arena.deinit();
-
-    const colors = try sharedColors();
-    var scratch = std.heap.ArenaAllocator.init(gpa);
-    defer scratch.deinit();
-    const sa = scratch.allocator();
-    const store = try viewSymbolStore(sa, palette);
-    defer store.deinit();
-
-    var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, zoom);
-    defer gs.deinit();
-    gs.store = store.asStore();
-    gs.mode = .labels;
-    const atl = sharedGpuAtlases();
-    gs.sprites = atl[0];
-    gs.glyphs = atl[1];
-    const surf = gs.asSurface();
-
-    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-    var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
-    try surf.beginScene(vt.z);
-    while (vt.next()) |t| {
-        const res = src.tile(sa, t.z, t.x, t.y) catch continue;
-        const bytes = res.tile orelse continue;
-        const layers = mlt.decode(sa, bytes) catch continue;
-        gs.setTile(t.z, t.x, t.y);
-        scene.replayTile(sa, surf, layers) catch continue;
-    }
-    out.scene = try gs.build(out.arena.allocator());
     return out;
 }
 
@@ -1469,7 +1439,6 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, @floatFromInt(z));
     defer gs.deinit();
     gs.store = store.asStore();
-    gs.mode = .geometry; // labels are decluttered view-wide, not cached per tile
     const atl = sharedGpuAtlases();
     gs.sprites = atl[0];
     gs.glyphs = atl[1];
@@ -1484,6 +1453,7 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
         }
     }
     out.scene = try gs.build(out.arena.allocator());
+    out.candidates = try gs.takeCandidates(out.arena.allocator());
     return out;
 }
 
@@ -2226,8 +2196,13 @@ pub const Chart = struct {
         out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
         errdefer out.arena.deinit();
 
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        // Each covering tile's cached geometry scene + its cached label candidates.
         var parts = std.ArrayList(render.gpu.Scene).empty;
-        defer parts.deinit(gpa);
+        var cands = std.ArrayList(render.gpu.LabelCandidate).empty;
 
         const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
         var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
@@ -2237,63 +2212,18 @@ pub const Chart = struct {
                 const built = self.renderTileGpuScene(t.z, t.x, t.y, palette, settings) catch continue;
                 geomPut(key, built);
             }
-            if (geomGet(key)) |g| parts.append(gpa, g.scene) catch {};
+            if (geomGet(key)) |g| {
+                parts.append(sa, g.scene) catch {};
+                cands.appendSlice(sa, g.candidates) catch {};
+            }
         }
 
-        // View-wide labels: decluttered across every covering tile at once.
-        const label = self.viewLabelScene(lon, lat, zoom, w, h, palette, settings) catch null;
-        defer if (label) |l| l.deinit();
-        if (label) |l| parts.append(gpa, l.scene) catch {};
+        // Labels: box every candidate at the view zoom and declutter across the
+        // WHOLE view at once, so a name never repeats across a seam. Cheap — no
+        // re-shaping (that was cached per tile).
+        parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
         out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
-        return out;
-    }
-
-    /// The view's labels as a draw-ready scene, decluttered across the whole view
-    /// (all covering tiles into ONE label pool). NOT cached — rebuilt each call,
-    /// which is cheap: it shapes and boxes labels but tessellates no geometry.
-    fn viewLabelScene(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
-        const out = try gpa.create(GpuScene);
-        errdefer gpa.destroy(out);
-        out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
-        errdefer out.arena.deinit();
-
-        const colors = try self.viewColorsRef();
-        const store = try self.viewStoreFor(palette);
-        var scratch = std.heap.ArenaAllocator.init(gpa);
-        defer scratch.deinit();
-        const sa = scratch.allocator();
-
-        var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, zoom);
-        defer gs.deinit();
-        gs.store = store.asStore();
-        gs.mode = .labels;
-        const atl = sharedGpuAtlases();
-        gs.sprites = atl[0];
-        gs.glyphs = atl[1];
-        const surf = gs.asSurface();
-
-        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
-        var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
-        try surf.beginScene(vt.z);
-        switch (self.backend) {
-            .reader => |*rd| {
-                while (vt.next()) |t| {
-                    const layers = self.viewTileLayers(rd, t.z, t.x, t.y) orelse continue;
-                    gs.setTile(t.z, t.x, t.y);
-                    scene.replayTile(sa, surf, layers) catch continue;
-                }
-            },
-            .cell => |*cb2| {
-                const one = [_]scene.CellRef{cellRef(cb2)};
-                while (vt.next()) |t| {
-                    gs.setTile(t.z, t.x, t.y);
-                    scene.appendTile(surf, sa, &one, t.z, t.x, t.y, self.pick_attrs) catch continue;
-                }
-            },
-            .cells => return error.Unsupported,
-        }
-        out.scene = try gs.build(out.arena.allocator());
         return out;
     }
 
@@ -2319,7 +2249,6 @@ pub const Chart = struct {
         var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, @floatFromInt(z));
         defer gs.deinit();
         gs.store = store.asStore();
-        gs.mode = .geometry; // labels are decluttered view-wide, not cached per tile
         const atl = sharedGpuAtlases();
         gs.sprites = atl[0];
         gs.glyphs = atl[1];
@@ -2337,6 +2266,7 @@ pub const Chart = struct {
             .cells => return error.Unsupported,
         }
         out.scene = try gs.build(out.arena.allocator());
+        out.candidates = try gs.takeCandidates(out.arena.allocator());
         return out;
     }
 

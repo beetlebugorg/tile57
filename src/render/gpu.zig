@@ -169,8 +169,30 @@ pub const AtlasId = enum(u8) {
     glyph = 2, // the SDF label-glyph atlas
 };
 
-/// What a surface pass emits — see GpuSurface.mode.
-pub const Mode = enum { all, geometry, labels };
+/// A shaped-but-not-yet-decluttered label. VIEW-INDEPENDENT: its renderable
+/// geometry is in absolute world (SDF glyph `quads`, or `verts`/`indices` when
+/// the SDF atlas is missing — one is empty), and its collision box is stored in
+/// LOCAL px relative to the world anchor. That lets tile57 cache a tile's
+/// candidates once and, every frame, box them at the live view zoom
+/// (anchor*256*2^zoom + local box) and run the pool — no re-shaping on a pan.
+pub const LabelCandidate = struct {
+    quads: []const Quad = &.{},
+    verts: []const Vertex = &.{},
+    indices: []const u32 = &.{},
+    ax: f32, // world anchor
+    ay: f32,
+    bx0: f32, // collision box, local px relative to the anchor
+    by0: f32,
+    bx1: f32,
+    by1: f32,
+    scamin: f32,
+    disp_cat: u8,
+    color: [4]u8, // range tint for the outline (triangle) fallback; SDF bakes its own
+    group: i64,
+    paint_key: u32,
+    cls: []const u8, // for the repeat rule
+    text: []const u8,
+};
 
 /// A contiguous slice of one buffer that draws with one pipeline. Ranges come
 /// out sorted by `paint_key`; draw them in order and the chart is correct.
@@ -296,10 +318,6 @@ pub const GpuSurface = struct {
     ops: std.ArrayList(Op) = .empty,
     cur: rs.FeatureMeta = .{},
     store: ?sym.SymbolStore = null,
-    /// What this pass emits. tile57 caches GEOMETRY per tile but declutters LABELS
-    /// across the whole view, so the two are portrayed by separate passes: a
-    /// geometry pass skips text, a labels pass skips everything else.
-    mode: Mode = .all,
     /// The atlases the host will upload. When `sprites` has a symbol's cell it
     /// draws as a quad; without it, the outline-triangle fallback keeps the mark
     /// visible. `glyphs` is required for SDF text (no atlas -> no labels).
@@ -312,12 +330,12 @@ pub const GpuSurface = struct {
     patterns: std.ArrayList(PatternCell) = .empty,
     pattern_ix: std.StringHashMapUnmanaged(u32) = .empty,
     fnt: ?fontmod.Font = null,
-    /// Shaped labels and the pool that ranks them. Held apart from `ops` because
-    /// which labels survive is a property of the WHOLE scene, not of the order
-    /// the engine walked it — so none may be admitted until `build` resolves the
-    /// pool.
-    labels: std.ArrayList(Op) = .empty,
-    pool: dc.Pool = .{},
+    /// Labels are NOT decluttered here — `build` emits geometry only. Each label
+    /// is shaped into a view-INDEPENDENT candidate (its glyph quads in absolute
+    /// world + a local-px box); the whole view's candidates are cached per tile
+    /// and decluttered together per frame (see `assembleLabels`), so a name never
+    /// repeats across a seam and shaping never re-runs on a pan.
+    candidates: std.ArrayList(LabelCandidate) = .empty,
     glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
 
     const vtable = rs.Surface.VTable{
@@ -352,8 +370,7 @@ pub const GpuSurface = struct {
         self.quads.deinit(self.a);
         self.patterns.deinit(self.a);
         self.pattern_ix.deinit(self.a);
-        self.labels.deinit(self.a);
-        self.pool.deinit(self.a);
+        self.candidates.deinit(self.a);
         self.glyph_cache.deinit(self.a);
     }
 
@@ -461,7 +478,6 @@ pub const GpuSurface = struct {
 
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, _: ?rs.DepthRange) anyerror!void {
         const self = sp(ctx);
-        if (self.mode == .labels) return;
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
         try self.push(.area, self.rgba(token), .{ .fill = .{ .rings = rings, .rule = .nonzero } });
     }
@@ -478,7 +494,6 @@ pub const GpuSurface = struct {
     /// derive that phase, so nothing extra rides the vertex.
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
         const self = sp(ctx);
-        if (self.mode == .labels) return;
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
         // Same density the pixel path rasterizes at, so a pattern repeats at the
@@ -508,7 +523,6 @@ pub const GpuSurface = struct {
 
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, _: ?f64) anyerror!void {
         const self = sp(ctx);
-        if (self.mode == .labels) return;
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
         try self.push(.line, self.rgba(token), .{ .stroke = .{
             .lines = lines,
@@ -519,7 +533,6 @@ pub const GpuSurface = struct {
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, _: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
         const self = sp(ctx);
-        if (self.mode == .labels) return;
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
         var eff = name;
@@ -530,7 +543,6 @@ pub const GpuSurface = struct {
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
         const self = sp(ctx);
-        if (self.mode == .labels) return;
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
         // Bold/faint split at the mariner's LIVE safety depth (metres), value in
@@ -591,7 +603,6 @@ pub const GpuSurface = struct {
     /// resolves its own).
     fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
         const self = sp(ctx);
-        if (self.mode == .geometry) return;
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
         const f = &(self.fnt orelse return);
@@ -638,26 +649,14 @@ pub const GpuSurface = struct {
             (try self.outlineRun(gids.items, x0, baseline, px, at)) orelse
             return; // all-whitespace run: nothing to place
 
-        // The collision box, in the screen frame this scene is for. The host owns
-        // the camera, but a pan only translates every box alike and so cannot
-        // change which labels collide; the zoom is what sets their relative size,
-        // and that is known. Ordinary labels are screen-upright, so no rotation
-        // enters the box either. The box uses the font metrics, not the atlas, so
-        // it matches the pixel/vector paths' declutter regardless of which
-        // geometry the run above produced.
-        const sc = self.screenPx(at);
-        const box = dc.Box{
-            .x0 = sc[0] + x0,
-            .y0 = sc[1] + baseline - f.ascent * px,
-            .x1 = sc[0] + x0 + pen,
-            .y1 = sc[1] + baseline + f.descent * px,
-        };
-        try self.pool.add(self.a, self.labels.items.len, style.group, self.cur.class, text, box);
-        try self.labels.append(self.a, .{
+        // Build the label's renderable geometry NOW — absolute world, so it is
+        // view-independent and caches — and store its box in LOCAL px relative to
+        // the anchor (the box uses the font metrics, not the atlas, so it matches
+        // the pixel/vector paths' declutter). `assembleLabels` boxes it at the
+        // live view zoom and runs the pool; nothing here is re-run on a pan.
+        const op = Op{
             .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
-            // Labels sort among themselves by emission order, which is the SENC
-            // sequence the pool already used to break its own ties.
-            .seq = self.labels.items.len,
+            .seq = 0,
             .kind = .text,
             .color = self.rgba(style.color),
             .scamin = if (self.cur.scamin) |s| @floatFromInt(s) else 0,
@@ -667,6 +666,33 @@ pub const GpuSurface = struct {
             .toy = self.tile_oy,
             .tscale = self.tile_scale,
             .geom = geom,
+        };
+        var cq = std.ArrayList(Quad).empty;
+        var cv_ = std.ArrayList(Vertex).empty;
+        var ci = std.ArrayList(u32).empty;
+        switch (geom) {
+            .sprite => |sq| try self.emitSpriteGeom(self.a, &cq, op, sq.anchor, sq.quads, sq.weight),
+            .mark => |m| try self.emitMarkGeom(self.a, &cv_, &ci, op, m.anchor, m.rings, m.rule),
+            else => unreachable,
+        }
+        const aw = opWorld(op, at);
+        try self.candidates.append(self.a, .{
+            .quads = try cq.toOwnedSlice(self.a),
+            .verts = try cv_.toOwnedSlice(self.a),
+            .indices = try ci.toOwnedSlice(self.a),
+            .ax = aw[0],
+            .ay = aw[1],
+            .bx0 = x0,
+            .by0 = baseline - f.ascent * px,
+            .bx1 = x0 + pen,
+            .by1 = baseline + f.descent * px,
+            .scamin = op.scamin,
+            .disp_cat = op.disp_cat,
+            .color = op.color,
+            .group = style.group,
+            .paint_key = op.paint_key,
+            .cls = self.cur.class,
+            .text = text,
         });
     }
 
@@ -783,18 +809,10 @@ pub const GpuSurface = struct {
         return error.UseBuildInstead;
     }
 
-    /// Order the scene and pack it into draw-ready buffers. Everything returned
-    /// is allocated from `arena`.
+    /// Order the GEOMETRY and pack it into draw-ready buffers. Labels are not
+    /// here — they are shaped into `candidates` and decluttered per view (see
+    /// `assembleLabels`). Everything returned is allocated from `arena`.
     pub fn build(self: *GpuSurface, arena: Allocator) !Scene {
-        // Rank the whole label set BEFORE any of it becomes geometry, then admit
-        // only the survivors. Text sorts last by paint_key either way, so this
-        // costs the ops sort nothing.
-        var kept = try self.pool.resolve(self.a, dc.REPEAT_PX);
-        defer kept.deinit(self.a);
-        for (self.labels.items, 0..) |label, i| {
-            if (kept.has(i)) try self.ops.append(self.a, label);
-        }
-
         std.mem.sort(Op, self.ops.items, {}, opLt);
 
         var verts = std.ArrayList(Vertex).empty;
@@ -862,6 +880,21 @@ pub const GpuSurface = struct {
             .ranges = try ranges.toOwnedSlice(arena),
             .patterns = pats,
         };
+    }
+
+    /// Copy this tile's shaped label candidates into `arena` (they were built in
+    /// the surface's scratch), so they outlive the portrayal and can be cached.
+    pub fn takeCandidates(self: *GpuSurface, arena: Allocator) ![]LabelCandidate {
+        const out = try arena.alloc(LabelCandidate, self.candidates.items.len);
+        for (self.candidates.items, out) |c, *o| {
+            o.* = c;
+            o.quads = try arena.dupe(Quad, c.quads);
+            o.verts = try arena.dupe(Vertex, c.verts);
+            o.indices = try arena.dupe(u32, c.indices);
+            o.cls = try arena.dupe(u8, c.cls);
+            o.text = try arena.dupe(u8, c.text);
+        }
+        return out;
     }
 
     /// Fold this draw into the previous range when it draws identically and is
@@ -1032,6 +1065,64 @@ pub fn assemble(arena: Allocator, scenes: []const Scene) !Scene {
         .quads = try quads.toOwnedSlice(arena),
         .ranges = try ranges.toOwnedSlice(arena),
         .patterns = try patterns.toOwnedSlice(arena),
+    };
+}
+
+/// Declutter a whole view's cached label CANDIDATES and pack the survivors into a
+/// draw-ready scene. This is the per-frame label cost: box each candidate at the
+/// live view zoom (its geometry is already shaped), rank the pool, emit. No
+/// re-shaping — that happened once, per tile, and was cached. `scratch` holds the
+/// pool; the result lives in `arena`.
+pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const LabelCandidate, view_zoom: f64, ignore_scamin: bool) !Scene {
+    var pool = dc.Pool{};
+    defer pool.deinit(scratch);
+    const s: f64 = 256.0 * std.math.exp2(view_zoom);
+
+    var ids = std.ArrayList(usize).empty;
+    defer ids.deinit(scratch);
+    for (cands, 0..) |c, i| {
+        // SCAMIN at the view zoom — base category (0) is never hidden (S-52).
+        if (!ignore_scamin and c.disp_cat != 0 and c.scamin > 0 and
+            !resolve.scaminVisible(@intFromFloat(c.scamin), view_zoom)) continue;
+        const ax = @as(f64, c.ax) * s;
+        const ay = @as(f64, c.ay) * s;
+        try pool.add(scratch, ids.items.len, c.group, c.cls, c.text, .{
+            .x0 = ax + c.bx0,
+            .y0 = ay + c.by0,
+            .x1 = ax + c.bx1,
+            .y1 = ay + c.by1,
+        });
+        try ids.append(scratch, i);
+    }
+    var kept = try pool.resolve(scratch, dc.REPEAT_PX);
+    defer kept.deinit(scratch);
+
+    var verts = std.ArrayList(Vertex).empty;
+    var indices = std.ArrayList(u32).empty;
+    var quads = std.ArrayList(Quad).empty;
+    var ranges = std.ArrayList(Range).empty;
+    for (ids.items, 0..) |ci, pool_id| {
+        if (!kept.has(pool_id)) continue;
+        const c = cands[ci];
+        if (c.quads.len > 0) {
+            const first = quads.items.len;
+            try quads.appendSlice(arena, c.quads);
+            try ranges.append(arena, .{ .first = @intCast(first), .count = @intCast(c.quads.len), .paint_key = c.paint_key, .pattern = NO_PATTERN, .color = c.color, .kind = .text, .prim = .quads, .atlas = .glyph });
+        }
+        if (c.indices.len > 0) {
+            const vbase: u32 = @intCast(verts.items.len);
+            const first = indices.items.len;
+            try verts.appendSlice(arena, c.verts);
+            for (c.indices) |idx| try indices.append(arena, idx + vbase);
+            try ranges.append(arena, .{ .first = @intCast(first), .count = @intCast(c.indices.len), .paint_key = c.paint_key, .pattern = NO_PATTERN, .color = c.color, .kind = .text, .prim = .triangles, .atlas = .none });
+        }
+    }
+    return .{
+        .vertices = try verts.toOwnedSlice(arena),
+        .indices = try indices.toOwnedSlice(arena),
+        .quads = try quads.toOwnedSlice(arena),
+        .ranges = try ranges.toOwnedSlice(arena),
+        .patterns = &.{},
     };
 }
 
@@ -1519,11 +1610,22 @@ const TextFixture = struct {
         try surf.drawText(text, &style, .{ .x = x, .y = y });
         try surf.endFeature();
     }
+    /// The decluttered label scene at the fixture's zoom (the labels-only path).
+    fn labelScene(self: *TextFixture, a: Allocator) !Scene {
+        const cands = try self.gs.takeCandidates(a);
+        return assembleLabels(a, a, cands, 4.0, false);
+    }
+    /// Geometry + decluttered labels assembled, as renderGpuScene does per view.
+    fn full(self: *TextFixture, a: Allocator) !Scene {
+        const geom = try self.gs.build(a);
+        const labels = try self.labelScene(a);
+        return assemble(a, &.{ geom, labels });
+    }
     /// One label alone: the baseline a crowded scene is measured against.
     fn one(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings, text: []const u8) !Scene {
         var fx = try TextFixture.init(a, colors, settings);
         try fx.label(text, 2000, 2000);
-        return fx.gs.build(a);
+        return fx.labelScene(a);
     }
 };
 
@@ -1552,7 +1654,7 @@ test "gpu: a label with a glyph atlas draws as one SDF quad run, not triangles" 
     fx.gs.glyphs = &glyphs;
     try fx.label("Annapolis", 2000, 2000); // 9 non-space glyphs
 
-    const scene = try fx.gs.build(a);
+    const scene = try fx.labelScene(a);
     // One text range, sampling the GLYPH atlas as quads — crisp SDF, not filled
     // outline triangles. 9 glyphs * 6 verts, and nothing tessellated.
     try testing.expectEqual(@as(usize, 1), scene.ranges.len);
@@ -1601,7 +1703,7 @@ test "gpu: a label becomes text-kind geometry that paints last" {
     try surf.endFeature();
     try fx.label("Rhode Island", 2000, 2000);
 
-    const scene = try fx.gs.build(a);
+    const scene = try fx.full(a);
     try testing.expectEqual(@as(usize, 2), scene.ranges.len);
     try testing.expectEqual(Kind.text, scene.ranges[scene.ranges.len - 1].kind);
     try testing.expect(scene.ranges[1].count > 0);
@@ -1632,14 +1734,14 @@ test "gpu: colliding labels resolve to one, and the loser emits no geometry" {
     var apart = try TextFixture.init(a, &colors, &settings);
     try apart.label("Alpha", 0, 0);
     try apart.label("Bravo", 5000, 5000); // thousands of px away
-    try testing.expectEqual(alpha + bravo, (try apart.gs.build(a)).vertices.len);
+    try testing.expectEqual(alpha + bravo, (try apart.labelScene(a)).vertices.len);
 
     var stacked = try TextFixture.init(a, &colors, &settings);
     try stacked.label("Alpha", 2000, 2000);
     try stacked.label("Bravo", 2000, 2000); // same spot, different text
     // The loser is dropped outright — not emitted transparent, not emitted
     // behind. Alpha wins: peers tie-break on emission order, the SENC sequence.
-    try testing.expectEqual(alpha, (try stacked.gs.build(a)).vertices.len);
+    try testing.expectEqual(alpha, (try stacked.labelScene(a)).vertices.len);
 }
 
 test "gpu: the same label repeated close by is dropped, far away is kept" {
@@ -1657,13 +1759,13 @@ test "gpu: the same label repeated close by is dropped, far away is kept" {
     var near = try TextFixture.init(a, &colors, &settings);
     try near.label("Rhode Island", 2000, 2000);
     try near.label("Rhode Island", 2200, 2000);
-    try testing.expectEqual(one, (try near.gs.build(a)).vertices.len);
+    try testing.expectEqual(one, (try near.labelScene(a)).vertices.len);
 
     // 600 px apart: far enough that the repeat is informative, not redundant.
     var far = try TextFixture.init(a, &colors, &settings);
     try far.label("Rhode Island", 2000, 2000);
     try far.label("Rhode Island", 2600, 2000);
-    try testing.expectEqual(one * 2, (try far.gs.build(a)).vertices.len);
+    try testing.expectEqual(one * 2, (try far.labelScene(a)).vertices.len);
 }
 
 test "gpu: text_size_scale grows the label and its collision box together" {
@@ -1693,12 +1795,12 @@ test "gpu: text_size_scale grows the label and its collision box together" {
     var small = try TextFixture.init(a, &colors, &plain);
     try small.label("Annapolis", 2000, 2000);
     try small.label("Baltimore", 2000, 2020);
-    try testing.expectEqual(ann + bal, (try small.gs.build(a)).vertices.len);
+    try testing.expectEqual(ann + bal, (try small.labelScene(a)).vertices.len);
 
     var grown = try TextFixture.init(a, &colors, &big);
     try grown.label("Annapolis", 2000, 2000);
     try grown.label("Baltimore", 2000, 2020);
-    try testing.expectEqual(ann, (try grown.gs.build(a)).vertices.len);
+    try testing.expectEqual(ann, (try grown.labelScene(a)).vertices.len);
 }
 
 // ---- ABI layout ------------------------------------------------------------
