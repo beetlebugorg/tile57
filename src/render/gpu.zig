@@ -812,12 +812,20 @@ pub const GpuSurface = struct {
                 .color = op.color,
             });
         }
+        // Pattern cells were interned into the surface's (scratch) allocator, but
+        // the scene must outlive it — so copy each cell's PIXELS into `arena`, not
+        // just the struct. Duping the struct alone leaves rgba dangling once the
+        // scratch arena is freed.
+        const pats = try arena.alloc(PatternCell, self.patterns.items.len);
+        for (self.patterns.items, pats) |src, *dst| {
+            dst.* = .{ .w = src.w, .h = src.h, .rgba = try arena.dupe(u8, src.rgba) };
+        }
         return .{
             .vertices = try verts.toOwnedSlice(arena),
             .indices = try indices.toOwnedSlice(arena),
             .quads = try quads.toOwnedSlice(arena),
             .ranges = try ranges.toOwnedSlice(arena),
-            .patterns = try arena.dupe(PatternCell, self.patterns.items),
+            .patterns = pats,
         };
     }
 
