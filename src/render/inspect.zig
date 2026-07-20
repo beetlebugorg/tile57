@@ -50,8 +50,8 @@ pub const Call = union(enum) {
 /// Strings are duped into the surface's allocator because meta is valid only for
 /// the duration of the call.
 pub const Meta = struct {
-    draw_prio: i64 = 0,
-    cat: i64 = 1,
+    display_priority: i64 = 0,
+    display_category: i64 = 1,
     vg: i64 = 0,
     scamin: ?i64 = null,
     overscale: bool = false,
@@ -137,8 +137,8 @@ pub const InspectSurface = struct {
     fn beginFeature(ctx: *anyopaque, meta: *const rs.FeatureMeta) anyerror!void {
         const self = sp(ctx);
         try self.features.append(self.a, .{ .meta = .{
-            .draw_prio = meta.draw_prio,
-            .cat = meta.cat,
+            .display_priority = meta.display_priority,
+            .display_category = meta.display_category,
             .vg = meta.vg,
             .scamin = meta.scamin,
             .overscale = meta.overscale,
@@ -220,7 +220,7 @@ test "InspectSurface records each call, grouped per feature, with meta" {
     try surf.beginScene(13);
 
     // Feature 1: a depth area — one fill.
-    const water_meta = rs.FeatureMeta{ .draw_prio = 3, .cat = 0, .vg = 13030, .class = "DEPARE", .s57_json = "{\"DRVAL1\":\"2\",\"DRVAL2\":\"5\"}" };
+    const water_meta = rs.FeatureMeta{ .display_priority = 3, .display_category = 0, .vg = 13030, .class = "DEPARE", .s57_json = "{\"DRVAL1\":\"2\",\"DRVAL2\":\"5\"}" };
     try surf.beginFeature(&water_meta);
     const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 0 }, .{ .x = 10, .y = 10 }, .{ .x = 0, .y = 10 } };
     const rings = [_][]const rs.TilePoint{&ring};
@@ -228,7 +228,7 @@ test "InspectSurface records each call, grouped per feature, with meta" {
     try surf.endFeature();
 
     // Feature 2: a lateral buoy — a symbol, a stroke and a label.
-    const buoy_meta = rs.FeatureMeta{ .draw_prio = 24, .cat = 1, .vg = 26050, .scamin = 30000, .class = "BOYLAT", .s57_json = "{\"OBJNAM\":\"CR\"}" };
+    const buoy_meta = rs.FeatureMeta{ .display_priority = 24, .display_category = 1, .vg = 26050, .scamin = 30000, .class = "BOYLAT", .s57_json = "{\"OBJNAM\":\"CR\"}" };
     try surf.beginFeature(&buoy_meta);
     const line = [_]rs.TilePoint{ .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 2 } };
     const lines = [_][]const rs.TilePoint{&line};
@@ -247,8 +247,8 @@ test "InspectSurface records each call, grouped per feature, with meta" {
 
     const f0 = is.features.items[0];
     try std.testing.expectEqualStrings("DEPARE", f0.meta.class);
-    try std.testing.expectEqual(@as(i64, 3), f0.meta.draw_prio);
-    try std.testing.expectEqual(@as(i64, 0), f0.meta.cat);
+    try std.testing.expectEqual(@as(i64, 3), f0.meta.display_priority);
+    try std.testing.expectEqual(@as(i64, 0), f0.meta.display_category);
     try std.testing.expectEqual(@as(usize, 1), f0.calls.items.len);
     switch (f0.calls.items[0]) {
         .fill_area => |fa| {

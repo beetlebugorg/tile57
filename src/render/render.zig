@@ -12,7 +12,7 @@
 //!   raster   — RasterCanvas: scanline-AA software rasterizer (RGBA8).
 //!   png      — RGBA8 -> PNG encoder (pure std, deterministic bytes).
 //!   pixel    — PixelSurface: the resolve-and-draw Surface implementation
-//!              (buffers ops, sorts by draw_prio, paints through a Canvas).
+//!              (buffers ops, sorts by display_priority, paints through a Canvas).
 //!   ascii    — AsciiSurface: the chart as a Unicode text grid (optional
 //!              ANSI-256 color). The worked example of adding a backend.
 //!   declutter— the label collision authority EVERY surface resolves through,

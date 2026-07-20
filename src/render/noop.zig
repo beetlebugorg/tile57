@@ -50,7 +50,7 @@ test "noop surface satisfies the full Surface lifecycle" {
     const surf = ns.asSurface();
 
     try surf.beginScene(13);
-    const meta = rs.FeatureMeta{ .draw_prio = 5, .cat = 1 };
+    const meta = rs.FeatureMeta{ .display_priority = 5, .display_category = 1 };
     try surf.beginFeature(&meta);
     const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 10, .y = 0 }, .{ .x = 10, .y = 10 } };
     const rings = [_][]const rs.TilePoint{&ring};

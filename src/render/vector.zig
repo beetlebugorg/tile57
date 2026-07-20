@@ -24,7 +24,7 @@
 //!     back for a second reason as well — which label SURVIVES cannot be known
 //!     until the whole scene is walked and the collision pool is resolved.
 //!     Callback order only survives to the screen if the host preserves it: a
-//!     host that batches by draw type must sort its own batches by `plane`.
+//!     host that batches by draw type must sort its own batches by `display_priority`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -89,18 +89,25 @@ pub const CLocalRings = extern struct {
 /// The S-52 display category — the axis the mariner's display_base /
 /// display_standard / display_other settings select on. Display base is the
 /// never-hide set: SCAMIN is not applied to it.
-pub const CDispCat = enum(c_int) { base = 0, standard = 1, other = 2 };
+pub const CDisplayCategory = enum(c_int) { base = 0, standard = 1, other = 2 };
+
+/// S-101 DisplayPlane. Outranks display_priority in paint order (S-52 PresLib
+/// §10.3.4.2: "the OVERRADAR flag takes precedence over the objects display
+/// priority").
+pub const CDisplayPlane = enum(c_int) { under_radar = 0, over_radar = 1 };
 
 /// The feature the following draw calls belong to. `cls` is the S-57 object-class
 /// acronym (NUL-terminated, "" if none); `scamin` is the SCAMIN 1:N denominator
-/// (<=0 => always visible); `plane` is the S-52 draw priority (paint-order hint);
-/// `disp_cat` is the display category the feature came in on — a host applying
-/// SCAMIN itself must skip it for `.base`.
+/// (<=0 => always visible); `display_plane` and `display_priority` are the two
+/// paint-order axes, in that order of precedence; `display_category` is the
+/// display category the feature came in on — a host applying SCAMIN itself must
+/// skip it for `.base`.
 pub const CFeature = extern struct {
     cls: [*:0]const u8,
     scamin: i64,
-    plane: i32,
-    disp_cat: CDispCat,
+    display_priority: i32,
+    display_plane: CDisplayPlane,
+    display_category: CDisplayCategory,
 };
 
 /// The GPU paint table. Every call gets `ctx` back verbatim; pointers are valid
@@ -182,8 +189,9 @@ pub const Candidate = struct {
     /// storage outlives the call that emits it.
     cls: [:0]const u8,
     scamin: i64,
-    plane: i32,
-    disp_cat: CDispCat,
+    display_priority: i32,
+    display_plane: CDisplayPlane,
+    display_category: CDisplayCategory,
     anchor: CWorldPt,
     text: []const u8,
     px: f32, // glyph size, device px
@@ -219,12 +227,11 @@ pub const Capture = struct {
     list: std.ArrayListUnmanaged(Candidate) = .empty,
 };
 
-/// Paint class, mirroring PixelSurface's OpLayer and the tile style's LAYER order
-/// (areas -> area_patterns -> lines -> point_symbols -> soundings -> text): the
-/// class is the major sort key and draw priority orders WITHIN a class, so a fill
-/// never paints over a line whatever its priority, exactly like the layer stack.
-/// Keeping the two surfaces on ONE rule is the point — the same scene through the
-/// pixel path and the GPU path must not disagree about what covers what.
+/// Paint class. NOT the major sort key — see pixel.zig's OpLayer and orderLt: it
+/// is the S-52 §10.3.4.1 tiebreak, applied only when display priority is equal.
+/// Keeping the two surfaces on ONE rule is the point — the
+/// same scene through the pixel path and the GPU path must not disagree about
+/// what covers what.
 const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4, text = 5 };
 
 /// What a buffered call will hand the host — one variant per CSurface entry.
@@ -242,11 +249,23 @@ const OpKind = union(enum) {
 const Op = struct {
     layer: OpLayer,
     prio: i64,
+    display_plane: i64 = 0,
     /// Emission (walk) order — the stable tie-break within a layer+priority.
     seq: usize,
     feat: CFeature,
     kind: OpKind,
 };
+
+/// See pixel.zig orderLt — this must stay byte-identical in behaviour.
+fn orderLt(_: void, l: Op, r: Op) bool {
+    const lt_text = l.layer == .text;
+    const rt_text = r.layer == .text;
+    if (lt_text != rt_text) return rt_text; // 0. text last
+    if (l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
+    if (l.prio != r.prio) return l.prio < r.prio; // 2. display priority
+    if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer); // 3. class
+    return l.seq < r.seq; // 4. SENC sequence
+}
 
 // ---- the Surface implementation --------------------------------------------
 pub const VectorSurface = struct {
@@ -434,11 +453,12 @@ pub const VectorSurface = struct {
         return .{
             .cls = cls.ptr,
             .scamin = self.cur.scamin orelse 0,
-            .plane = @intCast(self.cur.draw_prio),
+            .display_priority = @intCast(self.cur.display_priority),
             // Standard is the default for an unbanded feature (the baker's `cat < 0`
             // fallback, and the style's coalesce) — any other value is already
             // filtered out upstream by resolve.categoryVisible.
-            .disp_cat = switch (self.cur.cat) {
+            .display_plane = if (self.cur.display_plane != 0) .over_radar else .under_radar,
+            .display_category = switch (self.cur.display_category) {
                 0 => .base,
                 2 => .other,
                 else => .standard,
@@ -451,7 +471,8 @@ pub const VectorSurface = struct {
     fn push(self: *VectorSurface, layer: OpLayer, kind: OpKind) !void {
         try self.ops.append(self.a, .{
             .layer = layer,
-            .prio = self.cur.draw_prio,
+            .prio = self.cur.display_priority,
+            .display_plane = self.cur.display_plane,
             .seq = self.ops.items.len,
             .feat = self.cur_feature(),
             .kind = kind,
@@ -536,7 +557,7 @@ pub const VectorSurface = struct {
         const labels = self.labels.items;
         std.mem.sort(usize, kept_ids.items, labels, struct {
             fn lt(ls: []const Label, l: usize, r: usize) bool {
-                if (ls[l].feat.plane != ls[r].feat.plane) return ls[l].feat.plane < ls[r].feat.plane;
+                if (ls[l].feat.display_priority != ls[r].feat.display_priority) return ls[l].feat.display_priority < ls[r].feat.display_priority;
                 return l < r;
             }
         }.lt);
@@ -546,21 +567,15 @@ pub const VectorSurface = struct {
 
     /// Sort the scene's buffered draw calls into S-52 paint order and hand them to
     /// the host, so a host that simply draws in callback order is correct without
-    /// re-sorting. Class-major, draw priority within a class, walk order for ties
-    /// (see OpLayer) — the same rule PixelSurface paints by.
+    /// re-sorting. DrawingPriority, then walk order for ties, with text last (see
+    /// OpLayer) — the same rule PixelSurface paints by.
     ///
     /// The sort is why the calls are buffered at all: the engine walks tile by tile
     /// and feature by feature, so a high-priority buoy in the first tile is walked
     /// long before a low-priority depth area in the second. Only the whole scene
     /// can be put in order, and the scene is not known until it has been walked.
     fn emitOps(self: *VectorSurface) !void {
-        std.mem.sort(Op, self.ops.items, {}, struct {
-            fn lt(_: void, l: Op, r: Op) bool {
-                if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer);
-                if (l.prio != r.prio) return l.prio < r.prio;
-                return l.seq < r.seq;
-            }
-        }.lt);
+        std.mem.sort(Op, self.ops.items, {}, orderLt);
         for (self.ops.items) |*op| {
             const f = &op.feat;
             switch (op.kind) {
@@ -857,9 +872,10 @@ pub const VectorSurface = struct {
             // can free out from under a memoized candidate — dupe it.
             .cls = a.dupeZ(u8, self.cur.class) catch @as([:0]u8, @constCast("")),
             .scamin = self.cur.scamin orelse 0,
-            .plane = @intCast(self.cur.draw_prio),
+            .display_priority = @intCast(self.cur.display_priority),
             // Standard is the default for an unbanded feature (see cur_feature).
-            .disp_cat = switch (self.cur.cat) {
+            .display_plane = if (self.cur.display_plane != 0) .over_radar else .under_radar,
+            .display_category = switch (self.cur.display_category) {
                 0 => .base,
                 2 => .other,
                 else => .standard,
@@ -906,7 +922,7 @@ pub const VectorSurface = struct {
         const rot_deg = (if (c.upright) self.uprightTangent(c.rot_rad) else c.rot_rad) * 180.0 / std.math.pi;
         try self.pool.add(self.a, self.labels.items.len, c.group, c.cls, c.text, self.labelBox(c.anchor, c.x0, c.baseline, c.pen, c.px, rot_deg, c.rot_align));
         try self.labels.append(self.a, .{
-            .feat = .{ .cls = c.cls.ptr, .scamin = c.scamin, .plane = c.plane, .disp_cat = c.disp_cat },
+            .feat = .{ .cls = c.cls.ptr, .scamin = c.scamin, .display_priority = c.display_priority, .display_plane = c.display_plane, .display_category = c.display_category },
             .anchor = c.anchor,
             .text = c.text,
             .px = c.px,
@@ -1146,12 +1162,12 @@ test "VectorSurface: a sounding claims no space — a label on top of it survive
     // the shape of the bug this pool exists to kill. A sounding is a symbol: it
     // claims nothing, so the label still wins its space. Toggling soundings can
     // therefore never cost a chart its labels.
-    const meta = rs.FeatureMeta{ .class = "SOUNDG", .draw_prio = 5 };
+    const meta = rs.FeatureMeta{ .class = "SOUNDG", .display_priority = 5 };
     try surf.beginFeature(&meta);
     try surf.drawSounding(4.0, false, false, .{ .x = 2000, .y = 2000 });
     try surf.endFeature();
 
-    const light = rs.FeatureMeta{ .class = "LIGHTS", .draw_prio = 5 };
+    const light = rs.FeatureMeta{ .class = "LIGHTS", .display_priority = 5 };
     try surf.beginFeature(&light);
     const style = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 23 }; // light description
     try surf.drawText("Fl R 4s", &style, .{ .x = 2000, .y = 2000 });
@@ -1180,13 +1196,13 @@ test "VectorSurface: important text outranks a name it overlaps, whatever the wa
     // The NAME is walked first (the cell encoded it first) and carries the higher
     // feature draw priority. Neither buys it the space: the text group is the
     // whole ladder, and a label's feature priority says nothing about the label.
-    const named = rs.FeatureMeta{ .class = "SEAARE", .draw_prio = 9 };
+    const named = rs.FeatureMeta{ .class = "SEAARE", .display_priority = 9 };
     try surf.beginFeature(&named);
     const name = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 26 };
     try surf.drawText("Bay", &name, .{ .x = 2000, .y = 2000 });
     try surf.endFeature();
 
-    const bridge = rs.FeatureMeta{ .class = "BRIDGE", .draw_prio = 3 };
+    const bridge = rs.FeatureMeta{ .class = "BRIDGE", .display_priority = 3 };
     try surf.beginFeature(&bridge);
     const clearance = rs.TextStyle{ .color = "CHBLK", .font_size = 12, .group = 11 }; // vertical clearance
     try surf.drawText("clr 11", &clearance, .{ .x = 2000, .y = 2000 });
@@ -1585,7 +1601,7 @@ test "label memo: a mariner text-group switch changes the candidates it must be 
 /// Records the CFeature each draw call is tagged with.
 const FeatCb = struct {
     a: Allocator,
-    feats: std.ArrayListUnmanaged(struct { cls: []const u8, scamin: i64, disp_cat: CDispCat }) = .empty,
+    feats: std.ArrayListUnmanaged(struct { cls: []const u8, scamin: i64, display_category: CDisplayCategory }) = .empty,
 
     fn onFill(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {
         const self: *FeatCb = @ptrCast(@alignCast(ctx.?));
@@ -1593,7 +1609,7 @@ const FeatCb = struct {
         self.feats.append(self.a, .{
             .cls = self.a.dupe(u8, cls) catch return,
             .scamin = f.scamin,
-            .disp_cat = f.disp_cat,
+            .display_category = f.display_category,
         }) catch {};
     }
     fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
@@ -1627,12 +1643,12 @@ test "VectorSurface: every draw call carries its feature's display category" {
 
     // Display base carries a SCAMIN: the engine reports both and leaves the S-52
     // "SCAMIN shall not be applied to display base" call to the host.
-    const depare = rs.FeatureMeta{ .class = "DEPARE", .cat = 0, .scamin = 45000 };
+    const depare = rs.FeatureMeta{ .class = "DEPARE", .display_category = 0, .scamin = 45000 };
     try surf.beginFeature(&depare);
     try surf.fillArea("DEPVS", &rings, null);
     try surf.endFeature();
 
-    const dmpgrd = rs.FeatureMeta{ .class = "DMPGRD", .cat = 2 };
+    const dmpgrd = rs.FeatureMeta{ .class = "DMPGRD", .display_category = 2 };
     try surf.beginFeature(&dmpgrd);
     try surf.fillArea("CHBRN", &rings, null);
     try surf.endFeature();
@@ -1645,10 +1661,10 @@ test "VectorSurface: every draw call carries its feature's display category" {
     _ = try surf.endScene(a);
 
     try testing.expectEqual(@as(usize, 3), rec.feats.items.len);
-    try testing.expectEqual(CDispCat.base, rec.feats.items[0].disp_cat);
+    try testing.expectEqual(CDisplayCategory.base, rec.feats.items[0].display_category);
     try testing.expectEqual(@as(i64, 45000), rec.feats.items[0].scamin);
-    try testing.expectEqual(CDispCat.other, rec.feats.items[1].disp_cat);
-    try testing.expectEqual(CDispCat.standard, rec.feats.items[2].disp_cat);
+    try testing.expectEqual(CDisplayCategory.other, rec.feats.items[1].display_category);
+    try testing.expectEqual(CDisplayCategory.standard, rec.feats.items[2].display_category);
 }
 
 /// Records the KIND and draw priority of every geometry call, in the order the
@@ -1657,22 +1673,25 @@ const OrderCb = struct {
     a: Allocator,
     calls: std.ArrayListUnmanaged(Call) = .empty,
 
-    const Kind = enum { fill, stroke };
-    const Call = struct { kind: Kind, plane: i32 };
+    const Kind = enum { fill, stroke, symbol };
+    const Call = struct { kind: Kind, display_priority: i32 };
 
     fn onFill(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: CColor, _: c_int) callconv(.c) void {
         const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
-        self.calls.append(self.a, .{ .kind = .fill, .plane = f.plane }) catch {};
+        self.calls.append(self.a, .{ .kind = .fill, .display_priority = f.display_priority }) catch {};
     }
     fn onStroke(ctx: ?*anyopaque, f: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {
         const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
-        self.calls.append(self.a, .{ .kind = .stroke, .plane = f.plane }) catch {};
+        self.calls.append(self.a, .{ .kind = .stroke, .display_priority = f.display_priority }) catch {};
     }
-    fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
+    fn onSymbol(ctx: ?*anyopaque, f: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {
+        const self: *OrderCb = @ptrCast(@alignCast(ctx.?));
+        self.calls.append(self.a, .{ .kind = .symbol, .display_priority = f.display_priority }) catch {};
+    }
     fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
 
     fn surface(self: *OrderCb) CSurface {
-        return .{ .ctx = self, .fill_area = onFill, .stroke_line = onStroke, .draw_symbol = noSymbol, .draw_text = noText };
+        return .{ .ctx = self, .fill_area = onFill, .stroke_line = onStroke, .draw_symbol = onSymbol, .draw_text = noText };
     }
 };
 
@@ -1699,33 +1718,148 @@ test "VectorSurface: draws are emitted in paint order, not walk order" {
     // Walk order is deliberately NOT paint order — the high-priority fill is
     // walked FIRST, exactly as a real scene emits a tile's buoys before the next
     // tile's depth areas.
-    const hi = rs.FeatureMeta{ .class = "BOYLAT", .draw_prio = 24 };
+    const hi = rs.FeatureMeta{ .class = "BOYLAT", .display_priority = 24 };
     try surf.beginFeature(&hi);
     try surf.fillArea("CHBLK", &rings, null);
     try surf.endFeature();
 
-    const contour = rs.FeatureMeta{ .class = "DEPCNT", .draw_prio = 18 };
+    const contour = rs.FeatureMeta{ .class = "DEPCNT", .display_priority = 18 };
     try surf.beginFeature(&contour);
     try surf.strokeLine("DEPCNT", 1.0, .solid, &lines, null);
     try surf.endFeature();
 
-    const lo = rs.FeatureMeta{ .class = "DEPARE", .draw_prio = 3 };
+    const lo = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 3 };
     try surf.beginFeature(&lo);
     try surf.fillArea("DEPVS", &rings, null);
     try surf.endFeature();
 
     _ = try surf.endScene(a);
 
-    // Class-major, draw priority within the class: the plane-3 fill overtakes the
-    // plane-24 fill walked ahead of it, and the line paints over both despite
-    // ranking below plane 24 — a fill never covers a line, as in the layer stack.
+    // DrawingPriority is the sole axis, walk order breaks ties. The prio-3 fill
+    // overtakes the prio-24 fill walked ahead of it; the prio-18 line sits
+    // between them. Geometry class does NOT enter the comparison — the prio-24
+    // fill stays on top of the prio-18 line.
     try testing.expectEqual(@as(usize, 3), rec.calls.items.len);
     try testing.expectEqual(OrderCb.Kind.fill, rec.calls.items[0].kind);
-    try testing.expectEqual(@as(i32, 3), rec.calls.items[0].plane);
-    try testing.expectEqual(OrderCb.Kind.fill, rec.calls.items[1].kind);
-    try testing.expectEqual(@as(i32, 24), rec.calls.items[1].plane);
-    try testing.expectEqual(OrderCb.Kind.stroke, rec.calls.items[2].kind);
-    try testing.expectEqual(@as(i32, 18), rec.calls.items[2].plane);
+    try testing.expectEqual(@as(i32, 3), rec.calls.items[0].display_priority);
+    try testing.expectEqual(OrderCb.Kind.stroke, rec.calls.items[1].kind);
+    try testing.expectEqual(@as(i32, 18), rec.calls.items[1].display_priority);
+    try testing.expectEqual(OrderCb.Kind.fill, rec.calls.items[2].kind);
+    try testing.expectEqual(@as(i32, 24), rec.calls.items[2].display_priority);
+}
+
+/// Minimal symbol store for the order tests: VectorSurface.drawSymbol returns
+/// early without one, so a test that needs a point symbol must supply it.
+const FakeStore = struct {
+    square: sym.Symbol,
+    const vt = sym.SymbolStore.VTable{ .get = get, .getPattern = getPattern };
+    fn getPattern(_: *anyopaque, _: []const u8, _: f32) ?*const cv.Pattern {
+        return null;
+    }
+    fn get(ctx: *anyopaque, _: []const u8) ?*const sym.Symbol {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return &self.square;
+    }
+    const ring = [_]cv.Point{ .{ .x = -1, .y = -1 }, .{ .x = 1, .y = -1 }, .{ .x = 1, .y = 1 }, .{ .x = -1, .y = 1 } };
+    const contours = [_][]const cv.Point{&ring};
+    fn make() FakeStore {
+        return .{ .square = .{
+            .paths = &.{.{ .fill = .{ .r = 10, .g = 20, .b = 30 }, .contours = &contours }},
+            .pivot = .{ .x = 0, .y = 0 },
+        } };
+    }
+};
+
+test "surface: a light sector arc paints over a wreck symbol (display_priority, not class)" {
+    // The regression this pins: LightSectored.lua emits its sector arcs as LINES
+    // at DrawingPriority 24; Wreck.lua emits a point SYMBOL at 12. Class-major
+    // ordering put symbol(3) above line(2) and sank the arc under the wreck, so
+    // wrecks painted over light sectors. Priority is the axis: 24 beats 12.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = OrderCb{ .a = a };
+    const cb = rec.surface();
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    var fake = FakeStore.make();
+    vs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const line = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const lines = [_][]const rs.TilePoint{&line};
+
+    // Walk order is the adversarial one: the sector arc is walked FIRST, so
+    // class-major ordering (symbol above line) would hoist the wreck over it.
+    const sector = rs.FeatureMeta{ .class = "LIGHTS", .display_priority = 24 };
+    try surf.beginFeature(&sector);
+    try surf.strokeLine("LITRD", 1.0, .solid, &lines, null);
+    try surf.endFeature();
+
+    const wreck = rs.FeatureMeta{ .class = "WRECKS", .display_priority = 12 };
+    try surf.beginFeature(&wreck);
+    try surf.drawSymbol("BOYLAT13", .{ .x = 50, .y = 50 }, 0, sndfrm.SYMBOL_SCALE, false, .point, null);
+    try surf.endFeature();
+
+    _ = try surf.endScene(a);
+
+    try testing.expectEqual(@as(usize, 2), rec.calls.items.len);
+    // Wreck symbol (12) first == underneath; sector arc (24) last == on top.
+    try testing.expectEqual(OrderCb.Kind.symbol, rec.calls.items[0].kind);
+    try testing.expectEqual(@as(i32, 12), rec.calls.items[0].display_priority);
+    try testing.expectEqual(OrderCb.Kind.stroke, rec.calls.items[1].kind);
+    try testing.expectEqual(@as(i32, 24), rec.calls.items[1].display_priority);
+}
+
+test "surface: geometry class breaks ties ONLY at equal display priority" {
+    // S-52 §10.3.4.1 level 2: "If the display priority is equal among objects,
+    // line objects have to be drawn on top of area objects whereas point objects
+    // have to be drawn on top of both." All three sit at one priority here, and
+    // are walked in the exact reverse of the required order.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var rec = OrderCb{ .a = a };
+    const cb = rec.surface();
+    var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+    var fake = FakeStore.make();
+    vs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    vs.view_zoom = 12;
+    vs.setTile(12, 0, 0);
+    const surf = vs.asSurface();
+
+    const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+    const line = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const lines = [_][]const rs.TilePoint{&line};
+
+    const pt = rs.FeatureMeta{ .class = "BOYLAT", .display_priority = 12 };
+    try surf.beginFeature(&pt);
+    try surf.drawSymbol("BOYLAT13", .{ .x = 50, .y = 50 }, 0, sndfrm.SYMBOL_SCALE, false, .point, null);
+    try surf.endFeature();
+
+    const ln = rs.FeatureMeta{ .class = "DEPCNT", .display_priority = 12 };
+    try surf.beginFeature(&ln);
+    try surf.strokeLine("CHBLK", 1.0, .solid, &lines, null);
+    try surf.endFeature();
+
+    const ar = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 12 };
+    try surf.beginFeature(&ar);
+    try surf.fillArea("DEPVS", &rings, null);
+    try surf.endFeature();
+
+    _ = try surf.endScene(a);
+
+    // area < line < point, despite the walk order being point, line, area.
+    try testing.expectEqual(@as(usize, 3), rec.calls.items.len);
+    try testing.expectEqual(OrderCb.Kind.fill, rec.calls.items[0].kind);
+    try testing.expectEqual(OrderCb.Kind.stroke, rec.calls.items[1].kind);
+    try testing.expectEqual(OrderCb.Kind.symbol, rec.calls.items[2].kind);
 }
 
 /// Portray one stack of labels at a given framebuffer density and report how many
@@ -1784,7 +1918,8 @@ test "VectorSurface: an unset device scale is 1.0 (today's behaviour)" {
 test "CFeature matches the C tile57_feature layout" {
     // The header spells this struct out by hand; a silent size/offset drift here
     // is a wrong read on the host side of the ABI, not a compile error.
-    try testing.expectEqual(@sizeOf(CFeature), @sizeOf(extern struct { cls: [*:0]const u8, scamin: i64, plane: c_int, disp_cat: c_int }));
+    try testing.expectEqual(@sizeOf(CFeature), @sizeOf(extern struct { cls: [*:0]const u8, scamin: i64, display_priority: c_int, display_plane: c_int, display_category: c_int }));
     try testing.expectEqual(@as(usize, 0), @offsetOf(CFeature, "cls"));
-    try testing.expectEqual(@offsetOf(CFeature, "plane") + @sizeOf(c_int), @offsetOf(CFeature, "disp_cat"));
+    try testing.expectEqual(@offsetOf(CFeature, "display_priority") + @sizeOf(c_int), @offsetOf(CFeature, "display_plane"));
+    try testing.expectEqual(@offsetOf(CFeature, "display_plane") + @sizeOf(c_int), @offsetOf(CFeature, "display_category"));
 }

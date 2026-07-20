@@ -23,7 +23,7 @@ Whether the tiles come from a pre-baked PMTiles archive or are generated live fr
 a raw S-57 chart, the schema is the same. The live path (`src/scene/`)
 emits `areas`, `area_patterns`, `lines`, `point_symbols`, `soundings`, and
 `text`. Features carrying SCAMIN (attr 133) keep it as the per-feature `scamin`
-property, and every feature has a `draw_prio` for S-52 fill ordering. DEPCNT lines
+property, and every feature has a `display_priority` for S-52 fill ordering. DEPCNT lines
 carry `valdco` (the contour value, including the 0 m drying line) for line-centre
 labels. The same schema is encoded as MLT or MVT (see
 [architecture](./architecture.md)).
@@ -71,7 +71,7 @@ regardless of layer:
 | `class` | string | S-57 object-class acronym. |
 | `cell` | string | Source chart stem. |
 | `s57` | string | The feature's full S-57 attribute set as a JSON object (the pick report). |
-| `draw_prio` | int | S-52 draw priority (fill/stroke ordering). |
+| `display_priority` | int | S-52 draw priority (fill/stroke ordering). |
 | `cat` | int | Display category (base / standard / other gating). |
 | `band` | int | Navigational band rank. |
 | `scamin` | int | SCAMIN `1:N` denominator — present only on features that carry one. |

@@ -88,7 +88,7 @@ pub fn worldAxisToTile(w: f64, scale: f64) u32 {
 // each owning cell's decoded features are clipped to the ground it OWNS (partition.ownedFace,
 // projected into the tile) and concatenated per layer. The faces are a disjoint partition, so
 // there is no double-draw at a seam and no z-order re-sort — S-52 draw priority rides the
-// per-feature `draw_prio` property, which the style sorts client-side (so feature order within
+// per-feature `display_priority` property, which the style sorts client-side (so feature order within
 // a tile is cosmetic). This retires the streaming in-bake cross-cell combiner: the per-cell
 // bakes stay dumb + cacheable, and all cross-cell logic is precomputed as the partition.
 
@@ -583,7 +583,7 @@ fn scaleUpTile(layers: []mvt.DecodedLayer, shift: u5, tx: u32, ty: u32) void {
 }
 
 // Re-orient each polygon feature's rings (the sole MVT winding authority). Non-area features
-// pass through; the input `properties` are borrowed unchanged (draw_prio et al. survive).
+// pass through; the input `properties` are borrowed unchanged (display_priority et al. survive).
 fn orientPolys(a: std.mem.Allocator, feats: []const mvt.Feature) ![]const mvt.Feature {
     const out = try a.alloc(mvt.Feature, feats.len);
     for (feats, 0..) |f, i| {

@@ -58,8 +58,12 @@ fn propStr(props: []const mvt.Prop, key: []const u8) []const u8 {
 
 fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
     return .{
-        .draw_prio = propInt(props, "draw_prio", 0),
-        .cat = propInt(props, "cat", 1),
+        .display_priority = propInt(props, "display_priority", 0),
+        // Emitted only for OverRadar (see scene.appendMeta), so absent => 0
+        // UnderRadar. Not reading it is why the baked-tile path used to lose
+        // DisplayPlane entirely and replay every feature as UnderRadar.
+        .display_plane = propInt(props, "display_plane", 0),
+        .display_category = propInt(props, "display_category", 1),
         .vg = propInt(props, "vg", 0),
         .scamin = if (propOf(props, "scamin")) |_| propInt(props, "scamin", 0) else null,
         .class = propStr(props, "class"),

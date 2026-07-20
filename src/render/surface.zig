@@ -76,9 +76,12 @@ pub const TextStyle = struct {
 /// beginFeature / endFeature. All pick data is pre-computed by the engine so
 /// surfaces need not import s57/s101.
 pub const FeatureMeta = struct {
-    draw_prio: i64 = 0,
-    plane: i64 = 0, // S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar
-    cat: i64 = 1, // display category: 0 base, 1 standard, 2 other
+    display_priority: i64 = 0,
+    /// S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar. Outranks
+    /// display_priority in paint order — S-52 PresLib §10.3.4.2: "the OVERRADAR
+    /// flag takes precedence over the objects display priority".
+    display_plane: i64 = 0,
+    display_category: i64 = 1, // 0 base, 1 standard, 2 other
     vg: i64 = 0, // raw viewing group (0 = none)
     scamin: ?i64 = null, // SCAMIN 1:N denominator (null = no display limit)
     oscl: i64 = 0, // the source cell's X2 overscale gate denominator
@@ -110,7 +113,7 @@ pub const FeatureMeta = struct {
 ///
 /// Lifecycle per scene: beginScene → (beginFeature → draw calls → endFeature)* → endScene.
 /// The engine walks features in WALK order — tile by tile, then cell record order
-/// — NOT draw-priority order; `meta.draw_prio` carries the priority and it is the
+/// — NOT draw-priority order; `meta.display_priority` carries the priority and it is the
 /// surface's job to order by it (the pixel, ascii and vector surfaces each buffer
 /// the scene and sort at endScene). Geometry is already projected, clipped, and
 /// simplified into the scene's coordinate space.

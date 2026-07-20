@@ -100,14 +100,23 @@ const (
 	AlignMap RotAlign = 1
 )
 
-// DispCat is the S-52 display category a feature arrived on. A host applying
-// SCAMIN itself must skip it for DispBase (the never-hide safety minimum).
-type DispCat uint8
+// DisplayCategory is the S-52 display category a feature arrived on. A host applying
+// SCAMIN itself must skip it for DisplayBase (the never-hide safety minimum).
+// DisplayPlane is the S-101 DisplayPlane. It outranks DisplayPriority in paint
+// order (S-52 PresLib §10.3.4.2).
+type DisplayPlane uint8
 
 const (
-	DispBase     DispCat = 0
-	DispStandard DispCat = 1
-	DispOther    DispCat = 2
+	PlaneUnderRadar DisplayPlane = 0
+	PlaneOverRadar  DisplayPlane = 1
+)
+
+type DisplayCategory uint8
+
+const (
+	DisplayBase     DisplayCategory = 0
+	DisplayStandard DisplayCategory = 1
+	DisplayOther    DisplayCategory = 2
 )
 
 // WorldPoint is a web-mercator [0,1] position (y down).
@@ -120,8 +129,9 @@ type LocalPoint struct{ X, Y float32 }
 type SurfaceFeature struct {
 	Class   string  // object-class acronym ("" if none)
 	Scamin  int64   // SCAMIN 1:N denominator (<= 0 → always visible)
-	Plane   int32   // S-52 draw priority (paint hint)
-	DispCat DispCat // the display category the feature came in on
+	DisplayPriority int32   // S-52 draw priority (S-101 DrawingPriority, 0..30)
+	DisplayPlane    DisplayPlane    // S-101 DisplayPlane; outranks DisplayPriority in paint order
+	DisplayCategory DisplayCategory // the display category the feature came in on
 }
 
 // WorldRings is a multi-ring path in world space: ring k spans
@@ -233,7 +243,8 @@ func surfCB(ctx unsafe.Pointer) *SurfaceFuncs {
 
 func goFeature(f *C.tile57_feature) SurfaceFeature {
 	return SurfaceFeature{Class: C.GoString(f.cls), Scamin: int64(f.scamin),
-		Plane: int32(f.plane), DispCat: DispCat(f.disp_cat)}
+		DisplayPriority: int32(f.display_priority), DisplayPlane: DisplayPlane(f.display_plane),
+		DisplayCategory: DisplayCategory(f.display_category)}
 }
 
 // tile57_color is packed 0xRRGGBBAA (a scalar, not a struct — see tile57_color

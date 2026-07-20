@@ -570,21 +570,37 @@ typedef enum { TILE57_ALIGN_VIEWPORT = 0, TILE57_ALIGN_MAP = 1 } tile57_rot_alig
  * enabled categories it came in on. Display base is the never-hide set (the
  * safety-of-navigation minimum): SCAMIN is not applied to it. */
 typedef enum {
-    TILE57_DISP_BASE = 0, TILE57_DISP_STANDARD = 1, TILE57_DISP_OTHER = 2
-} tile57_disp_cat;
+    TILE57_DISPLAY_BASE = 0, TILE57_DISPLAY_STANDARD = 1, TILE57_DISPLAY_OTHER = 2
+} tile57_display_category;
+
+/* S-101 DisplayPlane. Outranks display_priority in paint order — S-52 PresLib
+ * §10.3.4.2: "the OVERRADAR flag takes precedence over the objects display
+ * priority". */
+typedef enum {
+    TILE57_PLANE_UNDER_RADAR = 0, TILE57_PLANE_OVER_RADAR = 1
+} tile57_display_plane;
 
 /* The feature the following draw calls belong to. `cls` is the S-57 object-class
  * acronym (NUL-terminated; "" if none); `scamin` is the SCAMIN 1:N denominator
- * (<= 0 => always visible); `plane` is the S-52 draw priority — the engine has
- * ALREADY sorted the call stream by it, so it is there for a host that re-buckets
- * the stream into its own batches and has to restore the order (see the draw
- * table below); `disp_cat` is the feature's display category. A host that applies
- * SCAMIN itself must skip it when disp_cat == TILE57_DISP_BASE. */
+ * (<= 0 => always visible); `display_category` is the feature's display category
+ * — a host that applies SCAMIN itself must skip it when display_category ==
+ * TILE57_DISPLAY_BASE.
+ *
+ * `display_plane` and `display_priority` are the two paint-order axes, in that
+ * order of precedence (see the draw table below). `display_priority` is the
+ * S-101 catalogue DrawingPriority, 0..30. The engine has ALREADY sorted the call
+ * stream by both, so they are here for a host that re-buckets the stream into
+ * its own batches and has to rebuild the order.
+ *
+ * NOTE: `display_priority` was called `plane` before, then `draw_prio`. The
+ * original name was simply wrong — it never carried DisplayPlane. That axis is
+ * now transmitted properly, as `display_plane`. */
 typedef struct {
     const char *cls;
     int64_t scamin;
-    int32_t plane;
-    tile57_disp_cat disp_cat;
+    int32_t display_priority;
+    tile57_display_plane display_plane;
+    tile57_display_category display_category;
 } tile57_feature;
 
 /* Draw table. Pointers are valid only for the duration of the call; ctx is
@@ -603,8 +619,13 @@ typedef struct {
  * again (an area pattern jumps over the lines drawn above it, a tessellated
  * symbol and an atlas sprite swap places), and it breaks it in a way that looks
  * plausible on a sparse chart and wrong on a dense one. If you batch, sort each
- * batch by `plane` yourself and draw the batches in the class order above. That
- * is what `plane` is still there for. */
+ * batch by `display_priority` yourself and draw the batches in the class order above.
+ * That is what `display_priority` is still there for.
+ *
+ * A host that batches PER TILE must go further: sorting within a tile still
+ * leaves paint order broken across tiles, because the tiles are drawn one after
+ * another. Walk the priority bands OUTSIDE the tile loop, or a low-priority
+ * symbol in one tile will cover a high-priority one in its neighbour. */
 typedef struct {
     void *ctx;
     /* Filled area (world). even_odd != 0 selects the even-odd rule. */

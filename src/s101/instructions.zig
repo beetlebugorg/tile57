@@ -92,12 +92,12 @@ pub const Portrayal = struct {
     texts: []const Text = &.{},
     // S-52 DrawingPriority for the feature = the MAX priority over its draw
     // instructions (mirrors the Go s101build feature DisplayPriority). 0 when the
-    // stream carries no DrawingPriority. Surfaced as the MVT `draw_prio` property
+    // stream carries no DrawingPriority. Surfaced as the MVT `display_priority` property
     // so the style can paint area fills in S-52 display order (DEPARE 3 < LNDARE 12).
-    draw_prio: i64 = 0,
+    display_priority: i64 = 0,
     // S-101 DisplayPlane: 0 = UnderRadar (the near-universal default), 1 = OverRadar.
     // Surfaced as the MVT `plane` property (emitted only when 1); the style's
-    // symbol-sort-key uses plane*64 + draw_prio, so an OverRadar symbol sorts above an
+    // symbol-sort-key uses plane*64 + display_priority, so an OverRadar symbol sorts above an
     // UnderRadar one of equal priority.
     plane: i64 = 0,
     // S-52 display-category rank (§10.3.4): 0=base, 1=standard, 2=other. The feature
@@ -177,7 +177,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var aug_figures = std.ArrayList(AugFigure).empty;
 
     var fill_token: ?[]const u8 = null;
-    var draw_prio: i64 = 0; // feature DrawingPriority = max seen in the stream
+    var display_priority: i64 = 0; // feature DrawingPriority = max seen in the stream
     var plane: i64 = 0; // S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar
     var cat: i64 = -1; // most-visible display-category rank; -1 until a banded VG is seen
     var vg: i64 = 0; // controlling viewing group = most-visible draw's banded VG (band(vg)==cat)
@@ -339,7 +339,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // each with its own DrawingPriority; the feature's priority is the MAX
             // (matches Go s101build's `priority = max(c.Priority)`).
             const v = std.fmt.parseInt(i64, std.mem.trim(u8, val, " "), 10) catch continue;
-            if (v > draw_prio) draw_prio = v;
+            if (v > display_priority) display_priority = v;
         } else if (std.mem.eql(u8, key, "ViewingGroup")) {
             // The feature's display category is the most-visible (lowest-rank) band
             // over its instructions. Text instructions carry ViewingGroup:<textGroup>,
@@ -373,7 +373,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         } else if (std.mem.eql(u8, key, "DisplayPlane")) {
             // S-101 draw plane vs the radar overlay. UnderRadar (the near-universal
             // default) stays 0; OverRadar -> 1 so the style's symbol-sort-key
-            // (plane*64 + draw_prio) sorts it above an equal-priority UnderRadar symbol.
+            // (plane*64 + display_priority) sorts it above an equal-priority UnderRadar symbol.
             // Any other/unknown value stays 0.
             if (std.mem.eql(u8, std.mem.trim(u8, val, " "), "OverRadar")) plane = 1;
         }
@@ -386,7 +386,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
         .lines = lines.items,
         .points = points.items,
         .texts = texts.items,
-        .draw_prio = draw_prio,
+        .display_priority = display_priority,
         .plane = plane,
         .cat = if (cat < 0) 1 else cat, // no banded VG -> Standard
         .vg = vg,
@@ -434,8 +434,8 @@ test "parse the real DEPARE03 instruction stream" {
     try std.testing.expectEqualStrings("DEPMS", p.fill_token.?);
     // DIAMOND1 is dropped (client-owned shallow-water pattern), so no patterns remain.
     try std.testing.expectEqual(@as(usize, 0), p.patterns.len);
-    // draw_prio = max(3, 9) over the two viewing-group sections.
-    try std.testing.expectEqual(@as(i64, 9), p.draw_prio);
+    // display_priority = max(3, 9) over the two viewing-group sections.
+    try std.testing.expectEqual(@as(i64, 9), p.display_priority);
     // DisplayPlane:UnderRadar -> plane 0 (the default; emitted-untagged in the tile).
     try std.testing.expectEqual(@as(i64, 0), p.plane);
     // Display category = most visible over {13030 -> Base, 90000 -> Other} = Base.
@@ -558,7 +558,7 @@ test "parse line + point + text instructions" {
     try std.testing.expectEqual(@as(usize, 1), line.lines.len);
     try std.testing.expectApproxEqAbs(@as(f64, 0.96) * PX_PER_MM, line.lines[0].width, 1e-6); // mm -> px (~3.63)
     try std.testing.expectEqualStrings("CHGRD", line.lines[0].color);
-    try std.testing.expectEqual(@as(i64, 9), line.draw_prio);
+    try std.testing.expectEqual(@as(i64, 9), line.display_priority);
 
     // LineInstructionUnsuppressed (UpdateInformation overlay) strokes like LineInstruction.
     const uns = try parse(a, "LineStyle:_simple_,,0.64,CHRVID02;LineInstructionUnsuppressed:_simple_");
@@ -567,7 +567,7 @@ test "parse line + point + text instructions" {
 
     // No DrawingPriority in the stream -> default 0.
     const nopri = try parse(a, "FontColor:CHBLK;TextInstruction:foo");
-    try std.testing.expectEqual(@as(i64, 0), nopri.draw_prio);
+    try std.testing.expectEqual(@as(i64, 0), nopri.display_priority);
 
     const pt = try parse(a, "LocalOffset:1,-2;Rotation:45;PointInstruction:BCNCAR01");
     try std.testing.expectEqual(@as(usize, 1), pt.points.len);

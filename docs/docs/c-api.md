@@ -329,7 +329,7 @@ typedef struct { const tile57_world_point *pts; uint32_t n;
 /* The S-52 display category the feature came in on. */
 typedef enum { TILE57_DISP_BASE=0, TILE57_DISP_STANDARD=1, TILE57_DISP_OTHER=2 } tile57_disp_cat;
 
-typedef struct { const char *cls; int64_t scamin; int32_t plane;
+typedef struct { const char *cls; int64_t scamin; int32_t display_priority;
                  tile57_disp_cat disp_cat; } tile57_feature;
 
 /* What a rotatable call's angle is referenced to: VIEWPORT = screen (stay upright),
@@ -400,19 +400,36 @@ even though the engine decluttered it correctly for the size it was told.
 #### Paint order
 
 The calls arrive in S-52 paint order. The engine buffers the scene and sorts it
-before calling you — class-major (areas, then area patterns, then lines, then point
-symbols, then soundings, then text, so a fill never covers a line whatever its
-priority) and by the feature's S-52 draw priority within each class. Draw them in
-the order you receive them and the picture is right; you need no sort of your own.
+before calling you, per S-52 Presentation Library §10.3.4.1:
+
+1. **`display_priority`** — the dominant key, and it "applies irrespective of whether an
+   object is a point, line or area". A light sector arc at priority 24 paints over
+   a wreck symbol at 12, even though one is a line and the other a point.
+2. **geometry class** — a tiebreak used *only* where `display_priority` is equal:
+   areas, then area patterns, then lines, then point symbols, then soundings.
+3. **emission order** — the tiebreak where both of the above are equal.
+
+Text is drawn last regardless of priority (§10.3.4.1, §16 rule 3). Draw the calls
+in the order you receive them and the picture is right; you need no sort of your own.
 
 That holds only as long as you *preserve* the order. A GPU renderer usually batches
 by draw type — all fills, then all sprites, then all text — to keep pipeline
 switches down, and batching reorders the stream by construction: it lifts every call
 of one type out of the sequence the engine placed it in. Global paint order is then
 broken again, and broken in the way that looks fine on an empty stretch of water and
-wrong in a harbour. If you batch, sort each batch by `f->plane` (the feature's draw
-priority) and draw the batches in the class order above. That is what `plane` is
-still exposed for.
+wrong in a harbour.
+
+**Do not batch by draw type and then sort each batch by `display_priority`.** That
+reproduces the exact inversion this ordering exists to prevent — it makes geometry
+class dominant and `display_priority` subordinate, so every sprite covers every line
+whatever the priorities say. If you must batch, batch by `display_priority` *band* and
+draw the bands in ascending order, switching pipelines within a band as the class
+tiebreak requires. `display_priority` is exposed so you can rebuild the real order, not so
+you can sort inside a per-type bucket.
+
+A host that batches per tile must go further: sorting within a tile still leaves
+paint order broken across tiles, because tiles are drawn one after another. Walk
+the priority bands *outside* the tile loop.
 
 Both text callbacks carry the label's `text_group`, so a host can style text by its
 S-52 role rather than by its feature — draw group 11 (important text: vertical

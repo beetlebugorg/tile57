@@ -195,8 +195,8 @@ and no host needs its own sort. The catch is that only an order you *preserve*
 survives. A GPU renderer that batches by draw type — all fills, then all sprites,
 then all text — to minimise pipeline switches has reordered the stream by
 construction, and global paint order breaks again. If you batch, sort each batch
-by the per-feature `plane` and draw the batches in the class order above; that is
-what `plane` is still exposed for.
+by the per-feature `display_priority` and draw the batches in the class order above; that is
+what `display_priority` is still exposed for.
 
 Its two text callbacks also carry the label's S-52
 text group, so a host can draw group 11 (important text) larger or bold and
