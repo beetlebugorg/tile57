@@ -17,6 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
+const paint = @import("paint.zig");
 const resolve = @import("resolve.zig");
 const cv = @import("canvas.zig");
 const raster = @import("raster.zig");
@@ -66,7 +67,7 @@ const OpKind = union(enum) {
 /// area fills. A stable (prio, seq) sort already prevents that — every op a
 /// symbol pushes shares its parent feature's priority and takes consecutive seq,
 /// so the group stays contiguous on its own.
-const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4, text = 5 };
+const OpLayer = paint.Layer;
 
 /// Paint order, straight out of S-52 PresLib Ed 4.0.0 §10.3.4.1 (p.70):
 ///
@@ -110,13 +111,10 @@ const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding
 /// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
 /// all and priority leads.
 fn orderLt(radar: bool, l: Op, r: Op) bool {
-    const lt_text = l.layer == .text;
-    const rt_text = r.layer == .text;
-    if (lt_text != rt_text) return rt_text; // 0. text last
-    if (radar and l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
-    if (l.prio != r.prio) return l.prio < r.prio; // 2. display priority
-    if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer); // 3. class
-    return l.seq < r.seq; // 4. SENC sequence
+    const lk = paint.key(l.layer, l.prio, l.display_plane, radar);
+    const rk = paint.key(r.layer, r.prio, r.display_plane, radar);
+    if (lk != rk) return lk < rk;
+    return l.seq < r.seq; // equal key: emission order (SENC sequence)
 }
 
 const Op = struct {

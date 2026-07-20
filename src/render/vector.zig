@@ -29,6 +29,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
+const paint = @import("paint.zig");
 const resolve = @import("resolve.zig");
 const cv = @import("canvas.zig");
 const sym = @import("symbols.zig");
@@ -239,7 +240,7 @@ pub const Capture = struct {
 /// Keeping the two surfaces on ONE rule is the point — the
 /// same scene through the pixel path and the GPU path must not disagree about
 /// what covers what.
-const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4, text = 5 };
+const OpLayer = paint.Layer;
 
 /// What a buffered call will hand the host — one variant per CSurface entry.
 const OpKind = union(enum) {
@@ -267,38 +268,18 @@ const Op = struct {
 /// `radar` is whether a RADAR overlay is present — the condition §10.3.4.2 puts
 /// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
 /// all and priority leads.
-/// The engine's paint order folded into ONE comparable integer per draw call.
-///
-/// This is the whole of S-52 PresLib §10.3.4.1/.2 as the engine applies it: text
-/// last, then DisplayPlane (only under a radar overlay, §10.3.4.2), then display
-/// priority, then geometry class. Emission order breaks the remaining ties and is
-/// preserved by handing the calls over in order, so it needs no bits here.
-///
-/// A GPU host must batch by draw type, which destroys the stream order and forces
-/// it to rebuild paint order itself. Without this it had to rebuild the RULE —
-/// a copy of the class taxonomy, the priority range and the radar gate, living in
-/// the host and drifting from the engine (they drifted, and the same spec bug had
-/// to be fixed twice). With it the host buckets on an integer it never decodes.
+/// Paint key for one draw call — see paint.zig, which is where the rule lives.
 fn paintKey(op: Op, radar: bool) u32 {
-    const is_text: u32 = if (op.layer == .text) 1 else 0;
-    const plane: u32 = if (radar and op.display_plane != 0) 1 else 0;
-    const prio: u32 = @intCast(std.math.clamp(op.prio, 0, @as(i64, PRIO_MAX)));
-    return ((is_text * 2 + plane) * (PRIO_MAX + 1) + prio) * CLASS_COUNT + @intFromEnum(op.layer);
+    return paint.key(op.layer, op.prio, op.display_plane, radar);
 }
 
-const PRIO_MAX: u32 = 30; // S-101 DrawingPriority range
-const CLASS_COUNT: u32 = 6; // OpLayer cardinality
-/// One past the largest paintKey — a host sizes its bucket array with it.
-pub const PAINT_KEY_MAX: u32 = 4 * (PRIO_MAX + 1) * CLASS_COUNT;
+const PAINT_KEY_MAX = paint.KEY_MAX;
 
 fn orderLt(radar: bool, l: Op, r: Op) bool {
-    const lt_text = l.layer == .text;
-    const rt_text = r.layer == .text;
-    if (lt_text != rt_text) return rt_text; // 0. text last
-    if (radar and l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
-    if (l.prio != r.prio) return l.prio < r.prio; // 2. display priority
-    if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer); // 3. class
-    return l.seq < r.seq; // 4. SENC sequence
+    const lk = paint.key(l.layer, l.prio, l.display_plane, radar);
+    const rk = paint.key(r.layer, r.prio, r.display_plane, radar);
+    if (lk != rk) return lk < rk;
+    return l.seq < r.seq; // equal key: emission order (SENC sequence)
 }
 
 // ---- the Surface implementation --------------------------------------------

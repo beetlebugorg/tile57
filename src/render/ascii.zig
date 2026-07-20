@@ -22,6 +22,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const rs = @import("surface.zig");
+const paint = @import("paint.zig");
 const resolve = @import("resolve.zig");
 const sndfrm = @import("sndfrm.zig");
 const declut = @import("declutter.zig");
@@ -89,7 +90,7 @@ const OpKind = union(enum) {
 
 /// Paint class, the same as the pixel surface (pixel.zig OpLayer). NOT the major
 /// sort key — it is the S-52 §10.3.4.1 tiebreak used only at equal priority.
-const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding = 4, text = 5 };
+const OpLayer = paint.Layer;
 
 const Op = struct {
     layer: OpLayer,
@@ -104,13 +105,10 @@ const Op = struct {
 /// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
 /// all and priority leads.
 fn orderLt(radar: bool, l: Op, r: Op) bool {
-    const lt_text = l.layer == .text;
-    const rt_text = r.layer == .text;
-    if (lt_text != rt_text) return rt_text; // 0. text last
-    if (radar and l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
-    if (l.prio != r.prio) return l.prio < r.prio; // 2. display priority
-    if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer); // 3. class
-    return l.seq < r.seq; // 4. SENC sequence
+    const lk = paint.key(l.layer, l.prio, l.display_plane, radar);
+    const rk = paint.key(r.layer, r.prio, r.display_plane, radar);
+    if (lk != rk) return lk < rk;
+    return l.seq < r.seq; // equal key: emission order (SENC sequence)
 }
 
 /// One character cell: the glyph and optional ANSI-256 fore/background. Cells
