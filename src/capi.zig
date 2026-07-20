@@ -736,7 +736,13 @@ export fn tile57_chart_gpu_scene(
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
     const built = c.renderGpuScene(lon, lat, zoom, width, height, paletteOf(&settings), &settings) catch |e| return fail(err, e);
+    return fillGpuScene(o, built, err);
+}
 
+/// Flatten a built GpuScene into the C struct, transferring ownership to the
+/// caller (freed with tile57_gpu_scene_free). Shared by the single-chart and
+/// composed entry points.
+fn fillGpuScene(o: *CGpuScene, built: *chart.GpuScene, err: ?*CError) c_int {
     // Pattern cells carry Zig slices; flatten them to ptr+len in the scene's own
     // arena so they die with it.
     const a = built.arena.allocator();
@@ -747,7 +753,6 @@ export fn tile57_chart_gpu_scene(
     for (built.scene.patterns, cells) |src, *dst| {
         dst.* = .{ .w = src.w, .h = src.h, .rgba = src.rgba.ptr, .rgba_len = src.rgba.len };
     }
-
     o.* = .{
         .vertices = built.scene.vertices.ptr,
         .vertex_count = built.scene.vertices.len,
@@ -762,6 +767,30 @@ export fn tile57_chart_gpu_scene(
         .owner = built,
     };
     return OK;
+}
+
+/// The composed twin of tile57_chart_gpu_scene: a whole chart LIBRARY portrayed
+/// into one draw-ready scene, seams stitched across cells. Same buffers, same
+/// tile57_gpu_scene_free. See tile57.h.
+export fn tile57_compose_gpu_scene(
+    handle: ?*compose.ComposeSource,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*CGpuScene,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{};
+    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const built = chart.renderComposeGpuScene(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings) catch |e| return fail(err, e);
+    return fillGpuScene(o, built, err);
 }
 
 /// Release a scene from tile57_chart_gpu_scene and zero the struct. Every pointer

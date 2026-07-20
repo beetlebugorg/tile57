@@ -1082,6 +1082,39 @@ fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtl
     return .{ .sprites = sprites, .glyphs = glyphs };
 }
 
+// The GPU-scene atlases are static (per catalogue + font), so they build ONCE per
+// process and every render — single chart or composed — shares them, rather than
+// each Chart rasterizing its own. Process-lifetime; never freed.
+var g_atlas_state: std.atomic.Value(u8) = .init(0);
+var g_atlas_sprites: render.gpu.SpriteAtlas = .{ .width = 0, .height = 0 };
+var g_atlas_glyphs: render.gpu.GlyphAtlas = .{};
+var g_atlas_ok = false;
+
+fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gpu.GlyphAtlas } {
+    while (g_atlas_state.load(.acquire) != 2) {
+        if (g_atlas_state.cmpxchgStrong(@as(u8, 0), @as(u8, 1), .acquire, .monotonic) == null) {
+            const aa = gpa.create(std.heap.ArenaAllocator) catch {
+                g_atlas_state.store(2, .release);
+                break;
+            };
+            aa.* = std.heap.ArenaAllocator.init(gpa);
+            if (buildGpuAtlases(aa.allocator())) |built| {
+                g_atlas_sprites = built.sprites;
+                g_atlas_glyphs = built.glyphs;
+                g_atlas_ok = true;
+            } else |_| {
+                aa.deinit();
+                gpa.destroy(aa);
+            }
+            g_atlas_state.store(2, .release);
+            break;
+        }
+        std.atomic.spinLoopHint();
+    }
+    if (!g_atlas_ok) return .{ null, null };
+    return .{ &g_atlas_sprites, &g_atlas_glyphs };
+}
+
 // ---- compose-backed view renders --------------------------------------------
 //
 // The compositor is the tile source; these are its VIEW backends: compose every
@@ -1250,6 +1283,45 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
     _ = try surf.endScene(a);
 }
 
+/// The composed DRAW-READY twin of renderComposeSurfaceView: portray the whole
+/// composed view (seams stitched across cells) into one GPU scene — Chart.
+/// renderGpuScene, but with the compositor as the tile source, so a host draws a
+/// chart LIBRARY without owning a scene. Result owns its arena (GpuScene.deinit).
+pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+    const out = try gpa.create(GpuScene);
+    errdefer gpa.destroy(out);
+    out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
+    errdefer out.arena.deinit();
+
+    const colors = try sharedColors();
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const store = try viewSymbolStore(sa, palette);
+    defer store.deinit();
+
+    var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, zoom);
+    defer gs.deinit();
+    gs.store = store.asStore();
+    const atl = sharedGpuAtlases();
+    gs.sprites = atl[0];
+    gs.glyphs = atl[1];
+    const surf = gs.asSurface();
+
+    const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+    var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    try surf.beginScene(vt.z);
+    while (vt.next()) |t| {
+        const res = src.tile(sa, t.z, t.x, t.y) catch continue;
+        const bytes = res.tile orelse continue;
+        const layers = mlt.decode(sa, bytes) catch continue;
+        gs.setTile(t.z, t.x, t.y);
+        scene.replayTile(sa, surf, layers) catch continue;
+    }
+    out.scene = try gs.build(out.arena.allocator());
+    return out;
+}
+
 /// Cursor object-query over a runtime compositor (the S-52 §10.8 pick across the
 /// whole composed set — seams included): replay the composed tile covering
 /// (lon,lat) at the view zoom through a QuerySurface and report each feature the
@@ -1404,14 +1476,6 @@ pub const Chart = struct {
     view_tiles_max: usize = 192, // > the ~96 tiles of one 2560px view: never evicts mid-render
     view_arena: ?*std.heap.ArenaAllocator = null,
     view_stores: [3]?*sprite.CatalogStore = .{ null, null, null },
-    // The GPU-scene path's atlases: the sprite-symbol cell map and the SDF glyph
-    // map, built once per handle from the embedded catalogue. Their layout is
-    // deterministic, so the UVs match the atlas PNGs a host uploads from
-    // tile57_bake_sprite_mln / tile57_bake_glyph_sdf. Held in their own arena.
-    gpu_atlas_arena: ?*std.heap.ArenaAllocator = null,
-    gpu_sprites: ?render.gpu.SpriteAtlas = null,
-    gpu_glyphs: ?render.gpu.GlyphAtlas = null,
-    gpu_atlas_built: bool = false,
     // The view label pass's per-tile candidate memo (render/labelcache.zig): what
     // lets renderSurfaceLabels run on every view-settle instead of re-portraying
     // the covering tiles each time. Bounded and released with the handle.
@@ -1641,28 +1705,6 @@ pub const Chart = struct {
         return self.view_arena.?.allocator();
     }
 
-    /// The GPU-scene atlases, built once per handle (the SVG rasterization
-    /// dominates, so never per render). Null if the build fails — the surface
-    /// then falls back to outline geometry rather than nothing.
-    fn gpuAtlases(self: *Chart) struct { ?*const render.gpu.SpriteAtlas, ?*const render.gpu.GlyphAtlas } {
-        if (!self.gpu_atlas_built) {
-            self.gpu_atlas_built = true;
-            const aa = gpa.create(std.heap.ArenaAllocator) catch return .{ null, null };
-            aa.* = std.heap.ArenaAllocator.init(gpa);
-            const built = buildGpuAtlases(aa.allocator()) catch {
-                aa.deinit();
-                gpa.destroy(aa);
-                return .{ null, null };
-            };
-            self.gpu_atlas_arena = aa;
-            self.gpu_sprites = built.sprites;
-            self.gpu_glyphs = built.glyphs;
-        }
-        const sp: ?*const render.gpu.SpriteAtlas = if (self.gpu_sprites) |*s| s else null;
-        const gl: ?*const render.gpu.GlyphAtlas = if (self.gpu_glyphs) |*g| g else null;
-        return .{ sp, gl };
-    }
-
     /// The palette colour tables (all three palettes). Parsed once per PROCESS, not
     /// once per handle: they are a pure function of the embedded colour profile — the
     /// same bytes for every chart — and read-only once parsed. A host that opens and
@@ -1717,10 +1759,6 @@ pub const Chart = struct {
         if (self.view_arena) |va| {
             va.deinit();
             gpa.destroy(va);
-        }
-        if (self.gpu_atlas_arena) |aa| {
-            aa.deinit();
-            gpa.destroy(aa);
         }
         gpa.destroy(self);
     }
@@ -2028,7 +2066,7 @@ pub const Chart = struct {
         gs.store = store.asStore();
         // Symbols/soundings -> sprite-atlas quads, labels -> SDF quads; both fall
         // back to outline triangles if the atlas build failed.
-        const atl = self.gpuAtlases();
+        const atl = sharedGpuAtlases();
         gs.sprites = atl[0];
         gs.glyphs = atl[1];
         const surf = gs.asSurface();

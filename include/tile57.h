@@ -864,6 +864,14 @@ tile57_status tile57_chart_gpu_scene(tile57_chart *chart, double lon, double lat
                              const tile57_mariner *m,
                              tile57_gpu_scene *out, tile57_error *err);
 
+/* The composed twin of tile57_chart_gpu_scene: a whole chart LIBRARY (opened via
+ * tile57_compose_open) portrayed into one draw-ready scene, seams stitched across
+ * cells. Same buffers and the same tile57_gpu_scene_free. */
+tile57_status tile57_compose_gpu_scene(struct tile57_compose *compose, double lon, double lat, double zoom,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             tile57_gpu_scene *out, tile57_error *err);
+
 /* Release a scene and zero the struct. Every pointer it handed out dies here,
  * so the host must have finished uploading first. Null-safe, and safe to call
  * twice. */
