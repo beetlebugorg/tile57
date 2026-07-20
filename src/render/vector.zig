@@ -747,16 +747,8 @@ pub const VectorSurface = struct {
     /// tile-space spacing so they tile). Symbols never collide — they all draw,
     /// and they claim nothing from the labels above them (see declutter.zig).
     fn emitSprite(self: *VectorSurface, layer: OpLayer, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_align: CRotAlign) !void {
-        const k = scale * 100.0 * dev;
-        var hw: f64 = 0;
-        var hh: f64 = 0;
-        for (s.paths) |p| for (p.contours) |contour| for (contour) |c| {
-            const lx = @abs((c.x - s.pivot.x) * k);
-            const ly = @abs((c.y - s.pivot.y) * k);
-            if (lx > hw) hw = lx;
-            if (ly > hh) hh = ly;
-        };
-        if (hw <= 0 or hh <= 0) return;
+        const he = sym.halfExtent(s, scale * 100.0 * dev);
+        if (he[0] <= 0 or he[1] <= 0) return;
         // The name is a slice into the decoded tile; buffered ops outlive it (see
         // fillPattern), so dupe into the render arena.
         try self.push(layer, .{ .sprite = .{
@@ -764,8 +756,8 @@ pub const VectorSurface = struct {
             .anchor = self.worldOf(at),
             .rot_deg = @floatCast(rot_deg),
             .rot_align = rot_align,
-            .hw = @floatCast(hw),
-            .hh = @floatCast(hh),
+            .hw = he[0],
+            .hh = he[1],
         } });
     }
 

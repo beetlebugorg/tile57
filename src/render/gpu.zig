@@ -63,9 +63,81 @@ pub const Vertex = extern struct {
     _pad: [2]u8 = .{ 0, 0 },
 };
 
+/// One textured-quad vertex — a symbol sprite or an SDF glyph. `x,y` is the
+/// WORLD anchor (like `Vertex`, camera-transformed); `ox,oy` the corner offset
+/// in reference px, already rotated; `u,v` the atlas UV. Six per quad (two
+/// triangles), non-indexed. The two channels stay split for the same reason as
+/// `Vertex`: the anchor rides the chart while the artwork holds a fixed screen
+/// size under zoom.
+pub const Quad = extern struct {
+    x: f32,
+    y: f32,
+    ox: f32,
+    oy: f32,
+    u: f32,
+    v: f32,
+    /// Straight-alpha RGBA. A sprite ignores it (the artwork is coloured); an
+    /// SDF glyph is tinted by it.
+    color: [4]u8,
+    /// SDF sharpen weight: 0 for a sprite, >0 emboldens an SDF glyph.
+    weight: f32 = 0,
+    scamin: f32 = 0,
+    disp_cat: u8 = 1,
+    /// Non-zero when the mark is chart-relative (a rotated view turns it).
+    map_align: u8 = 0,
+    _pad: [2]u8 = .{ 0, 0 },
+};
+
 /// `Range.pattern` when the range is not an area-fill pattern — which is every
 /// range except the `pattern` ones.
 pub const NO_PATTERN: u32 = std.math.maxInt(u32);
+
+/// Where each symbol's cell sits in the sprite atlas the host uploads. Built
+/// from the SAME sprite.json the host loads, so the UVs match its texture. The
+/// GPU-scene path looks a cell up by name and emits a quad over it.
+pub const SpriteAtlas = struct {
+    width: u32,
+    height: u32,
+    /// name -> cell rect in atlas px. Keys are owned by whoever built the map.
+    cells: std.StringHashMapUnmanaged(Cell) = .empty,
+
+    pub const Cell = struct { x: f32, y: f32, w: f32, h: f32 };
+
+    pub fn get(self: *const SpriteAtlas, name: []const u8) ?Cell {
+        return self.cells.get(name);
+    }
+    /// The UV rect (u0,v0,u1,v1) for a cell, normalized by the atlas size.
+    pub fn uv(self: *const SpriteAtlas, c: Cell) [4]f32 {
+        const w: f32 = @floatFromInt(self.width);
+        const h: f32 = @floatFromInt(self.height);
+        return .{ c.x / w, c.y / h, (c.x + c.w) / w, (c.y + c.h) / h };
+    }
+};
+
+/// SDF label-glyph placement, mirroring the sprite module's `glyph.Atlas` in a
+/// pure type: that module links libc (stb), and the render module must not, so
+/// the impure side (Chart) copies its glyph map into this. `off`/`advance`/`w`/`h`
+/// are EM units relative to the pen; `u,v` are atlas UVs.
+pub const GlyphAtlas = struct {
+    em_px: f32 = 32,
+    glyphs: std.AutoHashMapUnmanaged(u21, Info) = .empty,
+
+    pub const Info = extern struct {
+        u0: f32,
+        v0: f32,
+        u1: f32,
+        v1: f32,
+        off_x: f32,
+        off_y: f32,
+        w: f32,
+        h: f32,
+        advance: f32,
+    };
+
+    pub fn get(self: *const GlyphAtlas, cp: u21) ?Info {
+        return self.glyphs.get(cp);
+    }
+};
 
 /// One S-101 area-fill pattern cell, rasterized RGBA8 at this scene's screen
 /// density. The host uploads it as a texture; `w`/`h` are its size in DEVICE PX,
@@ -77,12 +149,33 @@ pub const PatternCell = struct {
     rgba: []const u8,
 };
 
-/// A contiguous slice of the index buffer that draws with one pipeline and one
-/// colour. Ranges come out sorted by `paint_key`; draw them in order and the
-/// chart is correct.
+/// Which buffer + primitive a range draws from. Fills, lines and pattern
+/// interiors are indexed triangles; symbols, soundings and text are textured
+/// quads (sprite atlas / SDF glyph atlas) — because a symbol is antialiased
+/// artwork and a label stays crisp as an SDF, neither of which a flat triangle
+/// gives. One range array holds BOTH, in paint order, so the host walks it once.
+pub const Prim = enum(u8) {
+    /// `first`/`count` index `Scene.indices`; draw indexed against `vertices`.
+    triangles = 0,
+    /// `first`/`count` are the first vertex and vertex count in `Scene.quads`
+    /// (6 per quad, non-indexed). `atlas` says which texture to sample.
+    quads = 1,
+};
+
+/// Which texture a `quads` range samples.
+pub const AtlasId = enum(u8) {
+    none = 0,
+    sprite = 1, // the S-101 symbol atlas
+    glyph = 2, // the SDF label-glyph atlas
+};
+
+/// A contiguous slice of one buffer that draws with one pipeline. Ranges come
+/// out sorted by `paint_key`; draw them in order and the chart is correct.
 pub const Range = extern struct {
-    first_index: u32,
-    index_count: u32,
+    /// Into `Scene.indices` when `prim == .triangles`, else into `Scene.quads`.
+    first: u32,
+    /// Index or vertex count, per `prim`.
+    count: u32,
     /// The engine's paint-order key. Ranges are already sorted by it; it is
     /// exposed so a host batching ACROSS scenes (tiles) can interleave them.
     /// Opaque — compare, never decode.
@@ -90,11 +183,14 @@ pub const Range = extern struct {
     /// Index into `Scene.patterns`, or `NO_PATTERN`. Set only on `pattern`
     /// ranges; see the tiling contract on `fillPattern`.
     pattern: u32,
-    /// Resolved RGBA for the palette this scene was built with. Meaningless on a
-    /// pattern range — the cell carries its own colours.
+    /// Resolved RGBA for the palette this scene was built with. On a sprite quad
+    /// range the artwork carries its own colour, so this is ignored; on an SDF
+    /// text range it tints the glyph.
     color: [4]u8,
     kind: Kind,
-    _pad: [3]u8 = .{ 0, 0, 0 },
+    prim: Prim,
+    atlas: AtlasId,
+    _pad: u8 = 0,
 };
 
 /// A finished scene. Everything borrows the arena passed to `endScene` and dies
@@ -102,6 +198,8 @@ pub const Range = extern struct {
 pub const Scene = struct {
     vertices: []const Vertex,
     indices: []const u32,
+    /// Textured-quad vertices for symbol/sounding/text ranges (`prim == .quads`).
+    quads: []const Quad,
     ranges: []const Range,
     /// Cells referenced by `Range.pattern`. Deduplicated: a chart full of one
     /// pattern uploads one texture, not one per feature.
@@ -129,6 +227,8 @@ pub const CScene = extern struct {
     vertex_count: usize = 0,
     indices: ?[*]const u32 = null,
     index_count: usize = 0,
+    quads: ?[*]const Quad = null,
+    quad_count: usize = 0,
     ranges: ?[*]const Range = null,
     range_count: usize = 0,
     patterns: ?[*]const CPattern = null,
@@ -156,9 +256,19 @@ const Geom = union(enum) {
     fill: struct { rings: []const []const rs.TilePoint, rule: tess.Rule },
     /// World-space polylines expanded to quads `half_w` reference px either side.
     stroke: struct { lines: []const []const rs.TilePoint, half_w: f32, dash: rs.Dash },
-    /// A symbol: world anchor plus local outline rings in reference px.
+    /// A symbol: world anchor plus local outline rings in reference px. Only the
+    /// FALLBACK for a symbol the sprite atlas is missing; the atlas path is
+    /// `.sprite`.
     mark: struct { anchor: rs.TilePoint, rings: []const []const [2]f32, rule: tess.Rule },
+    /// Textured quads at a world anchor: sprite symbols/soundings and SDF glyphs.
+    /// Each quad's corners are local reference px (already rotated). One op is one
+    /// draw (a symbol = 1 quad, a sounding or label = several).
+    sprite: struct { anchor: rs.TilePoint, quads: []const SpriteQuad, atlas: AtlasId, weight: f32 = 0 },
 };
+
+/// One textured quad, anchor-local: four corners in reference px and their atlas
+/// UVs, wound 0,1,2,0,2,3.
+const SpriteQuad = struct { corners: [4][2]f32, uv: [4][2]f32 };
 
 pub const GpuSurface = struct {
     a: Allocator,
@@ -176,6 +286,12 @@ pub const GpuSurface = struct {
     ops: std.ArrayList(Op) = .empty,
     cur: rs.FeatureMeta = .{},
     store: ?sym.SymbolStore = null,
+    /// The atlases the host will upload. When `sprites` has a symbol's cell it
+    /// draws as a quad; without it, the outline-triangle fallback keeps the mark
+    /// visible. `glyphs` is required for SDF text (no atlas -> no labels).
+    sprites: ?*const SpriteAtlas = null,
+    glyphs: ?*const GlyphAtlas = null,
+    quads: std.ArrayList(Quad) = .empty,
     tessellator: tess.Tessellator,
     /// Pattern cells in first-use order, and the name->index map that dedupes
     /// them. One density per scene, so the name alone is the key.
@@ -219,6 +335,7 @@ pub const GpuSurface = struct {
     pub fn deinit(self: *GpuSurface) void {
         self.tessellator.deinit();
         self.ops.deinit(self.a);
+        self.quads.deinit(self.a);
         self.patterns.deinit(self.a);
         self.pattern_ix.deinit(self.a);
         self.labels.deinit(self.a);
@@ -378,7 +495,7 @@ pub const GpuSurface = struct {
         var eff = name;
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
         const s = store.get(eff) orelse return;
-        try self.emitMark(.symbol, s, at, rot_deg, scale, self.refDev(), rot_north);
+        try self.emitSprite(.symbol, eff, s, at, rot_deg, scale, self.refDev(), rot_north);
     }
 
     fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
@@ -400,8 +517,37 @@ pub const GpuSurface = struct {
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
-            try self.emitMark(.sounding, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), false);
+            try self.emitSprite(.sounding, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), false);
         }
+    }
+
+    /// A symbol/sounding glyph as an atlas SPRITE quad — antialiased artwork, not
+    /// a flat-shaded outline. The cell's UV comes from the atlas the host loads;
+    /// the on-screen half-extent from the symbol geometry (`sym.halfExtent`), so
+    /// a sprite and the vector path size it identically. A symbol the atlas is
+    /// missing falls back to the outline triangles, keeping the mark visible.
+    fn emitSprite(self: *GpuSurface, kind: Kind, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_north: bool) !void {
+        const atlas = self.sprites orelse return self.emitMark(kind, s, at, rot_deg, scale, dev, rot_north);
+        const cell = atlas.get(name) orelse return self.emitMark(kind, s, at, rot_deg, scale, dev, rot_north);
+        const he = sym.halfExtent(s, scale * 100.0 * dev);
+        if (he[0] <= 0 or he[1] <= 0) return;
+        const rad = rot_deg * std.math.pi / 180.0;
+        const cs: f32 = @floatCast(@cos(rad));
+        const sn: f32 = @floatCast(@sin(rad));
+        const uvr = atlas.uv(cell); // u0, v0, u1, v1
+        // Pivot-centred cell over ±half-extent, wound 0,1,2,0,2,3 (see SpriteQuad).
+        const local = [4][2]f32{ .{ -he[0], -he[1] }, .{ he[0], -he[1] }, .{ he[0], he[1] }, .{ -he[0], he[1] } };
+        const uvs = [4][2]f32{ .{ uvr[0], uvr[1] }, .{ uvr[2], uvr[1] }, .{ uvr[2], uvr[3] }, .{ uvr[0], uvr[3] } };
+        var q: SpriteQuad = undefined;
+        for (0..4) |i| {
+            q.corners[i] = .{ local[i][0] * cs - local[i][1] * sn, local[i][0] * sn + local[i][1] * cs };
+            q.uv[i] = uvs[i];
+        }
+        const quads = try self.a.alloc(SpriteQuad, 1);
+        quads[0] = q;
+        // Sprites carry their own colour, so the range colour is a placeholder.
+        try self.push(kind, .{ 255, 255, 255, 255 }, .{ .sprite = .{ .anchor = at, .quads = quads, .atlas = .sprite } });
+        if (rot_north) self.ops.items[self.ops.items.len - 1].map_align = 1;
     }
 
     /// A label: shaped into outline rings now, admitted only if it wins its space.
@@ -574,45 +720,102 @@ pub const GpuSurface = struct {
 
         var verts = std.ArrayList(Vertex).empty;
         var indices = std.ArrayList(u32).empty;
+        var quads = std.ArrayList(Quad).empty;
         var ranges = std.ArrayList(Range).empty;
 
         for (self.ops.items) |op| {
+            // Sprites/SDF glyphs go to the quad buffer, everything else to the
+            // indexed triangle buffer. A paint_key folds in the geometry class, so
+            // ops that share a key share a kind — triangle and quad ranges never
+            // interleave WITHIN a key, and coalescing stays sound.
+            if (op.geom == .sprite) {
+                const sq = op.geom.sprite;
+                const first = quads.items.len;
+                try self.emitSpriteGeom(arena, &quads, op, sq.anchor, sq.quads, sq.weight);
+                const count = quads.items.len - first;
+                if (count == 0) continue;
+                if (coalesce(&ranges, op, .quads, sq.atlas, first, count)) continue;
+                try ranges.append(arena, .{
+                    .first = @intCast(first),
+                    .count = @intCast(count),
+                    .paint_key = op.paint_key,
+                    .pattern = NO_PATTERN,
+                    .kind = op.kind,
+                    .prim = .quads,
+                    .atlas = sq.atlas,
+                    .color = op.color,
+                });
+                continue;
+            }
             const first = indices.items.len;
             switch (op.geom) {
                 .fill => |f| try self.emitFill(arena, &verts, &indices, op, f.rings, f.rule),
                 .stroke => |s| try self.emitStroke(arena, &verts, &indices, op, s.lines, s.half_w),
                 .mark => |m| try self.emitMarkGeom(arena, &verts, &indices, op, m.anchor, m.rings, m.rule),
+                .sprite => unreachable,
             }
             const count = indices.items.len - first;
             if (count == 0) continue;
-            // Coalesce with the previous range when it draws identically — a
-            // feature emitting many rings at one priority is one draw, not many.
-            if (ranges.items.len > 0) {
-                const prev = &ranges.items[ranges.items.len - 1];
-                if (prev.paint_key == op.paint_key and prev.kind == op.kind and
-                    std.mem.eql(u8, &prev.color, &op.color) and
-                    prev.pattern == op.pattern and
-                    prev.first_index + prev.index_count == first)
-                {
-                    prev.index_count += @intCast(count);
-                    continue;
-                }
-            }
+            if (coalesce(&ranges, op, .triangles, .none, first, count)) continue;
             try ranges.append(arena, .{
-                .first_index = @intCast(first),
-                .index_count = @intCast(count),
+                .first = @intCast(first),
+                .count = @intCast(count),
                 .paint_key = op.paint_key,
                 .pattern = op.pattern,
                 .kind = op.kind,
+                .prim = .triangles,
+                .atlas = .none,
                 .color = op.color,
             });
         }
         return .{
             .vertices = try verts.toOwnedSlice(arena),
             .indices = try indices.toOwnedSlice(arena),
+            .quads = try quads.toOwnedSlice(arena),
             .ranges = try ranges.toOwnedSlice(arena),
             .patterns = try arena.dupe(PatternCell, self.patterns.items),
         };
+    }
+
+    /// Fold this draw into the previous range when it draws identically and is
+    /// contiguous in the same buffer — a feature emitting many rings, or a
+    /// sounding's several glyph quads, is ONE draw. Returns true when merged.
+    fn coalesce(ranges: *std.ArrayList(Range), op: Op, prim: Prim, atlas: AtlasId, first: usize, count: usize) bool {
+        if (ranges.items.len == 0) return false;
+        const prev = &ranges.items[ranges.items.len - 1];
+        if (prev.prim == prim and prev.atlas == atlas and prev.paint_key == op.paint_key and
+            prev.kind == op.kind and prev.pattern == op.pattern and
+            std.mem.eql(u8, &prev.color, &op.color) and
+            prev.first + prev.count == first)
+        {
+            prev.count += @intCast(count);
+            return true;
+        }
+        return false;
+    }
+
+    /// Expand each anchor-local SpriteQuad into 6 quad-buffer vertices (two
+    /// triangles, wound 0,1,2,0,2,3). The anchor's world position rides every
+    /// vertex; the corner is the local px offset, exactly like a mark.
+    fn emitSpriteGeom(self: *GpuSurface, arena: Allocator, quads: *std.ArrayList(Quad), op: Op, anchor: rs.TilePoint, specs: []const SpriteQuad, weight: f32) !void {
+        const w = self.worldOf(anchor);
+        for (specs) |sq| {
+            var qv: [4]Quad = undefined;
+            for (0..4) |i| qv[i] = .{
+                .x = w[0],
+                .y = w[1],
+                .ox = sq.corners[i][0],
+                .oy = sq.corners[i][1],
+                .u = sq.uv[i][0],
+                .v = sq.uv[i][1],
+                .color = op.color,
+                .weight = weight,
+                .scamin = op.scamin,
+                .disp_cat = op.disp_cat,
+                .map_align = op.map_align,
+            };
+            for ([_]usize{ 0, 1, 2, 0, 2, 3 }) |k| try quads.append(arena, qv[k]);
+        }
     }
 
     fn opLt(_: void, l: Op, r: Op) bool {
@@ -793,8 +996,8 @@ test "gpu: every index is in range and every range is non-empty" {
     try testing.expect(scene.ranges.len > 0);
     for (scene.indices) |i| try testing.expect(i < scene.vertices.len);
     for (scene.ranges) |r| {
-        try testing.expect(r.index_count > 0);
-        try testing.expect(r.first_index + r.index_count <= scene.indices.len);
+        try testing.expect(r.count > 0);
+        try testing.expect(r.first + r.count <= scene.indices.len);
     }
 }
 
@@ -903,6 +1106,87 @@ test "gpu: a mark's local offset carries the mm->0.01mm factor and the device sc
     try testing.expectApproxEqAbs(want, max_ox, 1e-5);
 }
 
+/// A sprite atlas with one 40x20 cell at (10,10) in a 100x50 sheet, for the
+/// symbol FakeStore hands out.
+fn fakeSprites(a: Allocator, name: []const u8) !SpriteAtlas {
+    var at = SpriteAtlas{ .width = 100, .height = 50 };
+    try at.cells.put(a, name, .{ .x = 10, .y = 10, .w = 40, .h = 20 });
+    return at;
+}
+
+test "gpu: a symbol in the atlas draws as a sprite quad, not triangles" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    var sprites = try fakeSprites(a, "BOYLAT13");
+    gs.sprites = &sprites;
+    const surf = gs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "WRECKS", .display_priority = 12 };
+    try surf.beginFeature(&meta);
+    try surf.drawSymbol("BOYLAT13", .{ .x = 2000, .y = 2000 }, 0, sndfrm.SYMBOL_SCALE, false, .point, null);
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    // One quad range (6 verts), sampling the sprite atlas — NOT tessellated
+    // triangles. This is the whole point: symbols stay antialiased artwork.
+    try testing.expectEqual(@as(usize, 1), scene.ranges.len);
+    try testing.expectEqual(Prim.quads, scene.ranges[0].prim);
+    try testing.expectEqual(AtlasId.sprite, scene.ranges[0].atlas);
+    try testing.expectEqual(Kind.symbol, scene.ranges[0].kind);
+    try testing.expectEqual(@as(u32, 6), scene.ranges[0].count);
+    try testing.expectEqual(@as(usize, 6), scene.quads.len);
+    try testing.expectEqual(@as(usize, 0), scene.indices.len); // nothing tessellated
+
+    // The quad's UVs span the cell: [10/100 .. 50/100] x [10/50 .. 30/50].
+    var u_lo: f32 = 1;
+    var u_hi: f32 = 0;
+    for (scene.quads) |q| {
+        u_lo = @min(u_lo, q.u);
+        u_hi = @max(u_hi, q.u);
+        // Every glyph vertex rides the one world anchor.
+        try testing.expectEqual(scene.quads[0].x, q.x);
+    }
+    try testing.expectApproxEqAbs(@as(f32, 0.10), u_lo, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.50), u_hi, 1e-6);
+}
+
+test "gpu: a sounding's glyphs coalesce into one sprite-quad draw" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    // FakeStore returns the same square for every name, so every composed glyph
+    // resolves; give the atlas a catch-all under each name it will ask for.
+    var sprites = SpriteAtlas{ .width = 64, .height = 64 };
+    for ([_][]const u8{ "SOUNDG21", "SOUNDG12", "SOUNDG55" }) |n| {
+        try sprites.cells.put(a, n, .{ .x = 0, .y = 0, .w = 8, .h = 8 });
+    }
+    gs.sprites = &sprites;
+    const surf = gs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "SOUNDG", .display_priority = 27 };
+    try surf.beginFeature(&meta);
+    try surf.drawSounding(12.5, false, false, .{ .x = 2000, .y = 2000 }); // -> 3 glyphs
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    // Three glyph quads, one anchor, one paint_key, one atlas: ONE draw.
+    try testing.expectEqual(@as(usize, 1), scene.ranges.len);
+    try testing.expectEqual(Prim.quads, scene.ranges[0].prim);
+    try testing.expectEqual(Kind.sounding, scene.ranges[0].kind);
+    try testing.expectEqual(@as(u32, 18), scene.ranges[0].count); // 3 glyphs * 6
+}
+
 test "gpu: sounding_size_scale grows the digits and their spacing together" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -952,7 +1236,7 @@ test "gpu: a pattern fill emits interior geometry plus a cell reference" {
     // (a host that ignored the interior would draw nothing).
     try testing.expectEqual(NO_PATTERN, scene.ranges[0].pattern);
     try testing.expect(scene.ranges[1].pattern != NO_PATTERN);
-    try testing.expect(scene.ranges[1].index_count > 0);
+    try testing.expect(scene.ranges[1].count > 0);
     try testing.expectEqual(@as(usize, 1), scene.patterns.len);
     try testing.expectEqual(@as(u32, 2), scene.patterns[0].w);
     try testing.expectEqual(@as(usize, 16), scene.patterns[0].rgba.len);
@@ -1091,11 +1375,11 @@ test "gpu: a label becomes text-kind geometry that paints last" {
     const scene = try fx.gs.build(a);
     try testing.expectEqual(@as(usize, 2), scene.ranges.len);
     try testing.expectEqual(Kind.text, scene.ranges[scene.ranges.len - 1].kind);
-    try testing.expect(scene.ranges[1].index_count > 0);
+    try testing.expect(scene.ranges[1].count > 0);
     // The glyphs ride the anchor: one world position, outlines as local px.
-    const first = scene.ranges[1].first_index;
+    const first = scene.ranges[1].first;
     const v0 = scene.vertices[scene.indices[first]];
-    for (scene.indices[first .. first + scene.ranges[1].index_count]) |i| {
+    for (scene.indices[first .. first + scene.ranges[1].count]) |i| {
         try testing.expectEqual(v0.x, scene.vertices[i].x);
         try testing.expectEqual(v0.y, scene.vertices[i].y);
     }
@@ -1203,19 +1487,28 @@ test "gpu: the C scene structs match their tile57.h layout" {
     try testing.expectEqual(@as(usize, 21), @offsetOf(Vertex, "map_align"));
 
     try testing.expectEqual(@as(usize, 24), @sizeOf(Range));
-    try testing.expectEqual(@as(usize, 0), @offsetOf(Range, "first_index"));
-    try testing.expectEqual(@as(usize, 4), @offsetOf(Range, "index_count"));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(Range, "first"));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(Range, "count"));
     try testing.expectEqual(@as(usize, 8), @offsetOf(Range, "paint_key"));
     try testing.expectEqual(@as(usize, 12), @offsetOf(Range, "pattern"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(Range, "color"));
     try testing.expectEqual(@as(usize, 20), @offsetOf(Range, "kind"));
+    try testing.expectEqual(@as(usize, 21), @offsetOf(Range, "prim"));
+    try testing.expectEqual(@as(usize, 22), @offsetOf(Range, "atlas"));
+
+    try testing.expectEqual(@as(usize, 40), @sizeOf(Quad));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(Quad, "u"));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(Quad, "color"));
+    try testing.expectEqual(@as(usize, 28), @offsetOf(Quad, "weight"));
+    try testing.expectEqual(@as(usize, 36), @offsetOf(Quad, "disp_cat"));
 
     try testing.expectEqual(@as(usize, 24), @sizeOf(CPattern));
     try testing.expectEqual(@as(usize, 8), @offsetOf(CPattern, "rgba"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(CPattern, "rgba_len"));
 
-    try testing.expectEqual(@as(usize, 72), @sizeOf(CScene));
-    try testing.expectEqual(@as(usize, 64), @offsetOf(CScene, "owner"));
+    try testing.expectEqual(@as(usize, 88), @sizeOf(CScene));
+    try testing.expectEqual(@as(usize, 32), @offsetOf(CScene, "quads"));
+    try testing.expectEqual(@as(usize, 80), @offsetOf(CScene, "owner"));
 
     // The header's tile57_gpu_kind values ARE paint.Layer — the S-52 class
     // tiebreak order, with pattern between area and line so an area-fill pattern
