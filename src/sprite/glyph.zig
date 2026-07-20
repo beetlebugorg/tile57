@@ -7,7 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 // C glue (src/sprite/svgraster.c): stb_truetype SDF + the shared PNG encoder.
-extern fn tg_glyph_sdf(font: [*]const u8, font_len: c_int, cp: c_int, em_px: f32, pad: c_int, w: *c_int, h: *c_int, xoff: *c_int, yoff: *c_int, advance: *f32) callconv(.c) ?[*]u8;
+extern fn tg_glyph_sdf(font: [*]const u8, font_len: c_int, cp: c_int, em_px: f32, pad: c_int, onedge: c_int, dist_scale: f32, w: *c_int, h: *c_int, xoff: *c_int, yoff: *c_int, advance: *f32) callconv(.c) ?[*]u8;
 extern fn tg_glyph_free(p: ?[*]u8) callconv(.c) void;
 extern fn tg_png_encode(rgba: [*]const u8, w: c_int, h: c_int, out_len: *c_int) callconv(.c) ?[*]u8;
 extern fn tg_svg_free(p: ?*anyopaque) callconv(.c) void;
@@ -81,7 +81,8 @@ pub fn build(a: Allocator, font: []const u8, cps: []const u21, em_px: f32, pad: 
         var xoff: c_int = 0;
         var yoff: c_int = 0;
         var adv: f32 = 0;
-        const sdf = tg_glyph_sdf(font.ptr, @intCast(font.len), @intCast(cp), em_px, @intCast(pad), &w, &h, &xoff, &yoff, &adv);
+        // GPU-atlas SDF encoding: edge at 128, a symmetric ±pad-px field (127/pad).
+        const sdf = tg_glyph_sdf(font.ptr, @intCast(font.len), @intCast(cp), em_px, @intCast(pad), 128, 127.0 / @as(f32, @floatFromInt(pad)), &w, &h, &xoff, &yoff, &adv);
         const gi = GlyphInfo{
             .off_x = @as(f32, @floatFromInt(xoff)) / em_px,
             .off_y = @as(f32, @floatFromInt(yoff)) / em_px,

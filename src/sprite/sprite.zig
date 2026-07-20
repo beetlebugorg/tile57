@@ -18,6 +18,7 @@ extern fn tg_svg_free(p: ?*anyopaque) void;
 
 /// SDF glyph atlas for GPU text (stb_truetype), a sibling baked asset.
 pub const glyph = @import("glyph.zig");
+pub const glyphpbf = @import("glyphpbf.zig");
 test {
     _ = glyph;
 }
