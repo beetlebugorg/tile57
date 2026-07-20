@@ -1335,12 +1335,28 @@ fn glyphMetricsJson(a: std.mem.Allocator, atlas: *const glyph_sdf.Atlas) ![]u8 {
 /// {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,v1,ox,oy,w,h,adv]}} (EM units).
 /// Only sprite_* filled. Free with tile57_assets_free. See tile57.h.
 export fn tile57_bake_glyph_sdf(out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
+    return bakeGlyphSdf(out, 0, err);
+}
+
+/// tile57_bake_glyph_sdf for a specific label-tier face: 0 regular, 1 bold, 2
+/// italic (render.labeltier / the draw_text_str `face` argument). A GPU host that
+/// wants bold place names and italic hydrography bakes one atlas per face.
+export fn tile57_bake_glyph_sdf_face(out: ?*CAssets, face: i32, err: ?*CError) callconv(.c) c_int {
+    return bakeGlyphSdf(out, face, err);
+}
+
+fn bakeGlyphSdf(out: ?*CAssets, face: i32, err: ?*CError) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = .{};
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const font = @import("render").font.notosans;
+    const ft = @import("render").font;
+    const font = switch (face) {
+        1 => ft.notosans_bold,
+        2 => ft.notosans_italic,
+        else => ft.notosans,
+    };
     const cps = glyph_sdf.defaultCodepoints(a) catch |e| return fail(err, e);
     var atlas = glyph_sdf.build(a, font, cps, 32.0, 6) catch |e| return fail(err, e);
     const png = (atlas.encodePng(a) catch |e| return fail(err, e)) orelse

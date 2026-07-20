@@ -693,8 +693,12 @@ typedef struct {
      * view_rotation : 0)` (a depth-contour value passes the tangent + MAP; an
      * ordinary label passes 0 + VIEWPORT and stays upright). `text_group` is the
      * label's S-52 text group, exactly as on draw_text (11 = important text).
+     * `face` is the label-tier face — 0 regular, 1 bold, 2 italic — so a host
+     * that keeps a glyph atlas per face (tile57_bake_glyph_sdf_face for the bold
+     * and italic faces) selects the right one; a host with only the regular atlas
+     * ignores it.
      * NULL => text tessellates via draw_text. Must be the LAST field. */
-    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo, int32_t text_group);
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo, int32_t text_group, int32_t face);
 } tile57_surface_cb;
 
 tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, double zoom,
@@ -1107,6 +1111,11 @@ tile57_status tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out
  * text pixel size). A host draws each glyph as a textured quad sampling the SDF.
  * Only sprite_* filled. Free with tile57_assets_free. */
 tile57_status tile57_bake_glyph_sdf(tile57_assets *out, tile57_error *err);
+/* tile57_bake_glyph_sdf for one label-tier face: 0 regular, 1 bold, 2 italic (the
+ * draw_text_str `face` argument). A host baking a per-face atlas set gets bold
+ * place names and italic hydrography from the SDF text path. Free with
+ * tile57_assets_free. */
+tile57_status tile57_bake_glyph_sdf_face(tile57_assets *out, int32_t face, tile57_error *err);
 void tile57_assets_free(tile57_assets *out);
 
 /* ---- chart-style generation ---------------------------------------------

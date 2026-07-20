@@ -330,13 +330,16 @@ pub const GpuSurface = struct {
     patterns: std.ArrayList(PatternCell) = .empty,
     pattern_ix: std.StringHashMapUnmanaged(u32) = .empty,
     fnt: ?fontmod.Font = null,
+    fnt_bold: ?fontmod.Font = null,
+    fnt_italic: ?fontmod.Font = null,
     /// Labels are NOT decluttered here — `build` emits geometry only. Each label
     /// is shaped into a view-INDEPENDENT candidate (its glyph quads in absolute
     /// world + a local-px box); the whole view's candidates are cached per tile
     /// and decluttered together per frame (see `assembleLabels`), so a name never
     /// repeats across a seam and shaping never re-runs on a pan.
     candidates: std.ArrayList(LabelCandidate) = .empty,
-    glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
+    // Keyed by (face_idx << 16 | gid): glyph ids are per-face (outline fallback).
+    glyph_cache: std.AutoHashMapUnmanaged(u32, []const []const cv.Point) = .empty,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -361,6 +364,8 @@ pub const GpuSurface = struct {
             .zoom = zoom,
             .tessellator = try tess.Tessellator.init(a),
             .fnt = fontmod.Font.init(fontmod.notosans) catch null,
+            .fnt_bold = fontmod.Font.init(fontmod.notosans_bold) catch null,
+            .fnt_italic = fontmod.Font.init(fontmod.notosans_italic) catch null,
         };
     }
 
@@ -609,7 +614,12 @@ pub const GpuSurface = struct {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
-        const f = &(self.fnt orelse return);
+        if (self.fnt == null) return;
+        // A bold/italic label shapes and renders from its real face; only the
+        // regular face has an SDF atlas, so a tiered label takes the outline path
+        // (real TrueType contours) rather than a synthesized embolden/shear.
+        const face = self.pickFace(style.weight, style.slant);
+        const f = face.f;
         const px: f32 = @floatCast((if (style.font_size > 0) style.font_size else 12) * self.textDev());
         if (px <= 1) return;
 
@@ -649,9 +659,12 @@ pub const GpuSurface = struct {
         // The run becomes either SDF glyph quads (crisp at any zoom, the whole
         // point of the atlas) or — when no glyph atlas is loaded — filled outline
         // triangles, so a host without the SDF asset still gets text.
-        const geom = (try self.sdfRun(gids.items, x0, baseline, px, at)) orelse
-            (try self.outlineRun(gids.items, x0, baseline, px, at)) orelse
-            return; // all-whitespace run: nothing to place
+        const geom = if (face.idx == 0)
+            (try self.sdfRun(gids.items, x0, baseline, px, at)) orelse
+                (try self.outlineRun(face, gids.items, x0, baseline, px, at)) orelse
+                return // all-whitespace run: nothing to place
+        else
+            (try self.outlineRun(face, gids.items, x0, baseline, px, at)) orelse return;
 
         // Build the label's renderable geometry NOW — absolute world, so it is
         // view-independent and caches — and store its box in LOCAL px relative to
@@ -727,12 +740,21 @@ pub const GpuSurface = struct {
         return .{ .sprite = .{ .anchor = at, .quads = try quads.toOwnedSlice(self.a), .atlas = .glyph } };
     }
 
+    /// The parsed face + its cache index for a label's weight/slant, falling back
+    /// to regular when the bold/italic face failed to load.
+    fn pickFace(self: *GpuSurface, weight: fontmod.Weight, slant: fontmod.Slant) struct { f: *const fontmod.Font, idx: u32 } {
+        if (weight == .bold) if (self.fnt_bold) |*b| return .{ .f = b, .idx = 1 };
+        if (slant == .italic) if (self.fnt_italic) |*i| return .{ .f = i, .idx = 2 };
+        return .{ .f = &self.fnt.?, .idx = 0 };
+    }
+
     /// The outline-triangle fallback: filled glyph contours, wound nonzero. Null
-    /// for an all-whitespace run.
-    fn outlineRun(self: *GpuSurface, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
+    /// for an all-whitespace run. `face` shapes the outlines (its cache index keeps
+    /// the three faces' per-id outlines distinct).
+    fn outlineRun(self: *GpuSurface, face: anytype, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
         var rings = std.ArrayList([]const [2]f32).empty;
         for (glyphs_in) |g| {
-            for (try self.glyphOutline(g.gid)) |contour| {
+            for (try self.glyphOutline(face.f, face.idx, g.gid)) |contour| {
                 if (contour.len < 3) continue;
                 const pts = try self.a.alloc([2]f32, contour.len);
                 // em units, y UP -> local reference px, y DOWN.
@@ -760,10 +782,11 @@ pub const GpuSurface = struct {
         return .{ @as(f64, w[0]) * s, @as(f64, w[1]) * s };
     }
 
-    fn glyphOutline(self: *GpuSurface, gid: u16) ![]const []const cv.Point {
-        if (self.glyph_cache.get(gid)) |hit| return hit;
-        const out = try self.fnt.?.outline(self.a, gid);
-        try self.glyph_cache.put(self.a, gid, out);
+    fn glyphOutline(self: *GpuSurface, face: *const fontmod.Font, idx: u32, gid: u16) ![]const []const cv.Point {
+        const key = (idx << 16) | gid;
+        if (self.glyph_cache.get(key)) |hit| return hit;
+        const out = try face.outline(self.a, gid);
+        try self.glyph_cache.put(self.a, key, out);
         return out;
     }
 
