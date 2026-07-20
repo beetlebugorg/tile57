@@ -27,6 +27,7 @@ const rs = @import("surface.zig");
 const resolve = @import("resolve.zig");
 const tess = @import("tess.zig");
 const sym = @import("symbols.zig");
+const sndfrm = @import("sndfrm.zig");
 const cv = @import("canvas.zig");
 const paint = @import("paint.zig");
 
@@ -135,6 +136,7 @@ pub const GpuSurface = struct {
         .drawText = drawText,
         .endFeature = endFeature,
         .endScene = endScene,
+        .size_scale = sizeScale,
     };
 
     pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, zoom: f64) !GpuSurface {
@@ -166,6 +168,28 @@ pub const GpuSurface = struct {
             @floatCast(self.tile_ox + @as(f64, @floatFromInt(p.x)) * self.tile_scale),
             @floatCast(self.tile_oy + @as(f64, @floatFromInt(p.y)) * self.tile_scale),
         };
+    }
+
+    /// The device scale local offsets are sized in. Like the vector surface, this
+    /// path hands the HOST reference-px sizes and does not draw them itself, so
+    /// unless it is told the density it emits marks in units the host does not
+    /// draw in. Both factors default to 1.0.
+    fn refDev(self: *const GpuSurface) f64 {
+        return self.settings.size_scale * self.settings.device_scale;
+    }
+
+    /// refDev with the mariner's extra SOUNDING multiplier folded in — sizes each
+    /// digit AND its pivot-baked spacing together, so a 3-digit sounding grows
+    /// without colliding with itself (mariner.sounding_size_scale, 1.0 = none).
+    fn soundingDev(self: *const GpuSurface) f64 {
+        return self.refDev() * self.settings.sounding_size_scale;
+    }
+
+    /// Surface contract: this surface's display scale, so the engine walks
+    /// complex-linestyle periods display-scaled and a HiDPI host gets both wider
+    /// spacing and bigger bricks.
+    fn sizeScale(ctx: *anyopaque) f64 {
+        return sp(ctx).refDev();
     }
 
     fn rgba(self: *const GpuSurface, token: rs.ColorToken) [4]u8 {
@@ -229,12 +253,30 @@ pub const GpuSurface = struct {
         var eff = name;
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
         const s = store.get(eff) orelse return;
-        try self.emitMark(.symbol, s, at, rot_deg, scale, rot_north);
+        try self.emitMark(.symbol, s, at, rot_deg, scale, self.refDev(), rot_north);
     }
 
-    fn drawSounding(_: *anyopaque, _: f64, _: bool, _: bool, _: rs.TilePoint) anyerror!void {
-        // Soundings compose digit glyphs through SNDFRM; they arrive here only
-        // when the engine cannot render them itself. Not yet emitted.
+    fn drawSounding(ctx: *anyopaque, depth_m: f64, swept: bool, low_acc: bool, at: rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        const store = self.store orelse return;
+        if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
+        // Bold/faint split at the mariner's LIVE safety depth (metres), value in
+        // the mariner's unit — the same composition the pixel and vector paths
+        // run, from the one shared SNDFRM routine.
+        const feet = self.settings.depth_unit == .feet;
+        const shown = if (feet) depth_m * sndfrm.M_TO_FT else depth_m;
+        const prefix: []const u8 = if (depth_m <= self.settings.safety_depth) "SOUNDS" else "SOUNDG";
+        const list = try sndfrm.syms(self.a, prefix, shown, swept, low_acc, feet);
+        // A sounding is a SYMBOL, not text: every one draws, none enters a
+        // collision pool, and each digit glyph self-positions by its own pivot —
+        // so the whole number is emitted at the one anchor. Screen-upright under
+        // a rotated view, sized by soundingDev so digit and spacing grow together.
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |glyph| {
+            if (glyph.len == 0) continue;
+            const s = store.get(glyph) orelse continue;
+            try self.emitMark(.sounding, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), false);
+        }
     }
 
     fn drawText(_: *anyopaque, _: []const u8, _: *const rs.TextStyle, _: rs.TilePoint) anyerror!void {
@@ -243,11 +285,17 @@ pub const GpuSurface = struct {
     }
 
     /// Flatten a symbol's paths into local reference-px rings, rotated.
-    fn emitMark(self: *GpuSurface, kind: Kind, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool) !void {
+    ///
+    /// `scale` is the engine's SYMBOL_SCALE — screen px per 0.01 mm — but symbol
+    /// contours are in mm user units, so the 100 converts mm to the 0.01 mm the
+    /// scale is quoted in. `dev` is the display density (refDev for point
+    /// symbols, soundingDev for digits). Dropping either shrinks every mark by
+    /// that factor; the pixel and vector paths both apply the same product.
+    fn emitMark(self: *GpuSurface, kind: Kind, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_north: bool) !void {
         const rad = rot_deg * std.math.pi / 180.0;
         const cs: f32 = @floatCast(@cos(rad));
         const sn: f32 = @floatCast(@sin(rad));
-        const k: f32 = @floatCast(scale);
+        const k: f32 = @floatCast(scale * 100.0 * dev);
         var rings = std.ArrayList([]const [2]f32).empty;
         var color: [4]u8 = .{ 0, 0, 0, 255 };
         for (s.paths) |path| {
@@ -421,6 +469,29 @@ fn testSurface(a: Allocator, colors: *const resolve.Colors, settings: *const res
     return s;
 }
 
+/// Minimal store for the mark tests: drawSymbol/drawSounding return early
+/// without one. Every name resolves to the same 2x2 mm square centred on its
+/// pivot, so a test counts glyphs by counting geometry.
+const FakeStore = struct {
+    square: sym.Symbol,
+    const vt = sym.SymbolStore.VTable{ .get = get, .getPattern = getPattern };
+    fn getPattern(_: *anyopaque, _: []const u8, _: f32) ?*const cv.Pattern {
+        return null;
+    }
+    fn get(ctx: *anyopaque, _: []const u8) ?*const sym.Symbol {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return &self.square;
+    }
+    const ring = [_]cv.Point{ .{ .x = -1, .y = -1 }, .{ .x = 1, .y = -1 }, .{ .x = 1, .y = 1 }, .{ .x = -1, .y = 1 } };
+    const contours = [_][]const cv.Point{&ring};
+    fn make() FakeStore {
+        return .{ .square = .{
+            .paths = &.{.{ .fill = .{ .r = 10, .g = 20, .b = 30 }, .contours = &contours }},
+            .pivot = .{ .x = 0, .y = 0 },
+        } };
+    }
+};
+
 test "gpu: ranges come out sorted by paint_key regardless of walk order" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -511,4 +582,100 @@ test "gpu: a stroke's width lives in the local offset, not the world position" {
     try testing.expectEqual(scene.vertices[0].y, scene.vertices[1].y);
     try testing.expectApproxEqAbs(scene.vertices[0].oy, -scene.vertices[1].oy, 1e-6);
     try testing.expect(@abs(scene.vertices[0].oy) > 0);
+}
+
+/// Emit one sounding and return its finished scene.
+fn soundingScene(a: Allocator, settings: *const resolve.Settings, depth_m: f64) !Scene {
+    var colors = try resolve.Colors.init(a, "");
+    var gs = try testSurface(a, &colors, settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    const surf = gs.asSurface();
+    const meta = rs.FeatureMeta{ .class = "SOUNDG", .display_priority = 27 };
+    try surf.beginFeature(&meta);
+    try surf.drawSounding(depth_m, false, false, .{ .x = 2000, .y = 2000 });
+    try surf.endFeature();
+    return gs.build(a);
+}
+
+test "gpu: a sounding emits one mark per composed SNDFRM glyph" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = resolve.Settings{}; // safety_depth 10 m, metres
+
+    // 4.0 m composes to a single glyph (SOUNDS14); 12.5 m to three (SOUNDG22,
+    // SOUNDG11, SOUNDG55 — two integer digits plus the subscript tenth). The
+    // digits are what make a sounding a NUMBER rather than one mark, so pin the
+    // ratio, not just "something was emitted".
+    const one = try soundingScene(a, &settings, 4.0);
+    const three = try soundingScene(a, &settings, 12.5);
+    try testing.expect(one.vertices.len > 0);
+    try testing.expectEqual(one.vertices.len * 3, three.vertices.len);
+    try testing.expectEqual(one.indices.len * 3, three.indices.len);
+}
+
+test "gpu: a sounding's glyphs coalesce into one sounding-class range" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const settings = resolve.Settings{};
+
+    const scene = try soundingScene(a, &settings, 12.5);
+    // Three glyphs, one anchor, one paint_key: one draw, not three.
+    try testing.expectEqual(@as(usize, 1), scene.ranges.len);
+    try testing.expectEqual(Kind.sounding, scene.ranges[0].kind);
+    try testing.expectEqual(paint.key(.sounding, 27, 0, false), scene.ranges[0].paint_key);
+    // Every glyph rides the anchor's world position; the digits are local px.
+    for (scene.vertices) |v| {
+        try testing.expectEqual(scene.vertices[0].x, v.x);
+        try testing.expectEqual(scene.vertices[0].y, v.y);
+    }
+}
+
+test "gpu: a mark's local offset carries the mm->0.01mm factor and the device scale" {
+    // The bug this pins: emitMark used `scale` raw. SYMBOL_SCALE is quoted in px
+    // per 0.01 mm but symbol contours are mm, so every mark came out 100x too
+    // small — and ignored size_scale/device_scale entirely, which this path must
+    // apply itself because the host draws the offsets without rescaling them.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    const surf = gs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "WRECKS", .display_priority = 12 };
+    try surf.beginFeature(&meta);
+    try surf.drawSymbol("BOYLAT13", .{ .x = 2000, .y = 2000 }, 0, sndfrm.SYMBOL_SCALE, false, .point, null);
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    // The square's corner sits 1 mm from the pivot: 1 * SYMBOL_SCALE * 100 px.
+    const want: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0);
+    var max_ox: f32 = 0;
+    for (scene.vertices) |v| max_ox = @max(max_ox, @abs(v.ox));
+    try testing.expectApproxEqAbs(want, max_ox, 1e-5);
+}
+
+test "gpu: sounding_size_scale grows the digits and their spacing together" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = resolve.Settings{};
+    const big = resolve.Settings{ .sounding_size_scale = 2.0 };
+
+    const s1 = try soundingScene(a, &plain, 12.5);
+    const s2 = try soundingScene(a, &big, 12.5);
+    try testing.expectEqual(s1.vertices.len, s2.vertices.len);
+    // Uniform 2x on every local offset — the pivot-baked spacing between digits
+    // is itself an offset, so it scales with them and a grown sounding cannot
+    // collide with itself.
+    for (s1.vertices, s2.vertices) |v1, v2| {
+        try testing.expectApproxEqAbs(v1.ox * 2.0, v2.ox, 1e-5);
+        try testing.expectApproxEqAbs(v1.oy * 2.0, v2.oy, 1e-5);
+    }
 }
