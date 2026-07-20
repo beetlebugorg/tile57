@@ -248,6 +248,13 @@ const Op = struct {
     disp_cat: u8,
     map_align: u8,
     pattern: u32 = NO_PATTERN,
+    // The tile->world transform AT THE TIME THIS OP WAS BUFFERED. Geometry is
+    // kept tile-local and converted in `build`, but a whole-view scene walks many
+    // tiles into one surface, so `self.tile_*` has moved on by build time — the op
+    // must carry its own tile origin or every tile collapses onto the last one.
+    tox: f64 = 0,
+    toy: f64 = 0,
+    tscale: f64 = 1,
     geom: Geom,
 };
 
@@ -419,8 +426,20 @@ pub const GpuSurface = struct {
             .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
             .map_align = 0,
             .pattern = pattern,
+            .tox = self.tile_ox,
+            .toy = self.tile_oy,
+            .tscale = self.tile_scale,
             .geom = geom,
         });
+    }
+
+    /// tile-local point -> world [0,1] using an OP's captured tile transform (not
+    /// the surface's current one, which has moved on to a later tile).
+    fn opWorld(op: Op, p: rs.TilePoint) [2]f32 {
+        return .{
+            @floatCast(op.tox + @as(f64, @floatFromInt(p.x)) * op.tscale),
+            @floatCast(op.toy + @as(f64, @floatFromInt(p.y)) * op.tscale),
+        };
     }
 
     // ---- Surface impl -------------------------------------------------------
@@ -631,6 +650,9 @@ pub const GpuSurface = struct {
             .scamin = if (self.cur.scamin) |s| @floatFromInt(s) else 0,
             .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
             .map_align = 0,
+            .tox = self.tile_ox,
+            .toy = self.tile_oy,
+            .tscale = self.tile_scale,
             .geom = geom,
         });
     }
@@ -849,8 +871,8 @@ pub const GpuSurface = struct {
     /// Expand each anchor-local SpriteQuad into 6 quad-buffer vertices (two
     /// triangles, wound 0,1,2,0,2,3). The anchor's world position rides every
     /// vertex; the corner is the local px offset, exactly like a mark.
-    fn emitSpriteGeom(self: *GpuSurface, arena: Allocator, quads: *std.ArrayList(Quad), op: Op, anchor: rs.TilePoint, specs: []const SpriteQuad, weight: f32) !void {
-        const w = self.worldOf(anchor);
+    fn emitSpriteGeom(_: *GpuSurface, arena: Allocator, quads: *std.ArrayList(Quad), op: Op, anchor: rs.TilePoint, specs: []const SpriteQuad, weight: f32) !void {
+        const w = opWorld(op, anchor);
         for (specs) |sq| {
             var qv: [4]Quad = undefined;
             for (0..4) |i| qv[i] = .{
@@ -893,7 +915,7 @@ pub const GpuSurface = struct {
         for (rings) |ring| {
             if (ring.len < 3) continue;
             const pts = try self.a.alloc([2]f32, ring.len);
-            for (ring, 0..) |p, i| pts[i] = self.worldOf(p);
+            for (ring, 0..) |p, i| pts[i] = opWorld(op, p);
             try contours.append(self.a, pts);
         }
         defer for (contours.items) |c| self.a.free(c);
@@ -910,13 +932,13 @@ pub const GpuSurface = struct {
     /// Expand a polyline into quads. The width is in REFERENCE PIXELS and goes
     /// into the local offset, not the world position, so a line keeps its screen
     /// width at every zoom without re-tessellating.
-    fn emitStroke(self: *GpuSurface, arena: Allocator, verts: *std.ArrayList(Vertex), indices: *std.ArrayList(u32), op: Op, lines: []const []const rs.TilePoint, half_w: f32) !void {
+    fn emitStroke(_: *GpuSurface, arena: Allocator, verts: *std.ArrayList(Vertex), indices: *std.ArrayList(u32), op: Op, lines: []const []const rs.TilePoint, half_w: f32) !void {
         for (lines) |line| {
             if (line.len < 2) continue;
             var i: usize = 0;
             while (i + 1 < line.len) : (i += 1) {
-                const a = self.worldOf(line[i]);
-                const b = self.worldOf(line[i + 1]);
+                const a = opWorld(op, line[i]);
+                const b = opWorld(op, line[i + 1]);
                 var dx = b[0] - a[0];
                 var dy = b[1] - a[1];
                 const len = @sqrt(dx * dx + dy * dy);
@@ -942,7 +964,7 @@ pub const GpuSurface = struct {
     fn emitMarkGeom(self: *GpuSurface, arena: Allocator, verts: *std.ArrayList(Vertex), indices: *std.ArrayList(u32), op: Op, anchor: rs.TilePoint, rings: []const []const [2]f32, rule: tess.Rule) !void {
         const tri = (try self.tessellator.run(rings, rule)) orelse return;
         defer self.a.free(tri.indices);
-        const w = self.worldOf(anchor);
+        const w = opWorld(op, anchor);
         const base: u32 = @intCast(verts.items.len);
         var i: usize = 0;
         while (i < tri.verts.len) : (i += 2) {
@@ -988,6 +1010,48 @@ const FakeStore = struct {
         } };
     }
 };
+
+test "gpu: geometry walked across tiles keeps each tile's world position" {
+    // The multi-tile collapse bug: a whole-view scene walks many tiles into one
+    // surface via setTile, but geometry is buffered tile-local and converted in
+    // build(). Using the SURFACE's current tile transform (the LAST tile) at
+    // build time instead of each op's own lands every tile's fill on the last
+    // tile. Emit a fill in tile (2,10,10) and another in (2,12,10) and check they
+    // sit two tile-columns apart, not on top of each other.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try GpuSurface.init(a, &colors, .day, &settings, 12.0);
+    defer gs.deinit();
+    const surf = gs.asSurface();
+
+    const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 4096, .y = 0 }, .{ .x = 4096, .y = 4096 }, .{ .x = 0, .y = 4096 } };
+    const rings = [_][]const rs.TilePoint{&ring};
+    const meta = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 9 };
+
+    gs.setTile(2, 10, 10); // world x in [10/4 .. 11/4] = [2.5 .. 2.75]
+    try surf.beginFeature(&meta);
+    try surf.fillArea("DEPVS", &rings, null);
+    try surf.endFeature();
+    gs.setTile(2, 12, 10); // world x in [12/4 .. 13/4] = [3.0 .. 3.25]
+    try surf.beginFeature(&meta);
+    try surf.fillArea("DEPVS", &rings, null);
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    var min_x: f32 = 1e9;
+    var max_x: f32 = -1e9;
+    for (scene.vertices) |v| {
+        min_x = @min(min_x, v.x);
+        max_x = @max(max_x, v.x);
+    }
+    // Two tiles two columns apart span world x [2.5 .. 3.25], not one tile's
+    // 0.25. The collapse bug made every vertex land in one tile.
+    try testing.expectApproxEqAbs(@as(f32, 2.5), min_x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 3.25), max_x, 1e-4);
+}
 
 test "gpu: ranges come out sorted by paint_key regardless of walk order" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
