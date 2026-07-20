@@ -299,6 +299,10 @@ pub const ComposeSource = struct {
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
     part: geometry.partition.Partition,
+    /// False when the partition had to be BUILT (no sidecar, or one that no
+    /// longer matches this cell set). The C layer uses it to refresh the cache
+    /// on disk, so a stale sidecar heals itself instead of costing every open.
+    part_loaded: bool = false,
     minz: u8,
     maxz: u8,
     loop_max: u8, // deepest zoom the sources can serve (native windows + one fill-up overscale zoom)
@@ -462,6 +466,55 @@ fn covDegBounds(cc: coverage.ChartCoverage) [4]f64 {
 // partition, derive the zoom range + union bounds, and finish `src`. The arrays
 // already live in src.arena; on error the caller's errdefer tears down whatever
 // it owns per `owns_archives`.
+/// Put the cell set in ONE canonical order, whatever order the caller handed the
+/// archives over in.
+///
+/// The partition's input key (geometry.partition.inputKey) hashes the cells in
+/// sequence, and its ownership tie-break falls back to input order — so the order
+/// is part of the artifact's identity. That used to make the sidecar depend on the
+/// CALLER: `tile57 bake` sorted its archive paths, while a host that walked a
+/// directory handed them over in readdir order, and the two disagreed. The bake's
+/// partition then failed to load with StalePartition and every open rebuilt an
+/// identical copy from scratch.
+///
+/// Sorting on the coverage NAME (the file basename stem — already the ownership
+/// tie-break name) rather than on the path makes this independent of the caller's
+/// order AND of the directory layout, so a flat `<out>/tiles/*.pmtiles` bake and a
+/// host mirroring `d1/`, `d5/` subdirs produce the same key. `date` breaks ties
+/// between two archives of the same cell.
+///
+/// readers/maps/shims are index-aligned (cell index == reader index, relied on by
+/// composeTile), so all three are permuted together. maps is empty when the
+/// archives are borrowed from open charts.
+fn canonicalizeCellOrder(
+    readers: []const *pmtiles.Reader,
+    maps: []const []align(std.heap.page_size_min) const u8,
+    shims: []const LoadedCov,
+) void {
+    const n = shims.len;
+    if (n < 2) return;
+    // Insertion sort: the arrays are index-aligned and small (a library is
+    // hundreds of cells), and it is stable, so equal (name, date) keeps arrival
+    // order rather than shuffling.
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        var j = i;
+        while (j > 0 and cellOrderLt(shims[j], shims[j - 1])) : (j -= 1) {
+            std.mem.swap(LoadedCov, @constCast(&shims[j]), @constCast(&shims[j - 1]));
+            std.mem.swap(*pmtiles.Reader, @constCast(&readers[j]), @constCast(&readers[j - 1]));
+            if (maps.len == n) std.mem.swap([]align(std.heap.page_size_min) const u8, @constCast(&maps[j]), @constCast(&maps[j - 1]));
+        }
+    }
+}
+
+fn cellOrderLt(x: LoadedCov, y: LoadedCov) bool {
+    return switch (std.mem.order(u8, x.name, y.name)) {
+        .lt => true,
+        .gt => false,
+        .eq => std.mem.order(u8, x.date, y.date) == .lt,
+    };
+}
+
 fn finishOpen(
     gpa: std.mem.Allocator,
     src: *ComposeSource,
@@ -472,6 +525,7 @@ fn finishOpen(
     owns_archives: bool,
 ) !*ComposeSource {
     const a = src.arena.allocator();
+    canonicalizeCellOrder(readers, maps, shims);
     var minz: u8 = 255;
     var maxz: u8 = 0;
     var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 }; // union coverage [w, s, e, n]
@@ -499,6 +553,7 @@ fn finishOpen(
         } else |err| std.debug.print("  partition sidecar unusable ({s}); building\n", .{@errorName(err)});
     }
     if (!loaded) src.part = try geometry.partition.build(gpa, cells);
+    src.part_loaded = loaded;
 
     const fill_max = @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
     src.maps = maps;

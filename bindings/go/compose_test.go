@@ -27,7 +27,7 @@ func TestComposeSingleCell(t *testing.T) {
 	}
 	defer chart.Close()
 
-	src, err := OpenComposeCharts([]*Source{chart}, "")
+	src, err := OpenComposeCharts([]*Source{chart})
 	if err != nil {
 		t.Fatalf("OpenComposeCharts: %v", err)
 	}
@@ -50,16 +50,14 @@ func TestComposeSingleCell(t *testing.T) {
 	if len(tile) == 0 || !owned {
 		t.Fatalf("centre tile z%d/%d/%d: %d bytes owned=%v, want content", z, cx, cy, len(tile), owned)
 	}
-	part := filepath.Join(t.TempDir(), "partition.tpart")
-	if err := src.SavePartition(part); err != nil {
-		t.Fatalf("SavePartition: %v", err)
-	}
 	if err := src.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Path-based open owns its charts and loads the sidecar.
-	src2, err := OpenCompose([]string{path}, part)
+	// Path-based open owns its charts. The ownership partition is the engine's
+	// business — found beside the archives, reused or rebuilt — so there is
+	// nothing to save or pass here; the serve must simply match.
+	src2, err := OpenCompose([]string{path})
 	if err != nil {
 		t.Fatalf("OpenCompose: %v", err)
 	}
@@ -101,7 +99,7 @@ func TestOpenComposeServe(t *testing.T) {
 		t.Fatalf("no per-cell archives in %s", dir)
 	}
 
-	src, err := OpenCompose(paths, os.Getenv("TILE57_COMPOSE_PARTITION"))
+	src, err := OpenCompose(paths)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-//! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives] [-j N]` — produce a
+//! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]` — produce a
 //! LIVE-composite structure on disk. Bake each chart to its OWN native-scale PMTiles under
 //! `<out-dir>/tiles/` (with its M_COVR coverage embedded in the metadata), then open a resident
 //! compositor over them and write the ownership partition to `<out-dir>/partition.tpart`. There is
@@ -6,10 +6,6 @@
 //! ABI `tile57_compose_*`) serves any tile ON DEMAND from this structure, so the per-chart bakes stay
 //! dumb + cacheable and the partition holds all cross-cell ownership. Native scale only — deeper
 //! coarse zooms are left to the client camera + MapLibre overzoom.
-//!
-//! `--from-archives`: `<base>` is ALREADY a directory of per-chart archives (*.pmtiles / *.cell.tmp);
-//! skip the bake and only (re)build the partition sidecar into `<out-dir>/partition.tpart` over them
-//! — the fast re-partition loop over a tiles dir.
 
 const std = @import("std");
 const chart = @import("chart"); // per-chart bake (bakeChartBytes) + freeBytes
@@ -31,7 +27,6 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var rules: ?[]const u8 = null;
-    var from_archives = false; // <base> is a dir of pre-baked archives — skip baking, only build the partition
     // Bake threads. Each concurrent bake holds a whole cell's parse + portray + raster
     // working set, so this is a MEMORY bound, not a core count — hence a modest default
     // rather than one thread per core. Tile generation within a cell is serial, so N
@@ -44,8 +39,6 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             out = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules = f.val(arg) orelse return;
-        } else if (std.mem.eql(u8, arg, "--from-archives")) {
-            from_archives = true;
         } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--workers")) {
             const v = f.val(arg) orelse return;
             workers = std.fmt.parseInt(usize, v, 10) catch return usageErr("-j/--workers expects a positive integer");
@@ -65,20 +58,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     // The per-chart archive paths that back the compositor.
     var archive_paths = std.ArrayList([]const u8).empty;
 
-    if (from_archives) {
-        // <base> is a directory of pre-baked *.pmtiles / *.cell.tmp — read them in place.
-        var dir = std.Io.Dir.cwd().openDir(io, base_path, .{ .iterate = true }) catch return usageErr("cannot open archives dir");
-        defer dir.close(io);
-        var walker = dir.walk(a) catch return usageErr("cannot walk archives dir");
-        defer walker.deinit();
-        while (walker.next(io) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.path, ".cell.tmp") and !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
-            archive_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
-        }
-        if (archive_paths.items.len == 0) return usageErr("no *.pmtiles / *.cell.tmp archives found");
-        std.debug.print("re-partition: {d} pre-baked archives from {s}\n", .{ archive_paths.items.len, base_path });
-    } else {
+    {
         // Bake each chart (dedup by stem — a boundary chart shared by two districts bakes once)
         // to its own <out-dir>/tiles/<STEM>.pmtiles.
         const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
@@ -157,6 +137,6 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     std.debug.print(
         "live structure -> {s}/\n  {d} per-chart archive(s){s} + partition.tpart (serve z {d}..{d})\n",
-        .{ out_dir, src.readers.len, if (from_archives) " (in place)" else " under tiles/", src.minz, src.loop_max },
+        .{ out_dir, src.readers.len, " under tiles/", src.minz, src.loop_max },
     );
 }

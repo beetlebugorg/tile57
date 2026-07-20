@@ -1,7 +1,7 @@
 //! tile57 — the offline S-57 -> PMTiles baker / inspector CLI.
 //!
 //! Subcommands:
-//!   bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]
+//!   bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]
 //!       Bake each chart to <out-dir>/tiles/<STEM>.pmtiles and write the ownership
 //!       partition to <out-dir>/partition.tpart — the live-composite structure a
 //!       runtime compositor serves tiles from on demand.

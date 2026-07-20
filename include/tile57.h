@@ -785,13 +785,12 @@ typedef struct {
 /* Open a compositor over `n` open charts (each a per-chart archive from the
  * bake, opened with tile57_chart_open). Charts whose archives embed no coverage are
  * skipped — they can own no ground; if none carries coverage the open is
- * TILE57_ERR_UNSUPPORTED. `partition_path` (NULL to skip) names a partition
- * sidecar — written by tile57_compose_save_partition (the `tile57 bake` CLI
- * emits one as partition.tpart) — to load and skip the build; a missing/stale
- * one falls back to building. TILE57_OK with *out set (close with
- * tile57_compose_close — BEFORE closing the charts). */
+ * TILE57_ERR_UNSUPPORTED. The ownership partition is an internal detail: it is
+ * found beside the archives, reused when it still matches the cell set, and
+ * rebuilt (and refreshed on disk) when it does not. Nothing to pass, nothing to
+ * manage. TILE57_OK with *out set (close with tile57_compose_close — BEFORE
+ * closing the charts). */
 tile57_status tile57_compose_open(tile57_chart *const *charts, size_t n,
-                                  const char *partition_path,
                                   tile57_compose **out, tile57_error *err);
 
 /* Open a WHOLE baked tree in one call: recursively walk `dir` for the *.pmtiles
@@ -807,7 +806,7 @@ tile57_status tile57_compose_open(tile57_chart *const *charts, size_t n,
  * *.pmtiles under `dir`, or none carrying coverage, is TILE57_ERR_UNSUPPORTED with
  * *out = NULL; an unreadable `dir` errors. TILE57_OK with *out set (close with
  * tile57_compose_close). */
-tile57_status tile57_compose_tree(const char *dir, const char *partition_path,
+tile57_status tile57_compose_tree(const char *dir,
                                   tile57_compose **out, uint32_t *out_chart_count,
                                   tile57_error *err);
 
@@ -874,10 +873,6 @@ tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, do
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_get_meta(tile57_compose *c, tile57_compose_meta *out);
 
-/* Serialize the compositor's ownership partition to the file `path` (a sidecar
- * a later tile57_compose_open can load to skip the build). */
-tile57_status tile57_compose_save_partition(tile57_compose *c, const char *path,
-                                            tile57_error *err);
 
 /* Release a compositor. Its charts stay open (and stay yours to close). */
 void tile57_compose_close(tile57_compose *c);

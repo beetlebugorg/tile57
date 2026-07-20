@@ -641,6 +641,7 @@ pub fn openPmtilesPath(io: std.Io, path: []const u8) !*Chart {
         return error.OutOfMemory;
     };
     src.* = .{ .backend = .{ .reader = reader }, .data_map = map, .cache = std.AutoHashMap(u64, []u8).init(gpa) };
+    src.source_path = gpa.dupe(u8, path) catch null;
     attachEmbeddedCoverage(src);
     return src;
 }
@@ -1312,6 +1313,11 @@ const OpenWork = struct {
 pub const Chart = struct {
     backend: Backend,
     data: ?[]u8 = null, // owned archive bytes (PMTiles backend only)
+    /// Where this chart was opened from, when it came from a path (owned; null
+    /// for byte-backed opens). The compositor uses it to find the ownership
+    /// partition sidecar the bake wrote next to the archives, so a host never
+    /// has to know that file exists.
+    source_path: ?[]u8 = null,
     cache: std.AutoHashMap(u64, []u8), // tile key -> MVT bytes (owned)
     cache_max: usize = 8192,
     // Emit the per-feature pick-report attrs (s57/cell) on live-generated tiles.
@@ -1611,6 +1617,7 @@ pub const Chart = struct {
         while (it.next()) |v| gpa.free(v.*);
         self.cache.deinit();
         if (self.data) |d| gpa.free(d);
+        if (self.source_path) |sp| gpa.free(sp);
         if (self.data_map) |m| filemap.unmap(m);
         if (self.coverage_arena) |ca| {
             ca.deinit();

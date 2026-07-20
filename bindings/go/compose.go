@@ -37,11 +37,10 @@ type ComposeMeta struct {
 // BORROWING them: every chart must outlive the compositor (Close the compositor
 // first), and while it serves, don't call those charts' own methods from other
 // goroutines. Charts whose archives embed no coverage are skipped; if none
-// carries coverage the open fails with ErrNoCoverage. If partitionPath is
-// non-empty it names a partition sidecar (from [ComposeSource.SavePartition]; the
-// `tile57 bake` CLI writes partition.tpart) to load and skip the owned-face
-// build; a missing/stale one falls back to building.
-func OpenComposeCharts(charts []*Source, partitionPath string) (*ComposeSource, error) {
+// carries coverage the open fails with ErrNoCoverage. The ownership partition is
+// handled by the engine — found beside the archives, reused when it matches, and
+// rebuilt when it does not.
+func OpenComposeCharts(charts []*Source) (*ComposeSource, error) {
 	if len(charts) == 0 {
 		return nil, fmt.Errorf("tile57: OpenComposeCharts needs at least one chart: %w", ErrEmptyInput)
 	}
@@ -56,13 +55,9 @@ func OpenComposeCharts(charts []*Source, partitionPath string) (*ComposeSource, 
 		}
 		cv[i] = s.ptr
 	}
-	var cpart *C.char
-	if partitionPath != "" {
-		cpart = ar.str(partitionPath)
-	}
 	var ptr *C.tile57_compose
 	var cerr C.tile57_error
-	if st := C.tile57_compose_open(cc, C.size_t(len(charts)), cpart, &ptr, &cerr); st != C.TILE57_OK {
+	if st := C.tile57_compose_open(cc, C.size_t(len(charts)), &ptr, &cerr); st != C.TILE57_OK {
 		// "No coverage-carrying chart" is TILE57_ERR_UNSUPPORTED; surface it as
 		// ErrNoCoverage so a host can branch, keeping the specific message.
 		if st == C.TILE57_ERR_UNSUPPORTED {
@@ -77,8 +72,8 @@ func OpenComposeCharts(charts []*Source, partitionPath string) (*ComposeSource, 
 // (each written by [BakeChart] / [BakeTree]): every path is opened as a chart
 // (mmap'd, so the chart set is never fully resident) and the compositor OWNS those charts —
 // Close releases them too. See [OpenComposeCharts] to compose over charts you
-// keep. partitionPath as in OpenComposeCharts.
-func OpenCompose(paths []string, partitionPath string) (*ComposeSource, error) {
+// keep.
+func OpenCompose(paths []string) (*ComposeSource, error) {
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("tile57: OpenCompose needs at least one path: %w", ErrEmptyInput)
 	}
@@ -96,7 +91,7 @@ func OpenCompose(paths []string, partitionPath string) (*ComposeSource, error) {
 		}
 		charts = append(charts, s)
 	}
-	cs, err := OpenComposeCharts(charts, partitionPath)
+	cs, err := OpenComposeCharts(charts)
 	if err != nil {
 		closeAll()
 		return nil, err
@@ -149,22 +144,6 @@ func (c *ComposeSource) Meta() ComposeMeta {
 	}
 }
 
-// SavePartition serializes the resident ownership partition to path — a sidecar a later
-// compose open can load (as partitionPath) to skip the owned-face build.
-func (c *ComposeSource) SavePartition(path string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.ptr == nil {
-		return fmt.Errorf("tile57: SavePartition on a closed ComposeSource")
-	}
-	var ar cArena
-	defer ar.free()
-	var cerr C.tile57_error
-	if st := C.tile57_compose_save_partition(c.ptr, ar.str(path), &cerr); st != C.TILE57_OK {
-		return statusError(st, &cerr)
-	}
-	return nil
-}
 
 // Close releases the compositor, then any charts [OpenCompose] opened for it.
 // Borrowed charts (from [OpenComposeCharts]) stay open. Idempotent.

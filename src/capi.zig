@@ -782,13 +782,55 @@ fn readSidecar(io: std.Io, path: []const u8) ![]u8 {
 /// Open a compositor over `n` open charts, BORROWING their archives + embedded
 /// coverage (the charts must outlive it; close the compositor first). Charts whose
 /// archives embed no coverage are skipped; none at all is TILE57_ERR_UNSUPPORTED.
-/// `partition_path` (or NULL) names a partition sidecar (tile57_compose_save_partition;
-/// the `tile57 bake` CLI writes partition.tpart) to load and skip the build — a
-/// missing/stale one falls back to building. See tile57.h.
+/// The ownership partition is found automatically: a bake leaves partition.tpart
+/// beside the archives it wrote, and it is loaded if it matches this cell set.
+/// A missing or stale one just means the compositor builds it. See tile57.h.
+/// Find the ownership partition a bake left beside these archives. `chart_path` is
+/// any one chart's source path; a bake writes `<out>/partition.tpart` with the
+/// archives under `<out>/tiles/`, and a host that mirrors subdirectories nests them
+/// deeper still, so walk up a few levels rather than guessing one layout. Returns
+/// the bytes (caller frees) or null — a miss is not an error, it just means the
+/// compositor builds the partition itself.
+fn discoverSidecar(io: std.Io, chart_path: []const u8) Sidecar {
+    var dir: ?[]const u8 = std.fs.path.dirname(chart_path);
+    var up: usize = 0;
+    while (dir) |d| : (up += 1) {
+        if (up > 3) break; // <archive>/../../.. is as far as any sane layout nests
+        const p = std.fs.path.join(gpa, &.{ d, "partition.tpart" }) catch return .{};
+        if (readSidecar(io, p)) |b| return .{ .bytes = b, .path = p } else |_| {}
+        gpa.free(p);
+        dir = std.fs.path.dirname(d);
+    }
+    return .{};
+}
+
+/// A partition sidecar found on disk: its bytes, and where it lives so a stale one
+/// can be rewritten in place. Both owned by gpa.
+const Sidecar = struct {
+    bytes: ?[]u8 = null,
+    path: ?[]u8 = null,
+
+    fn deinit(self: Sidecar) void {
+        if (self.bytes) |b| gpa.free(b);
+        if (self.path) |p| gpa.free(p);
+    }
+
+    /// Rewrite the sidecar when the compositor had to build the partition itself.
+    /// Only refreshes a file that already existed — creating one is the bake's job,
+    /// and guessing a location for a library we merely read would be worse than
+    /// leaving it alone.
+    fn refresh(self: Sidecar, io: std.Io, src: *compose.ComposeSource) void {
+        if (src.part_loaded) return;
+        const p = self.path orelse return;
+        const bytes = src.serializePartition(gpa) catch return;
+        defer gpa.free(bytes);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = bytes }) catch {};
+    }
+};
+
 export fn tile57_compose_open(
     charts: ?[*]const ?*Chart,
     n: usize,
-    partition_path: ?[*:0]const u8,
     out: ?*?*compose.ComposeSource,
     err: ?*CError,
 ) callconv(.c) c_int {
@@ -808,33 +850,32 @@ export fn tile57_compose_open(
         na += 1;
     }
 
-    // Optional partition sidecar; the lib has no std.process.Init, so stand up a
-    // threaded std.Io for the read (nothing else here does file I/O).
-    var owned: ?[]u8 = null;
-    defer if (owned) |b| gpa.free(b);
-    if (spanOpt(partition_path)) |pp| {
-        var threaded: std.Io.Threaded = .init(gpa, .{});
-        defer threaded.deinit();
-        if (readSidecar(threaded.io(), pp)) |b| {
-            owned = b;
-        } else |_| {}
+    // Find the partition beside the archives. The lib has no std.process.Init, so
+    // stand up a threaded std.Io for the read (nothing else here does file I/O).
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var sidecar: Sidecar = .{};
+    defer sidecar.deinit();
+    if (cs[0]) |c0| {
+        if (c0.source_path) |sp| sidecar = discoverSidecar(threaded.io(), sp);
     }
 
-    o.* = (compose.ComposeSource.open(gpa, archives[0..na], owned) catch |e| return fail(err, e)) orelse
+    const src = (compose.ComposeSource.open(gpa, archives[0..na], sidecar.bytes) catch |e| return fail(err, e)) orelse
         return failWith(err, .unsupported, "no chart carries per-cell coverage");
+    sidecar.refresh(threaded.io(), src);
+    o.* = src;
     return OK;
 }
 
 /// Walk `dir` recursively for baked *.pmtiles archives, open each (mmap'd, so the
 /// cell set is never fully resident) and compose them into one compositor that OWNS
 /// the archives it opened — the caller holds no chart handles and frees everything
-/// with tile57_compose_close. `partition_path` (or NULL) behaves exactly as in
+/// with tile57_compose_close. The ownership partition is found automatically, as in
 /// tile57_compose_open. *out_chart_count (NULL to ignore) = archives composed. No
 /// *.pmtiles under `dir` (or none carrying coverage) is TILE57_ERR_UNSUPPORTED, with
 /// *out = NULL. An unreadable `dir` errors. See tile57.h.
 export fn tile57_compose_tree(
     dir: ?[*:0]const u8,
-    partition_path: ?[*:0]const u8,
     out: ?*?*compose.ComposeSource,
     out_chart_count: ?*u32,
     err: ?*CError,
@@ -845,7 +886,7 @@ export fn tile57_compose_tree(
     const d = spanOpt(dir) orelse return failWith(err, .badarg, "dir must not be null");
 
     // The lib has no std.process.Init; stand up a threaded std.Io for the tree walk,
-    // the per-archive mmaps and the optional partition-sidecar read.
+    // the per-archive mmaps and the partition-sidecar read.
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -868,20 +909,19 @@ export fn tile57_compose_tree(
     }
     if (paths.items.len == 0) return failWith(err, .unsupported, "no .pmtiles archive under dir");
 
-    // Optional partition sidecar; a missing/stale one falls back to building — exactly
-    // as tile57_compose_open.
-    var owned: ?[]u8 = null;
-    defer if (owned) |b| gpa.free(b);
-    if (spanOpt(partition_path)) |pp| {
-        if (readSidecar(io, pp)) |b| {
-            owned = b;
-        } else |_| {}
-    }
+    // The partition sits beside the archives — a bake writes <out>/partition.tpart
+    // with the tiles under <out>/tiles, so discover from one of the paths we found
+    // rather than from `dir`, which may be either level. Missing or stale just
+    // means the compositor builds it.
+    var sidecar = discoverSidecar(io, paths.items[0]);
+    defer sidecar.deinit();
+    const owned = sidecar.bytes;
 
     // openFiles mmaps + opens each path and the compositor OWNS them (deinit closes
     // them), so tile57_compose_close alone releases the whole set.
     const src = (compose.ComposeSource.openFiles(io, gpa, paths.items, owned) catch |e| return failCtx(err, e, d)) orelse
         return failWith(err, .unsupported, "no archive carries per-cell coverage");
+    sidecar.refresh(io, src);
     o.* = src;
     if (out_chart_count) |p| p.* = @intCast(src.readers.len);
     return OK;
@@ -1062,18 +1102,6 @@ export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CCompo
     };
 }
 
-/// Serialize the compositor's ownership partition to the file `path` (a sidecar a
-/// later tile57_compose_open can load to skip the build). See tile57.h.
-export fn tile57_compose_save_partition(handle: ?*compose.ComposeSource, path: ?[*:0]const u8, err: ?*CError) callconv(.c) c_int {
-    const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
-    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
-    const bytes = src.serializePartition(gpa) catch |e| return fail(err, e);
-    defer gpa.free(bytes);
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = p, .data = bytes }) catch |e| return failCtx(err, e, p);
-    return OK;
-}
 
 /// Release a compositor. Its charts stay open (and stay the caller's to close).
 export fn tile57_compose_close(handle: ?*compose.ComposeSource) callconv(.c) void {
