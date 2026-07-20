@@ -291,6 +291,10 @@ tile57_status tile57_bake_partition_debug(const char *enc_root, const char *out_
 /* Opaque chart handle: one open baked archive. */
 typedef struct tile57_chart tile57_chart;
 
+/* Opaque runtime-compositor handle (a chart library). Forward-declared here so
+ * the draw-ready view calls can name it; opened via tile57_compose_open below. */
+typedef struct tile57_compose tile57_compose;
+
 /* Open a baked PMTiles archive from a file path, mmap'd (never fully
  * resident). The file must stay in place while the chart is open. TILE57_OK
  * with *out set (close with tile57_chart_close). */
@@ -867,7 +871,7 @@ tile57_status tile57_chart_gpu_scene(tile57_chart *chart, double lon, double lat
 /* The composed twin of tile57_chart_gpu_scene: a whole chart LIBRARY (opened via
  * tile57_compose_open) portrayed into one draw-ready scene, seams stitched across
  * cells. Same buffers and the same tile57_gpu_scene_free. */
-tile57_status tile57_compose_gpu_scene(struct tile57_compose *compose, double lon, double lat, double zoom,
+tile57_status tile57_compose_gpu_scene(tile57_compose *compose, double lon, double lat, double zoom,
                              uint32_t width, uint32_t height,
                              const tile57_mariner *m,
                              tile57_gpu_scene *out, tile57_error *err);
@@ -962,8 +966,7 @@ void tile57_chart_close(tile57_chart *chart);
  * not call those charts' own methods from other threads.
  * ======================================================================== */
 
-/* Opaque runtime-compositor handle. */
-typedef struct tile57_compose tile57_compose;
+/* (tile57_compose is forward-declared near tile57_chart at the top.) */
 
 /* Coverage/zoom summary filled by tile57_compose_get_meta. */
 typedef struct {
