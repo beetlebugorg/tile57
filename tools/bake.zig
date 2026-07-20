@@ -1,4 +1,4 @@
-//! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives]` — produce a
+//! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [--from-archives] [-j N]` — produce a
 //! LIVE-composite structure on disk. Bake each chart to its OWN native-scale PMTiles under
 //! `<out-dir>/tiles/` (with its M_COVR coverage embedded in the metadata), then open a resident
 //! compositor over them and write the ownership partition to `<out-dir>/partition.tpart`. There is
@@ -19,11 +19,24 @@ const Flags = common.Flags;
 const usageErr = common.usageErr;
 const resolveRulesDir = common.resolveRulesDir;
 
+/// Default bake threads. A concurrent bake holds a whole cell's parse + portray +
+/// raster working set, so this is bounded by MEMORY, not cores — half the cores,
+/// capped, keeps a big ENC_ROOT from thrashing on a laptop. Override with -j.
+fn defaultWorkers() usize {
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @max(1, @min(cpus / 2, 8));
+}
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var rules: ?[]const u8 = null;
     var from_archives = false; // <base> is a dir of pre-baked archives — skip baking, only build the partition
+    // Bake threads. Each concurrent bake holds a whole cell's parse + portray + raster
+    // working set, so this is a MEMORY bound, not a core count — hence a modest default
+    // rather than one thread per core. Tile generation within a cell is serial, so N
+    // workers stay N threads.
+    var workers: usize = defaultWorkers();
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -33,6 +46,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             rules = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--from-archives")) {
             from_archives = true;
+        } else if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--workers")) {
+            const v = f.val(arg) orelse return;
+            workers = std.fmt.parseInt(usize, v, 10) catch return usageErr("-j/--workers expects a positive integer");
+            if (workers == 0) return usageErr("-j/--workers must be >= 1");
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -86,21 +103,31 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
 
+        // Name every output up front, then hand the whole batch to the engine's
+        // parallel bake. It writes and frees each archive as it finishes, so peak
+        // memory tracks the worker count rather than the cell count.
+        var out_paths = std.ArrayList([]const u8).empty;
         for (cell_paths.items) |cp| {
-            const arc = (chart.bakeChartBytes(cp, rules_dir) catch |err| {
-                std.debug.print("  warn: bake of {s} failed ({s}); skipping\n", .{ cp, @errorName(err) });
-                continue;
-            }) orelse continue; // no M_COVR coverage — not a composable cell
-            defer chart.freeBytes(arc);
             const stem = std.fs.path.stem(std.fs.path.basename(cp));
             const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
-            const arc_path = std.fs.path.join(a, &.{ tiles_dir, name }) catch continue;
-            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = arc_path, .data = arc }) catch |err| {
-                std.debug.print("  warn: could not write {s} ({s})\n", .{ arc_path, @errorName(err) });
-                continue;
-            };
-            archive_paths.append(a, arc_path) catch {};
-            if (archive_paths.items.len % 25 == 0) std.debug.print("  baked {d}/{d} cells…\n", .{ archive_paths.items.len, cell_paths.items.len });
+            out_paths.append(a, std.fs.path.join(a, &.{ tiles_dir, name }) catch continue) catch {};
+        }
+        if (out_paths.items.len != cell_paths.items.len) return usageErr("out of memory naming archives");
+
+        const n_workers = @min(workers, cell_paths.items.len);
+        if (cell_paths.items.len > 1) {
+            std.debug.print("baking {d} cell(s) across {d} worker(s)…\n", .{ cell_paths.items.len, n_workers });
+        }
+        const baked = chart.bakeChartsToFiles(io, cell_paths.items, out_paths.items, rules_dir, n_workers, null, null);
+        if (baked == 0) return usageErr("no cells baked (no .000 with M_COVR found)");
+
+        // bakeChartsToFiles reports a count, not which ones — a cell with no M_COVR
+        // coverage writes nothing and is not composable, so keep only the archives
+        // that actually landed.
+        for (out_paths.items) |op| {
+            var fh = std.Io.Dir.cwd().openFile(io, op, .{}) catch continue;
+            fh.close(io);
+            archive_paths.append(a, op) catch {};
         }
         if (archive_paths.items.len == 0) return usageErr("no cells baked (no .000 with M_COVR found)");
     }
