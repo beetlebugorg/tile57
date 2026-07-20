@@ -60,6 +60,20 @@ pub const Vertex = extern struct {
     _pad: [2]u8 = .{ 0, 0 },
 };
 
+/// `Range.pattern` when the range is not an area-fill pattern — which is every
+/// range except the `pattern` ones.
+pub const NO_PATTERN: u32 = std.math.maxInt(u32);
+
+/// One S-101 area-fill pattern cell, rasterized RGBA8 at this scene's screen
+/// density. The host uploads it as a texture; `w`/`h` are its size in DEVICE PX,
+/// which is also its on-screen tiling period, so no separate period is carried.
+pub const PatternCell = struct {
+    w: u32,
+    h: u32,
+    /// `w * h * 4` bytes, row-major. Arena-owned, like the rest of the scene.
+    rgba: []const u8,
+};
+
 /// A contiguous slice of the index buffer that draws with one pipeline and one
 /// colour. Ranges come out sorted by `paint_key`; draw them in order and the
 /// chart is correct.
@@ -70,10 +84,14 @@ pub const Range = extern struct {
     /// exposed so a host batching ACROSS scenes (tiles) can interleave them.
     /// Opaque — compare, never decode.
     paint_key: u32,
+    /// Index into `Scene.patterns`, or `NO_PATTERN`. Set only on `pattern`
+    /// ranges; see the tiling contract on `fillPattern`.
+    pattern: u32,
+    /// Resolved RGBA for the palette this scene was built with. Meaningless on a
+    /// pattern range — the cell carries its own colours.
+    color: [4]u8,
     kind: Kind,
     _pad: [3]u8 = .{ 0, 0, 0 },
-    /// Resolved RGBA for the palette this scene was built with.
-    color: [4]u8,
 };
 
 /// A finished scene. Everything borrows the arena passed to `endScene` and dies
@@ -82,6 +100,9 @@ pub const Scene = struct {
     vertices: []const Vertex,
     indices: []const u32,
     ranges: []const Range,
+    /// Cells referenced by `Range.pattern`. Deduplicated: a chart full of one
+    /// pattern uploads one texture, not one per feature.
+    patterns: []const PatternCell,
 };
 
 /// A buffered draw call, held until endScene can order the whole scene. Geometry
@@ -95,6 +116,7 @@ const Op = struct {
     scamin: f32,
     disp_cat: u8,
     map_align: u8,
+    pattern: u32 = NO_PATTERN,
     geom: Geom,
 };
 
@@ -124,6 +146,10 @@ pub const GpuSurface = struct {
     cur: rs.FeatureMeta = .{},
     store: ?sym.SymbolStore = null,
     tessellator: tess.Tessellator,
+    /// Pattern cells in first-use order, and the name->index map that dedupes
+    /// them. One density per scene, so the name alone is the key.
+    patterns: std.ArrayList(PatternCell) = .empty,
+    pattern_ix: std.StringHashMapUnmanaged(u32) = .empty,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -153,6 +179,8 @@ pub const GpuSurface = struct {
     pub fn deinit(self: *GpuSurface) void {
         self.tessellator.deinit();
         self.ops.deinit(self.a);
+        self.patterns.deinit(self.a);
+        self.pattern_ix.deinit(self.a);
     }
 
     pub fn asSurface(self: *GpuSurface) rs.Surface {
@@ -201,6 +229,10 @@ pub const GpuSurface = struct {
     }
 
     fn push(self: *GpuSurface, kind: Kind, color: [4]u8, geom: Geom) !void {
+        try self.pushPattern(kind, color, NO_PATTERN, geom);
+    }
+
+    fn pushPattern(self: *GpuSurface, kind: Kind, color: [4]u8, pattern: u32, geom: Geom) !void {
         try self.ops.append(self.a, .{
             .paint_key = paint.key(kind, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
             .seq = self.ops.items.len,
@@ -209,6 +241,7 @@ pub const GpuSurface = struct {
             .scamin = if (self.cur.scamin) |s| @floatFromInt(s) else 0,
             .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
             .map_align = 0,
+            .pattern = pattern,
             .geom = geom,
         });
     }
@@ -229,11 +262,43 @@ pub const GpuSurface = struct {
         try self.push(.area, self.rgba(token), .{ .fill = .{ .rings = rings, .rule = .nonzero } });
     }
 
-    fn fillPattern(_: *anyopaque, _: rs.SymbolName, _: []const []const rs.TilePoint) anyerror!void {
-        // Area-fill patterns tile an atlas cell in screen space, which is a host
-        // shader concern, not geometry. They need their own range kind + cell
-        // metadata; until that is designed they are simply not emitted (the fill
-        // beneath them still is), rather than emitted wrong.
+    /// An area-fill pattern: the polygon interior, plus the cell to tile over it.
+    ///
+    /// THE HOST CONTRACT. The geometry is an ordinary tessellated interior — the
+    /// tiling is the host's, because it happens per-fragment at the live camera
+    /// scale and baking it here would mean re-tessellating on every zoom. The
+    /// cell is rasterized at this scene's density, so `w`/`h` ARE the on-screen
+    /// period in device px: the host samples it 1:1, phase-anchored to the WORLD
+    /// origin (not the screen), so the pattern stays fixed to the chart under a
+    /// pan instead of swimming across it. Vertex `x,y` is all that is needed to
+    /// derive that phase, so nothing extra rides the vertex.
+    fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        const store = self.store orelse return;
+        if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
+        // Same density the pixel path rasterizes at, so a pattern repeats at the
+        // same on-screen period on every surface.
+        const ppm: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.refDev());
+        const cell = store.getPattern(name, ppm) orelse return;
+        const ix = try self.internPattern(name, cell);
+        try self.pushPattern(.pattern, .{ 0, 0, 0, 255 }, ix, .{ .fill = .{ .rings = rings, .rule = .nonzero } });
+    }
+
+    /// Intern a cell by name, copying its pixels. The store's cache owns the
+    /// original and may evict it before `build` runs; the scene must outlive that.
+    fn internPattern(self: *GpuSurface, name: rs.SymbolName, cell: *const cv.Pattern) !u32 {
+        const gop = try self.pattern_ix.getOrPut(self.a, name);
+        if (gop.found_existing) return gop.value_ptr.*;
+        // The name is a slice into the decoded tile, which the same eviction can
+        // free — dupe it, since it is this map's key.
+        gop.key_ptr.* = try self.a.dupe(u8, name);
+        gop.value_ptr.* = @intCast(self.patterns.items.len);
+        try self.patterns.append(self.a, .{
+            .w = cell.w,
+            .h = cell.h,
+            .rgba = try self.a.dupe(u8, cell.rgba),
+        });
+        return gop.value_ptr.*;
     }
 
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, _: ?f64) anyerror!void {
@@ -356,6 +421,7 @@ pub const GpuSurface = struct {
                 const prev = &ranges.items[ranges.items.len - 1];
                 if (prev.paint_key == op.paint_key and prev.kind == op.kind and
                     std.mem.eql(u8, &prev.color, &op.color) and
+                    prev.pattern == op.pattern and
                     prev.first_index + prev.index_count == first)
                 {
                     prev.index_count += @intCast(count);
@@ -366,6 +432,7 @@ pub const GpuSurface = struct {
                 .first_index = @intCast(first),
                 .index_count = @intCast(count),
                 .paint_key = op.paint_key,
+                .pattern = op.pattern,
                 .kind = op.kind,
                 .color = op.color,
             });
@@ -374,6 +441,7 @@ pub const GpuSurface = struct {
             .vertices = try verts.toOwnedSlice(arena),
             .indices = try indices.toOwnedSlice(arena),
             .ranges = try ranges.toOwnedSlice(arena),
+            .patterns = try arena.dupe(PatternCell, self.patterns.items),
         };
     }
 
@@ -475,8 +543,12 @@ fn testSurface(a: Allocator, colors: *const resolve.Colors, settings: *const res
 const FakeStore = struct {
     square: sym.Symbol,
     const vt = sym.SymbolStore.VTable{ .get = get, .getPattern = getPattern };
-    fn getPattern(_: *anyopaque, _: []const u8, _: f32) ?*const cv.Pattern {
-        return null;
+    /// Two distinct 2x2 cells, so a test can tell dedup from collapse.
+    var cell_a = cv.Pattern{ .w = 2, .h = 2, .rgba = &([_]u8{0xAA} ** 16) };
+    var cell_b = cv.Pattern{ .w = 2, .h = 2, .rgba = &([_]u8{0xBB} ** 16) };
+    fn getPattern(_: *anyopaque, name: []const u8, _: f32) ?*const cv.Pattern {
+        if (std.mem.eql(u8, name, "NONE")) return null;
+        return if (std.mem.eql(u8, name, "DIAMOND1")) &cell_b else &cell_a;
     }
     fn get(ctx: *anyopaque, _: []const u8) ?*const sym.Symbol {
         const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -678,4 +750,123 @@ test "gpu: sounding_size_scale grows the digits and their spacing together" {
         try testing.expectApproxEqAbs(v1.ox * 2.0, v2.ox, 1e-5);
         try testing.expectApproxEqAbs(v1.oy * 2.0, v2.oy, 1e-5);
     }
+}
+
+const pat_ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 }, .{ .x = 0, .y = 100 } };
+const pat_rings = [_][]const rs.TilePoint{&pat_ring};
+
+test "gpu: a pattern fill emits interior geometry plus a cell reference" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    const surf = gs.asSurface();
+
+    // The fill beneath and the pattern over it: same feature, same priority,
+    // ordered by class (area 0 < pattern 1) so the pattern paints on top.
+    const meta = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 12 };
+    try surf.beginFeature(&meta);
+    try surf.fillArea("DEPVS", &pat_rings, null);
+    try surf.fillPattern("DRGARE01", &pat_rings);
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    try testing.expectEqual(@as(usize, 2), scene.ranges.len);
+    try testing.expectEqual(Kind.area, scene.ranges[0].kind);
+    try testing.expectEqual(Kind.pattern, scene.ranges[1].kind);
+    // The plain fill carries no cell; the pattern does, and it is real geometry
+    // (a host that ignored the interior would draw nothing).
+    try testing.expectEqual(NO_PATTERN, scene.ranges[0].pattern);
+    try testing.expect(scene.ranges[1].pattern != NO_PATTERN);
+    try testing.expect(scene.ranges[1].index_count > 0);
+    try testing.expectEqual(@as(usize, 1), scene.patterns.len);
+    try testing.expectEqual(@as(u32, 2), scene.patterns[0].w);
+    try testing.expectEqual(@as(usize, 16), scene.patterns[0].rgba.len);
+}
+
+test "gpu: identical patterns dedupe to one cell, distinct ones do not merge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    const surf = gs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 12 };
+    try surf.beginFeature(&meta);
+    try surf.fillPattern("DRGARE01", &pat_rings);
+    try surf.fillPattern("DRGARE01", &pat_rings); // same cell
+    try surf.fillPattern("DIAMOND1", &pat_rings); // different cell
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    // Two textures uploaded, not three: a chart full of one pattern must not
+    // upload it once per feature.
+    try testing.expectEqual(@as(usize, 2), scene.patterns.len);
+    try testing.expectEqual(@as(u8, 0xAA), scene.patterns[0].rgba[0]);
+    try testing.expectEqual(@as(u8, 0xBB), scene.patterns[1].rgba[0]);
+    // The two DRGARE01 fills coalesce into one draw; DIAMOND1 cannot join them,
+    // because coalescing across cells would silently paint one with the other.
+    try testing.expectEqual(@as(usize, 2), scene.ranges.len);
+    try testing.expectEqual(@as(u32, 0), scene.ranges[0].pattern);
+    try testing.expectEqual(@as(u32, 1), scene.ranges[1].pattern);
+}
+
+test "gpu: an unknown pattern name emits nothing rather than an untiled block" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    const surf = gs.asSurface();
+
+    const meta = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 12 };
+    try surf.beginFeature(&meta);
+    try surf.fillPattern("NONE", &pat_rings);
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    // A catalogue gap must not become a flat opaque polygon over the chart.
+    try testing.expectEqual(@as(usize, 0), scene.ranges.len);
+    try testing.expectEqual(@as(usize, 0), scene.patterns.len);
+}
+
+test "gpu: a pattern cell survives the store evicting its pixels" {
+    // The lifetime trap the pixel path documents: `name` and the cell both point
+    // into caches that an eviction can free before build() runs, so the scene
+    // must own copies.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    var fake = FakeStore.make();
+    gs.store = .{ .ptr = &fake, .vtable = &FakeStore.vt };
+    const surf = gs.asSurface();
+
+    var volatile_name = [_]u8{ 'D', 'R', 'G', 'A', 'R', 'E', '0', '1' };
+    const meta = rs.FeatureMeta{ .class = "DEPARE", .display_priority = 12 };
+    try surf.beginFeature(&meta);
+    try surf.fillPattern(&volatile_name, &pat_rings);
+    try surf.endFeature();
+
+    // Evict: scribble over both the name and the cell's pixels.
+    volatile_name = [_]u8{ 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X' };
+    FakeStore.cell_a.rgba = &([_]u8{0} ** 16);
+
+    const scene = try gs.build(a);
+    FakeStore.cell_a.rgba = &([_]u8{0xAA} ** 16); // restore for other tests
+    try testing.expectEqual(@as(usize, 1), scene.patterns.len);
+    try testing.expectEqual(@as(u8, 0xAA), scene.patterns[0].rgba[0]);
 }
