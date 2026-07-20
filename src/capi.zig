@@ -1201,7 +1201,6 @@ export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CCompo
     };
 }
 
-
 /// Release a compositor. Its charts stay open (and stay the caller's to close).
 export fn tile57_compose_close(handle: ?*compose.ComposeSource) callconv(.c) void {
     if (handle) |src| {
@@ -1700,4 +1699,3 @@ export fn tile57_free(ptr: ?*anyopaque) callconv(.c) void {
     const total = std.mem.readInt(usize, base[0..@sizeOf(usize)], .little);
     gpa.free(base[0..total]);
 }
-

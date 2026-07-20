@@ -741,13 +741,15 @@ pub const GpuSurface = struct {
             }
         }
         if (rings.items.len == 0) return null;
-        return .{ .mark = .{
-            .anchor = at,
-            .rings = try rings.toOwnedSlice(self.a),
-            // TrueType contours wind for the nonzero rule; even-odd would punch
-            // the bowl of every 'o' back out.
-            .rule = .nonzero,
-        } };
+        return .{
+            .mark = .{
+                .anchor = at,
+                .rings = try rings.toOwnedSlice(self.a),
+                // TrueType contours wind for the nonzero rule; even-odd would punch
+                // the bowl of every 'o' back out.
+                .rule = .nonzero,
+            },
+        };
     }
 
     /// World position in screen px at this scene's zoom — the frame the pool
@@ -794,12 +796,14 @@ pub const GpuSurface = struct {
             }
         }
         if (rings.items.len == 0) return;
-        try self.push(kind, color, .{ .mark = .{
-            .anchor = at,
-            .rings = try rings.toOwnedSlice(self.a),
-            // Compound symbols carry counters; even-odd is what makes them holes.
-            .rule = .even_odd,
-        } });
+        try self.push(kind, color, .{
+            .mark = .{
+                .anchor = at,
+                .rings = try rings.toOwnedSlice(self.a),
+                // Compound symbols carry counters; even-odd is what makes them holes.
+                .rule = .even_odd,
+            },
+        });
         if (rot_north) self.ops.items[self.ops.items.len - 1].map_align = 1;
     }
 
@@ -1640,8 +1644,15 @@ fn fakeGlyphs(a: Allocator) !GlyphAtlas {
     var cp: u21 = 0x21; // skip space (0x20): the layout emits no quad for it
     while (cp <= 0x7E) : (cp += 1) {
         try at.glyphs.put(a, cp, .{
-            .u0 = 0, .v0 = 0, .u1 = 0.1, .v1 = 0.1,
-            .off_x = 0.05, .off_y = -0.7, .w = 0.5, .h = 0.7, .advance = 0.6,
+            .u0 = 0,
+            .v0 = 0,
+            .u1 = 0.1,
+            .v1 = 0.1,
+            .off_x = 0.05,
+            .off_y = -0.7,
+            .w = 0.5,
+            .h = 0.7,
+            .advance = 0.6,
         });
     }
     return at;

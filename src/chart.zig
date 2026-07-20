@@ -1078,8 +1078,15 @@ fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtl
     while (git.next()) |e| {
         const g = e.value_ptr.*;
         try glyphs.glyphs.put(a, e.key_ptr.*, .{
-            .u0 = g.u0, .v0 = g.v0, .u1 = g.u1, .v1 = g.v1,
-            .off_x = g.off_x, .off_y = g.off_y, .w = g.w, .h = g.h, .advance = g.advance,
+            .u0 = g.u0,
+            .v0 = g.v0,
+            .u1 = g.u1,
+            .v1 = g.v1,
+            .off_x = g.off_x,
+            .off_y = g.off_y,
+            .w = g.w,
+            .h = g.h,
+            .advance = g.advance,
         });
     }
     return .{ .sprites = sprites, .glyphs = glyphs };
