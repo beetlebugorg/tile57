@@ -257,11 +257,14 @@ const Op = struct {
 };
 
 /// See pixel.zig orderLt — this must stay byte-identical in behaviour.
-fn orderLt(_: void, l: Op, r: Op) bool {
+/// `radar` is whether a RADAR overlay is present — the condition §10.3.4.2 puts
+/// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
+/// all and priority leads.
+fn orderLt(radar: bool, l: Op, r: Op) bool {
     const lt_text = l.layer == .text;
     const rt_text = r.layer == .text;
     if (lt_text != rt_text) return rt_text; // 0. text last
-    if (l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
+    if (radar and l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
     if (l.prio != r.prio) return l.prio < r.prio; // 2. display priority
     if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer); // 3. class
     return l.seq < r.seq; // 4. SENC sequence
@@ -575,7 +578,7 @@ pub const VectorSurface = struct {
     /// long before a low-priority depth area in the second. Only the whole scene
     /// can be put in order, and the scene is not known until it has been walked.
     fn emitOps(self: *VectorSurface) !void {
-        std.mem.sort(Op, self.ops.items, {}, orderLt);
+        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
         for (self.ops.items) |*op| {
             const f = &op.feat;
             switch (op.kind) {
@@ -1812,6 +1815,50 @@ test "surface: a light sector arc paints over a wreck symbol (display_priority, 
     try testing.expectEqual(@as(i32, 12), rec.calls.items[0].display_priority);
     try testing.expectEqual(OrderCb.Kind.stroke, rec.calls.items[1].kind);
     try testing.expectEqual(@as(i32, 24), rec.calls.items[1].display_priority);
+}
+
+test "surface: DisplayPlane orders only when a radar overlay is present" {
+    // S-52 §10.3.4.2 gates the OVERRADAR precedence on the radar overlay being
+    // present. Ungated, an OverRadar feature climbs above every higher-priority
+    // one — a built-up area fill burying a light sector arc, both at 24.
+    const Case = struct { radar: bool, first_prio: i32 };
+    for ([_]Case{
+        // No radar: priority leads, so the prio-12 area is underneath.
+        .{ .radar = false, .first_prio = 12 },
+        // Radar present: the OverRadar area outranks the UnderRadar arc.
+        .{ .radar = true, .first_prio = 24 },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var colors = try resolve.Colors.init(a, "");
+        const settings = resolve.Settings{ .radar_overlay = case.radar };
+        var rec = OrderCb{ .a = a };
+        const cb = rec.surface();
+        var vs = VectorSurface.init(a, &colors, .day, &settings, &cb);
+        vs.view_zoom = 12;
+        vs.setTile(12, 0, 0);
+        const surf = vs.asSurface();
+
+        const ring = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 } };
+        const rings = [_][]const rs.TilePoint{&ring};
+        const line = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 100 } };
+        const lines = [_][]const rs.TilePoint{&line};
+
+        const arc = rs.FeatureMeta{ .class = "LIGHTS", .display_priority = 24, .display_plane = 0 };
+        try surf.beginFeature(&arc);
+        try surf.strokeLine("LITRD", 1.0, .solid, &lines, null);
+        try surf.endFeature();
+
+        const built = rs.FeatureMeta{ .class = "BUAARE", .display_priority = 12, .display_plane = 1 };
+        try surf.beginFeature(&built);
+        try surf.fillArea("CHBRN", &rings, null);
+        try surf.endFeature();
+
+        _ = try surf.endScene(a);
+        try testing.expectEqual(@as(usize, 2), rec.calls.items.len);
+        try testing.expectEqual(case.first_prio, rec.calls.items[0].display_priority);
+    }
 }
 
 test "surface: geometry class breaks ties ONLY at equal display priority" {

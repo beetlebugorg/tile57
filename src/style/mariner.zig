@@ -56,6 +56,13 @@ pub const Settings = struct {
     show_soundings: ?bool = null,
 
     // -- overlays / opt-in markers (off by default) --
+    /// A RADAR overlay is being drawn under/over the chart. This is what gates
+    /// the S-101 DisplayPlane axis: S-52 PresLib §10.3.4.2 gives the OVERRADAR
+    /// flag precedence over display priority "when the RADAR overlay is present
+    /// on the ECDIS chart display" — and ONLY then. With no radar, DisplayPlane
+    /// must not reorder anything, or an OverRadar feature climbs above every
+    /// higher-priority one (a built-up area burying a light sector arc).
+    radar_overlay: bool = false,
     data_quality: bool = false,
     show_inform_callouts: bool = false,
     show_meta_bounds: bool = false,

@@ -100,11 +100,14 @@ const Op = struct {
 };
 
 /// See pixel.zig orderLt — this must stay byte-identical in behaviour.
-fn orderLt(_: void, l: Op, r: Op) bool {
+/// `radar` is whether a RADAR overlay is present — the condition §10.3.4.2 puts
+/// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
+/// all and priority leads.
+fn orderLt(radar: bool, l: Op, r: Op) bool {
     const lt_text = l.layer == .text;
     const rt_text = r.layer == .text;
     if (lt_text != rt_text) return rt_text; // 0. text last
-    if (l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
+    if (radar and l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
     if (l.prio != r.prio) return l.prio < r.prio; // 2. display priority
     if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer); // 3. class
     return l.seq < r.seq; // 4. SENC sequence
@@ -502,7 +505,7 @@ pub const AsciiSurface = struct {
         // Paint order = the pixel surface's exact sort: (DrawingPriority,
         // emission order), text last. See pixel.zig OpLayer for why geometry
         // class is not a key.
-        std.mem.sort(Op, self.ops.items, {}, orderLt);
+        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
 
         const grid = try self.a.alloc(Cell, @as(usize, self.cols) * self.rows);
         @memset(grid, .{});

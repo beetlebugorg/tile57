@@ -77,14 +77,16 @@ const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding
 ///    of the same type of geometry ... the given sequence in the data structure
 ///    of the SENC ... must be used."
 ///
-/// Above priority sits DisplayPlane, per §10.3.4.2 (p.72): "When the RADAR
-/// overlay is present on the ECDIS chart display the OVERRADAR flag takes
-/// precedence over the objects display priority." That is the ONE axis the
-/// standard places above priority, and it is the direction the tile style
-/// already folds it (maplibre.zig EFF_PRIO = display_plane * 64 + priority).
+/// Above priority sits DisplayPlane, per §10.3.4.2 (p.72) — but CONDITIONALLY:
+/// "When the RADAR overlay is present on the ECDIS chart display the OVERRADAR
+/// flag takes precedence over the objects display priority." Read the condition,
+/// not just the rule. With no radar overlay there is nothing for OverRadar to be
+/// over, and applying it anyway hoists those features above every higher-priority
+/// one — a built-up area at priority 24 climbing over a light sector arc at 24.
+/// So the axis is gated on Settings.radar_overlay.
 ///
-/// So four levels, in this order:
-///   1. DisplayPlane     — 0 UnderRadar, 1 OverRadar; outranks priority
+/// So the levels, in this order:
+///   1. DisplayPlane     — 0 UnderRadar, 1 OverRadar; ONLY with a radar overlay
 ///   2. display priority — class-independent
 ///   3. geometry class   — tiebreak ONLY at equal priority (area < line < point)
 ///   4. emission order   — tiebreak at equal priority AND class
@@ -101,15 +103,17 @@ const OpLayer = enum(u8) { area = 0, pattern = 1, line = 2, symbol = 3, sounding
 /// AddTextInstruction inherits its feature's priority (LandArea.lua:49 passes 3),
 /// so honouring it would sink labels under the fills they annotate.
 ///
-/// DisplayPlane is applied unconditionally, not only under a radar overlay: it
-/// is a two-value axis the catalogue sets deliberately (PortrayalModel.lua:363
-/// defaults UnderRadar), and honouring it with no radar present costs nothing
-/// while dropping it loses the distinction entirely.
-fn orderLt(_: void, l: Op, r: Op) bool {
+/// The DisplayPlane value is still carried on every feature and over the ABI —
+/// a host compositing a radar picture needs it. It just does not order the
+/// chart on its own.
+/// `radar` is whether a RADAR overlay is present — the condition §10.3.4.2 puts
+/// on the DisplayPlane axis. Without it, DisplayPlane is not an ordering axis at
+/// all and priority leads.
+fn orderLt(radar: bool, l: Op, r: Op) bool {
     const lt_text = l.layer == .text;
     const rt_text = r.layer == .text;
     if (lt_text != rt_text) return rt_text; // 0. text last
-    if (l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
+    if (radar and l.display_plane != r.display_plane) return l.display_plane < r.display_plane; // 1. DisplayPlane
     if (l.prio != r.prio) return l.prio < r.prio; // 2. display priority
     if (l.layer != r.layer) return @intFromEnum(l.layer) < @intFromEnum(r.layer); // 3. class
     return l.seq < r.seq; // 4. SENC sequence
@@ -615,7 +619,7 @@ pub const PixelSurface = struct {
 
         // Paint order = (DrawingPriority, emission order). See OpLayer for why
         // geometry class is NOT a key.
-        std.mem.sort(Op, self.ops.items, {}, orderLt);
+        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
 
         switch (self.output) {
             .png => {
