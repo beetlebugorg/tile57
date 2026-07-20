@@ -703,6 +703,74 @@ export fn tile57_chart_labels(
     return OK;
 }
 
+// ---- draw-ready GPU scenes (mirrors tile57_gpu_* in tile57.h) --------------
+
+const gpu = @import("render").gpu;
+
+/// The C-facing scene structs live in render/gpu.zig, beside the Vertex/Range
+/// they mirror, so the layout assertions guarding them against tile57.h run in
+/// the pure-Zig test build — capi.zig itself is excluded from it (lib_root.zig).
+const CGpuPattern = gpu.CPattern;
+const CGpuScene = gpu.CScene;
+
+/// Portray a view into DRAW-READY BUFFERS: triangles already in S-52 paint order,
+/// packed into ranges a host draws one pipeline at a time. The twin of
+/// tile57_chart_surface for a GPU host, which cannot use the callback stream
+/// without rebuilding paint order — and thus a whole second scene — for itself.
+/// The caller frees with tile57_gpu_scene_free. See tile57.h.
+export fn tile57_chart_gpu_scene(
+    handle: ?*Chart,
+    lon: f64,
+    lat: f64,
+    zoom: f64,
+    width: u32,
+    height: u32,
+    m: ?*const CMariner,
+    out: ?*CGpuScene,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{}; // defined on every return, per the POD contract
+    const c = handle orelse return failWith(err, .badarg, "chart must not be null");
+    if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
+        return failWith(err, .badarg, bad_size);
+    const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
+    const built = c.renderGpuScene(lon, lat, zoom, width, height, paletteOf(&settings), &settings) catch |e| return fail(err, e);
+
+    // Pattern cells carry Zig slices; flatten them to ptr+len in the scene's own
+    // arena so they die with it.
+    const a = built.arena.allocator();
+    const cells = a.alloc(CGpuPattern, built.scene.patterns.len) catch |e| {
+        built.deinit();
+        return fail(err, e);
+    };
+    for (built.scene.patterns, cells) |src, *dst| {
+        dst.* = .{ .w = src.w, .h = src.h, .rgba = src.rgba.ptr, .rgba_len = src.rgba.len };
+    }
+
+    o.* = .{
+        .vertices = built.scene.vertices.ptr,
+        .vertex_count = built.scene.vertices.len,
+        .indices = built.scene.indices.ptr,
+        .index_count = built.scene.indices.len,
+        .ranges = built.scene.ranges.ptr,
+        .range_count = built.scene.ranges.len,
+        .patterns = cells.ptr,
+        .pattern_count = cells.len,
+        .owner = built,
+    };
+    return OK;
+}
+
+/// Release a scene from tile57_chart_gpu_scene and zero the struct. Every pointer
+/// it handed out dies here, so the host must have finished uploading. Null-safe,
+/// and safe to call twice. See tile57.h.
+export fn tile57_gpu_scene_free(out: ?*CGpuScene) callconv(.c) void {
+    const o = out orelse return;
+    if (o.owner) |p| @as(*chart.GpuScene, @ptrCast(@alignCast(p))).deinit();
+    o.* = .{};
+}
+
 /// Portray ONE tile (z, x, y) to a surface — the per-tile twin of
 /// tile57_chart_surface. Same WORLD-SPACE tagged draw calls, for a single tile, so
 /// a host can portray+tessellate each tile once, cache it, and compose the view
@@ -1598,3 +1666,4 @@ export fn tile57_free(ptr: ?*anyopaque) callconv(.c) void {
     const total = std.mem.readInt(usize, base[0..@sizeOf(usize)], .little);
     gpa.free(base[0..total]);
 }
+

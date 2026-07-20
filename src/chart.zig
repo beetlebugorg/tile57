@@ -234,6 +234,19 @@ const CellBackend = struct {
     feat_bbox: ?[]const ?[4]f64 = null, // per-feature lon/lat bbox (spatial cull)
 };
 
+/// A built GPU scene and the arena its buffers live in. Handed out by
+/// `renderGpuScene`, which is the only thing that constructs one; the caller
+/// holds it for as long as it draws from the buffers, then deinits.
+pub const GpuScene = struct {
+    arena: std.heap.ArenaAllocator,
+    scene: render.gpu.Scene,
+
+    pub fn deinit(self: *GpuScene) void {
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
 /// The live-cell backend as the scene engine's one-cell reference: the cell plus
 /// the open-time portrayal streams and per-cell geometry caches the view paths
 /// replay from.
@@ -1905,6 +1918,69 @@ pub const Chart = struct {
             .cells => return error.Unsupported,
         }
         _ = try surf.endScene(a);
+    }
+
+    /// renderSurfaceView's DRAW-READY twin: instead of calling back per draw, it
+    /// returns triangulated geometry already in S-52 paint order, packed into
+    /// ranges a host draws one pipeline at a time (render/gpu.zig).
+    ///
+    /// A GPU host must batch by pipeline, which destroys the order the engine
+    /// emitted in — so a callback host has to rebuild paint order, and to do that
+    /// it grows a tessellator, a class taxonomy and a copy of the S-52 ordering
+    /// rule. That is a second scene, free to drift from this one, and it did: the
+    /// same OVERRADAR bug had to be fixed on both sides. This call exists so a
+    /// host owns no scene and knows no S-52.
+    ///
+    /// The whole view goes into ONE scene, so the label pool spans it and a name
+    /// cannot collide with itself across a tile seam. The result owns its arena;
+    /// release it with `GpuScene.deinit`.
+    pub fn renderGpuScene(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+        const out = try gpa.create(GpuScene);
+        errdefer gpa.destroy(out);
+        out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
+        errdefer out.arena.deinit();
+
+        const colors = try self.viewColorsRef();
+        const store = try self.viewStoreFor(palette);
+
+        // Scratch for the surface's own bookkeeping (buffered ops, shaped labels,
+        // the glyph cache). The scene it builds comes from the handle's arena and
+        // outlives this call; everything here does not.
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, zoom);
+        defer gs.deinit();
+        gs.store = store.asStore();
+        const surf = gs.asSurface();
+
+        // NO rotation parameter, deliberately — the same invariant the per-tile
+        // callback path documents. Geometry stays north-up in world space and the
+        // host applies the view rotation, so a course-up view that turns
+        // continuously never has to have its scene rebuilt.
+        const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
+        var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+        try surf.beginScene(vt.z);
+        switch (self.backend) {
+            .reader => |*rd| {
+                while (vt.next()) |t| {
+                    const layers = self.viewTileLayers(rd, t.z, t.x, t.y) orelse continue;
+                    gs.setTile(t.z, t.x, t.y);
+                    scene.replayTile(sa, surf, layers) catch continue;
+                }
+            },
+            .cell => |*cb2| {
+                const one = [_]scene.CellRef{cellRef(cb2)};
+                while (vt.next()) |t| {
+                    gs.setTile(t.z, t.x, t.y);
+                    scene.appendTile(surf, sa, &one, t.z, t.x, t.y, self.pick_attrs) catch continue;
+                }
+            },
+            .cells => return error.Unsupported,
+        }
+        out.scene = try gs.build(out.arena.allocator());
+        return out;
     }
 
     /// The VIEW-level, GLOBALLY-decluttered TEXT pass — renderSurfaceView's twin

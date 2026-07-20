@@ -699,6 +699,128 @@ tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, 
                              const tile57_mariner *m,
                              const tile57_surface_cb *surface, tile57_error *err);
 
+/* ---- draw-ready GPU scenes -------------------------------------------------
+ *
+ * The callback surface above hands a host a STREAM of draw calls, in paint
+ * order. A GPU host cannot draw that stream as it arrives: it has to batch by
+ * pipeline, and batching destroys the order. So it ends up sorting the calls
+ * back into order itself — which means owning a tessellator, a copy of the
+ * geometry-class taxonomy, and a copy of the S-52 ordering rule. That is a
+ * second scene, free to drift from the engine's, and it did drift: the same
+ * spec bug (applying OVERRADAR precedence with no radar overlay present) had to
+ * be found and fixed on both sides.
+ *
+ * tile57_chart_gpu_scene exists so that a host owns no scene and knows no S-52.
+ * It hands over geometry ALREADY triangulated, ALREADY in paint order, and
+ * ALREADY split into ranges that draw one pipeline at a time. Upload the three
+ * buffers, then walk the ranges in order and draw each one. That is the whole
+ * host obligation.
+ *
+ * What the host still owns: the camera, the shaders, and what to do with the
+ * per-vertex `scamin` / `disp_cat` gates — those are per-frame, and baking them
+ * in would force a rebuild on every zoom or category toggle. */
+
+/* One vertex. (x, y) is WORLD position (web-mercator, [0,1], y down) — the
+ * camera transforms it. (ox, oy) is an offset in REFERENCE PIXELS added in
+ * SCREEN space after projection: zero for area interiors, +/- half-width for
+ * line edges, and the glyph or symbol outline for marks. Keeping the two apart
+ * is what lets a symbol hold a constant on-screen size while its anchor moves
+ * with the chart, with no re-tessellation on zoom. */
+typedef struct {
+    float x, y;      /* world position, [0,1] */
+    float ox, oy;    /* screen-space offset, reference px */
+    float scamin;    /* SCAMIN 1:N denominator; 0 = always visible */
+    uint8_t disp_cat;  /* S-52 display category: 0 base, 1 standard, 2 other */
+    uint8_t map_align; /* nonzero = chart-relative: a rotated view must turn it */
+    uint8_t _pad[2];
+} tile57_gpu_vertex;
+
+/* What a range draws. The host picks a pipeline from this and nothing more —
+ * it is NOT the paint order. Ordering is paint_key and only paint_key. */
+typedef enum {
+    TILE57_GPU_AREA = 0,
+    TILE57_GPU_PATTERN = 1,
+    TILE57_GPU_LINE = 2,
+    TILE57_GPU_SYMBOL = 3,
+    TILE57_GPU_SOUNDING = 4,
+    TILE57_GPU_TEXT = 5
+} tile57_gpu_kind;
+
+/* Sentinel for tile57_gpu_range.pattern on every range that is not a pattern. */
+#define TILE57_GPU_NO_PATTERN 0xFFFFFFFFu
+
+/* One area-fill pattern cell: RGBA8, w * h * 4 bytes, row-major. It is
+ * rasterized at the scene's own screen density, so w and h ARE the on-screen
+ * tiling period in device px — there is no separate period to apply.
+ *
+ * The host tiles it: sample the cell 1:1 in device px, PHASE-ANCHORED TO THE
+ * WORLD ORIGIN rather than to the screen, so the pattern stays fixed to the
+ * chart under a pan instead of swimming across it. The vertex (x, y) is all
+ * that is needed to derive that phase. Tiling is left to the host because it
+ * resolves per-fragment at the live camera scale; baking it into geometry would
+ * mean re-tessellating on every zoom. */
+typedef struct {
+    uint32_t w, h;
+    const uint8_t *rgba;
+    size_t rgba_len;
+} tile57_gpu_pattern;
+
+/* A contiguous slice of the index buffer drawing with ONE pipeline and ONE
+ * colour. Ranges arrive already sorted by paint_key: draw them in order and the
+ * chart is correct. */
+typedef struct {
+    uint32_t first_index;
+    uint32_t index_count;
+    /* The engine's paint-order key. Already sorted by it; exposed so a host
+     * batching ACROSS scenes can interleave them. Opaque — compare, never
+     * decode. */
+    uint32_t paint_key;
+    /* Index into tile57_gpu_scene.patterns, or TILE57_GPU_NO_PATTERN. Set only
+     * on TILE57_GPU_PATTERN ranges. */
+    uint32_t pattern;
+    /* Resolved RGBA for the palette the scene was built with. Meaningless on a
+     * pattern range — the cell carries its own colours. */
+    uint8_t color[4];
+    uint8_t kind; /* tile57_gpu_kind */
+    uint8_t _pad[3];
+} tile57_gpu_range;
+
+/* Draw-ready buffers for one view. Every pointer is BORROWED and stays valid
+ * until tile57_gpu_scene_free; `owner` is opaque and must not be touched. */
+typedef struct {
+    const tile57_gpu_vertex *vertices;
+    size_t vertex_count;
+    const uint32_t *indices;
+    size_t index_count;
+    const tile57_gpu_range *ranges;
+    size_t range_count;
+    const tile57_gpu_pattern *patterns;
+    size_t pattern_count;
+    void *owner;
+} tile57_gpu_scene;
+
+/* Portray a view into the buffers above — the draw-ready twin of
+ * tile57_chart_surface. The WHOLE view builds into ONE scene, so labels
+ * declutter across it and a name cannot collide with itself over a tile seam.
+ *
+ * There is deliberately NO rotation parameter, for the same reason
+ * tile57_chart_tile_surface has none: geometry stays north-up in world space
+ * and the host applies the view rotation, so a course-up view that turns
+ * continuously never has to have its scene rebuilt. The per-vertex map_align
+ * flag is what keeps that invariant for marks that must turn with the chart.
+ *
+ * On OK the caller owns the scene and MUST release it with
+ * tile57_gpu_scene_free. On failure *out is zeroed and nothing needs freeing. */
+tile57_status tile57_chart_gpu_scene(tile57_chart *chart, double lon, double lat, double zoom,
+                             uint32_t width, uint32_t height,
+                             const tile57_mariner *m,
+                             tile57_gpu_scene *out, tile57_error *err);
+
+/* Release a scene and zero the struct. Every pointer it handed out dies here,
+ * so the host must have finished uploading first. Null-safe, and safe to call
+ * twice. */
+void tile57_gpu_scene_free(tile57_gpu_scene *scene);
+
 /* Portray ONE tile (z, x, y) through the SAME S-52 portrayal and the SAME
  * tile57_surface_cb, but for a single tile instead of a whole view. Lets a host
  * portray + tessellate each tile ONCE, cache the geometry keyed by (chart, z, x, y),

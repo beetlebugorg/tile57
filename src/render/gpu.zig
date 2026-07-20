@@ -32,6 +32,7 @@ const cv = @import("canvas.zig");
 const paint = @import("paint.zig");
 const fontmod = @import("font.zig");
 const dc = @import("declutter.zig");
+const tile = @import("tiles").tile;
 
 /// What a range draws — the host picks a pipeline from this, nothing more. It is
 /// NOT a paint-order key: ordering is `paint_key` and only `paint_key`. Shared
@@ -105,6 +106,34 @@ pub const Scene = struct {
     /// Cells referenced by `Range.pattern`. Deduplicated: a chart full of one
     /// pattern uploads one texture, not one per feature.
     patterns: []const PatternCell,
+};
+
+// ---- the C view of a scene (mirrors tile57_gpu_* in include/tile57.h) -------
+//
+// These live here, not in capi.zig, so the layout assertions below run: capi.zig
+// links libc and is deliberately outside the pure-Zig test build (lib_root.zig),
+// where a test would compile nowhere and report green.
+
+/// `PatternCell` flattened for C: a Zig slice is not POD across the seam.
+pub const CPattern = extern struct {
+    w: u32,
+    h: u32,
+    rgba: [*]const u8,
+    rgba_len: usize,
+};
+
+/// `Scene` flattened for C. Every pointer is BORROWED and dies with `owner`,
+/// which is the arena handle and opaque to the caller.
+pub const CScene = extern struct {
+    vertices: ?[*]const Vertex = null,
+    vertex_count: usize = 0,
+    indices: ?[*]const u32 = null,
+    index_count: usize = 0,
+    ranges: ?[*]const Range = null,
+    range_count: usize = 0,
+    patterns: ?[*]const CPattern = null,
+    pattern_count: usize = 0,
+    owner: ?*anyopaque = null,
 };
 
 /// A buffered draw call, held until endScene can order the whole scene. Geometry
@@ -199,6 +228,16 @@ pub const GpuSurface = struct {
 
     pub fn asSurface(self: *GpuSurface) rs.Surface {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Place the NEXT tile's geometry. A view walks many tiles into ONE scene, so
+    /// paint order, range packing and above all the label pool span the whole
+    /// view — a per-tile pool would let a name collide with itself across a seam.
+    pub fn setTile(self: *GpuSurface, z: u8, x: u32, y: u32) void {
+        const n = std.math.exp2(@as(f64, @floatFromInt(z)));
+        self.tile_scale = 1.0 / (n * @as(f64, @floatFromInt(tile.EXTENT)));
+        self.tile_ox = @as(f64, @floatFromInt(x)) / n;
+        self.tile_oy = @as(f64, @floatFromInt(y)) / n;
     }
 
     fn sp(ctx: *anyopaque) *GpuSurface {
@@ -1147,4 +1186,45 @@ test "gpu: text_size_scale grows the label and its collision box together" {
     try grown.label("Annapolis", 2000, 2000);
     try grown.label("Baltimore", 2000, 2020);
     try testing.expectEqual(ann, (try grown.gs.build(a)).vertices.len);
+}
+
+// ---- ABI layout ------------------------------------------------------------
+
+test "gpu: the C scene structs match their tile57.h layout" {
+    // include/tile57.h is hand-maintained, and a host compiles against IT while
+    // linking against THIS. A field reordered on one side only is a silent
+    // misread — wrong colours, wrong offsets, no error anywhere. These numbers
+    // came from a C program compiled against the header (sizeof + offsetof), so
+    // a Zig-side change that breaks the C view fails here instead of on a chart.
+    try testing.expectEqual(@as(usize, 24), @sizeOf(Vertex));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(Vertex, "ox"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(Vertex, "scamin"));
+    try testing.expectEqual(@as(usize, 20), @offsetOf(Vertex, "disp_cat"));
+    try testing.expectEqual(@as(usize, 21), @offsetOf(Vertex, "map_align"));
+
+    try testing.expectEqual(@as(usize, 24), @sizeOf(Range));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(Range, "first_index"));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(Range, "index_count"));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(Range, "paint_key"));
+    try testing.expectEqual(@as(usize, 12), @offsetOf(Range, "pattern"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(Range, "color"));
+    try testing.expectEqual(@as(usize, 20), @offsetOf(Range, "kind"));
+
+    try testing.expectEqual(@as(usize, 24), @sizeOf(CPattern));
+    try testing.expectEqual(@as(usize, 8), @offsetOf(CPattern, "rgba"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(CPattern, "rgba_len"));
+
+    try testing.expectEqual(@as(usize, 72), @sizeOf(CScene));
+    try testing.expectEqual(@as(usize, 64), @offsetOf(CScene, "owner"));
+
+    // The header's tile57_gpu_kind values ARE paint.Layer — the S-52 class
+    // tiebreak order, with pattern between area and line so an area-fill pattern
+    // paints over its fill and under its boundary.
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(Kind.area));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(Kind.pattern));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(Kind.line));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(Kind.symbol));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(Kind.sounding));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(Kind.text));
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), NO_PATTERN);
 }
