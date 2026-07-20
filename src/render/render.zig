@@ -32,6 +32,7 @@ pub const raster = @import("raster.zig");
 pub const png = @import("png.zig");
 pub const pixel = @import("pixel.zig");
 pub const ascii = @import("ascii.zig");
+pub const tess = @import("tess.zig");
 pub const kitty = @import("kitty.zig");
 pub const symbols = @import("symbols.zig");
 pub const sndfrm = @import("sndfrm.zig");
@@ -44,6 +45,7 @@ pub const labelcache = @import("labelcache.zig"); // per-tile label-candidate me
 
 test {
     _ = surface;
+    _ = tess;
     _ = vector;
     _ = declutter;
     _ = labelcache;
