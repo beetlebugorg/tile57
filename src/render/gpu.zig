@@ -535,6 +535,10 @@ pub const GpuSurface = struct {
         const self = sp(ctx);
         const store = self.store orelse return;
         if (!resolve.visible(&self.cur, name, self.zoom, self.settings)) return;
+        // The style path gates INFORM01 information callouts behind
+        // show_inform_callouts (mariner.zig); the live Surface path bypasses the
+        // style, so mirror that toggle here (as vector.zig / pixel.zig do).
+        if (!self.settings.show_inform_callouts and std.mem.eql(u8, name, "INFORM01")) return;
         var eff = name;
         if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
         const s = store.get(eff) orelse return;
