@@ -32,7 +32,27 @@ const max_cell_side: u32 = 640;
 pub const sprite_atlas_width: u32 = 2048;
 
 pub const SvgSrc = struct { id: []const u8, svg: []const u8 };
-pub const Atlas = struct { json: []u8, png: []u8 };
+/// One cell's rect in atlas px. Surfaced so an in-process consumer (the GPU
+/// scene path) can emit sprite-quad UVs without re-parsing `json` or decoding
+/// `png` — the packing is deterministic, so these match what a host that baked
+/// the atlas separately uploads.
+pub const CellRect = struct { x: f32, y: f32, w: f32, h: f32 };
+
+pub const Atlas = struct {
+    json: []u8,
+    png: []u8,
+    /// Atlas dimensions in px, for UV normalization. 0 until packed.
+    width: u32 = 0,
+    height: u32 = 0,
+    /// name -> cell rect, keys owned by the allocator passed to the builder.
+    cells: std.StringHashMapUnmanaged(CellRect) = .empty,
+
+    pub fn deinitCells(self: *Atlas, a: std.mem.Allocator) void {
+        var it = self.cells.keyIterator();
+        while (it.next()) |k| a.free(k.*);
+        self.cells.deinit(a);
+    }
+};
 
 // ---- CSS -----------------------------------------------------------------
 
@@ -672,7 +692,23 @@ fn packMln(a: std.mem.Allocator, ar: std.mem.Allocator, cells_in: []MlnCell, wid
     }
     try out.appendSlice(a, "}\n");
     const json = try out.toOwnedSlice(a);
-    return .{ .json = json, .png = png };
+
+    // Surface the cell rects (deterministic packing) so an in-process consumer
+    // gets UVs matching this exact atlas. Keys owned by `a`, freed via
+    // Atlas.deinitCells; a caller that only wants json/png can ignore them (an
+    // arena reclaims them).
+    var cells: std.StringHashMapUnmanaged(CellRect) = .empty;
+    var pit = placed.iterator();
+    while (pit.next()) |e| {
+        const p = e.value_ptr.*;
+        try cells.put(a, try a.dupe(u8, e.key_ptr.*), .{
+            .x = @floatFromInt(p.x),
+            .y = @floatFromInt(p.y),
+            .w = @floatFromInt(p.w),
+            .h = @floatFromInt(p.h),
+        });
+    }
+    return .{ .json = json, .png = png, .width = width, .height = height, .cells = cells };
 }
 
 const Tile = struct { w: u32, h: u32, rgba: []u8 };

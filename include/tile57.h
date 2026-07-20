@@ -749,6 +749,39 @@ typedef enum {
 /* Sentinel for tile57_gpu_range.pattern on every range that is not a pattern. */
 #define TILE57_GPU_NO_PATTERN 0xFFFFFFFFu
 
+/* Which buffer + primitive a range draws from. Fills, lines and pattern
+ * interiors are indexed triangles; symbols, soundings and text are textured
+ * quads — a symbol is antialiased artwork and a label is an SDF glyph, neither
+ * of which a flat triangle gives. */
+typedef enum {
+    TILE57_GPU_TRIANGLES = 0, /* range.first/count index the index buffer   */
+    TILE57_GPU_QUADS     = 1  /* range.first/count are quad-buffer vertices */
+} tile57_gpu_prim;
+
+/* Which atlas texture a QUADS range samples. */
+typedef enum {
+    TILE57_GPU_ATLAS_NONE   = 0,
+    TILE57_GPU_ATLAS_SPRITE = 1, /* the S-101 symbol atlas (tile57_bake_sprite_mln) */
+    TILE57_GPU_ATLAS_GLYPH  = 2  /* the SDF label-glyph atlas (tile57_bake_glyph_sdf) */
+} tile57_gpu_atlas;
+
+/* One textured-quad vertex — a symbol sprite or an SDF glyph. (x, y) is the
+ * WORLD anchor (camera-transformed, like tile57_gpu_vertex); (ox, oy) the
+ * corner offset in reference px, already rotated; (u, v) the atlas UV. Six per
+ * quad (two triangles), non-indexed. Anchor and offset stay split so the anchor
+ * rides the chart while the artwork holds a fixed screen size under zoom. */
+typedef struct {
+    float x, y;      /* world anchor, [0,1] */
+    float ox, oy;    /* screen-space corner offset, reference px */
+    float u, v;      /* atlas UV, [0,1] */
+    uint8_t color[4];/* straight-alpha; a sprite ignores it, an SDF glyph is tinted */
+    float weight;    /* SDF sharpen: 0 for a sprite, >0 emboldens a glyph */
+    float scamin;    /* as tile57_gpu_vertex */
+    uint8_t disp_cat;
+    uint8_t map_align;
+    uint8_t _pad[2];
+} tile57_gpu_quad;
+
 /* One area-fill pattern cell: RGBA8, w * h * 4 bytes, row-major. It is
  * rasterized at the scene's own screen density, so w and h ARE the on-screen
  * tiling period in device px — there is no separate period to apply.
@@ -765,12 +798,15 @@ typedef struct {
     size_t rgba_len;
 } tile57_gpu_pattern;
 
-/* A contiguous slice of the index buffer drawing with ONE pipeline and ONE
- * colour. Ranges arrive already sorted by paint_key: draw them in order and the
- * chart is correct. */
+/* A contiguous slice of ONE buffer drawing with ONE pipeline. Ranges arrive
+ * already sorted by paint_key: draw them in order and the chart is correct.
+ * `prim` says which buffer `first`/`count` address (indices vs quads); `atlas`
+ * says which texture a QUADS range samples. */
 typedef struct {
-    uint32_t first_index;
-    uint32_t index_count;
+    /* Into the index buffer when prim==TRIANGLES, else the first vertex in the
+     * quad buffer (6 per quad). */
+    uint32_t first;
+    uint32_t count;
     /* The engine's paint-order key. Already sorted by it; exposed so a host
      * batching ACROSS scenes can interleave them. Opaque — compare, never
      * decode. */
@@ -778,20 +814,32 @@ typedef struct {
     /* Index into tile57_gpu_scene.patterns, or TILE57_GPU_NO_PATTERN. Set only
      * on TILE57_GPU_PATTERN ranges. */
     uint32_t pattern;
-    /* Resolved RGBA for the palette the scene was built with. Meaningless on a
-     * pattern range — the cell carries its own colours. */
+    /* Resolved RGBA for the palette the scene was built with. A sprite range
+     * ignores it (the artwork is coloured); an SDF text range tints the glyph;
+     * a pattern range's cell carries its own colours. */
     uint8_t color[4];
-    uint8_t kind; /* tile57_gpu_kind */
-    uint8_t _pad[3];
+    uint8_t kind;  /* tile57_gpu_kind */
+    uint8_t prim;  /* tile57_gpu_prim */
+    uint8_t atlas; /* tile57_gpu_atlas (QUADS only) */
+    uint8_t _pad;
 } tile57_gpu_range;
 
 /* Draw-ready buffers for one view. Every pointer is BORROWED and stays valid
- * until tile57_gpu_scene_free; `owner` is opaque and must not be touched. */
+ * until tile57_gpu_scene_free; `owner` is opaque and must not be touched.
+ *
+ * The host uploads `vertices`+`indices` (the triangle buffers) and `quads` (the
+ * sprite/SDF buffer) plus the two atlas textures it baked once
+ * (tile57_bake_sprite_mln, tile57_bake_glyph_sdf), then walks `ranges` in order:
+ * a TRIANGLES range draws indexed from the flat-colour pipeline (or, when
+ * pattern != NO_PATTERN, the pattern pipeline with that cell); a QUADS range
+ * draws 6*N vertices from the sprite or SDF pipeline per `atlas`. */
 typedef struct {
     const tile57_gpu_vertex *vertices;
     size_t vertex_count;
     const uint32_t *indices;
     size_t index_count;
+    const tile57_gpu_quad *quads;
+    size_t quad_count;
     const tile57_gpu_range *ranges;
     size_t range_count;
     const tile57_gpu_pattern *patterns;

@@ -1043,6 +1043,45 @@ fn viewSymbolStore(a: std.mem.Allocator, palette: render.resolve.PaletteId) !*sp
     return store;
 }
 
+/// Build the GPU-scene atlases into `a`: the sprite-symbol cell map (same
+/// deterministic pack the host uploads) and the SDF glyph map. Cell SIZES are
+/// geometry, palette-independent, so the day stylesheet gives UVs that match the
+/// host's DEFAULT_CSS atlas PNG.
+fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtlas, glyphs: render.gpu.GlyphAtlas } {
+    var css_data: []const u8 = "";
+    for (embedded_assets.css) |e| {
+        if (std.mem.eql(u8, e.name, "daySvgStyle")) css_data = e.bytes;
+    }
+    const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+    for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+    const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+    for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+
+    // sprite atlas: reuse the same builder tile57_bake_sprite_mln does, so the
+    // cell rects are byte-for-byte the layout the host's PNG carries.
+    var atlas = try sprite.spriteMln(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{});
+    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height };
+    var cit = atlas.cells.iterator();
+    while (cit.next()) |e| {
+        const r = e.value_ptr.*;
+        try sprites.cells.put(a, e.key_ptr.*, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
+    }
+
+    // SDF glyph atlas: the same em_px/pad tile57_bake_glyph_sdf bakes.
+    const cps = try sprite.glyph.defaultCodepoints(a);
+    const gatlas = try sprite.glyph.build(a, render.font.notosans, cps, 32.0, 6);
+    var glyphs = render.gpu.GlyphAtlas{ .em_px = gatlas.em_px };
+    var git = gatlas.glyphs.iterator();
+    while (git.next()) |e| {
+        const g = e.value_ptr.*;
+        try glyphs.glyphs.put(a, e.key_ptr.*, .{
+            .u0 = g.u0, .v0 = g.v0, .u1 = g.u1, .v1 = g.v1,
+            .off_x = g.off_x, .off_y = g.off_y, .w = g.w, .h = g.h, .advance = g.advance,
+        });
+    }
+    return .{ .sprites = sprites, .glyphs = glyphs };
+}
+
 // ---- compose-backed view renders --------------------------------------------
 //
 // The compositor is the tile source; these are its VIEW backends: compose every
@@ -1365,6 +1404,14 @@ pub const Chart = struct {
     view_tiles_max: usize = 192, // > the ~96 tiles of one 2560px view: never evicts mid-render
     view_arena: ?*std.heap.ArenaAllocator = null,
     view_stores: [3]?*sprite.CatalogStore = .{ null, null, null },
+    // The GPU-scene path's atlases: the sprite-symbol cell map and the SDF glyph
+    // map, built once per handle from the embedded catalogue. Their layout is
+    // deterministic, so the UVs match the atlas PNGs a host uploads from
+    // tile57_bake_sprite_mln / tile57_bake_glyph_sdf. Held in their own arena.
+    gpu_atlas_arena: ?*std.heap.ArenaAllocator = null,
+    gpu_sprites: ?render.gpu.SpriteAtlas = null,
+    gpu_glyphs: ?render.gpu.GlyphAtlas = null,
+    gpu_atlas_built: bool = false,
     // The view label pass's per-tile candidate memo (render/labelcache.zig): what
     // lets renderSurfaceLabels run on every view-settle instead of re-portraying
     // the covering tiles each time. Bounded and released with the handle.
@@ -1594,6 +1641,28 @@ pub const Chart = struct {
         return self.view_arena.?.allocator();
     }
 
+    /// The GPU-scene atlases, built once per handle (the SVG rasterization
+    /// dominates, so never per render). Null if the build fails — the surface
+    /// then falls back to outline geometry rather than nothing.
+    fn gpuAtlases(self: *Chart) struct { ?*const render.gpu.SpriteAtlas, ?*const render.gpu.GlyphAtlas } {
+        if (!self.gpu_atlas_built) {
+            self.gpu_atlas_built = true;
+            const aa = gpa.create(std.heap.ArenaAllocator) catch return .{ null, null };
+            aa.* = std.heap.ArenaAllocator.init(gpa);
+            const built = buildGpuAtlases(aa.allocator()) catch {
+                aa.deinit();
+                gpa.destroy(aa);
+                return .{ null, null };
+            };
+            self.gpu_atlas_arena = aa;
+            self.gpu_sprites = built.sprites;
+            self.gpu_glyphs = built.glyphs;
+        }
+        const sp: ?*const render.gpu.SpriteAtlas = if (self.gpu_sprites) |*s| s else null;
+        const gl: ?*const render.gpu.GlyphAtlas = if (self.gpu_glyphs) |*g| g else null;
+        return .{ sp, gl };
+    }
+
     /// The palette colour tables (all three palettes). Parsed once per PROCESS, not
     /// once per handle: they are a pure function of the embedded colour profile — the
     /// same bytes for every chart — and read-only once parsed. A host that opens and
@@ -1648,6 +1717,10 @@ pub const Chart = struct {
         if (self.view_arena) |va| {
             va.deinit();
             gpa.destroy(va);
+        }
+        if (self.gpu_atlas_arena) |aa| {
+            aa.deinit();
+            gpa.destroy(aa);
         }
         gpa.destroy(self);
     }
@@ -1953,6 +2026,11 @@ pub const Chart = struct {
         var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, zoom);
         defer gs.deinit();
         gs.store = store.asStore();
+        // Symbols/soundings -> sprite-atlas quads, labels -> SDF quads; both fall
+        // back to outline triangles if the atlas build failed.
+        const atl = self.gpuAtlases();
+        gs.sprites = atl[0];
+        gs.glyphs = atl[1];
         const surf = gs.asSurface();
 
         // NO rotation parameter, deliberately — the same invariant the per-tile

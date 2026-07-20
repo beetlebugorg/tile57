@@ -753,6 +753,8 @@ export fn tile57_chart_gpu_scene(
         .vertex_count = built.scene.vertices.len,
         .indices = built.scene.indices.ptr,
         .index_count = built.scene.indices.len,
+        .quads = built.scene.quads.ptr,
+        .quad_count = built.scene.quads.len,
         .ranges = built.scene.ranges.ptr,
         .range_count = built.scene.ranges.len,
         .patterns = cells.ptr,
