@@ -1074,6 +1074,13 @@ tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, do
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_get_meta(tile57_compose *c, tile57_compose_meta *out);
 
+/* The deepest zoom the chart covering (lon,lat) can serve (its native window +
+ * overscale fill-up). A host caps its per-view zoom-in here so it never magnifies
+ * past that chart into nodata — unlike compose_meta.max_zoom, which is the
+ * library-wide max a distant deep chart inflates. Returns that library max where
+ * the point covers no cell. */
+uint8_t tile57_compose_max_zoom_at(tile57_compose *c, double lon, double lat);
+
 
 /* Release a compositor. Its charts stay open (and stay yours to close). */
 void tile57_compose_close(tile57_compose *c);

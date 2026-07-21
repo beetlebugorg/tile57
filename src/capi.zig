@@ -1201,6 +1201,14 @@ export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CCompo
     };
 }
 
+/// The deepest zoom the chart covering (lon,lat) can serve — the host caps its
+/// per-view zoom-in here so it never magnifies past that chart into nodata. Falls
+/// back to the library max where the point covers no cell. See tile57.h.
+export fn tile57_compose_max_zoom_at(handle: ?*compose.ComposeSource, lon: f64, lat: f64) callconv(.c) u8 {
+    const src = handle orelse return 0;
+    return src.maxZoomAt(lon, lat);
+}
+
 /// Release a compositor. Its charts stay open (and stay the caller's to close).
 export fn tile57_compose_close(handle: ?*compose.ComposeSource) callconv(.c) void {
     if (handle) |src| {
