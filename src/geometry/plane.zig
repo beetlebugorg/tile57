@@ -262,24 +262,24 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     }
 
     // Subtrahend pointer list, reused (cleared) each iteration — it only holds borrowed
-    // pointers into `covs`, so it stays tiny. The boolean intermediates below deliberately
-    // do NOT live in `sa`: it caches every cell's coverage for the whole loop, so scratch
-    // parked there would never be reclaimed — a coarse cell unions hundreds of finer
-    // cells, and every cell's union piling up was a whole-district compose's memory
-    // blow-up (tens of GB).
+    // pointers into `covs`, so it stays tiny.
     var subtr = std.ArrayList(Poly).empty;
     defer subtr.deinit(gpa);
 
+    // Boolean intermediates (the per-cell union of overlapping finer coverage, and the
+    // diff) live in a scratch arena that is RESET — not freed to the OS — after each cell.
+    // The old code freed each intermediate straight back to the page allocator to keep RSS
+    // down, but on a national NOAA build that was ~a quarter of the wall-clock spent in the
+    // kernel doing mmap/munmap + faulting the fresh pages (perf). Resetting the arena with
+    // retained capacity reuses the pages across cells, so there is no syscall churn — and
+    // RSS is still bounded: it caps at the single LARGEST cell's union (one coarse cell's
+    // overlap set), not the whole-district accumulation the earlier GPA-parking blowup came
+    // from. Only the finished `owned` polygon is copied into `gpa` (held by the partition).
+    var work = std.heap.ArenaAllocator.init(gpa);
+    defer work.deinit();
+
     for (order.items, 0..) |ci, k| {
-        // owned = cov \ (∪ finer cells whose bbox overlaps this one). The union/diff
-        // intermediates run on the page allocator, not `gpa`: they are large,
-        // odd-sized, and freed within the iteration, and a pooling gpa parks each
-        // freed size class on its own freelist — across hundreds of cells those
-        // parked pages inflated the compose's peak RSS by whole GBs. Page-granular
-        // allocation returns them to the OS at each free (unionAll frees its running
-        // accumulator each step, `uni`/`diff` right after use), and the boolean ops
-        // are far too coarse to feel the per-page cost. Only the finished `owned`
-        // polygon is copied into `gpa` (retained, held by the partition).
+        // owned = cov \ (∪ finer cells whose bbox overlaps this one).
         subtr.clearRetainingCapacity();
         for (0..k) |j| {
             if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(gpa, covs[j]);
@@ -287,13 +287,24 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         const owned = if (subtr.items.len == 0)
             try dupePolygonGpa(gpa, covs[k])
         else blk: {
-            const pa = std.heap.page_allocator;
-            const uni = try boolean.unionAll(pa, subtr.items);
-            defer boolean.freePolygon(pa, uni);
-            const diff = try boolean.compute(pa, covs[k], uni, .diff);
-            defer boolean.freePolygon(pa, diff);
-            break :blk try dupePolygonGpa(gpa, diff);
+            // A \ (B ∪ C ∪ …) = ((A \ B) \ C) \ … : sequential small diffs instead
+            // of unioning every overlapping finer cell first and diffing once. The
+            // pairwise-fold union grew its accumulator toward whole-district size —
+            // O(N²) sweep work for a coarse cell overlapped by hundreds of finer
+            // ones, and the dominant cost of a national partition build (perf: the
+            // boolean sweep was ~40% of wall-clock). Here the subject only SHRINKS
+            // (it starts as ONE cell's coverage), every subtrahend is one cell's
+            // coverage, and a subject emptied early — a gap-filler fully covered by
+            // the eligible cells, the common case — exits without touching the rest.
+            const wa = work.allocator();
+            var cur: [][]Pt = covs[k];
+            for (subtr.items) |sub| {
+                cur = try boolean.compute(wa, cur, sub, .diff);
+                if (cur.len == 0) break;
+            }
+            break :blk try dupePolygonGpa(gpa, cur);
         };
+        _ = work.reset(.retain_capacity); // reuse the pages next cell; no munmap
         // A gap-filler fully covered by the eligible cells owns nothing here —
         // drop its empty face so a nested finer cell adds no face at all.
         if (k >= n_eligible and owned.len == 0) {

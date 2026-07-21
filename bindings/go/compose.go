@@ -100,6 +100,35 @@ func OpenCompose(paths []string) (*ComposeSource, error) {
 	return cs, nil
 }
 
+// OpenComposeTree opens a WHOLE baked tree in one call: the engine recursively
+// walks dir for the *.pmtiles archives a bake produced, mmaps and opens each (the
+// cell set is never fully resident), and composes them. Unlike [OpenCompose] —
+// which round-trips tile57_chart_open across cgo once per archive, each standing
+// up per-chart machinery — the walk, open and compose all happen inside the one
+// engine call on its batch path; on a ~1700-cell library that is the difference
+// between a ~60 s and a ~5 s open. The compositor OWNS the archives it opened;
+// Close alone releases the whole set. The ownership partition is the engine's:
+// found beside the archives, reused when it matches, rebuilt when it does not.
+func OpenComposeTree(dir string) (*ComposeSource, error) {
+	if dir == "" {
+		return nil, fmt.Errorf("tile57: OpenComposeTree needs a directory: %w", ErrEmptyInput)
+	}
+	var ar cArena
+	defer ar.free()
+	cdir := ar.str(dir)
+	var ptr *C.tile57_compose
+	var cerr C.tile57_error
+	if st := C.tile57_compose_tree(cdir, &ptr, nil, &cerr); st != C.TILE57_OK {
+		// "No *.pmtiles under dir / none carrying coverage" is TILE57_ERR_UNSUPPORTED;
+		// surface it as ErrNoCoverage so a host can branch, keeping the message.
+		if st == C.TILE57_ERR_UNSUPPORTED {
+			return nil, fmt.Errorf("%s: %w", C.GoString(&cerr.message[0]), ErrNoCoverage)
+		}
+		return nil, statusError(st, &cerr)
+	}
+	return &ComposeSource{ptr: ptr}, nil
+}
+
 // Tile composes the tile (z,x,y) on demand, returning raw (decompressed) MLT bytes plus `owned` —
 // whether the ownership partition says a chart SHOULD render here. body!=nil → composed (owned).
 // body==nil && owned → a chart owns this ground but produced nothing (transient while its per-chart
