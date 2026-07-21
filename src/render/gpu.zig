@@ -670,12 +670,15 @@ pub const GpuSurface = struct {
             baseline -= f.descent * px;
         }
 
+        // A geographic-NAME label (S-52 text group, not class) carries the subtle
+        // halo so it reads over busy backgrounds; functional annotations (seabed,
+        // light descriptions, clearances) stay solid. Robust across every naming
+        // class — land or water — where a per-class list kept missing some.
+        const halo: f32 = if (isNameGroup(style.group)) HALO_WEIGHT else 0;
         // The run becomes SDF glyph quads (crisp at any zoom) against the selected
-        // atlas, tagged with a subtle halo width (bold/italic name tiers) so the
-        // host shader outlines them for legibility over soundings; or, when no glyph
-        // atlas is loaded, filled outline triangles from the real face.
+        // atlas; or, when no glyph atlas is loaded, filled outline triangles.
         const geom = if (has_atlas)
-            (try self.sdfRun(sel.atlas.?, sel.atlas_id, sel.halo, gids.items, x0, baseline, px, at)) orelse
+            (try self.sdfRun(sel.atlas.?, sel.atlas_id, halo, gids.items, x0, baseline, px, at)) orelse
                 (try self.outlineRun(face, gids.items, x0, baseline, px, at)) orelse
                 return // all-whitespace run: nothing to place
         else
@@ -740,42 +743,36 @@ pub const GpuSurface = struct {
     /// bold/italic geographic name off busy soundings. Regular labels get 0.
     const HALO_WEIGHT: f32 = 0.15;
 
-    /// A parsed face + its glyph-cache index, the atlas it shapes against, the
-    /// atlas id the host binds a texture for, and the halo width for its tier.
-    const FaceSel = struct { face: FaceRef, atlas: ?*const GlyphAtlas, atlas_id: AtlasId, halo: f32 };
+    /// A parsed face + its glyph-cache index, the atlas it shapes against, and the
+    /// atlas id the host binds a texture for. (Halo is decided by text group in
+    /// drawText, not here.)
+    const FaceSel = struct { face: FaceRef, atlas: ?*const GlyphAtlas, atlas_id: AtlasId };
 
-    /// Choose the atlas + matching face + halo for a label's weight/slant. The
-    /// bold/italic atlas is used only when the host uploaded it (and its face
-    /// parsed); otherwise it falls back to the regular atlas — the face and atlas
-    /// always agree so UVs and advances match.
+    /// Choose the atlas + matching face for a label's weight/slant. The bold/italic
+    /// atlas is used only when the host uploaded it (and its face parsed); otherwise
+    /// it falls back to the regular atlas — the face and atlas always agree so UVs
+    /// and advances match.
     fn selectFace(self: *GpuSurface, weight: fontmod.Weight, slant: fontmod.Slant) FaceSel {
         const reg = FaceRef{ .f = &self.fnt.?, .idx = 0 };
         if (weight == .bold) {
             if (self.glyphs_bold) |ab| if (self.fnt_bold) |*fb|
-                return .{ .face = .{ .f = fb, .idx = 1 }, .atlas = ab, .atlas_id = .glyph_bold, .halo = HALO_WEIGHT };
-            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = HALO_WEIGHT };
+                return .{ .face = .{ .f = fb, .idx = 1 }, .atlas = ab, .atlas_id = .glyph_bold };
+            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph };
         }
         if (slant == .italic) {
             if (self.glyphs_italic) |ai| if (self.fnt_italic) |*fi|
-                return .{ .face = .{ .f = fi, .idx = 2 }, .atlas = ai, .atlas_id = .glyph_italic, .halo = HALO_WEIGHT };
-            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = HALO_WEIGHT };
+                return .{ .face = .{ .f = fi, .idx = 2 }, .atlas = ai, .atlas_id = .glyph_italic };
+            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph };
         }
-        // Regular tier: a land-name label (points, capes, landmarks) also earns the
-        // halo so all land text reads cleanly; water-adjacent regular labels
-        // (seabed, light descriptions) stay solid.
-        const halo: f32 = if (isLandLabel(self.cur.class)) HALO_WEIGHT else 0;
-        return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = halo };
+        return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph };
     }
 
-    /// Land-name classes whose regular-tier labels carry the halo (BUAARE places
-    /// are the bold tier, already haloed). Water names (SEAARE/RIVERS/…) ride the
-    /// italic tier; water-adjacent regular labels (seabed, light descriptions)
-    /// stay solid by omission.
-    fn isLandLabel(class: []const u8) bool {
-        inline for (.{ "LNDRGN", "LNDMRK", "LNDARE", "BUISGL", "AIRARE", "HRBFAC", "FSHFAC" }) |c| {
-            if (std.mem.eql(u8, class, c)) return true;
-        }
-        return false;
+    /// S-52 text groups that name a place (land OR water) and so carry the halo:
+    /// 26 geographic names (BUAARE/LNDRGN/SEAARE/LNDARE/LNDMRK/…), 32 watercourse
+    /// names (RIVERS). Functional annotation groups — seabed (25), light
+    /// descriptions (23), clearances (11) — stay solid.
+    fn isNameGroup(group: i64) bool {
+        return group == 26 or group == 32;
     }
 
     /// Lay a shaped run out as SDF glyph quads against `atlas`, tagged with
