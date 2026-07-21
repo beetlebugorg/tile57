@@ -106,6 +106,12 @@ pub const NO_PATTERN: u32 = std.math.maxInt(u32);
 pub const SpriteAtlas = struct {
     width: u32,
     height: u32,
+    /// Atlas px per mm the cells were rasterized at (px_per_mm × display ratio).
+    /// A sprite quad is sized from its CELL — cell px × (draw scale / ppm) — not
+    /// re-derived from the vector outline, so the on-screen artwork is exactly the
+    /// rasterized cell (stroke and all), and every glyph of a multi-part mark (a
+    /// sounding's digits) sits on the pivot the cell was centred on.
+    ppm: f32 = 8,
     /// name -> cell rect in atlas px. Keys are owned by whoever built the map.
     cells: std.StringHashMapUnmanaged(Cell) = .empty,
 
@@ -759,15 +765,23 @@ pub const GpuSurface = struct {
     }
 
     /// A symbol/sounding glyph as an atlas SPRITE quad — antialiased artwork, not
-    /// a flat-shaded outline. The cell's UV comes from the atlas the host loads;
-    /// the on-screen half-extent from the symbol geometry (`sym.halfExtent`), so
-    /// a sprite and the vector path size it identically. A symbol the atlas is
-    /// missing falls back to the outline triangles, keeping the mark visible.
+    /// a flat-shaded outline. Both the UV and the on-screen half-extent come from
+    /// the CELL the host loaded: sizing from the vector outline instead
+    /// (`sym.halfExtent`) drops the rasterized stroke width and, worse, differs
+    /// per glyph, so a sounding's digits mis-size and drift off their shared
+    /// pivot. A symbol the atlas is missing falls back to the outline triangles
+    /// (sized from the outline, since there is no cell), keeping the mark visible.
     fn emitSprite(self: *GpuSurface, kind: Kind, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_north: bool) !void {
         const atlas = self.sprites orelse return self.emitMark(kind, s, at, rot_deg, scale, dev, rot_north);
         const cell = atlas.get(name) orelse return self.emitMark(kind, s, at, rot_deg, scale, dev, rot_north);
-        const he = sym.halfExtent(s, scale * 100.0 * dev);
-        if (he[0] <= 0 or he[1] <= 0) return;
+        if (cell.w <= 0 or cell.h <= 0 or atlas.ppm <= 0) return;
+        // Size the quad from the CELL, not the vector outline: `c` is on-screen
+        // reference px per atlas px, so cell px × c reproduces the rasterized
+        // artwork at the same physical size the vector path draws (stroke width
+        // included). The cell is pivot-centred, so ±(w,h)/2 about the anchor lands
+        // the pivot on the anchor — every digit of a sounding aligns on it.
+        const c: f32 = @floatCast(scale * 100.0 * dev / atlas.ppm);
+        const he = [2]f32{ cell.w * 0.5 * c, cell.h * 0.5 * c };
         const rad = rot_deg * std.math.pi / 180.0;
         const cs: f32 = @floatCast(@cos(rad));
         const sn: f32 = @floatCast(@sin(rad));

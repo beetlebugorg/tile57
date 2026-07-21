@@ -1087,7 +1087,7 @@ fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.g
     // SAME display ratio, so the cell rects are byte-for-byte the layout the
     // host's uploaded PNG carries (the normalized UVs must index that texture).
     var atlas = try sprite.spriteMln(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio);
-    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height };
+    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.px_per_unit * 100.0 * ratio) };
     var cit = atlas.cells.iterator();
     while (cit.next()) |e| {
         const r = e.value_ptr.*;
