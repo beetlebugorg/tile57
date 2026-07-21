@@ -770,7 +770,9 @@ typedef enum {
 typedef enum {
     TILE57_GPU_ATLAS_NONE   = 0,
     TILE57_GPU_ATLAS_SPRITE = 1, /* the S-101 symbol atlas (tile57_bake_sprite_mln) */
-    TILE57_GPU_ATLAS_GLYPH  = 2  /* the SDF label-glyph atlas (tile57_bake_glyph_sdf) */
+    TILE57_GPU_ATLAS_GLYPH  = 2, /* SDF label-glyph atlas, regular (tile57_bake_glyph_sdf) */
+    TILE57_GPU_ATLAS_GLYPH_BOLD   = 3, /* SDF glyph atlas, bold (tile57_bake_glyph_sdf_face 1) */
+    TILE57_GPU_ATLAS_GLYPH_ITALIC = 4  /* SDF glyph atlas, italic (tile57_bake_glyph_sdf_face 2) */
 } tile57_gpu_atlas;
 
 /* One textured-quad vertex — a symbol sprite or an SDF glyph. (x, y) is the

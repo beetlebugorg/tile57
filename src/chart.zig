@@ -1050,7 +1050,30 @@ fn viewSymbolStore(a: std.mem.Allocator, palette: render.resolve.PaletteId) !*sp
 /// deterministic pack the host uploads) and the SDF glyph map. Cell SIZES are
 /// geometry, palette-independent, so the day stylesheet gives UVs that match the
 /// host's DEFAULT_CSS atlas PNG.
-fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtlas, glyphs: render.gpu.GlyphAtlas } {
+/// One SDF glyph atlas from a face, at the em_px/pad tile57_bake_glyph_sdf(_face)
+/// bakes — so the internal metrics match the texture the host uploads.
+fn buildGlyphAtlas(a: std.mem.Allocator, font: []const u8, cps: []const u21) !render.gpu.GlyphAtlas {
+    const gatlas = try sprite.glyph.build(a, font, cps, 32.0, 6);
+    var glyphs = render.gpu.GlyphAtlas{ .em_px = gatlas.em_px };
+    var git = gatlas.glyphs.iterator();
+    while (git.next()) |e| {
+        const g = e.value_ptr.*;
+        try glyphs.glyphs.put(a, e.key_ptr.*, .{
+            .u0 = g.u0,
+            .v0 = g.v0,
+            .u1 = g.u1,
+            .v1 = g.v1,
+            .off_x = g.off_x,
+            .off_y = g.off_y,
+            .w = g.w,
+            .h = g.h,
+            .advance = g.advance,
+        });
+    }
+    return glyphs;
+}
+
+fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtlas, glyphs: render.gpu.GlyphAtlas, glyphs_bold: render.gpu.GlyphAtlas, glyphs_italic: render.gpu.GlyphAtlas } {
     var css_data: []const u8 = "";
     for (embedded_assets.css) |e| {
         if (std.mem.eql(u8, e.name, "daySvgStyle")) css_data = e.bytes;
@@ -1070,26 +1093,13 @@ fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtl
         try sprites.cells.put(a, e.key_ptr.*, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
     }
 
-    // SDF glyph atlas: the same em_px/pad tile57_bake_glyph_sdf bakes.
+    // SDF glyph atlases, one per label-tier face (regular / bold / italic) — the
+    // same faces + em_px/pad tile57_bake_glyph_sdf(_face) bakes for the host.
     const cps = try sprite.glyph.defaultCodepoints(a);
-    const gatlas = try sprite.glyph.build(a, render.font.notosans, cps, 32.0, 6);
-    var glyphs = render.gpu.GlyphAtlas{ .em_px = gatlas.em_px };
-    var git = gatlas.glyphs.iterator();
-    while (git.next()) |e| {
-        const g = e.value_ptr.*;
-        try glyphs.glyphs.put(a, e.key_ptr.*, .{
-            .u0 = g.u0,
-            .v0 = g.v0,
-            .u1 = g.u1,
-            .v1 = g.v1,
-            .off_x = g.off_x,
-            .off_y = g.off_y,
-            .w = g.w,
-            .h = g.h,
-            .advance = g.advance,
-        });
-    }
-    return .{ .sprites = sprites, .glyphs = glyphs };
+    const glyphs = try buildGlyphAtlas(a, render.font.notosans, cps);
+    const glyphs_bold = try buildGlyphAtlas(a, render.font.notosans_bold, cps);
+    const glyphs_italic = try buildGlyphAtlas(a, render.font.notosans_italic, cps);
+    return .{ .sprites = sprites, .glyphs = glyphs, .glyphs_bold = glyphs_bold, .glyphs_italic = glyphs_italic };
 }
 
 // ---- per-tile GEOMETRY cache (internal; the host never sees tiles) ----------
@@ -1196,9 +1206,18 @@ fn geomPut(key: GeomKey, sc: *GpuScene) void {
 var g_atlas_state: std.atomic.Value(u8) = .init(0);
 var g_atlas_sprites: render.gpu.SpriteAtlas = .{ .width = 0, .height = 0 };
 var g_atlas_glyphs: render.gpu.GlyphAtlas = .{};
+var g_atlas_glyphs_bold: render.gpu.GlyphAtlas = .{};
+var g_atlas_glyphs_italic: render.gpu.GlyphAtlas = .{};
 var g_atlas_ok = false;
 
-fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gpu.GlyphAtlas } {
+const SharedAtlases = struct {
+    sprites: ?*const render.gpu.SpriteAtlas,
+    glyphs: ?*const render.gpu.GlyphAtlas,
+    glyphs_bold: ?*const render.gpu.GlyphAtlas,
+    glyphs_italic: ?*const render.gpu.GlyphAtlas,
+};
+
+fn sharedGpuAtlases() SharedAtlases {
     while (g_atlas_state.load(.acquire) != 2) {
         if (g_atlas_state.cmpxchgStrong(@as(u8, 0), @as(u8, 1), .acquire, .monotonic) == null) {
             const aa = gpa.create(std.heap.ArenaAllocator) catch {
@@ -1209,6 +1228,8 @@ fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gp
             if (buildGpuAtlases(aa.allocator())) |built| {
                 g_atlas_sprites = built.sprites;
                 g_atlas_glyphs = built.glyphs;
+                g_atlas_glyphs_bold = built.glyphs_bold;
+                g_atlas_glyphs_italic = built.glyphs_italic;
                 g_atlas_ok = true;
             } else |_| {
                 aa.deinit();
@@ -1219,8 +1240,8 @@ fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gp
         }
         std.atomic.spinLoopHint();
     }
-    if (!g_atlas_ok) return .{ null, null };
-    return .{ &g_atlas_sprites, &g_atlas_glyphs };
+    if (!g_atlas_ok) return .{ .sprites = null, .glyphs = null, .glyphs_bold = null, .glyphs_italic = null };
+    return .{ .sprites = &g_atlas_sprites, .glyphs = &g_atlas_glyphs, .glyphs_bold = &g_atlas_glyphs_bold, .glyphs_italic = &g_atlas_glyphs_italic };
 }
 
 // ---- compose-backed view renders --------------------------------------------
@@ -1447,8 +1468,10 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     defer gs.deinit();
     gs.store = store.asStore();
     const atl = sharedGpuAtlases();
-    gs.sprites = atl[0];
-    gs.glyphs = atl[1];
+    gs.sprites = atl.sprites;
+    gs.glyphs = atl.glyphs;
+    gs.glyphs_bold = atl.glyphs_bold;
+    gs.glyphs_italic = atl.glyphs_italic;
     gs.setTile(z, x, y);
     const surf = gs.asSurface();
     try surf.beginScene(z);
@@ -2257,8 +2280,10 @@ pub const Chart = struct {
         defer gs.deinit();
         gs.store = store.asStore();
         const atl = sharedGpuAtlases();
-        gs.sprites = atl[0];
-        gs.glyphs = atl[1];
+        gs.sprites = atl.sprites;
+        gs.glyphs = atl.glyphs;
+        gs.glyphs_bold = atl.glyphs_bold;
+        gs.glyphs_italic = atl.glyphs_italic;
         gs.setTile(z, x, y);
         const surf = gs.asSurface();
         try surf.beginScene(z);

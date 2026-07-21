@@ -166,7 +166,9 @@ pub const Prim = enum(u8) {
 pub const AtlasId = enum(u8) {
     none = 0,
     sprite = 1, // the S-101 symbol atlas
-    glyph = 2, // the SDF label-glyph atlas
+    glyph = 2, // the SDF label-glyph atlas (regular face)
+    glyph_bold = 3, // the bold SDF label-glyph atlas (place-name tier)
+    glyph_italic = 4, // the italic SDF label-glyph atlas (hydrography tier)
 };
 
 /// A shaped-but-not-yet-decluttered label. VIEW-INDEPENDENT: its renderable
@@ -192,6 +194,7 @@ pub const LabelCandidate = struct {
     paint_key: u32,
     cls: []const u8, // for the repeat rule
     text: []const u8,
+    atlas: AtlasId = .glyph, // which glyph atlas the SDF quads sample (regular/bold/italic)
 };
 
 /// A contiguous slice of one buffer that draws with one pipeline. Ranges come
@@ -323,6 +326,11 @@ pub const GpuSurface = struct {
     /// visible. `glyphs` is required for SDF text (no atlas -> no labels).
     sprites: ?*const SpriteAtlas = null,
     glyphs: ?*const GlyphAtlas = null,
+    /// Per-face SDF atlases for the tier (host-uploaded, tile57_bake_glyph_sdf_face):
+    /// bold place names and italic hydrography sample their own atlas for true
+    /// bold/italic shapes. Null falls back to the regular `glyphs` atlas.
+    glyphs_bold: ?*const GlyphAtlas = null,
+    glyphs_italic: ?*const GlyphAtlas = null,
     quads: std.ArrayList(Quad) = .empty,
     tessellator: tess.Tessellator,
     /// Pattern cells in first-use order, and the name->index map that dedupes
@@ -615,15 +623,16 @@ pub const GpuSurface = struct {
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
         if (self.fnt == null) return;
-        // The SDF atlas is the regular face, and the host shader synthesizes bold
-        // (v_weight embolden) and italic (a shear on the quads) from it — so the
-        // atlas path shapes with the regular face. Only a host WITHOUT an atlas
-        // takes the outline fallback, which shapes/draws the real bold/italic face.
-        const has_atlas = self.glyphs != null;
-        const face: FaceRef = if (has_atlas)
-            .{ .f = &self.fnt.?, .idx = 0 }
-        else
-            self.pickFace(style.weight, style.slant);
+        // Pick the per-face SDF atlas + its matching face: bold place names sample
+        // the bold atlas, italic hydrography the italic atlas (true bold/italic
+        // shapes, not a synthesized embolden/shear). The face used for shaping MUST
+        // match the atlas used for UVs, so they travel together. A host without the
+        // per-face atlas falls back to the regular atlas (still real text).
+        const sel = self.selectFace(style.weight, style.slant);
+        const has_atlas = sel.atlas != null;
+        // Atlas path: the face that matches the chosen atlas (UVs + advances agree).
+        // No-atlas outline fallback: the real bold/italic face directly.
+        const face = if (has_atlas) sel.face else self.pickFace(style.weight, style.slant);
         const f = face.f;
         const px: f32 = @floatCast((if (style.font_size > 0) style.font_size else 12) * self.textDev());
         if (px <= 1) return;
@@ -661,13 +670,12 @@ pub const GpuSurface = struct {
             baseline -= f.descent * px;
         }
 
-        // The run becomes either SDF glyph quads (crisp at any zoom, the whole
-        // point of the atlas — emboldened for bold, sheared for italic in the
-        // shader/geometry) or, when no glyph atlas is loaded, filled outline
-        // triangles from the real bold/italic face so an atlas-less host still
-        // gets text.
+        // The run becomes SDF glyph quads (crisp at any zoom) against the selected
+        // atlas, tagged with a subtle halo width (bold/italic name tiers) so the
+        // host shader outlines them for legibility over soundings; or, when no glyph
+        // atlas is loaded, filled outline triangles from the real face.
         const geom = if (has_atlas)
-            (try self.sdfRun(gids.items, x0, baseline, px, at, style.weight, style.slant)) orelse
+            (try self.sdfRun(sel.atlas.?, sel.atlas_id, sel.halo, gids.items, x0, baseline, px, at)) orelse
                 (try self.outlineRun(face, gids.items, x0, baseline, px, at)) orelse
                 return // all-whitespace run: nothing to place
         else
@@ -694,8 +702,12 @@ pub const GpuSurface = struct {
         var cq = std.ArrayList(Quad).empty;
         var cv_ = std.ArrayList(Vertex).empty;
         var ci = std.ArrayList(u32).empty;
+        var atlas_id: AtlasId = .glyph;
         switch (geom) {
-            .sprite => |sq| try self.emitSpriteGeom(self.a, &cq, op, sq.anchor, sq.quads, sq.weight),
+            .sprite => |sq| {
+                atlas_id = sq.atlas; // regular / bold / italic glyph atlas
+                try self.emitSpriteGeom(self.a, &cq, op, sq.anchor, sq.quads, sq.weight);
+            },
             .mark => |m| try self.emitMarkGeom(self.a, &cv_, &ci, op, m.anchor, m.rings, m.rule),
             else => unreachable,
         }
@@ -717,25 +729,44 @@ pub const GpuSurface = struct {
             .paint_key = op.paint_key,
             .cls = self.cur.class,
             .text = text,
+            .atlas = atlas_id,
         });
     }
 
     const ShapedGlyph = struct { gid: u16, cp: u21, x: f32 };
 
-    /// Lay a shaped run out as SDF glyph quads against the glyph atlas, at the
-    /// anchor-local baseline origin (`x0`, `baseline`) in reference px. Null when
-    /// there is no glyph atlas (caller falls back to outlines) or the run yields
-    /// no glyph (all whitespace / all missing from the atlas).
-    /// SDF embolden for the bold place-name tier: the host shader shifts the
-    /// field threshold by `v_weight` (edge = 0.5 - weight), growing the stem by
-    /// roughly this fraction of an em — a synthesized bold from the one regular
-    /// atlas (no second atlas). Italic is a geometric shear on the quads instead.
-    const BOLD_SDF_WEIGHT: f32 = 0.18;
-    const ITALIC_SHEAR: f32 = 0.21; // tan(~12°): standard oblique slant
+    /// Subtle white-halo width (SDF field units) carried on the quad `weight` and
+    /// read by the host shader as a halo, NOT an embolden — just enough to lift a
+    /// bold/italic geographic name off busy soundings. Regular labels get 0.
+    const HALO_WEIGHT: f32 = 0.10;
 
-    fn sdfRun(self: *GpuSurface, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint, weight: fontmod.Weight, slant: fontmod.Slant) !?Geom {
-        const atlas = self.glyphs orelse return null;
-        const shear: f32 = if (slant == .italic) ITALIC_SHEAR else 0;
+    /// A parsed face + its glyph-cache index, the atlas it shapes against, the
+    /// atlas id the host binds a texture for, and the halo width for its tier.
+    const FaceSel = struct { face: FaceRef, atlas: ?*const GlyphAtlas, atlas_id: AtlasId, halo: f32 };
+
+    /// Choose the atlas + matching face + halo for a label's weight/slant. The
+    /// bold/italic atlas is used only when the host uploaded it (and its face
+    /// parsed); otherwise it falls back to the regular atlas — the face and atlas
+    /// always agree so UVs and advances match.
+    fn selectFace(self: *GpuSurface, weight: fontmod.Weight, slant: fontmod.Slant) FaceSel {
+        const reg = FaceRef{ .f = &self.fnt.?, .idx = 0 };
+        if (weight == .bold) {
+            if (self.glyphs_bold) |ab| if (self.fnt_bold) |*fb|
+                return .{ .face = .{ .f = fb, .idx = 1 }, .atlas = ab, .atlas_id = .glyph_bold, .halo = HALO_WEIGHT };
+            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = HALO_WEIGHT };
+        }
+        if (slant == .italic) {
+            if (self.glyphs_italic) |ai| if (self.fnt_italic) |*fi|
+                return .{ .face = .{ .f = fi, .idx = 2 }, .atlas = ai, .atlas_id = .glyph_italic, .halo = HALO_WEIGHT };
+            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = HALO_WEIGHT };
+        }
+        return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = 0 };
+    }
+
+    /// Lay a shaped run out as SDF glyph quads against `atlas`, tagged with
+    /// `atlas_id` (the texture the host binds) and `halo` (the quad weight). Null
+    /// when the run yields no glyph (all whitespace / all missing from the atlas).
+    fn sdfRun(self: *GpuSurface, atlas: *const GlyphAtlas, atlas_id: AtlasId, halo: f32, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
         var quads = std.ArrayList(SpriteQuad).empty;
         for (glyphs_in) |g| {
             const gi = atlas.get(g.cp) orelse continue; // space, or a glyph the atlas lacks
@@ -746,26 +777,13 @@ pub const GpuSurface = struct {
             const gy = baseline + gi.off_y * px;
             const gw = gi.w * px;
             const gh = gi.h * px;
-            // Italic: skew x proportional to height above the baseline, so the top
-            // of the glyph leans right (a fixed slant, sheared about the baseline).
-            const sx = struct {
-                fn f(x: f32, y: f32, base: f32, sh: f32) f32 {
-                    return x + sh * (base - y);
-                }
-            }.f;
             try quads.append(self.a, .{
-                .corners = .{
-                    .{ sx(gx, gy, baseline, shear), gy },
-                    .{ sx(gx + gw, gy, baseline, shear), gy },
-                    .{ sx(gx + gw, gy + gh, baseline, shear), gy + gh },
-                    .{ sx(gx, gy + gh, baseline, shear), gy + gh },
-                },
+                .corners = .{ .{ gx, gy }, .{ gx + gw, gy }, .{ gx + gw, gy + gh }, .{ gx, gy + gh } },
                 .uv = .{ .{ gi.u0, gi.v0 }, .{ gi.u1, gi.v0 }, .{ gi.u1, gi.v1 }, .{ gi.u0, gi.v1 } },
             });
         }
         if (quads.items.len == 0) return null;
-        const w: f32 = if (weight == .bold) BOLD_SDF_WEIGHT else 0;
-        return .{ .sprite = .{ .anchor = at, .quads = try quads.toOwnedSlice(self.a), .atlas = .glyph, .weight = w } };
+        return .{ .sprite = .{ .anchor = at, .quads = try quads.toOwnedSlice(self.a), .atlas = atlas_id, .weight = halo } };
     }
 
     /// A parsed face + its glyph-cache index (0 regular, 1 bold, 2 italic).
@@ -1169,7 +1187,7 @@ pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const Label
         if (c.quads.len > 0) {
             const first = quads.items.len;
             try quads.appendSlice(arena, c.quads);
-            try ranges.append(arena, .{ .first = @intCast(first), .count = @intCast(c.quads.len), .paint_key = c.paint_key, .pattern = NO_PATTERN, .color = c.color, .kind = .text, .prim = .quads, .atlas = .glyph });
+            try ranges.append(arena, .{ .first = @intCast(first), .count = @intCast(c.quads.len), .paint_key = c.paint_key, .pattern = NO_PATTERN, .color = c.color, .kind = .text, .prim = .quads, .atlas = c.atlas });
         }
         if (c.indices.len > 0) {
             const vbase: u32 = @intCast(verts.items.len);
