@@ -760,7 +760,20 @@ pub const GpuSurface = struct {
                 return .{ .face = .{ .f = fi, .idx = 2 }, .atlas = ai, .atlas_id = .glyph_italic, .halo = HALO_WEIGHT };
             return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = HALO_WEIGHT };
         }
-        return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = 0 };
+        // Regular tier: a land-name label (points, capes, landmarks) also earns the
+        // halo so all land text reads cleanly; water-adjacent regular labels
+        // (seabed, light descriptions) stay solid.
+        const halo: f32 = if (isLandLabel(self.cur.class)) HALO_WEIGHT else 0;
+        return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph, .halo = halo };
+    }
+
+    /// Land-name classes whose regular-tier labels carry the halo (BUAARE places
+    /// are the bold tier, already haloed).
+    fn isLandLabel(class: []const u8) bool {
+        inline for (.{ "LNDRGN", "LNDMRK", "LNDARE", "BUISGL" }) |c| {
+            if (std.mem.eql(u8, class, c)) return true;
+        }
+        return false;
     }
 
     /// Lay a shaped run out as SDF glyph quads against `atlas`, tagged with
