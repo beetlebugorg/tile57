@@ -738,7 +738,7 @@ pub const GpuSurface = struct {
     /// Subtle white-halo width (SDF field units) carried on the quad `weight` and
     /// read by the host shader as a halo, NOT an embolden — just enough to lift a
     /// bold/italic geographic name off busy soundings. Regular labels get 0.
-    const HALO_WEIGHT: f32 = 0.10;
+    const HALO_WEIGHT: f32 = 0.15;
 
     /// A parsed face + its glyph-cache index, the atlas it shapes against, the
     /// atlas id the host binds a texture for, and the halo width for its tier.
