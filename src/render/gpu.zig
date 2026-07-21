@@ -730,7 +730,7 @@ pub const GpuSurface = struct {
     /// field threshold by `v_weight` (edge = 0.5 - weight), growing the stem by
     /// roughly this fraction of an em — a synthesized bold from the one regular
     /// atlas (no second atlas). Italic is a geometric shear on the quads instead.
-    const BOLD_SDF_WEIGHT: f32 = 0.08;
+    const BOLD_SDF_WEIGHT: f32 = 0.18;
     const ITALIC_SHEAR: f32 = 0.21; // tan(~12°): standard oblique slant
 
     fn sdfRun(self: *GpuSurface, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint, weight: fontmod.Weight, slant: fontmod.Slant) !?Geom {

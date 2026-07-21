@@ -44,6 +44,7 @@ const objlcount = @import("objlcount.zig");
 const cell = @import("cell.zig");
 const s101dump = @import("s101dump.zig");
 const glyphs = @import("glyphs.zig");
+const gpudbg = @import("gpudbg.zig");
 const partdbg_png = @import("partdbg_png.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -66,6 +67,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "emit-glyphs")) {
         return glyphs.run(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "gpudbg")) {
+        return gpudbg.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "sprite")) {
