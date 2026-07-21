@@ -879,19 +879,26 @@ typedef struct {
  * continuously never has to have its scene rebuilt. The per-vertex map_align
  * flag is what keeps that invariant for marks that must turn with the chart.
  *
+ * pixel_ratio is the host's display density (1 standard, 2 Retina/HiDPI, ...).
+ * The sprite quads' texture UVs are for a sprite atlas baked at this ratio, so
+ * pass the SAME pixel_ratio to tile57_bake_sprite_mln for the texture you upload
+ * — otherwise the UVs will not index it. It does NOT change any on-screen size
+ * (a sprite quad is sized from its reference-px offsets); it only selects how
+ * dense the atlas texels are, so symbols stay sharp on a HiDPI display. 0 => 1.
+ *
  * On OK the caller owns the scene and MUST release it with
  * tile57_gpu_scene_free. On failure *out is zeroed and nothing needs freeing. */
 tile57_status tile57_chart_gpu_scene(tile57_chart *chart, double lon, double lat, double zoom,
                              uint32_t width, uint32_t height,
-                             const tile57_mariner *m,
+                             const tile57_mariner *m, double pixel_ratio,
                              tile57_gpu_scene *out, tile57_error *err);
 
 /* The composed twin of tile57_chart_gpu_scene: a whole chart LIBRARY (opened via
  * tile57_compose_open) portrayed into one draw-ready scene, seams stitched across
- * cells. Same buffers and the same tile57_gpu_scene_free. */
+ * cells. Same buffers and the same tile57_gpu_scene_free. pixel_ratio as above. */
 tile57_status tile57_compose_gpu_scene(tile57_compose *compose, double lon, double lat, double zoom,
                              uint32_t width, uint32_t height,
-                             const tile57_mariner *m,
+                             const tile57_mariner *m, double pixel_ratio,
                              tile57_gpu_scene *out, tile57_error *err);
 
 
@@ -1123,9 +1130,17 @@ tile57_status tile57_bake_assets(const char *catalog_dir, tile57_assets *out,
                                  tile57_error *err);
 /* Like tile57_bake_assets but sprite_json/sprite_png carry the MapLibre sprite-mln
  * atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON); other
- * fields are NULL. Free with tile57_assets_free. */
-tile57_status tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out,
-                                     tile57_error *err);
+ * fields are NULL. Free with tile57_assets_free.
+ *
+ * pixel_ratio is the host's display density (1 standard, 2 Retina/HiDPI, ...):
+ * symbol cells rasterize at that many device px per reference px, so the texture
+ * stays sharp when the display draws it enlarged. On-screen SIZE is unchanged
+ * (a GPU-scene quad is sized from the symbol's reference-px half-extent, not the
+ * texture). A GPU-scene host MUST pass the same pixel_ratio to the
+ * tile57_*_gpu_scene calls, or the scene's UVs will not index this texture.
+ * 0 is treated as 1. */
+tile57_status tile57_bake_sprite_mln(const char *catalog_dir, double pixel_ratio,
+                                     tile57_assets *out, tile57_error *err);
 /* SDF glyph atlas for GPU text: sprite_png is the RGBA signed-distance-field atlas
  * of the label font; sprite_json is {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,
  * v1,off_x,off_y,w,h,advance]}} with the quad geometry in EM units (multiply by the

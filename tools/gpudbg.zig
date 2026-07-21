@@ -60,7 +60,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer src.deinit();
 
     var settings = render.resolve.Settings{ .display_other = true };
-    const gs = chart.renderComposeGpuScene(src, lon, lat, zoom, 900, 700, .day, &settings) catch |e| {
+    const gs = chart.renderComposeGpuScene(src, lon, lat, zoom, 900, 700, .day, &settings, 1.0) catch |e| {
         std.debug.print("gpu scene error: {s}\n", .{@errorName(e)});
         return;
     };

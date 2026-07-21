@@ -726,6 +726,7 @@ export fn tile57_chart_gpu_scene(
     width: u32,
     height: u32,
     m: ?*const CMariner,
+    pixel_ratio: f64,
     out: ?*CGpuScene,
     err: ?*CError,
 ) callconv(.c) c_int {
@@ -735,7 +736,7 @@ export fn tile57_chart_gpu_scene(
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
-    const built = c.renderGpuScene(lon, lat, zoom, width, height, paletteOf(&settings), &settings) catch |e| return fail(err, e);
+    const built = c.renderGpuScene(lon, lat, zoom, width, height, paletteOf(&settings), &settings, pixel_ratio) catch |e| return fail(err, e);
     return fillGpuScene(o, built, err);
 }
 
@@ -780,6 +781,7 @@ export fn tile57_compose_gpu_scene(
     width: u32,
     height: u32,
     m: ?*const CMariner,
+    pixel_ratio: f64,
     out: ?*CGpuScene,
     err: ?*CError,
 ) callconv(.c) c_int {
@@ -789,7 +791,7 @@ export fn tile57_compose_gpu_scene(
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
-    const built = chart.renderComposeGpuScene(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings) catch |e| return fail(err, e);
+    const built = chart.renderComposeGpuScene(src, lon, lat, zoom, width, height, paletteOf(&settings), &settings, pixel_ratio) catch |e| return fail(err, e);
     return fillGpuScene(o, built, err);
 }
 
@@ -1303,7 +1305,7 @@ export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: ?*CAssets, err: ?
 /// Like tile57_bake_assets but the sprite_* fields carry the MapLibre sprite-mln
 /// atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON). Only
 /// sprite_json/sprite_png are filled. Free with tile57_assets_free. See tile57.h.
-export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
+export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, pixel_ratio: f64, out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = .{};
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1313,7 +1315,8 @@ export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, out: ?*CAssets, er
     defer arena.deinit();
     const a = arena.allocator();
     const cd = spanOpt(catalog_dir) orelse "";
-    const spr = bundle.spriteMlnBytes(io, a, cd, bundle.DEFAULT_CSS, &[_][]const u8{}) catch |e| return fail(err, e);
+    const ratio = if (pixel_ratio > 0) pixel_ratio else 1;
+    const spr = bundle.spriteMlnBytes(io, a, cd, bundle.DEFAULT_CSS, &[_][]const u8{}, ratio) catch |e| return fail(err, e);
     fillAssets(o, "", "", spr.json, spr.png, "", "") catch |e| {
         tile57_assets_free(o);
         return fail(err, e);

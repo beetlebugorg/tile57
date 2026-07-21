@@ -492,11 +492,22 @@ const MlnCell = struct { name: []const u8, w: u32, h: u32, ratio: f64, rgba: []c
 /// allocator-owned bytes. `soundings` are the distinct comma-joined glyph lists
 /// the soundings layer references (collected from the baked tiles); pass &.{} to
 /// skip them (e.g. the catalogue-only `sprite-mln` command without tiles).
-pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8, soundings: []const []const u8) !Atlas {
+/// `ratio` is the host's display pixel ratio (1 = standard, 2 = Retina/HiDPI,
+/// 3 = …): symbol cells rasterize at that many device px per reference px and
+/// carry it as their MapLibre `pixelRatio`, so a consumer draws them at the same
+/// LOGICAL size but samples a sharper texture. The atlas width and cell cap
+/// scale with it so the layout stays proportional and within texture limits.
+/// The GPU-scene cell-map (chart.buildGpuAtlases) and a host's uploaded texture
+/// (tile57_bake_sprite_mln) MUST pass the SAME ratio, or the normalized UVs the
+/// scene emits will not index the texture the host uploaded.
+pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8, soundings: []const []const u8, ratio: f64) !Atlas {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const ar = arena_state.allocator();
     var css = try loadCss(ar, css_data);
+    const ppm = px_per_mm * ratio; // device px per mm at this display ratio
+    const cell_cap: f64 = @as(f64, @floatFromInt(max_cell_side)) * ratio;
+    const atlas_w: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(sprite_atlas_width)) * ratio));
 
     var cells = std.ArrayList(MlnCell).empty;
     // name -> rendered symbol, for compositing sounding glyph stacks.
@@ -510,14 +521,14 @@ pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const A
         }
     }.less);
     for (sym_ordered) |s| {
-        const sym = renderSym(ar, s.svg, &css) orelse continue;
+        const sym = renderSymAt(ar, s.svg, &css, ppm) orelse continue;
         try rendered.put(s.id, sym); // for sounding composites (any size)
-        if (sym.w > max_cell_side or sym.h > max_cell_side) continue;
+        if (@as(f64, @floatFromInt(sym.w)) > cell_cap or @as(f64, @floatFromInt(sym.h)) > cell_cap) continue;
         const c = centredCanvas(ar, sym) orelse continue;
-        try cells.append(ar, .{ .name = s.id, .w = c.w, .h = c.h, .ratio = 1, .rgba = c.rgba });
+        try cells.append(ar, .{ .name = s.id, .w = c.w, .h = c.h, .ratio = ratio, .rgba = c.rgba });
         // "ctr:" — the raw cell, bbox-centred by MapLibre (pivot ignored).
         const ctr_name = try std.fmt.allocPrint(ar, "ctr:{s}", .{s.id});
-        try cells.append(ar, .{ .name = ctr_name, .w = sym.w, .h = sym.h, .ratio = 1, .rgba = sym.rgba });
+        try cells.append(ar, .{ .name = ctr_name, .w = sym.w, .h = sym.h, .ratio = ratio, .rgba = sym.rgba });
     }
 
     // Area-fill patterns, id order, keyed "pat:<id>" at the pattern pixel ratio.
@@ -550,10 +561,10 @@ pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const A
     }.less);
     for (snd_ordered) |stack| {
         const t = compositeSounding(ar, &rendered, stack) orelse continue;
-        try cells.append(ar, .{ .name = stack, .w = t.w, .h = t.h, .ratio = 1, .rgba = t.rgba });
+        try cells.append(ar, .{ .name = stack, .w = t.w, .h = t.h, .ratio = ratio, .rgba = t.rgba });
     }
 
-    return packMln(a, ar, cells.items, sprite_atlas_width);
+    return packMln(a, ar, cells.items, atlas_w);
 }
 
 // Composite a comma-joined glyph list (e.g. "SOUNDSC3,SOUNDS12,SOUNDS54") into
