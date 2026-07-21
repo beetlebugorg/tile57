@@ -85,7 +85,15 @@ pub const Quad = extern struct {
     disp_cat: u8 = 1,
     /// Non-zero when the mark is chart-relative (a rotated view turns it).
     map_align: u8 = 0,
-    _pad: [2]u8 = .{ 0, 0 },
+    /// Non-zero when this quad rides a run that must stay upright: the host
+    /// shader flips it 180° about the anchor when the run, once the view rotation
+    /// is added, would read into the left half-plane (a depth-contour value that
+    /// follows a right-to-left contour). 0 for every other quad.
+    flip: u8 = 0,
+    /// The run's own angle quantized to a full turn over 0..255 (`tangent_q /
+    /// 256 * 2π`), so the flip shader recovers cos/sin(tangent) with no rebuild.
+    /// Meaningful only when `flip` is set; 0 otherwise.
+    tangent_q: u8 = 0,
 };
 
 /// `Range.pattern` when the range is not an area-fill pattern — which is every
@@ -195,7 +203,22 @@ pub const LabelCandidate = struct {
     cls: []const u8, // for the repeat rule
     text: []const u8,
     atlas: AtlasId = .glyph, // which glyph atlas the SDF quads sample (regular/bold/italic)
+    /// A depth-contour value's carrier length in WORLD units: the label is
+    /// dropped when `len × 256·2^zoom` falls below LEGIBLE_PX at the view zoom
+    /// (assembleLabels), so a memoized contour re-gates itself as the mariner
+    /// zooms. 0 for an ordinary label (which always places).
+    gate_world_len: f32 = 0,
 };
+
+/// A contour value shorter than this on screen (px) is illegible, so it is
+/// dropped before the pool ranks it — the same gate the vector path applies.
+const LEGIBLE_PX: f64 = 10;
+
+/// Rotate a corner offset about the anchor-local origin: `(cs, sn)` are
+/// cos/sin of the run angle. cs=1, sn=0 is the identity (an unrotated run).
+fn rot2(x: f32, y: f32, cs: f32, sn: f32) [2]f32 {
+    return .{ x * cs - y * sn, x * sn + y * cs };
+}
 
 /// A contiguous slice of one buffer that draws with one pipeline. Ranges come
 /// out sorted by `paint_key`; draw them in order and the chart is correct.
@@ -275,6 +298,10 @@ const Op = struct {
     scamin: f32,
     disp_cat: u8,
     map_align: u8,
+    /// Carried onto every quad this op emits: a flippable tangent run (a contour
+    /// value) sets both; everything else leaves them 0. See Quad.flip/tangent_q.
+    flip: u8 = 0,
+    tangent_q: u8 = 0,
     pattern: u32 = NO_PATTERN,
     // The tile->world transform AT THE TIME THIS OP WAS BUFFERED. Geometry is
     // kept tile-local and converted in `build`, but a whole-view scene walks many
@@ -534,7 +561,7 @@ pub const GpuSurface = struct {
         return gop.value_ptr.*;
     }
 
-    fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, _: ?f64) anyerror!void {
+    fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
         try self.push(.line, self.rgba(token), .{ .stroke = .{
@@ -542,6 +569,156 @@ pub const GpuSurface = struct {
             .half_w = @floatCast(@max(width_px, 0.5) * 0.5),
             .dash = dash,
         } });
+        // A depth-contour value rides the line as a MAP-aligned, tangent-rotated
+        // label candidate — the same placement the vector path emits.
+        if (valdco) |v| try self.emitContourLabel(v, lines);
+    }
+
+    /// A depth-contour value, placed at the midpoint of the longest visible
+    /// segment and turned to that segment's tangent so it follows the contour:
+    /// MAP-aligned (the host shader adds the view rotation) and flippable (the
+    /// shader turns it 180° so the number never reads upside down). Mirrors
+    /// vector.emitContourLabel; the raster path draws the same value horizontal.
+    fn emitContourLabel(self: *GpuSurface, v: f64, lines: []const []const rs.TilePoint) !void {
+        const f = if (self.fnt) |*font| font else return;
+        var best2: f64 = 0;
+        var mid: rs.TilePoint = .{ .x = 0, .y = 0 };
+        var tangent: f64 = 0;
+        for (lines) |line| {
+            for (0..line.len -| 1) |i| {
+                const dx: f64 = @floatFromInt(line[i + 1].x - line[i].x);
+                const dy: f64 = @floatFromInt(line[i + 1].y - line[i].y);
+                const len2 = dx * dx + dy * dy;
+                if (len2 > best2) {
+                    best2 = len2;
+                    mid = .{ .x = @divTrunc(line[i].x + line[i + 1].x, 2), .y = @divTrunc(line[i].y + line[i + 1].y, 2) };
+                    tangent = std.math.atan2(dy, dx);
+                }
+            }
+        }
+        if (best2 == 0) return;
+        // The visible piece's length in WORLD units — assembleLabels gates it
+        // against the view zoom, so a memoized label re-gates itself on a zoom.
+        const gate_world_len: f32 = @floatCast(@sqrt(best2) * self.tile_scale);
+
+        var buf: [24]u8 = undefined;
+        const label_src = if (self.settings.depth_unit == .feet)
+            std.fmt.bufPrint(&buf, "{d}", .{@floor(v * sndfrm.M_TO_FT)}) catch return
+        else
+            std.fmt.bufPrint(&buf, "{d}", .{@round(v)}) catch return;
+        const label = try self.a.dupe(u8, label_src);
+
+        // CHGRD by day, a bright neutral at dusk/night (mariner.contourLabelColor).
+        const color: [4]u8 = switch (self.palette) {
+            .day => self.rgba("CHGRD"),
+            .dusk => .{ 0xdd, 0xe7, 0xec, 0xff },
+            .night => .{ 0xaa, 0xb7, 0xbf, 0xff },
+        };
+
+        // Shape at the contour size (10 CSS px), centred and vertically middled —
+        // the same metrics the vector/pixel paths use, so the box agrees.
+        const px: f32 = @floatCast(10.0 * self.textDev());
+        if (px <= 1) return;
+        var pen: f32 = 0;
+        var gids = std.ArrayList(ShapedGlyph).empty;
+        defer gids.deinit(self.a);
+        var it = (std.unicode.Utf8View.init(label) catch return).iterator();
+        while (it.nextCodepoint()) |cp| {
+            const gid = f.glyphIndex(cp);
+            try gids.append(self.a, .{ .gid = gid, .cp = cp, .x = pen });
+            pen += f.advance(gid) * px;
+        }
+        if (pen <= 0) return;
+        const x0: f32 = -pen / 2; // halign center
+        const baseline: f32 = (f.ascent - f.descent) / 2 * px; // valign middle
+
+        // Bake the tangent into the glyph geometry; the SDF path also flags the
+        // quads flippable so the shader keeps the value upright per frame.
+        const rot: f32 = @floatCast(tangent);
+        const face = FaceRef{ .f = f, .idx = 0 };
+        const geom = if (self.glyphs) |atlas|
+            (try self.sdfRun(atlas, .glyph, 0, gids.items, x0, baseline, px, mid, rot)) orelse
+                (try self.outlineRun(face, gids.items, x0, baseline, px, mid, rot)) orelse return
+        else
+            (try self.outlineRun(face, gids.items, x0, baseline, px, mid, rot)) orelse return;
+
+        // Quantize the tangent to a full turn for the flip shader (a coarse angle
+        // is enough — the flip is a binary decision near the ±90° boundary).
+        const turns = @mod(tangent / (2.0 * std.math.pi), 1.0);
+        const tq: u8 = @intFromFloat(@min(255.0, @floor(turns * 256.0)));
+        const op = Op{
+            .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+            .seq = 0,
+            .kind = .text,
+            .color = color,
+            .scamin = if (self.cur.scamin) |s| @floatFromInt(s) else 0,
+            .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
+            .map_align = 1,
+            .flip = 1,
+            .tangent_q = tq,
+            .tox = self.tile_ox,
+            .toy = self.tile_oy,
+            .tscale = self.tile_scale,
+            .geom = geom,
+        };
+        var cq = std.ArrayList(Quad).empty;
+        var cv_ = std.ArrayList(Vertex).empty;
+        var ci = std.ArrayList(u32).empty;
+        var atlas_id: AtlasId = .glyph;
+        switch (geom) {
+            .sprite => |sq| {
+                atlas_id = sq.atlas;
+                try self.emitSpriteGeom(self.a, &cq, op, sq.anchor, sq.quads, sq.weight);
+            },
+            .mark => |m| try self.emitMarkGeom(self.a, &cv_, &ci, op, m.anchor, m.rings, m.rule),
+            else => unreachable,
+        }
+
+        // Collision box: the AABB of the tangent-rotated run rect. The view
+        // rotation is unknown at scene-build time (the scene is rotation-free), so
+        // the box does not track it — an accepted approximation for sparse contour
+        // values, and it keeps assembleLabels off the rotation.
+        const cs: f32 = @cos(rot);
+        const sn: f32 = @sin(rot);
+        const rect = [_][2]f32{
+            .{ x0, baseline - f.ascent * px },
+            .{ x0 + pen, baseline - f.ascent * px },
+            .{ x0 + pen, baseline + f.descent * px },
+            .{ x0, baseline + f.descent * px },
+        };
+        var bx0: f32 = std.math.floatMax(f32);
+        var by0: f32 = std.math.floatMax(f32);
+        var bx1: f32 = -std.math.floatMax(f32);
+        var by1: f32 = -std.math.floatMax(f32);
+        for (rect) |c| {
+            const r = rot2(c[0], c[1], cs, sn);
+            bx0 = @min(bx0, r[0]);
+            by0 = @min(by0, r[1]);
+            bx1 = @max(bx1, r[0]);
+            by1 = @max(by1, r[1]);
+        }
+
+        const aw = opWorld(op, mid);
+        try self.candidates.append(self.a, .{
+            .quads = try cq.toOwnedSlice(self.a),
+            .verts = try cv_.toOwnedSlice(self.a),
+            .indices = try ci.toOwnedSlice(self.a),
+            .ax = aw[0],
+            .ay = aw[1],
+            .bx0 = bx0,
+            .by0 = by0,
+            .bx1 = bx1,
+            .by1 = by1,
+            .scamin = op.scamin,
+            .disp_cat = op.disp_cat,
+            .color = op.color,
+            .group = 0, // a contour value is not one of the spec's named text groups
+            .paint_key = op.paint_key,
+            .cls = self.cur.class,
+            .text = label,
+            .atlas = atlas_id,
+            .gate_world_len = gate_world_len,
+        });
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, _: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -678,11 +855,11 @@ pub const GpuSurface = struct {
         // The run becomes SDF glyph quads (crisp at any zoom) against the selected
         // atlas; or, when no glyph atlas is loaded, filled outline triangles.
         const geom = if (has_atlas)
-            (try self.sdfRun(sel.atlas.?, sel.atlas_id, halo, gids.items, x0, baseline, px, at)) orelse
-                (try self.outlineRun(face, gids.items, x0, baseline, px, at)) orelse
+            (try self.sdfRun(sel.atlas.?, sel.atlas_id, halo, gids.items, x0, baseline, px, at, 0)) orelse
+                (try self.outlineRun(face, gids.items, x0, baseline, px, at, 0)) orelse
                 return // all-whitespace run: nothing to place
         else
-            (try self.outlineRun(face, gids.items, x0, baseline, px, at)) orelse return;
+            (try self.outlineRun(face, gids.items, x0, baseline, px, at, 0)) orelse return;
 
         // Build the label's renderable geometry NOW — absolute world, so it is
         // view-independent and caches — and store its box in LOCAL px relative to
@@ -778,7 +955,11 @@ pub const GpuSurface = struct {
     /// Lay a shaped run out as SDF glyph quads against `atlas`, tagged with
     /// `atlas_id` (the texture the host binds) and `halo` (the quad weight). Null
     /// when the run yields no glyph (all whitespace / all missing from the atlas).
-    fn sdfRun(self: *GpuSurface, atlas: *const GlyphAtlas, atlas_id: AtlasId, halo: f32, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
+    fn sdfRun(self: *GpuSurface, atlas: *const GlyphAtlas, atlas_id: AtlasId, halo: f32, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint, rot: f32) !?Geom {
+        // `rot` turns the whole run about the anchor (a contour tangent); 0 for
+        // ordinary text. The host shader then adds the view rotation on top.
+        const cs: f32 = @cos(rot);
+        const sn: f32 = @sin(rot);
         var quads = std.ArrayList(SpriteQuad).empty;
         for (glyphs_in) |g| {
             const gi = atlas.get(g.cp) orelse continue; // space, or a glyph the atlas lacks
@@ -790,7 +971,7 @@ pub const GpuSurface = struct {
             const gw = gi.w * px;
             const gh = gi.h * px;
             try quads.append(self.a, .{
-                .corners = .{ .{ gx, gy }, .{ gx + gw, gy }, .{ gx + gw, gy + gh }, .{ gx, gy + gh } },
+                .corners = .{ rot2(gx, gy, cs, sn), rot2(gx + gw, gy, cs, sn), rot2(gx + gw, gy + gh, cs, sn), rot2(gx, gy + gh, cs, sn) },
                 .uv = .{ .{ gi.u0, gi.v0 }, .{ gi.u1, gi.v0 }, .{ gi.u1, gi.v1 }, .{ gi.u0, gi.v1 } },
             });
         }
@@ -812,14 +993,19 @@ pub const GpuSurface = struct {
     /// The outline-triangle fallback: filled glyph contours, wound nonzero. Null
     /// for an all-whitespace run. `face` shapes the outlines (its cache index keeps
     /// the three faces' per-id outlines distinct).
-    fn outlineRun(self: *GpuSurface, face: anytype, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
+    fn outlineRun(self: *GpuSurface, face: anytype, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint, rot: f32) !?Geom {
+        // `rot` turns the run about the anchor (a contour tangent) so the outline
+        // fallback follows the contour too; the triangle path carries no flip, so
+        // this degrades to possibly-upside-down only when the SDF atlas is absent.
+        const cs: f32 = @cos(rot);
+        const sn: f32 = @sin(rot);
         var rings = std.ArrayList([]const [2]f32).empty;
         for (glyphs_in) |g| {
             for (try self.glyphOutline(face.f, face.idx, g.gid)) |contour| {
                 if (contour.len < 3) continue;
                 const pts = try self.a.alloc([2]f32, contour.len);
                 // em units, y UP -> local reference px, y DOWN.
-                for (contour, 0..) |p, i| pts[i] = .{ x0 + g.x + p.x * px, baseline - p.y * px };
+                for (contour, 0..) |p, i| pts[i] = rot2(x0 + g.x + p.x * px, baseline - p.y * px, cs, sn);
                 try rings.append(self.a, pts);
             }
         }
@@ -1025,6 +1211,8 @@ pub const GpuSurface = struct {
                 .scamin = op.scamin,
                 .disp_cat = op.disp_cat,
                 .map_align = op.map_align,
+                .flip = op.flip,
+                .tangent_q = op.tangent_q,
             };
             for ([_]usize{ 0, 1, 2, 0, 2, 3 }) |k| try quads.append(arena, qv[k]);
         }
@@ -1176,6 +1364,9 @@ pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const Label
         // SCAMIN at the view zoom — base category (0) is never hidden (S-52).
         if (!ignore_scamin and c.disp_cat != 0 and c.scamin > 0 and
             !resolve.scaminVisible(@intFromFloat(c.scamin), view_zoom)) continue;
+        // A contour value whose visible piece is too short to carry a legible run
+        // at this zoom drops before the pool ranks it (mirrors the vector path).
+        if (c.gate_world_len > 0 and @as(f64, c.gate_world_len) * s < LEGIBLE_PX) continue;
         const ax = @as(f64, c.ax) * s;
         const ay = @as(f64, c.ay) * s;
         try pool.add(scratch, ids.items.len, c.group, c.cls, c.text, .{

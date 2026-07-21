@@ -69,12 +69,30 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var total: usize = 0;
     var weighted: usize = 0;
     var maxw: f32 = 0;
+    var flipped: usize = 0; // contour-value quads (flip=1, map-aligned, tangent set)
+    var sample_off: ?[2]f32 = null;
+    var sample_tan: u8 = 0;
     for (gs.scene.quads) |q| {
         total += 1;
         if (q.weight > 0) {
             weighted += 1;
             maxw = @max(maxw, q.weight);
         }
+        if (q.flip != 0) {
+            flipped += 1;
+            if (sample_off == null and (q.ox != 0 or q.oy != 0)) {
+                sample_off = .{ q.ox, q.oy };
+                sample_tan = q.tangent_q;
+            }
+        }
     }
     std.debug.print("gpu view {d},{d} z{d}: {d} quads, {d} with weight>0 (max {d:.3})\n", .{ lon, lat, zoom, total, weighted, maxw });
+    // A contour value's quads must be tangent-rotated (a non-axis-aligned corner
+    // offset) and flagged for the shader's uprightness flip.
+    if (sample_off) |off| {
+        const deg = @as(f32, @floatFromInt(sample_tan)) / 256.0 * 360.0;
+        std.debug.print("contour-label quads: {d} (flip=1, map-aligned); sample corner off=({d:.2},{d:.2}) tangent~{d:.0}deg\n", .{ flipped, off[0], off[1], deg });
+    } else {
+        std.debug.print("contour-label quads: {d}\n", .{flipped});
+    }
 }

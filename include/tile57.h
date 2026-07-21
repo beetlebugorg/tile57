@@ -779,7 +779,18 @@ typedef enum {
  * WORLD anchor (camera-transformed, like tile57_gpu_vertex); (ox, oy) the
  * corner offset in reference px, already rotated; (u, v) the atlas UV. Six per
  * quad (two triangles), non-indexed. Anchor and offset stay split so the anchor
- * rides the chart while the artwork holds a fixed screen size under zoom. */
+ * rides the chart while the artwork holds a fixed screen size under zoom.
+ *
+ * map_align: non-zero => the host adds its view rotation to (ox, oy) (an ORIENT
+ * symbol, a linestyle brick, a depth-contour value). 0 => screen-upright.
+ *
+ * flip / tangent_q keep a rotated text run upright: a depth-contour value that
+ * follows its contour sets flip=1 and tangent_q to the run's own angle quantized
+ * over a full turn (angle = tangent_q / 256 * 2π). When flip is set, the host
+ * negates (ox, oy) — a 180° turn about the anchor — for exactly the vertices
+ * whose run, once the view rotation is added, would read into the screen's left
+ * half-plane (cos(angle + view_rotation) < 0), so the number never appears
+ * upside down. flip=0 leaves tangent_q unused. */
 typedef struct {
     float x, y;      /* world anchor, [0,1] */
     float ox, oy;    /* screen-space corner offset, reference px */
@@ -789,7 +800,8 @@ typedef struct {
     float scamin;    /* as tile57_gpu_vertex */
     uint8_t disp_cat;
     uint8_t map_align;
-    uint8_t _pad[2];
+    uint8_t flip;      /* 1 => flip the run 180° to stay upright (see above)   */
+    uint8_t tangent_q; /* run angle over a full turn, tangent_q/256*2π         */
 } tile57_gpu_quad;
 
 /* One area-fill pattern cell: RGBA8, w * h * 4 bytes, row-major. It is
