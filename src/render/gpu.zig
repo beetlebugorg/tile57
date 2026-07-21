@@ -768,9 +768,11 @@ pub const GpuSurface = struct {
     }
 
     /// Land-name classes whose regular-tier labels carry the halo (BUAARE places
-    /// are the bold tier, already haloed).
+    /// are the bold tier, already haloed). Water names (SEAARE/RIVERS/…) ride the
+    /// italic tier; water-adjacent regular labels (seabed, light descriptions)
+    /// stay solid by omission.
     fn isLandLabel(class: []const u8) bool {
-        inline for (.{ "LNDRGN", "LNDMRK", "LNDARE", "BUISGL" }) |c| {
+        inline for (.{ "LNDRGN", "LNDMRK", "LNDARE", "BUISGL", "AIRARE", "HRBFAC", "FSHFAC" }) |c| {
             if (std.mem.eql(u8, class, c)) return true;
         }
         return false;
