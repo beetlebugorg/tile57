@@ -783,12 +783,15 @@ pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // Parse native-aware (S-101 or S-57): the band scale + the archive's coverage
     // sidecar both come from the real cell, so a native S-101 chart bands by its
     // DataCoverage display scale (not the S-57-misparsed cscl=0 approach default).
+    // The dataset stem is the ownership tie-break name AND the pick-report's
+    // "source cell" badge — pass it into the tile bake below (bakeArchive borrows
+    // it for cell.name), or every feature's `cell` prop bakes empty.
+    const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
     var cscl: i32 = s57.peekScale(gpa, cf.base) orelse 0;
     if (parseAnyCell(cf.base, cf.updates)) |loaded| {
         var cell = loaded.cell;
         defer cell.deinit();
         cscl = cell.params.cscl;
-        const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
         const band: u8 = @intFromEnum(bake_enc.bandOf(cscl));
         const cc = scene.coverage.fromCell(cov_arena.allocator(), &cell, stem, band);
         coverage_json = scene.coverage.encodeJson(cov_arena.allocator(), cc) catch null;
@@ -799,7 +802,7 @@ pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // coarser zooms where nothing coarser covers — a harbor-only region still
     // shows land and coast at z4. No overscale above the window.
     const zr = bake_enc.bandZooms(bake_enc.bandOf(cscl));
-    const cell_in = [_]ChartInput{.{ .base = cf.base, .updates = cf.updates }};
+    const cell_in = [_]ChartInput{.{ .base = cf.base, .updates = cf.updates, .name = stem }};
     return bakeArchive(&cell_in, resolveRulesDir(rules_dir), 0, zr.max, .mlt, true, null, null, coverage_json);
 }
 
