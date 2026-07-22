@@ -151,10 +151,13 @@ pub const CSurface = extern struct {
     /// anchor-relative baseline-left origin in px (ox,oy, alignment already applied)
     /// + UTF-8 text (ptr,len) + the glyph pixel size + the run rotation (deg) + its
     /// alignment (.map => host adds the view rotation) + colour + halo + the S-52
-    /// text group (as on draw_text; 11 = important text). The host lays the string
-    /// out from its glyph metrics and draws SDF quads. Null => text tessellates
-    /// via draw_text instead. Must be the LAST field (ABI-appended).
-    draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, f32, CRotAlign, CColor, CColor, i32) callconv(.c) void = null,
+    /// text group (as on draw_text; 11 = important text) + the label-tier face
+    /// (0 regular, 1 bold, 2 italic — render.labeltier), so a host that keeps
+    /// per-face glyph atlases picks the right one; a host with only the regular
+    /// atlas ignores the trailing arg. The host lays the string out from its glyph
+    /// metrics and draws SDF quads. Null => text tessellates via draw_text instead.
+    /// Must be the LAST field (ABI-appended).
+    draw_text_str: ?*const fn (?*anyopaque, *const CFeature, CWorldPt, f32, f32, [*]const u8, usize, f32, f32, CRotAlign, CColor, CColor, i32, i32) callconv(.c) void = null,
 };
 
 /// One label held back from the stream until endScene. Text is the only thing
@@ -174,6 +177,9 @@ const Label = struct {
     rot_align: CRotAlign,
     /// The candidate's S-52 text group, carried through to the host callback.
     group: i32,
+    /// Label-tier face (render.labeltier).
+    weight: fontmod.Weight = .regular,
+    slant: fontmod.Slant = .upright,
 };
 
 /// A label BEFORE the view is known: everything about it the TILE decides, and
@@ -219,6 +225,10 @@ pub const Candidate = struct {
     /// label is dropped when `len × 256·2^zoom` falls below LEGIBLE_PX at the
     /// view zoom. 0 = no gate (an ordinary label always places).
     gate_world_len: f64 = 0,
+    /// Label-tier face (render.labeltier): picks the tessellated outline face and
+    /// is handed to the host SDF callback.
+    weight: fontmod.Weight = .regular,
+    slant: fontmod.Slant = .upright,
 };
 
 /// Below this many screen px a depth contour's visible piece is too short to
@@ -291,7 +301,11 @@ pub const VectorSurface = struct {
     cb: *const CSurface,
     store: ?sym.SymbolStore = null,
     fnt: ?fontmod.Font = null,
-    glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
+    fnt_bold: ?fontmod.Font = null,
+    fnt_italic: ?fontmod.Font = null,
+    // Keyed by (face_idx << 16 | gid): glyph ids are per-face, so the tessellated
+    // outline cache must distinguish the regular / bold / italic contour.
+    glyph_cache: std.AutoHashMapUnmanaged(u32, []const []const cv.Point) = .empty,
 
     /// Current tile (set before replaying each tile) for tile-space -> world.
     tz: u8 = 0,
@@ -361,6 +375,8 @@ pub const VectorSurface = struct {
             .settings = settings,
             .cb = cb,
             .fnt = fontmod.Font.init(fontmod.notosans) catch null,
+            .fnt_bold = fontmod.Font.init(fontmod.notosans_bold) catch null,
+            .fnt_italic = fontmod.Font.init(fontmod.notosans_italic) catch null,
         };
     }
 
@@ -708,7 +724,7 @@ pub const VectorSurface = struct {
         // Follow the contour (MAP), flipped as needed so it never reads upside
         // down — the flip depends on the view rotation, so it is deferred too.
         // A contour value is not one of the spec's IMPORTANT text groups (group 0).
-        try self.holdLabel(label, 10, "center", "middle", 0, 0, color, tangent, .map, true, gate_world_len, 0, mid);
+        try self.holdLabel(label, 10, "center", "middle", 0, 0, color, tangent, .map, true, gate_world_len, 0, .regular, .upright, mid);
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, placement: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -820,7 +836,7 @@ pub const VectorSurface = struct {
         // An ordinary label stays upright under a rotated view: no rotation, and
         // screen-referenced so the host does not turn it with the chart. It carries
         // no legibility gate — a point label places at every zoom.
-        try self.holdLabel(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), 0, .viewport, false, 0, style.group, at);
+        try self.holdLabel(text, font_css, halign, valign, @floatCast(style.offset_x), @floatCast(style.offset_y), self.resolveColor(style.color), 0, .viewport, false, 0, style.group, style.weight, style.slant, at);
     }
 
     /// Shape a label and HOLD it: which labels survive is a property of the WHOLE
@@ -834,9 +850,9 @@ pub const VectorSurface = struct {
     /// In CAPTURE mode the shaped candidate parks in the driver's list instead —
     /// the whole point of the split: shaping is a property of the tile, and only
     /// the resolution below it is a property of the view.
-    fn holdLabel(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_rad: f64, rot_align: CRotAlign, upright: bool, gate_world_len: f64, group: i64, at: rs.TilePoint) !void {
+    fn holdLabel(self: *VectorSurface, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_rad: f64, rot_align: CRotAlign, upright: bool, gate_world_len: f64, group: i64, weight: fontmod.Weight, slant: fontmod.Slant, at: rs.TilePoint) !void {
         const a = if (self.capture) |cap| cap.a else self.a;
-        const c = (try self.shapeCandidate(a, text, font_css, halign, valign, ox_mm, oy_mm, color, rot_rad, rot_align, upright, gate_world_len, group, at)) orelse return;
+        const c = (try self.shapeCandidate(a, text, font_css, halign, valign, ox_mm, oy_mm, color, rot_rad, rot_align, upright, gate_world_len, group, weight, slant, at)) orelse return;
         if (self.capture) |cap| {
             try cap.list.append(cap.a, c);
             return;
@@ -849,8 +865,9 @@ pub const VectorSurface = struct {
     /// there is nothing to place (no font, sub-pixel type, empty run). Every
     /// slice it keeps is duped into `a`, which for a captured candidate is the
     /// tile cache entry's arena, not the render arena.
-    fn shapeCandidate(self: *VectorSurface, a: Allocator, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_rad: f64, rot_align: CRotAlign, upright: bool, gate_world_len: f64, group: i64, at: rs.TilePoint) !?Candidate {
-        const f = &(self.fnt orelse return null);
+    fn shapeCandidate(self: *VectorSurface, a: Allocator, text: []const u8, font_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, rot_rad: f64, rot_align: CRotAlign, upright: bool, gate_world_len: f64, group: i64, weight: fontmod.Weight, slant: fontmod.Slant, at: rs.TilePoint) !?Candidate {
+        if (self.fnt == null) return null;
+        const f = self.pickFace(weight, slant).f;
         const px = font_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return null;
 
@@ -903,6 +920,8 @@ pub const VectorSurface = struct {
             .rot_align = rot_align,
             .upright = upright,
             .gate_world_len = gate_world_len,
+            .weight = weight,
+            .slant = slant,
         };
     }
 
@@ -945,6 +964,8 @@ pub const VectorSurface = struct {
             // Groups are small §14.5 codes; a nonsense one degrades to "no group"
             // rather than trapping on the cast.
             .group = std.math.cast(i32, c.group) orelse 0,
+            .weight = c.weight,
+            .slant = c.slant,
         });
     }
 
@@ -983,16 +1004,26 @@ pub const VectorSurface = struct {
     /// offers: its SDF glyph atlas, or tessellated glyph outlines.
     fn emitLabel(self: *VectorSurface, l: Label) !void {
         if (self.cb.draw_text_str) |dts| {
-            dts(self.cb.ctx, &l.feat, l.anchor, l.x0, l.baseline, l.text.ptr, l.text.len, l.px, @floatCast(l.rot_deg), l.rot_align, ccolor(l.color), 0, l.group);
+            const fc: i32 = if (l.weight == .bold) 1 else if (l.slant == .italic) 2 else 0;
+            dts(self.cb.ctx, &l.feat, l.anchor, l.x0, l.baseline, l.text.ptr, l.text.len, l.px, @floatCast(l.rot_deg), l.rot_align, ccolor(l.color), 0, l.group, fc);
             return;
         }
         try self.emitText(l);
     }
 
-    fn glyphOutline(self: *VectorSurface, gid: u16) ![]const []const cv.Point {
-        if (self.glyph_cache.get(gid)) |hit| return hit;
-        const out = try self.fnt.?.outline(self.a, gid);
-        try self.glyph_cache.put(self.a, gid, out);
+    /// The parsed face + its cache index for a label's weight/slant, falling back
+    /// to regular when the bold/italic face failed to load.
+    fn pickFace(self: *VectorSurface, weight: fontmod.Weight, slant: fontmod.Slant) struct { f: *const fontmod.Font, idx: u32 } {
+        if (weight == .bold) if (self.fnt_bold) |*b| return .{ .f = b, .idx = 1 };
+        if (slant == .italic) if (self.fnt_italic) |*i| return .{ .f = i, .idx = 2 };
+        return .{ .f = &self.fnt.?, .idx = 0 };
+    }
+
+    fn glyphOutline(self: *VectorSurface, face: *const fontmod.Font, idx: u32, gid: u16) ![]const []const cv.Point {
+        const key = (idx << 16) | gid;
+        if (self.glyph_cache.get(key)) |hit| return hit;
+        const out = try face.outline(self.a, gid);
+        try self.glyph_cache.put(self.a, key, out);
         return out;
     }
 
@@ -1000,7 +1031,9 @@ pub const VectorSurface = struct {
     /// outlines, walking from the baseline origin the layout already fixed and
     /// rotated about the anchor (the host adds the view rotation when .map).
     fn emitText(self: *VectorSurface, l: Label) !void {
-        const f = &(self.fnt orelse return);
+        if (self.fnt == null) return;
+        const face = self.pickFace(l.weight, l.slant);
+        const f = face.f;
         const rad: f32 = @floatCast(l.rot_deg * std.math.pi / 180.0);
         const cosr = @cos(rad);
         const sinr = @sin(rad);
@@ -1010,7 +1043,7 @@ pub const VectorSurface = struct {
         var it = (std.unicode.Utf8View.init(l.text) catch return).iterator();
         while (it.nextCodepoint()) |cp| {
             const gid = f.glyphIndex(cp);
-            for (try self.glyphOutline(gid)) |contour| {
+            for (try self.glyphOutline(face.f, face.idx, gid)) |contour| {
                 const pts = try self.a.alloc(cv.Point, contour.len);
                 for (contour, 0..) |p, i| {
                     // em units, y up -> local px, y down (anchor-relative), then
@@ -1048,7 +1081,7 @@ const RecordCb = struct {
     fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
     fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
     fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
-    fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, rot_deg: f32, rot_align: CRotAlign, _: CColor, _: CColor, group: i32) callconv(.c) void {
+    fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, rot_deg: f32, rot_align: CRotAlign, _: CColor, _: CColor, group: i32, _: i32) callconv(.c) void {
         const self: *RecordCb = @ptrCast(@alignCast(ctx.?));
         const dup = self.a.dupe(u8, text[0..len]) catch return;
         self.texts.append(self.a, .{ .text = dup, .rot_deg = rot_deg, .rot_align = rot_align, .group = group }) catch {};
@@ -1286,7 +1319,7 @@ test "VectorSurface: labels_only emits decluttered text but no area/line/symbol 
             s.symbols += 1;
         }
         fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
-        fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, _: f32, _: CRotAlign, _: CColor, _: CColor, _: i32) callconv(.c) void {
+        fn onTextStr(ctx: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: f32, _: f32, text: [*]const u8, len: usize, _: f32, _: f32, _: CRotAlign, _: CColor, _: CColor, _: i32, _: i32) callconv(.c) void {
             const s: *@This() = @ptrCast(@alignCast(ctx.?));
             const dup = s.a.dupe(u8, text[0..len]) catch return;
             s.texts.append(s.a, dup) catch {};
@@ -1375,7 +1408,7 @@ const LabelRec = struct {
     fn noStroke(_: ?*anyopaque, _: *const CFeature, _: *const CWorldRings, _: f32, _: f32, _: f32, _: CColor) callconv(.c) void {}
     fn noSymbol(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: c_int, _: f32, _: CRotAlign) callconv(.c) void {}
     fn noText(_: ?*anyopaque, _: *const CFeature, _: CWorldPt, _: *const CLocalRings, _: CColor, _: CColor, _: f32, _: CRotAlign, _: i32) callconv(.c) void {}
-    fn onTextStr(ctx: ?*anyopaque, f: *const CFeature, anchor: CWorldPt, ox: f32, oy: f32, text: [*]const u8, len: usize, px: f32, rot_deg: f32, rot_align: CRotAlign, color: CColor, _: CColor, _: i32) callconv(.c) void {
+    fn onTextStr(ctx: ?*anyopaque, f: *const CFeature, anchor: CWorldPt, ox: f32, oy: f32, text: [*]const u8, len: usize, px: f32, rot_deg: f32, rot_align: CRotAlign, color: CColor, _: CColor, _: i32, _: i32) callconv(.c) void {
         const self: *LabelRec = @ptrCast(@alignCast(ctx.?));
         self.out.append(self.a, .{
             .color = color,

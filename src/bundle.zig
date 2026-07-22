@@ -222,17 +222,19 @@ fn readFills(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8) ![]sprit
 
 // Build the MapLibre sprite (sprite-mln) directly from the catalogue's Symbols +
 // AreaFills + palette CSS. Mirrors the old scripts/build_sprite.py, in Zig.
-pub fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, soundings: []const []const u8) !sprite.Atlas {
+pub fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, soundings: []const []const u8, ratio: f64) !sprite.Atlas {
     const symbols = try readSymbols(io, a, catalog_dir);
     const fills = try readFills(io, a, catalog_dir);
     const css = try readCss(io, a, catalog_dir, css_name);
-    return sprite.spriteMln(a, symbols, fills, css, soundings);
+    return sprite.spriteMln(a, symbols, fills, css, soundings, ratio);
 }
 
 // Emit sprite-mln.{json,png} + identical @2x copies (MapLibre requests @2x on
 // HiDPI; a missing @2x sheet fails the whole sprite load).
 pub fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, out_dir: []const u8, base: []const u8, soundings: []const []const u8) !sprite.Atlas {
-    const atlas = try spriteMlnBytes(io, a, catalog_dir, css_name, soundings);
+    // The MapLibre style pipeline bakes the base (1x) sheet; @2x is a separate
+    // (currently identical) copy the loader requires.
+    const atlas = try spriteMlnBytes(io, a, catalog_dir, css_name, soundings, 1.0);
     for ([_][]const u8{ "", "@2x" }) |suffix| {
         const jn = try std.fmt.allocPrint(a, "{s}{s}.json", .{ base, suffix });
         const pn = try std.fmt.allocPrint(a, "{s}{s}.png", .{ base, suffix });

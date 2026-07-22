@@ -17,14 +17,18 @@ the same change (see the polylabel entry as the worked example).
 | nanosvg | 2013–14 (Mikko Mononen) | `vendor/nanosvg/` | zlib |
 | stb_image_write | v1.16 (Sean Barrett) | `vendor/stb/` | public domain (MIT alternative) |
 | Noto Sans Regular | 2026.05.01 (Google) | `vendor/fonts/NotoSans-Regular.ttf` | SIL Open Font License 1.1 |
+| Noto Sans Bold | 2.000 (Google) | `vendor/fonts/NotoSans-Bold.ttf` | SIL Open Font License 1.1 |
+| Noto Sans Italic | 2.000 (Google) | `vendor/fonts/NotoSans-Italic.ttf` | SIL Open Font License 1.1 |
 
 - **Lua** is built from source and driven through `src/portray/lua_shim.c` to run
   the S-101 portrayal rules engine.
 - **nanosvg** rasterizes the S-101 SVG symbols into the sprite atlas; it embeds
   Anti-Grain Geometry rasterizer math by Maxim Shemanarev (also permissive).
-- **Noto Sans Regular** is `@embedFile`'d into the binary as the render
-  engine's single label face (glyph outlines parsed by `src/render/font.zig`,
-  a from-scratch TrueType outline reader — no font library is vendored).
+- **Noto Sans** (Regular, Bold, Italic) is `@embedFile`'d into the binary as the
+  render engine's label faces — the label-tier resolver (`src/render/labeltier.zig`)
+  picks bold for populated-place names and italic for hydrography. Glyph outlines
+  are parsed by `src/render/font.zig`, a from-scratch TrueType outline reader — no
+  font library is vendored.
 - **stb_image_write** writes the PNG sprite atlases.
 
 `vendor/lua/LICENSE.html` carries Lua's full notice; the nanosvg and stb licenses

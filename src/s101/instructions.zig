@@ -10,6 +10,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// S-52 CHARS text weight/slant, mirrored (render/font.zig owns the face-picking
+/// twins). s101 is below render in the module DAG, so it carries its own copy;
+/// scene maps these onto render's `font.Weight`/`font.Slant` when building the
+/// TextStyle. "Light" collapses to regular — no label sits below the readable floor.
+pub const Weight = enum { regular, bold };
+pub const Slant = enum { upright, italic };
+
 pub const Line = struct { style: []const u8, width: f64, color: []const u8 };
 pub const Point = struct { symbol: []const u8, rotation: f64, offset_x: f64, offset_y: f64, rot_north: bool = false };
 pub const Text = struct {
@@ -22,6 +29,12 @@ pub const Text = struct {
     // halign "left"|"center"|"right" (default "left"), valign "top"|"middle"|"bottom"
     // (default "bottom") — matching the oracle's hAlign/vAlign + halignName/valignName.
     font_size: f64 = 0,
+    // S-101 FontWeight / FontSlant (OpText). The catalogue emits these on only a
+    // handful of non-name labels (dredged-area depth in italics, magnetic-variation
+    // in light); the geographic-name hierarchy comes from the tier resolver in
+    // scene, which overrides these for name classes. Default regular/upright.
+    weight: Weight = .regular,
+    slant: Slant = .upright,
     halign: []const u8 = "left",
     valign: []const u8 = "bottom",
     // S-101 LocalOffset (mm, +x right / +y down): shifts the label off the feature's
@@ -193,6 +206,8 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
     var cur_oy: f64 = 0;
     var cur_font: []const u8 = "CHBLK";
     var cur_font_size: f64 = 0; // FontSize px (0 => emit default 12)
+    var cur_weight: Weight = .regular;
+    var cur_slant: Slant = .upright;
     var cur_align_h: []const u8 = ""; // TextAlignHorizontal (raw; mapped at TextInstruction)
     var cur_align_v: []const u8 = ""; // TextAlignVertical (raw; mapped at TextInstruction)
     var cur_tgrp: i64 = 0; // text group (S-52 §14.5) of the most recent ViewingGroup
@@ -323,6 +338,13 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             cur_font = val;
         } else if (std.mem.eql(u8, key, "FontSize")) {
             cur_font_size = toFloat(val);
+        } else if (std.mem.eql(u8, key, "FontWeight")) {
+            // CHARS weight: Bold emboldens; Medium/Light both hold at regular so no
+            // label drops below the S-52 readable-from-1m floor.
+            cur_weight = if (std.mem.eql(u8, std.mem.trim(u8, val, " "), "Bold")) .bold else .regular;
+        } else if (std.mem.eql(u8, key, "FontSlant")) {
+            // CHARS slant: "Italics" -> italic (hydrography), else upright.
+            cur_slant = if (std.mem.eql(u8, std.mem.trim(u8, val, " "), "Italics")) .italic else .upright;
         } else if (std.mem.eql(u8, key, "TextAlignHorizontal")) {
             cur_align_h = val;
         } else if (std.mem.eql(u8, key, "TextAlignVertical")) {
@@ -333,7 +355,7 @@ pub fn parse(a: Allocator, stream: []const u8) !Portrayal {
             // `if cmd.Reference == "" return nil`) — skip it here, equivalently.
             const txt = try decodeDEF(a, val);
             if (txt.len == 0) continue;
-            try texts.append(a, .{ .text = txt, .color = cur_font, .group = cur_tgrp, .font_size = cur_font_size, .halign = mapHAlign(cur_align_h), .valign = mapVAlign(cur_align_v), .offset_x = cur_ox, .offset_y = cur_oy });
+            try texts.append(a, .{ .text = txt, .color = cur_font, .group = cur_tgrp, .font_size = cur_font_size, .weight = cur_weight, .slant = cur_slant, .halign = mapHAlign(cur_align_h), .valign = mapVAlign(cur_align_v), .offset_x = cur_ox, .offset_y = cur_oy });
         } else if (std.mem.eql(u8, key, "DrawingPriority")) {
             // S-52 display priority. A feature draws across several viewing groups,
             // each with its own DrawingPriority; the feature's priority is the MAX

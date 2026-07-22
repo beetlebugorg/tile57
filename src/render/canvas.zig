@@ -56,6 +56,11 @@ pub const GlyphRun = struct {
     halo_w: f32,
     /// The source UTF-8 string (ToUnicode mapping).
     text: []const u8,
+    /// Label-tier face: 0 regular, 1 bold, 2 italic (render.labeltier). The PDF
+    /// canvas embeds only the regular face, so a non-zero face renders as filled
+    /// outlines (the `rings`, already shaped from the right face) rather than a
+    /// text object against a mismatched font.
+    face_idx: u32 = 0,
 };
 
 pub const Canvas = struct {

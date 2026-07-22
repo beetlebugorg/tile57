@@ -693,8 +693,12 @@ typedef struct {
      * view_rotation : 0)` (a depth-contour value passes the tangent + MAP; an
      * ordinary label passes 0 + VIEWPORT and stays upright). `text_group` is the
      * label's S-52 text group, exactly as on draw_text (11 = important text).
+     * `face` is the label-tier face — 0 regular, 1 bold, 2 italic — so a host
+     * that keeps a glyph atlas per face (tile57_bake_glyph_sdf_face for the bold
+     * and italic faces) selects the right one; a host with only the regular atlas
+     * ignores it.
      * NULL => text tessellates via draw_text. Must be the LAST field. */
-    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo, int32_t text_group);
+    void (*draw_text_str)(void *ctx, const tile57_feature *f, tile57_world_point anchor, float ox_px, float oy_px, const char *text, size_t text_len, float size_px, float rot_deg, tile57_rot_align align, tile57_color color, tile57_color halo, int32_t text_group, int32_t face);
 } tile57_surface_cb;
 
 tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, double zoom,
@@ -766,14 +770,27 @@ typedef enum {
 typedef enum {
     TILE57_GPU_ATLAS_NONE   = 0,
     TILE57_GPU_ATLAS_SPRITE = 1, /* the S-101 symbol atlas (tile57_bake_sprite_mln) */
-    TILE57_GPU_ATLAS_GLYPH  = 2  /* the SDF label-glyph atlas (tile57_bake_glyph_sdf) */
+    TILE57_GPU_ATLAS_GLYPH  = 2, /* SDF label-glyph atlas, regular (tile57_bake_glyph_sdf) */
+    TILE57_GPU_ATLAS_GLYPH_BOLD   = 3, /* SDF glyph atlas, bold (tile57_bake_glyph_sdf_face 1) */
+    TILE57_GPU_ATLAS_GLYPH_ITALIC = 4  /* SDF glyph atlas, italic (tile57_bake_glyph_sdf_face 2) */
 } tile57_gpu_atlas;
 
 /* One textured-quad vertex — a symbol sprite or an SDF glyph. (x, y) is the
  * WORLD anchor (camera-transformed, like tile57_gpu_vertex); (ox, oy) the
  * corner offset in reference px, already rotated; (u, v) the atlas UV. Six per
  * quad (two triangles), non-indexed. Anchor and offset stay split so the anchor
- * rides the chart while the artwork holds a fixed screen size under zoom. */
+ * rides the chart while the artwork holds a fixed screen size under zoom.
+ *
+ * map_align: non-zero => the host adds its view rotation to (ox, oy) (an ORIENT
+ * symbol, a linestyle brick, a depth-contour value). 0 => screen-upright.
+ *
+ * flip / tangent_q keep a rotated text run upright: a depth-contour value that
+ * follows its contour sets flip=1 and tangent_q to the run's own angle quantized
+ * over a full turn (angle = tangent_q / 256 * 2π). When flip is set, the host
+ * negates (ox, oy) — a 180° turn about the anchor — for exactly the vertices
+ * whose run, once the view rotation is added, would read into the screen's left
+ * half-plane (cos(angle + view_rotation) < 0), so the number never appears
+ * upside down. flip=0 leaves tangent_q unused. */
 typedef struct {
     float x, y;      /* world anchor, [0,1] */
     float ox, oy;    /* screen-space corner offset, reference px */
@@ -783,7 +800,8 @@ typedef struct {
     float scamin;    /* as tile57_gpu_vertex */
     uint8_t disp_cat;
     uint8_t map_align;
-    uint8_t _pad[2];
+    uint8_t flip;      /* 1 => flip the run 180° to stay upright (see above)   */
+    uint8_t tangent_q; /* run angle over a full turn, tangent_q/256*2π         */
 } tile57_gpu_quad;
 
 /* One area-fill pattern cell: RGBA8, w * h * 4 bytes, row-major. It is
@@ -861,19 +879,26 @@ typedef struct {
  * continuously never has to have its scene rebuilt. The per-vertex map_align
  * flag is what keeps that invariant for marks that must turn with the chart.
  *
+ * pixel_ratio is the host's display density (1 standard, 2 Retina/HiDPI, ...).
+ * The sprite quads' texture UVs are for a sprite atlas baked at this ratio, so
+ * pass the SAME pixel_ratio to tile57_bake_sprite_mln for the texture you upload
+ * — otherwise the UVs will not index it. It does NOT change any on-screen size
+ * (a sprite quad is sized from its reference-px offsets); it only selects how
+ * dense the atlas texels are, so symbols stay sharp on a HiDPI display. 0 => 1.
+ *
  * On OK the caller owns the scene and MUST release it with
  * tile57_gpu_scene_free. On failure *out is zeroed and nothing needs freeing. */
 tile57_status tile57_chart_gpu_scene(tile57_chart *chart, double lon, double lat, double zoom,
                              uint32_t width, uint32_t height,
-                             const tile57_mariner *m,
+                             const tile57_mariner *m, double pixel_ratio,
                              tile57_gpu_scene *out, tile57_error *err);
 
 /* The composed twin of tile57_chart_gpu_scene: a whole chart LIBRARY (opened via
  * tile57_compose_open) portrayed into one draw-ready scene, seams stitched across
- * cells. Same buffers and the same tile57_gpu_scene_free. */
+ * cells. Same buffers and the same tile57_gpu_scene_free. pixel_ratio as above. */
 tile57_status tile57_compose_gpu_scene(tile57_compose *compose, double lon, double lat, double zoom,
                              uint32_t width, uint32_t height,
-                             const tile57_mariner *m,
+                             const tile57_mariner *m, double pixel_ratio,
                              tile57_gpu_scene *out, tile57_error *err);
 
 
@@ -1068,6 +1093,13 @@ tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, do
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_get_meta(tile57_compose *c, tile57_compose_meta *out);
 
+/* The deepest zoom the chart covering (lon,lat) can serve (its native window +
+ * overscale fill-up). A host caps its per-view zoom-in here so it never magnifies
+ * past that chart into nodata — unlike compose_meta.max_zoom, which is the
+ * library-wide max a distant deep chart inflates. Returns that library max where
+ * the point covers no cell. */
+uint8_t tile57_compose_max_zoom_at(tile57_compose *c, double lon, double lat);
+
 
 /* Release a compositor. Its charts stay open (and stay yours to close). */
 void tile57_compose_close(tile57_compose *c);
@@ -1098,15 +1130,28 @@ tile57_status tile57_bake_assets(const char *catalog_dir, tile57_assets *out,
                                  tile57_error *err);
 /* Like tile57_bake_assets but sprite_json/sprite_png carry the MapLibre sprite-mln
  * atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON); other
- * fields are NULL. Free with tile57_assets_free. */
-tile57_status tile57_bake_sprite_mln(const char *catalog_dir, tile57_assets *out,
-                                     tile57_error *err);
+ * fields are NULL. Free with tile57_assets_free.
+ *
+ * pixel_ratio is the host's display density (1 standard, 2 Retina/HiDPI, ...):
+ * symbol cells rasterize at that many device px per reference px, so the texture
+ * stays sharp when the display draws it enlarged. On-screen SIZE is unchanged
+ * (a GPU-scene quad is sized from the symbol's reference-px half-extent, not the
+ * texture). A GPU-scene host MUST pass the same pixel_ratio to the
+ * tile57_*_gpu_scene calls, or the scene's UVs will not index this texture.
+ * 0 is treated as 1. */
+tile57_status tile57_bake_sprite_mln(const char *catalog_dir, double pixel_ratio,
+                                     tile57_assets *out, tile57_error *err);
 /* SDF glyph atlas for GPU text: sprite_png is the RGBA signed-distance-field atlas
  * of the label font; sprite_json is {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,
  * v1,off_x,off_y,w,h,advance]}} with the quad geometry in EM units (multiply by the
  * text pixel size). A host draws each glyph as a textured quad sampling the SDF.
  * Only sprite_* filled. Free with tile57_assets_free. */
 tile57_status tile57_bake_glyph_sdf(tile57_assets *out, tile57_error *err);
+/* tile57_bake_glyph_sdf for one label-tier face: 0 regular, 1 bold, 2 italic (the
+ * draw_text_str `face` argument). A host baking a per-face atlas set gets bold
+ * place names and italic hydrography from the SDF text path. Free with
+ * tile57_assets_free. */
+tile57_status tile57_bake_glyph_sdf_face(tile57_assets *out, int32_t face, tile57_error *err);
 void tile57_assets_free(tile57_assets *out);
 
 /* ---- chart-style generation ---------------------------------------------

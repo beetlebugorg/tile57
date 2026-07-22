@@ -85,7 +85,15 @@ pub const Quad = extern struct {
     disp_cat: u8 = 1,
     /// Non-zero when the mark is chart-relative (a rotated view turns it).
     map_align: u8 = 0,
-    _pad: [2]u8 = .{ 0, 0 },
+    /// Non-zero when this quad rides a run that must stay upright: the host
+    /// shader flips it 180° about the anchor when the run, once the view rotation
+    /// is added, would read into the left half-plane (a depth-contour value that
+    /// follows a right-to-left contour). 0 for every other quad.
+    flip: u8 = 0,
+    /// The run's own angle quantized to a full turn over 0..255 (`tangent_q /
+    /// 256 * 2π`), so the flip shader recovers cos/sin(tangent) with no rebuild.
+    /// Meaningful only when `flip` is set; 0 otherwise.
+    tangent_q: u8 = 0,
 };
 
 /// `Range.pattern` when the range is not an area-fill pattern — which is every
@@ -98,6 +106,12 @@ pub const NO_PATTERN: u32 = std.math.maxInt(u32);
 pub const SpriteAtlas = struct {
     width: u32,
     height: u32,
+    /// Atlas px per mm the cells were rasterized at (px_per_mm × display ratio).
+    /// A sprite quad is sized from its CELL — cell px × (draw scale / ppm) — not
+    /// re-derived from the vector outline, so the on-screen artwork is exactly the
+    /// rasterized cell (stroke and all), and every glyph of a multi-part mark (a
+    /// sounding's digits) sits on the pivot the cell was centred on.
+    ppm: f32 = 8,
     /// name -> cell rect in atlas px. Keys are owned by whoever built the map.
     cells: std.StringHashMapUnmanaged(Cell) = .empty,
 
@@ -166,7 +180,9 @@ pub const Prim = enum(u8) {
 pub const AtlasId = enum(u8) {
     none = 0,
     sprite = 1, // the S-101 symbol atlas
-    glyph = 2, // the SDF label-glyph atlas
+    glyph = 2, // the SDF label-glyph atlas (regular face)
+    glyph_bold = 3, // the bold SDF label-glyph atlas (place-name tier)
+    glyph_italic = 4, // the italic SDF label-glyph atlas (hydrography tier)
 };
 
 /// A shaped-but-not-yet-decluttered label. VIEW-INDEPENDENT: its renderable
@@ -192,7 +208,23 @@ pub const LabelCandidate = struct {
     paint_key: u32,
     cls: []const u8, // for the repeat rule
     text: []const u8,
+    atlas: AtlasId = .glyph, // which glyph atlas the SDF quads sample (regular/bold/italic)
+    /// A depth-contour value's carrier length in WORLD units: the label is
+    /// dropped when `len × 256·2^zoom` falls below LEGIBLE_PX at the view zoom
+    /// (assembleLabels), so a memoized contour re-gates itself as the mariner
+    /// zooms. 0 for an ordinary label (which always places).
+    gate_world_len: f32 = 0,
 };
+
+/// A contour value shorter than this on screen (px) is illegible, so it is
+/// dropped before the pool ranks it — the same gate the vector path applies.
+const LEGIBLE_PX: f64 = 10;
+
+/// Rotate a corner offset about the anchor-local origin: `(cs, sn)` are
+/// cos/sin of the run angle. cs=1, sn=0 is the identity (an unrotated run).
+fn rot2(x: f32, y: f32, cs: f32, sn: f32) [2]f32 {
+    return .{ x * cs - y * sn, x * sn + y * cs };
+}
 
 /// A contiguous slice of one buffer that draws with one pipeline. Ranges come
 /// out sorted by `paint_key`; draw them in order and the chart is correct.
@@ -272,6 +304,10 @@ const Op = struct {
     scamin: f32,
     disp_cat: u8,
     map_align: u8,
+    /// Carried onto every quad this op emits: a flippable tangent run (a contour
+    /// value) sets both; everything else leaves them 0. See Quad.flip/tangent_q.
+    flip: u8 = 0,
+    tangent_q: u8 = 0,
     pattern: u32 = NO_PATTERN,
     // The tile->world transform AT THE TIME THIS OP WAS BUFFERED. Geometry is
     // kept tile-local and converted in `build`, but a whole-view scene walks many
@@ -323,6 +359,11 @@ pub const GpuSurface = struct {
     /// visible. `glyphs` is required for SDF text (no atlas -> no labels).
     sprites: ?*const SpriteAtlas = null,
     glyphs: ?*const GlyphAtlas = null,
+    /// Per-face SDF atlases for the tier (host-uploaded, tile57_bake_glyph_sdf_face):
+    /// bold place names and italic hydrography sample their own atlas for true
+    /// bold/italic shapes. Null falls back to the regular `glyphs` atlas.
+    glyphs_bold: ?*const GlyphAtlas = null,
+    glyphs_italic: ?*const GlyphAtlas = null,
     quads: std.ArrayList(Quad) = .empty,
     tessellator: tess.Tessellator,
     /// Pattern cells in first-use order, and the name->index map that dedupes
@@ -330,13 +371,16 @@ pub const GpuSurface = struct {
     patterns: std.ArrayList(PatternCell) = .empty,
     pattern_ix: std.StringHashMapUnmanaged(u32) = .empty,
     fnt: ?fontmod.Font = null,
+    fnt_bold: ?fontmod.Font = null,
+    fnt_italic: ?fontmod.Font = null,
     /// Labels are NOT decluttered here — `build` emits geometry only. Each label
     /// is shaped into a view-INDEPENDENT candidate (its glyph quads in absolute
     /// world + a local-px box); the whole view's candidates are cached per tile
     /// and decluttered together per frame (see `assembleLabels`), so a name never
     /// repeats across a seam and shaping never re-runs on a pan.
     candidates: std.ArrayList(LabelCandidate) = .empty,
-    glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
+    // Keyed by (face_idx << 16 | gid): glyph ids are per-face (outline fallback).
+    glyph_cache: std.AutoHashMapUnmanaged(u32, []const []const cv.Point) = .empty,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -361,6 +405,8 @@ pub const GpuSurface = struct {
             .zoom = zoom,
             .tessellator = try tess.Tessellator.init(a),
             .fnt = fontmod.Font.init(fontmod.notosans) catch null,
+            .fnt_bold = fontmod.Font.init(fontmod.notosans_bold) catch null,
+            .fnt_italic = fontmod.Font.init(fontmod.notosans_italic) catch null,
         };
     }
 
@@ -521,7 +567,7 @@ pub const GpuSurface = struct {
         return gop.value_ptr.*;
     }
 
-    fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, _: ?f64) anyerror!void {
+    fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
         try self.push(.line, self.rgba(token), .{ .stroke = .{
@@ -529,6 +575,156 @@ pub const GpuSurface = struct {
             .half_w = @floatCast(@max(width_px, 0.5) * 0.5),
             .dash = dash,
         } });
+        // A depth-contour value rides the line as a MAP-aligned, tangent-rotated
+        // label candidate — the same placement the vector path emits.
+        if (valdco) |v| try self.emitContourLabel(v, lines);
+    }
+
+    /// A depth-contour value, placed at the midpoint of the longest visible
+    /// segment and turned to that segment's tangent so it follows the contour:
+    /// MAP-aligned (the host shader adds the view rotation) and flippable (the
+    /// shader turns it 180° so the number never reads upside down). Mirrors
+    /// vector.emitContourLabel; the raster path draws the same value horizontal.
+    fn emitContourLabel(self: *GpuSurface, v: f64, lines: []const []const rs.TilePoint) !void {
+        const f = if (self.fnt) |*font| font else return;
+        var best2: f64 = 0;
+        var mid: rs.TilePoint = .{ .x = 0, .y = 0 };
+        var tangent: f64 = 0;
+        for (lines) |line| {
+            for (0..line.len -| 1) |i| {
+                const dx: f64 = @floatFromInt(line[i + 1].x - line[i].x);
+                const dy: f64 = @floatFromInt(line[i + 1].y - line[i].y);
+                const len2 = dx * dx + dy * dy;
+                if (len2 > best2) {
+                    best2 = len2;
+                    mid = .{ .x = @divTrunc(line[i].x + line[i + 1].x, 2), .y = @divTrunc(line[i].y + line[i + 1].y, 2) };
+                    tangent = std.math.atan2(dy, dx);
+                }
+            }
+        }
+        if (best2 == 0) return;
+        // The visible piece's length in WORLD units — assembleLabels gates it
+        // against the view zoom, so a memoized label re-gates itself on a zoom.
+        const gate_world_len: f32 = @floatCast(@sqrt(best2) * self.tile_scale);
+
+        var buf: [24]u8 = undefined;
+        const label_src = if (self.settings.depth_unit == .feet)
+            std.fmt.bufPrint(&buf, "{d}", .{@floor(v * sndfrm.M_TO_FT)}) catch return
+        else
+            std.fmt.bufPrint(&buf, "{d}", .{@round(v)}) catch return;
+        const label = try self.a.dupe(u8, label_src);
+
+        // CHGRD by day, a bright neutral at dusk/night (mariner.contourLabelColor).
+        const color: [4]u8 = switch (self.palette) {
+            .day => self.rgba("CHGRD"),
+            .dusk => .{ 0xdd, 0xe7, 0xec, 0xff },
+            .night => .{ 0xaa, 0xb7, 0xbf, 0xff },
+        };
+
+        // Shape at the contour size (10 CSS px), centred and vertically middled —
+        // the same metrics the vector/pixel paths use, so the box agrees.
+        const px: f32 = @floatCast(10.0 * self.textDev());
+        if (px <= 1) return;
+        var pen: f32 = 0;
+        var gids = std.ArrayList(ShapedGlyph).empty;
+        defer gids.deinit(self.a);
+        var it = (std.unicode.Utf8View.init(label) catch return).iterator();
+        while (it.nextCodepoint()) |cp| {
+            const gid = f.glyphIndex(cp);
+            try gids.append(self.a, .{ .gid = gid, .cp = cp, .x = pen });
+            pen += f.advance(gid) * px;
+        }
+        if (pen <= 0) return;
+        const x0: f32 = -pen / 2; // halign center
+        const baseline: f32 = (f.ascent - f.descent) / 2 * px; // valign middle
+
+        // Bake the tangent into the glyph geometry; the SDF path also flags the
+        // quads flippable so the shader keeps the value upright per frame.
+        const rot: f32 = @floatCast(tangent);
+        const face = FaceRef{ .f = f, .idx = 0 };
+        const geom = if (self.glyphs) |atlas|
+            (try self.sdfRun(atlas, .glyph, 0, gids.items, x0, baseline, px, mid, rot)) orelse
+                (try self.outlineRun(face, gids.items, x0, baseline, px, mid, rot)) orelse return
+        else
+            (try self.outlineRun(face, gids.items, x0, baseline, px, mid, rot)) orelse return;
+
+        // Quantize the tangent to a full turn for the flip shader (a coarse angle
+        // is enough — the flip is a binary decision near the ±90° boundary).
+        const turns = @mod(tangent / (2.0 * std.math.pi), 1.0);
+        const tq: u8 = @intFromFloat(@min(255.0, @floor(turns * 256.0)));
+        const op = Op{
+            .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+            .seq = 0,
+            .kind = .text,
+            .color = color,
+            .scamin = if (self.cur.scamin) |s| @floatFromInt(s) else 0,
+            .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
+            .map_align = 1,
+            .flip = 1,
+            .tangent_q = tq,
+            .tox = self.tile_ox,
+            .toy = self.tile_oy,
+            .tscale = self.tile_scale,
+            .geom = geom,
+        };
+        var cq = std.ArrayList(Quad).empty;
+        var cv_ = std.ArrayList(Vertex).empty;
+        var ci = std.ArrayList(u32).empty;
+        var atlas_id: AtlasId = .glyph;
+        switch (geom) {
+            .sprite => |sq| {
+                atlas_id = sq.atlas;
+                try self.emitSpriteGeom(self.a, &cq, op, sq.anchor, sq.quads, sq.weight);
+            },
+            .mark => |m| try self.emitMarkGeom(self.a, &cv_, &ci, op, m.anchor, m.rings, m.rule),
+            else => unreachable,
+        }
+
+        // Collision box: the AABB of the tangent-rotated run rect. The view
+        // rotation is unknown at scene-build time (the scene is rotation-free), so
+        // the box does not track it — an accepted approximation for sparse contour
+        // values, and it keeps assembleLabels off the rotation.
+        const cs: f32 = @cos(rot);
+        const sn: f32 = @sin(rot);
+        const rect = [_][2]f32{
+            .{ x0, baseline - f.ascent * px },
+            .{ x0 + pen, baseline - f.ascent * px },
+            .{ x0 + pen, baseline + f.descent * px },
+            .{ x0, baseline + f.descent * px },
+        };
+        var bx0: f32 = std.math.floatMax(f32);
+        var by0: f32 = std.math.floatMax(f32);
+        var bx1: f32 = -std.math.floatMax(f32);
+        var by1: f32 = -std.math.floatMax(f32);
+        for (rect) |c| {
+            const r = rot2(c[0], c[1], cs, sn);
+            bx0 = @min(bx0, r[0]);
+            by0 = @min(by0, r[1]);
+            bx1 = @max(bx1, r[0]);
+            by1 = @max(by1, r[1]);
+        }
+
+        const aw = opWorld(op, mid);
+        try self.candidates.append(self.a, .{
+            .quads = try cq.toOwnedSlice(self.a),
+            .verts = try cv_.toOwnedSlice(self.a),
+            .indices = try ci.toOwnedSlice(self.a),
+            .ax = aw[0],
+            .ay = aw[1],
+            .bx0 = bx0,
+            .by0 = by0,
+            .bx1 = bx1,
+            .by1 = by1,
+            .scamin = op.scamin,
+            .disp_cat = op.disp_cat,
+            .color = op.color,
+            .group = 0, // a contour value is not one of the spec's named text groups
+            .paint_key = op.paint_key,
+            .cls = self.cur.class,
+            .text = label,
+            .atlas = atlas_id,
+            .gate_world_len = gate_world_len,
+        });
     }
 
     fn drawSymbol(ctx: *anyopaque, name: rs.SymbolName, at: rs.TilePoint, rot_deg: f64, scale: f64, rot_north: bool, _: rs.SymbolPlacement, danger_depth: ?f64) anyerror!void {
@@ -569,15 +765,23 @@ pub const GpuSurface = struct {
     }
 
     /// A symbol/sounding glyph as an atlas SPRITE quad — antialiased artwork, not
-    /// a flat-shaded outline. The cell's UV comes from the atlas the host loads;
-    /// the on-screen half-extent from the symbol geometry (`sym.halfExtent`), so
-    /// a sprite and the vector path size it identically. A symbol the atlas is
-    /// missing falls back to the outline triangles, keeping the mark visible.
+    /// a flat-shaded outline. Both the UV and the on-screen half-extent come from
+    /// the CELL the host loaded: sizing from the vector outline instead
+    /// (`sym.halfExtent`) drops the rasterized stroke width and, worse, differs
+    /// per glyph, so a sounding's digits mis-size and drift off their shared
+    /// pivot. A symbol the atlas is missing falls back to the outline triangles
+    /// (sized from the outline, since there is no cell), keeping the mark visible.
     fn emitSprite(self: *GpuSurface, kind: Kind, name: []const u8, s: *const sym.Symbol, at: rs.TilePoint, rot_deg: f64, scale: f64, dev: f64, rot_north: bool) !void {
         const atlas = self.sprites orelse return self.emitMark(kind, s, at, rot_deg, scale, dev, rot_north);
         const cell = atlas.get(name) orelse return self.emitMark(kind, s, at, rot_deg, scale, dev, rot_north);
-        const he = sym.halfExtent(s, scale * 100.0 * dev);
-        if (he[0] <= 0 or he[1] <= 0) return;
+        if (cell.w <= 0 or cell.h <= 0 or atlas.ppm <= 0) return;
+        // Size the quad from the CELL, not the vector outline: `c` is on-screen
+        // reference px per atlas px, so cell px × c reproduces the rasterized
+        // artwork at the same physical size the vector path draws (stroke width
+        // included). The cell is pivot-centred, so ±(w,h)/2 about the anchor lands
+        // the pivot on the anchor — every digit of a sounding aligns on it.
+        const c: f32 = @floatCast(scale * 100.0 * dev / atlas.ppm);
+        const he = [2]f32{ cell.w * 0.5 * c, cell.h * 0.5 * c };
         const rad = rot_deg * std.math.pi / 180.0;
         const cs: f32 = @floatCast(@cos(rad));
         const sn: f32 = @floatCast(@sin(rad));
@@ -609,7 +813,18 @@ pub const GpuSurface = struct {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
-        const f = &(self.fnt orelse return);
+        if (self.fnt == null) return;
+        // Pick the per-face SDF atlas + its matching face: bold place names sample
+        // the bold atlas, italic hydrography the italic atlas (true bold/italic
+        // shapes, not a synthesized embolden/shear). The face used for shaping MUST
+        // match the atlas used for UVs, so they travel together. A host without the
+        // per-face atlas falls back to the regular atlas (still real text).
+        const sel = self.selectFace(style.weight, style.slant);
+        const has_atlas = sel.atlas != null;
+        // Atlas path: the face that matches the chosen atlas (UVs + advances agree).
+        // No-atlas outline fallback: the real bold/italic face directly.
+        const face = if (has_atlas) sel.face else self.pickFace(style.weight, style.slant);
+        const f = face.f;
         const px: f32 = @floatCast((if (style.font_size > 0) style.font_size else 12) * self.textDev());
         if (px <= 1) return;
 
@@ -646,12 +861,19 @@ pub const GpuSurface = struct {
             baseline -= f.descent * px;
         }
 
-        // The run becomes either SDF glyph quads (crisp at any zoom, the whole
-        // point of the atlas) or — when no glyph atlas is loaded — filled outline
-        // triangles, so a host without the SDF asset still gets text.
-        const geom = (try self.sdfRun(gids.items, x0, baseline, px, at)) orelse
-            (try self.outlineRun(gids.items, x0, baseline, px, at)) orelse
-            return; // all-whitespace run: nothing to place
+        // A geographic-NAME label (S-52 text group, not class) carries the subtle
+        // halo so it reads over busy backgrounds; functional annotations (seabed,
+        // light descriptions, clearances) stay solid. Robust across every naming
+        // class — land or water — where a per-class list kept missing some.
+        const halo: f32 = if (isNameGroup(style.group)) HALO_WEIGHT else 0;
+        // The run becomes SDF glyph quads (crisp at any zoom) against the selected
+        // atlas; or, when no glyph atlas is loaded, filled outline triangles.
+        const geom = if (has_atlas)
+            (try self.sdfRun(sel.atlas.?, sel.atlas_id, halo, gids.items, x0, baseline, px, at, 0)) orelse
+                (try self.outlineRun(face, gids.items, x0, baseline, px, at, 0)) orelse
+                return // all-whitespace run: nothing to place
+        else
+            (try self.outlineRun(face, gids.items, x0, baseline, px, at, 0)) orelse return;
 
         // Build the label's renderable geometry NOW — absolute world, so it is
         // view-independent and caches — and store its box in LOCAL px relative to
@@ -674,8 +896,12 @@ pub const GpuSurface = struct {
         var cq = std.ArrayList(Quad).empty;
         var cv_ = std.ArrayList(Vertex).empty;
         var ci = std.ArrayList(u32).empty;
+        var atlas_id: AtlasId = .glyph;
         switch (geom) {
-            .sprite => |sq| try self.emitSpriteGeom(self.a, &cq, op, sq.anchor, sq.quads, sq.weight),
+            .sprite => |sq| {
+                atlas_id = sq.atlas; // regular / bold / italic glyph atlas
+                try self.emitSpriteGeom(self.a, &cq, op, sq.anchor, sq.quads, sq.weight);
+            },
             .mark => |m| try self.emitMarkGeom(self.a, &cv_, &ci, op, m.anchor, m.rings, m.rule),
             else => unreachable,
         }
@@ -697,17 +923,57 @@ pub const GpuSurface = struct {
             .paint_key = op.paint_key,
             .cls = self.cur.class,
             .text = text,
+            .atlas = atlas_id,
         });
     }
 
     const ShapedGlyph = struct { gid: u16, cp: u21, x: f32 };
 
-    /// Lay a shaped run out as SDF glyph quads against the glyph atlas, at the
-    /// anchor-local baseline origin (`x0`, `baseline`) in reference px. Null when
-    /// there is no glyph atlas (caller falls back to outlines) or the run yields
-    /// no glyph (all whitespace / all missing from the atlas).
-    fn sdfRun(self: *GpuSurface, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
-        const atlas = self.glyphs orelse return null;
+    /// Subtle white-halo width (SDF field units) carried on the quad `weight` and
+    /// read by the host shader as a halo, NOT an embolden — just enough to lift a
+    /// bold/italic geographic name off busy soundings. Regular labels get 0.
+    const HALO_WEIGHT: f32 = 0.15;
+
+    /// A parsed face + its glyph-cache index, the atlas it shapes against, and the
+    /// atlas id the host binds a texture for. (Halo is decided by text group in
+    /// drawText, not here.)
+    const FaceSel = struct { face: FaceRef, atlas: ?*const GlyphAtlas, atlas_id: AtlasId };
+
+    /// Choose the atlas + matching face for a label's weight/slant. The bold/italic
+    /// atlas is used only when the host uploaded it (and its face parsed); otherwise
+    /// it falls back to the regular atlas — the face and atlas always agree so UVs
+    /// and advances match.
+    fn selectFace(self: *GpuSurface, weight: fontmod.Weight, slant: fontmod.Slant) FaceSel {
+        const reg = FaceRef{ .f = &self.fnt.?, .idx = 0 };
+        if (weight == .bold) {
+            if (self.glyphs_bold) |ab| if (self.fnt_bold) |*fb|
+                return .{ .face = .{ .f = fb, .idx = 1 }, .atlas = ab, .atlas_id = .glyph_bold };
+            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph };
+        }
+        if (slant == .italic) {
+            if (self.glyphs_italic) |ai| if (self.fnt_italic) |*fi|
+                return .{ .face = .{ .f = fi, .idx = 2 }, .atlas = ai, .atlas_id = .glyph_italic };
+            return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph };
+        }
+        return .{ .face = reg, .atlas = self.glyphs, .atlas_id = .glyph };
+    }
+
+    /// S-52 text groups that name a place (land OR water) and so carry the halo:
+    /// 26 geographic names (BUAARE/LNDRGN/SEAARE/LNDARE/LNDMRK/…), 32 watercourse
+    /// names (RIVERS). Functional annotation groups — seabed (25), light
+    /// descriptions (23), clearances (11) — stay solid.
+    fn isNameGroup(group: i64) bool {
+        return group == 26 or group == 32;
+    }
+
+    /// Lay a shaped run out as SDF glyph quads against `atlas`, tagged with
+    /// `atlas_id` (the texture the host binds) and `halo` (the quad weight). Null
+    /// when the run yields no glyph (all whitespace / all missing from the atlas).
+    fn sdfRun(self: *GpuSurface, atlas: *const GlyphAtlas, atlas_id: AtlasId, halo: f32, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint, rot: f32) !?Geom {
+        // `rot` turns the whole run about the anchor (a contour tangent); 0 for
+        // ordinary text. The host shader then adds the view rotation on top.
+        const cs: f32 = @cos(rot);
+        const sn: f32 = @sin(rot);
         var quads = std.ArrayList(SpriteQuad).empty;
         for (glyphs_in) |g| {
             const gi = atlas.get(g.cp) orelse continue; // space, or a glyph the atlas lacks
@@ -719,24 +985,41 @@ pub const GpuSurface = struct {
             const gw = gi.w * px;
             const gh = gi.h * px;
             try quads.append(self.a, .{
-                .corners = .{ .{ gx, gy }, .{ gx + gw, gy }, .{ gx + gw, gy + gh }, .{ gx, gy + gh } },
+                .corners = .{ rot2(gx, gy, cs, sn), rot2(gx + gw, gy, cs, sn), rot2(gx + gw, gy + gh, cs, sn), rot2(gx, gy + gh, cs, sn) },
                 .uv = .{ .{ gi.u0, gi.v0 }, .{ gi.u1, gi.v0 }, .{ gi.u1, gi.v1 }, .{ gi.u0, gi.v1 } },
             });
         }
         if (quads.items.len == 0) return null;
-        return .{ .sprite = .{ .anchor = at, .quads = try quads.toOwnedSlice(self.a), .atlas = .glyph } };
+        return .{ .sprite = .{ .anchor = at, .quads = try quads.toOwnedSlice(self.a), .atlas = atlas_id, .weight = halo } };
+    }
+
+    /// A parsed face + its glyph-cache index (0 regular, 1 bold, 2 italic).
+    const FaceRef = struct { f: *const fontmod.Font, idx: u32 };
+
+    /// The parsed face + its cache index for a label's weight/slant, falling back
+    /// to regular when the bold/italic face failed to load.
+    fn pickFace(self: *GpuSurface, weight: fontmod.Weight, slant: fontmod.Slant) FaceRef {
+        if (weight == .bold) if (self.fnt_bold) |*b| return .{ .f = b, .idx = 1 };
+        if (slant == .italic) if (self.fnt_italic) |*i| return .{ .f = i, .idx = 2 };
+        return .{ .f = &self.fnt.?, .idx = 0 };
     }
 
     /// The outline-triangle fallback: filled glyph contours, wound nonzero. Null
-    /// for an all-whitespace run.
-    fn outlineRun(self: *GpuSurface, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint) !?Geom {
+    /// for an all-whitespace run. `face` shapes the outlines (its cache index keeps
+    /// the three faces' per-id outlines distinct).
+    fn outlineRun(self: *GpuSurface, face: anytype, glyphs_in: []const ShapedGlyph, x0: f32, baseline: f32, px: f32, at: rs.TilePoint, rot: f32) !?Geom {
+        // `rot` turns the run about the anchor (a contour tangent) so the outline
+        // fallback follows the contour too; the triangle path carries no flip, so
+        // this degrades to possibly-upside-down only when the SDF atlas is absent.
+        const cs: f32 = @cos(rot);
+        const sn: f32 = @sin(rot);
         var rings = std.ArrayList([]const [2]f32).empty;
         for (glyphs_in) |g| {
-            for (try self.glyphOutline(g.gid)) |contour| {
+            for (try self.glyphOutline(face.f, face.idx, g.gid)) |contour| {
                 if (contour.len < 3) continue;
                 const pts = try self.a.alloc([2]f32, contour.len);
                 // em units, y UP -> local reference px, y DOWN.
-                for (contour, 0..) |p, i| pts[i] = .{ x0 + g.x + p.x * px, baseline - p.y * px };
+                for (contour, 0..) |p, i| pts[i] = rot2(x0 + g.x + p.x * px, baseline - p.y * px, cs, sn);
                 try rings.append(self.a, pts);
             }
         }
@@ -760,10 +1043,11 @@ pub const GpuSurface = struct {
         return .{ @as(f64, w[0]) * s, @as(f64, w[1]) * s };
     }
 
-    fn glyphOutline(self: *GpuSurface, gid: u16) ![]const []const cv.Point {
-        if (self.glyph_cache.get(gid)) |hit| return hit;
-        const out = try self.fnt.?.outline(self.a, gid);
-        try self.glyph_cache.put(self.a, gid, out);
+    fn glyphOutline(self: *GpuSurface, face: *const fontmod.Font, idx: u32, gid: u16) ![]const []const cv.Point {
+        const key = (idx << 16) | gid;
+        if (self.glyph_cache.get(key)) |hit| return hit;
+        const out = try face.outline(self.a, gid);
+        try self.glyph_cache.put(self.a, key, out);
         return out;
     }
 
@@ -941,6 +1225,8 @@ pub const GpuSurface = struct {
                 .scamin = op.scamin,
                 .disp_cat = op.disp_cat,
                 .map_align = op.map_align,
+                .flip = op.flip,
+                .tangent_q = op.tangent_q,
             };
             for ([_]usize{ 0, 1, 2, 0, 2, 3 }) |k| try quads.append(arena, qv[k]);
         }
@@ -1092,6 +1378,9 @@ pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const Label
         // SCAMIN at the view zoom — base category (0) is never hidden (S-52).
         if (!ignore_scamin and c.disp_cat != 0 and c.scamin > 0 and
             !resolve.scaminVisible(@intFromFloat(c.scamin), view_zoom)) continue;
+        // A contour value whose visible piece is too short to carry a legible run
+        // at this zoom drops before the pool ranks it (mirrors the vector path).
+        if (c.gate_world_len > 0 and @as(f64, c.gate_world_len) * s < LEGIBLE_PX) continue;
         const ax = @as(f64, c.ax) * s;
         const ay = @as(f64, c.ay) * s;
         try pool.add(scratch, ids.items.len, c.group, c.cls, c.text, .{
@@ -1115,7 +1404,7 @@ pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const Label
         if (c.quads.len > 0) {
             const first = quads.items.len;
             try quads.appendSlice(arena, c.quads);
-            try ranges.append(arena, .{ .first = @intCast(first), .count = @intCast(c.quads.len), .paint_key = c.paint_key, .pattern = NO_PATTERN, .color = c.color, .kind = .text, .prim = .quads, .atlas = .glyph });
+            try ranges.append(arena, .{ .first = @intCast(first), .count = @intCast(c.quads.len), .paint_key = c.paint_key, .pattern = NO_PATTERN, .color = c.color, .kind = .text, .prim = .quads, .atlas = c.atlas });
         }
         if (c.indices.len > 0) {
             const vbase: u32 = @intCast(verts.items.len);
