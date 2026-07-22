@@ -71,6 +71,30 @@ pub fn toPlaneCells(a: std.mem.Allocator, loaded: []const LoadedCov) ![]geometry
     return cells;
 }
 
+/// Even-odd ray cast: is (px,py) inside the coverage `polys` (a bag of polygons,
+/// each outer ring + holes)? Crossing every ring with one XOR accumulator means a
+/// point inside a hole reads as outside, exactly as CATCOV=1 minus its holes.
+fn pointInCoverage(px: i64, py: i64, polys: []const geometry.plane.Poly) bool {
+    var inside = false;
+    for (polys) |poly| {
+        for (poly) |ring| {
+            if (ring.len < 3) continue;
+            var j = ring.len - 1;
+            for (ring, 0..) |p, i| {
+                const q = ring[j];
+                if ((p.y > py) != (q.y > py)) {
+                    const dy: f64 = @floatFromInt(q.y - p.y);
+                    const t: f64 = @as(f64, @floatFromInt(py - p.y)) / dy;
+                    const xint = @as(f64, @floatFromInt(p.x)) + t * @as(f64, @floatFromInt(q.x - p.x));
+                    if (@as(f64, @floatFromInt(px)) < xint) inside = !inside;
+                }
+                j = i;
+            }
+        }
+    }
+    return inside;
+}
+
 // A normalised web-mercator world axis coordinate ([0,1]) -> tile index at `scale`
 // (= 2^z), clamped to [0, scale-1].
 pub fn worldAxisToTile(w: f64, scale: f64) u32 {
@@ -327,6 +351,23 @@ pub const ComposeSource = struct {
     /// load to skip the owned-face build.
     pub fn serializePartition(self: *ComposeSource, gpa: std.mem.Allocator) ![]u8 {
         return geometry.partition.serialize(gpa, &self.part);
+    }
+
+    /// The deepest zoom any cell COVERING (lon,lat) can serve — `reach` (its native
+    /// window + overscale fill-up). Zooming past this over that ground hits nodata:
+    /// a host caps its zoom-in here, per view, instead of at the library-wide max
+    /// (which a distant deep chart inflates). Returns loop_max when the point lies
+    /// outside every cell's coverage (no cell to restrict against). Coverage points
+    /// are lon_e7/lat_e7 (see toPlaneCells), so the test is a plain lon/lat ray cast.
+    pub fn maxZoomAt(self: *const ComposeSource, lon: f64, lat: f64) u8 {
+        const px: i64 = @intFromFloat(lon * 1e7);
+        const py: i64 = @intFromFloat(lat * 1e7);
+        var best: u8 = 0;
+        for (self.part.cells) |c| {
+            if (c.reach <= best) continue; // can't beat what we already have
+            if (pointInCoverage(px, py, c.cov1)) best = c.reach;
+        }
+        return if (best == 0) self.loop_max else best;
     }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;

@@ -224,6 +224,8 @@ pub fn build(b: *std.Build) void {
     const addFont = struct {
         fn f(bb: *std.Build, m: *std.Build.Module) void {
             m.addAnonymousImport("font_ttf", .{ .root_source_file = bb.path("vendor/fonts/NotoSans-Regular.ttf") });
+            m.addAnonymousImport("font_ttf_bold", .{ .root_source_file = bb.path("vendor/fonts/NotoSans-Bold.ttf") });
+            m.addAnonymousImport("font_ttf_italic", .{ .root_source_file = bb.path("vendor/fonts/NotoSans-Italic.ttf") });
         }
     }.f;
     addFont(b, render_mod);

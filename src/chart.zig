@@ -783,12 +783,15 @@ pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // Parse native-aware (S-101 or S-57): the band scale + the archive's coverage
     // sidecar both come from the real cell, so a native S-101 chart bands by its
     // DataCoverage display scale (not the S-57-misparsed cscl=0 approach default).
+    // The dataset stem is the ownership tie-break name AND the pick-report's
+    // "source cell" badge — pass it into the tile bake below (bakeArchive borrows
+    // it for cell.name), or every feature's `cell` prop bakes empty.
+    const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
     var cscl: i32 = s57.peekScale(gpa, cf.base) orelse 0;
     if (parseAnyCell(cf.base, cf.updates)) |loaded| {
         var cell = loaded.cell;
         defer cell.deinit();
         cscl = cell.params.cscl;
-        const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
         const band: u8 = @intFromEnum(bake_enc.bandOf(cscl));
         const cc = scene.coverage.fromCell(cov_arena.allocator(), &cell, stem, band);
         coverage_json = scene.coverage.encodeJson(cov_arena.allocator(), cc) catch null;
@@ -799,7 +802,7 @@ pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // coarser zooms where nothing coarser covers — a harbor-only region still
     // shows land and coast at z4. No overscale above the window.
     const zr = bake_enc.bandZooms(bake_enc.bandOf(cscl));
-    const cell_in = [_]ChartInput{.{ .base = cf.base, .updates = cf.updates }};
+    const cell_in = [_]ChartInput{.{ .base = cf.base, .updates = cf.updates, .name = stem }};
     return bakeArchive(&cell_in, resolveRulesDir(rules_dir), 0, zr.max, .mlt, true, null, null, coverage_json);
 }
 
@@ -1050,29 +1053,10 @@ fn viewSymbolStore(a: std.mem.Allocator, palette: render.resolve.PaletteId) !*sp
 /// deterministic pack the host uploads) and the SDF glyph map. Cell SIZES are
 /// geometry, palette-independent, so the day stylesheet gives UVs that match the
 /// host's DEFAULT_CSS atlas PNG.
-fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtlas, glyphs: render.gpu.GlyphAtlas } {
-    var css_data: []const u8 = "";
-    for (embedded_assets.css) |e| {
-        if (std.mem.eql(u8, e.name, "daySvgStyle")) css_data = e.bytes;
-    }
-    const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
-    for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
-    const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
-    for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
-
-    // sprite atlas: reuse the same builder tile57_bake_sprite_mln does, so the
-    // cell rects are byte-for-byte the layout the host's PNG carries.
-    var atlas = try sprite.spriteMln(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{});
-    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height };
-    var cit = atlas.cells.iterator();
-    while (cit.next()) |e| {
-        const r = e.value_ptr.*;
-        try sprites.cells.put(a, e.key_ptr.*, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
-    }
-
-    // SDF glyph atlas: the same em_px/pad tile57_bake_glyph_sdf bakes.
-    const cps = try sprite.glyph.defaultCodepoints(a);
-    const gatlas = try sprite.glyph.build(a, render.font.notosans, cps, 32.0, 6);
+/// One SDF glyph atlas from a face, at the em_px/pad tile57_bake_glyph_sdf(_face)
+/// bakes — so the internal metrics match the texture the host uploads.
+fn buildGlyphAtlas(a: std.mem.Allocator, font: []const u8, cps: []const u21) !render.gpu.GlyphAtlas {
+    const gatlas = try sprite.glyph.build(a, font, cps, 32.0, 6);
     var glyphs = render.gpu.GlyphAtlas{ .em_px = gatlas.em_px };
     var git = gatlas.glyphs.iterator();
     while (git.next()) |e| {
@@ -1089,7 +1073,37 @@ fn buildGpuAtlases(a: std.mem.Allocator) !struct { sprites: render.gpu.SpriteAtl
             .advance = g.advance,
         });
     }
-    return .{ .sprites = sprites, .glyphs = glyphs };
+    return glyphs;
+}
+
+fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.gpu.SpriteAtlas, glyphs: render.gpu.GlyphAtlas, glyphs_bold: render.gpu.GlyphAtlas, glyphs_italic: render.gpu.GlyphAtlas } {
+    var css_data: []const u8 = "";
+    for (embedded_assets.css) |e| {
+        if (std.mem.eql(u8, e.name, "daySvgStyle")) css_data = e.bytes;
+    }
+    const sym_srcs = try a.alloc(sprite.SvgSrc, embedded_assets.symbols.len);
+    for (embedded_assets.symbols, 0..) |e, i| sym_srcs[i] = .{ .id = e.name, .svg = e.bytes };
+    const fill_srcs = try a.alloc(sprite.AreaFillSrc, embedded_assets.areafills.len);
+    for (embedded_assets.areafills, 0..) |e, i| fill_srcs[i] = .{ .id = e.name, .xml = e.bytes };
+
+    // sprite atlas: reuse the same builder tile57_bake_sprite_mln does at the
+    // SAME display ratio, so the cell rects are byte-for-byte the layout the
+    // host's uploaded PNG carries (the normalized UVs must index that texture).
+    var atlas = try sprite.spriteMln(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio);
+    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.px_per_unit * 100.0 * ratio) };
+    var cit = atlas.cells.iterator();
+    while (cit.next()) |e| {
+        const r = e.value_ptr.*;
+        try sprites.cells.put(a, e.key_ptr.*, .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h });
+    }
+
+    // SDF glyph atlases, one per label-tier face (regular / bold / italic) — the
+    // same faces + em_px/pad tile57_bake_glyph_sdf(_face) bakes for the host.
+    const cps = try sprite.glyph.defaultCodepoints(a);
+    const glyphs = try buildGlyphAtlas(a, render.font.notosans, cps);
+    const glyphs_bold = try buildGlyphAtlas(a, render.font.notosans_bold, cps);
+    const glyphs_italic = try buildGlyphAtlas(a, render.font.notosans_italic, cps);
+    return .{ .sprites = sprites, .glyphs = glyphs, .glyphs_bold = glyphs_bold, .glyphs_italic = glyphs_italic };
 }
 
 // ---- per-tile GEOMETRY cache (internal; the host never sees tiles) ----------
@@ -1196,9 +1210,31 @@ fn geomPut(key: GeomKey, sc: *GpuScene) void {
 var g_atlas_state: std.atomic.Value(u8) = .init(0);
 var g_atlas_sprites: render.gpu.SpriteAtlas = .{ .width = 0, .height = 0 };
 var g_atlas_glyphs: render.gpu.GlyphAtlas = .{};
+var g_atlas_glyphs_bold: render.gpu.GlyphAtlas = .{};
+var g_atlas_glyphs_italic: render.gpu.GlyphAtlas = .{};
 var g_atlas_ok = false;
+// Display pixel ratio the sprite cell-map was last built at — carried by the
+// GPU-scene build so its normalized UVs match a texture the host uploaded at the
+// same ratio (tile57_bake_sprite_mln). 1 until a scene asks for another.
+var g_atlas_ratio: f64 = 1;
 
-fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gpu.GlyphAtlas } {
+const SharedAtlases = struct {
+    sprites: ?*const render.gpu.SpriteAtlas,
+    glyphs: ?*const render.gpu.GlyphAtlas,
+    glyphs_bold: ?*const render.gpu.GlyphAtlas,
+    glyphs_italic: ?*const render.gpu.GlyphAtlas,
+};
+
+fn sharedGpuAtlases(ratio: f64) SharedAtlases {
+    // The sprite cell-map is keyed on the display ratio it was built at: a scene
+    // asking for a new ratio (a HiDPI display, or the window moved to one)
+    // rebuilds it so its normalized UVs match a texture baked at the same ratio.
+    const r = if (ratio > 0) ratio else 1;
+    if (r != g_atlas_ratio) {
+        g_atlas_ratio = r;
+        g_atlas_ok = false;
+        g_atlas_state.store(0, .release);
+    }
     while (g_atlas_state.load(.acquire) != 2) {
         if (g_atlas_state.cmpxchgStrong(@as(u8, 0), @as(u8, 1), .acquire, .monotonic) == null) {
             const aa = gpa.create(std.heap.ArenaAllocator) catch {
@@ -1206,9 +1242,11 @@ fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gp
                 break;
             };
             aa.* = std.heap.ArenaAllocator.init(gpa);
-            if (buildGpuAtlases(aa.allocator())) |built| {
+            if (buildGpuAtlases(aa.allocator(), g_atlas_ratio)) |built| {
                 g_atlas_sprites = built.sprites;
                 g_atlas_glyphs = built.glyphs;
+                g_atlas_glyphs_bold = built.glyphs_bold;
+                g_atlas_glyphs_italic = built.glyphs_italic;
                 g_atlas_ok = true;
             } else |_| {
                 aa.deinit();
@@ -1219,8 +1257,8 @@ fn sharedGpuAtlases() struct { ?*const render.gpu.SpriteAtlas, ?*const render.gp
         }
         std.atomic.spinLoopHint();
     }
-    if (!g_atlas_ok) return .{ null, null };
-    return .{ &g_atlas_sprites, &g_atlas_glyphs };
+    if (!g_atlas_ok) return .{ .sprites = null, .glyphs = null, .glyphs_bold = null, .glyphs_italic = null };
+    return .{ .sprites = &g_atlas_sprites, .glyphs = &g_atlas_glyphs, .glyphs_bold = &g_atlas_glyphs_bold, .glyphs_italic = &g_atlas_glyphs_italic };
 }
 
 // ---- compose-backed view renders --------------------------------------------
@@ -1395,7 +1433,7 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
 /// across the whole view — see Chart.renderGpuScene, with the compositor as the
 /// tile source so a host draws a chart LIBRARY without owning a scene. Result
 /// owns its arena (GpuScene.deinit).
-pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
     geomInvalidate(settings);
     const out = try gpa.create(GpuScene);
     errdefer gpa.destroy(out);
@@ -1413,7 +1451,7 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
     while (vt.next()) |t| {
         const key = GeomKey{ .handle = @intFromPtr(src), .z = t.z, .x = t.x, .y = t.y };
         if (geomGet(key) == null) {
-            const built = renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings) catch continue;
+            const built = renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio) catch continue;
             geomPut(key, built);
         }
         if (geomGet(key)) |g| {
@@ -1430,7 +1468,7 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
 
 /// ONE composed tile into a draw-ready scene — the per-tile twin of
 /// renderComposeGpuScene, for a host that caches tiles (see Chart.renderTileGpuScene).
-pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
     const out = try gpa.create(GpuScene);
     errdefer gpa.destroy(out);
     out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
@@ -1446,9 +1484,11 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, @floatFromInt(z));
     defer gs.deinit();
     gs.store = store.asStore();
-    const atl = sharedGpuAtlases();
-    gs.sprites = atl[0];
-    gs.glyphs = atl[1];
+    const atl = sharedGpuAtlases(pixel_ratio);
+    gs.sprites = atl.sprites;
+    gs.glyphs = atl.glyphs;
+    gs.glyphs_bold = atl.glyphs_bold;
+    gs.glyphs_italic = atl.glyphs_italic;
     gs.setTile(z, x, y);
     const surf = gs.asSurface();
     try surf.beginScene(z);
@@ -1530,6 +1570,10 @@ pub fn decodedCoverageFromArchive(a: std.mem.Allocator, archive: []const u8) !?s
 /// MUST call this once on its main thread before spawning them: then concurrent
 /// bake/render is race-free (the allocator is thread-safe, the portrayal context is
 /// thread-local, and these two globals are already populated so nobody writes them).
+/// `pixel_ratio` is the host's display ratio (1 standard, 2 Retina/HiDPI). The
+/// GPU sprite cell-map is (re)built at it so its normalized UVs index a texture
+/// the host baked at the SAME ratio (tile57_bake_sprite_mln). Call before the
+/// first GPU-scene build; calling again with a new ratio rebuilds the atlas.
 pub fn warmup() void {
     catalogue.warmUp();
     var ls_srcs = std.ArrayList(style.LineStyleSrc).empty;
@@ -2196,7 +2240,7 @@ pub const Chart = struct {
     /// No rotation parameter, deliberately: geometry stays north-up in absolute
     /// world coordinates and the host applies the view rotation, so a course-up
     /// view that turns continuously never rebuilds.
-    pub fn renderGpuScene(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+    pub fn renderGpuScene(self: *Chart, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
         geomInvalidate(settings);
         const out = try gpa.create(GpuScene);
         errdefer gpa.destroy(out);
@@ -2216,7 +2260,7 @@ pub const Chart = struct {
         while (vt.next()) |t| {
             const key = GeomKey{ .handle = @intFromPtr(self), .z = t.z, .x = t.x, .y = t.y };
             if (geomGet(key) == null) {
-                const built = self.renderTileGpuScene(t.z, t.x, t.y, palette, settings) catch continue;
+                const built = self.renderTileGpuScene(t.z, t.x, t.y, palette, settings, pixel_ratio) catch continue;
                 geomPut(key, built);
             }
             if (geomGet(key)) |g| {
@@ -2241,7 +2285,7 @@ pub const Chart = struct {
     /// with one camera), and declutter is PER-TILE at the tile's native zoom, so a
     /// label may repeat across a seam — a host wanting cross-tile text runs the
     /// view-level label pass on top. Result owns its arena (GpuScene.deinit).
-    pub fn renderTileGpuScene(self: *Chart, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings) !*GpuScene {
+    pub fn renderTileGpuScene(self: *Chart, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
         const out = try gpa.create(GpuScene);
         errdefer gpa.destroy(out);
         out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
@@ -2256,9 +2300,11 @@ pub const Chart = struct {
         var gs = try render.gpu.GpuSurface.init(sa, colors, palette, settings, @floatFromInt(z));
         defer gs.deinit();
         gs.store = store.asStore();
-        const atl = sharedGpuAtlases();
-        gs.sprites = atl[0];
-        gs.glyphs = atl[1];
+        const atl = sharedGpuAtlases(pixel_ratio);
+        gs.sprites = atl.sprites;
+        gs.glyphs = atl.glyphs;
+        gs.glyphs_bold = atl.glyphs_bold;
+        gs.glyphs_italic = atl.glyphs_italic;
         gs.setTile(z, x, y);
         const surf = gs.asSurface();
         try surf.beginScene(z);

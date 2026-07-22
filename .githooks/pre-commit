@@ -1,0 +1,7 @@
+#!/bin/sh
+# Mirror CI's format gate (.github/workflows/ci.yml): block a commit that would
+# leave src/, tools/, or build.zig unformatted. Fix with: zig fmt src/ tools/ build.zig
+if ! zig fmt --check src/ tools/ build.zig; then
+	echo "pre-commit: the files above are not zig-fmt clean. Run: zig fmt src/ tools/ build.zig" >&2
+	exit 1
+fi

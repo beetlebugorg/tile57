@@ -180,8 +180,11 @@ pub const PdfCanvas = struct {
 
     fn drawGlyphRunImpl(ctx: *anyopaque, run: *const cv.GlyphRun) anyerror!void {
         const self = sp(ctx);
-        if (self.font_data == null) {
-            // No font to embed: outline fills (visually identical, not text).
+        // No embeddable font, or a bold/italic run whose glyph ids belong to a face
+        // this PDF does not embed: fill the (face-correct) outlines instead of
+        // emitting a text object against the regular font. Visually identical,
+        // just not selectable text.
+        if (self.font_data == null or run.face_idx != 0) {
             if (run.halo) |hc| try strokePathImpl(ctx, run.rings, run.halo_w * 2, null, hc);
             try fillPathImpl(ctx, run.rings, run.color, .nonzero);
             return;

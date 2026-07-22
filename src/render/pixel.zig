@@ -183,7 +183,11 @@ pub const PixelSurface = struct {
     highlight: ?ScreenHighlight = null,
     /// The embedded label face; null only if the embedded TTF fails to parse.
     fnt: ?fontmod.Font = null,
-    glyph_cache: std.AutoHashMapUnmanaged(u16, []const []const cv.Point) = .empty,
+    fnt_bold: ?fontmod.Font = null,
+    fnt_italic: ?fontmod.Font = null,
+    // Keyed by (face_idx << 16 | gid): glyph ids are per-face, so the cache must
+    // distinguish the regular / bold / italic outline for the same id.
+    glyph_cache: std.AutoHashMapUnmanaged(u32, []const []const cv.Point) = .empty,
     ops: std.ArrayList(Op) = .empty,
     cur: rs.FeatureMeta = .{},
     cur_visible: bool = true,
@@ -223,6 +227,8 @@ pub const PixelSurface = struct {
             .px_per_tile = px_per_tile,
             .scale = px_per_tile / @as(f32, @floatFromInt(tile_extent)),
             .fnt = fontmod.Font.init(fontmod.notosans) catch null,
+            .fnt_bold = fontmod.Font.init(fontmod.notosans_bold) catch null,
+            .fnt_italic = fontmod.Font.init(fontmod.notosans_italic) catch null,
         };
     }
 
@@ -362,7 +368,7 @@ pub const PixelSurface = struct {
                 .night => cv.Color{ .r = 0xaa, .g = 0xb7, .b = 0xbf },
             };
             // A contour value is not one of the spec's IMPORTANT text groups.
-            try self.pushText(label, 10, "center", "middle", 0, 0, color, false, 0, mid);
+            if (self.fnt) |*rf| try self.pushText(rf, 0, label, 10, "center", "middle", 0, 0, color, false, 0, mid);
         }
     }
 
@@ -450,24 +456,35 @@ pub const PixelSurface = struct {
         // style deliberately renders no halo; match it. The GlyphRun halo plumbing
         // stays for a future opt-in legibility setting.
         const haloed = false;
-        try self.pushText(text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, style.group, .{
+        if (self.fnt == null) return;
+        const face = self.pickFace(style.weight, style.slant);
+        try self.pushText(face.f, face.idx, text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, style.group, .{
             .x = self.origin.x + @as(f32, @floatFromInt(at.x)) * self.scale,
             .y = self.origin.y + @as(f32, @floatFromInt(at.y)) * self.scale,
         });
     }
 
-    fn glyphOutline(self: *PixelSurface, gid: u16) ![]const []const cv.Point {
-        if (self.glyph_cache.get(gid)) |hit| return hit;
-        const out = try self.fnt.?.outline(self.a, gid);
-        try self.glyph_cache.put(self.a, gid, out);
+    /// The parsed face + its cache index for a label's weight/slant, falling back
+    /// to regular when the bold/italic face failed to load.
+    fn pickFace(self: *PixelSurface, weight: fontmod.Weight, slant: fontmod.Slant) struct { f: *const fontmod.Font, idx: u32 } {
+        if (weight == .bold) if (self.fnt_bold) |*b| return .{ .f = b, .idx = 1 };
+        if (slant == .italic) if (self.fnt_italic) |*i| return .{ .f = i, .idx = 2 };
+        return .{ .f = &self.fnt.?, .idx = 0 };
+    }
+
+    fn glyphOutline(self: *PixelSurface, face: *const fontmod.Font, idx: u32, gid: u16) ![]const []const cv.Point {
+        const key = (idx << 16) | gid;
+        if (self.glyph_cache.get(key)) |hit| return hit;
+        const out = try face.outline(self.a, gid);
+        try self.glyph_cache.put(self.a, key, out);
         return out;
     }
 
     /// Shape + buffer one label: glyphs advance left-to-right at `font_px`
     /// (CSS px; device scale applied here), anchored per halign/valign with
     /// MILLIMETRE offsets (S-52 LocalOffset, +y down), optional halo.
-    fn pushText(self: *PixelSurface, text: []const u8, font_px_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, haloed: bool, group: i64, anchor: cv.Point) !void {
-        const f = &(self.fnt orelse return);
+    fn pushText(self: *PixelSurface, face: *const fontmod.Font, face_idx: u32, text: []const u8, font_px_css: f32, halign: []const u8, valign: []const u8, ox_mm: f32, oy_mm: f32, color: cv.Color, haloed: bool, group: i64, anchor: cv.Point) !void {
+        const f = face;
         const px = font_px_css * @as(f32, @floatCast(self.textDev()));
         if (px <= 1) return;
         const mm_px: f32 = @floatCast(sndfrm.SYMBOL_SCALE * 100.0 * self.textDev());
@@ -500,7 +517,7 @@ pub const PixelSurface = struct {
         var rings = std.ArrayList([]const cv.Point).empty;
         var bbox = [4]f32{ std.math.floatMax(f32), std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
         for (gids.items) |g| {
-            const contours = try self.glyphOutline(g.gid);
+            const contours = try self.glyphOutline(face, face_idx, g.gid);
             for (contours) |contour| {
                 const pts = try self.a.alloc(cv.Point, contour.len);
                 for (contour, 0..) |p, i| {
@@ -526,6 +543,7 @@ pub const PixelSurface = struct {
                 .halo = if (haloed) self.resolveColor("CHWHT") else null,
                 .halo_w = halo_w,
                 .text = try self.a.dupe(u8, text),
+                .face_idx = face_idx,
             },
             .bbox = .{ bbox[0] - halo_w, bbox[1] - halo_w, bbox[2] + halo_w, bbox[3] + halo_w },
             .group = group,

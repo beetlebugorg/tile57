@@ -28,9 +28,13 @@
 // offset from the pen origin (y down), and the pen advance — all in `em_px` units,
 // so the caller normalizes by em_px to get size-independent (em) metrics. NULL for
 // blank glyphs (space): *w=*h=0 but *advance is still set. Free with tg_glyph_free.
+// `onedge`/`dist_scale` set the SDF encoding: the byte value at the glyph edge and
+// the value change per pixel of distance (inside > onedge). The GPU atlas uses
+// onedge=128, dist_scale=127/pad (a symmetric ±pad field); the MapLibre glyph-PBF
+// emitter uses onedge=191, dist_scale=255/8 (fontnik's radius-8 / cutoff-0.25).
 unsigned char *tg_glyph_sdf(const unsigned char *font, int font_len, int cp,
-                            float em_px, int pad, int *w, int *h,
-                            int *xoff, int *yoff, float *advance) {
+                            float em_px, int pad, int onedge, float dist_scale,
+                            int *w, int *h, int *xoff, int *yoff, float *advance) {
     (void)font_len;
     stbtt_fontinfo f;
     if (!stbtt_InitFont(&f, font, stbtt_GetFontOffsetForIndex(font, 0))) return NULL;
@@ -38,10 +42,8 @@ unsigned char *tg_glyph_sdf(const unsigned char *font, int font_len, int cp,
     int adv = 0, lsb = 0;
     stbtt_GetCodepointHMetrics(&f, cp, &adv, &lsb);
     *advance = (float)adv * scale;
-    unsigned char onedge = 128;
-    float dist_scale = 127.0f / (float)pad; // ±pad px -> the byte range
     *w = 0; *h = 0; *xoff = 0; *yoff = 0;
-    return stbtt_GetCodepointSDF(&f, scale, cp, pad, onedge, dist_scale, w, h, xoff, yoff);
+    return stbtt_GetCodepointSDF(&f, scale, cp, pad, (unsigned char)onedge, dist_scale, w, h, xoff, yoff);
 }
 void tg_glyph_free(unsigned char *p) { stbtt_FreeSDF(p, NULL); }
 

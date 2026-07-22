@@ -157,6 +157,9 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
                 const ts = rs.TextStyle{
                     .color = propStr(f.properties, "color_token"),
                     .font_size = propF64(f.properties, "font_size_px") orelse 12,
+                    // Label-tier face (render.labeltier): props omitted => regular/upright.
+                    .weight = if (std.mem.eql(u8, propStr(f.properties, "font_weight"), "bold")) .bold else .regular,
+                    .slant = if (std.mem.eql(u8, propStr(f.properties, "font_slant"), "italic")) .italic else .upright,
                     .halign = propStr(f.properties, "halign"),
                     .valign = propStr(f.properties, "valign"),
                     .offset_x = ox,
