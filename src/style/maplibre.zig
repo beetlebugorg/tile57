@@ -25,8 +25,10 @@ const FONT_ITALIC = .{"Noto Sans Italic"};
 // Bold"] parses as a function call (crashing symbol placement), not a font array.
 const TEXT_FONT = .{
     "case",
-    .{ "==", .{ "get", "font_weight" }, "bold" }, .{ "literal", FONT_BOLD },
-    .{ "==", .{ "get", "font_slant" }, "italic" }, .{ "literal", FONT_ITALIC },
+    .{ "==", .{ "get", "font_weight" }, "bold" },
+    .{ "literal", FONT_BOLD },
+    .{ "==", .{ "get", "font_slant" }, "italic" },
+    .{ "literal", FONT_ITALIC },
     .{ "literal", FONT },
 };
 

@@ -21,9 +21,8 @@ fn dumpAtlas(io: std.Io, a: std.mem.Allocator) !void {
         const gA1 = at1.info('A').?;
         const gA2 = at2.info('A').?;
         std.debug.print("{s}: {d}x{d} vs {d}x{d} | 'A' uv0=({d:.4},{d:.4}) vs ({d:.4},{d:.4}) {s}\n", .{
-            fc.name,      at1.width, at1.height, at2.width, at2.height,
-            gA1.u0,       gA1.v0,    gA2.u0,     gA2.v0,
-            if (at1.height == at2.height and gA1.v0 == gA2.v0) "MATCH" else "MISMATCH",
+            fc.name, at1.width, at1.height, at2.width, at2.height,
+            gA1.u0,  gA1.v0,    gA2.u0,     gA2.v0,    if (at1.height == at2.height and gA1.v0 == gA2.v0) "MATCH" else "MISMATCH",
         });
         // Write the atlas PNG for a visual check.
         if (try at1.encodePng(a)) |png| {
