@@ -1116,12 +1116,23 @@ fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.g
 // NOT cached here: they declutter across the whole view every call (see the label
 // pass in renderGpuScene), so a name never repeats across a tile seam.
 const GeomKey = struct { handle: usize, z: u8, x: u32, y: u32 };
-const GeomEntry = struct { scene: *GpuScene, gen: u64 };
+const GeomEntry = struct { scene: *GpuScene, gen: u64, bytes: usize };
 var g_geom: std.AutoHashMapUnmanaged(GeomKey, GeomEntry) = .empty;
 var g_geom_gen: u64 = 0;
+var g_geom_bytes: usize = 0;
+/// Entries at/after this generation belong to the walk in progress — its parts
+/// still reference their arenas, so eviction never crosses it (set by
+/// renderComposeGpuScene; engine calls are single-threaded per the contract).
+var g_geom_floor: u64 = 0;
 var g_geom_hash: u64 = 0;
 var g_geom_hash_set = false;
 const GEOM_CACHE_MAX = 1024;
+// The cache is bounded by BYTES as well as entries: 1024 tessellated tiles can
+// be gigabytes, and on a memory-limited device (iOS jetsam) that grows the
+// process to where big allocations FAIL — scenes stop assembling exactly on
+// the widest views. 160 MB holds several views' worth of tiles; past it the
+// LRU pays a re-portray instead of the process paying with its life.
+const GEOM_CACHE_MAX_BYTES: usize = 160 << 20;
 
 /// Content hash of the geometry-affecting settings. A byte hash won't do —
 /// Settings has slice fields (whose pointers move per call) and floats (whose
@@ -1155,8 +1166,19 @@ fn geomInvalidate(s: *const render.resolve.Settings) void {
     var it = g_geom.valueIterator();
     while (it.next()) |e| e.scene.deinit();
     g_geom.clearRetainingCapacity();
+    g_geom_bytes = 0;
     g_geom_hash = hh;
     g_geom_hash_set = true;
+}
+
+/// Drop EVERY cached tile: the memory-pressure valve. Called when a scene
+/// assembly fails allocation — reclaiming the cache and re-portraying beats
+/// a build that fails identically every frame forever.
+pub fn geomDropAll() void {
+    var it = g_geom.valueIterator();
+    while (it.next()) |e| e.scene.deinit();
+    g_geom.clearRetainingCapacity();
+    g_geom_bytes = 0;
 }
 
 /// Drop every cached tile belonging to a handle — called when it closes, so a
@@ -1169,7 +1191,10 @@ pub fn geomDropHandle(handle: usize) void {
         if (kv.key_ptr.handle == handle) doomed.append(gpa, kv.key_ptr.*) catch {};
     }
     for (doomed.items) |k| {
-        if (g_geom.fetchRemove(k)) |kv| kv.value.scene.deinit();
+        if (g_geom.fetchRemove(k)) |kv| {
+            g_geom_bytes -= @min(g_geom_bytes, kv.value.bytes);
+            kv.value.scene.deinit();
+        }
     }
 }
 
@@ -1184,23 +1209,31 @@ fn geomGet(key: GeomKey) ?*GpuScene {
 
 fn geomPut(key: GeomKey, sc: *GpuScene) void {
     g_geom_gen += 1;
-    g_geom.put(gpa, key, .{ .scene = sc, .gen = g_geom_gen }) catch {
+    const bytes = sc.arena.queryCapacity();
+    g_geom.put(gpa, key, .{ .scene = sc, .gen = g_geom_gen, .bytes = bytes }) catch {
         sc.deinit();
         return;
     };
-    if (g_geom.count() <= GEOM_CACHE_MAX) return;
-    // Evict the least-recently-used (linear scan; the map is bounded).
-    var oldest_key: ?GeomKey = null;
-    var oldest_gen: u64 = std.math.maxInt(u64);
-    var it = g_geom.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.gen < oldest_gen) {
-            oldest_gen = kv.value_ptr.gen;
-            oldest_key = kv.key_ptr.*;
+    g_geom_bytes += bytes;
+    // Evict least-recently-used until under BOTH bounds (linear scans; the map
+    // is bounded). Entries stored this generation are never evicted here —
+    // they are this walk's own tiles, still referenced by the caller.
+    while (g_geom.count() > GEOM_CACHE_MAX or g_geom_bytes > GEOM_CACHE_MAX_BYTES) {
+        var oldest_key: ?GeomKey = null;
+        var oldest_gen: u64 = std.math.maxInt(u64);
+        var it = g_geom.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.gen < oldest_gen) {
+                oldest_gen = kv.value_ptr.gen;
+                oldest_key = kv.key_ptr.*;
+            }
         }
-    }
-    if (oldest_key) |ok| {
-        if (g_geom.fetchRemove(ok)) |kv| kv.value.scene.deinit();
+        if (oldest_gen >= g_geom_floor) break; // only this walk's own tiles remain
+        const doomed = oldest_key orelse break;
+        if (g_geom.fetchRemove(doomed)) |kv| {
+            g_geom_bytes -= @min(g_geom_bytes, kv.value.bytes);
+            kv.value.scene.deinit();
+        } else break;
     }
 }
 
@@ -1434,7 +1467,21 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
 /// tile source so a host draws a chart LIBRARY without owning a scene. Result
 /// owns its arena (GpuScene.deinit).
 pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
+    // A failure here (the error set is allocation) is almost always the
+    // process squeezed by its own caches (a memory-limited device under
+    // jetsam pressure): reclaim the biggest pool and retry ONCE. Without
+    // this the host retries the identical failing build every frame,
+    // forever, displaying a stale band's scene — "cells at the wrong zooms".
+    return renderComposeGpuSceneInner(src, lon, lat, zoom, w, h, palette, settings, pixel_ratio) catch |err| {
+        std.debug.print("gpu scene: build failed ({s}) — dropping tile geometry cache and retrying\n", .{@errorName(err)});
+        geomDropAll();
+        return renderComposeGpuSceneInner(src, lon, lat, zoom, w, h, palette, settings, pixel_ratio);
+    };
+}
+
+fn renderComposeGpuSceneInner(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
     geomInvalidate(settings);
+    g_geom_floor = g_geom_gen + 1; // eviction never touches this walk's tiles
     const out = try gpa.create(GpuScene);
     errdefer gpa.destroy(out);
     out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
