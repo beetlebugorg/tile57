@@ -1453,11 +1453,14 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
     // healthy build prints nothing.)
     var failed: u32 = 0;
     var total: u32 = 0;
+    var empty: u32 = 0; // tiles that contributed NO geometry (fresh or cached)
+    var fresh: u32 = 0; // tiles portrayed this call (the rest were cache hits)
     var last_err: []const u8 = "";
     while (vt.next()) |t| {
         total += 1;
         const key = GeomKey{ .handle = @intFromPtr(src), .z = t.z, .x = t.x, .y = t.y };
         if (geomGet(key) == null) {
+            fresh += 1;
             if (renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio)) |built| {
                 geomPut(key, built);
             } else |err| {
@@ -1467,6 +1470,7 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
             }
         }
         if (geomGet(key)) |g| {
+            if (g.scene.vertices.len == 0 and g.scene.quads.len == 0) empty += 1;
             parts.append(sa, g.scene) catch {};
             cands.appendSlice(sa, g.candidates) catch {};
         } else {
@@ -1475,6 +1479,9 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
         }
     }
     if (failed > 0) std.debug.print("gpu scene z{d}: {d}/{d} tiles FAILED ({s}) — tile-shaped holes\n", .{ vt.z, failed, total, last_err });
+    // Not necessarily wrong (open ocean beyond coverage IS empty), but the
+    // first thing to read when tile-shaped holes appear over charted ground.
+    if (empty > 0) std.debug.print("gpu scene z{d}: {d}/{d} tiles empty ({d} fresh)\n", .{ vt.z, empty, total, fresh });
 
     parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
