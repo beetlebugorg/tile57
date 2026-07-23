@@ -252,6 +252,13 @@ tile57_status tile57_pmtiles_metadata(const uint8_t *pmtiles, size_t len,
                                       uint8_t **out, size_t *out_len,
                                       tile57_error *err);
 
+/* tile57_bake_tree additionally emits a shared baked-atlas SIDECAR SET into
+ * <out_dir>/_assets/ — a single 3x sprite atlas (sprite@3x.png/.json) plus the
+ * resolution-independent SDF label atlases (glyph{,-bold,-italic}.png/.json).
+ * A GPU chartplotter loads these at open instead of re-rasterizing ~1,500
+ * catalogue symbols + the font faces every time (~1.3s at 1x, more at HiDPI).
+ * They depend only on the embedded catalogue, not on any chart. */
+
 /* Bake the ownership-partition DEBUG tiles from an ENC_ROOT (on-disk path)
  * into a single PMTiles at out_path: the composited ownership faces (which
  * chart renders which ground at each band), one polygon per owning chart tagged

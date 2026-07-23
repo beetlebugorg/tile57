@@ -353,6 +353,9 @@ export fn tile57_bake_tree(
     defer threaded.deinit();
     const baked = chart.bakeTree(threaded.io(), in_d, out_d, null, workers, progress, progress_ctx) catch |e| return failCtx(err, e, in_d);
     if (out_baked) |p| p.* = @intCast(baked);
+    // Emit the shared atlas sidecars once, so hosts skip the per-open bake.
+    // Best-effort: a bake that produced tiles is still a success if this fails.
+    bakeAssetsDir(threaded.io(), out_d) catch {};
     return OK;
 }
 
@@ -1384,6 +1387,53 @@ fn bakeGlyphSdf(out: ?*CAssets, face: i32, err: ?*CError) c_int {
     }).ptr;
     o.sprite_json_len = json.len;
     return OK;
+}
+
+/// Emit the baked-atlas SIDECAR SET into `<out_dir>/_assets/` — once per
+/// library, so a chartplotter loads them at open instead of re-rasterizing the
+/// ~1,500 catalogue symbols + SDF font faces every time. Written:
+///   sprite@3x.png / .json   — the MapLibre sprite-mln atlas at ratio 3 (a
+///                             single high-density atlas; lower-density displays
+///                             sample it down. The scene ratio only sets the
+///                             atlas's normalized-UV layout, not symbol size —
+///                             cell_px/ppm is ratio-invariant — so ratio 3 is
+///                             correct for every device.)
+///   glyph{,-bold,-italic}.png / .json  — the SDF label atlases (resolution-
+///                             independent; one bake serves all zooms/densities).
+/// Private: tile57_bake_tree runs it after a tree bake. Best-effort per file.
+fn bakeAssetsDir(io: std.Io, out_dir: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const dir = try std.fmt.allocPrint(a, "{s}/_assets", .{out_dir});
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    // Sprite atlas at ratio 3 (single high-density; see the doc comment).
+    const spr = try bundle.spriteMlnBytes(io, a, "", bundle.DEFAULT_CSS, &[_][]const u8{}, 3.0);
+    try writeAsset(io, a, dir, "sprite@3x.png", spr.png);
+    try writeAsset(io, a, dir, "sprite@3x.json", spr.json);
+
+    // SDF glyph faces (resolution-independent).
+    const ft = @import("render").font;
+    const faces = [_]struct { name: []const u8, font: []const u8 }{
+        .{ .name = "glyph", .font = ft.notosans },
+        .{ .name = "glyph-bold", .font = ft.notosans_bold },
+        .{ .name = "glyph-italic", .font = ft.notosans_italic },
+    };
+    const cps = try glyph_sdf.defaultCodepoints(a);
+    for (faces) |f| {
+        var atlas = try glyph_sdf.build(a, f.font, cps, 32.0, 6);
+        const png = (try atlas.encodePng(a)) orelse return error.EncodeFailed;
+        const json = try glyphMetricsJson(a, &atlas);
+        try writeAsset(io, a, dir, try std.fmt.allocPrint(a, "{s}.png", .{f.name}), png);
+        try writeAsset(io, a, dir, try std.fmt.allocPrint(a, "{s}.json", .{f.name}), json);
+    }
+}
+
+fn writeAsset(io: std.Io, a: std.mem.Allocator, dir: []const u8, name: []const u8, bytes: []const u8) !void {
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, name });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
 /// Free every non-null buffer in *out and zero the struct. See tile57.h.
