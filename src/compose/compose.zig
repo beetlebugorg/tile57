@@ -229,6 +229,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // Every other contributing owner (seam, or fully-owned-but-no-native) is collected in face order.
     // `owned` = at least one cell's coverage face covers this tile (the partition says it SHOULD
     // render here) — so a caller can tell a transient/erroneous empty from true empty ocean.
+    const dbg = std.c.getenv("TILE57_COMPOSE_DEBUG") != null;
     var owned = false;
     var slots = std.ArrayList(u32).empty;
     var verbatim: ?usize = null; // cell index of the unique tile+buffer-owning cell
@@ -242,6 +243,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
         var grid = try geometry.plane.EdgeGrid.init(ta, face.owned, tileWidthE7(z));
         defer grid.deinit();
         const cls = grid.classify(tileClassifyBox(z, tx, ty));
+        if (dbg) std.debug.print("cmp z{d}/{d}/{d} tier{d} ci{d} cscl{d} cls={s} hasTile={}\n", .{ z, tx, ty, map.tier, ci, cscl, @tagName(cls), ownerHasTile(readers[ci], cscl, z, tx, ty) catch false });
         if (cls == .full) continue; // owns none of this tile
         owned = true;
         if (!(try ownerHasTile(readers[ci], cscl, z, tx, ty))) continue;
