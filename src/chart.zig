@@ -1453,15 +1453,30 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
     // healthy build prints nothing.)
     var failed: u32 = 0;
     var total: u32 = 0;
-    var empty: u32 = 0; // tiles that contributed NO geometry (fresh or cached)
+    var empty: u32 = 0; // tiles that contributed NO geometry this call
     var fresh: u32 = 0; // tiles portrayed this call (the rest were cache hits)
     var last_err: []const u8 = "";
+    // Empty tiles are NEVER cached: a truly-empty (open ocean) tile rebuilds
+    // for the cost of one partition classify, and a TRANSIENTLY empty one —
+    // whatever emptied it — must not become a hole that sticks until eviction.
+    // They still contribute to THIS call, so their arenas live until after
+    // assemble copies out of them.
+    var ephemeral = std.ArrayList(*GpuScene).empty;
+    defer for (ephemeral.items) |e| e.deinit();
     while (vt.next()) |t| {
         total += 1;
         const key = GeomKey{ .handle = @intFromPtr(src), .z = t.z, .x = t.x, .y = t.y };
         if (geomGet(key) == null) {
             fresh += 1;
             if (renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio)) |built| {
+                if (built.scene.vertices.len == 0 and built.scene.quads.len == 0) {
+                    empty += 1;
+                    if (ephemeral.append(sa, built)) |_| {
+                        parts.append(sa, built.scene) catch {};
+                        cands.appendSlice(sa, built.candidates) catch {};
+                    } else |_| built.deinit();
+                    continue;
+                }
                 geomPut(key, built);
             } else |err| {
                 failed += 1;
