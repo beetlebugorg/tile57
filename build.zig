@@ -32,7 +32,7 @@ fn addTess(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFiles(.{
         .root = b.path("vendor/libtess2/Source"),
         .files = &tess_sources,
-        .flags = &.{ "-std=gnu99", "-O2" },
+        .flags = &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" },
     });
 }
 
@@ -65,10 +65,10 @@ fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
 fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool, ios: bool) void {
     addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/lua/src"));
-    const shim_flags: []const []const u8 = if (posix) &.{"-DLUA_USE_POSIX"} else &.{};
+    const shim_flags: []const []const u8 = if (posix) &.{ "-DLUA_USE_POSIX", "-fno-sanitize=undefined" } else &.{"-fno-sanitize=undefined"};
     mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = shim_flags });
     var lua_flags = std.ArrayList([]const u8).empty;
-    lua_flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2" }) catch @panic("OOM");
+    lua_flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" }) catch @panic("OOM");
     if (posix) lua_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
     // iOS forbids system(3) (marked unavailable in the SDK). Stub loslib's
     // l_system hook to "no shell": os.execute() reports no shell available,
@@ -88,7 +88,7 @@ fn addSvgRaster(b: *std.Build, mod: *std.Build.Module) void {
     addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/nanosvg"));
     mod.addIncludePath(b.path("vendor/stb"));
-    mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2" } });
+    mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" } });
 }
 
 // Re-import the pure packages into a consumer module (engine, libtile57.a, the
