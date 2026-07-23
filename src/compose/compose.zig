@@ -364,6 +364,7 @@ pub const ComposeSource = struct {
         if (g_explain_count >= 80) return;
         const map = self.part.mapForZoom(z) orelse return;
         const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+        var spoke = false;
         for (map.faces) |face| {
             if (face.owned.len == 0) continue;
             const ci = face.index;
@@ -373,9 +374,24 @@ pub const ComposeSource = struct {
             defer grid.deinit();
             if (grid.classify(tileClassifyBox(z, tx, ty)) == .full) continue; // owns none of this tile
             g_explain_count += 1;
+            spoke = true;
             const has = ownerHasTile(self.readers[ci], self.part.cells[ci].cscl, z, tx, ty) catch false;
             const name = if (ci < self.names.len) self.names[ci] else "?";
             std.debug.print("empty-owned z{d}/{d}/{d}: {s} (1:{d}, tier{d}) hasTile={}\n", .{ z, tx, ty, name, self.part.cells[ci].cscl, map.tier, has });
+        }
+        if (spoke) return;
+        // NO face owns this tile at this tier — yet some cell's COVERAGE
+        // contains its centre: the tier map has a gap where the library has
+        // ground. That is a partition defect, and it must not be silent.
+        const tb = @import("tiles").tile.tileBoundsLonLat(z, tx, ty);
+        const cx: i64 = @intFromFloat(@round((tb[0] + tb[2]) * 0.5 * 1e7));
+        const cy: i64 = @intFromFloat(@round((tb[1] + tb[3]) * 0.5 * 1e7));
+        for (self.part.cells, 0..) |c, ci| {
+            if (!pointInCoverage(cx, cy, c.cov1)) continue;
+            g_explain_count += 1;
+            const name = if (ci < self.names.len) self.names[ci] else "?";
+            std.debug.print("UNOWNED-GAP z{d}/{d}/{d} (tier{d}): covered by {s} (1:{d}) but owned by NOBODY\n", .{ z, tx, ty, map.tier, name, c.cscl });
+            return; // one witness cell is enough
         }
     }
     /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can

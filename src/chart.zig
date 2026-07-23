@@ -1582,8 +1582,9 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
             if (mlt.decode(sa, bytes)) |layers| {
                 scene.replayTile(sa, surf, layers) catch {};
             } else |_| {}
-        } else if (res.owned) {
-            // Ground someone OWNS produced nothing: name the cell and why.
+        } else {
+            // Nothing served: say why — the owner with no tile, or charted
+            // ground the tier map gave to nobody. (True ocean stays silent.)
             src.explainEmpty(z, x, y);
         }
     }
