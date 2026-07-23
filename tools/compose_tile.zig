@@ -16,10 +16,11 @@ const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
 
-// Monotonic nanoseconds (std.time has no Timer in this toolchain).
+// Monotonic nanoseconds (std.time has no Timer in this toolchain). Via libc so
+// it runs on macOS too — the std.os.linux syscall dies with SIGSYS there.
 fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
