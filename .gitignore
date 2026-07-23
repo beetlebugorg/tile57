@@ -42,3 +42,4 @@ __pycache__/
 
 # render outputs dropped at the repo root during dev
 /a.pdf
+/zig-out-*/

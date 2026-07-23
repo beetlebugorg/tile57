@@ -15,8 +15,18 @@ const tess_sources = [_][]const u8{
     "bucketalloc.c", "dict.c", "geom.c", "mesh.c", "priorityq.c", "sweep.c", "tess.c",
 };
 
+// Cross-compiling to a non-macOS Apple target (`-Dtarget=aarch64-ios[-simulator]`)
+// needs that SDK's libc headers — Zig only bundles Apple headers for macOS. Pass
+// `--sysroot "$(xcrun --sdk iphoneos --show-sdk-path)"` and every C-compiling
+// module picks the headers up here (a no-op when no sysroot is given).
+fn addSysrootIncludes(b: *std.Build, mod: *std.Build.Module) void {
+    const sysroot = b.sysroot orelse return;
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+}
+
 fn addTess(b: *std.Build, mod: *std.Build.Module) void {
     mod.link_libc = true; // libtess2 uses assert.h/stdio.h/stdlib.h
+    addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/libtess2/Include"));
     mod.addIncludePath(b.path("vendor/libtess2/Source"));
     mod.addCSourceFiles(.{
@@ -52,18 +62,22 @@ fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
 // `posix`: define LUA_USE_POSIX (Unix). On Windows it must stay OFF — forcing it
 // pulls in <unistd.h>/dlopen; without it luaconf.h auto-selects LUA_USE_WINDOWS
 // from _WIN32. lua_shim.c is already portable (only getenv + ANSI stdio).
-fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool) void {
+fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool, ios: bool) void {
+    addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/lua/src"));
     const shim_flags: []const []const u8 = if (posix) &.{"-DLUA_USE_POSIX"} else &.{};
     mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = shim_flags });
-    const lua_flags: []const []const u8 = if (posix)
-        &.{ "-std=gnu99", "-DLUA_USE_POSIX", "-O2" }
-    else
-        &.{ "-std=gnu99", "-O2" };
+    var lua_flags = std.ArrayList([]const u8).empty;
+    lua_flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2" }) catch @panic("OOM");
+    if (posix) lua_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
+    // iOS forbids system(3) (marked unavailable in the SDK). Stub loslib's
+    // l_system hook to "no shell": os.execute() reports no shell available,
+    // os.execute(cmd) fails — nothing in the portrayal path shells out anyway.
+    if (ios) lua_flags.append(b.allocator, "-Dl_system(cmd)=((cmd)==0?0:-1)") catch @panic("OOM");
     mod.addCSourceFiles(.{
         .root = b.path("vendor/lua/src"),
         .files = &lua_sources,
-        .flags = lua_flags,
+        .flags = lua_flags.items,
     });
 }
 
@@ -71,6 +85,7 @@ fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool) void {
 // behind svgraster.c to a module. Used by the `sprite` module (sprite/pattern
 // atlas generation in the bake tool). Single-header C libs; need libc.
 fn addSvgRaster(b: *std.Build, mod: *std.Build.Module) void {
+    addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/nanosvg"));
     mod.addIncludePath(b.path("vendor/stb"));
     mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2" } });
@@ -293,7 +308,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s101", .module = s101_mod },
         },
     });
-    addLua(b, portray_mod, lua_posix);
+    addLua(b, portray_mod, lua_posix, target.result.os.tag == .ios);
     // Embed the S-101 Lua rules (216 framework + feature-class files) so the Lua
     // `require` searcher in lua_shim.c can load them from memory — tile57 portrays
     // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
@@ -417,6 +432,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib_root.zig"),
         .target = target,
         .optimize = optimize,
+        // iOS: std.debug's stack-trace machinery references
+        // _dyld_get_image_header_containing_address, which iOS' libdyld doesn't
+        // export — strip so the panic path never pulls it in.
+        .strip = target.result.os.tag == .ios,
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
