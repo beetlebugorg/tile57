@@ -118,6 +118,9 @@ pub fn worldAxisToTile(w: f64, scale: f64) u32 {
 
 const N_COMPOSE_LAYERS = mvt.VECTOR_LAYERS.len;
 
+/// explainEmpty print budget (process-wide) — see ComposeSource.explainEmpty.
+var g_explain_count: usize = 0;
+
 // The tile-index cover (nw..se) of an owner face's lon/lat bbox at zoom `scale = 1<<z`. The
 // on-demand composeTile culls candidate tiles through this exact box.
 const TileBBox = struct { tx0: u32, tx1: u32, ty0: u32, ty1: u32 };
@@ -325,6 +328,8 @@ pub const ComposeSource = struct {
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
     part: geometry.partition.Partition,
+    /// Cell names aligned with `readers` — diagnostics only (explainEmpty).
+    names: []const []const u8 = &.{},
     /// False when the partition had to be BUILT (no sidecar, or one that no
     /// longer matches this cell set). The C layer uses it to refresh the cache
     /// on disk, so a stale sidecar heals itself instead of costing every open.
@@ -348,6 +353,30 @@ pub const ComposeSource = struct {
     /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
     pub fn tile(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileResult {
         return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
+    }
+
+    /// Name, for the log, every cell whose owned face covers tile (z,tx,ty) —
+    /// and whether its archive HAS the tile. Called by the scene builder for a
+    /// tile that is OWNED yet served nothing: the one line that says which cell
+    /// swallowed the ground and why (no tile at this zoom vs clipped-empty).
+    /// Capped so an ocean of legitimate empties cannot flood a session.
+    pub fn explainEmpty(self: *ComposeSource, z: u8, tx: u32, ty: u32) void {
+        if (g_explain_count >= 80) return;
+        const map = self.part.mapForZoom(z) orelse return;
+        const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
+        for (map.faces) |face| {
+            if (face.owned.len == 0) continue;
+            const ci = face.index;
+            const bb = faceTileBBox(face, scale);
+            if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
+            var grid = geometry.plane.EdgeGrid.init(self.gpa, face.owned, tileWidthE7(z)) catch continue;
+            defer grid.deinit();
+            if (grid.classify(tileClassifyBox(z, tx, ty)) == .full) continue; // owns none of this tile
+            g_explain_count += 1;
+            const has = ownerHasTile(self.readers[ci], self.part.cells[ci].cscl, z, tx, ty) catch false;
+            const name = if (ci < self.names.len) self.names[ci] else "?";
+            std.debug.print("empty-owned z{d}/{d}/{d}: {s} (1:{d}, tier{d}) hasTile={}\n", .{ z, tx, ty, name, self.part.cells[ci].cscl, map.tier, has });
+        }
     }
     /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can
     /// load to skip the owned-face build.
@@ -691,9 +720,13 @@ fn finishOpen(
     if (!loaded) src.part = try geometry.partition.build(gpa, cells);
     src.part_loaded = loaded;
 
+    const names = try a.alloc([]const u8, shims.len);
+    for (shims, 0..) |sh, i| names[i] = sh.name;
+
     const fill_max = @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
     src.maps = maps;
     src.readers = readers;
+    src.names = names;
     src.owns_archives = owns_archives;
     src.minz = minz;
     src.maxz = maxz;

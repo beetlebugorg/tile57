@@ -1582,6 +1582,9 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
             if (mlt.decode(sa, bytes)) |layers| {
                 scene.replayTile(sa, surf, layers) catch {};
             } else |_| {}
+        } else if (res.owned) {
+            // Ground someone OWNS produced nothing: name the cell and why.
+            src.explainEmpty(z, x, y);
         }
     }
     out.scene = try gs.build(out.arena.allocator());
