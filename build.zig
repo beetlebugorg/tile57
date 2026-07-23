@@ -455,6 +455,16 @@ pub fn build(b: *std.Build) void {
     // (tile57_colortables_default / tile57_style_template).
     lib_mod.addImport("colorprofile_registry", colorprofile_registry);
     lib_mod.addImport("catalog", catalog_embed); // chart.renderView symbol/pattern store
+    // The engine's own git commit, embedded so the RUNTIME can state which
+    // engine a process actually linked (tile57_warmup logs it once): build
+    // provenance that survives any amount of checkout / link confusion.
+    {
+        const buildinfo = b.addOptions();
+        var code: u8 = 0;
+        const raw = b.runAllowFail(&.{ "git", "describe", "--always", "--dirty" }, &code, .ignore) catch "unknown";
+        buildinfo.addOption([]const u8, "commit", std.mem.trim(u8, raw, " \n\r\t"));
+        lib_mod.addImport("buildinfo", buildinfo.createModule());
+    }
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     // Bundle compiler-rt INTO the static archive. A non-Zig linker (the CGO host's gcc/clang,
     // `go test`) has no access to Zig's compiler-rt, so builtins the code references — e.g.

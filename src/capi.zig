@@ -1713,7 +1713,14 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
 /// Populate the process-global read-only registries (S-100 catalogue + linestyles) on
 /// the calling thread. Call ONCE on the main thread before opening/baking charts from
 /// worker threads, so concurrent bake/render is race-free. See tile57.h.
+var g_warmup_logged = false;
 export fn tile57_warmup() callconv(.c) void {
+    if (!g_warmup_logged) {
+        g_warmup_logged = true;
+        // Which engine THIS process actually linked — the one line that settles
+        // every "is the app running the latest?" question at runtime.
+        std.debug.print("tile57 engine @ {s}\n", .{@import("buildinfo").commit});
+    }
     chart.warmup();
 }
 
