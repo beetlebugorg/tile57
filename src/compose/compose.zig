@@ -558,17 +558,81 @@ fn cellOrderLt(x: LoadedCov, y: LoadedCov) bool {
     };
 }
 
-fn finishOpen(
-    gpa: std.mem.Allocator,
-    src: *ComposeSource,
+/// True when archive `x` serves strictly better than `y` for the SAME cell
+/// edition: wider zoom span first (an old bake predating fill-down/fill-up
+/// carries a narrower window — the classic stale twin), then more addressed
+/// tiles, then more tile bytes. All read from the PMTiles header, so the
+/// choice is a property of the archives — never of discovery order.
+fn servesBetter(x: *const pmtiles.Reader, y: *const pmtiles.Reader) bool {
+    if (x.header.min_zoom != y.header.min_zoom) return x.header.min_zoom < y.header.min_zoom;
+    if (x.header.max_zoom != y.header.max_zoom) return x.header.max_zoom > y.header.max_zoom;
+    if (x.header.num_addressed_tiles != y.header.num_addressed_tiles) return x.header.num_addressed_tiles > y.header.num_addressed_tiles;
+    return x.header.tile_data_length > y.header.tile_data_length;
+}
+
+/// Collapse SAME-(name, date) twin archives to ONE — the most capable. Two
+/// bakes of one cell edition carry the same DSID name+date (the date is the
+/// cell's, not the bake's), so the ownership tie-break cannot order them and
+/// used to fall through to input order: which twin won the ground depended on
+/// the host's directory enumeration, so the same library could render
+/// differently on two machines — with the stale twin's ground appearing only
+/// in the zoom window its older bake carried. Twins are adjacent after
+/// canonicalizeCellOrder; the arrays are compacted in place and the kept
+/// length returned. Distinct DATES are NOT collapsed: those are different
+/// editions, and the newer-date-first clip order already supersedes cleanly.
+fn dedupTwinArchives(
     readers: []const *pmtiles.Reader,
     maps: []const []align(std.heap.page_size_min) const u8,
     shims: []const LoadedCov,
+    owns_archives: bool,
+) usize {
+    const n = shims.len;
+    if (n < 2) return n;
+    const rs = @constCast(readers);
+    const ms = @constCast(maps);
+    const ss = @constCast(shims);
+    var w: usize = 0;
+    var i: usize = 0;
+    var dropped: usize = 0;
+    while (i < n) {
+        var best = i;
+        var j = i + 1;
+        while (j < n and std.mem.eql(u8, ss[j].name, ss[i].name) and std.mem.eql(u8, ss[j].date, ss[i].date)) : (j += 1) {
+            if (servesBetter(rs[j], rs[best])) best = j;
+        }
+        for (i..j) |k| {
+            if (k == best) continue;
+            dropped += 1;
+            if (owns_archives) {
+                rs[k].deinit();
+                filemap.unmap(ms[k]);
+            }
+        }
+        rs[w] = rs[best];
+        ss[w] = ss[best];
+        if (ms.len == n) ms[w] = ms[best];
+        w += 1;
+        i = j;
+    }
+    if (dropped > 0) std.debug.print("compose: {d} twin archive(s) of already-present cell editions dropped (kept the widest-serving)\n", .{dropped});
+    return w;
+}
+
+fn finishOpen(
+    gpa: std.mem.Allocator,
+    src: *ComposeSource,
+    readers_in: []const *pmtiles.Reader,
+    maps_in: []const []align(std.heap.page_size_min) const u8,
+    shims_in: []const LoadedCov,
     load_partition: ?[]const u8,
     owns_archives: bool,
 ) !*ComposeSource {
     const a = src.arena.allocator();
-    canonicalizeCellOrder(readers, maps, shims);
+    canonicalizeCellOrder(readers_in, maps_in, shims_in);
+    const kept = dedupTwinArchives(readers_in, maps_in, shims_in, owns_archives);
+    const readers = readers_in[0..kept];
+    const maps = if (maps_in.len == shims_in.len) maps_in[0..kept] else maps_in;
+    const shims = shims_in[0..kept];
     var minz: u8 = 255;
     var maxz: u8 = 0;
     var ubox = [4]f64{ 1e9, 1e9, -1e9, -1e9 }; // union coverage [w, s, e, n]
