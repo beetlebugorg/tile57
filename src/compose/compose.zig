@@ -649,6 +649,35 @@ fn finishOpen(
         ubox[3] = @max(ubox[3], sh.bounds[3]);
     }
 
+    // The composition-set facts, printed so a field report never has to be
+    // inferred: how many archives, how many DISTINCT cells (adjacent after the
+    // canonical name+date sort), how many names carry multiple editions, and
+    // how many archives start above z0 (a pre-fill-down bake — such an archive
+    // serves nothing at coarse zooms). Names of multi-edition groups follow,
+    // capped, so the claim is checkable against the actual files.
+    {
+        var distinct: usize = 0;
+        var multi: usize = 0;
+        var floored: usize = 0;
+        var i: usize = 0;
+        while (i < shims.len) {
+            var j = i + 1;
+            while (j < shims.len and std.mem.eql(u8, shims[j].name, shims[i].name)) : (j += 1) {}
+            distinct += 1;
+            if (j - i > 1) {
+                multi += 1;
+                if (multi <= 12) {
+                    std.debug.print("compose:   editions of {s}:", .{shims[i].name});
+                    for (i..j) |k| std.debug.print(" {s}(z{d}..{d})", .{ shims[k].date, readers[k].header.min_zoom, readers[k].header.max_zoom });
+                    std.debug.print("\n", .{});
+                }
+            }
+            i = j;
+        }
+        for (readers) |rp| floored += @intFromBool(rp.header.min_zoom > 0);
+        std.debug.print("compose: {d} archives, {d} distinct cells, {d} with multiple editions, {d} archives starting above z0\n", .{ shims.len, distinct, multi, floored });
+    }
+
     const cells = try toPlaneCells(a, shims);
     for (cells, readers) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
 
