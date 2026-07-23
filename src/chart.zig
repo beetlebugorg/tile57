@@ -1448,17 +1448,33 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
     var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    // A tile that fails to build or store leaves a tile-shaped NODATA hole in
+    // the scene, so it must never be silent: count and name the failures. (A
+    // healthy build prints nothing.)
+    var failed: u32 = 0;
+    var total: u32 = 0;
+    var last_err: []const u8 = "";
     while (vt.next()) |t| {
+        total += 1;
         const key = GeomKey{ .handle = @intFromPtr(src), .z = t.z, .x = t.x, .y = t.y };
         if (geomGet(key) == null) {
-            const built = renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio) catch continue;
-            geomPut(key, built);
+            if (renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio)) |built| {
+                geomPut(key, built);
+            } else |err| {
+                failed += 1;
+                last_err = @errorName(err);
+                continue;
+            }
         }
         if (geomGet(key)) |g| {
             parts.append(sa, g.scene) catch {};
             cands.appendSlice(sa, g.candidates) catch {};
+        } else {
+            failed += 1; // built but could not be cached (geomPut freed it)
+            last_err = "CachePutFailed";
         }
     }
+    if (failed > 0) std.debug.print("gpu scene z{d}: {d}/{d} tiles FAILED ({s}) — tile-shaped holes\n", .{ vt.z, failed, total, last_err });
 
     parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
