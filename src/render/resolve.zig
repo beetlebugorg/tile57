@@ -119,9 +119,14 @@ pub fn seabedToken(d: rs.DepthRange, m: *const Settings) []const u8 {
         if (band(d1, d2, 0)) return "DEPVS";
         return "DEPIT";
     }
-    if (band(d1, d2, m.deep_contour)) return "DEPDW";
+    // S-52 orders the ladder shallow <= safety <= deep. Un-normalized, a
+    // safety contour DEEPER than the deep contour let the deep test match
+    // first and shaded genuinely UNSAFE water in the white deep shade.
+    const eff_deep = @max(m.deep_contour, m.safety_contour);
+    const eff_shallow = @min(m.shallow_contour, m.safety_contour);
+    if (band(d1, d2, eff_deep)) return "DEPDW";
     if (band(d1, d2, m.safety_contour)) return "DEPMD";
-    if (band(d1, d2, m.shallow_contour)) return "DEPMS";
+    if (band(d1, d2, eff_shallow)) return "DEPMS";
     if (band(d1, d2, 0)) return "DEPVS";
     return "DEPIT";
 }

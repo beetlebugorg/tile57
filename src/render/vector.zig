@@ -351,6 +351,8 @@ pub const VectorSurface = struct {
     /// holding it costs one Op header per call, not a second copy of the scene.
     ops: std.ArrayListUnmanaged(Op) = .empty,
 
+    eff_safety: ?f64 = null,
+
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
         .beginFeature = beginFeature,
@@ -365,7 +367,20 @@ pub const VectorSurface = struct {
         // Render surface: the engine walks complex-linestyle periods at this scale.
         // (No store_complex_run — this surface WALKS/renders runs, never stores.)
         .size_scale = sizeScale,
+        .set_contour_ladder = setContourLadder,
     };
+
+    fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
+        const self = sp(ctx);
+        self.eff_safety = rs.Surface.effectiveSafety(self.settings.safety_contour, ladder);
+    }
+
+    /// Settings with the SNAPPED safety contour (see gpu.zig's twin).
+    fn effSettings(self: anytype) resolve.Settings {
+        var m2 = self.settings.*;
+        if (self.eff_safety) |v| m2.safety_contour = v;
+        return m2;
+    }
 
     pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, cb: *const CSurface) VectorSurface {
         return .{
@@ -638,7 +653,8 @@ pub const VectorSurface = struct {
         // A depth area re-shades LIVE against the mariner's contours (SEABED01) — the
         // baked token carries the bake context's contours, not this mariner's. Keep the
         // baked transparency: the swap is of the colour, not of the fill's opacity.
-        const name = if (depth) |d| resolve.seabedToken(d, self.settings) else ft.name;
+        var effm = self.effSettings();
+        const name = if (depth) |d| resolve.seabedToken(d, &effm) else ft.name;
         var col = self.resolveColor(name);
         col.a = ft.alpha;
         try self.push(.area, .{ .fill = .{ .rings = wr, .color = ccolor(col), .even_odd = 0 } });
@@ -738,7 +754,10 @@ pub const VectorSurface = struct {
         // the style, so mirror that toggle here.
         if (!self.settings.show_inform_callouts and std.mem.eql(u8, name, "INFORM01")) return;
         var eff = name;
-        if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
+        if (danger_depth) |dd| {
+            const sc = self.eff_safety orelse self.settings.safety_contour;
+            eff = if (dd > sc) "DANGER02" else "DANGER01";
+        }
         const s = store.get(eff) orelse return;
         // Draw as an atlas sprite when the host supports it; else tessellate.
         // Symbols never participate in declutter (S-52 icon-allow-overlap — they

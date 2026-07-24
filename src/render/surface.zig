@@ -163,7 +163,32 @@ pub const Surface = struct {
         /// The baked tile stays display-independent (the disk cache survives a
         /// display change). Null on render surfaces (they walk, not store).
         store_complex_run: ?*const fn (*anyopaque, style: []const u8, color: ColorToken, width_px: f64, arc0: f64, run: []const TilePoint) anyerror!void = null,
+        /// Present on RENDER surfaces: the tile's available depth-contour
+        /// ladder (distinct DEPCN valdco + DEPARE drval1 values, unsorted).
+        /// The surface snaps the mariner's safety contour to the next DEEPER
+        /// value in it (S-52: a safety contour absent from the data promotes
+        /// to the next deeper one; the shading split and the bold line must
+        /// coincide). replayTile calls this per tile before emitting; the
+        /// slice is valid only for the call. Null on the bake encoder.
+        set_contour_ladder: ?*const fn (*anyopaque, ladder: []const f64) void = null,
     };
+
+    pub fn setContourLadder(self: Surface, ladder: []const f64) void {
+        if (self.vtable.set_contour_ladder) |f| f(self.ptr, ladder);
+    }
+
+    /// The S-52 effective safety contour against a tile's ladder: the least
+    /// available value >= the mariner's, else the deepest available, else the
+    /// mariner's own (no ladder to snap to). Shared by every render surface.
+    pub fn effectiveSafety(safety: f64, ladder: []const f64) f64 {
+        var next: ?f64 = null;
+        var deepest: ?f64 = null;
+        for (ladder) |v| {
+            if (deepest == null or v > deepest.?) deepest = v;
+            if (v >= safety and (next == null or v < next.?)) next = v;
+        }
+        return next orelse (deepest orelse safety);
+    }
 
     pub fn beginScene(self: Surface, z: u8) anyerror!void {
         return self.vtable.beginScene(self.ptr, z);
@@ -209,3 +234,17 @@ pub const Surface = struct {
         return self.vtable.store_complex_run.?(self.ptr, style, color, width_px, arc0, run);
     }
 };
+
+test "effectiveSafety: next-deeper snap, deepest fallback, empty ladder" {
+    const t = @import("std").testing;
+    const ladder = [_]f64{ 2, 5.4, 9.1, 18.2, 30 };
+    // exact hit stays
+    try t.expectEqual(@as(f64, 9.1), Surface.effectiveSafety(9.1, &ladder));
+    // between rungs -> next DEEPER
+    try t.expectEqual(@as(f64, 18.2), Surface.effectiveSafety(10, &ladder));
+    try t.expectEqual(@as(f64, 5.4), Surface.effectiveSafety(2.2, &ladder));
+    // deeper than everything -> deepest available
+    try t.expectEqual(@as(f64, 30), Surface.effectiveSafety(50, &ladder));
+    // no ladder -> the mariner's own value
+    try t.expectEqual(@as(f64, 7), Surface.effectiveSafety(7, &.{}));
+}

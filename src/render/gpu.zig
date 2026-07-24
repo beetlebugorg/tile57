@@ -401,6 +401,10 @@ pub const GpuSurface = struct {
     candidates: std.ArrayList(LabelCandidate) = .empty,
     // Keyed by (face_idx << 16 | gid): glyph ids are per-face (outline fallback).
     glyph_cache: std.AutoHashMapUnmanaged(u32, []const []const cv.Point) = .empty,
+    /// The current tile's EFFECTIVE safety contour (mariner's value snapped to
+    /// the tile's ladder — see Surface.set_contour_ladder). Drives live water
+    /// shading, the danger-symbol swap, and the bold safety-contour line.
+    eff_safety: ?f64 = null,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -414,7 +418,21 @@ pub const GpuSurface = struct {
         .endFeature = endFeature,
         .endScene = endScene,
         .size_scale = sizeScale,
+        .set_contour_ladder = setContourLadder,
     };
+
+    fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
+        const self = sp(ctx);
+        self.eff_safety = rs.Surface.effectiveSafety(self.settings.safety_contour, ladder);
+    }
+
+    /// Settings with the SNAPPED safety contour — what live shading resolves
+    /// against, so the split always coincides with a contour that exists.
+    fn effSettings(self: *GpuSurface) resolve.Settings {
+        var m = self.settings.*;
+        if (self.eff_safety) |v| m.safety_contour = v;
+        return m;
+    }
 
     pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, zoom: f64) !GpuSurface {
         return .{
@@ -542,10 +560,16 @@ pub const GpuSurface = struct {
 
     fn endFeature(_: *anyopaque) anyerror!void {}
 
-    fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, _: ?rs.DepthRange) anyerror!void {
+    fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
-        try self.push(.area, self.rgba(token), .{ .fill = .{ .rings = rings, .rule = .nonzero } });
+        // Depth areas re-resolve their shade against the LIVE mariner contours
+        // (snapped): the baked token was fixed at bake defaults, and using it
+        // froze the app's water shading — contour changes moved only danger
+        // symbols. Mirrors vector/pixel (which always did this).
+        var eff = self.effSettings();
+        const name = if (depth) |d| resolve.seabedToken(d, &eff) else token;
+        try self.push(.area, self.rgba(name), .{ .fill = .{ .rings = rings, .rule = .nonzero } });
     }
 
     /// An area-fill pattern: the polygon interior, plus the cell to tile over it.
@@ -590,10 +614,24 @@ pub const GpuSurface = struct {
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
+        // THE safety contour (S-52 §10.5.5): the depth contour matching the
+        // effective safety value draws bold and solid — the boundary between
+        // safe and unsafe water must be unmistakable, and it must be the SAME
+        // contour the shading split sits on (both use the snapped value).
+        var w = width_px;
+        var dsh = dash;
+        if (valdco) |v| {
+            if (self.eff_safety) |eff| {
+                if (@abs(v - eff) < 0.01) {
+                    w = @max(width_px * 2.5, 2.0);
+                    dsh = .solid;
+                }
+            }
+        }
         try self.push(.line, self.rgba(token), .{ .stroke = .{
             .lines = lines,
-            .half_w = @floatCast(@max(width_px, 0.5) * 0.5),
-            .dash = dash,
+            .half_w = @floatCast(@max(w, 0.5) * 0.5),
+            .dash = dsh,
         } });
         // A depth-contour value rides the line as a MAP-aligned, tangent-rotated
         // label candidate — the same placement the vector path emits.
@@ -756,7 +794,10 @@ pub const GpuSurface = struct {
         // style, so mirror that toggle here (as vector.zig / pixel.zig do).
         if (!self.settings.show_inform_callouts and std.mem.eql(u8, name, "INFORM01")) return;
         var eff = name;
-        if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
+        if (danger_depth) |dd| {
+            const sc = self.eff_safety orelse self.settings.safety_contour;
+            eff = if (dd > sc) "DANGER02" else "DANGER01";
+        }
         const s = store.get(eff) orelse return;
         try self.emitSprite(.symbol, eff, s, at, rot_deg, scale, self.refDev(), rot_north);
     }

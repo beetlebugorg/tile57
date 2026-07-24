@@ -192,6 +192,8 @@ pub const PixelSurface = struct {
     cur: rs.FeatureMeta = .{},
     cur_visible: bool = true,
 
+    eff_safety: ?f64 = null,
+
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
         .beginFeature = beginFeature,
@@ -204,7 +206,20 @@ pub const PixelSurface = struct {
         .endFeature = endFeature,
         .endScene = endScene,
         .size_scale = sizeScale,
+        .set_contour_ladder = setContourLadder,
     };
+
+    fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
+        const self = sp(ctx);
+        self.eff_safety = rs.Surface.effectiveSafety(self.settings.safety_contour, ladder);
+    }
+
+    /// Settings with the SNAPPED safety contour (see gpu.zig's twin).
+    fn effSettings(self: anytype) resolve.Settings {
+        var m2 = self.settings.*;
+        if (self.eff_safety) |v| m2.safety_contour = v;
+        return m2;
+    }
 
     /// `a` should be the same scratch arena the engine allocates geometry
     /// from — buffered ops live until endScene, exactly like the tile
@@ -286,7 +301,8 @@ pub const PixelSurface = struct {
         const ft = rs.fillToken(token);
         // A depth area re-shades LIVE against the mariner's contours (SEABED01) — the
         // baked token carries the bake context's contours, not this mariner's.
-        const name = if (depth) |d| resolve.seabedToken(d, self.settings) else ft.name;
+        var effm = self.effSettings();
+        const name = if (depth) |d| resolve.seabedToken(d, &effm) else ft.name;
         var col = self.resolveColor(name);
         col.a = ft.alpha;
         try self.push(.area, .{ .fill = .{ .rings = try self.toCanvas(rings), .color = col } });
@@ -386,7 +402,10 @@ pub const PixelSurface = struct {
         // Live danger swap (mirrors mariner.pointSymbolImage): a danger lying
         // DEEPER than the mariner's safety contour draws the subdued DANGER02.
         var eff = name;
-        if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
+        if (danger_depth) |dd| {
+            const sc = self.eff_safety orelse self.settings.safety_contour;
+            eff = if (dd > sc) "DANGER02" else "DANGER01";
+        }
         const s = store.get(eff) orelse return; // unknown glyph: skip (the tile
         // path shows QUESMRK1 for unmapped CLASSES; an unmapped symbol NAME is
         // a catalogue gap and drawing nothing beats a wrong mark)

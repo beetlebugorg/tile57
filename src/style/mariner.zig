@@ -295,13 +295,17 @@ pub fn seabedTokenExpr(b: B, m: *const Settings) !Value {
             b.s("DEPIT"),
         });
     }
+    // shallow <= safety <= deep, per S-52 — see resolve.seabedToken (the
+    // engine twin of this expression; keep the two in step).
+    const eff_deep = @max(m.deep_contour, m.safety_contour);
+    const eff_shallow = @min(m.shallow_contour, m.safety_contour);
     return b.arr(&.{
         b.s("case"),
-        try band(b, d1, d2, m.deep_contour),
+        try band(b, d1, d2, eff_deep),
         b.s("DEPDW"),
         try band(b, d1, d2, m.safety_contour),
         b.s("DEPMD"),
-        try band(b, d1, d2, m.shallow_contour),
+        try band(b, d1, d2, eff_shallow),
         b.s("DEPMS"),
         try band(b, d1, d2, 0.0),
         b.s("DEPVS"),
