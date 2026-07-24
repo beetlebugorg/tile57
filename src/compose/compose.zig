@@ -136,11 +136,18 @@ fn faceTileBBox(face: geometry.plane.OwnedCell, scale: f64) TileBBox {
     };
     const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // NW: min lon, max lat
     const w_br = tile.lonLatToWorld(fb[2], fb[1]); // SE: max lon, min lat
+    // EXPANDED one tile each side: lonLatToWorld runs through the SYSTEM libm
+    // (@tan/@cos/@log), and macOS and iOS libm differ by ulps — one ulp at a
+    // face edge used to flip the @floor into tile indices and silently drop an
+    // entire ROW of tiles from a big face (whole-tile voids, one OS only).
+    // This bbox is only a CULL — the integer classifier decides exactly — so
+    // widening it removes the OS's math library from the outcome entirely.
+    const max_t: u32 = @intFromFloat(scale - 1);
     return .{
-        .tx0 = worldAxisToTile(w_tl[0], scale),
-        .tx1 = worldAxisToTile(w_br[0], scale),
-        .ty0 = worldAxisToTile(w_tl[1], scale),
-        .ty1 = worldAxisToTile(w_br[1], scale),
+        .tx0 = worldAxisToTile(w_tl[0], scale) -| 1,
+        .tx1 = @min(worldAxisToTile(w_br[0], scale) + 1, max_t),
+        .ty0 = worldAxisToTile(w_tl[1], scale) -| 1,
+        .ty1 = @min(worldAxisToTile(w_br[1], scale) + 1, max_t),
     };
 }
 
@@ -167,14 +174,14 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) geometry.plane.Box {
 // ancestor), clip its features to the owner's projected owned face, per-layer concat in
 // VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
 // the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
-fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, map: *const geometry.partition.BandMap, readers: []const *pmtiles.Reader, slots: []const u32, reach_cells: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
+fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, map: *const geometry.partition.BandMap, readers: []const *pmtiles.Reader, slots: []const u32, reach_cells: []const u32, z: u8, tx: u32, ty: u32, deep_overscale: bool) !?[]u8 {
     const compose = clip;
     var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
     for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
     for (slots) |slot| {
         const face = map.faces[slot];
         const ci = face.index;
-        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty)) orelse continue;
+        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty, deep_overscale)) orelse continue;
         const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
         if (face_px.len == 0) continue;
         for (layers) |layer| {
@@ -188,7 +195,7 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
     // clipFeatureToFace exception, minus a face. Everything else in the tile
     // (ground the cell doesn't own here) stays with its owners.
     for (reach_cells) |ci| {
-        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty)) orelse continue;
+        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty, false)) orelse continue;
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
             for (layer.features) |feat| {
@@ -302,7 +309,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     };
     if (slots.items.len == 0 and reach.items.len == 0) return .{ .tile = null, .owned = owned };
 
-    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, reach.items, z, tx, ty)) orelse return .{ .tile = null, .owned = owned };
+    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, reach.items, z, tx, ty, false)) orelse return .{ .tile = null, .owned = owned };
     // want_gzip → match the archive's stored (gzipped) bytes; else hand back the raw MLT.
     const bytes = if (want_gzip) try pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
     return .{ .tile = bytes, .owned = true };
@@ -773,12 +780,19 @@ fn decodeTile(a: std.mem.Allocator, tt: pmtiles.TileType, raw: []const u8) ![]mv
 // ancestor tile with the features scaled up into this descendant (overscale). null = nothing
 // reachable (below native, or a coarse-only zoom beyond the fill-up window, where the client
 // camera + MapLibre overzoom take over). Everything is arena-allocated in `a`.
-fn ownerTile(a: std.mem.Allocator, r: *pmtiles.Reader, cscl: i32, z: u8, tx: u32, ty: u32) !?[]mvt.DecodedLayer {
+/// `deep_overscale` widens the ancestor window from the band fill-up (+1 zoom)
+/// to DEEP_OVERSCALE_DZ — the cross-BAND compose fallback: where the governing
+/// band has no data at all, the best coarser chart serves scaled up (the
+/// paper-chart / ECDIS overscale behaviour) instead of a void.
+const DEEP_OVERSCALE_DZ: u8 = 8;
+
+fn ownerTile(a: std.mem.Allocator, r: *pmtiles.Reader, cscl: i32, z: u8, tx: u32, ty: u32, deep_overscale: bool) !?[]mvt.DecodedLayer {
     const tt = r.header.tile_type;
     if (try r.getTile(a, z, tx, ty)) |raw| return try decodeTile(a, tt, raw);
 
     const nmax = band.bandZooms(band.bandOf(cscl)).max;
-    if (z <= nmax or z > nmax + band.FILLUP_DZ or z > band.FILLUP_CEIL) return null;
+    const max_serve: u8 = if (deep_overscale) nmax +| DEEP_OVERSCALE_DZ else @min(nmax + band.FILLUP_DZ, band.FILLUP_CEIL);
+    if (z <= nmax or z > max_serve) return null;
     const shift: u5 = @intCast(z - nmax);
     const anc = (try r.getTile(a, nmax, tx >> shift, ty >> shift)) orelse return null;
     const layers = try decodeTile(a, tt, anc);
@@ -799,9 +813,13 @@ pub fn bandReach(cscl: i32) u8 {
 // tile-major compositor's discovery pass uses this to reproduce the compose predicate, and
 // the two passes must agree on which tiles compose.
 fn ownerHasTile(r: *pmtiles.Reader, cscl: i32, z: u8, tx: u32, ty: u32) !bool {
+    return ownerHasTileDeep(r, cscl, z, tx, ty, false);
+}
+fn ownerHasTileDeep(r: *pmtiles.Reader, cscl: i32, z: u8, tx: u32, ty: u32, deep_overscale: bool) !bool {
     if ((try r.getCompressed(z, tx, ty)) != null) return true;
     const nmax = band.bandZooms(band.bandOf(cscl)).max;
-    if (z <= nmax or z > nmax + band.FILLUP_DZ or z > band.FILLUP_CEIL) return false;
+    const max_serve: u8 = if (deep_overscale) nmax +| DEEP_OVERSCALE_DZ else @min(nmax + band.FILLUP_DZ, band.FILLUP_CEIL);
+    if (z <= nmax or z > max_serve) return false;
     const shift: u5 = @intCast(z - nmax);
     return (try r.getCompressed(nmax, tx >> shift, ty >> shift)) != null;
 }
