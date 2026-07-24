@@ -61,6 +61,12 @@ pub const Vertex = extern struct {
     /// bricks): a rotated view must turn it. Zero means screen-upright.
     map_align: u8,
     _pad: [2]u8 = .{ 0, 0 },
+    /// Straight-alpha RGBA, resolved for the scene's palette. Per-VERTEX (not
+    /// per-range) so a host can draw contiguous ranges of DIFFERENT colours in
+    /// one call — at coastal zooms the per-range uniform+draw churn measured
+    /// as the frame-rate cap on a phone. Range.color remains as advisory
+    /// metadata.
+    color: [4]u8 = .{ 0, 0, 0, 255 },
 };
 
 /// One textured-quad vertex — a symbol sprite or an SDF glyph. `x,y` is the
@@ -1202,7 +1208,6 @@ pub const GpuSurface = struct {
         const prev = &ranges.items[ranges.items.len - 1];
         if (prev.prim == prim and prev.atlas == atlas and prev.paint_key == op.paint_key and
             prev.kind == op.kind and prev.pattern == op.pattern and
-            std.mem.eql(u8, &prev.color, &op.color) and
             prev.first + prev.count == first)
         {
             prev.count += @intCast(count);
@@ -1251,6 +1256,7 @@ pub const GpuSurface = struct {
             .scamin = op.scamin,
             .disp_cat = op.disp_cat,
             .map_align = op.map_align,
+            .color = op.color,
         };
     }
 
@@ -1353,17 +1359,38 @@ pub fn assemble(arena: Allocator, scratch: Allocator, scenes: []const Scene) !Sc
             try ranges.append(scratch, nr);
         }
     }
-    // Cross-tile paint order: one global sort by the engine's key. Ties (same
-    // class/priority in different tiles) draw in any order — same paint band.
-    std.mem.sort(Range, ranges.items, {}, struct {
+    // Cross-tile paint order: one global STABLE sort by the engine's key (ties
+    // keep tile order, so the layout below is deterministic).
+    std.sort.block(Range, ranges.items, {}, struct {
         fn lt(_: void, a: Range, b: Range) bool {
             return a.paint_key < b.paint_key;
         }
     }.lt);
+    // Re-lay the index and quad streams IN SORTED RANGE ORDER, so ranges that
+    // draw identically sit contiguously and a host can merge whole paint bands
+    // into single draw calls. Without this, the global sort interleaves tiles
+    // and same-band ranges land at scattered offsets — a phone-measured
+    // frame-rate cap of thousands of draws where dozens suffice. One extra
+    // linear copy, on the build thread.
+    var indices2 = try scratch.alloc(u32, indices.items.len);
+    var quads2 = try scratch.alloc(Quad, quads.items.len);
+    var ipos: u32 = 0;
+    var qpos: u32 = 0;
+    for (ranges.items) |*r| {
+        if (r.prim == .triangles) {
+            @memcpy(indices2[ipos..][0..r.count], indices.items[r.first..][0..r.count]);
+            r.first = ipos;
+            ipos += r.count;
+        } else {
+            @memcpy(quads2[qpos..][0..r.count], quads.items[r.first..][0..r.count]);
+            r.first = qpos;
+            qpos += r.count;
+        }
+    }
     return .{
         .vertices = try arena.dupe(Vertex, verts.items),
-        .indices = try arena.dupe(u32, indices.items),
-        .quads = try arena.dupe(Quad, quads.items),
+        .indices = try arena.dupe(u32, indices2[0..ipos]),
+        .quads = try arena.dupe(Quad, quads2[0..qpos]),
         .ranges = try arena.dupe(Range, ranges.items),
         .patterns = try arena.dupe(PatternCell, patterns.items),
     };
@@ -2122,11 +2149,15 @@ test "gpu: the C scene structs match their tile57.h layout" {
     // misread — wrong colours, wrong offsets, no error anywhere. These numbers
     // came from a C program compiled against the header (sizeof + offsetof), so
     // a Zig-side change that breaks the C view fails here instead of on a chart.
-    try testing.expectEqual(@as(usize, 24), @sizeOf(Vertex));
+    try testing.expectEqual(@as(usize, 28), @sizeOf(Vertex));
     try testing.expectEqual(@as(usize, 8), @offsetOf(Vertex, "ox"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(Vertex, "scamin"));
     try testing.expectEqual(@as(usize, 20), @offsetOf(Vertex, "disp_cat"));
     try testing.expectEqual(@as(usize, 21), @offsetOf(Vertex, "map_align"));
+    // colour at 24: a Metal host MUST read this struct with packed_float2
+    // members — natural float2 alignment pads the stride to 32 and every
+    // vertex after the first reads garbage.
+    try testing.expectEqual(@as(usize, 24), @offsetOf(Vertex, "color"));
 
     try testing.expectEqual(@as(usize, 24), @sizeOf(Range));
     try testing.expectEqual(@as(usize, 0), @offsetOf(Range, "first"));

@@ -741,6 +741,9 @@ typedef struct {
     uint8_t disp_cat;  /* S-52 display category: 0 base, 1 standard, 2 other */
     uint8_t map_align; /* nonzero = chart-relative: a rotated view must turn it */
     uint8_t _pad[2];
+    uint8_t color[4]; /* straight-alpha RGBA, per-vertex — contiguous ranges of
+                       * different colours can merge into ONE draw; the range's
+                       * color field is advisory metadata now */
 } tile57_gpu_vertex;
 
 /* What a range draws. The host picks a pipeline from this and nothing more —
