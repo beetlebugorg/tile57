@@ -518,8 +518,10 @@ pub const StreamWriter = struct {
             .max_lon_e7 = opts.max_lon_e7,
             .max_lat_e7 = opts.max_lat_e7,
             .center_zoom = opts.center_zoom orelse min_z,
-            .center_lon_e7 = @divTrunc(opts.min_lon_e7 + opts.max_lon_e7, 2),
-            .center_lat_e7 = @divTrunc(opts.min_lat_e7 + opts.max_lat_e7, 2),
+            // Midpoints in i64: two e7 longitudes near the antimeridian sum
+            // past i32 (±1.8e9 each) — overflowed the bake for such cells.
+            .center_lon_e7 = @intCast(@divTrunc(@as(i64, opts.min_lon_e7) + opts.max_lon_e7, 2)),
+            .center_lat_e7 = @intCast(@divTrunc(@as(i64, opts.min_lat_e7) + opts.max_lat_e7, 2)),
         };
         var hbuf: [HEADER_LEN]u8 = undefined;
         header.serialize(&hbuf);

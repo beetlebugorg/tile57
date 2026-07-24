@@ -225,26 +225,21 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) geometry.plane.Box {
 /// (the ground the finer bands left bare within one tile), served with deep
 /// overscale. Regions are exact-integer boolean results, so the fill can never
 /// double-draw over finer-band ground.
-const ExtraFill = struct { ci: u32, region: []const []const geometry.plane.Pt };
+const ExtraFill = struct { ci: u32, region: []const []const geometry.plane.Pt, deep: bool };
 
-fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, map: *const geometry.partition.BandMap, readers: []const *pmtiles.Reader, slots: []const u32, reach_cells: []const u32, extras: []const ExtraFill, z: u8, tx: u32, ty: u32, deep_overscale: bool) !?[]u8 {
+fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, contribs: []const ExtraFill, reach_cells: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
     const compose = clip;
     var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
     for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
-    for (extras) |ex| {
-        const layers = (try ownerTile(ta, readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, true)) orelse continue;
+    // EVERY contribution arrives with its region already rect-clipped to the
+    // tile, so projection, clipping and memory here are bounded by the TILE —
+    // never by the face (whole-cell faces at coarse tiers are hundreds of
+    // thousands of points; projecting them per tile made per-tile arenas grow
+    // by hundreds of MB, whose doubling requests FAILED on a memory-limited
+    // device: the field's 'compose FAILED (OutOfMemory)').
+    for (contribs) |ex| {
+        const layers = (try ownerTile(ta, readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, ex.deep)) orelse continue;
         const face_px = try compose.projectFace(ta, ex.region, z, tx, ty);
-        if (face_px.len == 0) continue;
-        for (layers) |layer| {
-            const li = layerIndex(layer.name) orelse continue;
-            for (layer.features) |feat| try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
-        }
-    }
-    for (slots) |slot| {
-        const face = map.faces[slot];
-        const ci = face.index;
-        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty, deep_overscale)) orelse continue;
-        const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
         if (face_px.len == 0) continue;
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
@@ -328,7 +323,6 @@ fn rectClipRings(a: std.mem.Allocator, rings: []const []const geometry.plane.Pt,
 }
 
 pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, want_gzip: bool) !TileResult {
-    const compose = clip;
     const map = part.mapForZoom(z) orelse return .{ .tile = null, .owned = false };
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
 
@@ -345,41 +339,31 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // render here) — so a caller can tell a transient/erroneous empty from true empty ocean.
     const dbg = std.c.getenv("TILE57_COMPOSE_DEBUG") != null;
     var owned = false;
-    var slots = std.ArrayList(u32).empty;
+    var contribs = std.ArrayList(ExtraFill).empty;
     var verbatim: ?usize = null; // cell index of the unique tile+buffer-owning cell
-    for (map.faces, 0..) |face, slot| {
+    const cb0 = tileClassifyBox(z, tx, ty);
+    for (map.faces) |face| {
         if (face.owned.len == 0) continue;
         const ci = face.index;
         const cscl = part.cells[ci].cscl;
         const bb = faceTileBBox(face, scale);
         if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
 
-        var grid = try geometry.plane.EdgeGrid.init(ta, face.owned, tileWidthE7(z));
-        defer grid.deinit();
-        const cls = grid.classify(tileClassifyBox(z, tx, ty));
-        if (dbg) {
-            var fb2 = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
-            for (face.owned) |ring| for (ring) |p| {
-                const lo = @as(f64, @floatFromInt(p.x)) / 1e7;
-                const la = @as(f64, @floatFromInt(p.y)) / 1e7;
-                fb2[0] = @min(fb2[0], lo);
-                fb2[1] = @min(fb2[1], la);
-                fb2[2] = @max(fb2[2], lo);
-                fb2[3] = @max(fb2[3], la);
-            };
-            std.debug.print("cmp z{d}/{d}/{d} tier{d} ci{d} cscl{d} cls={s} hasTile={} facebb=({d:.1},{d:.1})..({d:.1},{d:.1})\n", .{ z, tx, ty, map.tier, ci, cscl, @tagName(cls), ownerHasTile(readers[ci], cscl, z, tx, ty) catch false, fb2[0], fb2[1], fb2[2], fb2[3] });
-        }
-        if (cls == .full) continue; // owns none of this tile
+        // Rect-clip the face to the tile FIRST: everything downstream —
+        // classify, projection, booleans, memory — is bounded by the tile,
+        // never by the face (whole-cell faces at coarse tiers OOM'd a
+        // memory-limited device tile by tile).
+        const clipped = rectClipRings(ta, face.owned, cb0) catch continue;
+        if (dbg) std.debug.print("cmp z{d}/{d}/{d} tier{d} ci{d} cscl{d} clippedRings={d} hasTile={}\n", .{ z, tx, ty, map.tier, ci, cscl, clipped.len, ownerHasTile(readers[ci], cscl, z, tx, ty) catch false });
+        if (clipped.len == 0) continue; // owns none of this tile
         owned = true;
         if (!(try ownerHasTile(readers[ci], cscl, z, tx, ty))) continue;
-        if (cls == .empty) { // owns the whole tile: its face projection can't be empty
+        var grid = try geometry.plane.EdgeGrid.init(ta, clipped, tileWidthE7(z));
+        defer grid.deinit();
+        if (grid.classify(cb0) == .empty) { // owns the whole tile (buffer included)
             verbatim = ci;
-            try slots.append(ta, @intCast(slot));
-            continue;
         }
-        const face_px = try compose.projectFace(ta, face.owned, z, tx, ty);
-        if (face_px.len == 0) continue;
-        try slots.append(ta, @intCast(slot));
+        try contribs.append(ta, .{ .ci = @intCast(ci), .region = clipped, .deep = false });
     }
 
     // Reach ring (spec §2.3, the cross-TILE half): a cell owning ground at this
@@ -393,7 +377,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     {
         var contributed = try ta.alloc(bool, part.cells.len);
         @memset(contributed, false);
-        for (slots.items) |slot| contributed[map.faces[slot].index] = true;
+        for (contribs.items) |c| contributed[c.ci] = true;
         var seen = try ta.alloc(bool, part.cells.len);
         @memset(seen, false);
         for (map.faces) |face| {
@@ -429,7 +413,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // overscale (the paper-chart / ECDIS behaviour, and what the partition
     // docs promise: "the ground is owned by a coarser band, reached by
     // querying that band's map").
-    var extras = std.ArrayList(ExtraFill).empty;
+    // (fill contributions append into `contribs` with deep=true)
     if (verbatim == null) fill: {
         const cb = tileClassifyBox(z, tx, ty);
         const rect = [_]geometry.plane.Pt{
@@ -442,10 +426,8 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
             rings[0] = try ta.dupe(geometry.plane.Pt, &rect);
             break :blk rings;
         };
-        for (slots.items) |slot| {
-            const sub = rectClipRings(ta, map.faces[slot].owned, cb) catch break :fill;
-            if (sub.len == 0) continue;
-            residual = geometry.boolean.compute(ta, residual, sub, .diff) catch break :fill;
+        for (contribs.items) |c| {
+            residual = geometry.boolean.compute(ta, residual, c.region, .diff) catch break :fill;
             if (residual.len == 0) break :fill; // governing band covers the whole tile
         }
         var mi: usize = 0;
@@ -463,17 +445,17 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
                 if (clipped.len == 0) continue;
                 const region = geometry.boolean.compute(ta, clipped, residual, .intersect) catch continue;
                 if (region.len == 0) continue;
-                try extras.append(ta, .{ .ci = @intCast(ci), .region = region });
+                try contribs.append(ta, .{ .ci = @intCast(ci), .region = region, .deep = true });
                 residual = geometry.boolean.compute(ta, residual, region, .diff) catch break;
             }
         }
-        if (extras.items.len > 0) owned = true;
+        if (contribs.items.len > 0) owned = true;
     }
 
-    if (slots.items.len == 0 and reach.items.len == 0 and extras.items.len == 0)
+    if (contribs.items.len == 0 and reach.items.len == 0)
         return .{ .tile = null, .owned = owned };
 
-    const enc = (try composeSeamTile(ta, part, map, readers, slots.items, reach.items, extras.items, z, tx, ty, false)) orelse return .{ .tile = null, .owned = owned };
+    const enc = (try composeSeamTile(ta, part, readers, contribs.items, reach.items, z, tx, ty)) orelse return .{ .tile = null, .owned = owned };
     // want_gzip → match the archive's stored (gzipped) bytes; else hand back the raw MLT.
     const bytes = if (want_gzip) try pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
     return .{ .tile = bytes, .owned = true };
