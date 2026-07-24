@@ -20,10 +20,11 @@ const errors = @import("errors"); // the engine error taxonomy + describe()
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
 const colorprofile_registry = @import("colorprofile_registry");
 
-// smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the live
-// tile/chart path makes many small, short-lived allocations; page_allocator
-// would mmap each one. Matches the bake CLI's allocator choice.
-const gpa = std.heap.smp_allocator;
+// c_allocator, not smp_allocator: smp never returns freed slabs to the OS, so
+// the host app's footprint sticks at the worst transient peak forever. libc
+// malloc unmaps large blocks on free and Instruments can see it. Hot paths
+// allocate through arenas, so per-alloc speed is not the bottleneck.
+const gpa = std.heap.c_allocator;
 const Chart = chart.Chart;
 
 // Wall-clock time for "today" date resolution in tile57_style_build. Zig 0.16

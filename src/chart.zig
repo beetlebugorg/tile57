@@ -36,10 +36,13 @@ const style = @import("style"); // displayDenomZ (the physical display-scale for
 const cell_coverage = @import("coverage"); // per-cell M_COVR coverage embedded in archive metadata
 const compose_mod = @import("compose"); // the runtime compositor (compose-backed view renders)
 
-// smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
-// makes many small, short-lived allocations (tile cache, cell dupes, index
-// lists); page_allocator would mmap each one. Matches the bake CLI + C ABI.
-const gpa = std.heap.smp_allocator;
+// c_allocator, not smp_allocator: smp's per-CPU slab freelists never return
+// pages to the OS, so a long-lived host process's footprint ratchets up to the
+// worst transient peak (compose bursts) and never recovers. libc malloc frees
+// large blocks (arena chunks) back to the OS and is visible to Instruments.
+// Hot-path allocation flows through arenas, so per-alloc speed is not the
+// bottleneck. Matches the bake CLI + C ABI.
+const gpa = std.heap.c_allocator;
 
 // The S-52 colour tables, parsed once per process from the embedded profile (see
 // Chart.viewColorsRef). Immutable after init — every chart shares these, so the
@@ -628,12 +631,15 @@ fn attachEmbeddedCoverage(src: *Chart) void {
             gpa.destroy(ar);
         }
     }.f;
+    // Gunzip with gpa and free after decode: the JSON TEXT (bigger than the
+    // decoded rings) must not sit in the retained coverage arena as garbage.
     const json: []const u8 = switch (h.internal_compression) {
         .none => raw,
-        .gzip => gzip.decompress(a, raw) catch return drop(cov_arena),
+        .gzip => gzip.decompress(gpa, raw) catch return drop(cov_arena),
         else => return drop(cov_arena),
     };
-    const cov = (cell_coverage.decodeFromMetadata(a, json) catch null) orelse return drop(cov_arena);
+    defer if (h.internal_compression == .gzip) gpa.free(json);
+    const cov = (cell_coverage.decodeFromMetadata(a, gpa, json) catch null) orelse return drop(cov_arena);
     if (cov.cscl == 0 and cov.cov1.len == 0) return drop(cov_arena);
     src.cell_cov = cov;
     src.coverage_arena = cov_arena;
@@ -1613,7 +1619,7 @@ fn renderComposeGpuSceneInner(src: *compose_mod.ComposeSource, lon: f64, lat: f6
 
     parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
-    out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
+    out.scene = try render.gpu.assemble(out.arena.allocator(), sa, parts.items);
     return out;
 }
 
@@ -2445,7 +2451,7 @@ pub const Chart = struct {
         // re-shaping (that was cached per tile).
         parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
-        out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
+        out.scene = try render.gpu.assemble(out.arena.allocator(), sa, parts.items);
         return out;
     }
 

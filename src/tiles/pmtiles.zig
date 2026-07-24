@@ -281,7 +281,12 @@ pub fn deserializeDir(a: Allocator, buf: []const u8) ![]Entry {
 pub const Reader = struct {
     bytes: []const u8,
     header: Header,
-    root: []Entry,
+    // Decoded lazily on the first tile probe: a composed library opens thousands
+    // of archives, most never touched in a session — an eager root decode cost
+    // ~80MB and seconds of open time across a full ENC library. Until first use
+    // the arena has no chunks at all.
+    root: []Entry = &.{},
+    root_done: bool = false,
     arena: std.heap.ArenaAllocator,
     // Deserialized leaf directories by leaf offset. A compositor probes a reader once
     // per (tile, pass); re-deserializing the same leaf into the arena on EVERY probe
@@ -291,11 +296,26 @@ pub const Reader = struct {
 
     pub fn init(gpa: Allocator, bytes: []const u8) !Reader {
         const header = try Header.parse(bytes);
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        const a = arena.allocator();
-        const root_raw = try maybeDecompress(a, bytes[@intCast(header.root_dir_offset)..][0..@intCast(header.root_dir_length)], header.internal_compression);
-        const root = try deserializeDir(a, root_raw);
-        return .{ .bytes = bytes, .header = header, .root = root, .arena = arena };
+        return .{ .bytes = bytes, .header = header, .arena = std.heap.ArenaAllocator.init(gpa) };
+    }
+
+    // Decompress with the arena's CHILD allocator and free after decode, so the
+    // arena retains only the Entry slices — an arena'd gzip output would sit as
+    // dead weight in every touched reader for the life of the process.
+    fn decodeDir(r: *Reader, off: usize, len: usize) ![]Entry {
+        const scratch = r.arena.child_allocator;
+        const comp = r.header.internal_compression;
+        const raw = try maybeDecompress(scratch, r.bytes[off..][0..len], comp);
+        defer if (comp != .none) scratch.free(@constCast(raw));
+        return deserializeDir(r.arena.allocator(), raw);
+    }
+
+    fn ensureRoot(r: *Reader) ![]Entry {
+        if (!r.root_done) {
+            r.root = try r.decodeDir(@intCast(r.header.root_dir_offset), @intCast(r.header.root_dir_length));
+            r.root_done = true;
+        }
+        return r.root;
     }
 
     pub fn deinit(r: *Reader) void {
@@ -313,7 +333,7 @@ pub const Reader = struct {
     /// Return the raw (still tile-compressed) bytes for a tile, or null if absent.
     pub fn getCompressed(r: *Reader, z: u8, x: u32, y: u32) !?[]const u8 {
         const tid = zxyToTileId(z, x, y);
-        var dir = r.root;
+        var dir = try r.ensureRoot();
         var depth: u8 = 0;
         while (depth < 4) : (depth += 1) {
             const idx = findEntry(dir, tid) orelse return null;
@@ -324,8 +344,7 @@ pub const Reader = struct {
                 const gop = try r.leaves.getOrPut(a, e.offset);
                 if (!gop.found_existing) {
                     errdefer _ = r.leaves.remove(e.offset);
-                    const raw = try maybeDecompress(a, r.bytes[@intCast(r.header.leaf_dir_offset + e.offset)..][0..e.length], r.header.internal_compression);
-                    gop.value_ptr.* = try deserializeDir(a, raw);
+                    gop.value_ptr.* = try r.decodeDir(@intCast(r.header.leaf_dir_offset + e.offset), e.length);
                 }
                 dir = gop.value_ptr.*;
                 continue;

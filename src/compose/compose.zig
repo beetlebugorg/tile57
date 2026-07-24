@@ -266,7 +266,7 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
     // until encode peaked at 2.5 GB on a many-cell coarse tile — a guaranteed
     // per-tile OutOfMemory on a memory-limited device, forever, for exactly
     // those tiles.
-    var sub = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    var sub = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer sub.deinit();
     for (contribs) |ex| {
         // EVERYTHING transient for this contributor — its decoded tile, the
@@ -461,7 +461,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // The whole residual computation lives in a throwaway arena: the boolean
     // chain's intermediates over hundreds of contributors were ~100 MB per fat
     // tile in the tile arena; only surviving fill regions are copied out.
-    var fill_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    var fill_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer fill_arena.deinit();
     const fa = fill_arena.allocator();
     if (verbatim == null and !no_fill) fill: {
@@ -480,7 +480,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
         // in the arena (hundreds of steps on a fat tile); every 16 steps the
         // small surviving residual is copied into the drained side and the
         // other resets, bounding the chain's peak to ~16 steps of scratch.
-        var fill_arena2 = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        var fill_arena2 = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer fill_arena2.deinit();
         var arenas = [2]*std.heap.ArenaAllocator{ &fill_arena, &fill_arena2 };
         var cur_a: usize = 0;
@@ -766,12 +766,15 @@ fn openSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8
             filemap.unmap(map);
             continue;
         };
-        const meta = readMetaJson(a, rp) orelse {
+        // Metadata JSON text + parser scratch go through gpa and are freed
+        // here; only the decoded coverage lands in the compositor's arena.
+        const meta = readMetaJson(gpa, rp) orelse {
             rp.deinit();
             filemap.unmap(map);
             continue;
         };
-        const cc = (coverage.decodeFromMetadata(a, meta) catch null) orelse {
+        defer if (rp.header.internal_compression == .gzip) gpa.free(meta);
+        const cc = (coverage.decodeFromMetadata(a, gpa, meta) catch null) orelse {
             rp.deinit();
             filemap.unmap(map);
             continue;

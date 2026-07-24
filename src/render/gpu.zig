@@ -1107,6 +1107,11 @@ pub const GpuSurface = struct {
     pub fn build(self: *GpuSurface, arena: Allocator) !Scene {
         std.mem.sort(Op, self.ops.items, {}, opLt);
 
+        // Grow the working lists in the SCRATCH allocator, not `arena`: an
+        // ArrayList growing inside an arena strands every outgrown copy there
+        // for the arena's lifetime — for a cached tile scene that ~doubled the
+        // resident cost of every entry. The final slices are duped into `arena`
+        // at the end (everything is by-value, so relocation is safe).
         var verts = std.ArrayList(Vertex).empty;
         var indices = std.ArrayList(u32).empty;
         var quads = std.ArrayList(Quad).empty;
@@ -1120,11 +1125,11 @@ pub const GpuSurface = struct {
             if (op.geom == .sprite) {
                 const sq = op.geom.sprite;
                 const first = quads.items.len;
-                try self.emitSpriteGeom(arena, &quads, op, sq.anchor, sq.quads, sq.weight);
+                try self.emitSpriteGeom(self.a, &quads, op, sq.anchor, sq.quads, sq.weight);
                 const count = quads.items.len - first;
                 if (count == 0) continue;
                 if (coalesce(&ranges, op, .quads, sq.atlas, first, count)) continue;
-                try ranges.append(arena, .{
+                try ranges.append(self.a, .{
                     .first = @intCast(first),
                     .count = @intCast(count),
                     .paint_key = op.paint_key,
@@ -1138,15 +1143,15 @@ pub const GpuSurface = struct {
             }
             const first = indices.items.len;
             switch (op.geom) {
-                .fill => |f| try self.emitFill(arena, &verts, &indices, op, f.rings, f.rule),
-                .stroke => |s| try self.emitStroke(arena, &verts, &indices, op, s.lines, s.half_w),
-                .mark => |m| try self.emitMarkGeom(arena, &verts, &indices, op, m.anchor, m.rings, m.rule),
+                .fill => |f| try self.emitFill(self.a, &verts, &indices, op, f.rings, f.rule),
+                .stroke => |s| try self.emitStroke(self.a, &verts, &indices, op, s.lines, s.half_w),
+                .mark => |m| try self.emitMarkGeom(self.a, &verts, &indices, op, m.anchor, m.rings, m.rule),
                 .sprite => unreachable,
             }
             const count = indices.items.len - first;
             if (count == 0) continue;
             if (coalesce(&ranges, op, .triangles, .none, first, count)) continue;
-            try ranges.append(arena, .{
+            try ranges.append(self.a, .{
                 .first = @intCast(first),
                 .count = @intCast(count),
                 .paint_key = op.paint_key,
@@ -1166,10 +1171,10 @@ pub const GpuSurface = struct {
             dst.* = .{ .w = src.w, .h = src.h, .rgba = try arena.dupe(u8, src.rgba) };
         }
         return .{
-            .vertices = try verts.toOwnedSlice(arena),
-            .indices = try indices.toOwnedSlice(arena),
-            .quads = try quads.toOwnedSlice(arena),
-            .ranges = try ranges.toOwnedSlice(arena),
+            .vertices = try arena.dupe(Vertex, verts.items),
+            .indices = try arena.dupe(u32, indices.items),
+            .quads = try arena.dupe(Quad, quads.items),
+            .ranges = try arena.dupe(Range, ranges.items),
             .patterns = pats,
         };
     }
@@ -1322,7 +1327,9 @@ pub const GpuSurface = struct {
 /// tessellate) happened once per tile; this is memcpy + an offset fixup + a sort.
 /// Everything is copied into `arena`, so the result is independent of the input
 /// scenes' lifetimes (a cached tile may be evicted after).
-pub fn assemble(arena: Allocator, scenes: []const Scene) !Scene {
+pub fn assemble(arena: Allocator, scratch: Allocator, scenes: []const Scene) !Scene {
+    // Working lists grow in `scratch` (stale growth copies die with it); only
+    // the final slices are duped into `arena` — see GpuSurface.build.
     var verts = std.ArrayList(Vertex).empty;
     var indices = std.ArrayList(u32).empty;
     var quads = std.ArrayList(Quad).empty;
@@ -1333,17 +1340,17 @@ pub fn assemble(arena: Allocator, scenes: []const Scene) !Scene {
         const ibase: u32 = @intCast(indices.items.len);
         const qbase: u32 = @intCast(quads.items.len);
         const pbase: u32 = @intCast(patterns.items.len);
-        try verts.appendSlice(arena, s.vertices);
-        for (s.indices) |idx| try indices.append(arena, idx + vbase);
-        try quads.appendSlice(arena, s.quads);
+        try verts.appendSlice(scratch, s.vertices);
+        for (s.indices) |idx| try indices.append(scratch, idx + vbase);
+        try quads.appendSlice(scratch, s.quads);
         // Pattern pixels live in the source scene's arena; copy them so the result
-        // outlives it.
-        for (s.patterns) |cell| try patterns.append(arena, .{ .w = cell.w, .h = cell.h, .rgba = try arena.dupe(u8, cell.rgba) });
+        // outlives it (straight into `arena` — pixels are duped exactly once).
+        for (s.patterns) |cell| try patterns.append(scratch, .{ .w = cell.w, .h = cell.h, .rgba = try arena.dupe(u8, cell.rgba) });
         for (s.ranges) |r| {
             var nr = r;
             nr.first = r.first + (if (r.prim == .triangles) ibase else qbase);
             if (r.pattern != NO_PATTERN) nr.pattern = r.pattern + pbase;
-            try ranges.append(arena, nr);
+            try ranges.append(scratch, nr);
         }
     }
     // Cross-tile paint order: one global sort by the engine's key. Ties (same
@@ -1354,11 +1361,11 @@ pub fn assemble(arena: Allocator, scenes: []const Scene) !Scene {
         }
     }.lt);
     return .{
-        .vertices = try verts.toOwnedSlice(arena),
-        .indices = try indices.toOwnedSlice(arena),
-        .quads = try quads.toOwnedSlice(arena),
-        .ranges = try ranges.toOwnedSlice(arena),
-        .patterns = try patterns.toOwnedSlice(arena),
+        .vertices = try arena.dupe(Vertex, verts.items),
+        .indices = try arena.dupe(u32, indices.items),
+        .quads = try arena.dupe(Quad, quads.items),
+        .ranges = try arena.dupe(Range, ranges.items),
+        .patterns = try arena.dupe(PatternCell, patterns.items),
     };
 }
 
@@ -1916,7 +1923,7 @@ const TextFixture = struct {
     fn full(self: *TextFixture, a: Allocator) !Scene {
         const geom = try self.gs.build(a);
         const labels = try self.labelScene(a);
-        return assemble(a, &.{ geom, labels });
+        return assemble(a, a, &.{ geom, labels });
     }
     /// One label alone: the baseline a crowded scene is measured against.
     fn one(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings, text: []const u8) !Scene {
