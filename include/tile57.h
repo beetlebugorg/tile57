@@ -1256,6 +1256,12 @@ tile57_status tile57_style_template(tile57_scheme scheme, const char *source_til
  * host answering an OS memory warning. Call with NO scene build in flight. */
 void tile57_trim_caches(void);
 
+/* GPU-scene ABI self-description: sizeof(tile57_gpu_vertex) |
+ * sizeof(tile57_gpu_quad)<<8 | sizeof(tile57_gpu_range)<<16. Compare against
+ * your compiled sizeofs at startup — a header/library skew otherwise renders
+ * garbage (sheared vertex stream), not an error. */
+uint32_t tile57_abi_gpu_layout(void);
+
 void tile57_warmup(void);
 
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,
