@@ -880,6 +880,7 @@ const BakeFileCtx = struct {
     rules_dir: ?[]const u8,
     io: std.Io,
     ok: []bool,
+    ms: []i64, // per-cell wall time — the bake profiles itself (slowest cells printed at the end)
     progress: BakeProgress,
     progress_ctx: ?*anyopaque,
     done: std.atomic.Value(u32),
@@ -888,6 +889,11 @@ const BakeFileCtx = struct {
 };
 
 fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
+    const t0 = std.Io.Clock.awake.now(ctx.io);
+    defer {
+        const t1 = std.Io.Clock.awake.now(ctx.io);
+        ctx.ms[i] = @intCast(@divTrunc(t1.nanoseconds - t0.nanoseconds, 1_000_000));
+    }
     const arc = (bakeChartBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
     defer freeBytes(arc);
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ctx.out_paths[i], .data = arc }) catch return;
@@ -930,7 +936,10 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
     const ok = gpa.alloc(bool, in_paths.len) catch return 0;
     defer gpa.free(ok);
     @memset(ok, false);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false) };
+    const cell_ms = gpa.alloc(i64, in_paths.len) catch return 0;
+    defer gpa.free(cell_ms);
+    @memset(cell_ms, 0);
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false) };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     if (n <= 1) {
@@ -945,6 +954,28 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
     var count: usize = 0;
     for (ok) |o| {
         if (o) count += 1;
+    }
+    // The bake profiles itself: total per-cell work and the slowest cells,
+    // every run — 'the bake is slow' must never again need external tooling
+    // to answer WHERE.
+    {
+        var total: i64 = 0;
+        for (cell_ms) |m| total += m;
+        std.debug.print("bake profile: {d} cells, {d} ms cell-work total\n", .{ in_paths.len, total });
+        var shown: usize = 0;
+        while (shown < 10) : (shown += 1) {
+            var best: usize = 0;
+            var best_ms: i64 = -1;
+            for (cell_ms, 0..) |m, mi| {
+                if (m > best_ms) {
+                    best_ms = m;
+                    best = mi;
+                }
+            }
+            if (best_ms <= 0) break;
+            std.debug.print("  slow cell: {d} ms  {s}\n", .{ best_ms, in_paths[best] });
+            cell_ms[best] = -1;
+        }
     }
     return count;
 }
