@@ -285,6 +285,48 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
 /// server wants — the HTTP layer gzips on the wire). gpa-owned; null if no cell owns this tile. This
 /// is the runtime compositor: with the partition loaded once, serving a tile is a classify plus
 /// either one memcpy/decompress or one decode/clip/encode, not a whole-district pass.
+/// Sutherland–Hodgman rect clip of a ring bag: cuts boolean operands to tile
+/// size in LINEAR time, so the cross-band fill's cost per tile is bounded by
+/// the tile — never by the face. A tier-0 face is a whole coastal cell
+/// (hundreds of thousands of points); exact booleans against it requested
+/// oversized allocations that FAILED tile-by-tile on a memory-limited device,
+/// at exactly the coarse zooms.
+fn rectClipRings(a: std.mem.Allocator, rings: []const []const geometry.plane.Pt, box: geometry.plane.Box) ![][]geometry.plane.Pt {
+    var out = std.ArrayList([]geometry.plane.Pt).empty;
+    for (rings) |ring| {
+        var cur = std.ArrayList(geometry.plane.Pt).empty;
+        try cur.appendSlice(a, ring);
+        inline for (.{
+            .{ .axis = 0, .lim = "min_x", .keep_ge = true },
+            .{ .axis = 0, .lim = "max_x", .keep_ge = false },
+            .{ .axis = 1, .lim = "min_y", .keep_ge = true },
+            .{ .axis = 1, .lim = "max_y", .keep_ge = false },
+        }) |cl| {
+            if (cur.items.len == 0) break;
+            const lim: i64 = @field(box, cl.lim);
+            var nxt = std.ArrayList(geometry.plane.Pt).empty;
+            const npts = cur.items.len;
+            for (cur.items, 0..) |p, k| {
+                const q = cur.items[(k + 1) % npts];
+                const pv: i64 = if (cl.axis == 0) p.x else p.y;
+                const qv: i64 = if (cl.axis == 0) q.x else q.y;
+                const pin = if (cl.keep_ge) pv >= lim else pv <= lim;
+                const qin = if (cl.keep_ge) qv >= lim else qv <= lim;
+                if (pin) try nxt.append(a, p);
+                if (pin != qin) {
+                    const t = @as(f64, @floatFromInt(lim - pv)) / @as(f64, @floatFromInt(qv - pv));
+                    const ox: i64 = if (cl.axis == 0) lim else p.x + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.x - p.x)))));
+                    const oy: i64 = if (cl.axis == 1) lim else p.y + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.y - p.y)))));
+                    try nxt.append(a, .{ .x = ox, .y = oy });
+                }
+            }
+            cur = nxt;
+        }
+        if (cur.items.len >= 3) try out.append(a, try cur.toOwnedSlice(a));
+    }
+    return out.toOwnedSlice(a);
+}
+
 pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, want_gzip: bool) !TileResult {
     const compose = clip;
     const map = part.mapForZoom(z) orelse return .{ .tile = null, .owned = false };
@@ -401,7 +443,9 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
             break :blk rings;
         };
         for (slots.items) |slot| {
-            residual = geometry.boolean.compute(ta, residual, map.faces[slot].owned, .diff) catch break :fill;
+            const sub = rectClipRings(ta, map.faces[slot].owned, cb) catch break :fill;
+            if (sub.len == 0) continue;
+            residual = geometry.boolean.compute(ta, residual, sub, .diff) catch break :fill;
             if (residual.len == 0) break :fill; // governing band covers the whole tile
         }
         var mi: usize = 0;
@@ -415,7 +459,9 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
                 const bb = faceTileBBox(face, scale);
                 if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
                 if (!(try ownerHasTileDeep(readers[ci], part.cells[ci].cscl, z, tx, ty, true))) continue;
-                const region = geometry.boolean.compute(ta, face.owned, residual, .intersect) catch continue;
+                const clipped = rectClipRings(ta, face.owned, cb) catch continue;
+                if (clipped.len == 0) continue;
+                const region = geometry.boolean.compute(ta, clipped, residual, .intersect) catch continue;
                 if (region.len == 0) continue;
                 try extras.append(ta, .{ .ci = @intCast(ci), .region = region });
                 residual = geometry.boolean.compute(ta, residual, region, .diff) catch break;

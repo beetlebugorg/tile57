@@ -1577,7 +1577,17 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     gs.setTile(z, x, y);
     const surf = gs.asSurface();
     try surf.beginScene(z);
-    if (src.tile(sa, z, x, y)) |res| {
+    // A per-tile OutOfMemory reclaims the biggest pool and retries once —
+    // without this, coarse tiles vanished one by one on a memory-limited
+    // device while every counter upstream read healthy.
+    const tile_res = src.tile(sa, z, x, y) catch |err| blk: {
+        if (err == error.OutOfMemory) {
+            geomDropAll();
+            break :blk src.tile(sa, z, x, y);
+        }
+        break :blk err;
+    };
+    if (tile_res) |res| {
         if (res.tile) |bytes| {
             if (mlt.decode(sa, bytes)) |layers| {
                 scene.replayTile(sa, surf, layers) catch |err| {
