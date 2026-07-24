@@ -307,7 +307,37 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
             if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .tile = try gpa.dupe(u8, blob), .owned = true };
         } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .tile = try gpa.dupe(u8, raw), .owned = true };
     };
-    if (slots.items.len == 0 and reach.items.len == 0) return .{ .tile = null, .owned = owned };
+    if (slots.items.len == 0 and reach.items.len == 0) {
+        // NOTHING at the governing band serves this tile — walk DOWN the tier
+        // stack and serve the best coarser band's chart, overscaled: the
+        // paper-chart / ECDIS behaviour, and what the partition docs promise
+        // ("the ground is owned by a coarser band, reached by querying that
+        // band's map"). Without this, ground between a band's cells renders
+        // VOID at zooms its own band cannot serve — cells at the wrong zooms.
+        var mi: usize = 0;
+        while (mi < part.maps.len and &part.maps[mi] != map) mi += 1;
+        var ci_map = mi + 1;
+        while (ci_map < part.maps.len) : (ci_map += 1) {
+            const cmap = &part.maps[ci_map];
+            var cslots = std.ArrayList(u32).empty;
+            for (cmap.faces, 0..) |face, slot| {
+                if (face.owned.len == 0) continue;
+                const ci = face.index;
+                const bb = faceTileBBox(face, scale);
+                if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
+                var grid = try geometry.plane.EdgeGrid.init(ta, face.owned, tileWidthE7(z));
+                defer grid.deinit();
+                if (grid.classify(tileClassifyBox(z, tx, ty)) == .full) continue;
+                if (!(try ownerHasTileDeep(readers[ci], part.cells[ci].cscl, z, tx, ty, true))) continue;
+                try cslots.append(ta, @intCast(slot));
+            }
+            if (cslots.items.len == 0) continue;
+            const cenc = (try composeSeamTile(ta, part, cmap, readers, cslots.items, &.{}, z, tx, ty, true)) orelse continue;
+            const cbytes = if (want_gzip) try pmtiles.StreamWriter.gzipTile(gpa, cenc) else try gpa.dupe(u8, cenc);
+            return .{ .tile = cbytes, .owned = true };
+        }
+        return .{ .tile = null, .owned = owned };
+    }
 
     const enc = (try composeSeamTile(ta, part, map, readers, slots.items, reach.items, z, tx, ty, false)) orelse return .{ .tile = null, .owned = owned };
     // want_gzip → match the archive's stored (gzipped) bytes; else hand back the raw MLT.
