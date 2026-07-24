@@ -1249,6 +1249,10 @@ tile57_status tile57_style_template(tile57_scheme scheme, const char *source_til
  * baking charts from worker threads, so those globals are fully populated first and
  * concurrent bake/render is race-free (the allocator is thread-safe and the portrayal
  * context is thread-local). Cheap and safe to call more than once. */
+/* Drop the engine's reclaimable caches (per-tile GPU geometry pool). For a
+ * host answering an OS memory warning. Call with NO scene build in flight. */
+void tile57_trim_caches(void);
+
 void tile57_warmup(void);
 
 /* Free ANY buffer the engine returned (tiles, style JSON, the scamin array,

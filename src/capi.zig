@@ -1715,6 +1715,13 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
 /// the calling thread. Call ONCE on the main thread before opening/baking charts from
 /// worker threads, so concurrent bake/render is race-free. See tile57.h.
 var g_warmup_logged = false;
+/// Drop the engine's reclaimable caches (the per-tile GPU geometry pool —
+/// the largest). For a host answering an OS memory warning. MUST be called
+/// with no scene build in flight (the caches feed the build in progress).
+export fn tile57_trim_caches() callconv(.c) void {
+    chart.geomDropAll();
+}
+
 export fn tile57_warmup() callconv(.c) void {
     if (!g_warmup_logged) {
         g_warmup_logged = true;
