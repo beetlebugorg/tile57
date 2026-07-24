@@ -1332,11 +1332,20 @@ fn sharedGpuAtlases(ratio: f64) SharedAtlases {
                 g_atlas_glyphs_bold = built.glyphs_bold;
                 g_atlas_glyphs_italic = built.glyphs_italic;
                 g_atlas_ok = true;
-            } else |_| {
+                g_atlas_state.store(2, .release);
+            } else |err| {
                 aa.deinit();
                 gpa.destroy(aa);
+                // A FAILED build must not latch: one transient OutOfMemory here
+                // used to null the atlases for the rest of the process — every
+                // symbol then TESSELLATES (the no-atlas fallback): black-blob
+                // symbols, quads=0, and 5-10x the vertices, whose memory
+                // pressure feeds the very OOM that started it. Reset to 0 so
+                // the next scene retries; report every failure.
+                std.debug.print("gpu atlases: build FAILED ({s}) — will retry next scene; symbols tessellate until then\n", .{@errorName(err)});
+                geomDropCold(); // reclaim (walk-safe: never the in-flight walk's tiles)
+                g_atlas_state.store(0, .release);
             }
-            g_atlas_state.store(2, .release);
             break;
         }
         std.atomic.spinLoopHint();

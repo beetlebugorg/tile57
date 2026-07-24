@@ -221,6 +221,21 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) geometry.plane.Box {
 // ancestor), clip its features to the owner's projected owned face, per-layer concat in
 // VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
 // the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
+/// Deep-dupe feature properties into `a`: clip borrows them from the decoded
+/// tile, and the per-contributor decode arena is reset immediately after the
+/// clip — anything still borrowed would dangle.
+fn dupeProps(a: std.mem.Allocator, props: []const mvt.Prop) ![]const mvt.Prop {
+    const out = try a.alloc(mvt.Prop, props.len);
+    for (props, 0..) |p, i| out[i] = .{
+        .key = try a.dupe(u8, p.key),
+        .value = switch (p.value) {
+            .string => |sv| .{ .string = try a.dupe(u8, sv) },
+            else => p.value,
+        },
+    };
+    return out;
+}
+
 /// One cross-band fill contribution: cell `ci`'s features, clipped to `region`
 /// (the ground the finer bands left bare within one tile), served with deep
 /// overscale. Regions are exact-integer boolean results, so the fill can never
@@ -237,13 +252,26 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
     // thousands of points; projecting them per tile made per-tile arenas grow
     // by hundreds of MB, whose doubling requests FAILED on a memory-limited
     // device: the field's 'compose FAILED (OutOfMemory)').
+    // Each contributor's DECODED tile lives only for its own clip: decode into
+    // a per-contributor sub-arena, deep-dupe the (borrowed) properties of the
+    // clipped survivors into `ta`, reset. Holding every contributor's decode
+    // until encode peaked at 2.5 GB on a many-cell coarse tile — a guaranteed
+    // per-tile OutOfMemory on a memory-limited device, forever, for exactly
+    // those tiles.
+    var sub = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer sub.deinit();
     for (contribs) |ex| {
-        const layers = (try ownerTile(ta, readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, ex.deep)) orelse continue;
+        _ = sub.reset(.retain_capacity);
+        const layers = (try ownerTile(sub.allocator(), readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, ex.deep)) orelse continue;
         const face_px = try compose.projectFace(ta, ex.region, z, tx, ty);
         if (face_px.len == 0) continue;
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
-            for (layer.features) |feat| try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
+            for (layer.features) |feat| {
+                const before = buckets[li].items.len;
+                try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
+                for (buckets[li].items[before..]) |*nf| nf.properties = try dupeProps(ta, nf.properties);
+            }
         }
     }
     // Reach-ring cells: no owned ground in this tile, but their light sector
@@ -252,14 +280,15 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
     // clipFeatureToFace exception, minus a face. Everything else in the tile
     // (ground the cell doesn't own here) stays with its owners.
     for (reach_cells) |ci| {
-        const layers = (try ownerTile(ta, readers[ci], part.cells[ci].cscl, z, tx, ty, false)) orelse continue;
+        _ = sub.reset(.retain_capacity);
+        const layers = (try ownerTile(sub.allocator(), readers[ci], part.cells[ci].cscl, z, tx, ty, false)) orelse continue;
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
             for (layer.features) |feat| {
                 if (feat.geom_type != .linestring or !compose.isLightFigure(feat)) continue;
                 const parts = try ta.alloc([]const mvt.Point, feat.parts.len);
                 for (feat.parts, 0..) |p, i| parts[i] = try ta.dupe(mvt.Point, p);
-                try buckets[li].append(ta, .{ .geom_type = .linestring, .parts = parts, .properties = feat.properties });
+                try buckets[li].append(ta, .{ .geom_type = .linestring, .parts = parts, .properties = try dupeProps(ta, feat.properties) });
             }
         }
     }
