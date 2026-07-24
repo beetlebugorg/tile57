@@ -1173,12 +1173,32 @@ fn geomInvalidate(s: *const render.resolve.Settings) void {
 
 /// Drop EVERY cached tile: the memory-pressure valve. Called when a scene
 /// assembly fails allocation — reclaiming the cache and re-portraying beats
-/// a build that fails identically every frame forever.
+/// a build that fails identically every frame forever. ONLY safe between
+/// walks: a walk's parts reference cached arenas until assemble copies out.
 pub fn geomDropAll() void {
     var it = g_geom.valueIterator();
     while (it.next()) |e| e.scene.deinit();
     g_geom.clearRetainingCapacity();
     g_geom_bytes = 0;
+}
+
+/// The MID-WALK pressure valve: drop every cached tile EXCEPT the walk in
+/// progress's own (gen >= g_geom_floor) — those arenas are still referenced
+/// by the walk's parts, and freeing them is a use-after-free in assemble
+/// (crashed in memcpy on device).
+pub fn geomDropCold() void {
+    var doomed = std.ArrayList(GeomKey).empty;
+    defer doomed.deinit(gpa);
+    var it = g_geom.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.gen < g_geom_floor) doomed.append(gpa, kv.key_ptr.*) catch {};
+    }
+    for (doomed.items) |k| {
+        if (g_geom.fetchRemove(k)) |kv| {
+            g_geom_bytes -= @min(g_geom_bytes, kv.value.bytes);
+            kv.value.scene.deinit();
+        }
+    }
 }
 
 /// Drop every cached tile belonging to a handle — called when it closes, so a
@@ -1582,7 +1602,7 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     // device while every counter upstream read healthy.
     const tile_res = src.tile(sa, z, x, y) catch |err| blk: {
         if (err == error.OutOfMemory) {
-            geomDropAll();
+            geomDropCold(); // NOT geomDropAll: the walk's own tiles are still referenced
             break :blk src.tile(sa, z, x, y);
         }
         break :blk err;
