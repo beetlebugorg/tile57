@@ -1182,6 +1182,7 @@ export fn tile57_compose_labels(
 export fn tile57_compose_query(handle: ?*compose.ComposeSource, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
     const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
+    src.explainPoint(gpa, lon, lat, zoom); // every tap logs the serving story of that spot
     chart.composeQueryPoint(src, lon, lat, zoom, cbp) catch |e| return fail(err, e);
     return OK;
 }
