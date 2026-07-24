@@ -221,6 +221,14 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) geometry.plane.Box {
 // ancestor), clip its features to the owner's projected owned face, per-layer concat in
 // VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
 // the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
+/// Deep-copy a clipped feature out of the per-contributor scratch arena: parts,
+/// points and properties all move into `a` before the scratch resets.
+fn dupeFeature(a: std.mem.Allocator, f: mvt.Feature) !mvt.Feature {
+    const parts = try a.alloc([]const mvt.Point, f.parts.len);
+    for (f.parts, 0..) |p, i| parts[i] = try a.dupe(mvt.Point, p);
+    return .{ .id = f.id, .geom_type = f.geom_type, .parts = parts, .properties = try dupeProps(a, f.properties) };
+}
+
 /// Deep-dupe feature properties into `a`: clip borrows them from the decoded
 /// tile, and the per-contributor decode arena is reset immediately after the
 /// clip — anything still borrowed would dangle.
@@ -261,17 +269,23 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
     var sub = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer sub.deinit();
     for (contribs) |ex| {
+        // EVERYTHING transient for this contributor — its decoded tile, the
+        // face projection, and every feature clip's boolean intermediates —
+        // lives in the reset-per-contributor scratch; only the clipped
+        // SURVIVORS are copied into the tile arena. Clip intermediates
+        // accumulating across thousands of features were the last
+        // hundreds-of-MB spike that still OOM'd the fattest coarse tiles on
+        // a memory-limited device.
         _ = sub.reset(.retain_capacity);
-        const layers = (try ownerTile(sub.allocator(), readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, ex.deep)) orelse continue;
-        const face_px = try compose.projectFace(ta, ex.region, z, tx, ty);
+        const sa2 = sub.allocator();
+        const layers = (try ownerTile(sa2, readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, ex.deep)) orelse continue;
+        const face_px = try compose.projectFace(sa2, ex.region, z, tx, ty);
         if (face_px.len == 0) continue;
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
-            for (layer.features) |feat| {
-                const before = buckets[li].items.len;
-                try compose.clipFeatureToFace(ta, &buckets[li], feat, face_px);
-                for (buckets[li].items[before..]) |*nf| nf.properties = try dupeProps(ta, nf.properties);
-            }
+            var tmpb = std.ArrayList(mvt.Feature).empty;
+            for (layer.features) |feat| try compose.clipFeatureToFace(sa2, &tmpb, feat, face_px);
+            for (tmpb.items) |f| try buckets[li].append(ta, try dupeFeature(ta, f));
         }
     }
     // Reach-ring cells: no owned ground in this tile, but their light sector
@@ -370,6 +384,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     var owned = false;
     var contribs = std.ArrayList(ExtraFill).empty;
     var verbatim: ?usize = null; // cell index of the unique tile+buffer-owning cell
+    const no_fill = std.c.getenv("TILE57_NO_FILL") != null; // measurement valve
     const cb0 = tileClassifyBox(z, tx, ty);
     for (map.faces) |face| {
         if (face.owned.len == 0) continue;
@@ -443,7 +458,13 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // docs promise: "the ground is owned by a coarser band, reached by
     // querying that band's map").
     // (fill contributions append into `contribs` with deep=true)
-    if (verbatim == null) fill: {
+    // The whole residual computation lives in a throwaway arena: the boolean
+    // chain's intermediates over hundreds of contributors were ~100 MB per fat
+    // tile in the tile arena; only surviving fill regions are copied out.
+    var fill_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer fill_arena.deinit();
+    const fa = fill_arena.allocator();
+    if (verbatim == null and !no_fill) fill: {
         const cb = tileClassifyBox(z, tx, ty);
         const rect = [_]geometry.plane.Pt{
             .{ .x = cb.min_x, .y = cb.min_y }, .{ .x = cb.max_x, .y = cb.min_y },
@@ -451,13 +472,32 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
             .{ .x = cb.min_x, .y = cb.min_y },
         };
         var residual: [][]geometry.plane.Pt = blk: {
-            const rings = try ta.alloc([]geometry.plane.Pt, 1);
-            rings[0] = try ta.dupe(geometry.plane.Pt, &rect);
+            const rings = try fa.alloc([]geometry.plane.Pt, 1);
+            rings[0] = try fa.dupe(geometry.plane.Pt, &rect);
             break :blk rings;
         };
+        // Ping-pong compaction: the boolean chain's intermediates accumulate
+        // in the arena (hundreds of steps on a fat tile); every 16 steps the
+        // small surviving residual is copied into the drained side and the
+        // other resets, bounding the chain's peak to ~16 steps of scratch.
+        var fill_arena2 = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer fill_arena2.deinit();
+        var arenas = [2]*std.heap.ArenaAllocator{ &fill_arena, &fill_arena2 };
+        var cur_a: usize = 0;
+        var steps: usize = 0;
         for (contribs.items) |c| {
-            residual = geometry.boolean.compute(ta, residual, c.region, .diff) catch break :fill;
+            residual = geometry.boolean.compute(arenas[cur_a].allocator(), residual, c.region, .diff) catch break :fill;
             if (residual.len == 0) break :fill; // governing band covers the whole tile
+            steps += 1;
+            if (steps % 16 == 0) {
+                const other = 1 - cur_a;
+                const oa = arenas[other].allocator();
+                const moved = oa.alloc([]geometry.plane.Pt, residual.len) catch break :fill;
+                for (residual, 0..) |ring, ri| moved[ri] = oa.dupe(geometry.plane.Pt, ring) catch break :fill;
+                _ = arenas[cur_a].reset(.retain_capacity);
+                residual = moved;
+                cur_a = other;
+            }
         }
         var mi: usize = 0;
         while (mi < part.maps.len and &part.maps[mi] != map) mi += 1;
@@ -470,12 +510,26 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
                 const bb = faceTileBBox(face, scale);
                 if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
                 if (!(try ownerHasTileDeep(readers[ci], part.cells[ci].cscl, z, tx, ty, true))) continue;
-                const clipped = rectClipRings(ta, face.owned, cb) catch continue;
+                const wa = arenas[cur_a].allocator();
+                const clipped = rectClipRings(wa, face.owned, cb) catch continue;
                 if (clipped.len == 0) continue;
-                const region = geometry.boolean.compute(ta, clipped, residual, .intersect) catch continue;
+                const region = geometry.boolean.compute(wa, clipped, residual, .intersect) catch continue;
                 if (region.len == 0) continue;
-                try contribs.append(ta, .{ .ci = @intCast(ci), .region = region, .deep = true });
-                residual = geometry.boolean.compute(ta, residual, region, .diff) catch break;
+                // Copy the surviving region OUT of the throwaway arenas.
+                const kept = try ta.alloc([]geometry.plane.Pt, region.len);
+                for (region, 0..) |ring, ri| kept[ri] = try ta.dupe(geometry.plane.Pt, ring);
+                try contribs.append(ta, .{ .ci = @intCast(ci), .region = kept, .deep = true });
+                residual = geometry.boolean.compute(wa, residual, region, .diff) catch break;
+                steps += 1;
+                if (steps % 16 == 0) {
+                    const other = 1 - cur_a;
+                    const oa2 = arenas[other].allocator();
+                    const moved2 = oa2.alloc([]geometry.plane.Pt, residual.len) catch break;
+                    for (residual, 0..) |ring, ri| moved2[ri] = oa2.dupe(geometry.plane.Pt, ring) catch break;
+                    _ = arenas[cur_a].reset(.retain_capacity);
+                    residual = moved2;
+                    cur_a = other;
+                }
             }
         }
         if (contribs.items.len > 0) owned = true;
