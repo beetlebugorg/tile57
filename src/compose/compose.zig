@@ -735,6 +735,7 @@ fn finishOpen(
     }
     if (!loaded) src.part = try geometry.partition.build(gpa, cells);
     src.part_loaded = loaded;
+    std.debug.print("compose: partition {s}\n", .{if (loaded) "LOADED from sidecar" else "BUILT fresh (no/stale sidecar)"});
 
     const names = try a.alloc([]const u8, shims.len);
     for (shims, 0..) |sh, i| names[i] = sh.name;
