@@ -744,6 +744,11 @@ typedef struct {
     uint8_t color[4]; /* straight-alpha RGBA, per-vertex — contiguous ranges of
                        * different colours can merge into ONE draw; the range's
                        * color field is advisory metadata now */
+    float depth;     /* paint-order depth in (0,1): LATER paint = SMALLER
+                      * (closer). Draw OPAQUE ranges (range flags bit 0)
+                      * front-to-back, depth test LESS + write; then everything
+                      * else in paint order, test LESS, no write. 0 = always
+                      * passes. */
 } tile57_gpu_vertex;
 
 /* What a range draws. The host picks a pipeline from this and nothing more —
@@ -805,6 +810,9 @@ typedef struct {
     uint8_t map_align;
     uint8_t flip;      /* 1 => flip the run 180° to stay upright (see above)   */
     uint8_t tangent_q; /* run angle over a full turn, tangent_q/256*2π         */
+    float depth;     /* paint-order depth, same contract as the vertex's —
+                      * linestyle-brick quads ride LOW paint bands and must
+                      * lose to opaque fills above them */
 } tile57_gpu_quad;
 
 /* One area-fill pattern cell: RGBA8, w * h * 4 bytes, row-major. It is
@@ -846,7 +854,8 @@ typedef struct {
     uint8_t kind;  /* tile57_gpu_kind */
     uint8_t prim;  /* tile57_gpu_prim */
     uint8_t atlas; /* tile57_gpu_atlas (QUADS only) */
-    uint8_t _pad;
+    uint8_t flags;   /* bit 0: OPAQUE (pattern-less triangles, all alpha 255) —
+                      * eligible for the front-to-back depth-tested pass */
 } tile57_gpu_range;
 
 /* Draw-ready buffers for one view. Every pointer is BORROWED and stays valid

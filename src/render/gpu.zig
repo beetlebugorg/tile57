@@ -67,6 +67,13 @@ pub const Vertex = extern struct {
     /// as the frame-rate cap on a phone. Range.color remains as advisory
     /// metadata.
     color: [4]u8 = .{ 0, 0, 0, 255 },
+    /// Paint-order depth in (0,1): LATER paint = SMALLER value (closer).
+    /// Assigned per RANGE by build/assemble after the paint sort. A host draws
+    /// OPAQUE ranges front-to-back with depth test LESS + write (hidden
+    /// fragments never shade), then blended content in paint order with test
+    /// LESS, no write — under-an-opaque is culled, everything else blends
+    /// exactly as painter's order did. 0 (the default) always passes.
+    depth: f32 = 0,
 };
 
 /// One textured-quad vertex — a symbol sprite or an SDF glyph. `x,y` is the
@@ -100,6 +107,10 @@ pub const Quad = extern struct {
     /// 256 * 2π`), so the flip shader recovers cos/sin(tangent) with no rebuild.
     /// Meaningful only when `flip` is set; 0 otherwise.
     tangent_q: u8 = 0,
+    /// Paint-order depth, same contract as Vertex.depth: quads are NOT all
+    /// top-band content (linestyle bricks ride LOW bands under area fills) —
+    /// without this they float above every fill in a depth-tested pass.
+    depth: f32 = 0,
 };
 
 /// `Range.pattern` when the range is not an area-fill pattern — which is every
@@ -253,7 +264,10 @@ pub const Range = extern struct {
     kind: Kind,
     prim: Prim,
     atlas: AtlasId,
-    _pad: u8 = 0,
+    /// Bit 0: OPAQUE — a pattern-less triangle range whose every colour has
+    /// alpha 255. Such ranges are eligible for a host's front-to-back
+    /// depth-tested pass; everything else must blend in paint order.
+    flags: u8 = 0,
 };
 
 /// A finished scene. Everything borrows the arena passed to `endScene` and dies
@@ -1166,7 +1180,20 @@ pub const GpuSurface = struct {
                 .prim = .triangles,
                 .atlas = .none,
                 .color = op.color,
+                .flags = if (op.pattern == NO_PATTERN and op.color[3] == 255) 1 else 0,
             });
+        }
+        // Paint-order depth, per RANGE: range i of N gets (N-i)/(N+1) — later
+        // paint = closer. Written through each range's index span (a vertex
+        // belongs to exactly one range). assemble() reassigns per view.
+        const nr = ranges.items.len;
+        for (ranges.items, 0..) |r, i| {
+            const d: f32 = @floatCast(@as(f64, @floatFromInt(nr - i)) / @as(f64, @floatFromInt(nr + 1)));
+            if (r.prim == .triangles) {
+                for (indices.items[r.first..][0..r.count]) |idx| verts.items[idx].depth = d;
+            } else {
+                for (quads.items[r.first..][0..r.count]) |*q| q.depth = d;
+            }
         }
         // Pattern cells were interned into the surface's (scratch) allocator, but
         // the scene must outlive it — so copy each cell's PIXELS into `arena`, not
@@ -1206,6 +1233,13 @@ pub const GpuSurface = struct {
     fn coalesce(ranges: *std.ArrayList(Range), op: Op, prim: Prim, atlas: AtlasId, first: usize, count: usize) bool {
         if (ranges.items.len == 0) return false;
         const prev = &ranges.items[ranges.items.len - 1];
+        const op_flags: u8 = if (prim == .triangles and op.pattern == NO_PATTERN and op.color[3] == 255) 1 else 0;
+        // OPAQUE ranges never merge across colours: each keeps its own depth,
+        // so overlapping same-band fills of different colours resolve by depth
+        // exactly as painter's order did. Blended ranges may colour-merge —
+        // they still draw in buffer order.
+        if (prev.flags != op_flags) return false;
+        if (op_flags == 1 and !std.mem.eql(u8, &prev.color, &op.color)) return false;
         if (prev.prim == prim and prev.atlas == atlas and prev.paint_key == op.paint_key and
             prev.kind == op.kind and prev.pattern == op.pattern and
             prev.first + prev.count == first)
@@ -1385,6 +1419,17 @@ pub fn assemble(arena: Allocator, scratch: Allocator, scenes: []const Scene) !Sc
             @memcpy(quads2[qpos..][0..r.count], quads.items[r.first..][0..r.count]);
             r.first = qpos;
             qpos += r.count;
+        }
+    }
+    // Whole-view paint-order depth, per RANGE (overwrites the per-tile values:
+    // the global sort interleaved tiles). Later paint = closer; see Vertex.depth.
+    const nr = ranges.items.len;
+    for (ranges.items, 0..) |r, i| {
+        const d: f32 = @floatCast(@as(f64, @floatFromInt(nr - i)) / @as(f64, @floatFromInt(nr + 1)));
+        if (r.prim == .triangles) {
+            for (indices2[r.first..][0..r.count]) |idx| verts.items[idx].depth = d;
+        } else {
+            for (quads2[r.first..][0..r.count]) |*q| q.depth = d;
         }
     }
     return .{
@@ -2149,15 +2194,14 @@ test "gpu: the C scene structs match their tile57.h layout" {
     // misread — wrong colours, wrong offsets, no error anywhere. These numbers
     // came from a C program compiled against the header (sizeof + offsetof), so
     // a Zig-side change that breaks the C view fails here instead of on a chart.
-    try testing.expectEqual(@as(usize, 28), @sizeOf(Vertex));
+    try testing.expectEqual(@as(usize, 32), @sizeOf(Vertex));
     try testing.expectEqual(@as(usize, 8), @offsetOf(Vertex, "ox"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(Vertex, "scamin"));
     try testing.expectEqual(@as(usize, 20), @offsetOf(Vertex, "disp_cat"));
     try testing.expectEqual(@as(usize, 21), @offsetOf(Vertex, "map_align"));
-    // colour at 24: a Metal host MUST read this struct with packed_float2
-    // members — natural float2 alignment pads the stride to 32 and every
-    // vertex after the first reads garbage.
     try testing.expectEqual(@as(usize, 24), @offsetOf(Vertex, "color"));
+    try testing.expectEqual(@as(usize, 28), @offsetOf(Vertex, "depth"));
+    try testing.expectEqual(@as(usize, 23), @offsetOf(Range, "flags"));
 
     try testing.expectEqual(@as(usize, 24), @sizeOf(Range));
     try testing.expectEqual(@as(usize, 0), @offsetOf(Range, "first"));
@@ -2169,7 +2213,8 @@ test "gpu: the C scene structs match their tile57.h layout" {
     try testing.expectEqual(@as(usize, 21), @offsetOf(Range, "prim"));
     try testing.expectEqual(@as(usize, 22), @offsetOf(Range, "atlas"));
 
-    try testing.expectEqual(@as(usize, 40), @sizeOf(Quad));
+    try testing.expectEqual(@as(usize, 44), @sizeOf(Quad));
+    try testing.expectEqual(@as(usize, 40), @offsetOf(Quad, "depth"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(Quad, "u"));
     try testing.expectEqual(@as(usize, 24), @offsetOf(Quad, "color"));
     try testing.expectEqual(@as(usize, 28), @offsetOf(Quad, "weight"));
