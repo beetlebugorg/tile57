@@ -1120,7 +1120,10 @@ fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.g
     // sprite atlas: reuse the same builder tile57_bake_sprite_mln does at the
     // SAME display ratio, so the cell rects are byte-for-byte the layout the
     // host's uploaded PNG carries (the normalized UVs must index that texture).
-    var atlas = try sprite.spriteMln(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio);
+    // Layout only: the scene consumer reads cells + dims, never the pixels —
+    // the full bake here (composite + zlib) was ~2/3 of the render path's
+    // cycles in a field profile whenever the shared atlases (re)built.
+    var atlas = try sprite.spriteMlnOpts(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio, false);
     var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.px_per_unit * 100.0 * ratio) };
     var cit = atlas.cells.iterator();
     while (cit.next()) |e| {
@@ -1326,7 +1329,10 @@ fn sharedGpuAtlases(ratio: f64) SharedAtlases {
                 break;
             };
             aa.* = std.heap.ArenaAllocator.init(gpa);
+            const bt0 = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
             if (buildGpuAtlases(aa.allocator(), g_atlas_ratio)) |built| {
+                const bt1 = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
+                std.debug.print("gpu atlases built @ {d:.2}x in {d} ms\n", .{ g_atlas_ratio, @divTrunc(bt1.nanoseconds - bt0.nanoseconds, 1_000_000) });
                 g_atlas_sprites = built.sprites;
                 g_atlas_glyphs = built.glyphs;
                 g_atlas_glyphs_bold = built.glyphs_bold;
