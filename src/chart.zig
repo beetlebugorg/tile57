@@ -1577,16 +1577,22 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     gs.setTile(z, x, y);
     const surf = gs.asSurface();
     try surf.beginScene(z);
-    if (src.tile(sa, z, x, y) catch null) |res| {
+    if (src.tile(sa, z, x, y)) |res| {
         if (res.tile) |bytes| {
             if (mlt.decode(sa, bytes)) |layers| {
-                scene.replayTile(sa, surf, layers) catch {};
-            } else |_| {}
+                scene.replayTile(sa, surf, layers) catch |err| {
+                    std.debug.print("TILE LOST z{d}/{d}/{d}: replay FAILED ({s}) after {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
+                };
+            } else |err| {
+                std.debug.print("TILE LOST z{d}/{d}/{d}: decode FAILED ({s}) on {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
+            }
         } else {
             // Nothing served: say why — the owner with no tile, or charted
             // ground the tier map gave to nobody. (True ocean stays silent.)
             src.explainEmpty(z, x, y);
         }
+    } else |err| {
+        std.debug.print("TILE LOST z{d}/{d}/{d}: compose FAILED ({s})\n", .{ z, x, y, @errorName(err) });
     }
     out.scene = try gs.build(out.arena.allocator());
     out.candidates = try gs.takeCandidates(out.arena.allocator());
