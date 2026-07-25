@@ -218,13 +218,26 @@ fn androidTriple(target: std.Build.ResolvedTarget) ?[]const u8 {
 // Generate a Zig `--libc` config for the NDK sysroot and return it as a file the
 // caller pins to the android artifact via `setLibCFile`. The `asm/` arch headers
 // live in the triple subdir (sys_include_dir), which a plain `--sysroot` misses.
-fn androidLibcFile(b: *std.Build, ndk: []const u8, triple: []const u8, api: u32) std.Build.LazyPath {
-    const host = switch (@import("builtin").os.tag) {
-        .macos => "darwin-x86_64", // the NDK ships x86_64 host binaries even on arm64 macs
+fn ndkSysroot(b: *std.Build, ndk: []const u8) []const u8 {
+    const base = b.fmt("{s}/toolchains/llvm/prebuilt", .{ndk});
+    // The NDK ships one host toolchain dir; pick the one that exists rather than
+    // assume (darwin-arm64 vs darwin-x86_64 vary by NDK/host).
+    const candidates = [_][]const u8{ "darwin-arm64", "darwin-x86_64", "linux-x86_64", "windows-x86_64" };
+    for (candidates) |host| {
+        const sysroot = b.fmt("{s}/{s}/sysroot", .{ base, host });
+        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/usr/include", .{sysroot}), .{}) catch continue;
+        return sysroot;
+    }
+    const def = switch (@import("builtin").os.tag) {
+        .macos => "darwin-x86_64",
         .windows => "windows-x86_64",
         else => "linux-x86_64",
     };
-    const sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/{s}/sysroot", .{ ndk, host });
+    return b.fmt("{s}/{s}/sysroot", .{ base, def });
+}
+
+fn androidLibcFile(b: *std.Build, ndk: []const u8, triple: []const u8, api: u32) std.Build.LazyPath {
+    const sysroot = ndkSysroot(b, ndk);
     const content = b.fmt(
         \\include_dir={s}/usr/include
         \\sys_include_dir={s}/usr/include/{s}
