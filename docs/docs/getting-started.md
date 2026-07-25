@@ -119,7 +119,15 @@ handle-free via `tile57_enc_*`. See the [C API](./c-api.md).
 Add tile57 as a dependency and `@import("tile57")`:
 
 ```zig
+const std = @import("std");
 const tile57 = @import("tile57");
+
+// tile57 needs an allocator and a std.Io. Any allocator works; the C ABI uses
+// std.heap.c_allocator.
+const gpa = std.heap.c_allocator;
+var threaded: std.Io.Threaded = .init(gpa, .{});
+defer threaded.deinit();
+const io = threaded.io();
 
 // Open one baked archive as a chart (mmap'd): metadata, pick, view renders.
 var chart = try tile57.Chart.openPmtilesPath(io, "out/tiles/US5MD1MC.pmtiles");
@@ -127,9 +135,12 @@ defer chart.deinit();
 const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
 
 // Or compose the whole bake output and take any output from it.
-var src = (try tile57.compose.ComposeSource.openFiles(io, gpa, paths, "out/partition.tpart")).?;
+const paths = [_][]const u8{"out/tiles/US5MD1MC.pmtiles"};
+var src = (try tile57.compose.ComposeSource.openFiles(io, gpa, &paths, "out/partition.tpart")).?;
 defer src.deinit();
 const result = try src.tile(gpa, 15, 9371, 12534);          // one composed tile
+
+var settings = tile57.render.resolve.Settings{};            // S-52 display defaults
 const png = try tile57.compose.renderView(src, -76.48, 38.974, 13.5,
     1600, 1200, .day, &settings, .png, null);               // one composed view
 ```

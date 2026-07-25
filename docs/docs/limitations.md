@@ -13,9 +13,9 @@ buoys and beacons, lights (including sector legs and arcs), dangers
 (obstructions / wrecks / rocks), data-quality zones, restricted/anchorage areas,
 and text labels.
 
-But "no rule errors" is not the same as "pixel-perfect S-52", and this project is
-an AI-built experiment and learning tool — **do not use it for navigation**. This
-page is an honest list of what is still incomplete, taken from the engine code.
+But "no rule errors" is not the same as "pixel-perfect S-52" — **do not use it for
+navigation**. This page is an honest list of what is still incomplete, taken from
+the engine code.
 
 :::warning Not for navigation
 See the warning on the [introduction](./intro.md). NOAA ENC charts are U.S. public
