@@ -3,7 +3,32 @@ const std = @import("std");
 // The vendored S-101 PortrayalCatalog, relative to the engine/ build root. Its
 // Rules (Lua) + Symbols/LineStyles/AreaFills/ColorProfiles (assets) are embedded
 // into the binary so tile57 portrays + styles charts with no on-disk catalogue.
+//
+// Two sources, same upstream commit: a dev checkout has it as the git submodule
+// below; a *fetched* tile57 package does not (zig's fetcher skips git
+// submodules, and the package excludes it from `paths`), so build() falls back
+// to the `s101_portrayal` lazy dependency in build.zig.zon. See resolveCatalog.
 const PORTRAYAL_CATALOG = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog";
+
+// Where the PortrayalCatalog actually is for THIS build: `.b` is the builder
+// whose root the relative `.root` resolves under (the tile57 build itself for
+// the submodule, the s101_portrayal dependency's builder for the fetched
+// fallback) — embedDir walks and @embedFile's through it. Null means the lazy
+// dependency fetch was just scheduled and build() must return so zig can re-run
+// it with the package on disk.
+const Catalog = struct { b: *std.Build, root: []const u8 };
+fn resolveCatalog(b: *std.Build) ?Catalog {
+    // Probe a directory only an *initialized* submodule has (a plain clone
+    // leaves vendor/S-101_Portrayal-Catalogue as an empty directory).
+    const probe = b.pathFromRoot(PORTRAYAL_CATALOG ++ "/Rules");
+    if (std.Io.Dir.openDirAbsolute(b.graph.io, probe, .{})) |dir| {
+        var d = dir;
+        d.close(b.graph.io);
+        return .{ .b = b, .root = PORTRAYAL_CATALOG };
+    } else |_| {}
+    const dep = b.lazyDependency("s101_portrayal", .{}) orelse return null;
+    return .{ .b = dep.builder, .root = "PortrayalCatalog" };
+}
 
 // libtess2 (vendored, SGI Free Software License B — vendor/libtess2/LICENSE.txt).
 // The polygon tessellator behind the GPU surface: contours in, triangles out,
@@ -177,6 +202,11 @@ fn addPkgTest(
 }
 
 pub fn build(b: *std.Build) void {
+    // The S-101 PortrayalCatalog source (submodule, or the lazy dependency for
+    // a fetched package). On the first pass of a fetch this is null — return so
+    // zig downloads the package and re-runs build().
+    const catalog = resolveCatalog(b) orelse return;
+
     const target = b.standardTargetOptions(.{});
     // Default to ReleaseFast: the tile57 CLI is a compute-heavy baking tool, and a
     // Debug build bakes ~2.6x slower (no inlining/hoisting/vectorisation). A plain
@@ -312,7 +342,7 @@ pub fn build(b: *std.Build) void {
     // Embed the S-101 Lua rules (216 framework + feature-class files) so the Lua
     // `require` searcher in lua_shim.c can load them from memory — tile57 portrays
     // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
-    portray_mod.addImport("rules_registry", embedDir(b, "rules_registry", PORTRAYAL_CATALOG ++ "/Rules", ".lua"));
+    portray_mod.addImport("rules_registry", embedDir(catalog.b, "rules_registry", catalog.b.pathJoin(&.{ catalog.root, "Rules" }), ".lua"));
 
     // MapLibre style generation (src/style/): color tables, line styles, the
     // style.json layer set (maplibre.zig), and the S-52 mariner settings model +
@@ -367,7 +397,7 @@ pub fn build(b: *std.Build) void {
     // directly (tile57_colortables_default / tile57_style_template) AND it rides on
     // catalog_embed below. A second embedDir for the same dir would create a second
     // same-named module and collide in the libtile57.a build (where both are present).
-    const colorprofile_registry = embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml");
+    const colorprofile_registry = embedDir(catalog.b, "colorprofile_registry", catalog.b.pathJoin(&.{ catalog.root, "ColorProfiles" }), ".xml");
 
     // The S-101 portrayal *assets* embedded into the binary: symbol SVGs, the palette
     // CSS, line-style + area-fill XML, and the colour profile. The bundle pipeline
@@ -375,10 +405,10 @@ pub fn build(b: *std.Build) void {
     // catalogue; a --catalog / positional dir still overrides (read from disk). Shared
     // by the CLI baker AND libtile57.a (so the C ABI bake_bundle needs no catalogue).
     const catalog_embed = b.createModule(.{ .root_source_file = b.path("tools/catalog_embed.zig") });
-    catalog_embed.addImport("symbols_registry", embedDir(b, "symbols_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".svg"));
-    catalog_embed.addImport("css_registry", embedDir(b, "css_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".css"));
-    catalog_embed.addImport("linestyles_registry", embedDir(b, "linestyles_registry", PORTRAYAL_CATALOG ++ "/LineStyles", ".xml"));
-    catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
+    catalog_embed.addImport("symbols_registry", embedDir(catalog.b, "symbols_registry", catalog.b.pathJoin(&.{ catalog.root, "Symbols" }), ".svg"));
+    catalog_embed.addImport("css_registry", embedDir(catalog.b, "css_registry", catalog.b.pathJoin(&.{ catalog.root, "Symbols" }), ".css"));
+    catalog_embed.addImport("linestyles_registry", embedDir(catalog.b, "linestyles_registry", catalog.b.pathJoin(&.{ catalog.root, "LineStyles" }), ".xml"));
+    catalog_embed.addImport("areafills_registry", embedDir(catalog.b, "areafills_registry", catalog.b.pathJoin(&.{ catalog.root, "AreaFills" }), ".xml"));
     catalog_embed.addImport("colorprofile_registry", colorprofile_registry);
 
     // The chart-bundle module: S-101 portrayal asset emission + the per-cell composite
@@ -466,6 +496,13 @@ pub fn build(b: *std.Build) void {
         lib_mod.addImport("buildinfo", buildinfo.createModule());
     }
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
+    // The archive for zig-package consumers (lookout-core links it into its own
+    // build): a named lazy path, NOT dep.artifact() — the default install step
+    // installs the `tile57` CLI under the same name, and on macOS the lib
+    // reaches the install step only as the repacked file below. The raw archive
+    // is fine for a zig consumer; ld64/libtool consumers must still repack
+    // (loose-object extract) exactly like scripts/macho-align.sh does.
+    b.addNamedLazyPath("libtile57_a", lib.getEmittedBin());
     // Bundle compiler-rt INTO the static archive. A non-Zig linker (the CGO host's gcc/clang,
     // `go test`) has no access to Zig's compiler-rt, so builtins the code references — e.g.
     // `roundq` (f128 @round, pulled in by std.json's number→int coercion in coverage decode) —
