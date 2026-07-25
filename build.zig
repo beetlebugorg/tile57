@@ -201,6 +201,42 @@ fn addPkgTest(
     return tm;
 }
 
+// The NDK triple for an *-linux-android target, or null when the target isn't
+// android. Drives the sysroot's arch-specific include + crt subdirs.
+fn androidTriple(target: std.Build.ResolvedTarget) ?[]const u8 {
+    const t = target.result;
+    if (t.abi != .android and t.abi != .androideabi) return null;
+    return switch (t.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        .x86 => "i686-linux-android",
+        .arm, .thumb => "arm-linux-androideabi",
+        else => null,
+    };
+}
+
+// Generate a Zig `--libc` config for the NDK sysroot and return it as a file the
+// caller pins to the android artifact via `setLibCFile`. The `asm/` arch headers
+// live in the triple subdir (sys_include_dir), which a plain `--sysroot` misses.
+fn androidLibcFile(b: *std.Build, ndk: []const u8, triple: []const u8, api: u32) std.Build.LazyPath {
+    const host = switch (@import("builtin").os.tag) {
+        .macos => "darwin-x86_64", // the NDK ships x86_64 host binaries even on arm64 macs
+        .windows => "windows-x86_64",
+        else => "linux-x86_64",
+    };
+    const sysroot = b.fmt("{s}/toolchains/llvm/prebuilt/{s}/sysroot", .{ ndk, host });
+    const content = b.fmt(
+        \\include_dir={s}/usr/include
+        \\sys_include_dir={s}/usr/include/{s}
+        \\crt_dir={s}/usr/lib/{s}/{d}
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\gcc_dir=
+        \\
+    , .{ sysroot, sysroot, triple, sysroot, triple, api });
+    return b.addWriteFiles().add(b.fmt("android-libc-{s}.txt", .{triple}), content);
+}
+
 pub fn build(b: *std.Build) void {
     // The S-101 PortrayalCatalog source (submodule, or the lazy dependency for
     // a fetched package). On the first pass of a fetch this is null — return so
@@ -217,6 +253,19 @@ pub fn build(b: *std.Build) void {
     // preferred_optimize_mode — that keeps the no-flag default at Debug and drops
     // the -Doptimize option entirely.
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
+
+    // Cross-compiling to *-linux-android: Zig ships no bionic headers, so the C
+    // deps (Lua, libtess2, nanosvg, stb) need the NDK sysroot. Pass the NDK root
+    // with `-Dandroid-ndk=<path>` and this generates the Zig libc config (include
+    // + arch `asm/` include + per-API crt dir) and pins it to the lib artifact
+    // ONLY — a global `--libc` would break the host tools pinned to linux-musl.
+    // `zig build lib -Dtarget=aarch64-linux-android -Dandroid-ndk=$ANDROID_NDK`.
+    const android_ndk = b.option([]const u8, "android-ndk", "Android NDK root (enables the *-linux-android libc for the lib)");
+    const android_api = b.option(u32, "android-api", "Android API level for the NDK sysroot (default 24)") orelse 24;
+    const android_libc: ?std.Build.LazyPath = if (androidTriple(target)) |triple|
+        (if (android_ndk) |ndk| androidLibcFile(b, ndk, triple, android_api) else null)
+    else
+        null;
 
     // Lua: POSIX feature flags on Unix; Windows lets luaconf.h auto-pick
     // LUA_USE_WINDOWS. The portray module is target-agnostic (it inherits each
@@ -496,6 +545,8 @@ pub fn build(b: *std.Build) void {
         lib_mod.addImport("buildinfo", buildinfo.createModule());
     }
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
+    // Android cross-compile: point the C deps at the NDK sysroot (see -Dandroid-ndk).
+    if (android_libc) |libc| lib.setLibCFile(libc);
     // The archive for zig-package consumers (lookout-core links it into its own
     // build): a named lazy path, NOT dep.artifact() — the default install step
     // installs the `tile57` CLI under the same name, and on macOS the lib
