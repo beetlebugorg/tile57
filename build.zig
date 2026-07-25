@@ -718,8 +718,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
     };
     const compose_step = b.step("compose-test", "Run the runtime compositor + clip-core tests");
-    _ = addPkgTest(b, compose_step, "src/compose/compose.zig", target, optimize, &compose_deps);
-    _ = addPkgTest(b, test_step, "src/compose/compose.zig", target, optimize, &compose_deps);
+    // compose.zig reads two debug-valve env vars via std.c.getenv, so the test
+    // binaries need libc (the shipped lib already links it; addPkgTest omits it).
+    addPkgTest(b, compose_step, "src/compose/compose.zig", target, optimize, &compose_deps).link_libc = true;
+    addPkgTest(b, test_step, "src/compose/compose.zig", target, optimize, &compose_deps).link_libc = true;
 
     // The chart-bundle module hosts the per-cell composite (composeTile / ComposeSource). Its full
     // dep set (engine + assets/sprite/catalog) needs libc, so create the test module directly
