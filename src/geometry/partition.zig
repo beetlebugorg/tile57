@@ -150,7 +150,13 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
 // which is what makes an incremental recompose safe when coverage is unchanged.
 
 pub const MAGIC = [4]u8{ 'T', '5', '7', 'P' };
-pub const FORMAT_VERSION: u32 = 2; // 2: fill-up gap-filler faces (finer cells own uncovered ground at coarse tiers)
+// The version is the ALGORITHM generation, not just the byte layout: a sidecar
+// carries the bake-time partition VERBATIM, and the input key validates only
+// the input cells — never the faces. Faces computed by an older, buggier build
+// otherwise outlive every fix (a field device rendered a Great Lakes cell
+// owning Gulf-of-Mexico ground from exactly such a sidecar). Bump on ANY
+// change to the owned-face computation.
+pub const FORMAT_VERSION: u32 = 3; // 3: antimeridian coverage split + serve-floor semantics
 
 pub const LoadError = error{
     BadMagic,

@@ -245,9 +245,10 @@ pub fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, 
 }
 
 // Read + parse one cell (base .000 + sequential updates) from `dir`; null on
-// any failure. The parsed cell allocates from smp_allocator (thread-safe).
+// any failure. The parsed cell allocates from c_allocator (thread-safe, and
+// returns freed pages to the OS between cells — see chart.zig's gpa note).
 fn readParseCell(io: std.Io, dir: std.Io.Dir, bpath: []const u8) ?engine.s57.Cell {
-    const gpa = std.heap.smp_allocator;
+    const gpa = std.heap.c_allocator;
     const base = dir.readFileAlloc(io, bpath, gpa, .unlimited) catch return null;
     defer gpa.free(base);
     if (base.len == 0) return null;

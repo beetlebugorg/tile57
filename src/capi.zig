@@ -20,10 +20,11 @@ const errors = @import("errors"); // the engine error taxonomy + describe()
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
 const colorprofile_registry = @import("colorprofile_registry");
 
-// smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the live
-// tile/chart path makes many small, short-lived allocations; page_allocator
-// would mmap each one. Matches the bake CLI's allocator choice.
-const gpa = std.heap.smp_allocator;
+// c_allocator, not smp_allocator: smp never returns freed slabs to the OS, so
+// the host app's footprint sticks at the worst transient peak forever. libc
+// malloc unmaps large blocks on free and Instruments can see it. Hot paths
+// allocate through arenas, so per-alloc speed is not the bottleneck.
+const gpa = std.heap.c_allocator;
 const Chart = chart.Chart;
 
 // Wall-clock time for "today" date resolution in tile57_style_build. Zig 0.16
@@ -1182,6 +1183,7 @@ export fn tile57_compose_labels(
 export fn tile57_compose_query(handle: ?*compose.ComposeSource, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
     const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
+    src.explainPoint(gpa, lon, lat, zoom); // every tap logs the serving story of that spot
     chart.composeQueryPoint(src, lon, lat, zoom, cbp) catch |e| return fail(err, e);
     return OK;
 }
@@ -1713,7 +1715,32 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
 /// Populate the process-global read-only registries (S-100 catalogue + linestyles) on
 /// the calling thread. Call ONCE on the main thread before opening/baking charts from
 /// worker threads, so concurrent bake/render is race-free. See tile57.h.
+var g_warmup_logged = false;
+/// Drop the engine's reclaimable caches (the per-tile GPU geometry pool —
+/// the largest). For a host answering an OS memory warning. MUST be called
+/// with no scene build in flight (the caches feed the build in progress).
+export fn tile57_trim_caches() callconv(.c) void {
+    chart.geomDropAll();
+}
+
+/// GPU-scene ABI self-description: sizeof(vertex) | sizeof(quad)<<8 |
+/// sizeof(range)<<16. A host compiled against a NEWER tile57.h than the
+/// library it links renders GARBAGE (a 28-byte shader stride over a 24-byte
+/// stream shears every vertex after the first) — comparing this at open turns
+/// silent shear into a loud refusal, and a host calling it against a library
+/// too old to export it fails at LINK time, which is better still.
+export fn tile57_abi_gpu_layout() callconv(.c) u32 {
+    const g = @import("render").gpu;
+    return @as(u32, @sizeOf(g.Vertex)) | (@as(u32, @sizeOf(g.Quad)) << 8) | (@as(u32, @sizeOf(g.Range)) << 16);
+}
+
 export fn tile57_warmup() callconv(.c) void {
+    if (!g_warmup_logged) {
+        g_warmup_logged = true;
+        // Which engine THIS process actually linked — the one line that settles
+        // every "is the app running the latest?" question at runtime.
+        std.debug.print("tile57 engine @ {s}\n", .{@import("buildinfo").commit});
+    }
     chart.warmup();
 }
 

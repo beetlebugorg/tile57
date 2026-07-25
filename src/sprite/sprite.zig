@@ -501,6 +501,13 @@ const MlnCell = struct { name: []const u8, w: u32, h: u32, ratio: f64, rgba: []c
 /// (tile57_bake_sprite_mln) MUST pass the SAME ratio, or the normalized UVs the
 /// scene emits will not index the texture the host uploaded.
 pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8, soundings: []const []const u8, ratio: f64) !Atlas {
+    return spriteMlnOpts(a, symbols, fills, css_data, soundings, ratio, true);
+}
+
+/// `want_pixels = false`: layout only (cells + dims, empty png) — for the
+/// in-process GPU-scene atlas, which never reads the pixels and must not pay
+/// the compositing + PNG compression of a full device-density bake.
+pub fn spriteMlnOpts(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8, soundings: []const []const u8, ratio: f64, want_pixels: bool) !Atlas {
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const ar = arena_state.allocator();
@@ -564,7 +571,7 @@ pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const A
         try cells.append(ar, .{ .name = stack, .w = t.w, .h = t.h, .ratio = ratio, .rgba = t.rgba });
     }
 
-    return packMln(a, ar, cells.items, atlas_w);
+    return packMlnOpts(a, ar, cells.items, atlas_w, want_pixels);
 }
 
 // Composite a comma-joined glyph list (e.g. "SOUNDSC3,SOUNDS12,SOUNDS54") into
@@ -647,6 +654,15 @@ fn lessMlnByHeight(_: void, a: MlnCell, b: MlnCell) bool {
 // Shelf-pack MlnCells and emit the MapLibre sprite JSON {x,y,width,height,
 // pixelRatio} + atlas PNG. `cells_in` must already be in id order (stable ties).
 fn packMln(a: std.mem.Allocator, ar: std.mem.Allocator, cells_in: []MlnCell, width: u32) !Atlas {
+    return packMlnOpts(a, ar, cells_in, width, true);
+}
+
+// `want_pixels = false` computes ONLY the layout (cell rects + dimensions):
+// no pixel compositing and — crucially — no PNG encode. The in-process
+// GPU-scene atlas consumer reads nothing but the layout, yet paid the full
+// zlib compress of a device-density atlas (~2/3 of the render path's cycles
+// in a field profile) every time the shared atlases (re)built.
+fn packMlnOpts(a: std.mem.Allocator, ar: std.mem.Allocator, cells_in: []MlnCell, width: u32, want_pixels: bool) !Atlas {
     std.sort.insertion(MlnCell, cells_in, {}, lessMlnByHeight);
     const Placed = struct { x: u32, y: u32, w: u32, h: u32, ratio: f64 };
     var placed = std.StringHashMap(Placed).init(ar);
@@ -666,22 +682,24 @@ fn packMln(a: std.mem.Allocator, ar: std.mem.Allocator, cells_in: []MlnCell, wid
     }
     const height = pen_y + row_h + pad;
 
-    const rgba = try ar.alloc(u8, @as(usize, width) * height * 4);
-    @memset(rgba, 0);
-    for (cells_in) |c| {
-        const p = placed.get(c.name).?;
-        var row: u32 = 0;
-        while (row < c.h) : (row += 1) {
-            const src_off = @as(usize, row) * c.w * 4;
-            const dst_off = (@as(usize, p.y + row) * width + p.x) * 4;
-            @memcpy(rgba[dst_off .. dst_off + c.w * 4], c.rgba[src_off .. src_off + c.w * 4]);
+    var png: []u8 = &.{};
+    if (want_pixels) {
+        const rgba = try ar.alloc(u8, @as(usize, width) * height * 4);
+        @memset(rgba, 0);
+        for (cells_in) |c| {
+            const p = placed.get(c.name).?;
+            var row: u32 = 0;
+            while (row < c.h) : (row += 1) {
+                const src_off = @as(usize, row) * c.w * 4;
+                const dst_off = (@as(usize, p.y + row) * width + p.x) * 4;
+                @memcpy(rgba[dst_off .. dst_off + c.w * 4], c.rgba[src_off .. src_off + c.w * 4]);
+            }
         }
+        var png_len: c_int = 0;
+        const png_ptr = tg_png_encode(rgba.ptr, @intCast(width), @intCast(height), &png_len) orelse return error.PngEncode;
+        defer tg_svg_free(png_ptr);
+        png = try a.dupe(u8, png_ptr[0..@intCast(png_len)]);
     }
-
-    var png_len: c_int = 0;
-    const png_ptr = tg_png_encode(rgba.ptr, @intCast(width), @intCast(height), &png_len) orelse return error.PngEncode;
-    defer tg_svg_free(png_ptr);
-    const png = try a.dupe(u8, png_ptr[0..@intCast(png_len)]);
 
     // MapLibre sprite JSON: names sorted, {x,y,width,height,pixelRatio}.
     var names = std.ArrayList([]const u8).empty;

@@ -81,6 +81,34 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
 /// Replay one decoded tile's layers as Surface calls (between the caller's
 /// begin/endScene). Layer names route exactly as TileSurface emitted them.
 pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLayer) !void {
+    // Pre-scan the tile's depth-contour ladder (DEPCN valdco + DEPARE drval1)
+    // so a render surface can snap the mariner's safety contour to the next
+    // DEEPER contour that actually exists (S-52) — and bold exactly that line.
+    {
+        var ladder: [64]f64 = undefined;
+        var n: usize = 0;
+        outer: for (layers) |layer| {
+            const areas = std.mem.startsWith(u8, layer.name, "areas");
+            const lines = std.mem.startsWith(u8, layer.name, "lines");
+            if (!areas and !lines) continue;
+            for (layer.features) |f| {
+                const v = propF64(f.properties, if (areas) "drval1" else "valdco") orelse continue;
+                var seen = false;
+                for (ladder[0..n]) |lv| {
+                    if (lv == v) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    ladder[n] = v;
+                    n += 1;
+                    if (n == ladder.len) break :outer; // ladder is tiny in practice
+                }
+            }
+        }
+        surf.setContourLadder(ladder[0..n]);
+    }
     for (layers) |layer| {
         const is_areas = std.mem.startsWith(u8, layer.name, "areas");
         const is_patterns = std.mem.startsWith(u8, layer.name, "area_patterns");

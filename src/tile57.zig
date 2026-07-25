@@ -37,6 +37,11 @@ pub const Chart = chart.Chart;
 pub const Format = chart.Format;
 pub const ChartInput = chart.ChartInput;
 pub const Progress = chart.Progress;
+/// A draw-ready GPU scene: geometry already triangulated, in paint order, and
+/// split into one-pipeline ranges. Built by `Chart.renderGpuScene` (one chart) or
+/// `compose.renderGpuScene` (a whole library); free with `GpuScene.deinit`. The
+/// Zig side of the C ABI's `tile57_gpu_scene`.
+pub const GpuScene = chart.GpuScene;
 /// Streaming ENC_ROOT open (read a chart's bytes on demand, low memory): see
 /// Chart.openChartsStreaming.
 pub const ChartMeta = chart.ChartMeta;
@@ -80,6 +85,10 @@ pub const compose = struct {
     pub const renderView = chart.renderComposeView;
     /// The composed world-space surface stream (the GPU vector twin).
     pub const renderSurfaceView = chart.renderComposeSurfaceView;
+    /// The composed draw-ready GPU scene (the GPU twin of `renderSurfaceView`): a
+    /// whole chart library into one `GpuScene`, seams stitched across cells. The
+    /// Zig side of the C ABI's `tile57_compose_gpu_scene`.
+    pub const renderGpuScene = chart.renderComposeGpuScene;
     /// The composed view-level, globally-decluttered TEXT-only pass (draws no
     /// geometry — the host draws that from its per-tile cache).
     pub const renderLabels = chart.renderComposeLabels;

@@ -2212,10 +2212,14 @@ pub const ViewTiles = struct {
                 self.tx = self.tx0;
                 self.ty += 1;
             }
-            if (cur_ty < 0 or cur_ty >= self.max_t or cur_tx < 0 or cur_tx >= self.max_t) continue;
+            // y clamps at the mercator poles; x WRAPS — longitude is cyclic, so a
+            // view straddling the antimeridian fetches the far side's tiles. The
+            // canvas origin keeps the UNwrapped position: the tile draws at its
+            // continuous spot in the view, whichever world copy it came from.
+            if (cur_ty < 0 or cur_ty >= self.max_t) continue;
             return .{
                 .z = self.z,
-                .x = @intCast(cur_tx),
+                .x = @intCast(@mod(cur_tx, self.max_t)),
                 .y = @intCast(cur_ty),
                 .origin_x = @floatCast(@as(f64, @floatFromInt(cur_tx)) * self.pt - self.left),
                 .origin_y = @floatCast(@as(f64, @floatFromInt(cur_ty)) * self.pt - self.top),

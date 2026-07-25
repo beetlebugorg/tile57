@@ -3,7 +3,32 @@ const std = @import("std");
 // The vendored S-101 PortrayalCatalog, relative to the engine/ build root. Its
 // Rules (Lua) + Symbols/LineStyles/AreaFills/ColorProfiles (assets) are embedded
 // into the binary so tile57 portrays + styles charts with no on-disk catalogue.
+//
+// Two sources, same upstream commit: a dev checkout has it as the git submodule
+// below; a *fetched* tile57 package does not (zig's fetcher skips git
+// submodules, and the package excludes it from `paths`), so build() falls back
+// to the `s101_portrayal` lazy dependency in build.zig.zon. See resolveCatalog.
 const PORTRAYAL_CATALOG = "vendor/S-101_Portrayal-Catalogue/PortrayalCatalog";
+
+// Where the PortrayalCatalog actually is for THIS build: `.b` is the builder
+// whose root the relative `.root` resolves under (the tile57 build itself for
+// the submodule, the s101_portrayal dependency's builder for the fetched
+// fallback) — embedDir walks and @embedFile's through it. Null means the lazy
+// dependency fetch was just scheduled and build() must return so zig can re-run
+// it with the package on disk.
+const Catalog = struct { b: *std.Build, root: []const u8 };
+fn resolveCatalog(b: *std.Build) ?Catalog {
+    // Probe a directory only an *initialized* submodule has (a plain clone
+    // leaves vendor/S-101_Portrayal-Catalogue as an empty directory).
+    const probe = b.pathFromRoot(PORTRAYAL_CATALOG ++ "/Rules");
+    if (std.Io.Dir.openDirAbsolute(b.graph.io, probe, .{})) |dir| {
+        var d = dir;
+        d.close(b.graph.io);
+        return .{ .b = b, .root = PORTRAYAL_CATALOG };
+    } else |_| {}
+    const dep = b.lazyDependency("s101_portrayal", .{}) orelse return null;
+    return .{ .b = dep.builder, .root = "PortrayalCatalog" };
+}
 
 // libtess2 (vendored, SGI Free Software License B — vendor/libtess2/LICENSE.txt).
 // The polygon tessellator behind the GPU surface: contours in, triangles out,
@@ -15,14 +40,24 @@ const tess_sources = [_][]const u8{
     "bucketalloc.c", "dict.c", "geom.c", "mesh.c", "priorityq.c", "sweep.c", "tess.c",
 };
 
+// Cross-compiling to a non-macOS Apple target (`-Dtarget=aarch64-ios[-simulator]`)
+// needs that SDK's libc headers — Zig only bundles Apple headers for macOS. Pass
+// `--sysroot "$(xcrun --sdk iphoneos --show-sdk-path)"` and every C-compiling
+// module picks the headers up here (a no-op when no sysroot is given).
+fn addSysrootIncludes(b: *std.Build, mod: *std.Build.Module) void {
+    const sysroot = b.sysroot orelse return;
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+}
+
 fn addTess(b: *std.Build, mod: *std.Build.Module) void {
     mod.link_libc = true; // libtess2 uses assert.h/stdio.h/stdlib.h
+    addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/libtess2/Include"));
     mod.addIncludePath(b.path("vendor/libtess2/Source"));
     mod.addCSourceFiles(.{
         .root = b.path("vendor/libtess2/Source"),
         .files = &tess_sources,
-        .flags = &.{ "-std=gnu99", "-O2" },
+        .flags = &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" },
     });
 }
 
@@ -52,18 +87,22 @@ fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
 // `posix`: define LUA_USE_POSIX (Unix). On Windows it must stay OFF — forcing it
 // pulls in <unistd.h>/dlopen; without it luaconf.h auto-selects LUA_USE_WINDOWS
 // from _WIN32. lua_shim.c is already portable (only getenv + ANSI stdio).
-fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool) void {
+fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool, ios: bool) void {
+    addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/lua/src"));
-    const shim_flags: []const []const u8 = if (posix) &.{"-DLUA_USE_POSIX"} else &.{};
+    const shim_flags: []const []const u8 = if (posix) &.{ "-DLUA_USE_POSIX", "-fno-sanitize=undefined" } else &.{"-fno-sanitize=undefined"};
     mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = shim_flags });
-    const lua_flags: []const []const u8 = if (posix)
-        &.{ "-std=gnu99", "-DLUA_USE_POSIX", "-O2" }
-    else
-        &.{ "-std=gnu99", "-O2" };
+    var lua_flags = std.ArrayList([]const u8).empty;
+    lua_flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" }) catch @panic("OOM");
+    if (posix) lua_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
+    // iOS forbids system(3) (marked unavailable in the SDK). Stub loslib's
+    // l_system hook to "no shell": os.execute() reports no shell available,
+    // os.execute(cmd) fails — nothing in the portrayal path shells out anyway.
+    if (ios) lua_flags.append(b.allocator, "-Dl_system(cmd)=((cmd)==0?0:-1)") catch @panic("OOM");
     mod.addCSourceFiles(.{
         .root = b.path("vendor/lua/src"),
         .files = &lua_sources,
-        .flags = lua_flags,
+        .flags = lua_flags.items,
     });
 }
 
@@ -71,9 +110,10 @@ fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool) void {
 // behind svgraster.c to a module. Used by the `sprite` module (sprite/pattern
 // atlas generation in the bake tool). Single-header C libs; need libc.
 fn addSvgRaster(b: *std.Build, mod: *std.Build.Module) void {
+    addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/nanosvg"));
     mod.addIncludePath(b.path("vendor/stb"));
-    mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2" } });
+    mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" } });
 }
 
 // Re-import the pure packages into a consumer module (engine, libtile57.a, the
@@ -162,6 +202,11 @@ fn addPkgTest(
 }
 
 pub fn build(b: *std.Build) void {
+    // The S-101 PortrayalCatalog source (submodule, or the lazy dependency for
+    // a fetched package). On the first pass of a fetch this is null — return so
+    // zig downloads the package and re-runs build().
+    const catalog = resolveCatalog(b) orelse return;
+
     const target = b.standardTargetOptions(.{});
     // Default to ReleaseFast: the tile57 CLI is a compute-heavy baking tool, and a
     // Debug build bakes ~2.6x slower (no inlining/hoisting/vectorisation). A plain
@@ -293,11 +338,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s101", .module = s101_mod },
         },
     });
-    addLua(b, portray_mod, lua_posix);
+    addLua(b, portray_mod, lua_posix, target.result.os.tag == .ios);
     // Embed the S-101 Lua rules (216 framework + feature-class files) so the Lua
     // `require` searcher in lua_shim.c can load them from memory — tile57 portrays
     // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
-    portray_mod.addImport("rules_registry", embedDir(b, "rules_registry", PORTRAYAL_CATALOG ++ "/Rules", ".lua"));
+    portray_mod.addImport("rules_registry", embedDir(catalog.b, "rules_registry", catalog.b.pathJoin(&.{ catalog.root, "Rules" }), ".lua"));
 
     // MapLibre style generation (src/style/): color tables, line styles, the
     // style.json layer set (maplibre.zig), and the S-52 mariner settings model +
@@ -352,7 +397,7 @@ pub fn build(b: *std.Build) void {
     // directly (tile57_colortables_default / tile57_style_template) AND it rides on
     // catalog_embed below. A second embedDir for the same dir would create a second
     // same-named module and collide in the libtile57.a build (where both are present).
-    const colorprofile_registry = embedDir(b, "colorprofile_registry", PORTRAYAL_CATALOG ++ "/ColorProfiles", ".xml");
+    const colorprofile_registry = embedDir(catalog.b, "colorprofile_registry", catalog.b.pathJoin(&.{ catalog.root, "ColorProfiles" }), ".xml");
 
     // The S-101 portrayal *assets* embedded into the binary: symbol SVGs, the palette
     // CSS, line-style + area-fill XML, and the colour profile. The bundle pipeline
@@ -360,10 +405,10 @@ pub fn build(b: *std.Build) void {
     // catalogue; a --catalog / positional dir still overrides (read from disk). Shared
     // by the CLI baker AND libtile57.a (so the C ABI bake_bundle needs no catalogue).
     const catalog_embed = b.createModule(.{ .root_source_file = b.path("tools/catalog_embed.zig") });
-    catalog_embed.addImport("symbols_registry", embedDir(b, "symbols_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".svg"));
-    catalog_embed.addImport("css_registry", embedDir(b, "css_registry", PORTRAYAL_CATALOG ++ "/Symbols", ".css"));
-    catalog_embed.addImport("linestyles_registry", embedDir(b, "linestyles_registry", PORTRAYAL_CATALOG ++ "/LineStyles", ".xml"));
-    catalog_embed.addImport("areafills_registry", embedDir(b, "areafills_registry", PORTRAYAL_CATALOG ++ "/AreaFills", ".xml"));
+    catalog_embed.addImport("symbols_registry", embedDir(catalog.b, "symbols_registry", catalog.b.pathJoin(&.{ catalog.root, "Symbols" }), ".svg"));
+    catalog_embed.addImport("css_registry", embedDir(catalog.b, "css_registry", catalog.b.pathJoin(&.{ catalog.root, "Symbols" }), ".css"));
+    catalog_embed.addImport("linestyles_registry", embedDir(catalog.b, "linestyles_registry", catalog.b.pathJoin(&.{ catalog.root, "LineStyles" }), ".xml"));
+    catalog_embed.addImport("areafills_registry", embedDir(catalog.b, "areafills_registry", catalog.b.pathJoin(&.{ catalog.root, "AreaFills" }), ".xml"));
     catalog_embed.addImport("colorprofile_registry", colorprofile_registry);
 
     // The chart-bundle module: S-101 portrayal asset emission + the per-cell composite
@@ -417,6 +462,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib_root.zig"),
         .target = target,
         .optimize = optimize,
+        // iOS: std.debug's stack-trace machinery references
+        // _dyld_get_image_header_containing_address, which iOS' libdyld doesn't
+        // export — strip so the panic path never pulls it in.
+        .strip = target.result.os.tag == .ios,
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
@@ -436,7 +485,24 @@ pub fn build(b: *std.Build) void {
     // (tile57_colortables_default / tile57_style_template).
     lib_mod.addImport("colorprofile_registry", colorprofile_registry);
     lib_mod.addImport("catalog", catalog_embed); // chart.renderView symbol/pattern store
+    // The engine's own git commit, embedded so the RUNTIME can state which
+    // engine a process actually linked (tile57_warmup logs it once): build
+    // provenance that survives any amount of checkout / link confusion.
+    {
+        const buildinfo = b.addOptions();
+        var code: u8 = 0;
+        const raw = b.runAllowFail(&.{ "git", "describe", "--always", "--dirty" }, &code, .ignore) catch "unknown";
+        buildinfo.addOption([]const u8, "commit", std.mem.trim(u8, raw, " \n\r\t"));
+        lib_mod.addImport("buildinfo", buildinfo.createModule());
+    }
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
+    // The archive for zig-package consumers (lookout-core links it into its own
+    // build): a named lazy path, NOT dep.artifact() — the default install step
+    // installs the `tile57` CLI under the same name, and on macOS the lib
+    // reaches the install step only as the repacked file below. The raw archive
+    // is fine for a zig consumer; ld64/libtool consumers must still repack
+    // (loose-object extract) exactly like scripts/macho-align.sh does.
+    b.addNamedLazyPath("libtile57_a", lib.getEmittedBin());
     // Bundle compiler-rt INTO the static archive. A non-Zig linker (the CGO host's gcc/clang,
     // `go test`) has no access to Zig's compiler-rt, so builtins the code references — e.g.
     // `roundq` (f128 @round, pulled in by std.json's number→int coercion in coverage decode) —
@@ -652,8 +718,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
     };
     const compose_step = b.step("compose-test", "Run the runtime compositor + clip-core tests");
-    _ = addPkgTest(b, compose_step, "src/compose/compose.zig", target, optimize, &compose_deps);
-    _ = addPkgTest(b, test_step, "src/compose/compose.zig", target, optimize, &compose_deps);
+    // compose.zig reads two debug-valve env vars via std.c.getenv, so the test
+    // binaries need libc (the shipped lib already links it; addPkgTest omits it).
+    addPkgTest(b, compose_step, "src/compose/compose.zig", target, optimize, &compose_deps).link_libc = true;
+    addPkgTest(b, test_step, "src/compose/compose.zig", target, optimize, &compose_deps).link_libc = true;
 
     // The chart-bundle module hosts the per-cell composite (composeTile / ComposeSource). Its full
     // dep set (engine + assets/sprite/catalog) needs libc, so create the test module directly

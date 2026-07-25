@@ -123,9 +123,13 @@ pub fn encodeJson(a: std.mem.Allocator, cov: ChartCoverage) ![]u8 {
 }
 
 /// Extract the coverage embedded in a PMTiles metadata JSON blob, or null if absent /
-/// unparseable. The whole result (rings + strings) is allocated in `a`.
-pub fn decodeFromMetadata(a: std.mem.Allocator, metadata_json: []const u8) !?ChartCoverage {
-    var parsed = std.json.parseFromSlice(Envelope, a, metadata_json, .{ .ignore_unknown_fields = true }) catch return null;
+/// unparseable. The RESULT (rings + strings) is allocated in `a`; the JSON
+/// parser's scratch goes through `scratch`, which must be able to actually
+/// free (NOT an arena) — callers passing a retained arena for both kept the
+/// parser's whole intermediate DTO alive for the arena's lifetime, tens of MB
+/// across a full library open.
+pub fn decodeFromMetadata(a: std.mem.Allocator, scratch: std.mem.Allocator, metadata_json: []const u8) !?ChartCoverage {
+    var parsed = std.json.parseFromSlice(Envelope, scratch, metadata_json, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit(); // frees the DTO's own arena; the copies below live in `a`
     const dto = parsed.value.coverage orelse return null;
     return ChartCoverage{
@@ -204,7 +208,7 @@ test "coverage round-trips through the metadata envelope, integers exact" {
     // Embed under "coverage" alongside the other metadata keys the decoder must skip.
     const meta = try std.fmt.allocPrint(a, "{{\"name\":\"chartplotter\",\"format\":\"pbf\",\"scamin\":[1000,2000],\"coverage\":{s}}}", .{inner});
 
-    const got = (try decodeFromMetadata(a, meta)) orelse return error.TestUnexpectedResult;
+    const got = (try decodeFromMetadata(a, testing.allocator, meta)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("US5MD1MC", got.name);
     try testing.expectEqualStrings("20210115", got.date);
     try testing.expectEqual(@as(i32, 20_000), got.cscl);
@@ -224,7 +228,7 @@ test "metadata without a coverage key decodes to null" {
     defer arena.deinit();
     const a = arena.allocator();
     const meta = "{\"name\":\"chartplotter\",\"format\":\"pbf\",\"scamin\":[1000]}";
-    try testing.expect((try decodeFromMetadata(a, meta)) == null);
+    try testing.expect((try decodeFromMetadata(a, testing.allocator, meta)) == null);
 }
 
 test "bboxOf spans all rings; empty coverage yields a zero bbox" {

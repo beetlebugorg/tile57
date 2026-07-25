@@ -36,10 +36,13 @@ const style = @import("style"); // displayDenomZ (the physical display-scale for
 const cell_coverage = @import("coverage"); // per-cell M_COVR coverage embedded in archive metadata
 const compose_mod = @import("compose"); // the runtime compositor (compose-backed view renders)
 
-// smp_allocator (Zig's fast thread-safe GPA), not page_allocator: the engine
-// makes many small, short-lived allocations (tile cache, cell dupes, index
-// lists); page_allocator would mmap each one. Matches the bake CLI + C ABI.
-const gpa = std.heap.smp_allocator;
+// c_allocator, not smp_allocator: smp's per-CPU slab freelists never return
+// pages to the OS, so a long-lived host process's footprint ratchets up to the
+// worst transient peak (compose bursts) and never recovers. libc malloc frees
+// large blocks (arena chunks) back to the OS and is visible to Instruments.
+// Hot-path allocation flows through arenas, so per-alloc speed is not the
+// bottleneck. Matches the bake CLI + C ABI.
+const gpa = std.heap.c_allocator;
 
 // The S-52 colour tables, parsed once per process from the embedded profile (see
 // Chart.viewColorsRef). Immutable after init — every chart shares these, so the
@@ -628,12 +631,15 @@ fn attachEmbeddedCoverage(src: *Chart) void {
             gpa.destroy(ar);
         }
     }.f;
+    // Gunzip with gpa and free after decode: the JSON TEXT (bigger than the
+    // decoded rings) must not sit in the retained coverage arena as garbage.
     const json: []const u8 = switch (h.internal_compression) {
         .none => raw,
-        .gzip => gzip.decompress(a, raw) catch return drop(cov_arena),
+        .gzip => gzip.decompress(gpa, raw) catch return drop(cov_arena),
         else => return drop(cov_arena),
     };
-    const cov = (cell_coverage.decodeFromMetadata(a, json) catch null) orelse return drop(cov_arena);
+    defer if (h.internal_compression == .gzip) gpa.free(json);
+    const cov = (cell_coverage.decodeFromMetadata(a, gpa, json) catch null) orelse return drop(cov_arena);
     if (cov.cscl == 0 and cov.cov1.len == 0) return drop(cov_arena);
     src.cell_cov = cov;
     src.coverage_arena = cov_arena;
@@ -880,6 +886,7 @@ const BakeFileCtx = struct {
     rules_dir: ?[]const u8,
     io: std.Io,
     ok: []bool,
+    ms: []i64, // per-cell wall time — the bake profiles itself (slowest cells printed at the end)
     progress: BakeProgress,
     progress_ctx: ?*anyopaque,
     done: std.atomic.Value(u32),
@@ -888,6 +895,11 @@ const BakeFileCtx = struct {
 };
 
 fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
+    const t0 = std.Io.Clock.awake.now(ctx.io);
+    defer {
+        const t1 = std.Io.Clock.awake.now(ctx.io);
+        ctx.ms[i] = @intCast(@divTrunc(t1.nanoseconds - t0.nanoseconds, 1_000_000));
+    }
     const arc = (bakeChartBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
     defer freeBytes(arc);
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ctx.out_paths[i], .data = arc }) catch return;
@@ -930,7 +942,10 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
     const ok = gpa.alloc(bool, in_paths.len) catch return 0;
     defer gpa.free(ok);
     @memset(ok, false);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false) };
+    const cell_ms = gpa.alloc(i64, in_paths.len) catch return 0;
+    defer gpa.free(cell_ms);
+    @memset(cell_ms, 0);
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false) };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     if (n <= 1) {
@@ -945,6 +960,28 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
     var count: usize = 0;
     for (ok) |o| {
         if (o) count += 1;
+    }
+    // The bake profiles itself: total per-cell work and the slowest cells,
+    // every run — 'the bake is slow' must never again need external tooling
+    // to answer WHERE.
+    {
+        var total: i64 = 0;
+        for (cell_ms) |m| total += m;
+        std.debug.print("bake profile: {d} cells, {d} ms cell-work total\n", .{ in_paths.len, total });
+        var shown: usize = 0;
+        while (shown < 10) : (shown += 1) {
+            var best: usize = 0;
+            var best_ms: i64 = -1;
+            for (cell_ms, 0..) |m, mi| {
+                if (m > best_ms) {
+                    best_ms = m;
+                    best = mi;
+                }
+            }
+            if (best_ms <= 0) break;
+            std.debug.print("  slow cell: {d} ms  {s}\n", .{ best_ms, in_paths[best] });
+            cell_ms[best] = -1;
+        }
     }
     return count;
 }
@@ -1089,7 +1126,10 @@ fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.g
     // sprite atlas: reuse the same builder tile57_bake_sprite_mln does at the
     // SAME display ratio, so the cell rects are byte-for-byte the layout the
     // host's uploaded PNG carries (the normalized UVs must index that texture).
-    var atlas = try sprite.spriteMln(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio);
+    // Layout only: the scene consumer reads cells + dims, never the pixels —
+    // the full bake here (composite + zlib) was ~2/3 of the render path's
+    // cycles in a field profile whenever the shared atlases (re)built.
+    var atlas = try sprite.spriteMlnOpts(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio, false);
     var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.px_per_unit * 100.0 * ratio) };
     var cit = atlas.cells.iterator();
     while (cit.next()) |e| {
@@ -1116,12 +1156,23 @@ fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.g
 // NOT cached here: they declutter across the whole view every call (see the label
 // pass in renderGpuScene), so a name never repeats across a tile seam.
 const GeomKey = struct { handle: usize, z: u8, x: u32, y: u32 };
-const GeomEntry = struct { scene: *GpuScene, gen: u64 };
+const GeomEntry = struct { scene: *GpuScene, gen: u64, bytes: usize };
 var g_geom: std.AutoHashMapUnmanaged(GeomKey, GeomEntry) = .empty;
 var g_geom_gen: u64 = 0;
+var g_geom_bytes: usize = 0;
+/// Entries at/after this generation belong to the walk in progress — its parts
+/// still reference their arenas, so eviction never crosses it (set by
+/// renderComposeGpuScene; engine calls are single-threaded per the contract).
+var g_geom_floor: u64 = 0;
 var g_geom_hash: u64 = 0;
 var g_geom_hash_set = false;
 const GEOM_CACHE_MAX = 1024;
+// The cache is bounded by BYTES as well as entries: 1024 tessellated tiles can
+// be gigabytes, and on a memory-limited device (iOS jetsam) that grows the
+// process to where big allocations FAIL — scenes stop assembling exactly on
+// the widest views. 160 MB holds several views' worth of tiles; past it the
+// LRU pays a re-portray instead of the process paying with its life.
+const GEOM_CACHE_MAX_BYTES: usize = 160 << 20;
 
 /// Content hash of the geometry-affecting settings. A byte hash won't do —
 /// Settings has slice fields (whose pointers move per call) and floats (whose
@@ -1155,8 +1206,39 @@ fn geomInvalidate(s: *const render.resolve.Settings) void {
     var it = g_geom.valueIterator();
     while (it.next()) |e| e.scene.deinit();
     g_geom.clearRetainingCapacity();
+    g_geom_bytes = 0;
     g_geom_hash = hh;
     g_geom_hash_set = true;
+}
+
+/// Drop EVERY cached tile: the memory-pressure valve. Called when a scene
+/// assembly fails allocation — reclaiming the cache and re-portraying beats
+/// a build that fails identically every frame forever. ONLY safe between
+/// walks: a walk's parts reference cached arenas until assemble copies out.
+pub fn geomDropAll() void {
+    var it = g_geom.valueIterator();
+    while (it.next()) |e| e.scene.deinit();
+    g_geom.clearRetainingCapacity();
+    g_geom_bytes = 0;
+}
+
+/// The MID-WALK pressure valve: drop every cached tile EXCEPT the walk in
+/// progress's own (gen >= g_geom_floor) — those arenas are still referenced
+/// by the walk's parts, and freeing them is a use-after-free in assemble
+/// (crashed in memcpy on device).
+pub fn geomDropCold() void {
+    var doomed = std.ArrayList(GeomKey).empty;
+    defer doomed.deinit(gpa);
+    var it = g_geom.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.gen < g_geom_floor) doomed.append(gpa, kv.key_ptr.*) catch {};
+    }
+    for (doomed.items) |k| {
+        if (g_geom.fetchRemove(k)) |kv| {
+            g_geom_bytes -= @min(g_geom_bytes, kv.value.bytes);
+            kv.value.scene.deinit();
+        }
+    }
 }
 
 /// Drop every cached tile belonging to a handle — called when it closes, so a
@@ -1169,7 +1251,10 @@ pub fn geomDropHandle(handle: usize) void {
         if (kv.key_ptr.handle == handle) doomed.append(gpa, kv.key_ptr.*) catch {};
     }
     for (doomed.items) |k| {
-        if (g_geom.fetchRemove(k)) |kv| kv.value.scene.deinit();
+        if (g_geom.fetchRemove(k)) |kv| {
+            g_geom_bytes -= @min(g_geom_bytes, kv.value.bytes);
+            kv.value.scene.deinit();
+        }
     }
 }
 
@@ -1184,23 +1269,31 @@ fn geomGet(key: GeomKey) ?*GpuScene {
 
 fn geomPut(key: GeomKey, sc: *GpuScene) void {
     g_geom_gen += 1;
-    g_geom.put(gpa, key, .{ .scene = sc, .gen = g_geom_gen }) catch {
+    const bytes = sc.arena.queryCapacity();
+    g_geom.put(gpa, key, .{ .scene = sc, .gen = g_geom_gen, .bytes = bytes }) catch {
         sc.deinit();
         return;
     };
-    if (g_geom.count() <= GEOM_CACHE_MAX) return;
-    // Evict the least-recently-used (linear scan; the map is bounded).
-    var oldest_key: ?GeomKey = null;
-    var oldest_gen: u64 = std.math.maxInt(u64);
-    var it = g_geom.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.gen < oldest_gen) {
-            oldest_gen = kv.value_ptr.gen;
-            oldest_key = kv.key_ptr.*;
+    g_geom_bytes += bytes;
+    // Evict least-recently-used until under BOTH bounds (linear scans; the map
+    // is bounded). Entries stored this generation are never evicted here —
+    // they are this walk's own tiles, still referenced by the caller.
+    while (g_geom.count() > GEOM_CACHE_MAX or g_geom_bytes > GEOM_CACHE_MAX_BYTES) {
+        var oldest_key: ?GeomKey = null;
+        var oldest_gen: u64 = std.math.maxInt(u64);
+        var it = g_geom.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.gen < oldest_gen) {
+                oldest_gen = kv.value_ptr.gen;
+                oldest_key = kv.key_ptr.*;
+            }
         }
-    }
-    if (oldest_key) |ok| {
-        if (g_geom.fetchRemove(ok)) |kv| kv.value.scene.deinit();
+        if (oldest_gen >= g_geom_floor) break; // only this walk's own tiles remain
+        const doomed = oldest_key orelse break;
+        if (g_geom.fetchRemove(doomed)) |kv| {
+            g_geom_bytes -= @min(g_geom_bytes, kv.value.bytes);
+            kv.value.scene.deinit();
+        } else break;
     }
 }
 
@@ -1242,17 +1335,29 @@ fn sharedGpuAtlases(ratio: f64) SharedAtlases {
                 break;
             };
             aa.* = std.heap.ArenaAllocator.init(gpa);
+            const bt0 = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
             if (buildGpuAtlases(aa.allocator(), g_atlas_ratio)) |built| {
+                const bt1 = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io());
+                std.debug.print("gpu atlases built @ {d:.2}x in {d} ms\n", .{ g_atlas_ratio, @divTrunc(bt1.nanoseconds - bt0.nanoseconds, 1_000_000) });
                 g_atlas_sprites = built.sprites;
                 g_atlas_glyphs = built.glyphs;
                 g_atlas_glyphs_bold = built.glyphs_bold;
                 g_atlas_glyphs_italic = built.glyphs_italic;
                 g_atlas_ok = true;
-            } else |_| {
+                g_atlas_state.store(2, .release);
+            } else |err| {
                 aa.deinit();
                 gpa.destroy(aa);
+                // A FAILED build must not latch: one transient OutOfMemory here
+                // used to null the atlases for the rest of the process — every
+                // symbol then TESSELLATES (the no-atlas fallback): black-blob
+                // symbols, quads=0, and 5-10x the vertices, whose memory
+                // pressure feeds the very OOM that started it. Reset to 0 so
+                // the next scene retries; report every failure.
+                std.debug.print("gpu atlases: build FAILED ({s}) — will retry next scene; symbols tessellate until then\n", .{@errorName(err)});
+                geomDropCold(); // reclaim (walk-safe: never the in-flight walk's tiles)
+                g_atlas_state.store(0, .release);
             }
-            g_atlas_state.store(2, .release);
             break;
         }
         std.atomic.spinLoopHint();
@@ -1434,7 +1539,21 @@ pub fn renderComposeSurfaceView(src: *compose_mod.ComposeSource, lon: f64, lat: 
 /// tile source so a host draws a chart LIBRARY without owning a scene. Result
 /// owns its arena (GpuScene.deinit).
 pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
+    // A failure here (the error set is allocation) is almost always the
+    // process squeezed by its own caches (a memory-limited device under
+    // jetsam pressure): reclaim the biggest pool and retry ONCE. Without
+    // this the host retries the identical failing build every frame,
+    // forever, displaying a stale band's scene — "cells at the wrong zooms".
+    return renderComposeGpuSceneInner(src, lon, lat, zoom, w, h, palette, settings, pixel_ratio) catch |err| {
+        std.debug.print("gpu scene: build failed ({s}) — dropping tile geometry cache and retrying\n", .{@errorName(err)});
+        geomDropAll();
+        return renderComposeGpuSceneInner(src, lon, lat, zoom, w, h, palette, settings, pixel_ratio);
+    };
+}
+
+fn renderComposeGpuSceneInner(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
     geomInvalidate(settings);
+    g_geom_floor = g_geom_gen + 1; // eviction never touches this walk's tiles
     const out = try gpa.create(GpuScene);
     errdefer gpa.destroy(out);
     out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
@@ -1448,21 +1567,59 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
 
     const pt: f32 = @floatCast(256.0 * std.math.pow(f64, 2.0, zoom - @round(zoom)));
     var vt = scene.ViewTiles.init(lon, lat, zoom, w, h, pt);
+    // A tile that fails to build or store leaves a tile-shaped NODATA hole in
+    // the scene, so it must never be silent: count and name the failures. (A
+    // healthy build prints nothing.)
+    var failed: u32 = 0;
+    var total: u32 = 0;
+    var empty: u32 = 0; // tiles that contributed NO geometry this call
+    var fresh: u32 = 0; // tiles portrayed this call (the rest were cache hits)
+    var last_err: []const u8 = "";
+    // Empty tiles are NEVER cached: a truly-empty (open ocean) tile rebuilds
+    // for the cost of one partition classify, and a TRANSIENTLY empty one —
+    // whatever emptied it — must not become a hole that sticks until eviction.
+    // They still contribute to THIS call, so their arenas live until after
+    // assemble copies out of them.
+    var ephemeral = std.ArrayList(*GpuScene).empty;
+    defer for (ephemeral.items) |e| e.deinit();
     while (vt.next()) |t| {
+        total += 1;
         const key = GeomKey{ .handle = @intFromPtr(src), .z = t.z, .x = t.x, .y = t.y };
         if (geomGet(key) == null) {
-            const built = renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio) catch continue;
-            geomPut(key, built);
+            fresh += 1;
+            if (renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio)) |built| {
+                if (built.scene.vertices.len == 0 and built.scene.quads.len == 0) {
+                    empty += 1;
+                    if (ephemeral.append(sa, built)) |_| {
+                        parts.append(sa, built.scene) catch {};
+                        cands.appendSlice(sa, built.candidates) catch {};
+                    } else |_| built.deinit();
+                    continue;
+                }
+                geomPut(key, built);
+            } else |err| {
+                failed += 1;
+                last_err = @errorName(err);
+                continue;
+            }
         }
         if (geomGet(key)) |g| {
+            if (g.scene.vertices.len == 0 and g.scene.quads.len == 0) empty += 1;
             parts.append(sa, g.scene) catch {};
             cands.appendSlice(sa, g.candidates) catch {};
+        } else {
+            failed += 1; // built but could not be cached (geomPut freed it)
+            last_err = "CachePutFailed";
         }
     }
+    if (failed > 0) std.debug.print("gpu scene z{d}: {d}/{d} tiles FAILED ({s}) — tile-shaped holes\n", .{ vt.z, failed, total, last_err });
+    // Not necessarily wrong (open ocean beyond coverage IS empty), but the
+    // first thing to read when tile-shaped holes appear over charted ground.
+    if (empty > 0) std.debug.print("gpu scene z{d}: {d}/{d} tiles empty ({d} fresh)\n", .{ vt.z, empty, total, fresh });
 
     parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
-    out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
+    out.scene = try render.gpu.assemble(out.arena.allocator(), sa, parts.items);
     return out;
 }
 
@@ -1492,12 +1649,32 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     gs.setTile(z, x, y);
     const surf = gs.asSurface();
     try surf.beginScene(z);
-    if (src.tile(sa, z, x, y) catch null) |res| {
+    // A per-tile OutOfMemory reclaims the biggest pool and retries once —
+    // without this, coarse tiles vanished one by one on a memory-limited
+    // device while every counter upstream read healthy.
+    const tile_res = src.tile(sa, z, x, y) catch |err| blk: {
+        if (err == error.OutOfMemory) {
+            geomDropCold(); // NOT geomDropAll: the walk's own tiles are still referenced
+            break :blk src.tile(sa, z, x, y);
+        }
+        break :blk err;
+    };
+    if (tile_res) |res| {
         if (res.tile) |bytes| {
             if (mlt.decode(sa, bytes)) |layers| {
-                scene.replayTile(sa, surf, layers) catch {};
-            } else |_| {}
+                scene.replayTile(sa, surf, layers) catch |err| {
+                    std.debug.print("TILE LOST z{d}/{d}/{d}: replay FAILED ({s}) after {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
+                };
+            } else |err| {
+                std.debug.print("TILE LOST z{d}/{d}/{d}: decode FAILED ({s}) on {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
+            }
+        } else {
+            // Nothing served: say why — the owner with no tile, or charted
+            // ground the tier map gave to nobody. (True ocean stays silent.)
+            src.explainEmpty(z, x, y);
         }
+    } else |err| {
+        std.debug.print("TILE LOST z{d}/{d}/{d}: compose FAILED ({s})\n", .{ z, x, y, @errorName(err) });
     }
     out.scene = try gs.build(out.arena.allocator());
     out.candidates = try gs.takeCandidates(out.arena.allocator());
@@ -2274,7 +2451,7 @@ pub const Chart = struct {
         // re-shaping (that was cached per tile).
         parts.append(sa, try render.gpu.assembleLabels(sa, sa, cands.items, zoom, settings.ignore_scamin)) catch {};
 
-        out.scene = try render.gpu.assemble(out.arena.allocator(), parts.items);
+        out.scene = try render.gpu.assemble(out.arena.allocator(), sa, parts.items);
         return out;
     }
 

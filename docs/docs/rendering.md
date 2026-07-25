@@ -143,8 +143,8 @@ tile57_chart_pdf(c, -76.48, 38.974, 15.1, 1600, 1200, &m, &pdf, &plen, NULL);
 
 That renders ONE chart, no composition. A view across a whole chart library
 is the same call on the compositor — `tile57_compose_png` / `_pdf` — which
-composes every covering tile through the ownership partition first. See the
-[C API](./c-api.md).
+composes every covering tile through the ownership partition first. See
+[Compose](./api/compose.md).
 
 `m.size_scale` calibrates physical size (so 1 S-52 millimetre is a true
 millimetre on your display). Every field of `tile57_mariner` — categories, text
@@ -165,7 +165,9 @@ overlapping.
 Both interfaces are directly available: build a `PixelSurface`, drive it with
 `scene.generateTile` / `scene.generateView`, or replay a decoded tile with
 `scene.replayTile`. See `tools/bake.zig`'s `runRender` for a complete worked
-example.
+example. For the higher-level `Chart` entry points — `renderView` (PNG / PDF /
+canvas), `renderSurfaceView`, and `renderGpuScene` — see the
+[Zig API render page](./zig/render.md#render-surfaces).
 
 ## Extending it
 
@@ -180,30 +182,36 @@ the ten Surface methods and you receive the full semantic stream — this is
 how MVT and MLT are done (`TileSurface` in `src/scene/scene.zig`), and how a
 GeoJSON debug dump or a GPU display list would be done.
 
-**From the C ABI:** both interfaces are exposed as callback tables.
-`tile57_chart_canvas` drives a `tile57_canvas_cb` — C function pointers receiving
-resolved, flattened paths, patterns, and glyph outlines in pixel space, in
-paint order (the Canvas seat). `tile57_chart_surface` drives a `tile57_surface_cb` —
-the world-space, semantically tagged stream (per-feature class + SCAMIN, world
-anchors, reference-pixel outlines) a GPU host tessellates once and transforms
-per frame (the Surface seat).
+**From the C ABI:** the same engine is exposed three ways, all in S-52 paint order
+— see [Render surfaces](./api/render.md#render-surfaces) for the full contract:
 
-That stream arrives in S-52 paint order too: the engine buffers the scene and
-sorts it (areas → patterns → lines → symbols → soundings → text, by draw priority
-within each class) before calling you, so drawing in callback order is correct
-and no host needs its own sort. The catch is that only an order you *preserve*
-survives. A GPU renderer that batches by draw type — all fills, then all sprites,
-then all text — to minimise pipeline switches has reordered the stream by
-construction, and global paint order breaks again. If you batch, sort each batch
-by the per-feature `display_priority` and draw the batches in the class order above; that is
-what `display_priority` is still exposed for.
+- `tile57_chart_canvas` drives a `tile57_canvas_cb` — resolved, flattened paths,
+  patterns, and glyph outlines in **pixel** space (the Canvas seat).
+- `tile57_chart_surface` drives a `tile57_surface_cb` — the **world-space**,
+  semantically tagged stream (per-feature class + SCAMIN, world anchors,
+  reference-pixel outlines) a GPU host tessellates once and transforms per frame
+  (the Surface seat).
+- `tile57_chart_gpu_scene` hands back **draw-ready GPU buffers** — already
+  triangulated, already in paint order, already batched into one-pipeline ranges —
+  so a GPU host does no tessellation and owns no copy of the S-52 ordering rules.
 
-Its two text callbacks also carry the label's S-52
-text group, so a host can draw group 11 (important text) larger or bold and
-ordinary names normally — that group belongs to the label, not the feature.
-Both have composed twins on the compositor
-(`tile57_compose_canvas` / `tile57_compose_surface`). A custom output format in
-Zig is still one small file in `src/render/`.
+The two callback seats arrive already sorted (areas → patterns → lines → symbols →
+soundings → text, by draw priority within each class), so drawing in callback order
+is correct and no host needs its own sort — but only an order you *preserve*
+survives. A GPU host that batches by draw type to cut pipeline switches reorders the
+stream and breaks paint order; the fix is to batch by `display_priority` **band**
+(not by pipeline, and *not* by sorting each per-type batch), drawing the bands in
+ascending order. That rule is documented in full on the C API page:
+[Paint order](./api/render.md#paint-order). The
+[draw-ready GPU scene](./api/render.md#draw-ready-gpu-scenes-batched-buffers)
+sidesteps it entirely — its ranges *are* the order, so drawing them in sequence is
+all a host does.
+
+The two text callbacks also carry the label's S-52 text group, so a host can draw
+group 11 (important text) larger or bold and ordinary names normally — that group
+belongs to the label, not the feature. All three seats have composed twins on the
+compositor (`tile57_compose_canvas` / `_surface` / `_gpu_scene`). A custom output
+format in Zig is still one small file in `src/render/`.
 
 For a tile-renderer host that caches geometry per tile (via the per-tile
 `tile57_chart_tile_surface`), a companion `tile57_chart_labels`

@@ -61,6 +61,19 @@ pub const Vertex = extern struct {
     /// bricks): a rotated view must turn it. Zero means screen-upright.
     map_align: u8,
     _pad: [2]u8 = .{ 0, 0 },
+    /// Straight-alpha RGBA, resolved for the scene's palette. Per-VERTEX (not
+    /// per-range) so a host can draw contiguous ranges of DIFFERENT colours in
+    /// one call — at coastal zooms the per-range uniform+draw churn measured
+    /// as the frame-rate cap on a phone. Range.color remains as advisory
+    /// metadata.
+    color: [4]u8 = .{ 0, 0, 0, 255 },
+    /// Paint-order depth in (0,1): LATER paint = SMALLER value (closer).
+    /// Assigned per RANGE by build/assemble after the paint sort. A host draws
+    /// OPAQUE ranges front-to-back with depth test LESS + write (hidden
+    /// fragments never shade), then blended content in paint order with test
+    /// LESS, no write — under-an-opaque is culled, everything else blends
+    /// exactly as painter's order did. 0 (the default) always passes.
+    depth: f32 = 0,
 };
 
 /// One textured-quad vertex — a symbol sprite or an SDF glyph. `x,y` is the
@@ -94,6 +107,10 @@ pub const Quad = extern struct {
     /// 256 * 2π`), so the flip shader recovers cos/sin(tangent) with no rebuild.
     /// Meaningful only when `flip` is set; 0 otherwise.
     tangent_q: u8 = 0,
+    /// Paint-order depth, same contract as Vertex.depth: quads are NOT all
+    /// top-band content (linestyle bricks ride LOW bands under area fills) —
+    /// without this they float above every fill in a depth-tested pass.
+    depth: f32 = 0,
 };
 
 /// `Range.pattern` when the range is not an area-fill pattern — which is every
@@ -247,7 +264,10 @@ pub const Range = extern struct {
     kind: Kind,
     prim: Prim,
     atlas: AtlasId,
-    _pad: u8 = 0,
+    /// Bit 0: OPAQUE — a pattern-less triangle range whose every colour has
+    /// alpha 255. Such ranges are eligible for a host's front-to-back
+    /// depth-tested pass; everything else must blend in paint order.
+    flags: u8 = 0,
 };
 
 /// A finished scene. Everything borrows the arena passed to `endScene` and dies
@@ -381,6 +401,10 @@ pub const GpuSurface = struct {
     candidates: std.ArrayList(LabelCandidate) = .empty,
     // Keyed by (face_idx << 16 | gid): glyph ids are per-face (outline fallback).
     glyph_cache: std.AutoHashMapUnmanaged(u32, []const []const cv.Point) = .empty,
+    /// The current tile's EFFECTIVE safety contour (mariner's value snapped to
+    /// the tile's ladder — see Surface.set_contour_ladder). Drives live water
+    /// shading, the danger-symbol swap, and the bold safety-contour line.
+    eff_safety: ?f64 = null,
 
     const vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -394,7 +418,21 @@ pub const GpuSurface = struct {
         .endFeature = endFeature,
         .endScene = endScene,
         .size_scale = sizeScale,
+        .set_contour_ladder = setContourLadder,
     };
+
+    fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
+        const self = sp(ctx);
+        self.eff_safety = rs.Surface.effectiveSafety(self.settings.safety_contour, ladder);
+    }
+
+    /// Settings with the SNAPPED safety contour — what live shading resolves
+    /// against, so the split always coincides with a contour that exists.
+    fn effSettings(self: *GpuSurface) resolve.Settings {
+        var m = self.settings.*;
+        if (self.eff_safety) |v| m.safety_contour = v;
+        return m;
+    }
 
     pub fn init(a: Allocator, colors: *const resolve.Colors, palette: resolve.PaletteId, settings: *const resolve.Settings, zoom: f64) !GpuSurface {
         return .{
@@ -522,10 +560,16 @@ pub const GpuSurface = struct {
 
     fn endFeature(_: *anyopaque) anyerror!void {}
 
-    fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, _: ?rs.DepthRange) anyerror!void {
+    fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
-        try self.push(.area, self.rgba(token), .{ .fill = .{ .rings = rings, .rule = .nonzero } });
+        // Depth areas re-resolve their shade against the LIVE mariner contours
+        // (snapped): the baked token was fixed at bake defaults, and using it
+        // froze the app's water shading — contour changes moved only danger
+        // symbols. Mirrors vector/pixel (which always did this).
+        var eff = self.effSettings();
+        const name = if (depth) |d| resolve.seabedToken(d, &eff) else token;
+        try self.push(.area, self.rgba(name), .{ .fill = .{ .rings = rings, .rule = .nonzero } });
     }
 
     /// An area-fill pattern: the polygon interior, plus the cell to tile over it.
@@ -570,10 +614,24 @@ pub const GpuSurface = struct {
     fn strokeLine(ctx: *anyopaque, token: rs.ColorToken, width_px: f64, dash: rs.Dash, lines: []const []const rs.TilePoint, valdco: ?f64) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
+        // THE safety contour (S-52 §10.5.5): the depth contour matching the
+        // effective safety value draws bold and solid — the boundary between
+        // safe and unsafe water must be unmistakable, and it must be the SAME
+        // contour the shading split sits on (both use the snapped value).
+        var w = width_px;
+        var dsh = dash;
+        if (valdco) |v| {
+            if (self.eff_safety) |eff| {
+                if (@abs(v - eff) < 0.01) {
+                    w = @max(width_px * 2.5, 2.0);
+                    dsh = .solid;
+                }
+            }
+        }
         try self.push(.line, self.rgba(token), .{ .stroke = .{
             .lines = lines,
-            .half_w = @floatCast(@max(width_px, 0.5) * 0.5),
-            .dash = dash,
+            .half_w = @floatCast(@max(w, 0.5) * 0.5),
+            .dash = dsh,
         } });
         // A depth-contour value rides the line as a MAP-aligned, tangent-rotated
         // label candidate — the same placement the vector path emits.
@@ -736,7 +794,10 @@ pub const GpuSurface = struct {
         // style, so mirror that toggle here (as vector.zig / pixel.zig do).
         if (!self.settings.show_inform_callouts and std.mem.eql(u8, name, "INFORM01")) return;
         var eff = name;
-        if (danger_depth) |dd| eff = if (dd > self.settings.safety_contour) "DANGER02" else "DANGER01";
+        if (danger_depth) |dd| {
+            const sc = self.eff_safety orelse self.settings.safety_contour;
+            eff = if (dd > sc) "DANGER02" else "DANGER01";
+        }
         const s = store.get(eff) orelse return;
         try self.emitSprite(.symbol, eff, s, at, rot_deg, scale, self.refDev(), rot_north);
     }
@@ -1107,6 +1168,11 @@ pub const GpuSurface = struct {
     pub fn build(self: *GpuSurface, arena: Allocator) !Scene {
         std.mem.sort(Op, self.ops.items, {}, opLt);
 
+        // Grow the working lists in the SCRATCH allocator, not `arena`: an
+        // ArrayList growing inside an arena strands every outgrown copy there
+        // for the arena's lifetime — for a cached tile scene that ~doubled the
+        // resident cost of every entry. The final slices are duped into `arena`
+        // at the end (everything is by-value, so relocation is safe).
         var verts = std.ArrayList(Vertex).empty;
         var indices = std.ArrayList(u32).empty;
         var quads = std.ArrayList(Quad).empty;
@@ -1120,11 +1186,11 @@ pub const GpuSurface = struct {
             if (op.geom == .sprite) {
                 const sq = op.geom.sprite;
                 const first = quads.items.len;
-                try self.emitSpriteGeom(arena, &quads, op, sq.anchor, sq.quads, sq.weight);
+                try self.emitSpriteGeom(self.a, &quads, op, sq.anchor, sq.quads, sq.weight);
                 const count = quads.items.len - first;
                 if (count == 0) continue;
                 if (coalesce(&ranges, op, .quads, sq.atlas, first, count)) continue;
-                try ranges.append(arena, .{
+                try ranges.append(self.a, .{
                     .first = @intCast(first),
                     .count = @intCast(count),
                     .paint_key = op.paint_key,
@@ -1138,15 +1204,15 @@ pub const GpuSurface = struct {
             }
             const first = indices.items.len;
             switch (op.geom) {
-                .fill => |f| try self.emitFill(arena, &verts, &indices, op, f.rings, f.rule),
-                .stroke => |s| try self.emitStroke(arena, &verts, &indices, op, s.lines, s.half_w),
-                .mark => |m| try self.emitMarkGeom(arena, &verts, &indices, op, m.anchor, m.rings, m.rule),
+                .fill => |f| try self.emitFill(self.a, &verts, &indices, op, f.rings, f.rule),
+                .stroke => |s| try self.emitStroke(self.a, &verts, &indices, op, s.lines, s.half_w),
+                .mark => |m| try self.emitMarkGeom(self.a, &verts, &indices, op, m.anchor, m.rings, m.rule),
                 .sprite => unreachable,
             }
             const count = indices.items.len - first;
             if (count == 0) continue;
             if (coalesce(&ranges, op, .triangles, .none, first, count)) continue;
-            try ranges.append(arena, .{
+            try ranges.append(self.a, .{
                 .first = @intCast(first),
                 .count = @intCast(count),
                 .paint_key = op.paint_key,
@@ -1155,7 +1221,20 @@ pub const GpuSurface = struct {
                 .prim = .triangles,
                 .atlas = .none,
                 .color = op.color,
+                .flags = if (op.pattern == NO_PATTERN and op.color[3] == 255) 1 else 0,
             });
+        }
+        // Paint-order depth, per RANGE: range i of N gets (N-i)/(N+1) — later
+        // paint = closer. Written through each range's index span (a vertex
+        // belongs to exactly one range). assemble() reassigns per view.
+        const nr = ranges.items.len;
+        for (ranges.items, 0..) |r, i| {
+            const d: f32 = @floatCast(@as(f64, @floatFromInt(nr - i)) / @as(f64, @floatFromInt(nr + 1)));
+            if (r.prim == .triangles) {
+                for (indices.items[r.first..][0..r.count]) |idx| verts.items[idx].depth = d;
+            } else {
+                for (quads.items[r.first..][0..r.count]) |*q| q.depth = d;
+            }
         }
         // Pattern cells were interned into the surface's (scratch) allocator, but
         // the scene must outlive it — so copy each cell's PIXELS into `arena`, not
@@ -1166,10 +1245,10 @@ pub const GpuSurface = struct {
             dst.* = .{ .w = src.w, .h = src.h, .rgba = try arena.dupe(u8, src.rgba) };
         }
         return .{
-            .vertices = try verts.toOwnedSlice(arena),
-            .indices = try indices.toOwnedSlice(arena),
-            .quads = try quads.toOwnedSlice(arena),
-            .ranges = try ranges.toOwnedSlice(arena),
+            .vertices = try arena.dupe(Vertex, verts.items),
+            .indices = try arena.dupe(u32, indices.items),
+            .quads = try arena.dupe(Quad, quads.items),
+            .ranges = try arena.dupe(Range, ranges.items),
             .patterns = pats,
         };
     }
@@ -1195,9 +1274,15 @@ pub const GpuSurface = struct {
     fn coalesce(ranges: *std.ArrayList(Range), op: Op, prim: Prim, atlas: AtlasId, first: usize, count: usize) bool {
         if (ranges.items.len == 0) return false;
         const prev = &ranges.items[ranges.items.len - 1];
+        const op_flags: u8 = if (prim == .triangles and op.pattern == NO_PATTERN and op.color[3] == 255) 1 else 0;
+        // OPAQUE ranges never merge across colours: each keeps its own depth,
+        // so overlapping same-band fills of different colours resolve by depth
+        // exactly as painter's order did. Blended ranges may colour-merge —
+        // they still draw in buffer order.
+        if (prev.flags != op_flags) return false;
+        if (op_flags == 1 and !std.mem.eql(u8, &prev.color, &op.color)) return false;
         if (prev.prim == prim and prev.atlas == atlas and prev.paint_key == op.paint_key and
             prev.kind == op.kind and prev.pattern == op.pattern and
-            std.mem.eql(u8, &prev.color, &op.color) and
             prev.first + prev.count == first)
         {
             prev.count += @intCast(count);
@@ -1246,6 +1331,7 @@ pub const GpuSurface = struct {
             .scamin = op.scamin,
             .disp_cat = op.disp_cat,
             .map_align = op.map_align,
+            .color = op.color,
         };
     }
 
@@ -1322,7 +1408,9 @@ pub const GpuSurface = struct {
 /// tessellate) happened once per tile; this is memcpy + an offset fixup + a sort.
 /// Everything is copied into `arena`, so the result is independent of the input
 /// scenes' lifetimes (a cached tile may be evicted after).
-pub fn assemble(arena: Allocator, scenes: []const Scene) !Scene {
+pub fn assemble(arena: Allocator, scratch: Allocator, scenes: []const Scene) !Scene {
+    // Working lists grow in `scratch` (stale growth copies die with it); only
+    // the final slices are duped into `arena` — see GpuSurface.build.
     var verts = std.ArrayList(Vertex).empty;
     var indices = std.ArrayList(u32).empty;
     var quads = std.ArrayList(Quad).empty;
@@ -1333,32 +1421,64 @@ pub fn assemble(arena: Allocator, scenes: []const Scene) !Scene {
         const ibase: u32 = @intCast(indices.items.len);
         const qbase: u32 = @intCast(quads.items.len);
         const pbase: u32 = @intCast(patterns.items.len);
-        try verts.appendSlice(arena, s.vertices);
-        for (s.indices) |idx| try indices.append(arena, idx + vbase);
-        try quads.appendSlice(arena, s.quads);
+        try verts.appendSlice(scratch, s.vertices);
+        for (s.indices) |idx| try indices.append(scratch, idx + vbase);
+        try quads.appendSlice(scratch, s.quads);
         // Pattern pixels live in the source scene's arena; copy them so the result
-        // outlives it.
-        for (s.patterns) |cell| try patterns.append(arena, .{ .w = cell.w, .h = cell.h, .rgba = try arena.dupe(u8, cell.rgba) });
+        // outlives it (straight into `arena` — pixels are duped exactly once).
+        for (s.patterns) |cell| try patterns.append(scratch, .{ .w = cell.w, .h = cell.h, .rgba = try arena.dupe(u8, cell.rgba) });
         for (s.ranges) |r| {
             var nr = r;
             nr.first = r.first + (if (r.prim == .triangles) ibase else qbase);
             if (r.pattern != NO_PATTERN) nr.pattern = r.pattern + pbase;
-            try ranges.append(arena, nr);
+            try ranges.append(scratch, nr);
         }
     }
-    // Cross-tile paint order: one global sort by the engine's key. Ties (same
-    // class/priority in different tiles) draw in any order — same paint band.
-    std.mem.sort(Range, ranges.items, {}, struct {
+    // Cross-tile paint order: one global STABLE sort by the engine's key (ties
+    // keep tile order, so the layout below is deterministic).
+    std.sort.block(Range, ranges.items, {}, struct {
         fn lt(_: void, a: Range, b: Range) bool {
             return a.paint_key < b.paint_key;
         }
     }.lt);
+    // Re-lay the index and quad streams IN SORTED RANGE ORDER, so ranges that
+    // draw identically sit contiguously and a host can merge whole paint bands
+    // into single draw calls. Without this, the global sort interleaves tiles
+    // and same-band ranges land at scattered offsets — a phone-measured
+    // frame-rate cap of thousands of draws where dozens suffice. One extra
+    // linear copy, on the build thread.
+    var indices2 = try scratch.alloc(u32, indices.items.len);
+    var quads2 = try scratch.alloc(Quad, quads.items.len);
+    var ipos: u32 = 0;
+    var qpos: u32 = 0;
+    for (ranges.items) |*r| {
+        if (r.prim == .triangles) {
+            @memcpy(indices2[ipos..][0..r.count], indices.items[r.first..][0..r.count]);
+            r.first = ipos;
+            ipos += r.count;
+        } else {
+            @memcpy(quads2[qpos..][0..r.count], quads.items[r.first..][0..r.count]);
+            r.first = qpos;
+            qpos += r.count;
+        }
+    }
+    // Whole-view paint-order depth, per RANGE (overwrites the per-tile values:
+    // the global sort interleaved tiles). Later paint = closer; see Vertex.depth.
+    const nr = ranges.items.len;
+    for (ranges.items, 0..) |r, i| {
+        const d: f32 = @floatCast(@as(f64, @floatFromInt(nr - i)) / @as(f64, @floatFromInt(nr + 1)));
+        if (r.prim == .triangles) {
+            for (indices2[r.first..][0..r.count]) |idx| verts.items[idx].depth = d;
+        } else {
+            for (quads2[r.first..][0..r.count]) |*q| q.depth = d;
+        }
+    }
     return .{
-        .vertices = try verts.toOwnedSlice(arena),
-        .indices = try indices.toOwnedSlice(arena),
-        .quads = try quads.toOwnedSlice(arena),
-        .ranges = try ranges.toOwnedSlice(arena),
-        .patterns = try patterns.toOwnedSlice(arena),
+        .vertices = try arena.dupe(Vertex, verts.items),
+        .indices = try arena.dupe(u32, indices2[0..ipos]),
+        .quads = try arena.dupe(Quad, quads2[0..qpos]),
+        .ranges = try arena.dupe(Range, ranges.items),
+        .patterns = try arena.dupe(PatternCell, patterns.items),
     };
 }
 
@@ -1916,7 +2036,7 @@ const TextFixture = struct {
     fn full(self: *TextFixture, a: Allocator) !Scene {
         const geom = try self.gs.build(a);
         const labels = try self.labelScene(a);
-        return assemble(a, &.{ geom, labels });
+        return assemble(a, a, &.{ geom, labels });
     }
     /// One label alone: the baseline a crowded scene is measured against.
     fn one(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings, text: []const u8) !Scene {
@@ -2115,11 +2235,14 @@ test "gpu: the C scene structs match their tile57.h layout" {
     // misread — wrong colours, wrong offsets, no error anywhere. These numbers
     // came from a C program compiled against the header (sizeof + offsetof), so
     // a Zig-side change that breaks the C view fails here instead of on a chart.
-    try testing.expectEqual(@as(usize, 24), @sizeOf(Vertex));
+    try testing.expectEqual(@as(usize, 32), @sizeOf(Vertex));
     try testing.expectEqual(@as(usize, 8), @offsetOf(Vertex, "ox"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(Vertex, "scamin"));
     try testing.expectEqual(@as(usize, 20), @offsetOf(Vertex, "disp_cat"));
     try testing.expectEqual(@as(usize, 21), @offsetOf(Vertex, "map_align"));
+    try testing.expectEqual(@as(usize, 24), @offsetOf(Vertex, "color"));
+    try testing.expectEqual(@as(usize, 28), @offsetOf(Vertex, "depth"));
+    try testing.expectEqual(@as(usize, 23), @offsetOf(Range, "flags"));
 
     try testing.expectEqual(@as(usize, 24), @sizeOf(Range));
     try testing.expectEqual(@as(usize, 0), @offsetOf(Range, "first"));
@@ -2131,7 +2254,8 @@ test "gpu: the C scene structs match their tile57.h layout" {
     try testing.expectEqual(@as(usize, 21), @offsetOf(Range, "prim"));
     try testing.expectEqual(@as(usize, 22), @offsetOf(Range, "atlas"));
 
-    try testing.expectEqual(@as(usize, 40), @sizeOf(Quad));
+    try testing.expectEqual(@as(usize, 44), @sizeOf(Quad));
+    try testing.expectEqual(@as(usize, 40), @offsetOf(Quad, "depth"));
     try testing.expectEqual(@as(usize, 16), @offsetOf(Quad, "u"));
     try testing.expectEqual(@as(usize, 24), @offsetOf(Quad, "color"));
     try testing.expectEqual(@as(usize, 28), @offsetOf(Quad, "weight"));

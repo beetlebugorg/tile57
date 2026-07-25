@@ -16,11 +16,11 @@ const common = @import("common.zig");
 const Flags = common.Flags;
 const usageErr = common.usageErr;
 
-// Monotonic nanoseconds (std.time has no Timer in this toolchain).
-fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+// Monotonic nanoseconds via the std.Io clock (cross-platform — the POSIX
+// clock_gettime binding doesn't exist under the Windows calling convention, and
+// std.time has no Timer in this toolchain). `.awake` is CLOCK_MONOTONIC.
+fn nowNs(io: std.Io) u64 {
+    return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
 }
 
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -107,7 +107,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     // Open the resident source (mmap archives + partition once) — the amortised cost.
-    const open_t0 = nowNs();
+    const open_t0 = nowNs(io);
     const src = (compose.ComposeSource.openFiles(io, a, paths.items, load_bytes) catch |err| {
         std.debug.print("error: open compose source failed ({s})\n", .{@errorName(err)});
         return;
@@ -116,7 +116,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     };
     defer src.deinit();
-    const open_ms = @as(f64, @floatFromInt(nowNs() - open_t0)) / 1e6;
+    const open_ms = @as(f64, @floatFromInt(nowNs(io) - open_t0)) / 1e6;
     std.debug.print("opened {d} cell(s), partition {s}, in {d:.1} ms (serve z {d}..{d})\n", .{ src.readers.len, if (load_bytes != null) "loaded" else "built", open_ms, src.minz, src.loop_max });
 
     // Artifact sweep: compose every in-bounds tile at the scan zooms and report
@@ -163,10 +163,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     // Serve the requested tile.
-    const serve_t0 = nowNs();
+    const serve_t0 = nowNs(io);
     const res = try src.tile(a, z, tx, ty);
     const tile = res.tile;
-    const serve_ms = @as(f64, @floatFromInt(nowNs() - serve_t0)) / 1e6;
+    const serve_ms = @as(f64, @floatFromInt(nowNs(io) - serve_t0)) / 1e6;
     if (tile) |t| {
         std.debug.print("served z{d}/{d}/{d}: {d} bytes (raw MLT, owned={}) in {d:.3} ms\n", .{ z, tx, ty, t.len, res.owned, serve_ms });
         if (out) |op| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = op, .data = t }) catch |err|
@@ -179,7 +179,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         const half = bench / 2;
         var served: usize = 0;
         var bytes: usize = 0;
-        const bench_t0 = nowNs();
+        const bench_t0 = nowNs(io);
         var dx: u32 = 0;
         while (dx < bench) : (dx += 1) {
             var dy: u32 = 0;
@@ -194,7 +194,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
             }
         }
-        const total_ms = @as(f64, @floatFromInt(nowNs() - bench_t0)) / 1e6;
+        const total_ms = @as(f64, @floatFromInt(nowNs(io) - bench_t0)) / 1e6;
         const n: f64 = @floatFromInt(bench * bench);
         std.debug.print("bench: {d}/{d} tiles owned, queried {d} in {d:.1} ms = {d:.3} ms/tile ({d} bytes total)\n", .{ served, @as(u32, bench * bench), @as(u32, bench * bench), total_ms, total_ms / n, bytes });
     }

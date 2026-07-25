@@ -51,6 +51,11 @@ const config = {
         title: 'tile57',
         items: [
           {
+            to: '/contributing',
+            label: 'Contributing',
+            position: 'right',
+          },
+          {
             href: 'https://github.com/beetlebugorg/chartplotter-go',
             label: 'chartplotter-go',
             position: 'right',
