@@ -220,20 +220,21 @@ fn androidTriple(target: std.Build.ResolvedTarget) ?[]const u8 {
 // live in the triple subdir (sys_include_dir), which a plain `--sysroot` misses.
 fn ndkSysroot(b: *std.Build, ndk: []const u8) []const u8 {
     const base = b.fmt("{s}/toolchains/llvm/prebuilt", .{ndk});
-    // The NDK ships one host toolchain dir; pick the one that exists rather than
-    // assume (darwin-arm64 vs darwin-x86_64 vary by NDK/host).
-    const candidates = [_][]const u8{ "darwin-arm64", "darwin-x86_64", "linux-x86_64", "windows-x86_64" };
+    // The NDK ships one host toolchain dir. Probe the host-OS default FIRST (what
+    // the NDK actually ships — e.g. darwin-x86_64 even on Apple silicon) so the
+    // result is correct regardless of how accessAbsolute behaves; only fall
+    // through to alternates (a future darwin-arm64 toolchain) if it's absent.
+    const candidates: []const []const u8 = switch (@import("builtin").os.tag) {
+        .macos => &.{ "darwin-x86_64", "darwin-arm64" },
+        .windows => &.{"windows-x86_64"},
+        else => &.{ "linux-x86_64", "linux-aarch64" },
+    };
     for (candidates) |host| {
         const sysroot = b.fmt("{s}/{s}/sysroot", .{ base, host });
         std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/usr/include", .{sysroot}), .{}) catch continue;
         return sysroot;
     }
-    const def = switch (@import("builtin").os.tag) {
-        .macos => "darwin-x86_64",
-        .windows => "windows-x86_64",
-        else => "linux-x86_64",
-    };
-    return b.fmt("{s}/{s}/sysroot", .{ base, def });
+    return b.fmt("{s}/{s}/sysroot", .{ base, candidates[0] }); // default; clear path in errors
 }
 
 fn androidLibcFile(b: *std.Build, ndk: []const u8, triple: []const u8, api: u32) std.Build.LazyPath {
