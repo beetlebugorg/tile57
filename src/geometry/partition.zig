@@ -115,10 +115,15 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
         plane.freeOwned(gpa, m.faces);
         gpa.free(m.pos);
     };
+    // One coverage index for every tier: coverage is tier-invariant, and it is
+    // also what makes a face a pure function of its subtrahend index list.
+    var cov_idx = try plane.buildCoverageIndex(gpa, cells);
+    defer cov_idx.deinit(gpa);
+
     const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
     for (tiers, 0..) |t, i| {
         const t0 = if (stats) plane.statNow() else 0;
-        const faces = try plane.ownedAtTierIndexed(gpa, cells, t);
+        const faces = try plane.ownedAtTierWithIndex(gpa, cells, t, &cov_idx);
         if (stats) std.debug.print("partition tier {d}: call total {d:.0} ms, {d} faces\n", .{
             t, @as(f64, @floatFromInt(plane.statNow() - t0)) / 1e6, faces.len,
         });

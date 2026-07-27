@@ -213,6 +213,99 @@ pub fn statNow() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+/// Worker count for the parallel partition passes. Overridable because the
+/// passes' correctness claim IS that they serialize byte-identically to a
+/// serial run, and checking that means forcing both over the same input.
+fn workerCount(m: usize) usize {
+    if (std.c.getenv("TILE57_PARTITION_WORKERS")) |w| {
+        if (std.fmt.parseInt(usize, std.mem.sliceTo(w, 0), 10) catch null) |n|
+            return @max(1, @min(n, 64));
+    }
+    if (m < 64) return 1; // not worth the threads
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @max(1, @min(cpus, 8));
+}
+
+/// Every cell's coverage (∪cov1 \ ∪cov2) and its bbox, keyed by GLOBAL cell
+/// index. Coverage is tier-invariant, so the multi-tier build computes it once
+/// here instead of once per tier. Ring geometry lives in per-worker arenas over
+/// the page allocator; the slices live in `gpa`. Free with `deinit`.
+pub const CoverageIndex = struct {
+    covs: []Poly,
+    bbs: [][4]i64,
+    arenas: []std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *CoverageIndex, gpa: Allocator) void {
+        for (self.arenas) |*ar| ar.deinit();
+        gpa.free(self.arenas);
+        gpa.free(self.covs);
+        gpa.free(self.bbs);
+    }
+};
+
+pub fn buildCoverageIndex(gpa: Allocator, cells: []const Cell) !CoverageIndex {
+    const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
+    const t0 = if (stats) statNow() else 0;
+
+    const n = cells.len;
+    const covs = try gpa.alloc(Poly, n);
+    errdefer gpa.free(covs);
+    const bbs = try gpa.alloc([4]i64, n);
+    errdefer gpa.free(bbs);
+
+    const workers = workerCount(n);
+    const arenas = try gpa.alloc(std.heap.ArenaAllocator, workers);
+    for (arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer {
+        for (arenas) |*ar| ar.deinit();
+        gpa.free(arenas);
+    }
+
+    var next = std.atomic.Value(usize).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+
+    const Job = struct {
+        cells: []const Cell,
+        covs: []Poly,
+        bbs: [][4]i64,
+        arenas: []std.heap.ArenaAllocator,
+        next: *std.atomic.Value(usize),
+        failed: *std.atomic.Value(bool),
+
+        fn run(j: *const @This(), w: usize) void {
+            // The worker's own arena: the caller's allocator may be an arena
+            // and is not required to be thread-safe.
+            const ka = j.arenas[w].allocator();
+            while (true) {
+                const i = j.next.fetchAdd(1, .monotonic);
+                if (i >= j.cells.len) return;
+                if (j.failed.load(.acquire)) return;
+                const cov = cellCoverage(ka, j.cells[i]) catch
+                    return j.failed.store(true, .release);
+                j.covs[i] = cov;
+                j.bbs[i] = polyBbox(cov);
+            }
+        }
+    };
+
+    const job = Job{ .cells = cells, .covs = covs, .bbs = bbs, .arenas = arenas, .next = &next, .failed = &failed };
+    {
+        var threads: [63]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |t| t.join();
+        while (spawned < workers - 1) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, Job.run, .{ &job, spawned + 1 }) catch break;
+        }
+        job.run(0); // this thread takes a share too
+    }
+    if (failed.load(.acquire)) return error.OutOfMemory;
+
+    if (stats) std.debug.print("partition coverage index: {d} cells workers={d} {d:.0} ms\n", .{
+        n, workers, @as(f64, @floatFromInt(statNow() - t0)) / 1e6,
+    });
+    return .{ .covs = covs, .bbs = bbs, .arenas = arenas };
+}
+
 /// Identical result to `ownedAtTier`, built for scale. `ownedAtTier` accumulates a
 /// GLOBAL union of every finer cell and differences each cell against it — the
 /// operands grow to the whole nation, so it is O(cells²) in operand size (a
@@ -222,6 +315,14 @@ pub fn statNow() u64 {
 /// (cross-checked by the test below); charts overlap locally, so the per-cell
 /// subtrahend stays small. Use this variant for real ENC data.
 pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
+    var idx = try buildCoverageIndex(gpa, cells);
+    defer idx.deinit(gpa);
+    return ownedAtTierWithIndex(gpa, cells, tier, &idx);
+}
+
+/// `ownedAtTierIndexed` with the coverage precomputed — the multi-tier caller
+/// (`partition.build`) shares one CoverageIndex across every tier.
+pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex) ![]OwnedCell {
     var order = std.ArrayList(usize).empty;
     defer order.deinit(gpa);
     for (cells, 0..) |c, i| {
@@ -260,16 +361,15 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     // chains, for aiming optimization work at what the profile actually says.
     const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
 
-    // Coverage + bbox per eligible cell (in finest→coarsest order), computed once.
+    // Order-position views into the shared index (the sweep addresses cells by
+    // their position in this tier's walk).
     const m = order.items.len;
-    const t_cov0 = if (stats) statNow() else 0;
-    const covs = try sa.alloc([][]Pt, m);
+    const covs = try sa.alloc(Poly, m);
     const bbs = try sa.alloc([4]i64, m);
     for (order.items, 0..) |ci, k| {
-        covs[k] = try cellCoverage(sa, cells[ci]);
-        bbs[k] = polyBbox(covs[k]);
+        covs[k] = idx.covs[ci];
+        bbs[k] = idx.bbs[ci];
     }
-    const cov_ns = if (stats) statNow() - t_cov0 else 0;
 
     var out = std.ArrayList(OwnedCell).empty;
     errdefer {
@@ -292,18 +392,7 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     if (stat_ns) |v| @memset(v, 0);
     if (stat_nsub) |v| @memset(v, 0);
 
-    const workers = blk: {
-        // Overridable because the parallel sweep's correctness claim IS that it
-        // serializes byte-identically to the serial one, and checking that means
-        // forcing both over the same input.
-        if (std.c.getenv("TILE57_PARTITION_WORKERS")) |w| {
-            if (std.fmt.parseInt(usize, std.mem.sliceTo(w, 0), 10) catch null) |n|
-                break :blk @max(1, @min(n, 64));
-        }
-        if (m < 64) break :blk 1; // not worth the threads
-        const cpus = std.Thread.getCpuCount() catch 1;
-        break :blk @max(1, @min(cpus, 8));
-    };
+    const workers = workerCount(m);
 
     var next = std.atomic.Value(usize).init(0);
     var failed = std.atomic.Value(bool).init(false);
@@ -408,9 +497,8 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
 
     if (stats) {
         const sweep_ns = statNow() - t_sweep0;
-        std.debug.print("partition tier {d}: m={d} ({d} eligible) workers={d} cov={d:.0} ms sweep={d:.0} ms\n", .{
-            tier,                                     m, n_eligible, workers,
-            @as(f64, @floatFromInt(cov_ns)) / 1e6,    @as(f64, @floatFromInt(sweep_ns)) / 1e6,
+        std.debug.print("partition tier {d}: m={d} ({d} eligible) workers={d} sweep={d:.0} ms\n", .{
+            tier, m, n_eligible, workers, @as(f64, @floatFromInt(sweep_ns)) / 1e6,
         });
         const by_ns = try sa.alloc(usize, m);
         for (by_ns, 0..) |*v, i| v.* = i;
