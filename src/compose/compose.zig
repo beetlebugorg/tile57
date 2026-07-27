@@ -142,6 +142,38 @@ fn pointInCoverage(px: i64, py: i64, polys: []const geometry.plane.Poly) bool {
     return inside;
 }
 
+/// Bounding box [w,s,e,n] of the rings `pointInCoverage` would actually cross.
+/// Empty (no ring of 3+ points) yields an inverted box, which rejects every
+/// point — matching the ray cast's `false` for the same input.
+fn coverageBBox(polys: []const geometry.plane.Poly) [4]i64 {
+    var b = [4]i64{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+    for (polys) |poly| for (poly) |ring| {
+        if (ring.len < 3) continue; // skipped by the ray cast; keep the box tight
+        for (ring) |p| {
+            b[0] = @min(b[0], p.x);
+            b[1] = @min(b[1], p.y);
+            b[2] = @max(b[2], p.x);
+            b[3] = @max(b[3], p.y);
+        }
+    };
+    return b;
+}
+
+fn reachDesc(cells: []const geometry.plane.Cell, l: u32, r: u32) bool {
+    return cells[l].reach > cells[r].reach;
+}
+
+/// `maxZoomAt`'s lookup index over `cells`, allocated in `a`.
+const MaxZoomIndex = struct { order: []const u32, bbox: []const [4]i64 };
+fn buildMaxZoomIndex(a: std.mem.Allocator, cells: []const geometry.plane.Cell) !MaxZoomIndex {
+    const order = try a.alloc(u32, cells.len);
+    const bbs = try a.alloc([4]i64, cells.len);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    for (bbs, cells) |*b, c| b.* = coverageBBox(c.cov1);
+    std.mem.sort(u32, order, cells, reachDesc);
+    return .{ .order = order, .bbox = bbs };
+}
+
 // A normalised web-mercator world axis coordinate ([0,1]) -> tile index at `scale`
 // (= 2^z), clamped to [0, scale-1].
 pub fn worldAxisToTile(w: f64, scale: f64) u32 {
@@ -564,6 +596,11 @@ pub const ComposeSource = struct {
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
     part: geometry.partition.Partition,
+    /// `maxZoomAt` acceleration, arena-owned, built beside the partition: cell
+    /// indices by DESCENDING `reach`, and each cell's cov1 bbox. Both index
+    /// `part.cells`. See `maxZoomAt` for why the naive walk was too slow.
+    mz_order: []const u32 = &.{},
+    mz_bbox: []const [4]i64 = &.{},
     /// Cell names aligned with `readers` — diagnostics + partition identity.
     names: []const []const u8 = &.{},
     /// DSID dates aligned with `names` — the other half of the identity the v4
@@ -694,15 +731,23 @@ pub const ComposeSource = struct {
     /// (which a distant deep chart inflates). Returns loop_max when the point lies
     /// outside every cell's coverage (no cell to restrict against). Coverage points
     /// are lon_e7/lat_e7 (see toPlaneCells), so the test is a plain lon/lat ray cast.
+    /// Walked in DESCENDING `reach` (mz_order), so the first covering cell IS the
+    /// answer — nothing later can beat it. The bbox (mz_bbox) rejects the rest
+    /// without a ray cast: `pointInCoverage` is linear in every ring of every
+    /// cell, and a host calling this per frame measured 48% of render-thread CPU
+    /// during a pinch on Android. Cells at reach 0 never win (a coarser cell's
+    /// fill-up covers them), and descending order means the first is the last.
     pub fn maxZoomAt(self: *const ComposeSource, lon: f64, lat: f64) u8 {
         const px: i64 = @intFromFloat(lon * 1e7);
         const py: i64 = @intFromFloat(lat * 1e7);
-        var best: u8 = 0;
-        for (self.part.cells) |c| {
-            if (c.reach <= best) continue; // can't beat what we already have
-            if (pointInCoverage(px, py, c.cov1)) best = c.reach;
+        for (self.mz_order) |ci| {
+            const c = self.part.cells[ci];
+            if (c.reach == 0) break;
+            const b = self.mz_bbox[ci];
+            if (px < b[0] or px > b[2] or py < b[1] or py > b[3]) continue;
+            if (pointInCoverage(px, py, c.cov1)) return c.reach;
         }
-        return if (best == 0) self.loop_max else best;
+        return self.loop_max;
     }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
@@ -1028,6 +1073,10 @@ fn finishOpen(
         break :blk try geometry.partition.buildIncremental(gpa, cells, ids, null);
     };
     src.part = res.part;
+    // The partition borrows `cells` in order, so the index lines up with part.cells.
+    const mzi = try buildMaxZoomIndex(a, cells);
+    src.mz_order = mzi.order;
+    src.mz_bbox = mzi.bbox;
     // Nothing swept ⇒ the sidecar already IS this partition; anything swept ⇒
     // the C layer refreshes the file so the next open adopts everything.
     src.part_loaded = res.swept == 0;
@@ -1295,6 +1344,77 @@ test "composeTile carries per-feature SCAMIN through the seam clip + re-encode" 
     }
     try std.testing.expect(seen_west);
     try std.testing.expect(seen_east);
+}
+
+test "maxZoomAt: indexed walk matches the exhaustive one" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A square ring [x0,x0+w] x [y0,y0+w] as one single-ring coverage feature.
+    const sq = struct {
+        fn f(al: std.mem.Allocator, x0: i64, y0: i64, w: i64) ![]const geometry.plane.Poly {
+            const P = geometry.plane.Pt;
+            const ring = try al.dupe(P, &.{
+                .{ .x = x0, .y = y0 },         .{ .x = x0 + w, .y = y0 },
+                .{ .x = x0 + w, .y = y0 + w }, .{ .x = x0, .y = y0 + w },
+            });
+            const rings = try al.dupe([]const P, &.{ring});
+            return try al.dupe(geometry.plane.Poly, &.{rings});
+        }
+    }.f;
+
+    // Overlapping cells of differing reach, deliberately NOT in reach order, plus
+    // a degenerate one (2-point ring: the ray cast skips it, so must the bbox).
+    const cells = try a.dupe(geometry.plane.Cell, &.{
+        .{ .cscl = 1, .band_floor = 0, .order = 0, .reach = 9, .cov1 = try sq(a, 0, 0, 100_000) },
+        .{ .cscl = 2, .band_floor = 0, .order = 1, .reach = 14, .cov1 = try sq(a, 20_000, 20_000, 30_000) },
+        .{ .cscl = 3, .band_floor = 0, .order = 2, .reach = 11, .cov1 = try sq(a, 10_000, 10_000, 80_000) },
+        .{ .cscl = 4, .band_floor = 0, .order = 3, .reach = 0, .cov1 = try sq(a, 0, 0, 100_000) },
+        .{ .cscl = 5, .band_floor = 0, .order = 4, .reach = 20, .cov1 = &.{} },
+    });
+
+    const mzi = try buildMaxZoomIndex(a, cells);
+    var src: ComposeSource = .{
+        .gpa = gpa,
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .maps = &.{},
+        .readers = &.{},
+        .part = .{ .gpa = gpa, .cells = cells, .tiers = &.{}, .maps = &.{} },
+        .mz_order = mzi.order,
+        .mz_bbox = mzi.bbox,
+        .minz = 0,
+        .maxz = 0,
+        .loop_max = 7,
+        .bounds = .{ 0, 0, 0, 0 },
+    };
+    defer src.arena.deinit();
+
+    // The pre-index implementation, kept here as the oracle.
+    const exhaustive = struct {
+        fn f(s: *const ComposeSource, px: i64, py: i64) u8 {
+            var best: u8 = 0;
+            for (s.part.cells) |c| {
+                if (c.reach <= best) continue;
+                if (pointInCoverage(px, py, c.cov1)) best = c.reach;
+            }
+            return if (best == 0) s.loop_max else best;
+        }
+    }.f;
+
+    // Deepest cell, mid cell, coarse-only ground, and off-coverage (-> loop_max).
+    const probes = [_][2]i64{
+        .{ 30_000, 30_000 }, .{ 60_000, 60_000 }, .{ 5_000, 5_000 },
+        .{ 95_000, 95_000 }, .{ 200_000, 200_000 }, .{ -5_000, 50_000 },
+    };
+    for (probes) |p| {
+        const lon = @as(f64, @floatFromInt(p[0])) / 1e7;
+        const lat = @as(f64, @floatFromInt(p[1])) / 1e7;
+        try std.testing.expectEqual(exhaustive(&src, p[0], p[1]), src.maxZoomAt(lon, lat));
+    }
+    try std.testing.expectEqual(@as(u8, 14), src.maxZoomAt(3e-3, 3e-3)); // inside the reach-14 square
+    try std.testing.expectEqual(@as(u8, 7), src.maxZoomAt(2e-2, 2e-2)); // outside every cell -> loop_max
 }
 
 // The integer value of `key` on a decoded feature, or null if absent.
