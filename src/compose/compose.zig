@@ -313,10 +313,14 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
         const layers = (try ownerTile(sa2, readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, ex.deep)) orelse continue;
         const face_px = try compose.projectFace(sa2, ex.region, z, tx, ty);
         if (face_px.len == 0) continue;
+        // One edge index over the face per contributor: clipFeatureToFace
+        // consults it to spare every boundary-far feature the full-face scan.
+        var fgrid = try geometry.plane.EdgeGrid.init(sa2, face_px, 512);
+        defer fgrid.deinit();
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
             var tmpb = std.ArrayList(mvt.Feature).empty;
-            for (layer.features) |feat| try compose.clipFeatureToFace(sa2, &tmpb, feat, face_px);
+            for (layer.features) |feat| try compose.clipFeatureToFace(sa2, &tmpb, feat, face_px, &fgrid);
             for (tmpb.items) |f| try buckets[li].append(ta, try dupeFeature(ta, f));
         }
     }
