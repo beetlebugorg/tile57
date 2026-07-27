@@ -547,6 +547,17 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
         for (0..m) |k| todo.appendAssumeCapacity(@intCast(k));
     }
 
+    // Claim order = longest chain first. A chain's cost tracks its subtrahend
+    // count, and the count is known up front now — better than the coarse-end
+    // heuristic at keeping a whale off one worker's tail. Pure scheduling:
+    // results land by index, so any deterministic order is byte-safe.
+    std.mem.sort(u32, todo.items, lists, struct {
+        fn lt(ls: []const []const u32, x: u32, y: u32) bool {
+            if (ls[x].len != ls[y].len) return ls[x].len > ls[y].len;
+            return x > y; // tie: coarse end first, as before
+        }
+    }.lt);
+
     var out = std.ArrayList(OwnedCell).empty;
     errdefer {
         for (out.items) |c| boolean.freePolygon(gpa, c.owned);
@@ -600,14 +611,10 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
             var subtr = std.ArrayList(Poly).empty;
 
             while (true) {
-                // Claim from the COARSE end first. `order` runs finest→coarsest
-                // and a cell's cost grows with how many earlier cells overlap
-                // it, so the last iterations are the expensive ones; taking them
-                // in ascending order leaves one worker finishing the whole tail
-                // alone. Longest-first is the standard fix.
+                // `todo` is presorted longest-chain-first; claim in order.
                 const claimed = s.next.fetchAdd(1, .monotonic);
                 if (claimed >= s.todo.len) return;
-                const k = s.todo[s.todo.len - 1 - claimed];
+                const k = s.todo[claimed];
                 if (s.failed.load(.acquire)) return;
                 const c0 = if (s.stat_ns != null) statNow() else 0;
 
