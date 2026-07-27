@@ -919,7 +919,14 @@ fn discoverSidecar(io: std.Io, chart_path: []const u8) Sidecar {
     while (dir) |d| : (up += 1) {
         if (up > 3) break; // <archive>/../../.. is as far as any sane layout nests
         const p = std.fs.path.join(gpa, &.{ d, "partition.tpart" }) catch return .{};
-        if (readSidecar(io, p)) |b| return .{ .bytes = b, .path = p } else |_| {}
+        if (readSidecar(io, p)) |b| {
+            std.debug.print("compose: sidecar {s} ({d} bytes)\n", .{ p, b.len });
+            return .{ .bytes = b, .path = p };
+        } else |e| if (e != error.FileNotFound) {
+            // A sidecar that EXISTS but cannot be read is a field fact worth a
+            // line — a silent miss here costs a full rebuild every open.
+            std.debug.print("compose: sidecar {s} unreadable ({s})\n", .{ p, @errorName(e) });
+        }
         gpa.free(p);
         dir = std.fs.path.dirname(d);
     }
@@ -946,7 +953,11 @@ const Sidecar = struct {
         const p = self.path orelse return;
         const bytes = src.serializePartition(gpa) catch return;
         defer gpa.free(bytes);
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = bytes }) catch {};
+        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = bytes })) |_| {
+            std.debug.print("compose: sidecar refreshed {s}\n", .{p});
+        } else |e| {
+            std.debug.print("compose: sidecar refresh failed {s} ({s})\n", .{ p, @errorName(e) });
+        }
     }
 };
 
