@@ -94,6 +94,10 @@ pub const Partition = struct {
 /// per distinct band floor. All face geometry is freshly allocated in `gpa`; free
 /// with `Partition.deinit`.
 pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
+    return buildWith(gpa, cells, null);
+}
+
+fn buildWith(gpa: std.mem.Allocator, cells: []const plane.Cell, adopt: ?*plane.AdoptCtx) !Partition {
     // Distinct band floors.
     var seen = std.AutoHashMap(u8, void).init(gpa);
     defer seen.deinit();
@@ -117,7 +121,7 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
     var cov_idx = try plane.buildCoverageIndex(gpa, cells);
     defer cov_idx.deinit(gpa);
 
-    const tier_faces = try plane.ownedTiers(gpa, cells, tiers, &cov_idx);
+    const tier_faces = try plane.ownedTiersAdopt(gpa, cells, tiers, &cov_idx, adopt);
     defer gpa.free(tier_faces);
     var built: usize = 0;
     errdefer {
@@ -139,48 +143,54 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
 }
 
 // ===========================================================================
-// Serialization — a precomputed partition as a self-contained sidecar.
+// Serialization — a precomputed partition as a self-contained sidecar (v4).
 // ===========================================================================
 //
-// The partition is a pure function of the cell set (each cell's coverage rings,
-// cscl, band_floor, order, reach). Building it runs the expensive owned-face
-// booleans; the RESULT is tiny (the whole owned-face geometry is ~1 MB for a
-// district). So it is worth precomputing once and reusing: a cold recompose skips
-// the build, and a runtime compositor can serve tiles from the sidecar alone.
+// v4 makes staleness PER-FACE instead of all-or-nothing. Every face is stamped
+// with a digest of everything its diff chain read: the owning cell's content
+// and every subtrahend's, in application order (plane.faceInputDigest over
+// contentDigest values). A loader recomputes current digests from the cells it
+// holds and ADOPTS every stored face whose stamp still matches — that geometry
+// is exactly what the sweep would recompute — sweeping only the rest. Adding,
+// removing or updating cells therefore recomputes only the changed
+// neighborhood, and a sidecar built over one cell set seeds a build over a
+// larger one (the chart-pack merge case).
+//
+// Cells are identified by (name, date), never by index or rank: the `order`
+// rank shifts when cells come and go, while the strings it derives from do
+// not. Multiple editions of one name coexist (distinct dates); the digest
+// disambiguates the rest.
 //
 // Format (little-endian, length-prefixed):
-//   magic "T57P" | version u32 | input_key u64 | n_cells u32 | n_maps u32
-//   per map:  tier u8 | n_faces u32
-//     per face:  cell_index u32 | n_rings u32
+//   magic "T57P" | version u32 | n_ids u32 | n_maps u32
+//   per id:   name_len u16 | name | date_len u16 | date | digest u64
+//   per map:  tier u8 | n_faces u32 | n_empty u32
+//     per face:  id_ref u32 | fdig u64 | n_rings u32
 //       per ring:  n_pts u32 | pts (x i64, y i64)…
-// `pos` and `tiers` are reconstructed on load (pos from faces + n_cells).
-//
-// `input_key` binds the geometry to the exact cells it was built from: a loader
-// recomputes it from the cells it holds and rejects a stale sidecar (→ rebuild),
-// which is what makes an incremental recompose safe when coverage is unchanged.
+//     per empty: id_ref u32 | fdig u64
+//   (an "empty" is a dropped gap-filler face — recorded so a clean reload
+//    adopts the emptiness instead of re-running the diff chain that proved it)
 
 pub const MAGIC = [4]u8{ 'T', '5', '7', 'P' };
 // The version is the ALGORITHM generation, not just the byte layout: a sidecar
-// carries the bake-time partition VERBATIM, and the input key validates only
-// the input cells — never the faces. Faces computed by an older, buggier build
+// carries the bake-time partition VERBATIM, and the digests validate only the
+// input cells — never the faces. Faces computed by an older, buggier build
 // otherwise outlive every fix (a field device rendered a Great Lakes cell
 // owning Gulf-of-Mexico ground from exactly such a sidecar). Bump on ANY
 // change to the owned-face computation.
-pub const FORMAT_VERSION: u32 = 3; // 3: antimeridian coverage split + serve-floor semantics
+pub const FORMAT_VERSION: u32 = 4; // 4: per-face input digests + (name,date) identity — incremental adoption
 
 pub const LoadError = error{
     BadMagic,
-    UnsupportedVersion,
-    StalePartition, // input_key mismatch — the cells changed; rebuild
-    CellCountMismatch,
+    UnsupportedVersion, // v3 and earlier: no per-face digests; rebuild fresh
     Truncated,
     OutOfMemory,
 };
 
-/// A hash of the exact inputs `build` consumes, so a stored partition can be
-/// matched to the cells a loader holds. Coverage points are hashed as raw bytes;
-/// both shipped targets are little-endian, and a false mismatch only forces a
-/// (safe) rebuild.
+/// The identity a face reference survives cell-set changes through. Borrowed;
+/// the compositor's shims own the strings.
+pub const CellId = struct { name: []const u8, date: []const u8 };
+
 fn hashPolyPoints(h: *std.hash.Wyhash, poly: plane.Poly) void {
     for (poly) |ring| {
         const n: u32 = @intCast(ring.len);
@@ -189,22 +199,31 @@ fn hashPolyPoints(h: *std.hash.Wyhash, poly: plane.Poly) void {
     }
 }
 
-pub fn inputKey(cells: []const plane.Cell) u64 {
-    var h = std.hash.Wyhash.init(0x5457_3537_5041_5254); // "TW57PART"
-    for (cells) |c| {
-        h.update(std.mem.asBytes(&c.cscl));
-        h.update(std.mem.asBytes(&c.band_floor));
-        h.update(std.mem.asBytes(&c.order));
-        h.update(std.mem.asBytes(&c.reach));
-        // cov1/cov2 are bags of polygons (each a set of rings). Descend to the POINTS and hash
-        // their bytes — never the ring slices' fat pointers, which are heap addresses that vary
-        // per process. Ring lengths go in too so a regrouping can't alias to the same digest.
-        for (c.cov1) |poly| hashPolyPoints(&h, poly);
-        h.update(&[_]u8{0xff}); // cov1/cov2 boundary marker
-        for (c.cov2) |poly| hashPolyPoints(&h, poly);
-        h.update(&[_]u8{0xfe}); // cell boundary marker
-    }
+/// Identity-stable content digest of one cell: everything a face computation
+/// reads from it EXCEPT the order rank — the rank shifts when cells are added
+/// or removed, while (date, name), which it encodes, does not. Coverage points
+/// are hashed as raw bytes; both shipped targets are little-endian, and a
+/// false mismatch only forces a (safe) recompute of that neighborhood.
+pub fn contentDigest(cell: plane.Cell, id: CellId) u64 {
+    var h = std.hash.Wyhash.init(0x5457_3537_4644_3454); // "TW57FD4T"
+    h.update(std.mem.asBytes(&cell.cscl));
+    h.update(std.mem.asBytes(&cell.band_floor));
+    h.update(std.mem.asBytes(&cell.reach));
+    h.update(id.name);
+    h.update(&[_]u8{0});
+    h.update(id.date);
+    h.update(&[_]u8{0});
+    for (cell.cov1) |poly| hashPolyPoints(&h, poly);
+    h.update(&[_]u8{0xff}); // cov1/cov2 boundary marker
+    for (cell.cov2) |poly| hashPolyPoints(&h, poly);
     return h.final();
+}
+
+fn contentDigests(a: std.mem.Allocator, cells: []const plane.Cell, ids: []const CellId) ![]u64 {
+    std.debug.assert(ids.len == cells.len);
+    const out = try a.alloc(u64, cells.len);
+    for (cells, ids, out) |c, id, *d| d.* = contentDigest(c, id);
+    return out;
 }
 
 fn putInt(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, v: T) !void {
@@ -214,19 +233,57 @@ fn putInt(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), comptime T: type, v: 
 }
 
 /// Encode `part` to a fresh `gpa`-owned byte slice (free with `gpa.free`).
-pub fn serialize(gpa: std.mem.Allocator, part: *const Partition) ![]u8 {
+/// `ids[i]` identifies `part.cells[i]`. Face digests are re-derived through the
+/// same tier walk the build used, so a loader holding the same cells computes
+/// the same stamps.
+pub fn serialize(gpa: std.mem.Allocator, part: *const Partition, ids: []const CellId) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const sa = arena.allocator();
+
+    const digests = try contentDigests(sa, part.cells, ids);
+
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(gpa);
     try buf.appendSlice(gpa, &MAGIC);
     try putInt(gpa, &buf, u32, FORMAT_VERSION);
-    try putInt(gpa, &buf, u64, inputKey(part.cells));
     try putInt(gpa, &buf, u32, @intCast(part.cells.len));
     try putInt(gpa, &buf, u32, @intCast(part.maps.len));
+    for (ids, digests) |id, d| {
+        try putInt(gpa, &buf, u16, @intCast(id.name.len));
+        try buf.appendSlice(gpa, id.name);
+        try putInt(gpa, &buf, u16, @intCast(id.date.len));
+        try buf.appendSlice(gpa, id.date);
+        try putInt(gpa, &buf, u64, d);
+    }
+
+    var idx = try plane.buildCoverageIndex(sa, part.cells);
+    defer idx.deinit(sa);
+
     for (part.maps) |m| {
+        const walk = try plane.tierWalk(sa, part.cells, m.tier);
+        const bbs = try sa.alloc([4]i64, walk.order.len);
+        for (walk.order, 0..) |ci, k| bbs[k] = idx.bbs[ci];
+        const lists = try plane.subtrahendLists(sa, bbs);
+        const fdig = try sa.alloc(u64, walk.order.len);
+        var gl = std.ArrayList(u32).empty;
+        for (walk.order, 0..) |ci, k| {
+            gl.clearRetainingCapacity();
+            for (lists[k]) |j| try gl.append(sa, @intCast(walk.order[j]));
+            fdig[k] = plane.faceInputDigest(digests, ci, gl.items);
+        }
+
         try putInt(gpa, &buf, u8, m.tier);
         try putInt(gpa, &buf, u32, @intCast(m.faces.len));
-        for (m.faces) |f| {
-            try putInt(gpa, &buf, u32, @intCast(f.index));
+        try putInt(gpa, &buf, u32, @intCast(walk.order.len - m.faces.len));
+        // Faces land in walk order (assembly appends walking it), so emitting
+        // by walk keeps face order identical to the resident partition's.
+        for (walk.order, 0..) |ci, k| {
+            const slot = m.pos[ci];
+            if (slot < 0) continue;
+            const f = m.faces[@intCast(slot)];
+            try putInt(gpa, &buf, u32, @intCast(ci));
+            try putInt(gpa, &buf, u64, fdig[k]);
             try putInt(gpa, &buf, u32, @intCast(f.owned.len));
             for (f.owned) |ring| {
                 try putInt(gpa, &buf, u32, @intCast(ring.len));
@@ -235,6 +292,11 @@ pub fn serialize(gpa: std.mem.Allocator, part: *const Partition) ![]u8 {
                     try putInt(gpa, &buf, i64, p.y);
                 }
             }
+        }
+        for (walk.order, 0..) |ci, k| {
+            if (m.pos[ci] >= 0) continue;
+            try putInt(gpa, &buf, u32, @intCast(ci));
+            try putInt(gpa, &buf, u64, fdig[k]);
         }
     }
     return buf.toOwnedSlice(gpa);
@@ -250,70 +312,112 @@ const Cursor = struct {
         self.pos += n;
         return v;
     }
+    fn getBytes(self: *Cursor, n: usize) ![]const u8 {
+        if (self.pos + n > self.bytes.len) return error.Truncated;
+        defer self.pos += n;
+        return self.bytes[self.pos..][0..n];
+    }
 };
 
-// Read one face (index + rings) fully, or free its partial geometry and error.
-fn readFace(gpa: std.mem.Allocator, cur: *Cursor) !plane.OwnedCell {
-    const index: usize = @intCast(try cur.getInt(u32));
-    const n_rings = try cur.getInt(u32);
-    const owned = try gpa.alloc([]plane.Pt, n_rings);
-    var built: usize = 0;
-    errdefer {
-        for (owned[0..built]) |r| gpa.free(r);
-        gpa.free(owned);
-    }
-    while (built < n_rings) : (built += 1) {
-        const n_pts = try cur.getInt(u32);
-        const ring = try gpa.alloc(plane.Pt, n_pts);
-        errdefer gpa.free(ring);
-        for (ring) |*p| p.* = .{ .x = try cur.getInt(i64), .y = try cur.getInt(i64) };
-        owned[built] = ring;
-    }
-    return .{ .index = index, .owned = owned };
-}
-
-/// Decode a sidecar produced by `serialize` into a live `Partition` that borrows
-/// `cells` (kept alive by the caller, exactly as `build` does). Rejects a sidecar
-/// whose `input_key` does not match `cells` (the cells changed → rebuild).
-pub fn deserialize(gpa: std.mem.Allocator, bytes: []const u8, cells: []const plane.Cell) LoadError!Partition {
+/// Parse a v4 sidecar into an adoption pool: every stored face whose cell
+/// resolves by (name, date, digest) lands under (current index, face digest).
+/// Unresolvable faces are skipped — their ground's owner changed, so the build
+/// recomputes them. Geometry is decoded into `pa` (an arena the caller frees
+/// after the build; adopted faces are duped out on assembly).
+fn fillAdoptPool(
+    pa: std.mem.Allocator,
+    bytes: []const u8,
+    ids: []const CellId,
+    digests: []const u64,
+    pool: *std.AutoHashMap(plane.AdoptCtx.PoolKey, plane.Poly),
+) LoadError!void {
     if (bytes.len < MAGIC.len or !std.mem.eql(u8, bytes[0..MAGIC.len], &MAGIC)) return error.BadMagic;
     var cur = Cursor{ .bytes = bytes, .pos = MAGIC.len };
     if (try cur.getInt(u32) != FORMAT_VERSION) return error.UnsupportedVersion;
-    if (try cur.getInt(u64) != inputKey(cells)) return error.StalePartition;
-    if (try cur.getInt(u32) != @as(u32, @intCast(cells.len))) return error.CellCountMismatch;
+    const n_ids = try cur.getInt(u32);
     const n_maps = try cur.getInt(u32);
 
-    const tiers = try gpa.alloc(u8, n_maps);
-    errdefer gpa.free(tiers);
-    const maps = try gpa.alloc(BandMap, n_maps);
-    errdefer gpa.free(maps);
-    var built_maps: usize = 0;
-    errdefer for (maps[0..built_maps]) |m| {
-        plane.freeOwned(gpa, m.faces);
-        gpa.free(m.pos);
-    };
-
-    for (0..n_maps) |i| {
-        const tier = try cur.getInt(u8);
-        const n_faces = try cur.getInt(u32);
-        const faces = try gpa.alloc(plane.OwnedCell, n_faces);
-        var built_faces: usize = 0;
-        errdefer {
-            for (faces[0..built_faces]) |f| boolean.freePolygon(gpa, f.owned);
-            gpa.free(faces);
-        }
-        while (built_faces < n_faces) : (built_faces += 1) {
-            faces[built_faces] = try readFace(gpa, &cur);
-        }
-        const pos = try gpa.alloc(i32, cells.len);
-        @memset(pos, -1);
-        for (faces, 0..) |f, slot| pos[f.index] = @intCast(slot);
-        tiers[i] = tier;
-        maps[i] = .{ .tier = tier, .faces = faces, .pos = pos };
-        built_maps = i + 1;
+    // (name ++ 0 ++ date) → current indices; digest picks among duplicates.
+    var by_key = std.StringHashMap(std.ArrayList(u32)).init(pa);
+    for (ids, 0..) |id, i| {
+        const key = try std.mem.concat(pa, u8, &.{ id.name, "\x00", id.date });
+        const gop = try by_key.getOrPut(key);
+        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+        try gop.value_ptr.append(pa, @intCast(i));
+    }
+    const resolve = try pa.alloc(?u32, n_ids);
+    for (resolve) |*r| {
+        const name = try cur.getBytes(try cur.getInt(u16));
+        const date = try cur.getBytes(try cur.getInt(u16));
+        const dig = try cur.getInt(u64);
+        r.* = null;
+        const key = try std.mem.concat(pa, u8, &.{ name, "\x00", date });
+        if (by_key.get(key)) |list| for (list.items) |ci| {
+            if (digests[ci] == dig) {
+                r.* = ci;
+                break;
+            }
+        };
     }
 
-    return .{ .gpa = gpa, .cells = cells, .tiers = tiers, .maps = maps };
+    for (0..n_maps) |_| {
+        _ = try cur.getInt(u8); // tier — adoption is digest-keyed, tier-agnostic
+        const n_faces = try cur.getInt(u32);
+        const n_empty = try cur.getInt(u32);
+        for (0..n_faces) |_| {
+            const id_ref = try cur.getInt(u32);
+            if (id_ref >= n_ids) return error.Truncated;
+            const fdig = try cur.getInt(u64);
+            const n_rings = try cur.getInt(u32);
+            const rings = try pa.alloc([]const plane.Pt, n_rings);
+            for (rings) |*ring| {
+                const n_pts = try cur.getInt(u32);
+                const pts = try pa.alloc(plane.Pt, n_pts);
+                for (pts) |*p| p.* = .{ .x = try cur.getInt(i64), .y = try cur.getInt(i64) };
+                ring.* = pts;
+            }
+            if (resolve[id_ref]) |ci| try pool.put(.{ .ci = ci, .fdig = fdig }, rings);
+        }
+        for (0..n_empty) |_| {
+            const id_ref = try cur.getInt(u32);
+            if (id_ref >= n_ids) return error.Truncated;
+            const fdig = try cur.getInt(u64);
+            if (resolve[id_ref]) |ci| try pool.put(.{ .ci = ci, .fdig = fdig }, &.{});
+        }
+    }
+}
+
+pub const IncrementalResult = struct {
+    part: Partition,
+    /// Face slots adopted verbatim from the sidecar (including empty markers).
+    adopted: u64,
+    /// Face slots that ran a diff chain. Zero ⇒ the sidecar already IS this
+    /// partition (slots neither adopted nor swept were tier-reuse dupes).
+    swept: u64,
+};
+
+/// Build over `cells`, adopting from a v4 sidecar every face whose input
+/// digest still matches — same result bytes as `build`, only the changed
+/// neighborhood is recomputed. `sidecar == null` builds fresh. A malformed or
+/// pre-v4 sidecar errors; the caller falls back to `buildIncremental(.., null)`.
+pub fn buildIncremental(
+    gpa: std.mem.Allocator,
+    cells: []const plane.Cell,
+    ids: []const CellId,
+    sidecar: ?[]const u8,
+) !IncrementalResult {
+    var pool_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer pool_arena.deinit();
+    const pa = pool_arena.allocator();
+
+    var adopt = plane.AdoptCtx{
+        .digests = try contentDigests(pa, cells, ids),
+        .pool = std.AutoHashMap(plane.AdoptCtx.PoolKey, plane.Poly).init(pa),
+    };
+    if (sidecar) |bytes| try fillAdoptPool(pa, bytes, ids, adopt.digests, &adopt.pool);
+
+    const part = try buildWith(gpa, cells, &adopt);
+    return .{ .part = part, .adopted = adopt.adopted, .swept = adopt.swept };
 }
 
 // ===========================================================================
@@ -407,7 +511,7 @@ test "fill-up: finer cells own coarse-tier ground only where nothing coarser cov
     try testing.expectEqual(@as(?usize, 1), part.ownerAt(14, 50, 50));
 }
 
-test "partition serialize/deserialize round-trips exactly" {
+test "v4 sidecar: clean reload adopts every face slot and round-trips bytes" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -416,17 +520,23 @@ test "partition serialize/deserialize round-trips exactly" {
     const harbor = try boxPoly(a, 40, 40, 60, 60);
     const cells = [_]plane.Cell{
         .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coarse} },
-        .{ .cscl = 20_000, .band_floor = 13, .order = 0, .cov1 = &.{harbor} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 1, .cov1 = &.{harbor} },
+    };
+    const ids = [_]CellId{
+        .{ .name = "US4COARSE", .date = "20250101" },
+        .{ .name = "US5HARBR", .date = "20250202" },
     };
 
     var part = try build(testing.allocator, &cells);
     defer part.deinit();
-
-    const bytes = try serialize(testing.allocator, &part);
+    const bytes = try serialize(testing.allocator, &part, &ids);
     defer testing.allocator.free(bytes);
 
-    var got = try deserialize(testing.allocator, bytes, &cells);
-    defer got.deinit();
+    var res = try buildIncremental(testing.allocator, &cells, &ids, bytes);
+    defer res.part.deinit();
+    try testing.expectEqual(@as(u64, 0), res.swept); // nothing recomputed
+    try testing.expect(res.adopted > 0);
+    const got = &res.part;
 
     // Structural equality: tiers, per-map faces (IN ORDER — the compositor's tile
     // iteration order rides on it), owned rings and their points.
@@ -445,8 +555,8 @@ test "partition serialize/deserialize round-trips exactly" {
         }
     }
 
-    // Re-serializing the loaded partition yields the identical bytes.
-    const bytes2 = try serialize(testing.allocator, &got);
+    // Re-serializing the adopted partition yields the identical bytes.
+    const bytes2 = try serialize(testing.allocator, got, &ids);
     defer testing.allocator.free(bytes2);
     try testing.expectEqualSlices(u8, bytes, bytes2);
 
@@ -456,32 +566,206 @@ test "partition serialize/deserialize round-trips exactly" {
     try testing.expectEqual(part.ownerAt(10, 50, 50), got.ownerAt(10, 50, 50));
 }
 
-test "partition sidecar rejects a stale cell set + a corrupt blob" {
+test "v4 sidecar: a changed cell recomputes only its neighborhood; corrupt blobs rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const coarse = try boxPoly(a, 0, 0, 100, 100);
     const harbor = try boxPoly(a, 40, 40, 60, 60);
+    const far = try boxPoly(a, 500, 500, 600, 600); // disjoint from the change
     const cells = [_]plane.Cell{
         .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coarse} },
-        .{ .cscl = 20_000, .band_floor = 13, .order = 0, .cov1 = &.{harbor} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 1, .cov1 = &.{harbor} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 2, .cov1 = &.{far} },
+    };
+    const ids = [_]CellId{
+        .{ .name = "US4COARSE", .date = "20250101" },
+        .{ .name = "US5HARBR", .date = "20250202" },
+        .{ .name = "US5FARAWY", .date = "20250303" },
     };
     var part = try build(testing.allocator, &cells);
     defer part.deinit();
-    const bytes = try serialize(testing.allocator, &part);
+    const bytes = try serialize(testing.allocator, &part, &ids);
     defer testing.allocator.free(bytes);
 
-    // Different coverage → different input_key → rejected (→ caller rebuilds).
-    const harbor2 = try boxPoly(a, 41, 40, 60, 60); // one vertex moved
+    // One harbor vertex moves (a chart update). The incremental build over the
+    // new cells must byte-equal a fresh build — and the far cell must adopt.
+    const harbor2 = try boxPoly(a, 41, 40, 60, 60);
     const cells2 = [_]plane.Cell{
         .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{coarse} },
-        .{ .cscl = 20_000, .band_floor = 13, .order = 0, .cov1 = &.{harbor2} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 1, .cov1 = &.{harbor2} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 2, .cov1 = &.{far} },
     };
-    try testing.expectError(error.StalePartition, deserialize(testing.allocator, bytes, &cells2));
+    var fresh = try build(testing.allocator, &cells2);
+    defer fresh.deinit();
+    const want = try serialize(testing.allocator, &fresh, &ids);
+    defer testing.allocator.free(want);
 
-    // A truncated blob and a bad magic are caught, not UB.
-    try testing.expectError(error.Truncated, deserialize(testing.allocator, bytes[0 .. bytes.len - 4], &cells));
+    var res = try buildIncremental(testing.allocator, &cells2, &ids, bytes);
+    defer res.part.deinit();
+    const got = try serialize(testing.allocator, &res.part, &ids);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, want, got);
+    try testing.expect(res.adopted > 0); // the far cell's slots adopted
+    try testing.expect(res.swept > 0); // the changed neighborhood recomputed
+
+    // A truncated blob, a bad magic, and a pre-v4 version are caught, not UB.
+    try testing.expectError(error.Truncated, buildIncremental(testing.allocator, &cells, &ids, bytes[0 .. bytes.len - 4]));
     const bad = [_]u8{0} ** 8;
-    try testing.expectError(error.BadMagic, deserialize(testing.allocator, &bad, &cells));
+    try testing.expectError(error.BadMagic, buildIncremental(testing.allocator, &cells, &ids, &bad));
+    const old = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(old);
+    std.mem.writeInt(u32, old[4..8], 3, .little);
+    try testing.expectError(error.UnsupportedVersion, buildIncremental(testing.allocator, &cells, &ids, old));
+}
+
+test "fuzz: incremental build over a mutated set == fresh build, byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0x14C4E4E7);
+    const rnd = prng.random();
+    const grid: i64 = 64;
+
+    const Gen = struct {
+        fn cell(aa: std.mem.Allocator, r: std.Random, k: usize) !struct { c: plane.Cell, id: CellId } {
+            const x0 = r.intRangeAtMost(i64, -6, 4) * grid;
+            const y0 = r.intRangeAtMost(i64, -6, 4) * grid;
+            const w = r.intRangeAtMost(i64, 1, 6) * grid;
+            const h = r.intRangeAtMost(i64, 1, 6) * grid;
+            const cov = try boxPoly(aa, x0, y0, x0 + w, y0 + h);
+            const covs = try aa.alloc(plane.Poly, 1);
+            covs[0] = cov;
+            return .{
+                .c = .{
+                    .cscl = @intCast(1000 + k * 100),
+                    .band_floor = r.intRangeAtMost(u8, 0, 13),
+                    .order = k,
+                    .reach = if (r.uintLessThan(u8, 4) == 0) r.intRangeAtMost(u8, 5, 13) else 255,
+                    .cov1 = covs,
+                },
+                .id = .{
+                    .name = try std.fmt.allocPrint(aa, "C{d}", .{k}),
+                    .date = try std.fmt.allocPrint(aa, "202501{d:0>2}", .{(k % 28) + 1}),
+                },
+            };
+        }
+    };
+
+    var trial: usize = 0;
+    while (trial < 40) : (trial += 1) {
+        const n = rnd.intRangeAtMost(usize, 2, 8);
+        var cells_a = std.ArrayList(plane.Cell).empty;
+        var ids_a = std.ArrayList(CellId).empty;
+        for (0..n) |k| {
+            const g = try Gen.cell(a, rnd, k);
+            try cells_a.append(a, g.c);
+            try ids_a.append(a, g.id);
+        }
+        var part_a = try build(testing.allocator, cells_a.items);
+        const sc = try serialize(testing.allocator, &part_a, ids_a.items);
+        part_a.deinit();
+        defer testing.allocator.free(sc);
+
+        // Mutate into set B: remove one, add one, or update one in place.
+        var cells_b = std.ArrayList(plane.Cell).empty;
+        try cells_b.appendSlice(a, cells_a.items);
+        var ids_b = std.ArrayList(CellId).empty;
+        try ids_b.appendSlice(a, ids_a.items);
+        switch (rnd.uintLessThan(u8, 3)) {
+            0 => { // remove a random cell (ranks recompute below)
+                const victim = rnd.uintLessThan(usize, cells_b.items.len);
+                _ = cells_b.orderedRemove(victim);
+                _ = ids_b.orderedRemove(victim);
+            },
+            1 => { // add a new cell
+                const g = try Gen.cell(a, rnd, n);
+                try cells_b.append(a, g.c);
+                try ids_b.append(a, g.id);
+            },
+            else => { // a chart update: new coverage, new date
+                const victim = rnd.uintLessThan(usize, cells_b.items.len);
+                const g = try Gen.cell(a, rnd, n + 1);
+                cells_b.items[victim].cov1 = g.c.cov1;
+                ids_b.items[victim].date = "20260101";
+            },
+        }
+        // Re-rank order by (date, name) exactly as toPlaneCells does — order is
+        // a derived rank, so a membership change reassigns it.
+        const rank = try a.alloc(usize, cells_b.items.len);
+        for (rank, 0..) |*v, i| v.* = i;
+        std.mem.sort(usize, rank, ids_b.items, struct {
+            fn lt(ids: []const CellId, x: usize, y: usize) bool {
+                return ordersBeforeKeys(ids[x].date, ids[x].name, ids[y].date, ids[y].name);
+            }
+        }.lt);
+        for (rank, 0..) |ci, r| cells_b.items[ci].order = r;
+
+        var fresh = try build(testing.allocator, cells_b.items);
+        const want = try serialize(testing.allocator, &fresh, ids_b.items);
+        fresh.deinit();
+        defer testing.allocator.free(want);
+
+        var res = try buildIncremental(testing.allocator, cells_b.items, ids_b.items, sc);
+        const got = try serialize(testing.allocator, &res.part, ids_b.items);
+        res.part.deinit();
+        defer testing.allocator.free(got);
+
+        try testing.expectEqualSlices(u8, want, got);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "merge: a one-pack sidecar seeds the union build; distant faces adopt" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Pack A around the origin, pack B far east — disjoint ground.
+    const a_coarse = try boxPoly(a, 0, 0, 200, 200);
+    const a_fine = try boxPoly(a, 50, 50, 100, 100);
+    const b_coarse = try boxPoly(a, 5000, 0, 5200, 200);
+    const b_fine = try boxPoly(a, 5050, 50, 5100, 100);
+
+    const cells_a = [_]plane.Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{a_coarse} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 1, .cov1 = &.{a_fine} },
+    };
+    const ids_a = [_]CellId{
+        .{ .name = "US4WEST", .date = "20250101" },
+        .{ .name = "US5WEST", .date = "20250102" },
+    };
+    var part_a = try build(testing.allocator, &cells_a);
+    defer part_a.deinit();
+    const sc = try serialize(testing.allocator, &part_a, &ids_a);
+    defer testing.allocator.free(sc);
+
+    // The union: A's cells keep their relative order; B appends after.
+    const cells_u = [_]plane.Cell{
+        .{ .cscl = 100_000, .band_floor = 9, .order = 0, .cov1 = &.{a_coarse} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 1, .cov1 = &.{a_fine} },
+        .{ .cscl = 100_000, .band_floor = 9, .order = 2, .cov1 = &.{b_coarse} },
+        .{ .cscl = 20_000, .band_floor = 13, .order = 3, .cov1 = &.{b_fine} },
+    };
+    const ids_u = [_]CellId{
+        .{ .name = "US4WEST", .date = "20250101" },
+        .{ .name = "US5WEST", .date = "20250102" },
+        .{ .name = "US4EAST", .date = "20250201" },
+        .{ .name = "US5EAST", .date = "20250202" },
+    };
+
+    var fresh = try build(testing.allocator, &cells_u);
+    defer fresh.deinit();
+    const want = try serialize(testing.allocator, &fresh, &ids_u);
+    defer testing.allocator.free(want);
+
+    var res = try buildIncremental(testing.allocator, &cells_u, &ids_u, sc);
+    defer res.part.deinit();
+    const got = try serialize(testing.allocator, &res.part, &ids_u);
+    defer testing.allocator.free(got);
+
+    try testing.expectEqualSlices(u8, want, got);
+    try testing.expect(res.adopted > 0); // A's ground, untouched by B, seeded the union
 }

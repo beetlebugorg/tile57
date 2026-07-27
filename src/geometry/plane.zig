@@ -209,7 +209,7 @@ fn bboxOverlap(a: [4]i64, b: [4]i64) bool {
 /// the bboxes makes enumeration output-sensitive instead of the O(m²) all-pairs
 /// scan; the lists are IDENTICAL to that scan's (asserted by the test below),
 /// so the diff chains — and their bytes — are unchanged.
-fn subtrahendLists(sa: Allocator, bbs: []const [4]i64) ![]const []const u32 {
+pub fn subtrahendLists(sa: Allocator, bbs: []const [4]i64) ![]const []const u32 {
     const m = bbs.len;
     const lists = try sa.alloc([]const u32, m);
     for (lists) |*l| l.* = &.{};
@@ -431,7 +431,7 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
 /// `ownedAtTierIndexed` with the coverage precomputed — the multi-tier caller
 /// (`partition.build`) shares one CoverageIndex across every tier.
 pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex) ![]OwnedCell {
-    return ownedAtTierImpl(gpa, cells, tier, idx, null);
+    return ownedAtTierImpl(gpa, cells, tier, idx, null, null);
 }
 
 /// Cross-tier face reuse. A face is a pure function of the cell's own coverage
@@ -460,11 +460,56 @@ const ReuseCtx = struct {
     };
 };
 
-fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex, reuse: ?*ReuseCtx) ![]OwnedCell {
+/// Sidecar adoption. A stored face carries a digest of everything its diff
+/// chain read — its own cell's content and every subtrahend's, in order. If a
+/// cell's CURRENT face input digest matches a stored one, the stored geometry
+/// IS what the sweep would recompute, and is adopted verbatim.
+pub const AdoptCtx = struct {
+    /// Per GLOBAL cell index: identity-stable content digest
+    /// (partition.contentDigest — no order rank, it shifts under insertion).
+    digests: []const u64,
+    /// (global cell index, face input digest) → geometry to adopt. An empty
+    /// Poly is a real entry: the face was empty (a fully-covered gap-filler).
+    pool: std.AutoHashMap(PoolKey, Poly),
+    adopted: u64 = 0,
+    /// Face slots that ran a diff chain — neither adopted nor tier-reused.
+    /// Zero ⇒ the sidecar already IS this partition.
+    swept: u64 = 0,
+
+    pub const PoolKey = struct { ci: u32, fdig: u64 };
+};
+
+/// The digest a face's diff chain is a pure function of: own content digest,
+/// then each subtrahend's, in application order.
+pub fn faceInputDigest(digests: []const u64, ci: usize, glist: []const u32) u64 {
+    var h = std.hash.Wyhash.init(0x7457_4644_4947_5354); // face-digest seed
+    h.update(std.mem.asBytes(&digests[ci]));
+    for (glist) |g| h.update(std.mem.asBytes(&digests[g]));
+    return h.final();
+}
+
+const HitSrc = union(enum) {
+    /// A face already built at an earlier tier of this run.
+    prior: struct { tier_idx: u32, slot: i32 },
+    /// A face adopted verbatim from a sidecar (borrowed; duped on assembly).
+    ext: Poly,
+};
+
+/// One tier's walk: every cell in priority order (position IS priority), and
+/// how many lead it as eligible. Eligible cells (band_floor ≤ tier, surviving
+/// the reach cut) come first, finest→coarsest; then the fill-up gap-fillers —
+/// FINER cells (band_floor > tier) that own ground at this coarser tier only
+/// where NO eligible cell covers. Among the fillers the COARSEST wins (closest
+/// to this tier's display scale), equal scales by the usual tie-break. So a
+/// harbor-only region still has an owner at z4, scamin-thinned by the bake.
+/// The serializer re-derives face digests through this same walk.
+pub const TierWalk = struct { order: []usize, n_eligible: usize };
+
+pub fn tierWalk(a: Allocator, cells: []const Cell, tier: u8) !TierWalk {
     var order = std.ArrayList(usize).empty;
-    defer order.deinit(gpa);
+    errdefer order.deinit(a);
     for (cells, 0..) |c, i| {
-        if (c.band_floor <= tier) try order.append(gpa, i);
+        if (c.band_floor <= tier) try order.append(a, i);
     }
     std.mem.sort(usize, order.items, cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
@@ -473,16 +518,9 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
     }.lt);
     reachCut(cells, &order, tier);
 
-    // Fill-up gap-fillers: FINER cells (band_floor > tier) own ground at this
-    // coarser tier only where NO eligible cell covers — appended after every
-    // eligible cell, so they can never take ground from the band's own cells
-    // (position in `order` is priority: each cell's face is its coverage minus
-    // every earlier cell's). Among the fillers the COARSEST wins (closest to
-    // this tier's display scale), equal scales by the usual tie-break. So a
-    // harbor-only region still has an owner at z4, scamin-thinned by the bake.
     const n_eligible = order.items.len;
     for (cells, 0..) |c, i| {
-        if (c.band_floor > tier) try order.append(gpa, i);
+        if (c.band_floor > tier) try order.append(a, i);
     }
     std.mem.sort(usize, order.items[n_eligible..], cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
@@ -490,10 +528,17 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
             return cs[ia].order < cs[ib].order;
         }
     }.lt);
+    return .{ .order = try order.toOwnedSlice(a), .n_eligible = n_eligible };
+}
 
+fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex, reuse: ?*ReuseCtx, adopt: ?*AdoptCtx) ![]OwnedCell {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
+
+    const walk = try tierWalk(sa, cells, tier);
+    const order = walk.order;
+    const n_eligible = walk.n_eligible;
 
     // TILE57_PARTITION_STATS=1: per-tier phase timings + worst per-cell diff
     // chains, for aiming optimization work at what the profile actually says.
@@ -501,10 +546,10 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
 
     // Order-position views into the shared index (the sweep addresses cells by
     // their position in this tier's walk).
-    const m = order.items.len;
+    const m = order.len;
     const covs = try sa.alloc(Poly, m);
     const bbs = try sa.alloc([4]i64, m);
-    for (order.items, 0..) |ci, k| {
+    for (order, 0..) |ci, k| {
         covs[k] = idx.covs[ci];
         bbs[k] = idx.bbs[ci];
     }
@@ -513,35 +558,47 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
     const lists = try subtrahendLists(sa, bbs);
     const lists_ns = if (stats) statNow() - t_lists0 else 0;
 
-    // Reuse lookup: rewrite each list to global indices, hash it, and match it
-    // against the cell's lists from earlier tiers. A hit skips the sweep for
-    // that cell entirely; only misses go on the todo list.
-    const HitSrc = struct { tier_idx: u32, slot: i32 };
+    // Reuse/adoption lookup: rewrite each list to global indices, hash it, and
+    // match it (a) against the cell's lists from earlier tiers, (b) against the
+    // sidecar adoption pool by face input digest. Either hit skips the sweep
+    // for that cell entirely; only misses go on the todo list.
     var hitv: []?HitSrc = &.{};
     var glists: [][]u32 = &.{};
     var hashes: []u64 = &.{};
-    if (reuse != null) {
+    if (reuse != null or adopt != null) {
         hitv = try sa.alloc(?HitSrc, m);
         @memset(hitv, null);
         glists = try sa.alloc([]u32, m);
         hashes = try sa.alloc(u64, m);
     }
     var todo = std.ArrayList(u32).empty;
-    if (reuse) |rc| {
+    if (reuse != null or adopt != null) {
+        var reuse_hits: u64 = 0;
         for (0..m) |k| {
+            const ci = order[k];
             const gl = try sa.alloc(u32, lists[k].len);
-            for (lists[k], 0..) |j, x| gl[x] = @intCast(order.items[j]);
+            for (lists[k], 0..) |j, x| gl[x] = @intCast(order[j]);
             glists[k] = gl;
             hashes[k] = std.hash.Wyhash.hash(0x7457_5245, std.mem.sliceAsBytes(gl));
-            for (rc.caches[order.items[k]].items) |e| {
-                if (e.hash == hashes[k] and std.mem.eql(u32, e.glist, gl)) {
-                    hitv[k] = .{ .tier_idx = e.tier_idx, .slot = e.slot };
-                    break;
+            if (reuse) |rc| {
+                for (rc.caches[ci].items) |e| {
+                    if (e.hash == hashes[k] and std.mem.eql(u32, e.glist, gl)) {
+                        hitv[k] = .{ .prior = .{ .tier_idx = e.tier_idx, .slot = e.slot } };
+                        reuse_hits += 1;
+                        break;
+                    }
                 }
             }
+            if (hitv[k] == null) if (adopt) |ac| {
+                if (ac.pool.get(.{ .ci = @intCast(ci), .fdig = faceInputDigest(ac.digests, ci, gl) })) |face| {
+                    hitv[k] = .{ .ext = face };
+                    ac.adopted += 1;
+                }
+            };
             if (hitv[k] == null) try todo.append(sa, @intCast(k));
         }
-        rc.hits += m - todo.items.len;
+        if (reuse) |rc| rc.hits += reuse_hits;
+        if (adopt) |ac| ac.swept += todo.items.len;
     } else {
         try todo.ensureTotalCapacity(sa, m);
         for (0..m) |k| todo.appendAssumeCapacity(@intCast(k));
@@ -694,7 +751,7 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
         }.gt);
         for (by_ns[0..@min(m, 20)]) |k| {
             std.debug.print("  cell[{d}] {s} subs={d} diff={d:.1} ms\n", .{
-                order.items[k],
+                order[k],
                 if (k >= n_eligible) @as([]const u8, "fill") else "elig",
                 stat_nsub.?[k],
                 @as(f64, @floatFromInt(stat_ns.?[k])) / 1e6,
@@ -702,13 +759,16 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
         }
     }
 
-    for (order.items, 0..) |ci, k| {
-        const poly: Poly = if (reuse != null and hitv[k] != null) blk: {
-            // Same cell, same global subtrahend list at an earlier tier: the
-            // diff chain is identical, so the face bytes are — dupe, don't diff.
-            const hs = hitv[k].?;
-            if (hs.slot < 0) break :blk &.{}; // was an empty (dropped) face
-            break :blk reuse.?.prior.items[hs.tier_idx][@intCast(hs.slot)].owned;
+    for (order, 0..) |ci, k| {
+        const poly: Poly = if (hitv.len != 0 and hitv[k] != null) switch (hitv[k].?) {
+            // Same cell, same subtrahend content at an earlier tier or in the
+            // sidecar: the diff chain is identical, so the face bytes are —
+            // dupe, don't diff.
+            .prior => |hs| if (hs.slot < 0)
+                &.{} // was an empty (dropped) face
+            else
+                reuse.?.prior.items[hs.tier_idx][@intCast(hs.slot)].owned,
+            .ext => |face| face,
         } else results[k];
 
         // A gap-filler fully covered by the eligible cells owns nothing here —
@@ -741,10 +801,18 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
 /// switch for proving it changes nothing.
 pub fn ownedTiers(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex) ![][]OwnedCell {
     const use_reuse = std.c.getenv("TILE57_PARTITION_NO_REUSE") == null;
-    return ownedTiersOpt(gpa, cells, tiers, idx, use_reuse);
+    return ownedTiersOpt(gpa, cells, tiers, idx, use_reuse, null);
 }
 
-fn ownedTiersOpt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex, use_reuse: bool) ![][]OwnedCell {
+/// `ownedTiers` with a sidecar adoption pool: faces whose input digest matches
+/// a pool entry are adopted verbatim instead of swept. Adoption changes only
+/// HOW a face is produced, never its bytes — the pool key IS the proof.
+pub fn ownedTiersAdopt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex, adopt: ?*AdoptCtx) ![][]OwnedCell {
+    const use_reuse = std.c.getenv("TILE57_PARTITION_NO_REUSE") == null;
+    return ownedTiersOpt(gpa, cells, tiers, idx, use_reuse, adopt);
+}
+
+fn ownedTiersOpt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex, use_reuse: bool, adopt: ?*AdoptCtx) ![][]OwnedCell {
     var prior = std.ArrayList([]OwnedCell).empty;
     errdefer {
         for (prior.items) |faces| freeOwned(gpa, faces);
@@ -765,7 +833,7 @@ fn ownedTiersOpt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *c
 
     for (tiers, 0..) |tier, ti| {
         rc.cur_tier = @intCast(ti);
-        const faces = try ownedAtTierImpl(gpa, cells, tier, idx, if (use_reuse) &rc else null);
+        const faces = try ownedAtTierImpl(gpa, cells, tier, idx, if (use_reuse) &rc else null, adopt);
         prior.appendAssumeCapacity(faces);
     }
     if (std.c.getenv("TILE57_PARTITION_STATS") != null and use_reuse)
@@ -1353,8 +1421,8 @@ test "fuzz: ownedTiers with reuse is byte-identical to reuse off" {
 
         var idx = try buildCoverageIndex(a, cells.items);
 
-        const with = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, true);
-        const without = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, false);
+        const with = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, true, null);
+        const without = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, false, null);
 
         try testing.expectEqual(without.len, with.len);
         for (without, with) |w0, w1| {

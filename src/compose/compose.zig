@@ -564,11 +564,14 @@ pub const ComposeSource = struct {
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
     part: geometry.partition.Partition,
-    /// Cell names aligned with `readers` — diagnostics only (explainEmpty).
+    /// Cell names aligned with `readers` — diagnostics + partition identity.
     names: []const []const u8 = &.{},
-    /// False when the partition had to be BUILT (no sidecar, or one that no
-    /// longer matches this cell set). The C layer uses it to refresh the cache
-    /// on disk, so a stale sidecar heals itself instead of costing every open.
+    /// DSID dates aligned with `names` — the other half of the identity the v4
+    /// sidecar references faces by.
+    dates: []const []const u8 = &.{},
+    /// False when any face had to be SWEPT (no sidecar, or one whose ground
+    /// partially changed). The C layer uses it to refresh the cache on disk,
+    /// so a stale sidecar heals itself instead of costing every open.
     part_loaded: bool = false,
     minz: u8,
     maxz: u8,
@@ -677,9 +680,12 @@ pub const ComposeSource = struct {
         }
     }
     /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can
-    /// load to skip the owned-face build.
+    /// adopt faces from instead of re-sweeping them.
     pub fn serializePartition(self: *ComposeSource, gpa: std.mem.Allocator) ![]u8 {
-        return geometry.partition.serialize(gpa, &self.part);
+        const ids = try gpa.alloc(geometry.partition.CellId, self.names.len);
+        defer gpa.free(ids);
+        for (ids, self.names, self.dates) |*id, n, d| id.* = .{ .name = n, .date = d };
+        return geometry.partition.serialize(gpa, &self.part, ids);
     }
 
     /// The deepest zoom any cell COVERING (lon,lat) can serve — `reach` (its native
@@ -842,13 +848,13 @@ fn covDegBounds(cc: coverage.ChartCoverage) [4]f64 {
 /// Put the cell set in ONE canonical order, whatever order the caller handed the
 /// archives over in.
 ///
-/// The partition's input key (geometry.partition.inputKey) hashes the cells in
-/// sequence, and its ownership tie-break falls back to input order — so the order
-/// is part of the artifact's identity. That used to make the sidecar depend on the
-/// CALLER: `tile57 bake` sorted its archive paths, while a host that walked a
-/// directory handed them over in readdir order, and the two disagreed. The bake's
-/// partition then failed to load with StalePartition and every open rebuilt an
-/// identical copy from scratch.
+/// The ownership tie-break falls back to the order rank, and equal-cscl diff
+/// sequences follow it — so cell order is part of the artifact's identity even
+/// though the v4 digests deliberately hash (date, name) instead of the rank.
+/// Uncanonicalized, the sidecar depended on the CALLER: `tile57 bake` sorted its
+/// archive paths, while a host that walked a directory handed them over in
+/// readdir order, and the two disagreed — every open rebuilt an identical
+/// partition from scratch.
 ///
 /// Sorting on the coverage NAME (the file basename stem — already the ownership
 /// tie-break name) rather than on the path makes this independent of the caller's
@@ -1011,16 +1017,21 @@ fn finishOpen(
     const cells = try toPlaneCells(a, shims);
     for (cells, readers) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
 
-    var loaded = false;
-    if (load_partition) |bytes| {
-        if (geometry.partition.deserialize(gpa, bytes, cells)) |p| {
-            src.part = p;
-            loaded = true;
-        } else |err| std.debug.print("  partition sidecar unusable ({s}); building\n", .{@errorName(err)});
-    }
-    if (!loaded) src.part = try geometry.partition.build(gpa, cells);
-    src.part_loaded = loaded;
-    std.debug.print("compose: partition {s}\n", .{if (loaded) "LOADED from sidecar" else "BUILT fresh (no/stale sidecar)"});
+    const ids = try a.alloc(geometry.partition.CellId, shims.len);
+    for (ids, shims) |*id, sh| id.* = .{ .name = sh.name, .date = sh.date };
+    const res = blk: {
+        if (load_partition) |bytes| {
+            if (geometry.partition.buildIncremental(gpa, cells, ids, bytes)) |r|
+                break :blk r
+            else |err| std.debug.print("  partition sidecar unusable ({s}); building fresh\n", .{@errorName(err)});
+        }
+        break :blk try geometry.partition.buildIncremental(gpa, cells, ids, null);
+    };
+    src.part = res.part;
+    // Nothing swept ⇒ the sidecar already IS this partition; anything swept ⇒
+    // the C layer refreshes the file so the next open adopts everything.
+    src.part_loaded = res.swept == 0;
+    std.debug.print("compose: partition {d} face slots adopted, {d} swept\n", .{ res.adopted, res.swept });
     // Decoder ring for the stats harness's cell[<index>] lines.
     if (std.c.getenv("TILE57_PARTITION_STATS") != null) {
         for (shims, 0..) |sh, i| std.debug.print("cell[{d}] {s} {s} cscl={d} floor={d} reach={d}\n", .{
@@ -1030,11 +1041,14 @@ fn finishOpen(
 
     const names = try a.alloc([]const u8, shims.len);
     for (shims, 0..) |sh, i| names[i] = sh.name;
+    const dates = try a.alloc([]const u8, shims.len);
+    for (shims, 0..) |sh, i| dates[i] = sh.date;
 
     const fill_max = @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
     src.maps = maps;
     src.readers = readers;
     src.names = names;
+    src.dates = dates;
     src.owns_archives = owns_archives;
     src.minz = minz;
     src.maxz = maxz;

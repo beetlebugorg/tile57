@@ -8,7 +8,7 @@
 //!   * `plane`     — the per-tier coverage partition (`ownedAtTier`), the FULL /
 //!     EMPTY / SEAM tile classifier (`EdgeGrid`), and `clipLineOutsidePolys`.
 //!   * `partition` — the cell-ownership partition and its `.tpart` sidecar
-//!     (`serialize` / `deserialize` / `inputKey`).
+//!     (`serialize` / `buildIncremental`: per-face input digests, v4).
 
 pub const boolean = @import("boolean.zig");
 pub const plane = @import("plane.zig");
