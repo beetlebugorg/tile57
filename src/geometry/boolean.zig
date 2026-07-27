@@ -56,7 +56,8 @@ pub const Op = enum { intersect, unite, diff, sym_diff };
 /// closing chord slices across the region (the visible "wedge" artifact). On a
 /// parity-correct survivor graph a dead end can never happen, so any increase
 /// marks a boolean bug at the exact tile being composed. Callers snapshot
-/// before/after (single-threaded per compute).
+/// before/after; updates are atomic (computes run concurrently in the
+/// partition sweep) but snapshot-delta reads assume no concurrent compute.
 pub var open_chain_walks: u64 = 0;
 /// Diagnostic: how many compute() calls fell back to the region-sampled
 /// in_result recomputation because the sweep-flag pass dead-ended a walk.
@@ -508,14 +509,17 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
     // midpoint test is unambiguous (coincident seam edges keep their typing,
     // which the sampling cannot decide and the sweep handles well). Both
     // passes are pure functions of the input geometry, so determinism holds.
-    const chains_before = open_chain_walks;
-    const large_before = large_open_chains;
-    const first = try connectEdges(gpa, sw.processed.items, false);
-    if (open_chain_walks == chains_before) return first;
+    // The retry decision reads THIS call's walk stats, never the shared
+    // counters: computes run concurrently (the partition sweep), and another
+    // thread's dead end must not trigger — or mask — a retry here.
+    var first_stats: WalkStats = .{};
+    const first = try connectEdges(gpa, sw.processed.items, false, &first_stats);
+    if (first_stats.chains == 0) {
+        publishWalkStats(.{ .stitched = first_stats.stitched });
+        return first;
+    }
     freePolygon(gpa, first);
-    robust_retries += 1;
-    open_chain_walks = chains_before; // the retry's own walk re-judges health
-    large_open_chains = large_before;
+    _ = @atomicRmw(u64, &robust_retries, .Add, 1, .monotonic);
     for (sw.processed.items) |e| {
         if (!(e.left and e.edge_type == .normal)) continue;
         const other: Polygon = if (e.subject) clip else subject;
@@ -534,7 +538,27 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
             .sym_diff => true,
         };
     }
-    return connectEdges(gpa, sw.processed.items, true);
+    var retry_stats: WalkStats = .{};
+    const res = try connectEdges(gpa, sw.processed.items, true, &retry_stats);
+    // Chains/large report the FINAL walk only (the retry re-judges health);
+    // stitches from both walks really happened.
+    retry_stats.stitched += first_stats.stitched;
+    publishWalkStats(retry_stats);
+    return res;
+}
+
+/// Per-compute walk outcome; folded into the shared counters at the end of the
+/// call so concurrent computes never read each other's in-flight state.
+const WalkStats = struct {
+    chains: u64 = 0,
+    large: u64 = 0,
+    stitched: u64 = 0,
+};
+
+fn publishWalkStats(s: WalkStats) void {
+    if (s.chains != 0) _ = @atomicRmw(u64, &open_chain_walks, .Add, s.chains, .monotonic);
+    if (s.large != 0) _ = @atomicRmw(u64, &large_open_chains, .Add, s.large, .monotonic);
+    if (s.stitched != 0) _ = @atomicRmw(u64, &stitched_gaps, .Add, s.stitched, .monotonic);
 }
 
 /// Add one operand's rings to the sweep with its self-overlapping collinear
@@ -738,7 +762,7 @@ fn nearSegment(v: Pt, a: Pt, b: Pt) bool {
     return dot >= 0 and dot <= len2;
 }
 
-fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt {
+fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool, stats: *WalkStats) ![][]Pt {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
@@ -919,7 +943,7 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt 
             const j = best orelse continue;
             paired[i] = true;
             paired[j] = true;
-            stitched_gaps += 1;
+            stats.stitched += 1;
             const idx = edges.items.len;
             try edges.append(sa, .{ .a = v, .b = odd.items[j] });
             for ([_]Pt{ v, odd.items[j] }) |pp| {
@@ -955,10 +979,10 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt 
                 }
             }
             const ei = picked orelse {
-                open_chain_walks += 1; // dead end: the emitted chain closes on a chord
+                stats.chains += 1; // dead end: the emitted chain closes on a chord
                 const cdx: i128 = cur.x - loop_start.x;
                 const cdy: i128 = cur.y - loop_start.y;
-                if (cdx * cdx + cdy * cdy > 32 * 32) large_open_chains += 1;
+                if (cdx * cdx + cdy * cdy > 32 * 32) stats.large += 1;
                 break;
             };
             edges.items[ei].used = true;
