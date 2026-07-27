@@ -431,6 +431,36 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
 /// `ownedAtTierIndexed` with the coverage precomputed — the multi-tier caller
 /// (`partition.build`) shares one CoverageIndex across every tier.
 pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex) ![]OwnedCell {
+    return ownedAtTierImpl(gpa, cells, tier, idx, null);
+}
+
+/// Cross-tier face reuse. A face is a pure function of the cell's own coverage
+/// (tier-invariant, shared via the CoverageIndex) and its ordered subtrahend
+/// list AS GLOBAL INDICES: if a later tier produces the same list for the same
+/// cell, the diff chain — and therefore the face bytes — is identical, so the
+/// earlier face is duped instead of recomputed.
+const ReuseCtx = struct {
+    /// Build-lifetime storage for the cached lists.
+    arena: Allocator,
+    /// Per GLOBAL cell index: one entry per distinct subtrahend list seen.
+    caches: []std.ArrayList(Entry),
+    /// Faces of the tiers already built (gpa memory, owned by the caller).
+    prior: *std.ArrayList([]OwnedCell),
+    /// Index of the tier being built, into `prior` once it lands there.
+    cur_tier: u32 = 0,
+    hits: u64 = 0,
+
+    const Entry = struct {
+        hash: u64,
+        glist: []const u32,
+        tier_idx: u32,
+        /// Slot in that tier's faces, or -1: the face was empty and dropped
+        /// (a fully-covered gap-filler).
+        slot: i32,
+    };
+};
+
+fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex, reuse: ?*ReuseCtx) ![]OwnedCell {
     var order = std.ArrayList(usize).empty;
     defer order.deinit(gpa);
     for (cells, 0..) |c, i| {
@@ -483,6 +513,40 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
     const lists = try subtrahendLists(sa, bbs);
     const lists_ns = if (stats) statNow() - t_lists0 else 0;
 
+    // Reuse lookup: rewrite each list to global indices, hash it, and match it
+    // against the cell's lists from earlier tiers. A hit skips the sweep for
+    // that cell entirely; only misses go on the todo list.
+    const HitSrc = struct { tier_idx: u32, slot: i32 };
+    var hitv: []?HitSrc = &.{};
+    var glists: [][]u32 = &.{};
+    var hashes: []u64 = &.{};
+    if (reuse != null) {
+        hitv = try sa.alloc(?HitSrc, m);
+        @memset(hitv, null);
+        glists = try sa.alloc([]u32, m);
+        hashes = try sa.alloc(u64, m);
+    }
+    var todo = std.ArrayList(u32).empty;
+    if (reuse) |rc| {
+        for (0..m) |k| {
+            const gl = try sa.alloc(u32, lists[k].len);
+            for (lists[k], 0..) |j, x| gl[x] = @intCast(order.items[j]);
+            glists[k] = gl;
+            hashes[k] = std.hash.Wyhash.hash(0x7457_5245, std.mem.sliceAsBytes(gl));
+            for (rc.caches[order.items[k]].items) |e| {
+                if (e.hash == hashes[k] and std.mem.eql(u32, e.glist, gl)) {
+                    hitv[k] = .{ .tier_idx = e.tier_idx, .slot = e.slot };
+                    break;
+                }
+            }
+            if (hitv[k] == null) try todo.append(sa, @intCast(k));
+        }
+        rc.hits += m - todo.items.len;
+    } else {
+        try todo.ensureTotalCapacity(sa, m);
+        for (0..m) |k| todo.appendAssumeCapacity(@intCast(k));
+    }
+
     var out = std.ArrayList(OwnedCell).empty;
     errdefer {
         for (out.items) |c| boolean.freePolygon(gpa, c.owned);
@@ -504,7 +568,7 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
     if (stat_ns) |v| @memset(v, 0);
     if (stat_nsub) |v| @memset(v, 0);
 
-    const workers = workerCount(m);
+    const workers = workerCount(todo.items.len);
 
     var next = std.atomic.Value(usize).init(0);
     var failed = std.atomic.Value(bool).init(false);
@@ -512,6 +576,7 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
     const Sweep = struct {
         covs: []const Poly,
         lists: []const []const u32,
+        todo: []const u32,
         results: []Poly,
         keeps: []std.heap.ArenaAllocator,
         next: *std.atomic.Value(usize),
@@ -541,8 +606,8 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
                 // in ascending order leaves one worker finishing the whole tail
                 // alone. Longest-first is the standard fix.
                 const claimed = s.next.fetchAdd(1, .monotonic);
-                if (claimed >= s.covs.len) return;
-                const k = s.covs.len - 1 - claimed;
+                if (claimed >= s.todo.len) return;
+                const k = s.todo[s.todo.len - 1 - claimed];
                 if (s.failed.load(.acquire)) return;
                 const c0 = if (s.stat_ns != null) statNow() else 0;
 
@@ -586,6 +651,7 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
     const sweep = Sweep{
         .covs = covs,
         .lists = lists,
+        .todo = todo.items,
         .results = results,
         .keeps = keeps,
         .next = &next,
@@ -608,8 +674,8 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
 
     if (stats) {
         const sweep_ns = statNow() - t_sweep0;
-        std.debug.print("partition tier {d}: m={d} ({d} eligible) workers={d} lists={d:.0} ms sweep={d:.0} ms\n", .{
-            tier,                                       m, n_eligible, workers,
+        std.debug.print("partition tier {d}: m={d} ({d} eligible, {d} reused) workers={d} lists={d:.0} ms sweep={d:.0} ms\n", .{
+            tier,                                       m, n_eligible, m - todo.items.len, workers,
             @as(f64, @floatFromInt(lists_ns)) / 1e6,    @as(f64, @floatFromInt(sweep_ns)) / 1e6,
         });
         const by_ns = try sa.alloc(usize, m);
@@ -630,17 +696,74 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
     }
 
     for (order.items, 0..) |ci, k| {
-        const poly = results[k];
+        const poly: Poly = if (reuse != null and hitv[k] != null) blk: {
+            // Same cell, same global subtrahend list at an earlier tier: the
+            // diff chain is identical, so the face bytes are — dupe, don't diff.
+            const hs = hitv[k].?;
+            if (hs.slot < 0) break :blk &.{}; // was an empty (dropped) face
+            break :blk reuse.?.prior.items[hs.tier_idx][@intCast(hs.slot)].owned;
+        } else results[k];
+
         // A gap-filler fully covered by the eligible cells owns nothing here —
         // drop its empty face so a nested finer cell adds no face at all.
-        if (k >= n_eligible and poly.len == 0) continue;
-        const owned = try dupePolygonGpa(gpa, poly);
-        out.append(gpa, .{ .index = ci, .owned = owned }) catch |e| {
-            boolean.freePolygon(gpa, owned);
-            return e;
+        const dropped = k >= n_eligible and poly.len == 0;
+        if (!dropped) {
+            const owned = try dupePolygonGpa(gpa, poly);
+            out.append(gpa, .{ .index = ci, .owned = owned }) catch |e| {
+                boolean.freePolygon(gpa, owned);
+                return e;
+            };
+        }
+        if (reuse) |rc| if (hitv[k] == null) {
+            // First time this cell produced this list — remember the face.
+            try rc.caches[ci].append(rc.arena, .{
+                .hash = hashes[k],
+                .glist = try rc.arena.dupe(u32, glists[k]),
+                .tier_idx = rc.cur_tier,
+                .slot = if (dropped) -1 else @intCast(out.items.len - 1),
+            });
         };
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// The whole band stack in one call: one faces slice per tier, with cross-tier
+/// face reuse (see ReuseCtx). Each tier's slice has the same element semantics
+/// as `ownedAtTierIndexed`; free each with `freeOwned` and the outer slice with
+/// `gpa.free`. TILE57_PARTITION_NO_REUSE=1 disables the reuse path — the A/B
+/// switch for proving it changes nothing.
+pub fn ownedTiers(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex) ![][]OwnedCell {
+    const use_reuse = std.c.getenv("TILE57_PARTITION_NO_REUSE") == null;
+    return ownedTiersOpt(gpa, cells, tiers, idx, use_reuse);
+}
+
+fn ownedTiersOpt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex, use_reuse: bool) ![][]OwnedCell {
+    var prior = std.ArrayList([]OwnedCell).empty;
+    errdefer {
+        for (prior.items) |faces| freeOwned(gpa, faces);
+        prior.deinit(gpa);
+    }
+    try prior.ensureTotalCapacity(gpa, tiers.len);
+
+    var cache_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer cache_arena.deinit();
+    const ca = cache_arena.allocator();
+
+    var rc = ReuseCtx{
+        .arena = ca,
+        .caches = try ca.alloc(std.ArrayList(ReuseCtx.Entry), cells.len),
+        .prior = &prior,
+    };
+    for (rc.caches) |*c| c.* = std.ArrayList(ReuseCtx.Entry).empty;
+
+    for (tiers, 0..) |tier, ti| {
+        rc.cur_tier = @intCast(ti);
+        const faces = try ownedAtTierImpl(gpa, cells, tier, idx, if (use_reuse) &rc else null);
+        prior.appendAssumeCapacity(faces);
+    }
+    if (std.c.getenv("TILE57_PARTITION_STATS") != null and use_reuse)
+        std.debug.print("partition reuse: {d} faces duped across {d} tiers\n", .{ rc.hits, tiers.len });
+    return prior.toOwnedSlice(gpa);
 }
 
 
@@ -1179,6 +1302,64 @@ test "fuzz: partition == per-point finest-eligible-covering, zero overlap, zero 
                 }
             }
         }
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "fuzz: ownedTiers with reuse is byte-identical to reuse off" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0xFACE5EED);
+    const rnd = prng.random();
+    const grid: i64 = 64;
+
+    var trial: usize = 0;
+    while (trial < 120) : (trial += 1) {
+        const ncells = rnd.intRangeAtMost(usize, 1, 8);
+        var cells = std.ArrayList(Cell).empty;
+        for (0..ncells) |k| {
+            const x0 = rnd.intRangeAtMost(i64, -6, 4) * grid;
+            const y0 = rnd.intRangeAtMost(i64, -6, 4) * grid;
+            const w = rnd.intRangeAtMost(i64, 1, 6) * grid;
+            const h = rnd.intRangeAtMost(i64, 1, 6) * grid;
+            const cov = try boxPoly(a, x0, y0, x0 + w, y0 + h);
+            const covs = try a.alloc(Poly, 1);
+            covs[0] = cov;
+            try cells.append(a, .{
+                .cscl = @intCast(1000 + k * 100),
+                .band_floor = rnd.intRangeAtMost(u8, 0, 13),
+                .order = k,
+                // Some cells reach-capped so the pool flips across tiers.
+                .reach = if (rnd.uintLessThan(u8, 4) == 0) rnd.intRangeAtMost(u8, 5, 13) else 255,
+                .cov1 = covs,
+            });
+        }
+        // Distinct floors, descending — the band stack partition.build derives.
+        var tier_set = std.ArrayList(u8).empty;
+        for (cells.items) |c| {
+            if (std.mem.indexOfScalar(u8, tier_set.items, c.band_floor) == null)
+                try tier_set.append(a, c.band_floor);
+        }
+        std.mem.sort(u8, tier_set.items, {}, comptime std.sort.desc(u8));
+
+        var idx = try buildCoverageIndex(a, cells.items);
+
+        const with = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, true);
+        const without = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, false);
+
+        try testing.expectEqual(without.len, with.len);
+        for (without, with) |w0, w1| {
+            try testing.expectEqual(w0.len, w1.len);
+            for (w0, w1) |f0, f1| {
+                try testing.expectEqual(f0.index, f1.index);
+                try testing.expectEqual(f0.owned.len, f1.owned.len);
+                for (f0.owned, f1.owned) |r0, r1|
+                    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(r0), std.mem.sliceAsBytes(r1));
+            }
+        }
+        idx.deinit(a); // release its page-allocator worker arenas before the reset
         _ = arena.reset(.retain_capacity);
     }
 }

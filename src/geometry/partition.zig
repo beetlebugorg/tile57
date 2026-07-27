@@ -110,28 +110,28 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
 
     const maps = try gpa.alloc(BandMap, tiers.len);
     errdefer gpa.free(maps);
-    var built: usize = 0;
-    errdefer for (maps[0..built]) |m| {
-        plane.freeOwned(gpa, m.faces);
-        gpa.free(m.pos);
-    };
+
     // One coverage index for every tier: coverage is tier-invariant, and it is
-    // also what makes a face a pure function of its subtrahend index list.
+    // also what makes a face a pure function of its subtrahend index list —
+    // the invariant ownedTiers' cross-tier reuse rides on.
     var cov_idx = try plane.buildCoverageIndex(gpa, cells);
     defer cov_idx.deinit(gpa);
 
-    const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
+    const tier_faces = try plane.ownedTiers(gpa, cells, tiers, &cov_idx);
+    defer gpa.free(tier_faces);
+    var built: usize = 0;
+    errdefer {
+        for (maps[0..built]) |m| {
+            plane.freeOwned(gpa, m.faces);
+            gpa.free(m.pos);
+        }
+        for (tier_faces[built..]) |faces| plane.freeOwned(gpa, faces);
+    }
     for (tiers, 0..) |t, i| {
-        const t0 = if (stats) plane.statNow() else 0;
-        const faces = try plane.ownedAtTierWithIndex(gpa, cells, t, &cov_idx);
-        if (stats) std.debug.print("partition tier {d}: call total {d:.0} ms, {d} faces\n", .{
-            t, @as(f64, @floatFromInt(plane.statNow() - t0)) / 1e6, faces.len,
-        });
-        errdefer plane.freeOwned(gpa, faces);
         const pos = try gpa.alloc(i32, cells.len);
         @memset(pos, -1);
-        for (faces, 0..) |f, slot| pos[f.index] = @intCast(slot);
-        maps[i] = .{ .tier = t, .faces = faces, .pos = pos };
+        for (tier_faces[i], 0..) |f, slot| pos[f.index] = @intCast(slot);
+        maps[i] = .{ .tier = t, .faces = tier_faces[i], .pos = pos };
         built = i + 1;
     }
 
