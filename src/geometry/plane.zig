@@ -204,6 +204,114 @@ fn bboxOverlap(a: [4]i64, b: [4]i64) bool {
     return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3];
 }
 
+/// For each order position k: the ascending positions j<k whose bbox overlaps
+/// k's — the cell's diff subtrahends, in application order. A uniform grid over
+/// the bboxes makes enumeration output-sensitive instead of the O(m²) all-pairs
+/// scan; the lists are IDENTICAL to that scan's (asserted by the test below),
+/// so the diff chains — and their bytes — are unchanged.
+fn subtrahendLists(sa: Allocator, bbs: []const [4]i64) ![]const []const u32 {
+    const m = bbs.len;
+    const lists = try sa.alloc([]const u32, m);
+    for (lists) |*l| l.* = &.{};
+    if (m == 0) return lists;
+
+    // Data extent over valid bboxes. A cell whose coverage emptied has an
+    // inverted bbox: it overlaps nothing and nothing overlaps it — skipped on
+    // insert, and its own query yields the empty list, exactly like the scan.
+    var ext = [4]i64{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+    var any = false;
+    for (bbs) |b| {
+        if (b[0] > b[2] or b[1] > b[3]) continue;
+        any = true;
+        ext[0] = @min(ext[0], b[0]);
+        ext[1] = @min(ext[1], b[1]);
+        ext[2] = @max(ext[2], b[2]);
+        ext[3] = @max(ext[3], b[3]);
+    }
+    if (!any) return lists;
+
+    // ~256 buckets per axis. A cell spanning more than 64 buckets per axis
+    // (an overview cell over the whole extent) would flood thousands of
+    // buckets; it goes on the linear whale list instead — there are few, and
+    // they overlap nearly everything anyway.
+    const GRID: i64 = 256;
+    const OVERSIZE: i64 = 64;
+    const cw = @max(1, @divTrunc(ext[2] - ext[0], GRID) + 1);
+    const ch = @max(1, @divTrunc(ext[3] - ext[1], GRID) + 1);
+
+    var buckets = std.AutoHashMap([2]i32, std.ArrayList(u32)).init(sa);
+    var whales = std.ArrayList(u32).empty;
+
+    for (bbs, 0..) |b, k| {
+        if (b[0] > b[2] or b[1] > b[3]) continue;
+        const gx0 = @divFloor(b[0] - ext[0], cw);
+        const gx1 = @divFloor(b[2] - ext[0], cw);
+        const gy0 = @divFloor(b[1] - ext[1], ch);
+        const gy1 = @divFloor(b[3] - ext[1], ch);
+        if (gx1 - gx0 > OVERSIZE or gy1 - gy0 > OVERSIZE) {
+            try whales.append(sa, @intCast(k));
+            continue;
+        }
+        var gy = gy0;
+        while (gy <= gy1) : (gy += 1) {
+            var gx = gx0;
+            while (gx <= gx1) : (gx += 1) {
+                const gop = try buckets.getOrPut(.{ @intCast(gx), @intCast(gy) });
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                try gop.value_ptr.append(sa, @intCast(k));
+            }
+        }
+    }
+
+    // Generation-stamped dedup across the buckets one query touches.
+    const stamp = try sa.alloc(u32, m);
+    @memset(stamp, 0);
+    var gen: u32 = 0;
+    var hits = std.ArrayList(u32).empty;
+
+    for (bbs, 0..) |b, k| {
+        if (b[0] > b[2] or b[1] > b[3]) continue;
+        hits.clearRetainingCapacity();
+        const gx0 = @divFloor(b[0] - ext[0], cw);
+        const gx1 = @divFloor(b[2] - ext[0], cw);
+        const gy0 = @divFloor(b[1] - ext[1], ch);
+        const gy1 = @divFloor(b[3] - ext[1], ch);
+        if (gx1 - gx0 > OVERSIZE or gy1 - gy0 > OVERSIZE) {
+            // A whale's own query would walk most buckets anyway — plain scan.
+            for (0..k) |j| {
+                if (bboxOverlap(bbs[j], b)) try hits.append(sa, @intCast(j));
+            }
+        } else {
+            gen += 1;
+            // Whale and bucket lists are both ascending in k: prefix cut at k.
+            for (whales.items) |j| {
+                if (j >= k) break;
+                if (bboxOverlap(bbs[j], b)) {
+                    stamp[j] = gen;
+                    try hits.append(sa, j);
+                }
+            }
+            var gy = gy0;
+            while (gy <= gy1) : (gy += 1) {
+                var gx = gx0;
+                while (gx <= gx1) : (gx += 1) {
+                    const bucket = buckets.get(.{ @intCast(gx), @intCast(gy) }) orelse continue;
+                    for (bucket.items) |j| {
+                        if (j >= k) break;
+                        if (stamp[j] != gen and bboxOverlap(bbs[j], b)) {
+                            stamp[j] = gen;
+                            try hits.append(sa, j);
+                        }
+                    }
+                }
+            }
+            std.mem.sort(u32, hits.items, {}, comptime std.sort.asc(u32));
+        }
+        lists[k] = try sa.dupe(u32, hits.items);
+    }
+    return lists;
+}
+
 /// Monotonic ns for the TILE57_PARTITION_STATS harness — a dev tool; plane has
 /// no std.Io handle, so posix, and 0 where that clock doesn't exist.
 pub fn statNow() u64 {
@@ -371,6 +479,10 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
         bbs[k] = idx.bbs[ci];
     }
 
+    const t_lists0 = if (stats) statNow() else 0;
+    const lists = try subtrahendLists(sa, bbs);
+    const lists_ns = if (stats) statNow() - t_lists0 else 0;
+
     var out = std.ArrayList(OwnedCell).empty;
     errdefer {
         for (out.items) |c| boolean.freePolygon(gpa, c.owned);
@@ -399,7 +511,7 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
 
     const Sweep = struct {
         covs: []const Poly,
-        bbs: []const [4]i64,
+        lists: []const []const u32,
         results: []Poly,
         keeps: []std.heap.ArenaAllocator,
         next: *std.atomic.Value(usize),
@@ -435,9 +547,8 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
                 const c0 = if (s.stat_ns != null) statNow() else 0;
 
                 subtr.clearRetainingCapacity();
-                for (0..k) |j| {
-                    if (bboxOverlap(s.bbs[j], s.bbs[k]))
-                        subtr.append(ka, s.covs[j]) catch return s.failed.store(true, .release);
+                for (s.lists[k]) |j| {
+                    subtr.append(ka, s.covs[j]) catch return s.failed.store(true, .release);
                 }
                 // A \ (B ∪ C ∪ …) = ((A \ B) \ C) \ … : sequential small diffs
                 // instead of unioning every overlapping finer cell first and
@@ -474,7 +585,7 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
 
     const sweep = Sweep{
         .covs = covs,
-        .bbs = bbs,
+        .lists = lists,
         .results = results,
         .keeps = keeps,
         .next = &next,
@@ -497,8 +608,9 @@ pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: 
 
     if (stats) {
         const sweep_ns = statNow() - t_sweep0;
-        std.debug.print("partition tier {d}: m={d} ({d} eligible) workers={d} sweep={d:.0} ms\n", .{
-            tier, m, n_eligible, workers, @as(f64, @floatFromInt(sweep_ns)) / 1e6,
+        std.debug.print("partition tier {d}: m={d} ({d} eligible) workers={d} lists={d:.0} ms sweep={d:.0} ms\n", .{
+            tier,                                       m, n_eligible, workers,
+            @as(f64, @floatFromInt(lists_ns)) / 1e6,    @as(f64, @floatFromInt(sweep_ns)) / 1e6,
         });
         const by_ns = try sa.alloc(usize, m);
         for (by_ns, 0..) |*v, i| v.* = i;
@@ -1213,6 +1325,41 @@ test "quadrant-split partition stitches to the same result (shared integer grid)
             }
         }
         _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "subtrahendLists: grid equals the all-pairs scan, element for element" {
+    var prng = std.Random.DefaultPrng.init(0xA3B0C5);
+    const rnd = prng.random();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (0..60) |trial| {
+        _ = arena.reset(.retain_capacity);
+        const n = 1 + rnd.uintLessThan(usize, 150);
+        const bbs = try a.alloc([4]i64, n);
+        for (bbs) |*b| {
+            if (rnd.uintLessThan(u8, 12) == 0) {
+                // Emptied coverage: inverted bbox, overlaps nothing.
+                b.* = .{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+            } else if (trial % 3 == 0 and rnd.uintLessThan(u8, 8) == 0) {
+                // Whale: spans the whole extent (exercises the oversize path).
+                b.* = .{ -2000, -2000, 2000, 2000 };
+            } else {
+                const x0 = rnd.intRangeAtMost(i64, -1000, 1000);
+                const y0 = rnd.intRangeAtMost(i64, -1000, 1000);
+                b.* = .{ x0, y0, x0 + rnd.intRangeAtMost(i64, 0, 400), y0 + rnd.intRangeAtMost(i64, 0, 400) };
+            }
+        }
+        const lists = try subtrahendLists(a, bbs);
+        for (bbs, 0..) |b, k| {
+            var want = std.ArrayList(u32).empty;
+            for (0..k) |j| {
+                if (bboxOverlap(bbs[j], b)) try want.append(a, @intCast(j));
+            }
+            try testing.expectEqualSlices(u32, want.items, lists[k]);
+        }
     }
 }
 
