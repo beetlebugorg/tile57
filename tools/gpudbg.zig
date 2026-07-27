@@ -85,7 +85,14 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
         }
     }
-    std.debug.print("gpu view {d},{d} z{d}: {d} quads, {d} with weight>0 (max {d:.3})\n", .{ lon, lat, zoom, total, weighted, maxw });
+    // Scene SIZE first: vertices/indices/ranges are what the tessellator produces
+    // and the GPU uploads, so this line is the density measurement a low-zoom
+    // scene-build cost is judged by (the quad detail below is the label check).
+    std.debug.print("gpu view {d},{d} z{d}: {d} verts, {d} indices ({d} tris), {d} quads, {d} ranges\n", .{
+        lon,               lat, zoom, gs.scene.vertices.len, gs.scene.indices.len,
+        gs.scene.indices.len / 3, gs.scene.quads.len,        gs.scene.ranges.len,
+    });
+    std.debug.print("  quads: {d} total, {d} with weight>0 (max {d:.3})\n", .{ total, weighted, maxw });
     // A contour value's quads must be tangent-rotated (a non-axis-aligned corner
     // offset) and flagged for the shader's uprightness flip.
     if (sample_off) |off| {
