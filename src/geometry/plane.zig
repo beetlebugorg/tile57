@@ -24,6 +24,7 @@
 //! and unit-testable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const boolean = @import("boolean.zig");
 
@@ -203,6 +204,15 @@ fn bboxOverlap(a: [4]i64, b: [4]i64) bool {
     return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3];
 }
 
+/// Monotonic ns for the TILE57_PARTITION_STATS harness — a dev tool; plane has
+/// no std.Io handle, so posix, and 0 where that clock doesn't exist.
+pub fn statNow() u64 {
+    if (builtin.os.tag == .windows) return 0;
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 /// Identical result to `ownedAtTier`, built for scale. `ownedAtTier` accumulates a
 /// GLOBAL union of every finer cell and differences each cell against it — the
 /// operands grow to the whole nation, so it is O(cells²) in operand size (a
@@ -246,14 +256,20 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     defer scratch.deinit();
     const sa = scratch.allocator();
 
+    // TILE57_PARTITION_STATS=1: per-tier phase timings + worst per-cell diff
+    // chains, for aiming optimization work at what the profile actually says.
+    const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
+
     // Coverage + bbox per eligible cell (in finest→coarsest order), computed once.
     const m = order.items.len;
+    const t_cov0 = if (stats) statNow() else 0;
     const covs = try sa.alloc([][]Pt, m);
     const bbs = try sa.alloc([4]i64, m);
     for (order.items, 0..) |ci, k| {
         covs[k] = try cellCoverage(sa, cells[ci]);
         bbs[k] = polyBbox(covs[k]);
     }
+    const cov_ns = if (stats) statNow() - t_cov0 else 0;
 
     var out = std.ArrayList(OwnedCell).empty;
     errdefer {
@@ -269,6 +285,12 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     // the same bytes as a serial one.
     const results = try sa.alloc(Poly, m);
     for (results) |*r| r.* = &.{};
+
+    // Per-cell stat slots: workers write only their claimed index — race-free.
+    const stat_ns: ?[]u64 = if (stats) try sa.alloc(u64, m) else null;
+    const stat_nsub: ?[]u32 = if (stats) try sa.alloc(u32, m) else null;
+    if (stat_ns) |v| @memset(v, 0);
+    if (stat_nsub) |v| @memset(v, 0);
 
     const workers = blk: {
         // Overridable because the parallel sweep's correctness claim IS that it
@@ -293,6 +315,8 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         keeps: []std.heap.ArenaAllocator,
         next: *std.atomic.Value(usize),
         failed: *std.atomic.Value(bool),
+        stat_ns: ?[]u64,
+        stat_nsub: ?[]u32,
 
         fn run(s: *const @This(), w: usize) void {
             // Both arenas are the worker's own, over the page allocator: the
@@ -319,6 +343,7 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
                 if (claimed >= s.covs.len) return;
                 const k = s.covs.len - 1 - claimed;
                 if (s.failed.load(.acquire)) return;
+                const c0 = if (s.stat_ns != null) statNow() else 0;
 
                 subtr.clearRetainingCapacity();
                 for (0..k) |j| {
@@ -345,6 +370,10 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
                 // Into `keep` before the reset below reclaims `work`.
                 s.results[k] = dupePolygonGpa(ka, cur) catch
                     return s.failed.store(true, .release);
+                if (s.stat_ns) |ns| {
+                    ns[k] = statNow() - c0;
+                    s.stat_nsub.?[k] = @intCast(subtr.items.len);
+                }
                 _ = work.reset(.retain_capacity); // reuse the pages next cell; no munmap
             }
         }
@@ -361,8 +390,11 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         .keeps = keeps,
         .next = &next,
         .failed = &failed,
+        .stat_ns = stat_ns,
+        .stat_nsub = stat_nsub,
     };
 
+    const t_sweep0 = if (stats) statNow() else 0;
     {
         var threads = try sa.alloc(std.Thread, workers - 1);
         var spawned: usize = 0;
@@ -373,6 +405,29 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         sweep.run(0); // this thread takes a share too
     }
     if (failed.load(.acquire)) return error.OutOfMemory;
+
+    if (stats) {
+        const sweep_ns = statNow() - t_sweep0;
+        std.debug.print("partition tier {d}: m={d} ({d} eligible) workers={d} cov={d:.0} ms sweep={d:.0} ms\n", .{
+            tier,                                     m, n_eligible, workers,
+            @as(f64, @floatFromInt(cov_ns)) / 1e6,    @as(f64, @floatFromInt(sweep_ns)) / 1e6,
+        });
+        const by_ns = try sa.alloc(usize, m);
+        for (by_ns, 0..) |*v, i| v.* = i;
+        std.mem.sort(usize, by_ns, stat_ns.?, struct {
+            fn gt(ns: []const u64, x: usize, y: usize) bool {
+                return ns[x] > ns[y];
+            }
+        }.gt);
+        for (by_ns[0..@min(m, 20)]) |k| {
+            std.debug.print("  cell[{d}] {s} subs={d} diff={d:.1} ms\n", .{
+                order.items[k],
+                if (k >= n_eligible) @as([]const u8, "fill") else "elig",
+                stat_nsub.?[k],
+                @as(f64, @floatFromInt(stat_ns.?[k])) / 1e6,
+            });
+        }
+    }
 
     for (order.items, 0..) |ci, k| {
         const poly = results[k];

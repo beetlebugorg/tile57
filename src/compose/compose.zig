@@ -1021,6 +1021,12 @@ fn finishOpen(
     if (!loaded) src.part = try geometry.partition.build(gpa, cells);
     src.part_loaded = loaded;
     std.debug.print("compose: partition {s}\n", .{if (loaded) "LOADED from sidecar" else "BUILT fresh (no/stale sidecar)"});
+    // Decoder ring for the stats harness's cell[<index>] lines.
+    if (std.c.getenv("TILE57_PARTITION_STATS") != null) {
+        for (shims, 0..) |sh, i| std.debug.print("cell[{d}] {s} {s} cscl={d} floor={d} reach={d}\n", .{
+            i, sh.name, sh.date, cells[i].cscl, cells[i].band_floor, cells[i].reach,
+        });
+    }
 
     const names = try a.alloc([]const u8, shims.len);
     for (shims, 0..) |sh, i| names[i] = sh.name;

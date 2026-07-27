@@ -115,8 +115,13 @@ pub fn build(gpa: std.mem.Allocator, cells: []const plane.Cell) !Partition {
         plane.freeOwned(gpa, m.faces);
         gpa.free(m.pos);
     };
+    const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
     for (tiers, 0..) |t, i| {
+        const t0 = if (stats) plane.statNow() else 0;
         const faces = try plane.ownedAtTierIndexed(gpa, cells, t);
+        if (stats) std.debug.print("partition tier {d}: call total {d:.0} ms, {d} faces\n", .{
+            t, @as(f64, @floatFromInt(plane.statNow() - t0)) / 1e6, faces.len,
+        });
         errdefer plane.freeOwned(gpa, faces);
         const pos = try gpa.alloc(i32, cells.len);
         @memset(pos, -1);
