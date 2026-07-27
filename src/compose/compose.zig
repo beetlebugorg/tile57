@@ -501,6 +501,30 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     defer fill_arena.deinit();
     const fa = fill_arena.allocator();
     if (verbatim == null and !no_fill) fill: {
+        // The fill exists to hand bare ground to a COARSER band — so first ask
+        // whether any coarser cell could take it at all: same face-bbox +
+        // deep-tile filters the loop below applies, none of the geometry. At
+        // the coarsest populated band (every Great Lakes tile at z4) there are
+        // no takers, and the residual chain — hundreds of diff sweeps on a fat
+        // tile — was pure discovery cost for an empty answer. No candidates
+        // means the block cannot contribute, so skipping it is output-identical.
+        var mi: usize = 0;
+        while (mi < part.maps.len and &part.maps[mi] != map) mi += 1;
+        {
+            var any = false;
+            var cm = mi + 1;
+            outer: while (cm < part.maps.len) : (cm += 1) {
+                for (part.maps[cm].faces) |face| {
+                    if (face.owned.len == 0) continue;
+                    const bb = faceTileBBox(face, scale);
+                    if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
+                    if (!(try ownerHasTileDeep(readers[face.index], part.cells[face.index].cscl, z, tx, ty, true))) continue;
+                    any = true;
+                    break :outer;
+                }
+            }
+            if (!any) break :fill;
+        }
         const cb = tileClassifyBox(z, tx, ty);
         const rect = [_]geometry.plane.Pt{
             .{ .x = cb.min_x, .y = cb.min_y }, .{ .x = cb.max_x, .y = cb.min_y },
@@ -535,8 +559,6 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
                 cur_a = other;
             }
         }
-        var mi: usize = 0;
-        while (mi < part.maps.len and &part.maps[mi] != map) mi += 1;
         var ci_map = mi + 1;
         while (ci_map < part.maps.len and residual.len > 0) : (ci_map += 1) {
             for (part.maps[ci_map].faces) |face| {
