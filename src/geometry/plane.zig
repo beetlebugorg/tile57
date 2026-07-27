@@ -261,60 +261,133 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         out.deinit(gpa);
     }
 
-    // Subtrahend pointer list, reused (cleared) each iteration — it only holds borrowed
-    // pointers into `covs`, so it stays tiny.
-    var subtr = std.ArrayList(Poly).empty;
-    defer subtr.deinit(gpa);
+    // Every cell's face is its coverage minus the coverage of the earlier cells
+    // that overlap it — and `covs`/`bbs` above are INPUTS, computed for all m
+    // cells before any face is. No iteration reads another's result, so the
+    // whole sweep is parallel across cells. Results are placed BY INDEX and the
+    // output assembled in order afterwards, so a parallel build serializes to
+    // the same bytes as a serial one.
+    const results = try sa.alloc(Poly, m);
+    for (results) |*r| r.* = &.{};
 
-    // Boolean intermediates (the per-cell union of overlapping finer coverage, and the
-    // diff) live in a scratch arena that is RESET — not freed to the OS — after each cell.
-    // The old code freed each intermediate straight back to the page allocator to keep RSS
-    // down, but on a national NOAA build that was ~a quarter of the wall-clock spent in the
-    // kernel doing mmap/munmap + faulting the fresh pages (perf). Resetting the arena with
-    // retained capacity reuses the pages across cells, so there is no syscall churn — and
-    // RSS is still bounded: it caps at the single LARGEST cell's union (one coarse cell's
-    // overlap set), not the whole-district accumulation the earlier GPA-parking blowup came
-    // from. Only the finished `owned` polygon is copied into `gpa` (held by the partition).
-    var work = std.heap.ArenaAllocator.init(gpa);
-    defer work.deinit();
+    const workers = blk: {
+        // Overridable because the parallel sweep's correctness claim IS that it
+        // serializes byte-identically to the serial one, and checking that means
+        // forcing both over the same input.
+        if (std.c.getenv("TILE57_PARTITION_WORKERS")) |w| {
+            if (std.fmt.parseInt(usize, std.mem.sliceTo(w, 0), 10) catch null) |n|
+                break :blk @max(1, @min(n, 64));
+        }
+        if (m < 64) break :blk 1; // not worth the threads
+        const cpus = std.Thread.getCpuCount() catch 1;
+        break :blk @max(1, @min(cpus, 8));
+    };
+
+    var next = std.atomic.Value(usize).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+
+    const Sweep = struct {
+        covs: []const Poly,
+        bbs: []const [4]i64,
+        results: []Poly,
+        keeps: []std.heap.ArenaAllocator,
+        next: *std.atomic.Value(usize),
+        failed: *std.atomic.Value(bool),
+
+        fn run(s: *const @This(), w: usize) void {
+            // Both arenas are the worker's own, over the page allocator: the
+            // caller's allocator may be an arena and is not required to be
+            // thread-safe, so nothing here may touch it. `work` holds the
+            // boolean intermediates and is reset per cell — the RSS bound the
+            // serial sweep relied on, now per worker. `keep` holds the finished
+            // faces, which must outlive the join.
+            var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer work.deinit();
+            const ka = s.keeps[w].allocator();
+
+            // Subtrahend pointer list, reused (cleared) each iteration — it only
+            // holds borrowed pointers into `covs`, so it stays tiny.
+            var subtr = std.ArrayList(Poly).empty;
+
+            while (true) {
+                // Claim from the COARSE end first. `order` runs finest→coarsest
+                // and a cell's cost grows with how many earlier cells overlap
+                // it, so the last iterations are the expensive ones; taking them
+                // in ascending order leaves one worker finishing the whole tail
+                // alone. Longest-first is the standard fix.
+                const claimed = s.next.fetchAdd(1, .monotonic);
+                if (claimed >= s.covs.len) return;
+                const k = s.covs.len - 1 - claimed;
+                if (s.failed.load(.acquire)) return;
+
+                subtr.clearRetainingCapacity();
+                for (0..k) |j| {
+                    if (bboxOverlap(s.bbs[j], s.bbs[k]))
+                        subtr.append(ka, s.covs[j]) catch return s.failed.store(true, .release);
+                }
+                // A \ (B ∪ C ∪ …) = ((A \ B) \ C) \ … : sequential small diffs
+                // instead of unioning every overlapping finer cell first and
+                // diffing once. The pairwise-fold union grew its accumulator
+                // toward whole-district size — O(N²) sweep work for a coarse
+                // cell overlapped by hundreds of finer ones. Here the subject
+                // only SHRINKS, every subtrahend is one cell's coverage, and a
+                // subject emptied early — a gap-filler fully covered by the
+                // eligible cells, the common case — exits without the rest.
+                var cur: Poly = s.covs[k];
+                if (subtr.items.len != 0) {
+                    const wa = work.allocator();
+                    for (subtr.items) |sub| {
+                        cur = boolean.compute(wa, cur, sub, .diff) catch
+                            return s.failed.store(true, .release);
+                        if (cur.len == 0) break;
+                    }
+                }
+                // Into `keep` before the reset below reclaims `work`.
+                s.results[k] = dupePolygonGpa(ka, cur) catch
+                    return s.failed.store(true, .release);
+                _ = work.reset(.retain_capacity); // reuse the pages next cell; no munmap
+            }
+        }
+    };
+
+    const keeps = try sa.alloc(std.heap.ArenaAllocator, workers);
+    for (keeps) |*ka| ka.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer for (keeps) |*ka| ka.deinit();
+
+    const sweep = Sweep{
+        .covs = covs,
+        .bbs = bbs,
+        .results = results,
+        .keeps = keeps,
+        .next = &next,
+        .failed = &failed,
+    };
+
+    {
+        var threads = try sa.alloc(std.Thread, workers - 1);
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |t| t.join();
+        while (spawned < workers - 1) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, Sweep.run, .{ &sweep, spawned + 1 }) catch break;
+        }
+        sweep.run(0); // this thread takes a share too
+    }
+    if (failed.load(.acquire)) return error.OutOfMemory;
 
     for (order.items, 0..) |ci, k| {
-        // owned = cov \ (∪ finer cells whose bbox overlaps this one).
-        subtr.clearRetainingCapacity();
-        for (0..k) |j| {
-            if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(gpa, covs[j]);
-        }
-        const owned = if (subtr.items.len == 0)
-            try dupePolygonGpa(gpa, covs[k])
-        else blk: {
-            // A \ (B ∪ C ∪ …) = ((A \ B) \ C) \ … : sequential small diffs instead
-            // of unioning every overlapping finer cell first and diffing once. The
-            // pairwise-fold union grew its accumulator toward whole-district size —
-            // O(N²) sweep work for a coarse cell overlapped by hundreds of finer
-            // ones, and the dominant cost of a national partition build (perf: the
-            // boolean sweep was ~40% of wall-clock). Here the subject only SHRINKS
-            // (it starts as ONE cell's coverage), every subtrahend is one cell's
-            // coverage, and a subject emptied early — a gap-filler fully covered by
-            // the eligible cells, the common case — exits without touching the rest.
-            const wa = work.allocator();
-            var cur: [][]Pt = covs[k];
-            for (subtr.items) |sub| {
-                cur = try boolean.compute(wa, cur, sub, .diff);
-                if (cur.len == 0) break;
-            }
-            break :blk try dupePolygonGpa(gpa, cur);
-        };
-        _ = work.reset(.retain_capacity); // reuse the pages next cell; no munmap
+        const poly = results[k];
         // A gap-filler fully covered by the eligible cells owns nothing here —
         // drop its empty face so a nested finer cell adds no face at all.
-        if (k >= n_eligible and owned.len == 0) {
+        if (k >= n_eligible and poly.len == 0) continue;
+        const owned = try dupePolygonGpa(gpa, poly);
+        out.append(gpa, .{ .index = ci, .owned = owned }) catch |e| {
             boolean.freePolygon(gpa, owned);
-            continue;
-        }
-        try out.append(gpa, .{ .index = ci, .owned = owned });
+            return e;
+        };
     }
     return out.toOwnedSlice(gpa);
 }
+
 
 fn dupePolygonGpa(gpa: Allocator, poly: Poly) ![][]Pt {
     const out = try gpa.alloc([]Pt, poly.len);
