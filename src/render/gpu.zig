@@ -1709,7 +1709,6 @@ test "assembleLabels: fill-down symbols pool by priority; isolated and text unto
     try testing.expectEqual(@as(usize, 1), text_ranges);
 }
 
-
 fn testSurface(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings) !GpuSurface {
     var s = try GpuSurface.init(a, colors, .day, settings, 12.0);
     s.tile_scale = 1.0 / 4096.0;

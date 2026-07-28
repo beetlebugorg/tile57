@@ -739,8 +739,8 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
     if (stats) {
         const sweep_ns = statNow() - t_sweep0;
         std.debug.print("partition tier {d}: m={d} ({d} eligible, {d} reused) workers={d} lists={d:.0} ms sweep={d:.0} ms\n", .{
-            tier,                                       m, n_eligible, m - todo.items.len, workers,
-            @as(f64, @floatFromInt(lists_ns)) / 1e6,    @as(f64, @floatFromInt(sweep_ns)) / 1e6,
+            tier,                                    m,                                       n_eligible, m - todo.items.len, workers,
+            @as(f64, @floatFromInt(lists_ns)) / 1e6, @as(f64, @floatFromInt(sweep_ns)) / 1e6,
         });
         const by_ns = try sa.alloc(usize, m);
         for (by_ns, 0..) |*v, i| v.* = i;
@@ -840,7 +840,6 @@ fn ownedTiersOpt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *c
         std.debug.print("partition reuse: {d} faces duped across {d} tiers\n", .{ rc.hits, tiers.len });
     return prior.toOwnedSlice(gpa);
 }
-
 
 fn dupePolygonGpa(gpa: Allocator, poly: Poly) ![][]Pt {
     const out = try gpa.alloc([]Pt, poly.len);

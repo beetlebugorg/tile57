@@ -354,7 +354,6 @@ fn composeLayers(ra: std.mem.Allocator, part: *const geometry.partition.Partitio
 /// server wants — the HTTP layer gzips on the wire). gpa-owned; null if no cell owns this tile. This
 /// is the runtime compositor: with the partition loaded once, serving a tile is a classify plus
 /// either one memcpy/decompress or one decode/clip/encode, not a whole-district pass.
-
 pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, want_gzip: bool) !TileResult {
     const res = try composeTileContent(gpa, part, readers, z, tx, ty, if (want_gzip) .gzip_bytes else .raw_bytes);
     return .{ .tile = switch (res.content) {
@@ -1107,7 +1106,8 @@ fn finishOpen(
         if (load_partition) |bytes| {
             if (geometry.partition.buildIncremental(gpa, cells, ids, bytes)) |r|
                 break :blk r
-            else |err| std.debug.print("  partition sidecar unusable ({s}); building fresh\n", .{@errorName(err)});
+            else |err|
+                std.debug.print("  partition sidecar unusable ({s}); building fresh\n", .{@errorName(err)});
         }
         break :blk try geometry.partition.buildIncremental(gpa, cells, ids, null);
     };
@@ -1444,7 +1444,7 @@ test "maxZoomAt: indexed walk matches the exhaustive one" {
 
     // Deepest cell, mid cell, coarse-only ground, and off-coverage (-> loop_max).
     const probes = [_][2]i64{
-        .{ 30_000, 30_000 }, .{ 60_000, 60_000 }, .{ 5_000, 5_000 },
+        .{ 30_000, 30_000 }, .{ 60_000, 60_000 },   .{ 5_000, 5_000 },
         .{ 95_000, 95_000 }, .{ 200_000, 200_000 }, .{ -5_000, 50_000 },
     };
     for (probes) |p| {

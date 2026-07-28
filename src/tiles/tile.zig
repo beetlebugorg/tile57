@@ -717,7 +717,7 @@ test "ring cull: sub-pixel rings drop at fill_down, survive at native" {
     // Exactly the 2 px^2 floor (16 x 16 extent units = 2 x 2 display px,
     // |shoelace| 512) is kept — the test is >=, so the threshold itself survives.
     const at_floor = [_]mvt.Point{
-        .{ .x = 0, .y = 0 },  .{ .x = 16, .y = 0 },
+        .{ .x = 0, .y = 0 },   .{ .x = 16, .y = 0 },
         .{ .x = 16, .y = 16 }, .{ .x = 0, .y = 16 },
     };
     try t.expectEqual(@as(u64, 512), @abs(ringArea2(&at_floor)));
@@ -725,15 +725,15 @@ test "ring cull: sub-pixel rings drop at fill_down, survive at native" {
 
     // A ring just under it (11 x 11 units, |shoelace| 242 < 256) goes.
     const under = [_]mvt.Point{
-        .{ .x = 0, .y = 0 },  .{ .x = 11, .y = 0 },
+        .{ .x = 0, .y = 0 },   .{ .x = 11, .y = 0 },
         .{ .x = 11, .y = 11 }, .{ .x = 0, .y = 11 },
     };
     try t.expect(!ringVisible(&under, Detail.fill_down));
 
     // Winding must not matter: the same ring counter-clockwise reads the same.
     const ccw = [_]mvt.Point{
-        .{ .x = 0, .y = 16 },  .{ .x = 16, .y = 16 },
-        .{ .x = 16, .y = 0 },  .{ .x = 0, .y = 0 },
+        .{ .x = 0, .y = 16 }, .{ .x = 16, .y = 16 },
+        .{ .x = 16, .y = 0 }, .{ .x = 0, .y = 0 },
     };
     try t.expectEqual(-ringArea2(&at_floor), ringArea2(&ccw));
     try t.expect(ringVisible(&ccw, Detail.fill_down));
@@ -754,13 +754,13 @@ test "a hole can never outlive the ring containing it" {
     var outer_side: i32 = 3;
     while (outer_side <= 64) : (outer_side += 1) {
         const outer = [_]mvt.Point{
-            .{ .x = 0, .y = 0 },                 .{ .x = outer_side, .y = 0 },
+            .{ .x = 0, .y = 0 },                   .{ .x = outer_side, .y = 0 },
             .{ .x = outer_side, .y = outer_side }, .{ .x = 0, .y = outer_side },
         };
         var hole_side: i32 = 1;
         while (hole_side < outer_side) : (hole_side += 1) {
             const hole = [_]mvt.Point{
-                .{ .x = 1, .y = 1 },                        .{ .x = 1 + hole_side, .y = 1 },
+                .{ .x = 1, .y = 1 },                         .{ .x = 1 + hole_side, .y = 1 },
                 .{ .x = 1 + hole_side, .y = 1 + hole_side }, .{ .x = 1, .y = 1 + hole_side },
             };
             try t.expect(@abs(ringArea2(&hole)) < @abs(ringArea2(&outer)));
