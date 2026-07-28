@@ -248,10 +248,12 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) geometry.plane.Box {
     return .{ .min_x = lon0 - bufx, .min_y = lat0 - bufy, .max_x = lon1 + bufx, .max_y = lat1 + bufy };
 }
 
-// Compose one seam/overscale tile from its contributing owner slots (in face order) into raw MLT
-// bytes, or null if nothing survives the clip. Decode each owner's tile (native or overscaled
-// ancestor), clip its features to the owner's projected owned face, per-layer concat in
-// VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
+// Compose one seam/overscale tile from its contributing owner slots (in face order) into decoded
+// per-layer features, or null if nothing survives the clip. Decode each owner's tile (native or
+// overscaled ancestor), clip its features to the owner's projected owned face, per-layer concat in
+// VECTOR_LAYERS order, re-orient polygons. `ra` owns every surviving feature — the per-tile scratch
+// for a byte-serving caller (which encodes and drops them), the caller's allocator for the GPU
+// scene path (which portrays them directly, never paying the encode/decode round-trip). Shared by
 // the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
 /// Deep-copy a clipped feature out of the per-contributor scratch arena: parts,
 /// points and properties all move into `a` before the scratch resets.
@@ -282,7 +284,7 @@ fn dupeProps(a: std.mem.Allocator, props: []const mvt.Prop) ![]const mvt.Prop {
 /// double-draw over finer-band ground.
 const ExtraFill = struct { ci: u32, region: []const []const geometry.plane.Pt, deep: bool };
 
-fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, contribs: []const ExtraFill, reach_cells: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
+fn composeLayers(ra: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, contribs: []const ExtraFill, reach_cells: []const u32, z: u8, tx: u32, ty: u32) !?[]const mvt.Layer {
     const compose = clip;
     var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
     for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
@@ -321,7 +323,7 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
             const li = layerIndex(layer.name) orelse continue;
             var tmpb = std.ArrayList(mvt.Feature).empty;
             for (layer.features) |feat| try compose.clipFeatureToFace(sa2, &tmpb, feat, face_px, &fgrid);
-            for (tmpb.items) |f| try buckets[li].append(ta, try dupeFeature(ta, f));
+            for (tmpb.items) |f| try buckets[li].append(ra, try dupeFeature(ra, f));
         }
     }
     // Reach-ring cells: no owned ground in this tile, but their light sector
@@ -336,20 +338,20 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
             const li = layerIndex(layer.name) orelse continue;
             for (layer.features) |feat| {
                 if (feat.geom_type != .linestring or !compose.isLightFigure(feat)) continue;
-                const parts = try ta.alloc([]const mvt.Point, feat.parts.len);
-                for (feat.parts, 0..) |p, i| parts[i] = try ta.dupe(mvt.Point, p);
-                try buckets[li].append(ta, .{ .geom_type = .linestring, .parts = parts, .properties = try dupeProps(ta, feat.properties) });
+                const parts = try ra.alloc([]const mvt.Point, feat.parts.len);
+                for (feat.parts, 0..) |p, i| parts[i] = try ra.dupe(mvt.Point, p);
+                try buckets[li].append(ra, .{ .geom_type = .linestring, .parts = parts, .properties = try dupeProps(ra, feat.properties) });
             }
         }
     }
     var out_layers = std.ArrayList(mvt.Layer).empty;
     for (&buckets, 0..) |*bucket, li| {
         if (bucket.items.len == 0) continue;
-        const feats = try orientPolys(ta, bucket.items);
-        try out_layers.append(ta, .{ .name = mvt.VECTOR_LAYERS[li], .features = feats });
+        const feats = try orientPolys(ra, bucket.items);
+        try out_layers.append(ra, .{ .name = mvt.VECTOR_LAYERS[li], .features = feats });
     }
     if (out_layers.items.len == 0) return null;
-    return try mlt.encode(ta, .{ .layers = out_layers.items });
+    return out_layers.items;
 }
 
 /// Compose ONE tile on demand from a resident partition + mmap'd per-cell `readers` (cell index ==
@@ -359,53 +361,20 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
 /// server wants — the HTTP layer gzips on the wire). gpa-owned; null if no cell owns this tile. This
 /// is the runtime compositor: with the partition loaded once, serving a tile is a classify plus
 /// either one memcpy/decompress or one decode/clip/encode, not a whole-district pass.
-/// Sutherland–Hodgman rect clip of a ring bag: cuts boolean operands to tile
-/// size in LINEAR time, so the cross-band fill's cost per tile is bounded by
-/// the tile — never by the face. A tier-0 face is a whole coastal cell
-/// (hundreds of thousands of points); exact booleans against it requested
-/// oversized allocations that FAILED tile-by-tile on a memory-limited device,
-/// at exactly the coarse zooms.
-fn rectClipRings(a: std.mem.Allocator, rings: []const []const geometry.plane.Pt, box: geometry.plane.Box) ![][]geometry.plane.Pt {
-    var out = std.ArrayList([]geometry.plane.Pt).empty;
-    for (rings) |ring| {
-        var cur = std.ArrayList(geometry.plane.Pt).empty;
-        try cur.appendSlice(a, ring);
-        inline for (.{
-            .{ .axis = 0, .lim = "min_x", .keep_ge = true },
-            .{ .axis = 0, .lim = "max_x", .keep_ge = false },
-            .{ .axis = 1, .lim = "min_y", .keep_ge = true },
-            .{ .axis = 1, .lim = "max_y", .keep_ge = false },
-        }) |cl| {
-            if (cur.items.len == 0) break;
-            const lim: i64 = @field(box, cl.lim);
-            var nxt = std.ArrayList(geometry.plane.Pt).empty;
-            const npts = cur.items.len;
-            for (cur.items, 0..) |p, k| {
-                const q = cur.items[(k + 1) % npts];
-                const pv: i64 = if (cl.axis == 0) p.x else p.y;
-                const qv: i64 = if (cl.axis == 0) q.x else q.y;
-                const pin = if (cl.keep_ge) pv >= lim else pv <= lim;
-                const qin = if (cl.keep_ge) qv >= lim else qv <= lim;
-                if (pin) try nxt.append(a, p);
-                if (pin != qin) {
-                    const t = @as(f64, @floatFromInt(lim - pv)) / @as(f64, @floatFromInt(qv - pv));
-                    const ox: i64 = if (cl.axis == 0) lim else p.x + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.x - p.x)))));
-                    const oy: i64 = if (cl.axis == 1) lim else p.y + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.y - p.y)))));
-                    try nxt.append(a, .{ .x = ox, .y = oy });
-                }
-            }
-            cur = nxt;
-        }
-        if (cur.items.len >= 3) try out.append(a, try cur.toOwnedSlice(a));
-    }
-    return out.toOwnedSlice(a);
-}
 
 pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, want_gzip: bool) !TileResult {
-    const map = part.mapForZoom(z) orelse return .{ .tile = null, .owned = false };
+    const res = try composeTileContent(gpa, part, readers, z, tx, ty, if (want_gzip) .gzip_bytes else .raw_bytes);
+    return .{ .tile = switch (res.content) {
+        .bytes => |b| b,
+        else => null,
+    }, .owned = res.owned };
+}
+
+fn composeTileContent(a: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, mode: ContentMode) !TileContentResult {
+    const map = part.mapForZoom(z) orelse return .{ .content = .none, .owned = false };
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ta = arena.allocator();
 
@@ -433,7 +402,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
         // classify, projection, booleans, memory — is bounded by the tile,
         // never by the face (whole-cell faces at coarse tiers OOM'd a
         // memory-limited device tile by tile).
-        const clipped = rectClipRings(ta, face.owned, cb0) catch continue;
+        const clipped = geometry.plane.rectClipRings(ta, face.owned, cb0) catch continue;
         if (dbg) std.debug.print("cmp z{d}/{d}/{d} tier{d} ci{d} cscl{d} clippedRings={d} hasTile={}\n", .{ z, tx, ty, map.tier, ci, cscl, clipped.len, ownerHasTile(readers[ci], cscl, z, tx, ty) catch false });
         if (clipped.len == 0) continue; // owns none of this tile
         owned = true;
@@ -451,7 +420,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // sweeping in, and the bake addressed this tile for exactly that reach
     // (buildTileMap's lightReachTiles ring around the cell's light_bbox). Apply
     // the SAME ring here: consult each such cell's archive and let
-    // composeSeamTile take only its constructed LIGHTS figures, whole.
+    // composeLayers take only its constructed LIGHTS figures, whole.
     // Without this the figures amputate exactly at the composed-tile boundary.
     var reach = std.ArrayList(u32).empty;
     {
@@ -482,9 +451,9 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // Verbatim fast path: only when no reach cell contributes (else the figures
     // must merge, so the tile seam-composes; content-identical for the owner).
     if (reach.items.len == 0) if (verbatim) |ci| {
-        if (want_gzip) {
-            if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .tile = try gpa.dupe(u8, blob), .owned = true };
-        } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .tile = try gpa.dupe(u8, raw), .owned = true };
+        if (mode == .gzip_bytes) {
+            if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .content = .{ .bytes = try a.dupe(u8, blob) }, .owned = true };
+        } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .content = .{ .bytes = try a.dupe(u8, raw) }, .owned = true };
     };
     // Cross-band fill (partial OR whole-tile): whatever ground the governing
     // band leaves bare in THIS tile composes from coarser bands, clipped to
@@ -536,70 +505,83 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
             rings[0] = try fa.dupe(geometry.plane.Pt, &rect);
             break :blk rings;
         };
-        // Ping-pong compaction: the boolean chain's intermediates accumulate
-        // in the arena (hundreds of steps on a fat tile); every 16 steps the
-        // small surviving residual is copied into the drained side and the
-        // other resets, bounding the chain's peak to ~16 steps of scratch.
+        // Two arenas ping-pong across bands: each band's boolean scratch dies
+        // with its arena reset once the surviving residual has moved to the
+        // drained side, so the peak is one band of scratch, never the chain.
         var fill_arena2 = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer fill_arena2.deinit();
         var arenas = [2]*std.heap.ArenaAllocator{ &fill_arena, &fill_arena2 };
         var cur_a: usize = 0;
-        var steps: usize = 0;
-        for (contribs.items) |c| {
-            residual = geometry.boolean.compute(arenas[cur_a].allocator(), residual, c.region, .diff) catch break :fill;
+        // Governing band: its faces are a disjoint partition, so the plain
+        // concatenation of the contributor regions is already their even-odd
+        // union — ONE diff sweep takes them all out of the residual, where a
+        // per-contributor chain re-swept the whole residual hundreds of times
+        // on a fat coarse tile.
+        if (contribs.items.len != 0) {
+            const wa = arenas[cur_a].allocator();
+            var nrings: usize = 0;
+            for (contribs.items) |c| nrings += c.region.len;
+            const all = wa.alloc([]const geometry.plane.Pt, nrings) catch break :fill;
+            var ri: usize = 0;
+            for (contribs.items) |c| for (c.region) |ring| {
+                all[ri] = ring;
+                ri += 1;
+            };
+            residual = geometry.boolean.compute(wa, residual, all, .diff) catch break :fill;
             if (residual.len == 0) break :fill; // governing band covers the whole tile
-            steps += 1;
-            if (steps % 16 == 0) {
-                const other = 1 - cur_a;
-                const oa = arenas[other].allocator();
-                const moved = oa.alloc([]geometry.plane.Pt, residual.len) catch break :fill;
-                for (residual, 0..) |ring, ri| moved[ri] = oa.dupe(geometry.plane.Pt, ring) catch break :fill;
-                _ = arenas[cur_a].reset(.retain_capacity);
-                residual = moved;
-                cur_a = other;
-            }
         }
         var ci_map = mi + 1;
-        while (ci_map < part.maps.len and residual.len > 0) : (ci_map += 1) {
+        bands: while (ci_map < part.maps.len and residual.len > 0) : (ci_map += 1) {
+            // One band at a time: its faces are disjoint, so every face
+            // intersects the SAME band-entry residual (no face can own ground
+            // a sibling already took), and the band's regions then leave the
+            // residual in a single concatenated diff.
+            const wa = arenas[cur_a].allocator();
+            var band_rings = std.ArrayList([]const geometry.plane.Pt).empty;
             for (part.maps[ci_map].faces) |face| {
-                if (residual.len == 0) break;
                 if (face.owned.len == 0) continue;
                 const ci = face.index;
                 const bb = faceTileBBox(face, scale);
                 if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
                 if (!(try ownerHasTileDeep(readers[ci], part.cells[ci].cscl, z, tx, ty, true))) continue;
-                const wa = arenas[cur_a].allocator();
-                const clipped = rectClipRings(wa, face.owned, cb) catch continue;
+                const clipped = geometry.plane.rectClipRings(wa, face.owned, cb) catch continue;
                 if (clipped.len == 0) continue;
                 const region = geometry.boolean.compute(wa, clipped, residual, .intersect) catch continue;
                 if (region.len == 0) continue;
+                band_rings.appendSlice(wa, region) catch break;
                 // Copy the surviving region OUT of the throwaway arenas.
                 const kept = try ta.alloc([]geometry.plane.Pt, region.len);
                 for (region, 0..) |ring, ri| kept[ri] = try ta.dupe(geometry.plane.Pt, ring);
                 try contribs.append(ta, .{ .ci = @intCast(ci), .region = kept, .deep = true });
-                residual = geometry.boolean.compute(wa, residual, region, .diff) catch break;
-                steps += 1;
-                if (steps % 16 == 0) {
-                    const other = 1 - cur_a;
-                    const oa2 = arenas[other].allocator();
-                    const moved2 = oa2.alloc([]geometry.plane.Pt, residual.len) catch break;
-                    for (residual, 0..) |ring, ri| moved2[ri] = oa2.dupe(geometry.plane.Pt, ring) catch break;
-                    _ = arenas[cur_a].reset(.retain_capacity);
-                    residual = moved2;
-                    cur_a = other;
-                }
             }
+            if (band_rings.items.len == 0) continue;
+            const next = geometry.boolean.compute(wa, residual, band_rings.items, .diff) catch continue;
+            // Move the surviving residual to the drained arena and drop the
+            // band's scratch with this side's reset.
+            const other = 1 - cur_a;
+            const oa = arenas[other].allocator();
+            const moved = oa.alloc([]geometry.plane.Pt, next.len) catch break :bands;
+            for (next, 0..) |ring, ri| moved[ri] = oa.dupe(geometry.plane.Pt, ring) catch break :bands;
+            _ = arenas[cur_a].reset(.retain_capacity);
+            residual = moved;
+            cur_a = other;
         }
         if (contribs.items.len > 0) owned = true;
     }
 
     if (contribs.items.len == 0 and reach.items.len == 0)
-        return .{ .tile = null, .owned = owned };
+        return .{ .content = .none, .owned = owned };
 
-    const enc = (try composeSeamTile(ta, part, readers, contribs.items, reach.items, z, tx, ty)) orelse return .{ .tile = null, .owned = owned };
-    // want_gzip → match the archive's stored (gzipped) bytes; else hand back the raw MLT.
-    const bytes = if (want_gzip) try pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
-    return .{ .tile = bytes, .owned = true };
+    // Layers mode composes into the CALLER's allocator (the features ARE the
+    // result); byte modes compose into the tile arena, encode, and only the
+    // bytes leave. Same features, same order, either way.
+    const ra = if (mode == .layers) a else ta;
+    const layers = (try composeLayers(ra, part, readers, contribs.items, reach.items, z, tx, ty)) orelse return .{ .content = .none, .owned = owned };
+    if (mode == .layers) return .{ .content = .{ .layers = try decodedView(a, layers) }, .owned = true };
+    const enc = try mlt.encode(ta, .{ .layers = layers });
+    // gzip_bytes → match the archive's stored (gzipped) bytes; raw_bytes → the raw MLT.
+    const bytes = if (mode == .gzip_bytes) try pmtiles.StreamWriter.gzipTile(a, enc) else try a.dupe(u8, enc);
+    return .{ .content = .{ .bytes = bytes }, .owned = true };
 }
 
 /// The outcome of composing one tile: its bytes (null if nothing rendered) and whether the ownership
@@ -607,6 +589,37 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
 /// owns the ground but produced nothing — transient during a bake, suspect once a bake is done);
 /// `tile == null and !owned` = true empty (no cell owns this ground — open ocean, safe to cache).
 pub const TileResult = struct { tile: ?[]u8, owned: bool };
+
+/// One composed tile as CONTENT rather than wire bytes: `bytes` is a verbatim
+/// owner blob (raw MLT, still to decode — the single-owner fast path has no
+/// decoded form to give), `layers` are the composed features themselves,
+/// allocated in the caller's allocator. The GPU scene and query paths portray
+/// `layers` directly — the same features the byte contract would have encoded,
+/// minus the encode/decode round-trip that was ~a fifth of a cold scene build.
+pub const TileContent = union(enum) { none, bytes: []u8, layers: []const mvt.DecodedLayer };
+pub const TileContentResult = struct { content: TileContent, owned: bool };
+
+/// What form composeTileContent hands back: the archive-matching gzipped MLT,
+/// the raw MLT a live server wants, or the decoded layers a renderer wants.
+const ContentMode = enum { gzip_bytes, raw_bytes, layers };
+
+/// DecodedLayer views over freshly composed features. Every part and property
+/// slice here was allocated by THIS compose call and is unaliased, so shedding
+/// the const the builder types carry is sound — the consumer (replay) only
+/// reads either way.
+fn decodedView(a: std.mem.Allocator, layers: []const mvt.Layer) ![]const mvt.DecodedLayer {
+    const out = try a.alloc(mvt.DecodedLayer, layers.len);
+    for (layers, 0..) |layer, li| {
+        const feats = try a.alloc(mvt.DecodedFeature, layer.features.len);
+        for (layer.features, 0..) |f, fi| {
+            const parts = try a.alloc([]mvt.Point, f.parts.len);
+            for (f.parts, 0..) |part, pi| parts[pi] = @constCast(part);
+            feats[fi] = .{ .geom_type = f.geom_type, .parts = parts, .properties = @constCast(f.properties) };
+        }
+        out[li] = .{ .name = layer.name, .extent = tile.EXTENT, .features = feats };
+    }
+    return out;
+}
 
 /// A resident compositor: the per-cell archives held mmap'd and the ownership partition built once
 /// (or loaded from a sidecar), so `serve` composes any tile without a whole-district pass. Open once,
@@ -655,6 +668,13 @@ pub const ComposeSource = struct {
     /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
     pub fn tile(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileResult {
         return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
+    }
+
+    /// The same tile as decoded content (see TileContent): what a renderer or
+    /// query wants — layers to portray directly, or a verbatim blob to decode.
+    /// Everything in the result is allocated in `a`.
+    pub fn tileContent(self: *ComposeSource, a: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileContentResult {
+        return composeTileContent(a, &self.part, self.readers, z, tx, ty, .layers);
     }
 
     /// The complete serving story of ONE point at ONE zoom — printed on every

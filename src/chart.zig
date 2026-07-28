@@ -1652,15 +1652,20 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     // A per-tile OutOfMemory reclaims the biggest pool and retries once —
     // without this, coarse tiles vanished one by one on a memory-limited
     // device while every counter upstream read healthy.
-    const tile_res = src.tile(sa, z, x, y) catch |err| blk: {
+    const tile_res = src.tileContent(sa, z, x, y) catch |err| blk: {
         if (err == error.OutOfMemory) {
             geomDropCold(); // NOT geomDropAll: the walk's own tiles are still referenced
-            break :blk src.tile(sa, z, x, y);
+            break :blk src.tileContent(sa, z, x, y);
         }
         break :blk err;
     };
-    if (tile_res) |res| {
-        if (res.tile) |bytes| {
+    if (tile_res) |res| switch (res.content) {
+        // Seam-composed: the features come back decoded — portray them as-is.
+        .layers => |layers| scene.replayTile(sa, surf, layers) catch |err| {
+            std.debug.print("TILE LOST z{d}/{d}/{d}: replay FAILED ({s}) on composed layers\n", .{ z, x, y, @errorName(err) });
+        },
+        // Verbatim single-owner blob: decode the stored MLT, then portray.
+        .bytes => |bytes| {
             if (mlt.decode(sa, bytes)) |layers| {
                 scene.replayTile(sa, surf, layers) catch |err| {
                     std.debug.print("TILE LOST z{d}/{d}/{d}: replay FAILED ({s}) after {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
@@ -1668,11 +1673,10 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
             } else |err| {
                 std.debug.print("TILE LOST z{d}/{d}/{d}: decode FAILED ({s}) on {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
             }
-        } else {
-            // Nothing served: say why — the owner with no tile, or charted
-            // ground the tier map gave to nobody. (True ocean stays silent.)
-            src.explainEmpty(z, x, y);
-        }
+        },
+        // Nothing served: say why — the owner with no tile, or charted
+        // ground the tier map gave to nobody. (True ocean stays silent.)
+        .none => src.explainEmpty(z, x, y),
     } else |err| {
         std.debug.print("TILE LOST z{d}/{d}/{d}: compose FAILED ({s})\n", .{ z, x, y, @errorName(err) });
     }
@@ -1708,10 +1712,15 @@ pub fn composeQueryPoint(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     };
     const surf = qs.asSurface();
     try surf.beginScene(z);
-    const res = src.tile(a, z, tx, ty) catch return;
-    const bytes = res.tile orelse return;
-    const layers = mlt.decode(a, bytes) catch return;
-    scene.replayTile(a, surf, layers) catch return;
+    const res = src.tileContent(a, z, tx, ty) catch return;
+    switch (res.content) {
+        .layers => |layers| scene.replayTile(a, surf, layers) catch return,
+        .bytes => |bytes| {
+            const layers = mlt.decode(a, bytes) catch return;
+            scene.replayTile(a, surf, layers) catch return;
+        },
+        .none => return,
+    }
     _ = surf.endScene(a) catch {};
 }
 

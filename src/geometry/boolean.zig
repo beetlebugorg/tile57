@@ -255,7 +255,6 @@ const Sweeper = struct {
     processed: std.ArrayList(*SweepEvent), // every event in pop order
     op: Op,
     next_id: u32 = 0,
-    interactions: u64 = 0, // edge-pair interactions (crossing/T-touch/overlap) this sweep
 
     fn newEvent(self: *Sweeper, p: Pt, left: bool, subject: bool) !*SweepEvent {
         const ev = try self.arena.create(SweepEvent);
@@ -339,7 +338,6 @@ const Sweeper = struct {
         const it = findIntersection(le1.p, le1.other.p, le2.p, le2.other.p);
         if (it.n == 0) return 0;
         if (it.n == 1 and (le1.p.eql(le2.p) or le1.other.p.eql(le2.other.p))) return 0; // shared endpoint only
-        self.interactions += 1;
 
         if (it.n == 1) {
             if (!le1.p.eql(it.p0) and !le1.other.p.eql(it.p0)) try self.divideSegment(le1, it.p0, gpa);
@@ -448,18 +446,6 @@ const Sweeper = struct {
 const SCRATCH_RETAIN: usize = 1 << 20;
 
 pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt {
-    return computeTracked(gpa, subject, clip, op, null);
-}
-
-/// `compute`, additionally reporting whether the sweep stayed on its clean
-/// path: no edge pair interacted (crossing, T-touch subdivision, collinear
-/// overlap), and every result walk closed on the first try. A clean run engaged
-/// none of the path-dependent machinery (snap subdivision, overlap typing, the
-/// robust retry, micro-stitching), so its output is a pure function of each
-/// operand's reduced edge set — which is what lets a caller substitute a
-/// provably-equivalent operand (the compositor's boundary-far clip stand-in)
-/// and rely on byte-identical output. `out_clean` is always written.
-pub fn computeTracked(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op, out_clean: ?*bool) ![][]Pt {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -544,11 +530,9 @@ pub fn computeTracked(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op, o
     var first_stats: WalkStats = .{};
     const first = try connectEdges(gpa, sw.processed.items, false, &first_stats, &scratch_state);
     if (first_stats.chains == 0) {
-        if (out_clean) |c| c.* = sw.interactions == 0;
         publishWalkStats(.{ .stitched = first_stats.stitched });
         return first;
     }
-    if (out_clean) |c| c.* = false;
     freePolygon(gpa, first);
     _ = @atomicRmw(u64, &robust_retries, .Add, 1, .monotonic);
     for (sw.processed.items) |e| {

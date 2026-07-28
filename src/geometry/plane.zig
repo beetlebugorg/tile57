@@ -851,6 +851,48 @@ fn dupePolygonGpa(gpa: Allocator, poly: Poly) ![][]Pt {
     return out;
 }
 
+/// Sutherland–Hodgman rect clip of a ring bag: cuts boolean operands to tile
+/// size in LINEAR time, so the cross-band fill's cost per tile is bounded by
+/// the tile — never by the face. A tier-0 face is a whole coastal cell
+/// (hundreds of thousands of points); exact booleans against it requested
+/// oversized allocations that FAILED tile-by-tile on a memory-limited device,
+/// at exactly the coarse zooms.
+pub fn rectClipRings(a: std.mem.Allocator, rings: []const []const Pt, box: Box) ![][]Pt {
+    var out = std.ArrayList([]Pt).empty;
+    for (rings) |ring| {
+        var cur = std.ArrayList(Pt).empty;
+        try cur.appendSlice(a, ring);
+        inline for (.{
+            .{ .axis = 0, .lim = "min_x", .keep_ge = true },
+            .{ .axis = 0, .lim = "max_x", .keep_ge = false },
+            .{ .axis = 1, .lim = "min_y", .keep_ge = true },
+            .{ .axis = 1, .lim = "max_y", .keep_ge = false },
+        }) |cl| {
+            if (cur.items.len == 0) break;
+            const lim: i64 = @field(box, cl.lim);
+            var nxt = std.ArrayList(Pt).empty;
+            const npts = cur.items.len;
+            for (cur.items, 0..) |p, k| {
+                const q = cur.items[(k + 1) % npts];
+                const pv: i64 = if (cl.axis == 0) p.x else p.y;
+                const qv: i64 = if (cl.axis == 0) q.x else q.y;
+                const pin = if (cl.keep_ge) pv >= lim else pv <= lim;
+                const qin = if (cl.keep_ge) qv >= lim else qv <= lim;
+                if (pin) try nxt.append(a, p);
+                if (pin != qin) {
+                    const t = @as(f64, @floatFromInt(lim - pv)) / @as(f64, @floatFromInt(qv - pv));
+                    const ox: i64 = if (cl.axis == 0) lim else p.x + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.x - p.x)))));
+                    const oy: i64 = if (cl.axis == 1) lim else p.y + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.y - p.y)))));
+                    try nxt.append(a, .{ .x = ox, .y = oy });
+                }
+            }
+            cur = nxt;
+        }
+        if (cur.items.len >= 3) try out.append(a, try cur.toOwnedSlice(a));
+    }
+    return out.toOwnedSlice(a);
+}
+
 // ---------------------------------------------------------------------------
 // Line clipping against coverage (no polygon boolean).
 // ---------------------------------------------------------------------------
@@ -883,8 +925,11 @@ fn pointInEvenOddF(rings: Poly, x: f64, y: f64) bool {
 /// sub-run whose midpoint is on the wanted side — INSIDE `covered` when `keep_inside`,
 /// else OUTSIDE. Returns a list of poly-lines allocated in `gpa`. The line analogue of
 /// a polygon intersect/difference: no polygon boolean, so a line crossing the boundary
-/// is cut cleanly, not offset-doubled.
-fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_inside: bool) ![][]Pt {
+/// is cut cleanly, not offset-doubled. `grid`, when supplied, must index exactly
+/// `covered`'s edges: splits then come from the buckets near each segment and the
+/// midpoint parity from the grid's ray walk, so the cost per segment is the
+/// geometry NEAR it — never the whole coverage. Output is identical either way.
+fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_inside: bool, grid: ?*const EdgeGrid) ![][]Pt {
     var out = std.ArrayList([]Pt).empty;
     errdefer {
         for (out.items) |r| gpa.free(r);
@@ -909,7 +954,32 @@ fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_insi
         var splits = std.ArrayList(SplitPt).empty;
         try splits.append(sc, .{ .key = keyOf(a, a, b), .p = a });
         try splits.append(sc, .{ .key = keyOf(b, a, b), .p = b });
-        for (covered) |ring| {
+        if (grid) |g| {
+            const Gather = struct {
+                sc: Allocator,
+                splits: *std.ArrayList(SplitPt),
+                a: Pt,
+                b: Pt,
+                fn each(ctx: *const @This(), e: EdgeGrid.Seg) error{OutOfMemory}!void {
+                    const it = boolean.segIntersect(ctx.a, ctx.b, e.a, e.b);
+                    switch (it.n) {
+                        1 => try ctx.splits.append(ctx.sc, .{ .key = keyOf(it.p0, ctx.a, ctx.b), .p = it.p0 }),
+                        2 => {
+                            try ctx.splits.append(ctx.sc, .{ .key = keyOf(it.p0, ctx.a, ctx.b), .p = it.p0 });
+                            try ctx.splits.append(ctx.sc, .{ .key = keyOf(it.p1, ctx.a, ctx.b), .p = it.p1 });
+                        },
+                        else => {},
+                    }
+                }
+            };
+            const g_ctx = Gather{ .sc = sc, .splits = &splits, .a = a, .b = b };
+            try g.eachNearBox(.{
+                .min_x = @min(a.x, b.x),
+                .min_y = @min(a.y, b.y),
+                .max_x = @max(a.x, b.x),
+                .max_y = @max(a.y, b.y),
+            }, &g_ctx, Gather.each);
+        } else for (covered) |ring| {
             if (ring.len < 2) continue;
             var j = ring.len - 1;
             for (ring, 0..) |c, k| {
@@ -937,7 +1007,8 @@ fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_insi
             if (q.eql(prev)) continue;
             const mx = (@as(f64, @floatFromInt(prev.x)) + @as(f64, @floatFromInt(q.x))) / 2;
             const my = (@as(f64, @floatFromInt(prev.y)) + @as(f64, @floatFromInt(q.y))) / 2;
-            if (pointInEvenOddF(covered, mx, my) != keep_inside) {
+            const mid_in = if (grid) |g| g.parityF(mx, my) else pointInEvenOddF(covered, mx, my);
+            if (mid_in != keep_inside) {
                 // Sub-run is on the unwanted side: flush the kept run (ends at prev), skip.
                 try flushRun(gpa, &out, &run);
                 try run.append(gpa, q);
@@ -954,20 +1025,34 @@ fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_insi
 /// Keep the parts of `line` OUTSIDE `covered` — the parts a cell owns when `covered`
 /// is the finer coverage that beats it (the seam stroke stays on the covered side).
 pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
-    return clipLineByCoverage(gpa, line, covered, false);
+    return clipLineByCoverage(gpa, line, covered, false, null);
 }
 
 /// Keep the parts of `line` INSIDE `covered` — clips a cell's line features to its
 /// owned face at compose time (`covered` = the cell's owned region).
 pub fn clipLineInsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
-    return clipLineByCoverage(gpa, line, covered, true);
+    return clipLineByCoverage(gpa, line, covered, true, null);
+}
+
+/// clipLineInsidePolys with the caller's edge grid over the SAME coverage —
+/// identical output, cost bounded by the geometry near the line.
+pub fn clipLineInsidePolysGrid(gpa: Allocator, line: []const Pt, covered: Poly, grid: *const EdgeGrid) ![][]Pt {
+    return clipLineByCoverage(gpa, line, covered, true, grid);
 }
 
 const SplitPt = struct {
     key: i128,
     p: Pt,
+    // Total order: key first (position along the segment), then the point
+    // itself. Two DISTINCT crossings can share a key (the key projects onto
+    // the dominant axis, and near-tangent crossings collide on it) — under a
+    // key-only sort their order is whatever the sort felt like, and duplicate
+    // gatherings (the grid path sees an edge once per bucket it spans)
+    // interleave instead of collapsing against the consecutive-equal dedup.
     fn lt(_: void, a: SplitPt, b: SplitPt) bool {
-        return a.key < b.key;
+        if (a.key != b.key) return a.key < b.key;
+        if (a.p.x != b.p.x) return a.p.x < b.p.x;
+        return a.p.y < b.p.y;
     }
 };
 
@@ -1013,6 +1098,9 @@ pub const EdgeGrid = struct {
     buckets: std.AutoHashMap(BKey, std.ArrayList(Seg)),
     covered: Poly,
     gpa: Allocator,
+    // Occupied bucket bounds, so a ray walk knows where the geometry ends.
+    min_gx: i64 = std.math.maxInt(i64),
+    max_gx: i64 = std.math.minInt(i64),
 
     const BKey = struct { gx: i64, gy: i64 };
     pub const Seg = struct { a: Pt, b: Pt };
@@ -1051,6 +1139,8 @@ pub const EdgeGrid = struct {
     fn insert(self: *EdgeGrid, s: Seg) !void {
         const gx0 = self.gridOf(@min(s.a.x, s.b.x));
         const gx1 = self.gridOf(@max(s.a.x, s.b.x));
+        self.min_gx = @min(self.min_gx, gx0);
+        self.max_gx = @max(self.max_gx, gx1);
         const gy0 = self.gridOf(@min(s.a.y, s.b.y));
         const gy1 = self.gridOf(@max(s.a.y, s.b.y));
         var gx = gx0;
@@ -1081,6 +1171,55 @@ pub const EdgeGrid = struct {
             }
         }
         return false;
+    }
+
+    /// Even-odd containment of a float point against the indexed coverage,
+    /// equal by construction to the brute-force scan: the +x ray visits the
+    /// bucket row once per column, applies the SAME per-edge crossing predicate,
+    /// and counts each crossing exactly once — in the one column that contains
+    /// the crossing's x (an edge spanning several buckets is seen in each, and
+    /// skipped in all but that one). Touches only edges near the ray instead of
+    /// every edge of the coverage.
+    pub fn parityF(self: *const EdgeGrid, x: f64, y: f64) bool {
+        if (self.max_gx < self.min_gx) return false; // no edges at all
+        const fx: i64 = @intFromFloat(@floor(x));
+        const gy = self.gridOf(@intFromFloat(@floor(y)));
+        var inside = false;
+        var gx = @max(self.gridOf(fx), self.min_gx);
+        while (gx <= self.max_gx) : (gx += 1) {
+            const list = self.buckets.get(.{ .gx = gx, .gy = gy }) orelse continue;
+            for (list.items) |e| {
+                const yi: f64 = @floatFromInt(e.a.y);
+                const yj: f64 = @floatFromInt(e.b.y);
+                if ((yi > y) == (yj > y)) continue;
+                const xi: f64 = @floatFromInt(e.a.x);
+                const xj: f64 = @floatFromInt(e.b.x);
+                const xint = xi + (y - yi) * (xj - xi) / (yj - yi);
+                if (x >= xint) continue;
+                if (self.gridOf(@intFromFloat(@floor(xint))) != gx) continue;
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    /// Visit every indexed edge whose bucket range meets `box`, possibly more
+    /// than once (an edge lives in each bucket its bbox spans). Callers that
+    /// split at intersections tolerate the duplicates — identical split points
+    /// collapse in their sort — so no dedup set is paid here.
+    pub fn eachNearBox(self: *const EdgeGrid, box: Box, ctx: anytype, comptime f: fn (@TypeOf(ctx), Seg) error{OutOfMemory}!void) !void {
+        const gx0 = self.gridOf(box.min_x);
+        const gx1 = self.gridOf(box.max_x);
+        const gy0 = self.gridOf(box.min_y);
+        const gy1 = self.gridOf(box.max_y);
+        var gx = gx0;
+        while (gx <= gx1) : (gx += 1) {
+            var gy = gy0;
+            while (gy <= gy1) : (gy += 1) {
+                const list = self.buckets.get(.{ .gx = gx, .gy = gy }) orelse continue;
+                for (list.items) |e| try f(ctx, e);
+            }
+        }
     }
 
     /// Classify a tile against the coverage this grid indexes.
@@ -1615,6 +1754,58 @@ test "subtrahendLists: grid equals the all-pairs scan, element for element" {
                 if (bboxOverlap(bbs[j], b)) try want.append(a, @intCast(j));
             }
             try testing.expectEqualSlices(u32, want.items, lists[k]);
+        }
+    }
+}
+
+test "EdgeGrid.parityF and grid line clip match their brute-force twins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(57);
+    const rnd = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        // A random jagged multi-ring coverage in a 4096 box.
+        const nrings = 1 + rnd.uintLessThan(usize, 3);
+        const rings = try a.alloc([]const Pt, nrings);
+        for (rings) |*ring| {
+            const n = 4 + rnd.uintLessThan(usize, 12);
+            const r = try a.alloc(Pt, n);
+            for (r) |*pp| pp.* = .{
+                .x = @as(i64, rnd.uintLessThan(u16, 4097)),
+                .y = @as(i64, rnd.uintLessThan(u16, 4097)),
+            };
+            ring.* = r;
+        }
+        var grid = try EdgeGrid.init(a, rings, 512);
+        defer grid.deinit();
+
+        // Parity at scattered float points (the .0/.5 midpoint lattice the
+        // line clip actually queries).
+        var q: usize = 0;
+        while (q < 50) : (q += 1) {
+            const x = @as(f64, @floatFromInt(rnd.uintLessThan(u16, 8193))) / 2.0 - 64.0;
+            const y = @as(f64, @floatFromInt(rnd.uintLessThan(u16, 8193))) / 2.0 - 64.0;
+            try testing.expectEqual(pointInEvenOddF(rings, x, y), grid.parityF(x, y));
+        }
+
+        // A random polyline clipped with and without the grid: identical runs.
+        const ln = try a.alloc(Pt, 2 + rnd.uintLessThan(usize, 6));
+        for (ln) |*pp| pp.* = .{
+            .x = @as(i64, rnd.uintLessThan(u16, 4097)),
+            .y = @as(i64, rnd.uintLessThan(u16, 4097)),
+        };
+        const plain = try clipLineInsidePolys(a, ln, rings);
+        const via_grid = try clipLineInsidePolysGrid(a, ln, rings, &grid);
+        try testing.expectEqual(plain.len, via_grid.len);
+        for (plain, via_grid) |pr, gr| {
+            try testing.expectEqual(pr.len, gr.len);
+            for (pr, gr) |pp, gp| {
+                try testing.expectEqual(pp.x, gp.x);
+                try testing.expectEqual(pp.y, gp.y);
+            }
         }
     }
 }
