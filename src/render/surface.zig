@@ -182,16 +182,23 @@ pub const Surface = struct {
     }
 
     /// The S-52 effective safety contour against a tile's ladder: the least
-    /// available value >= the mariner's, else the deepest available, else the
-    /// mariner's own (no ladder to snap to). Shared by every render surface.
+    /// available value >= the mariner's, else the mariner's own. Shared by every
+    /// render surface.
+    ///
+    /// The snap only ever goes DEEPER. Falling back to the deepest available rung
+    /// (the old behaviour) could only fire when EVERY rung is shallower than the
+    /// mariner asked for — if any were deeper, `next` would have matched it — so
+    /// it always snapped the split DOWN and shaded water as safer than requested.
+    /// The ladder is scanned per TILE, which made that misfire constantly: a tile
+    /// holding only a drval1=0 depth area (open sound, contours all in the
+    /// neighbouring tiles) snapped safety to 0 and painted every fill DEPMD, one
+    /// tile-shaped box of wrong shade against its neighbours.
     pub fn effectiveSafety(safety: f64, ladder: []const f64) f64 {
         var next: ?f64 = null;
-        var deepest: ?f64 = null;
         for (ladder) |v| {
-            if (deepest == null or v > deepest.?) deepest = v;
             if (v >= safety and (next == null or v < next.?)) next = v;
         }
-        return next orelse (deepest orelse safety);
+        return next orelse safety;
     }
 
     pub fn beginScene(self: Surface, z: u8) anyerror!void {
@@ -239,7 +246,7 @@ pub const Surface = struct {
     }
 };
 
-test "effectiveSafety: next-deeper snap, deepest fallback, empty ladder" {
+test "effectiveSafety: next-deeper snap, never shallower, empty ladder" {
     const t = @import("std").testing;
     const ladder = [_]f64{ 2, 5.4, 9.1, 18.2, 30 };
     // exact hit stays
@@ -247,8 +254,11 @@ test "effectiveSafety: next-deeper snap, deepest fallback, empty ladder" {
     // between rungs -> next DEEPER
     try t.expectEqual(@as(f64, 18.2), Surface.effectiveSafety(10, &ladder));
     try t.expectEqual(@as(f64, 5.4), Surface.effectiveSafety(2.2, &ladder));
-    // deeper than everything -> deepest available
-    try t.expectEqual(@as(f64, 30), Surface.effectiveSafety(50, &ladder));
+    // deeper than everything -> the mariner's own value, NEVER a shallower rung:
+    // snapping down would shade unsafe water in a safe shade
+    try t.expectEqual(@as(f64, 50), Surface.effectiveSafety(50, &ladder));
+    // a lone shallow rung (the tile-shaped-box case) must not drag the split to 0
+    try t.expectEqual(@as(f64, 10), Surface.effectiveSafety(10, &.{0}));
     // no ladder -> the mariner's own value
     try t.expectEqual(@as(f64, 7), Surface.effectiveSafety(7, &.{}));
 }
