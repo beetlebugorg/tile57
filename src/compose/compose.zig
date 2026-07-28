@@ -203,16 +203,9 @@ var g_explain_count: usize = 0;
 // The tile-index cover (nw..se) of an owner face's lon/lat bbox at zoom `scale = 1<<z`. The
 // on-demand composeTile culls candidate tiles through this exact box.
 const TileBBox = struct { tx0: u32, tx1: u32, ty0: u32, ty1: u32 };
-fn faceTileBBox(face: geometry.plane.OwnedCell, scale: f64) TileBBox {
-    var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
-    for (face.owned) |ring| for (ring) |p| {
-        const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
-        const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
-        fb[0] = @min(fb[0], lon);
-        fb[1] = @min(fb[1], lat);
-        fb[2] = @max(fb[2], lon);
-        fb[3] = @max(fb[3], lat);
-    };
+/// `fb` is the face's lon/lat bbox, precomputed once per map (BandMap.bbox) — walking
+/// the rings here instead cost 3% of all native time, re-derived per tile per face.
+fn faceTileBBox(fb: [4]f64, scale: f64) TileBBox {
     const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // NW: min lon, max lat
     const w_br = tile.lonLatToWorld(fb[2], fb[1]); // SE: max lon, min lat
     // EXPANDED one tile each side: lonLatToWorld runs through the SYSTEM libm
@@ -391,11 +384,11 @@ fn composeTileContent(a: std.mem.Allocator, part: *const geometry.partition.Part
     var verbatim: ?usize = null; // cell index of the unique tile+buffer-owning cell
     const no_fill = std.c.getenv("TILE57_NO_FILL") != null; // measurement valve
     const cb0 = tileClassifyBox(z, tx, ty);
-    for (map.faces) |face| {
+    for (map.faces, 0..) |face, fslot| {
         if (face.owned.len == 0) continue;
         const ci = face.index;
         const cscl = part.cells[ci].cscl;
-        const bb = faceTileBBox(face, scale);
+        const bb = faceTileBBox(map.bbox[fslot], scale);
         if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
 
         // Rect-clip the face to the tile FIRST: everything downstream —
@@ -483,9 +476,9 @@ fn composeTileContent(a: std.mem.Allocator, part: *const geometry.partition.Part
             var any = false;
             var cm = mi + 1;
             outer: while (cm < part.maps.len) : (cm += 1) {
-                for (part.maps[cm].faces) |face| {
+                for (part.maps[cm].faces, 0..) |face, fslot| {
                     if (face.owned.len == 0) continue;
-                    const bb = faceTileBBox(face, scale);
+                    const bb = faceTileBBox(part.maps[cm].bbox[fslot], scale);
                     if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
                     if (!(try ownerHasTileDeep(readers[face.index], part.cells[face.index].cscl, z, tx, ty, true))) continue;
                     any = true;
@@ -538,10 +531,10 @@ fn composeTileContent(a: std.mem.Allocator, part: *const geometry.partition.Part
             // residual in a single concatenated diff.
             const wa = arenas[cur_a].allocator();
             var band_rings = std.ArrayList([]const geometry.plane.Pt).empty;
-            for (part.maps[ci_map].faces) |face| {
+            for (part.maps[ci_map].faces, 0..) |face, fslot| {
                 if (face.owned.len == 0) continue;
                 const ci = face.index;
-                const bb = faceTileBBox(face, scale);
+                const bb = faceTileBBox(part.maps[ci_map].bbox[fslot], scale);
                 if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
                 if (!(try ownerHasTileDeep(readers[ci], part.cells[ci].cscl, z, tx, ty, true))) continue;
                 const clipped = geometry.plane.rectClipRings(wa, face.owned, cb) catch continue;
@@ -733,10 +726,10 @@ pub const ComposeSource = struct {
         const map = self.part.mapForZoom(z) orelse return;
         const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
         var spoke = false;
-        for (map.faces) |face| {
+        for (map.faces, 0..) |face, fslot| {
             if (face.owned.len == 0) continue;
             const ci = face.index;
-            const bb = faceTileBBox(face, scale);
+            const bb = faceTileBBox(map.bbox[fslot], scale);
             if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
             var grid = geometry.plane.EdgeGrid.init(self.gpa, face.owned, tileWidthE7(z)) catch continue;
             defer grid.deinit();

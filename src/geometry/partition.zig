@@ -35,7 +35,28 @@ pub const BandMap = struct {
     /// `n_cells`-long: global cell index → its slot in `faces`, or -1 if the cell
     /// owns nothing at this band. Lets the compositor fetch a cell's face in O(1).
     pos: []i32,
+    /// Parallel to `faces`: each face's lon/lat bbox `{min_lon, min_lat, max_lon,
+    /// max_lat}`, computed ONCE here. The compositor culls candidate faces by this
+    /// box on every tile of every build, and deriving it walks every point of every
+    /// ring — at 35 tiles per build against every face of every coarser map that
+    /// re-walk was 3% of all native time on device. The rings never change, so it
+    /// is a property of the map, not of the tile being served.
+    bbox: [][4]f64,
 };
+
+/// `{min_lon, min_lat, max_lon, max_lat}` over every point of every ring.
+fn faceLonLatBBox(face: plane.OwnedCell) [4]f64 {
+    var b = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
+    for (face.owned) |ring| for (ring) |p| {
+        const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
+        const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
+        b[0] = @min(b[0], lon);
+        b[1] = @min(b[1], lat);
+        b[2] = @max(b[2], lon);
+        b[3] = @max(b[3], lat);
+    };
+    return b;
+}
 
 pub const Partition = struct {
     gpa: std.mem.Allocator,
@@ -50,6 +71,7 @@ pub const Partition = struct {
         for (self.maps) |m| {
             plane.freeOwned(self.gpa, m.faces);
             self.gpa.free(m.pos);
+            self.gpa.free(m.bbox);
         }
         self.gpa.free(self.maps);
         self.gpa.free(self.tiers);
@@ -128,6 +150,7 @@ fn buildWith(gpa: std.mem.Allocator, cells: []const plane.Cell, adopt: ?*plane.A
         for (maps[0..built]) |m| {
             plane.freeOwned(gpa, m.faces);
             gpa.free(m.pos);
+            gpa.free(m.bbox);
         }
         for (tier_faces[built..]) |faces| plane.freeOwned(gpa, faces);
     }
@@ -135,7 +158,9 @@ fn buildWith(gpa: std.mem.Allocator, cells: []const plane.Cell, adopt: ?*plane.A
         const pos = try gpa.alloc(i32, cells.len);
         @memset(pos, -1);
         for (tier_faces[i], 0..) |f, slot| pos[f.index] = @intCast(slot);
-        maps[i] = .{ .tier = t, .faces = tier_faces[i], .pos = pos };
+        const bbox = try gpa.alloc([4]f64, tier_faces[i].len);
+        for (tier_faces[i], 0..) |f, slot| bbox[slot] = faceLonLatBBox(f);
+        maps[i] = .{ .tier = t, .faces = tier_faces[i], .pos = pos, .bbox = bbox };
         built = i + 1;
     }
 
