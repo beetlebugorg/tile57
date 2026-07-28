@@ -1484,6 +1484,30 @@ pub fn assemble(arena: Allocator, scratch: Allocator, scenes: []const Scene) !Sc
     var quads = std.ArrayList(Quad).empty;
     var ranges = std.ArrayList(Range).empty;
     var patterns = std.ArrayList(PatternCell).empty;
+    // Reserve the EXACT totals up front. `scratch` is an arena, where growing by
+    // doubling STRANDS every intermediate buffer — a 400k-vertex view re-copied
+    // and abandoned its whole vertex stream a dozen times over, which made this
+    // concat the largest single memcpy site in the device profile. Every size is
+    // known before the first append, so nothing here needs to grow at all.
+    {
+        var nv: usize = 0;
+        var ni: usize = 0;
+        var nq: usize = 0;
+        var nr: usize = 0;
+        var np: usize = 0;
+        for (scenes) |s| {
+            nv += s.vertices.len;
+            ni += s.indices.len;
+            nq += s.quads.len;
+            nr += s.ranges.len;
+            np += s.patterns.len;
+        }
+        try verts.ensureTotalCapacityPrecise(scratch, nv);
+        try indices.ensureTotalCapacityPrecise(scratch, ni);
+        try quads.ensureTotalCapacityPrecise(scratch, nq);
+        try ranges.ensureTotalCapacityPrecise(scratch, nr);
+        try patterns.ensureTotalCapacityPrecise(scratch, np);
+    }
     for (scenes) |s| {
         const vbase: u32 = @intCast(verts.items.len);
         const ibase: u32 = @intCast(indices.items.len);
