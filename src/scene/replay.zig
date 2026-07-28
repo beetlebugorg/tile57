@@ -69,7 +69,7 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
         .class = propStr(props, "class"),
         .s57_json = propStr(props, "s57"), // cursor-pick attribute blob (baked)
         .cell_name = propStr(props, "cell"), // source cell badge (baked)
-        .band = @intCast(std.math.clamp(propInt(props, "band", 0), 0, 255)),
+        .band = @intCast(std.math.clamp(propInt(props, "band", rs.BAND_UNKNOWN), 0, 255)),
         .bnd = propInt(props, "bnd", 2),
         .pts = propInt(props, "pts", 2),
         .masked = propInt(props, "masked", 0) != 0,

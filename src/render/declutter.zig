@@ -6,13 +6,19 @@
 //!
 //! The S-52 model this encodes:
 //!
-//!   * ONLY TEXT COMPETES. A sounding is a SYMBOL — the Presentation Library
-//!     draws soundings as symbol glyphs precisely so they stay legible and
-//!     correctly located — and every symbol must be drawn: S-52 defines
-//!     suppression only for coincident LINES and area boundaries, never for
-//!     symbols. So a symbol (sounding included) neither drops a label nor is
-//!     dropped by one; text is drawn last, on top of it. Nothing but text ever
-//!     enters this pool.
+//!   * ONLY TEXT COMPETES — at chart scale. A sounding is a SYMBOL — the
+//!     Presentation Library draws soundings as symbol glyphs precisely so they
+//!     stay legible and correctly located — and every symbol must be drawn:
+//!     S-52 defines suppression only for coincident LINES and area boundaries,
+//!     never for symbols. So a symbol (sounding included) neither drops a
+//!     label nor is dropped by one; text is drawn last, on top of it. That
+//!     rule is scoped to content displayed WITHIN its usage band's window,
+//!     which is the only display S-52 governs. Below the window — a
+//!     harbour-band symbol overscaled to an overview zoom, ground S-52 would
+//!     never put it on — unmanaged overplot buries the chart, so FILL-DOWN
+//!     symbols enter a pool of their own (addSymbol): they compete only with
+//!     each other, never with or against text, display base never enters at
+//!     all, and an uncontested symbol always draws.
 //!
 //!   * RANK. Text carries a text group, and the groups split into IMPORTANT
 //!     text (10-19) and Other text (everything else) — the one text ranking
@@ -136,6 +142,21 @@ pub const Pool = struct {
             .seq = self.cands.items.len,
             .box = box,
             .key = h.final(),
+        });
+    }
+
+    /// A fill-down symbol (see the header): competes only inside a symbol
+    /// pool, ranked by S-52 display priority — higher claims space first —
+    /// then emission order. `key` stays 0 and the caller resolves with
+    /// repeat 0, so only true overlap ever suppresses; an isolated symbol is
+    /// uncontested by construction and always survives.
+    pub fn addSymbol(self: *Pool, a: Allocator, id: usize, display_priority: i64, box: Box) !void {
+        try self.cands.append(a, .{
+            .id = id,
+            .tier = @intCast(9 - std.math.clamp(display_priority, 0, 9)),
+            .seq = self.cands.items.len,
+            .box = box,
+            .key = 0,
         });
     }
 

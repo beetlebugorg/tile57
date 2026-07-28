@@ -32,6 +32,7 @@ const cv = @import("canvas.zig");
 const paint = @import("paint.zig");
 const fontmod = @import("font.zig");
 const dc = @import("declutter.zig");
+const tband = @import("tiles").band;
 const tile = @import("tiles").tile;
 
 /// What a range draws — the host picks a pipeline from this, nothing more. It is
@@ -231,6 +232,10 @@ pub const LabelCandidate = struct {
     /// (assembleLabels), so a memoized contour re-gates itself as the mariner
     /// zooms. 0 for an ordinary label (which always places).
     gate_world_len: f32 = 0,
+    /// A fill-down symbol sprite (dc.Pool.addSymbol): pooled against symbols
+    /// only, ranked by `sym_priority` (the feature's S-52 display priority).
+    is_symbol: bool = false,
+    sym_priority: u8 = 0,
 };
 
 /// A contour value shorter than this on screen (px) is illegible, so it is
@@ -857,9 +862,72 @@ pub const GpuSurface = struct {
         }
         const quads = try self.a.alloc(SpriteQuad, 1);
         quads[0] = q;
+        // A non-base point symbol displayed BELOW its usage band's window is a
+        // fill-down sprite on ground S-52 would never draw it on: it becomes a
+        // collision CANDIDATE (dc.Pool.addSymbol) instead of unconditional
+        // geometry, so dense overscaled clutter resolves to its top-priority
+        // representatives while an uncontested symbol still always draws. At
+        // native zooms — the display the spec governs — every symbol is pushed
+        // unconditionally, exactly as before.
+        if (kind == .symbol and self.cur.display_category != 0 and belowBandWindow(self.cur.band, self.zoom)) {
+            const op = Op{
+                .paint_key = paint.key(kind, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+                .seq = 0,
+                .kind = kind,
+                .color = .{ 255, 255, 255, 255 },
+                .scamin = if (self.cur.scamin) |sc| @floatFromInt(sc) else 0,
+                .disp_cat = @intCast(std.math.clamp(self.cur.display_category, 0, 2)),
+                .map_align = if (rot_north) 1 else 0,
+                .tox = self.tile_ox,
+                .toy = self.tile_oy,
+                .tscale = self.tile_scale,
+                .geom = .{ .sprite = .{ .anchor = at, .quads = quads, .atlas = .sprite } },
+            };
+            var cq = std.ArrayList(Quad).empty;
+            try self.emitSpriteGeom(self.a, &cq, op, at, quads, 0);
+            var bx0: f32 = std.math.floatMax(f32);
+            var by0: f32 = std.math.floatMax(f32);
+            var bx1: f32 = -std.math.floatMax(f32);
+            var by1: f32 = -std.math.floatMax(f32);
+            for (q.corners) |corner| {
+                bx0 = @min(bx0, corner[0]);
+                by0 = @min(by0, corner[1]);
+                bx1 = @max(bx1, corner[0]);
+                by1 = @max(by1, corner[1]);
+            }
+            const aw = opWorld(op, at);
+            try self.candidates.append(self.a, .{
+                .quads = try cq.toOwnedSlice(self.a),
+                .ax = aw[0],
+                .ay = aw[1],
+                .bx0 = bx0,
+                .by0 = by0,
+                .bx1 = bx1,
+                .by1 = by1,
+                .scamin = op.scamin,
+                .disp_cat = op.disp_cat,
+                .color = op.color,
+                .group = 0,
+                .paint_key = op.paint_key,
+                .cls = self.cur.class,
+                .text = "",
+                .atlas = .sprite,
+                .is_symbol = true,
+                .sym_priority = @intCast(std.math.clamp(self.cur.display_priority, 0, 9)),
+            });
+            return;
+        }
         // Sprites carry their own colour, so the range colour is a placeholder.
         try self.push(kind, .{ 255, 255, 255, 255 }, .{ .sprite = .{ .anchor = at, .quads = quads, .atlas = .sprite } });
         if (rot_north) self.ops.items[self.ops.items.len - 1].map_align = 1;
+    }
+
+    /// Whether zoom sits below `band`'s native window — the fill-down regime.
+    /// A band value past .overview (a foreign producer) never pools.
+    fn belowBandWindow(b: u8, zoom: f64) bool {
+        if (b > @intFromEnum(tband.Band.overview)) return false;
+        const floor: f64 = @floatFromInt(tband.bandZooms(@enumFromInt(b)).min);
+        return zoom < floor;
     }
 
     /// A label: shaped into outline rings now, admitted only if it wins its space.
@@ -1490,10 +1558,16 @@ pub fn assemble(arena: Allocator, scratch: Allocator, scenes: []const Scene) !Sc
 pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const LabelCandidate, view_zoom: f64, ignore_scamin: bool) !Scene {
     var pool = dc.Pool{};
     defer pool.deinit(scratch);
+    // Fill-down symbols pool separately: symbols compete only with symbols
+    // (see declutter's header), and only true overlap suppresses (repeat 0).
+    var spool = dc.Pool{};
+    defer spool.deinit(scratch);
     const s: f64 = 256.0 * std.math.exp2(view_zoom);
 
     var ids = std.ArrayList(usize).empty;
     defer ids.deinit(scratch);
+    var sids = std.ArrayList(usize).empty;
+    defer sids.deinit(scratch);
     for (cands, 0..) |c, i| {
         // SCAMIN at the view zoom — base category (0) is never hidden (S-52).
         if (!ignore_scamin and c.disp_cat != 0 and c.scamin > 0 and
@@ -1503,21 +1577,49 @@ pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const Label
         if (c.gate_world_len > 0 and @as(f64, c.gate_world_len) * s < LEGIBLE_PX) continue;
         const ax = @as(f64, c.ax) * s;
         const ay = @as(f64, c.ay) * s;
-        try pool.add(scratch, ids.items.len, c.group, c.cls, c.text, .{
+        const box = dc.Box{
             .x0 = ax + c.bx0,
             .y0 = ay + c.by0,
             .x1 = ax + c.bx1,
             .y1 = ay + c.by1,
-        });
-        try ids.append(scratch, i);
+        };
+        if (c.is_symbol) {
+            try spool.addSymbol(scratch, sids.items.len, c.sym_priority, box);
+            try sids.append(scratch, i);
+        } else {
+            try pool.add(scratch, ids.items.len, c.group, c.cls, c.text, box);
+            try ids.append(scratch, i);
+        }
     }
     var kept = try pool.resolve(scratch, dc.REPEAT_PX);
     defer kept.deinit(scratch);
+    var skept = try spool.resolve(scratch, 0);
+    defer skept.deinit(scratch);
 
     var verts = std.ArrayList(Vertex).empty;
     var indices = std.ArrayList(u32).empty;
     var quads = std.ArrayList(Quad).empty;
     var ranges = std.ArrayList(Range).empty;
+    for (sids.items, 0..) |ci, pool_id| {
+        if (!skept.has(pool_id)) continue;
+        const c = cands[ci];
+        if (c.quads.len == 0) continue;
+        const first = quads.items.len;
+        try quads.appendSlice(arena, c.quads);
+        // Kept symbols coalesce into one range per (paint, atlas) run — they
+        // are contiguous in the quad buffer, so hundreds of one-quad sprites
+        // never become hundreds of draw calls.
+        if (ranges.items.len > 0) {
+            const last = &ranges.items[ranges.items.len - 1];
+            if (last.kind == .symbol and last.paint_key == c.paint_key and last.atlas == c.atlas and
+                std.mem.eql(u8, &last.color, &c.color) and last.first + last.count == first)
+            {
+                last.count += @intCast(c.quads.len);
+                continue;
+            }
+        }
+        try ranges.append(arena, .{ .first = @intCast(first), .count = @intCast(c.quads.len), .paint_key = c.paint_key, .pattern = NO_PATTERN, .color = c.color, .kind = .symbol, .prim = .quads, .atlas = c.atlas });
+    }
     for (ids.items, 0..) |ci, pool_id| {
         if (!kept.has(pool_id)) continue;
         const c = cands[ci];
@@ -1544,6 +1646,45 @@ pub fn assembleLabels(arena: Allocator, scratch: Allocator, cands: []const Label
 }
 
 const testing = std.testing;
+
+test "assembleLabels: fill-down symbols pool by priority; isolated and text untouched" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two symbols on the SAME anchor (boxes collide): priority 8 must win over
+    // priority 2. A third symbol far away is uncontested and must survive with
+    // them. A text label overlapping the symbols is a different pool entirely
+    // and must also survive.
+    const mk = struct {
+        const q = [_]Quad{std.mem.zeroes(Quad)};
+        fn sym(ax: f32, prio: u8) LabelCandidate {
+            return .{ .quads = &q, .ax = ax, .ay = 0.5, .bx0 = -8, .by0 = -8, .bx1 = 8, .by1 = 8, .scamin = 0, .disp_cat = 1, .color = .{ 255, 255, 255, 255 }, .group = 0, .paint_key = 1, .cls = "X", .text = "", .is_symbol = true, .sym_priority = prio };
+        }
+    };
+    const cands = [_]LabelCandidate{
+        mk.sym(0.5, 2),
+        mk.sym(0.5, 8),
+        mk.sym(0.9, 2),
+        .{ .quads = &mk.q, .ax = 0.5, .ay = 0.5, .bx0 = -8, .by0 = -8, .bx1 = 8, .by1 = 8, .scamin = 0, .disp_cat = 1, .color = .{ 255, 255, 255, 255 }, .group = 10, .paint_key = 2, .cls = "T", .text = "name" },
+    };
+    const scene = try assembleLabels(a, a, &cands, 4.0, false);
+    // priority-8 symbol + isolated symbol + the text label = 3 quads; the
+    // priority-2 twin lost its space.
+    try testing.expectEqual(@as(usize, 3), scene.quads.len);
+    var sym_ranges: usize = 0;
+    var text_ranges: usize = 0;
+    for (scene.ranges) |r| switch (r.kind) {
+        .symbol => sym_ranges += 1,
+        .text => text_ranges += 1,
+        else => {},
+    };
+    // The two kept symbols share paint and atlas, so they coalesce into ONE
+    // draw range (pooled sprites must not multiply draw calls).
+    try testing.expectEqual(@as(usize, 1), sym_ranges);
+    try testing.expectEqual(@as(usize, 1), text_ranges);
+}
+
 
 fn testSurface(a: Allocator, colors: *const resolve.Colors, settings: *const resolve.Settings) !GpuSurface {
     var s = try GpuSurface.init(a, colors, .day, settings, 12.0);

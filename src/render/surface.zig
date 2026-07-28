@@ -78,6 +78,8 @@ pub const TextStyle = struct {
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
 /// beginFeature / endFeature. All pick data is pre-computed by the engine so
 /// surfaces need not import s57/s101.
+pub const BAND_UNKNOWN: u8 = 255;
+
 pub const FeatureMeta = struct {
     display_priority: i64 = 0,
     /// S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar. Outranks
@@ -97,7 +99,9 @@ pub const FeatureMeta = struct {
     class: []const u8 = "", // S-57 object-class acronym (e.g. "LIGHTS")
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""
     cell_name: []const u8 = "", // source ENC cell name or ""
-    band: u8 = 0, // NOAA navigational band (0 = finest)
+    /// Usage band (tiles.band.Band ordinal) of the SOURCE cell, or BAND_UNKNOWN
+    /// when the feature carries none — unknown never counts as fill-down.
+    band: u8 = BAND_UNKNOWN,
     date_start: []const u8 = "",
     date_end: []const u8 = "",
     // S-52 boundary (§8.6.1) and point-symbol (§11.2.2) variant tags:
