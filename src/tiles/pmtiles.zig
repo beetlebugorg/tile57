@@ -278,6 +278,53 @@ pub fn deserializeDir(a: Allocator, buf: []const u8) ![]Entry {
 
 // ---- reader -------------------------------------------------------------
 
+/// A kernel-blocking lock, one implementation per platform family. Zig 0.16 moved
+/// std.Thread.Mutex behind an Io this layer does not take, and on Darwin it spins
+/// anyway. Every variant is correct ZERO-INITIALIZED, so a Reader needs no init
+/// call and `= .{}` on the field is the whole setup:
+///   - Darwin: os_unfair_lock (OS_UNFAIR_LOCK_INIT is 0). Apple-only symbol, so it
+///     must not reach another link.
+///   - Windows: SRWLOCK (SRWLOCK_INIT is 0), the OS's own kernel-blocking lock —
+///     there is no pthread to link against on an MSVC/mingw target.
+///   - Linux/Android: a zeroed pthread_mutex_t is PTHREAD_MUTEX_INITIALIZER.
+const Lock = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos => struct {
+        const Handle = extern struct { v: u32 = 0 };
+        extern "c" fn os_unfair_lock_lock(l: *Handle) void;
+        extern "c" fn os_unfair_lock_unlock(l: *Handle) void;
+        h: Handle = .{},
+        fn lock(self: *@This()) void {
+            os_unfair_lock_lock(&self.h);
+        }
+        fn unlock(self: *@This()) void {
+            os_unfair_lock_unlock(&self.h);
+        }
+    },
+    .windows => struct {
+        const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
+        extern "kernel32" fn AcquireSRWLockExclusive(l: *SRWLOCK) callconv(.winapi) void;
+        extern "kernel32" fn ReleaseSRWLockExclusive(l: *SRWLOCK) callconv(.winapi) void;
+        l: SRWLOCK = .{},
+        fn lock(self: *@This()) void {
+            AcquireSRWLockExclusive(&self.l);
+        }
+        fn unlock(self: *@This()) void {
+            ReleaseSRWLockExclusive(&self.l);
+        }
+    },
+    else => struct {
+        extern "c" fn pthread_mutex_lock(m: *std.c.pthread_mutex_t) c_int;
+        extern "c" fn pthread_mutex_unlock(m: *std.c.pthread_mutex_t) c_int;
+        m: std.c.pthread_mutex_t = std.mem.zeroes(std.c.pthread_mutex_t),
+        fn lock(self: *@This()) void {
+            _ = pthread_mutex_lock(&self.m);
+        }
+        fn unlock(self: *@This()) void {
+            _ = pthread_mutex_unlock(&self.m);
+        }
+    },
+};
+
 pub const Reader = struct {
     bytes: []const u8,
     header: Header,
@@ -293,6 +340,13 @@ pub const Reader = struct {
     // grew it without bound on directory-heavy archives, so each leaf is decoded once
     // and reused. Arena-backed (freed wholesale by deinit).
     leaves: std.AutoHashMapUnmanaged(u64, []Entry) = .empty,
+    /// Guards the LAZY directory state above (`root`/`root_done`, `leaves`, and the
+    /// arena they come from). A composed view builds its tiles on several threads and
+    /// one cell commonly owns ground in several of them, so two threads reach the same
+    /// reader; without this the first probe of a cold archive races on the hashmap and
+    /// the arena. Held only across directory decode — the bytes it yields point into
+    /// the read-only mmap, and the tile's gunzip runs unlocked.
+    dir_mu: Lock = .{},
 
     pub fn init(gpa: Allocator, bytes: []const u8) !Reader {
         const header = try Header.parse(bytes);
@@ -333,6 +387,8 @@ pub const Reader = struct {
     /// Return the raw (still tile-compressed) bytes for a tile, or null if absent.
     pub fn getCompressed(r: *Reader, z: u8, x: u32, y: u32) !?[]const u8 {
         const tid = zxyToTileId(z, x, y);
+        r.dir_mu.lock();
+        defer r.dir_mu.unlock();
         var dir = try r.ensureRoot();
         var depth: u8 = 0;
         while (depth < 4) : (depth += 1) {
