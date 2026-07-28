@@ -254,11 +254,11 @@ pub fn clipLine(a: Allocator, line: []const mvt.Point, b: Box) ![][]mvt.Point {
 
 /// Clip a projected line to a tile box and simplify each surviving run (dropping
 /// runs shorter than 2 points). The common "clip a line for this tile" composite.
-pub fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: Box) ![]const []const mvt.Point {
+pub fn clipSimplifyLine(a: Allocator, proj: []const mvt.Point, box: Box, detail: Detail) ![]const []const mvt.Point {
     const sub = try clipLine(a, proj, box);
     var out = std.ArrayList([]const mvt.Point).empty;
     for (sub) |run| {
-        const s = try simplifyRing(a, run);
+        const s = try simplifyRing(a, run, detail);
         if (s.len >= 2) try out.append(a, s);
     }
     return out.items;
@@ -480,9 +480,68 @@ test "clipLinePhased keeps arc phase across the box boundary" {
 // Mirror the Go baker: Douglas-Peucker (½-px tolerance) then drop exact consecutive
 // duplicates + collinear midpoints. Points are already on the integer MVT grid here
 // (worldToTile rounds), so the math is exact integer (no separate quantize step).
+//
+// How hard a given tile is generalized is the caller's `Detail`: a chart's own
+// band window keeps that Go-parity resolution, the fill-down zooms below it get
+// a coarser one (see Detail.fill_down).
 
-// (4.0)^2 in MVT extent units — Go's simplifyTolerance=4.0 (~½ px at extent 4096).
-const SIMPLIFY_EPS2: i128 = 16;
+/// One display pixel in extent units, against the 512 CSS-px tile S-52 display
+/// sizes are defined for: EXTENT/512 = 8. PX2 is its square, the unit for ring
+/// areas. This is the tighter of the two tile sizes in play — the native pixel
+/// surfaces draw 256 px/tile, where the same threshold is worth a quarter the
+/// display area — so a limit stated in these units errs toward keeping geometry.
+pub const PX: i32 = @divExact(EXTENT, 512);
+pub const PX2: i64 = @as(i64, PX) * PX;
+
+/// How hard a tile's geometry is generalized. Both knobs are in tile extent
+/// units, so the math stays exact integer and a bake is reproducible.
+pub const Detail = struct {
+    /// Douglas-Peucker tolerance SQUARED (perpendicular distance^2).
+    eps2: i128,
+    /// Smallest |shoelace| (twice the signed area) a polygon ring may have and
+    /// still be emitted. 0 keeps every ring, however small.
+    min_area2: i64,
+
+    /// A tile inside its chart's own band window: Go's simplifyTolerance = 4.0
+    /// (~½ display px at extent 4096), every ring kept whatever its size. What
+    /// the baker has always emitted, and what it keeps emitting there.
+    pub const native: Detail = .{ .eps2 = 16, .min_area2 = 0 };
+
+    /// A tile baked BELOW its chart's band window — the fill-down zooms, where a
+    /// chart is displayed at a scale it was never compiled for and carries detail
+    /// two orders of magnitude past what the display resolves. One display px of
+    /// DP (4x the squared tolerance) and a 2 display px^2 floor on polygon rings:
+    /// under that a ring is a triangle pair covering a pixel and a half, costing
+    /// a decode, a tessellation and a GPU upload to draw nothing. On a Great
+    /// Lakes z4 tile the floor takes 90% of the depth-area rings.
+    pub const fill_down: Detail = .{ .eps2 = 4 * 16, .min_area2 = 2 * 2 * PX2 };
+};
+
+/// Twice the signed area of a ring (shoelace). Sign follows winding; y is down,
+/// so positive is clockwise (exterior) per the MVT spec. Exact in i64 — a ring
+/// out of the clip box spans at most EXTENT + 2*BUFFER per axis.
+pub fn ringArea2(ring: []const mvt.Point) i64 {
+    if (ring.len < 3) return 0;
+    var acc: i64 = 0;
+    var j = ring.len - 1;
+    for (ring, 0..) |p, i| {
+        const q = ring[j];
+        acc += @as(i64, q.x) * p.y - @as(i64, p.x) * q.y;
+        j = i;
+    }
+    return acc;
+}
+
+/// Whether a ring is big enough to emit under `detail` — the sub-pixel cull.
+/// A ring is judged only against its OWN size, which is what makes the cull safe
+/// for holes: a hole is strictly smaller than the ring containing it (before the
+/// clip and after, since both are cut by the same box), so an outer ring that
+/// survives may lose holes, and one that is dropped takes every hole with it.
+/// There is no ring order in which an orphan hole can be left behind.
+pub fn ringVisible(ring: []const mvt.Point, detail: Detail) bool {
+    if (detail.min_area2 == 0) return true;
+    return @abs(ringArea2(ring)) >= detail.min_area2;
+}
 
 /// Drop exact consecutive duplicates and collinear midpoints (lossless at integer
 /// resolution) — Go's quantizePts. Use directly as the no-DP fallback (quantizeRingExact).
@@ -505,9 +564,9 @@ pub fn dedupCollinear(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
     return out.items;
 }
 
-/// Douglas-Peucker on integer tile coords (perp dist^2 vs SIMPLIFY_EPS2), keeping
-/// the first/last vertex. Iterative (explicit stack). Returns kept points.
-fn douglasPeucker(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
+/// Douglas-Peucker on integer tile coords (perp dist^2 vs `eps2`), keeping the
+/// first/last vertex. Iterative (explicit stack). Returns kept points.
+fn douglasPeucker(a: Allocator, pts: []const mvt.Point, eps2: i128) ![]mvt.Point {
     const n = pts.len;
     if (n < 3) return a.dupe(mvt.Point, pts);
     const keep = try a.alloc(bool, n);
@@ -545,7 +604,7 @@ fn douglasPeucker(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
                 besti = i;
             }
         }
-        const exceeds = if (den == 0) best > SIMPLIFY_EPS2 else best > SIMPLIFY_EPS2 * den;
+        const exceeds = if (den == 0) best > eps2 else best > eps2 * den;
         if (exceeds) {
             keep[besti] = true;
             try stack.append(a, .{ s, besti });
@@ -557,11 +616,16 @@ fn douglasPeucker(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
     return out.items;
 }
 
-/// Simplify a clipped ring/line (Go quantizeRing): Douglas-Peucker then collinear/
-/// duplicate removal. Caller falls back to dedupCollinear (quantizeRingExact) when
-/// this collapses a ring below its minimum vertex count.
-pub fn simplifyRing(a: Allocator, pts: []const mvt.Point) ![]mvt.Point {
-    return dedupCollinear(a, try douglasPeucker(a, pts));
+/// Simplify a clipped ring/line (Go quantizeRing): Douglas-Peucker at `detail`'s
+/// tolerance then collinear/duplicate removal. Caller falls back to dedupCollinear
+/// (quantizeRingExact) when this collapses a ring below its minimum vertex count.
+///
+/// Simplification runs AFTER the clip, so a run lying on a tile edge stays on it:
+/// adjacent charts digitize a shared seam to the same integers and this algorithm
+/// is deterministic, so both sides of a boundary simplify identically and the seam
+/// stays crack-free at any tolerance.
+pub fn simplifyRing(a: Allocator, pts: []const mvt.Point, detail: Detail) ![]mvt.Point {
+    return dedupCollinear(a, try douglasPeucker(a, pts, detail.eps2));
 }
 
 // ---- tests --------------------------------------------------------------
@@ -623,6 +687,117 @@ test "line clip splits a line that exits and re-enters" {
     for (parts) |part| for (part) |p| {
         try std.testing.expect(p.x >= b.min and p.x <= b.max);
     };
+}
+
+test "Detail.native is the Go-parity resolution: ½ px DP, no ring cull" {
+    const t = std.testing;
+    // The native tolerance is the one every tile inside a chart's band window has
+    // always been simplified at — pin it, since a drift here re-baselines every
+    // native-band tile in every archive.
+    try t.expectEqual(@as(i128, 16), Detail.native.eps2);
+    try t.expectEqual(@as(i64, 0), Detail.native.min_area2);
+    // 1 display px = 8 extent units at the 512 CSS-px tile; fill_down's DP is one
+    // full px (8^2 = 64) and its ring floor 2 px^2 (|shoelace| = 2 * 2 * 64).
+    try t.expectEqual(@as(i32, 8), PX);
+    try t.expectEqual(@as(i128, 64), Detail.fill_down.eps2);
+    try t.expectEqual(@as(i64, 256), Detail.fill_down.min_area2);
+}
+
+test "ring cull: sub-pixel rings drop at fill_down, survive at native" {
+    const t = std.testing;
+    // 2 x 2 extent units = ¼ x ¼ display px: |shoelace| 8, far under the floor.
+    const speck = [_]mvt.Point{
+        .{ .x = 100, .y = 100 }, .{ .x = 102, .y = 100 },
+        .{ .x = 102, .y = 102 }, .{ .x = 100, .y = 102 },
+    };
+    try t.expectEqual(@as(u64, 8), @abs(ringArea2(&speck)));
+    try t.expect(!ringVisible(&speck, Detail.fill_down));
+    try t.expect(ringVisible(&speck, Detail.native)); // native culls nothing
+
+    // Exactly the 2 px^2 floor (16 x 16 extent units = 2 x 2 display px,
+    // |shoelace| 512) is kept — the test is >=, so the threshold itself survives.
+    const at_floor = [_]mvt.Point{
+        .{ .x = 0, .y = 0 },  .{ .x = 16, .y = 0 },
+        .{ .x = 16, .y = 16 }, .{ .x = 0, .y = 16 },
+    };
+    try t.expectEqual(@as(u64, 512), @abs(ringArea2(&at_floor)));
+    try t.expect(ringVisible(&at_floor, Detail.fill_down));
+
+    // A ring just under it (11 x 11 units, |shoelace| 242 < 256) goes.
+    const under = [_]mvt.Point{
+        .{ .x = 0, .y = 0 },  .{ .x = 11, .y = 0 },
+        .{ .x = 11, .y = 11 }, .{ .x = 0, .y = 11 },
+    };
+    try t.expect(!ringVisible(&under, Detail.fill_down));
+
+    // Winding must not matter: the same ring counter-clockwise reads the same.
+    const ccw = [_]mvt.Point{
+        .{ .x = 0, .y = 16 },  .{ .x = 16, .y = 16 },
+        .{ .x = 16, .y = 0 },  .{ .x = 0, .y = 0 },
+    };
+    try t.expectEqual(-ringArea2(&at_floor), ringArea2(&ccw));
+    try t.expect(ringVisible(&ccw, Detail.fill_down));
+
+    // Degenerate rings (fewer than 3 points, zero area) are never "visible".
+    const line = [_]mvt.Point{ .{ .x = 0, .y = 0 }, .{ .x = 4000, .y = 0 } };
+    try t.expectEqual(@as(i64, 0), ringArea2(&line));
+    try t.expect(!ringVisible(&line, Detail.fill_down));
+}
+
+test "a hole can never outlive the ring containing it" {
+    const t = std.testing;
+    // Any hole is strictly inside its outer ring, so |hole area| < |outer area|,
+    // and the cull is monotone in |area| — hence "hole survives => outer survives"
+    // holds for every threshold, and an orphan hole (which orientAreaRings would
+    // re-wind into a spurious fill) is unreachable. Sweep nested square rings
+    // across the whole size range against the fill_down floor.
+    var outer_side: i32 = 3;
+    while (outer_side <= 64) : (outer_side += 1) {
+        const outer = [_]mvt.Point{
+            .{ .x = 0, .y = 0 },                 .{ .x = outer_side, .y = 0 },
+            .{ .x = outer_side, .y = outer_side }, .{ .x = 0, .y = outer_side },
+        };
+        var hole_side: i32 = 1;
+        while (hole_side < outer_side) : (hole_side += 1) {
+            const hole = [_]mvt.Point{
+                .{ .x = 1, .y = 1 },                        .{ .x = 1 + hole_side, .y = 1 },
+                .{ .x = 1 + hole_side, .y = 1 + hole_side }, .{ .x = 1, .y = 1 + hole_side },
+            };
+            try t.expect(@abs(ringArea2(&hole)) < @abs(ringArea2(&outer)));
+            if (ringVisible(&hole, Detail.fill_down))
+                try t.expect(ringVisible(&outer, Detail.fill_down));
+        }
+    }
+}
+
+test "coarser DP keeps the shape and drops the wiggle" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A straight run with a 6-unit wiggle — over the ½ display px native tolerance
+    // (4 units), under the 1 px fill_down one (8): native keeps the wiggle
+    // vertices, fill_down flattens the run to its endpoints. Both keep the first
+    // and last vertex.
+    var pts = std.ArrayList(mvt.Point).empty;
+    var i: i32 = 0;
+    while (i <= 40) : (i += 1) {
+        try pts.append(a, .{ .x = i * 20, .y = if (@mod(i, 2) == 0) @as(i32, 0) else 6 });
+    }
+    const nat = try simplifyRing(a, pts.items, Detail.native);
+    const fd = try simplifyRing(a, pts.items, Detail.fill_down);
+    try t.expect(fd.len < nat.len);
+    try t.expectEqual(@as(usize, 2), fd.len); // collapsed to the endpoints
+    try t.expectEqual(pts.items[0], fd[0]);
+    try t.expectEqual(pts.items[pts.items.len - 1], fd[fd.len - 1]);
+
+    // A real corner (40 units off the chord, 5 display px) survives BOTH — the
+    // coarser tolerance drops noise, not shape.
+    const corner = [_]mvt.Point{
+        .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 40 }, .{ .x = 200, .y = 0 },
+    };
+    try t.expectEqual(@as(usize, 3), (try simplifyRing(a, &corner, Detail.fill_down)).len);
 }
 
 test "line clip exit-split: retrace out and back yields two runs (Go ClipLine parity)" {
