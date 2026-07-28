@@ -59,15 +59,19 @@ N×N block of tiles around `(x, y)`.
 ```
 tile57 png|pdf <cell.000 | bundle.pmtiles> <z> <x> <y> -o <out> [--size N]
 tile57 png|pdf <cell.000 | bundle.pmtiles> --view <lon,lat,zoom> --size WxH -o <out>
+tile57 png|pdf <baked-library-dir> --view <lon,lat,zoom> --size WxH -o <out>
 ```
 
 Render one tile, or a view (any centre, fractional zoom, any pixel size),
 through the [native S-52 pixel path](./rendering.md): PNG raster or
 deterministic vector PDF with real text objects. An S-57 chart renders with
 the S-101 rules evaluated live; a baked `.pmtiles` bundle renders by tile
-replay. `--palette day|dusk|night` picks the colour scheme, `--dq` overlays
-data quality, `--scale F` multiplies physical symbol size, and the mariner
-settings flags (`--safety`, `--feet`, `--no-names`, …) are shown in
+replay. A directory holding baked archives renders the COMPOSITE — the
+compositor opens every `*.pmtiles` under it and the view is quilted across all
+of them, the same picture a client sees. `--palette day|dusk|night` picks the
+colour scheme, `--dq` overlays data quality, `--scale F` multiplies physical
+symbol size, and the mariner settings flags (`--safety`, `--feet`,
+`--no-names`, …) are shown in
 [The Rendering Engine](./rendering.md#from-the-command-line).
 
 ### `ascii`
@@ -170,16 +174,19 @@ are auto-detected everywhere — `png`, `bake`, and the C API read a native S-10
 
 ```
 tile57 inspect  <file.pmtiles> [z x y]
-tile57 tiledump <tile.mlt | tile.mvt> [--geom CLASS [--coords]]
+tile57 tiledump <tile.mlt | tile.mvt> [--prop KEY] [--geom CLASS [--coords]] [--verts]
 ```
 
 `inspect` summarises a baked archive — zoom range and tile counts — and, given
 `z x y`, one stored tile (`-o` dumps its raw decompressed bytes). `tiledump`
 decodes one raw tile and summarises it: per-layer feature counts by geometry
 type plus value histograms of the portrayal properties (`class`,
-`symbol_name`, `ls`). `--geom CLASS` switches to per-feature geometry detail
-for one class (`--coords` lists the coordinates) — for hunting degenerate
-geometry.
+`symbol_name`, `ls`); `--prop KEY` adds a histogram of any other property
+(`cell`, `scamin`, `band`). `--geom CLASS` switches to per-feature geometry
+detail for one class (`--coords` lists the coordinates) — for hunting
+degenerate geometry. `--verts` gives the density attribution: features, parts
+and VERTICES per (layer, class), sorted by vertex count, plus how many polygon
+rings fall under one display pixel squared — where a heavy tile's cost lives.
 
 ### `objlcount`
 
