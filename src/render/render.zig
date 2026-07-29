@@ -35,6 +35,9 @@ pub const ascii = @import("ascii.zig");
 pub const tess = @import("tess.zig");
 pub const paint = @import("paint.zig");
 pub const gpu = @import("gpu.zig");
+/// Ranges -> a host's draw calls: which pipeline, which atlas, what the uniform
+/// block says, and what folds into the previous draw. Pure; see batch.zig.
+pub const batch = @import("batch.zig");
 pub const kitty = @import("kitty.zig");
 pub const symbols = @import("symbols.zig");
 pub const sndfrm = @import("sndfrm.zig");
@@ -49,6 +52,7 @@ pub const labelcache = @import("labelcache.zig"); // per-tile label-candidate me
 test {
     _ = paint;
     _ = gpu;
+    _ = batch;
     _ = surface;
     _ = tess;
     _ = vector;
