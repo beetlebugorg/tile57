@@ -288,6 +288,47 @@ pub const Scene = struct {
     patterns: []const PatternCell,
 };
 
+/// The per-draw uniform block the reference shaders read, byte for byte.
+///
+/// The engine never fills this in — every field is per-frame host state (camera,
+/// live gates, pattern phase), and baking it into a scene would force a rebuild
+/// on every zoom. It is declared HERE because the layout is not the host's to
+/// choose: it is the other half of the vertex contract above, and a host that
+/// lays it out differently gets silently wrong shading rather than an error.
+/// Three backends each kept their own copy of it until they disagreed about
+/// what `color` meant.
+///
+/// std140 and C both put `color` at 96 and the block at 128 bytes; the layout
+/// test at the bottom of this file pins that.
+pub const Uniforms = extern struct {
+    /// Column-major world -> clip. The engine emits world [0,1] web-mercator.
+    mvp: [16]f32,
+    /// Reference-px -> clip-space delta, for the constant-screen-size channel
+    /// (`Vertex.ox/oy`, `Quad.ox/oy`).
+    px_to_clip: [2]f32,
+    /// Multiplies that same channel: display density x the mariner's symbol size.
+    size_scale: f32,
+    /// The view's S-52 display-scale denominator (the N in 1:N), tested against
+    /// `Vertex.scamin` / `Quad.scamin` to cull over-scale marks.
+    current_scale: f32,
+    /// Bit per `disp_cat`: 0 clears that category for this draw.
+    cat_mask: u32,
+    /// Camera centre world-x. Each vertex wraps to the world instance (x, x±1)
+    /// nearest this, which is what makes the antimeridian seamless.
+    wrap_x: f32 = 0.5,
+    rot_sin: f32 = 0,
+    rot_cos: f32 = 1,
+    /// SDF halo background — the active palette's NODATA, set per SDF range so a
+    /// night scheme does not glare. Read ONLY by the SDF fragment stage; the
+    /// flat-colour and pattern pipelines take their colour per vertex.
+    color: [4]f32 = .{ 0, 0, 0, 1 },
+    /// Pattern phase: framebuffer px of the scene's phase origin. World-fixed
+    /// between rebuilds, so a pattern does not swim under a pan.
+    anchor_px: [2]f32 = .{ 0, 0 },
+    /// Pattern cell period in framebuffer px (`PatternCell.w/h` x density).
+    cell_px: [2]f32 = .{ 1, 1 },
+};
+
 // ---- the C view of a scene (mirrors tile57_gpu_* in include/tile57.h) -------
 //
 // These live here, not in capi.zig, so the layout assertions below run: capi.zig
@@ -2432,6 +2473,17 @@ test "gpu: the C scene structs match their tile57.h layout" {
     try testing.expectEqual(@as(usize, 88), @sizeOf(CScene));
     try testing.expectEqual(@as(usize, 32), @offsetOf(CScene, "quads"));
     try testing.expectEqual(@as(usize, 80), @offsetOf(CScene, "owner"));
+
+    // The uniform block is read by shaders, not by us, so nothing here would
+    // fail if it drifted — pin it. `color` at 96 is what std140 demands (vec4
+    // aligns to 16) and what C gives naturally; they agree only by luck of the
+    // field order above, so a reorder must break this test loudly.
+    try testing.expectEqual(@as(usize, 128), @sizeOf(Uniforms));
+    try testing.expectEqual(@as(usize, 64), @offsetOf(Uniforms, "px_to_clip"));
+    try testing.expectEqual(@as(usize, 80), @offsetOf(Uniforms, "cat_mask"));
+    try testing.expectEqual(@as(usize, 96), @offsetOf(Uniforms, "color"));
+    try testing.expectEqual(@as(usize, 112), @offsetOf(Uniforms, "anchor_px"));
+    try testing.expectEqual(@as(usize, 120), @offsetOf(Uniforms, "cell_px"));
 
     // The header's tile57_gpu_kind values ARE paint.Layer — the S-52 class
     // tiebreak order, with pattern between area and line so an area-fill pattern

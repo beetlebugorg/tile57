@@ -1746,14 +1746,17 @@ export fn tile57_trim_caches() callconv(.c) void {
 }
 
 /// GPU-scene ABI self-description: sizeof(vertex) | sizeof(quad)<<8 |
-/// sizeof(range)<<16. A host compiled against a NEWER tile57.h than the
-/// library it links renders GARBAGE (a 28-byte shader stride over a 24-byte
-/// stream shears every vertex after the first) — comparing this at open turns
-/// silent shear into a loud refusal, and a host calling it against a library
-/// too old to export it fails at LINK time, which is better still.
+/// sizeof(range)<<16 | sizeof(uniforms)<<24. A host compiled against a NEWER
+/// tile57.h than the library it links renders GARBAGE (a 28-byte shader stride
+/// over a 24-byte stream shears every vertex after the first) — comparing this
+/// at open turns silent shear into a loud refusal, and a host calling it
+/// against a library too old to export it fails at LINK time, which is better
+/// still. Uniforms rides in the top byte: 128 fits, and a block the shaders
+/// read past the end of is the same class of silent corruption.
 export fn tile57_abi_gpu_layout() callconv(.c) u32 {
     const g = @import("render").gpu;
-    return @as(u32, @sizeOf(g.Vertex)) | (@as(u32, @sizeOf(g.Quad)) << 8) | (@as(u32, @sizeOf(g.Range)) << 16);
+    return @as(u32, @sizeOf(g.Vertex)) | (@as(u32, @sizeOf(g.Quad)) << 8) |
+        (@as(u32, @sizeOf(g.Range)) << 16) | (@as(u32, @sizeOf(g.Uniforms)) << 24);
 }
 
 export fn tile57_warmup() callconv(.c) void {

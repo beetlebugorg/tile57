@@ -881,6 +881,33 @@ typedef struct {
     void *owner;
 } tile57_gpu_scene;
 
+/* The per-draw uniform block the reference shaders read, byte for byte.
+ *
+ * The engine never fills this in — every field is per-frame host state (camera,
+ * live gates, pattern phase), and baking it into a scene would force a rebuild
+ * on every zoom. It is declared here because the LAYOUT is not the host's to
+ * choose: it is the other half of the vertex contract above, and a host that
+ * lays it out differently gets silently wrong shading rather than an error.
+ * Mirrors render/gpu.zig's Uniforms; its sizeof rides in
+ * tile57_abi_gpu_layout() so a skew is caught at open. std140 and C agree on
+ * this field order: color at 96, the block 128 bytes. */
+typedef struct {
+    float mvp[16];       /* column-major world ([0,1] web-mercator) -> clip    */
+    float px_to_clip[2]; /* reference-px -> clip delta (the ox/oy channel)     */
+    float size_scale;    /* density x mariner symbol size, on that channel     */
+    float current_scale; /* the view's 1:N denominator, tested against scamin  */
+    uint32_t cat_mask;   /* bit per disp_cat; a 0 clears that category         */
+    float wrap_x;        /* camera centre world-x (the antimeridian wrap)      */
+    float rot_sin;
+    float rot_cos;
+    /* SDF halo background — the active palette's NODATA, set per SDF range.
+     * Read ONLY by the SDF fragment stage; the flat-colour and pattern
+     * pipelines take their colour per vertex. */
+    float color[4];
+    float anchor_px[2];  /* pattern phase origin, framebuffer px               */
+    float cell_px[2];    /* pattern cell period, framebuffer px                */
+} tile57_gpu_uniforms;
+
 /* Portray a view into the buffers above — the draw-ready twin of
  * tile57_chart_surface. The WHOLE view builds into ONE scene, so labels
  * declutter across it and a name cannot collide with itself over a tile seam.
@@ -1266,9 +1293,10 @@ tile57_status tile57_style_template(tile57_scheme scheme, const char *source_til
 void tile57_trim_caches(void);
 
 /* GPU-scene ABI self-description: sizeof(tile57_gpu_vertex) |
- * sizeof(tile57_gpu_quad)<<8 | sizeof(tile57_gpu_range)<<16. Compare against
- * your compiled sizeofs at startup — a header/library skew otherwise renders
- * garbage (sheared vertex stream), not an error. */
+ * sizeof(tile57_gpu_quad)<<8 | sizeof(tile57_gpu_range)<<16 |
+ * sizeof(tile57_gpu_uniforms)<<24. Compare against your compiled sizeofs at
+ * startup — a header/library skew otherwise renders garbage (sheared vertex
+ * stream, or a uniform block the shaders read past), not an error. */
 uint32_t tile57_abi_gpu_layout(void);
 
 void tile57_warmup(void);
