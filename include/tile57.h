@@ -881,6 +881,69 @@ typedef struct {
     void *owner;
 } tile57_gpu_scene;
 
+/* ---- batching a scene into draw calls -------------------------------------
+ *
+ * Ranges arrive in paint order; a host still has to decide, per range, which
+ * pipeline draws it, which atlas it samples, what the uniform block should say
+ * and whether it folds into the previous draw. That reading of kind/prim/
+ * atlas/pattern is the engine's, so tile57_gpu_batch() does it — the host keeps
+ * its pipeline objects, its textures, its command encoder, and any extra pass
+ * structure of its own. */
+
+/* Which of the four pipelines draws an item. */
+typedef enum {
+    TILE57_GPU_PIPE_CHART   = 0, /* flat-colour triangles; colour per vertex   */
+    TILE57_GPU_PIPE_PATTERN = 1, /* area fill tiled from a pattern cell        */
+    TILE57_GPU_PIPE_SPRITE  = 2, /* symbol quads from the sprite atlas         */
+    TILE57_GPU_PIPE_SDF     = 3  /* SDF glyph quads, with the halo tiers       */
+} tile57_gpu_pipeline;
+
+/* Per-frame host state the classification depends on — the scalars the engine
+ * cannot derive from a scene. Zero-initialising this is NOT the default: it
+ * would gate off text and soundings and claim no atlases. */
+typedef struct {
+    bool text_on;             /* mariner text switch; off drops TEXT ranges    */
+    bool sound_on;            /* mariner soundings switch                      */
+    bool exclude_opaque_tris; /* host draws those in its own depth pass first  */
+    uint8_t atlas_have;       /* bit per tile57_gpu_atlas the host uploaded    */
+    float halo[4];            /* palette background, for SDF label halos       */
+} tile57_gpu_batch_opts;
+
+/* One draw call. first/count index the same buffers tile57_gpu_range does, so a
+ * merged draw is just a wider slice of them. The three uniform fields are the
+ * only parts of the block that vary per draw: build the frame uniform once and
+ * apply these over it. */
+typedef struct {
+    uint32_t first;
+    uint32_t count;
+    uint8_t prim;     /* tile57_gpu_prim                                       */
+    uint8_t pipeline; /* tile57_gpu_pipeline                                   */
+    uint8_t atlas;    /* tile57_gpu_atlas AFTER the missing-tier fallback      */
+    uint8_t _pad;
+    /* Index into the scene's patterns, or TILE57_GPU_NO_PATTERN. Look YOUR cell
+     * texture up by this and derive the uniform's cell_px from its size — which
+     * is why no pattern data is passed in. Comparing this index is equivalent to
+     * comparing the dimensions it implies, so the merge stays correct without
+     * them. A pattern whose cell never rasterized is yours to drop: only you
+     * know what uploaded, and the flat fill underneath already drew. */
+    uint32_t pattern;
+    uint32_t cat_mask_or; /* OR into the uniform's cat_mask (soundings)        */
+    float color[4];       /* the uniform's color (halo on SDF draws)           */
+} tile57_gpu_draw;
+
+/* Batch ranges into draw calls. Returns how many draws the batch HAS: a return
+ * greater than `out_cap` means the buffer was too small and NOTHING should be
+ * drawn from it, since a truncated batch is missing chart silently. Pass
+ * out=NULL to ask for the count alone; `range_count` is always a safe capacity,
+ * as draws only ever merge, never split.
+ *
+ * Takes only the ranges — the batcher needs no vertex, quad or pattern buffer,
+ * so a host need not hold a whole scene alive to ask. Allocates nothing and
+ * touches no GPU. */
+size_t tile57_gpu_batch(const tile57_gpu_range *ranges, size_t range_count,
+                        const tile57_gpu_batch_opts *opts,
+                        tile57_gpu_draw *out, size_t out_cap);
+
 /* The per-draw uniform block the reference shaders read, byte for byte.
  *
  * The engine never fills this in — every field is per-frame host state (camera,
