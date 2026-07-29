@@ -142,6 +142,38 @@ fn pointInCoverage(px: i64, py: i64, polys: []const geometry.plane.Poly) bool {
     return inside;
 }
 
+/// Bounding box [w,s,e,n] of the rings `pointInCoverage` would actually cross.
+/// Empty (no ring of 3+ points) yields an inverted box, which rejects every
+/// point — matching the ray cast's `false` for the same input.
+fn coverageBBox(polys: []const geometry.plane.Poly) [4]i64 {
+    var b = [4]i64{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+    for (polys) |poly| for (poly) |ring| {
+        if (ring.len < 3) continue; // skipped by the ray cast; keep the box tight
+        for (ring) |p| {
+            b[0] = @min(b[0], p.x);
+            b[1] = @min(b[1], p.y);
+            b[2] = @max(b[2], p.x);
+            b[3] = @max(b[3], p.y);
+        }
+    };
+    return b;
+}
+
+fn reachDesc(cells: []const geometry.plane.Cell, l: u32, r: u32) bool {
+    return cells[l].reach > cells[r].reach;
+}
+
+/// `maxZoomAt`'s lookup index over `cells`, allocated in `a`.
+const MaxZoomIndex = struct { order: []const u32, bbox: []const [4]i64 };
+fn buildMaxZoomIndex(a: std.mem.Allocator, cells: []const geometry.plane.Cell) !MaxZoomIndex {
+    const order = try a.alloc(u32, cells.len);
+    const bbs = try a.alloc([4]i64, cells.len);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    for (bbs, cells) |*b, c| b.* = coverageBBox(c.cov1);
+    std.mem.sort(u32, order, cells, reachDesc);
+    return .{ .order = order, .bbox = bbs };
+}
+
 // A normalised web-mercator world axis coordinate ([0,1]) -> tile index at `scale`
 // (= 2^z), clamped to [0, scale-1].
 pub fn worldAxisToTile(w: f64, scale: f64) u32 {
@@ -171,16 +203,9 @@ var g_explain_count: usize = 0;
 // The tile-index cover (nw..se) of an owner face's lon/lat bbox at zoom `scale = 1<<z`. The
 // on-demand composeTile culls candidate tiles through this exact box.
 const TileBBox = struct { tx0: u32, tx1: u32, ty0: u32, ty1: u32 };
-fn faceTileBBox(face: geometry.plane.OwnedCell, scale: f64) TileBBox {
-    var fb = [4]f64{ 1e9, 1e9, -1e9, -1e9 };
-    for (face.owned) |ring| for (ring) |p| {
-        const lon = @as(f64, @floatFromInt(p.x)) / 1e7;
-        const lat = @as(f64, @floatFromInt(p.y)) / 1e7;
-        fb[0] = @min(fb[0], lon);
-        fb[1] = @min(fb[1], lat);
-        fb[2] = @max(fb[2], lon);
-        fb[3] = @max(fb[3], lat);
-    };
+/// `fb` is the face's lon/lat bbox, precomputed once per map (BandMap.bbox) — walking
+/// the rings here instead cost 3% of all native time, re-derived per tile per face.
+fn faceTileBBox(fb: [4]f64, scale: f64) TileBBox {
     const w_tl = tile.lonLatToWorld(fb[0], fb[3]); // NW: min lon, max lat
     const w_br = tile.lonLatToWorld(fb[2], fb[1]); // SE: max lon, min lat
     // EXPANDED one tile each side: lonLatToWorld runs through the SYSTEM libm
@@ -216,10 +241,12 @@ fn tileClassifyBox(z: u8, tx: u32, ty: u32) geometry.plane.Box {
     return .{ .min_x = lon0 - bufx, .min_y = lat0 - bufy, .max_x = lon1 + bufx, .max_y = lat1 + bufy };
 }
 
-// Compose one seam/overscale tile from its contributing owner slots (in face order) into raw MLT
-// bytes, or null if nothing survives the clip. Decode each owner's tile (native or overscaled
-// ancestor), clip its features to the owner's projected owned face, per-layer concat in
-// VECTOR_LAYERS order, re-orient polygons, encode. `ta` is a per-tile scratch allocator. Shared by
+// Compose one seam/overscale tile from its contributing owner slots (in face order) into decoded
+// per-layer features, or null if nothing survives the clip. Decode each owner's tile (native or
+// overscaled ancestor), clip its features to the owner's projected owned face, per-layer concat in
+// VECTOR_LAYERS order, re-orient polygons. `ra` owns every surviving feature — the per-tile scratch
+// for a byte-serving caller (which encodes and drops them), the caller's allocator for the GPU
+// scene path (which portrays them directly, never paying the encode/decode round-trip). Shared by
 // the batch pass 2 and the on-demand composeTile, so both emit byte-identical tiles.
 /// Deep-copy a clipped feature out of the per-contributor scratch arena: parts,
 /// points and properties all move into `a` before the scratch resets.
@@ -250,7 +277,7 @@ fn dupeProps(a: std.mem.Allocator, props: []const mvt.Prop) ![]const mvt.Prop {
 /// double-draw over finer-band ground.
 const ExtraFill = struct { ci: u32, region: []const []const geometry.plane.Pt, deep: bool };
 
-fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, contribs: []const ExtraFill, reach_cells: []const u32, z: u8, tx: u32, ty: u32) !?[]u8 {
+fn composeLayers(ra: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, contribs: []const ExtraFill, reach_cells: []const u32, z: u8, tx: u32, ty: u32) !?[]const mvt.Layer {
     const compose = clip;
     var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
     for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
@@ -281,11 +308,15 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
         const layers = (try ownerTile(sa2, readers[ex.ci], part.cells[ex.ci].cscl, z, tx, ty, ex.deep)) orelse continue;
         const face_px = try compose.projectFace(sa2, ex.region, z, tx, ty);
         if (face_px.len == 0) continue;
+        // One edge index over the face per contributor: clipFeatureToFace
+        // consults it to spare every boundary-far feature the full-face scan.
+        var fgrid = try geometry.plane.EdgeGrid.init(sa2, face_px, 512);
+        defer fgrid.deinit();
         for (layers) |layer| {
             const li = layerIndex(layer.name) orelse continue;
             var tmpb = std.ArrayList(mvt.Feature).empty;
-            for (layer.features) |feat| try compose.clipFeatureToFace(sa2, &tmpb, feat, face_px);
-            for (tmpb.items) |f| try buckets[li].append(ta, try dupeFeature(ta, f));
+            for (layer.features) |feat| try compose.clipFeatureToFace(sa2, &tmpb, feat, face_px, &fgrid);
+            for (tmpb.items) |f| try buckets[li].append(ra, try dupeFeature(ra, f));
         }
     }
     // Reach-ring cells: no owned ground in this tile, but their light sector
@@ -300,20 +331,20 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
             const li = layerIndex(layer.name) orelse continue;
             for (layer.features) |feat| {
                 if (feat.geom_type != .linestring or !compose.isLightFigure(feat)) continue;
-                const parts = try ta.alloc([]const mvt.Point, feat.parts.len);
-                for (feat.parts, 0..) |p, i| parts[i] = try ta.dupe(mvt.Point, p);
-                try buckets[li].append(ta, .{ .geom_type = .linestring, .parts = parts, .properties = try dupeProps(ta, feat.properties) });
+                const parts = try ra.alloc([]const mvt.Point, feat.parts.len);
+                for (feat.parts, 0..) |p, i| parts[i] = try ra.dupe(mvt.Point, p);
+                try buckets[li].append(ra, .{ .geom_type = .linestring, .parts = parts, .properties = try dupeProps(ra, feat.properties) });
             }
         }
     }
     var out_layers = std.ArrayList(mvt.Layer).empty;
     for (&buckets, 0..) |*bucket, li| {
         if (bucket.items.len == 0) continue;
-        const feats = try orientPolys(ta, bucket.items);
-        try out_layers.append(ta, .{ .name = mvt.VECTOR_LAYERS[li], .features = feats });
+        const feats = try orientPolys(ra, bucket.items);
+        try out_layers.append(ra, .{ .name = mvt.VECTOR_LAYERS[li], .features = feats });
     }
     if (out_layers.items.len == 0) return null;
-    return try mlt.encode(ta, .{ .layers = out_layers.items });
+    return out_layers.items;
 }
 
 /// Compose ONE tile on demand from a resident partition + mmap'd per-cell `readers` (cell index ==
@@ -323,53 +354,19 @@ fn composeSeamTile(ta: std.mem.Allocator, part: *const geometry.partition.Partit
 /// server wants — the HTTP layer gzips on the wire). gpa-owned; null if no cell owns this tile. This
 /// is the runtime compositor: with the partition loaded once, serving a tile is a classify plus
 /// either one memcpy/decompress or one decode/clip/encode, not a whole-district pass.
-/// Sutherland–Hodgman rect clip of a ring bag: cuts boolean operands to tile
-/// size in LINEAR time, so the cross-band fill's cost per tile is bounded by
-/// the tile — never by the face. A tier-0 face is a whole coastal cell
-/// (hundreds of thousands of points); exact booleans against it requested
-/// oversized allocations that FAILED tile-by-tile on a memory-limited device,
-/// at exactly the coarse zooms.
-fn rectClipRings(a: std.mem.Allocator, rings: []const []const geometry.plane.Pt, box: geometry.plane.Box) ![][]geometry.plane.Pt {
-    var out = std.ArrayList([]geometry.plane.Pt).empty;
-    for (rings) |ring| {
-        var cur = std.ArrayList(geometry.plane.Pt).empty;
-        try cur.appendSlice(a, ring);
-        inline for (.{
-            .{ .axis = 0, .lim = "min_x", .keep_ge = true },
-            .{ .axis = 0, .lim = "max_x", .keep_ge = false },
-            .{ .axis = 1, .lim = "min_y", .keep_ge = true },
-            .{ .axis = 1, .lim = "max_y", .keep_ge = false },
-        }) |cl| {
-            if (cur.items.len == 0) break;
-            const lim: i64 = @field(box, cl.lim);
-            var nxt = std.ArrayList(geometry.plane.Pt).empty;
-            const npts = cur.items.len;
-            for (cur.items, 0..) |p, k| {
-                const q = cur.items[(k + 1) % npts];
-                const pv: i64 = if (cl.axis == 0) p.x else p.y;
-                const qv: i64 = if (cl.axis == 0) q.x else q.y;
-                const pin = if (cl.keep_ge) pv >= lim else pv <= lim;
-                const qin = if (cl.keep_ge) qv >= lim else qv <= lim;
-                if (pin) try nxt.append(a, p);
-                if (pin != qin) {
-                    const t = @as(f64, @floatFromInt(lim - pv)) / @as(f64, @floatFromInt(qv - pv));
-                    const ox: i64 = if (cl.axis == 0) lim else p.x + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.x - p.x)))));
-                    const oy: i64 = if (cl.axis == 1) lim else p.y + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.y - p.y)))));
-                    try nxt.append(a, .{ .x = ox, .y = oy });
-                }
-            }
-            cur = nxt;
-        }
-        if (cur.items.len >= 3) try out.append(a, try cur.toOwnedSlice(a));
-    }
-    return out.toOwnedSlice(a);
+pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, want_gzip: bool) !TileResult {
+    const res = try composeTileContent(gpa, part, readers, z, tx, ty, if (want_gzip) .gzip_bytes else .raw_bytes);
+    return .{ .tile = switch (res.content) {
+        .bytes => |b| b,
+        else => null,
+    }, .owned = res.owned };
 }
 
-pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, want_gzip: bool) !TileResult {
-    const map = part.mapForZoom(z) orelse return .{ .tile = null, .owned = false };
+fn composeTileContent(a: std.mem.Allocator, part: *const geometry.partition.Partition, readers: []const *pmtiles.Reader, z: u8, tx: u32, ty: u32, mode: ContentMode) !TileContentResult {
+    const map = part.mapForZoom(z) orelse return .{ .content = .none, .owned = false };
     const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ta = arena.allocator();
 
@@ -386,18 +383,18 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     var verbatim: ?usize = null; // cell index of the unique tile+buffer-owning cell
     const no_fill = std.c.getenv("TILE57_NO_FILL") != null; // measurement valve
     const cb0 = tileClassifyBox(z, tx, ty);
-    for (map.faces) |face| {
+    for (map.faces, 0..) |face, fslot| {
         if (face.owned.len == 0) continue;
         const ci = face.index;
         const cscl = part.cells[ci].cscl;
-        const bb = faceTileBBox(face, scale);
+        const bb = faceTileBBox(map.bbox[fslot], scale);
         if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
 
         // Rect-clip the face to the tile FIRST: everything downstream —
         // classify, projection, booleans, memory — is bounded by the tile,
         // never by the face (whole-cell faces at coarse tiers OOM'd a
         // memory-limited device tile by tile).
-        const clipped = rectClipRings(ta, face.owned, cb0) catch continue;
+        const clipped = geometry.plane.rectClipRings(ta, face.owned, cb0) catch continue;
         if (dbg) std.debug.print("cmp z{d}/{d}/{d} tier{d} ci{d} cscl{d} clippedRings={d} hasTile={}\n", .{ z, tx, ty, map.tier, ci, cscl, clipped.len, ownerHasTile(readers[ci], cscl, z, tx, ty) catch false });
         if (clipped.len == 0) continue; // owns none of this tile
         owned = true;
@@ -415,7 +412,7 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // sweeping in, and the bake addressed this tile for exactly that reach
     // (buildTileMap's lightReachTiles ring around the cell's light_bbox). Apply
     // the SAME ring here: consult each such cell's archive and let
-    // composeSeamTile take only its constructed LIGHTS figures, whole.
+    // composeLayers take only its constructed LIGHTS figures, whole.
     // Without this the figures amputate exactly at the composed-tile boundary.
     var reach = std.ArrayList(u32).empty;
     {
@@ -446,9 +443,9 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     // Verbatim fast path: only when no reach cell contributes (else the figures
     // must merge, so the tile seam-composes; content-identical for the owner).
     if (reach.items.len == 0) if (verbatim) |ci| {
-        if (want_gzip) {
-            if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .tile = try gpa.dupe(u8, blob), .owned = true };
-        } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .tile = try gpa.dupe(u8, raw), .owned = true };
+        if (mode == .gzip_bytes) {
+            if (try readers[ci].getCompressed(z, tx, ty)) |blob| return .{ .content = .{ .bytes = try a.dupe(u8, blob) }, .owned = true };
+        } else if (try readers[ci].getTile(ta, z, tx, ty)) |raw| return .{ .content = .{ .bytes = try a.dupe(u8, raw) }, .owned = true };
     };
     // Cross-band fill (partial OR whole-tile): whatever ground the governing
     // band leaves bare in THIS tile composes from coarser bands, clipped to
@@ -465,6 +462,30 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
     defer fill_arena.deinit();
     const fa = fill_arena.allocator();
     if (verbatim == null and !no_fill) fill: {
+        // The fill exists to hand bare ground to a COARSER band — so first ask
+        // whether any coarser cell could take it at all: same face-bbox +
+        // deep-tile filters the loop below applies, none of the geometry. At
+        // the coarsest populated band (every Great Lakes tile at z4) there are
+        // no takers, and the residual chain — hundreds of diff sweeps on a fat
+        // tile — was pure discovery cost for an empty answer. No candidates
+        // means the block cannot contribute, so skipping it is output-identical.
+        var mi: usize = 0;
+        while (mi < part.maps.len and &part.maps[mi] != map) mi += 1;
+        {
+            var any = false;
+            var cm = mi + 1;
+            outer: while (cm < part.maps.len) : (cm += 1) {
+                for (part.maps[cm].faces, 0..) |face, fslot| {
+                    if (face.owned.len == 0) continue;
+                    const bb = faceTileBBox(part.maps[cm].bbox[fslot], scale);
+                    if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
+                    if (!(try ownerHasTileDeep(readers[face.index], part.cells[face.index].cscl, z, tx, ty, true))) continue;
+                    any = true;
+                    break :outer;
+                }
+            }
+            if (!any) break :fill;
+        }
         const cb = tileClassifyBox(z, tx, ty);
         const rect = [_]geometry.plane.Pt{
             .{ .x = cb.min_x, .y = cb.min_y }, .{ .x = cb.max_x, .y = cb.min_y },
@@ -476,72 +497,83 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
             rings[0] = try fa.dupe(geometry.plane.Pt, &rect);
             break :blk rings;
         };
-        // Ping-pong compaction: the boolean chain's intermediates accumulate
-        // in the arena (hundreds of steps on a fat tile); every 16 steps the
-        // small surviving residual is copied into the drained side and the
-        // other resets, bounding the chain's peak to ~16 steps of scratch.
+        // Two arenas ping-pong across bands: each band's boolean scratch dies
+        // with its arena reset once the surviving residual has moved to the
+        // drained side, so the peak is one band of scratch, never the chain.
         var fill_arena2 = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer fill_arena2.deinit();
         var arenas = [2]*std.heap.ArenaAllocator{ &fill_arena, &fill_arena2 };
         var cur_a: usize = 0;
-        var steps: usize = 0;
-        for (contribs.items) |c| {
-            residual = geometry.boolean.compute(arenas[cur_a].allocator(), residual, c.region, .diff) catch break :fill;
+        // Governing band: its faces are a disjoint partition, so the plain
+        // concatenation of the contributor regions is already their even-odd
+        // union — ONE diff sweep takes them all out of the residual, where a
+        // per-contributor chain re-swept the whole residual hundreds of times
+        // on a fat coarse tile.
+        if (contribs.items.len != 0) {
+            const wa = arenas[cur_a].allocator();
+            var nrings: usize = 0;
+            for (contribs.items) |c| nrings += c.region.len;
+            const all = wa.alloc([]const geometry.plane.Pt, nrings) catch break :fill;
+            var ri: usize = 0;
+            for (contribs.items) |c| for (c.region) |ring| {
+                all[ri] = ring;
+                ri += 1;
+            };
+            residual = geometry.boolean.compute(wa, residual, all, .diff) catch break :fill;
             if (residual.len == 0) break :fill; // governing band covers the whole tile
-            steps += 1;
-            if (steps % 16 == 0) {
-                const other = 1 - cur_a;
-                const oa = arenas[other].allocator();
-                const moved = oa.alloc([]geometry.plane.Pt, residual.len) catch break :fill;
-                for (residual, 0..) |ring, ri| moved[ri] = oa.dupe(geometry.plane.Pt, ring) catch break :fill;
-                _ = arenas[cur_a].reset(.retain_capacity);
-                residual = moved;
-                cur_a = other;
-            }
         }
-        var mi: usize = 0;
-        while (mi < part.maps.len and &part.maps[mi] != map) mi += 1;
         var ci_map = mi + 1;
-        while (ci_map < part.maps.len and residual.len > 0) : (ci_map += 1) {
-            for (part.maps[ci_map].faces) |face| {
-                if (residual.len == 0) break;
+        bands: while (ci_map < part.maps.len and residual.len > 0) : (ci_map += 1) {
+            // One band at a time: its faces are disjoint, so every face
+            // intersects the SAME band-entry residual (no face can own ground
+            // a sibling already took), and the band's regions then leave the
+            // residual in a single concatenated diff.
+            const wa = arenas[cur_a].allocator();
+            var band_rings = std.ArrayList([]const geometry.plane.Pt).empty;
+            for (part.maps[ci_map].faces, 0..) |face, fslot| {
                 if (face.owned.len == 0) continue;
                 const ci = face.index;
-                const bb = faceTileBBox(face, scale);
+                const bb = faceTileBBox(part.maps[ci_map].bbox[fslot], scale);
                 if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
                 if (!(try ownerHasTileDeep(readers[ci], part.cells[ci].cscl, z, tx, ty, true))) continue;
-                const wa = arenas[cur_a].allocator();
-                const clipped = rectClipRings(wa, face.owned, cb) catch continue;
+                const clipped = geometry.plane.rectClipRings(wa, face.owned, cb) catch continue;
                 if (clipped.len == 0) continue;
                 const region = geometry.boolean.compute(wa, clipped, residual, .intersect) catch continue;
                 if (region.len == 0) continue;
+                band_rings.appendSlice(wa, region) catch break;
                 // Copy the surviving region OUT of the throwaway arenas.
                 const kept = try ta.alloc([]geometry.plane.Pt, region.len);
                 for (region, 0..) |ring, ri| kept[ri] = try ta.dupe(geometry.plane.Pt, ring);
                 try contribs.append(ta, .{ .ci = @intCast(ci), .region = kept, .deep = true });
-                residual = geometry.boolean.compute(wa, residual, region, .diff) catch break;
-                steps += 1;
-                if (steps % 16 == 0) {
-                    const other = 1 - cur_a;
-                    const oa2 = arenas[other].allocator();
-                    const moved2 = oa2.alloc([]geometry.plane.Pt, residual.len) catch break;
-                    for (residual, 0..) |ring, ri| moved2[ri] = oa2.dupe(geometry.plane.Pt, ring) catch break;
-                    _ = arenas[cur_a].reset(.retain_capacity);
-                    residual = moved2;
-                    cur_a = other;
-                }
             }
+            if (band_rings.items.len == 0) continue;
+            const next = geometry.boolean.compute(wa, residual, band_rings.items, .diff) catch continue;
+            // Move the surviving residual to the drained arena and drop the
+            // band's scratch with this side's reset.
+            const other = 1 - cur_a;
+            const oa = arenas[other].allocator();
+            const moved = oa.alloc([]geometry.plane.Pt, next.len) catch break :bands;
+            for (next, 0..) |ring, ri| moved[ri] = oa.dupe(geometry.plane.Pt, ring) catch break :bands;
+            _ = arenas[cur_a].reset(.retain_capacity);
+            residual = moved;
+            cur_a = other;
         }
         if (contribs.items.len > 0) owned = true;
     }
 
     if (contribs.items.len == 0 and reach.items.len == 0)
-        return .{ .tile = null, .owned = owned };
+        return .{ .content = .none, .owned = owned };
 
-    const enc = (try composeSeamTile(ta, part, readers, contribs.items, reach.items, z, tx, ty)) orelse return .{ .tile = null, .owned = owned };
-    // want_gzip → match the archive's stored (gzipped) bytes; else hand back the raw MLT.
-    const bytes = if (want_gzip) try pmtiles.StreamWriter.gzipTile(gpa, enc) else try gpa.dupe(u8, enc);
-    return .{ .tile = bytes, .owned = true };
+    // Layers mode composes into the CALLER's allocator (the features ARE the
+    // result); byte modes compose into the tile arena, encode, and only the
+    // bytes leave. Same features, same order, either way.
+    const ra = if (mode == .layers) a else ta;
+    const layers = (try composeLayers(ra, part, readers, contribs.items, reach.items, z, tx, ty)) orelse return .{ .content = .none, .owned = owned };
+    if (mode == .layers) return .{ .content = .{ .layers = try decodedView(a, layers) }, .owned = true };
+    const enc = try mlt.encode(ta, .{ .layers = layers });
+    // gzip_bytes → match the archive's stored (gzipped) bytes; raw_bytes → the raw MLT.
+    const bytes = if (mode == .gzip_bytes) try pmtiles.StreamWriter.gzipTile(a, enc) else try a.dupe(u8, enc);
+    return .{ .content = .{ .bytes = bytes }, .owned = true };
 }
 
 /// The outcome of composing one tile: its bytes (null if nothing rendered) and whether the ownership
@@ -549,6 +581,37 @@ pub fn composeTile(gpa: std.mem.Allocator, part: *const geometry.partition.Parti
 /// owns the ground but produced nothing — transient during a bake, suspect once a bake is done);
 /// `tile == null and !owned` = true empty (no cell owns this ground — open ocean, safe to cache).
 pub const TileResult = struct { tile: ?[]u8, owned: bool };
+
+/// One composed tile as CONTENT rather than wire bytes: `bytes` is a verbatim
+/// owner blob (raw MLT, still to decode — the single-owner fast path has no
+/// decoded form to give), `layers` are the composed features themselves,
+/// allocated in the caller's allocator. The GPU scene and query paths portray
+/// `layers` directly — the same features the byte contract would have encoded,
+/// minus the encode/decode round-trip that was ~a fifth of a cold scene build.
+pub const TileContent = union(enum) { none, bytes: []u8, layers: []const mvt.DecodedLayer };
+pub const TileContentResult = struct { content: TileContent, owned: bool };
+
+/// What form composeTileContent hands back: the archive-matching gzipped MLT,
+/// the raw MLT a live server wants, or the decoded layers a renderer wants.
+const ContentMode = enum { gzip_bytes, raw_bytes, layers };
+
+/// DecodedLayer views over freshly composed features. Every part and property
+/// slice here was allocated by THIS compose call and is unaliased, so shedding
+/// the const the builder types carry is sound — the consumer (replay) only
+/// reads either way.
+fn decodedView(a: std.mem.Allocator, layers: []const mvt.Layer) ![]const mvt.DecodedLayer {
+    const out = try a.alloc(mvt.DecodedLayer, layers.len);
+    for (layers, 0..) |layer, li| {
+        const feats = try a.alloc(mvt.DecodedFeature, layer.features.len);
+        for (layer.features, 0..) |f, fi| {
+            const parts = try a.alloc([]mvt.Point, f.parts.len);
+            for (f.parts, 0..) |part, pi| parts[pi] = @constCast(part);
+            feats[fi] = .{ .geom_type = f.geom_type, .parts = parts, .properties = @constCast(f.properties) };
+        }
+        out[li] = .{ .name = layer.name, .extent = tile.EXTENT, .features = feats };
+    }
+    return out;
+}
 
 /// A resident compositor: the per-cell archives held mmap'd and the ownership partition built once
 /// (or loaded from a sidecar), so `serve` composes any tile without a whole-district pass. Open once,
@@ -564,11 +627,19 @@ pub const ComposeSource = struct {
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
     part: geometry.partition.Partition,
-    /// Cell names aligned with `readers` — diagnostics only (explainEmpty).
+    /// `maxZoomAt` acceleration, arena-owned, built beside the partition: cell
+    /// indices by DESCENDING `reach`, and each cell's cov1 bbox. Both index
+    /// `part.cells`. See `maxZoomAt` for why the naive walk was too slow.
+    mz_order: []const u32 = &.{},
+    mz_bbox: []const [4]i64 = &.{},
+    /// Cell names aligned with `readers` — diagnostics + partition identity.
     names: []const []const u8 = &.{},
-    /// False when the partition had to be BUILT (no sidecar, or one that no
-    /// longer matches this cell set). The C layer uses it to refresh the cache
-    /// on disk, so a stale sidecar heals itself instead of costing every open.
+    /// DSID dates aligned with `names` — the other half of the identity the v4
+    /// sidecar references faces by.
+    dates: []const []const u8 = &.{},
+    /// False when any face had to be SWEPT (no sidecar, or one whose ground
+    /// partially changed). The C layer uses it to refresh the cache on disk,
+    /// so a stale sidecar heals itself instead of costing every open.
     part_loaded: bool = false,
     minz: u8,
     maxz: u8,
@@ -589,6 +660,13 @@ pub const ComposeSource = struct {
     /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
     pub fn tile(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileResult {
         return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
+    }
+
+    /// The same tile as decoded content (see TileContent): what a renderer or
+    /// query wants — layers to portray directly, or a verbatim blob to decode.
+    /// Everything in the result is allocated in `a`.
+    pub fn tileContent(self: *ComposeSource, a: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileContentResult {
+        return composeTileContent(a, &self.part, self.readers, z, tx, ty, .layers);
     }
 
     /// The complete serving story of ONE point at ONE zoom — printed on every
@@ -647,10 +725,10 @@ pub const ComposeSource = struct {
         const map = self.part.mapForZoom(z) orelse return;
         const scale: f64 = @floatFromInt(@as(u64, 1) << @intCast(z));
         var spoke = false;
-        for (map.faces) |face| {
+        for (map.faces, 0..) |face, fslot| {
             if (face.owned.len == 0) continue;
             const ci = face.index;
-            const bb = faceTileBBox(face, scale);
+            const bb = faceTileBBox(map.bbox[fslot], scale);
             if (tx < bb.tx0 or tx > bb.tx1 or ty < bb.ty0 or ty > bb.ty1) continue;
             var grid = geometry.plane.EdgeGrid.init(self.gpa, face.owned, tileWidthE7(z)) catch continue;
             defer grid.deinit();
@@ -677,9 +755,12 @@ pub const ComposeSource = struct {
         }
     }
     /// Serialize the resident ownership partition to a sidecar blob (gpa-owned) a later open can
-    /// load to skip the owned-face build.
+    /// adopt faces from instead of re-sweeping them.
     pub fn serializePartition(self: *ComposeSource, gpa: std.mem.Allocator) ![]u8 {
-        return geometry.partition.serialize(gpa, &self.part);
+        const ids = try gpa.alloc(geometry.partition.CellId, self.names.len);
+        defer gpa.free(ids);
+        for (ids, self.names, self.dates) |*id, n, d| id.* = .{ .name = n, .date = d };
+        return geometry.partition.serialize(gpa, &self.part, ids);
     }
 
     /// The deepest zoom any cell COVERING (lon,lat) can serve — `reach` (its native
@@ -688,15 +769,23 @@ pub const ComposeSource = struct {
     /// (which a distant deep chart inflates). Returns loop_max when the point lies
     /// outside every cell's coverage (no cell to restrict against). Coverage points
     /// are lon_e7/lat_e7 (see toPlaneCells), so the test is a plain lon/lat ray cast.
+    /// Walked in DESCENDING `reach` (mz_order), so the first covering cell IS the
+    /// answer — nothing later can beat it. The bbox (mz_bbox) rejects the rest
+    /// without a ray cast: `pointInCoverage` is linear in every ring of every
+    /// cell, and a host calling this per frame measured 48% of render-thread CPU
+    /// during a pinch on Android. Cells at reach 0 never win (a coarser cell's
+    /// fill-up covers them), and descending order means the first is the last.
     pub fn maxZoomAt(self: *const ComposeSource, lon: f64, lat: f64) u8 {
         const px: i64 = @intFromFloat(lon * 1e7);
         const py: i64 = @intFromFloat(lat * 1e7);
-        var best: u8 = 0;
-        for (self.part.cells) |c| {
-            if (c.reach <= best) continue; // can't beat what we already have
-            if (pointInCoverage(px, py, c.cov1)) best = c.reach;
+        for (self.mz_order) |ci| {
+            const c = self.part.cells[ci];
+            if (c.reach == 0) break;
+            const b = self.mz_bbox[ci];
+            if (px < b[0] or px > b[2] or py < b[1] or py > b[3]) continue;
+            if (pointInCoverage(px, py, c.cov1)) return c.reach;
         }
-        return if (best == 0) self.loop_max else best;
+        return self.loop_max;
     }
     pub fn deinit(self: *ComposeSource) void {
         const gpa = self.gpa;
@@ -842,13 +931,13 @@ fn covDegBounds(cc: coverage.ChartCoverage) [4]f64 {
 /// Put the cell set in ONE canonical order, whatever order the caller handed the
 /// archives over in.
 ///
-/// The partition's input key (geometry.partition.inputKey) hashes the cells in
-/// sequence, and its ownership tie-break falls back to input order — so the order
-/// is part of the artifact's identity. That used to make the sidecar depend on the
-/// CALLER: `tile57 bake` sorted its archive paths, while a host that walked a
-/// directory handed them over in readdir order, and the two disagreed. The bake's
-/// partition then failed to load with StalePartition and every open rebuilt an
-/// identical copy from scratch.
+/// The ownership tie-break falls back to the order rank, and equal-cscl diff
+/// sequences follow it — so cell order is part of the artifact's identity even
+/// though the v4 digests deliberately hash (date, name) instead of the rank.
+/// Uncanonicalized, the sidecar depended on the CALLER: `tile57 bake` sorted its
+/// archive paths, while a host that walked a directory handed them over in
+/// readdir order, and the two disagreed — every open rebuilt an identical
+/// partition from scratch.
 ///
 /// Sorting on the coverage NAME (the file basename stem — already the ownership
 /// tie-break name) rather than on the path makes this independent of the caller's
@@ -1011,24 +1100,43 @@ fn finishOpen(
     const cells = try toPlaneCells(a, shims);
     for (cells, readers) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
 
-    var loaded = false;
-    if (load_partition) |bytes| {
-        if (geometry.partition.deserialize(gpa, bytes, cells)) |p| {
-            src.part = p;
-            loaded = true;
-        } else |err| std.debug.print("  partition sidecar unusable ({s}); building\n", .{@errorName(err)});
+    const ids = try a.alloc(geometry.partition.CellId, shims.len);
+    for (ids, shims) |*id, sh| id.* = .{ .name = sh.name, .date = sh.date };
+    const res = blk: {
+        if (load_partition) |bytes| {
+            if (geometry.partition.buildIncremental(gpa, cells, ids, bytes)) |r|
+                break :blk r
+            else |err|
+                std.debug.print("  partition sidecar unusable ({s}); building fresh\n", .{@errorName(err)});
+        }
+        break :blk try geometry.partition.buildIncremental(gpa, cells, ids, null);
+    };
+    src.part = res.part;
+    // The partition borrows `cells` in order, so the index lines up with part.cells.
+    const mzi = try buildMaxZoomIndex(a, cells);
+    src.mz_order = mzi.order;
+    src.mz_bbox = mzi.bbox;
+    // Nothing swept ⇒ the sidecar already IS this partition; anything swept ⇒
+    // the C layer refreshes the file so the next open adopts everything.
+    src.part_loaded = res.swept == 0;
+    std.debug.print("compose: partition {d} face slots adopted, {d} swept\n", .{ res.adopted, res.swept });
+    // Decoder ring for the stats harness's cell[<index>] lines.
+    if (std.c.getenv("TILE57_PARTITION_STATS") != null) {
+        for (shims, 0..) |sh, i| std.debug.print("cell[{d}] {s} {s} cscl={d} floor={d} reach={d}\n", .{
+            i, sh.name, sh.date, cells[i].cscl, cells[i].band_floor, cells[i].reach,
+        });
     }
-    if (!loaded) src.part = try geometry.partition.build(gpa, cells);
-    src.part_loaded = loaded;
-    std.debug.print("compose: partition {s}\n", .{if (loaded) "LOADED from sidecar" else "BUILT fresh (no/stale sidecar)"});
 
     const names = try a.alloc([]const u8, shims.len);
     for (shims, 0..) |sh, i| names[i] = sh.name;
+    const dates = try a.alloc([]const u8, shims.len);
+    for (shims, 0..) |sh, i| dates[i] = sh.date;
 
     const fill_max = @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
     src.maps = maps;
     src.readers = readers;
     src.names = names;
+    src.dates = dates;
     src.owns_archives = owns_archives;
     src.minz = minz;
     src.maxz = maxz;
@@ -1275,6 +1383,77 @@ test "composeTile carries per-feature SCAMIN through the seam clip + re-encode" 
     }
     try std.testing.expect(seen_west);
     try std.testing.expect(seen_east);
+}
+
+test "maxZoomAt: indexed walk matches the exhaustive one" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A square ring [x0,x0+w] x [y0,y0+w] as one single-ring coverage feature.
+    const sq = struct {
+        fn f(al: std.mem.Allocator, x0: i64, y0: i64, w: i64) ![]const geometry.plane.Poly {
+            const P = geometry.plane.Pt;
+            const ring = try al.dupe(P, &.{
+                .{ .x = x0, .y = y0 },         .{ .x = x0 + w, .y = y0 },
+                .{ .x = x0 + w, .y = y0 + w }, .{ .x = x0, .y = y0 + w },
+            });
+            const rings = try al.dupe([]const P, &.{ring});
+            return try al.dupe(geometry.plane.Poly, &.{rings});
+        }
+    }.f;
+
+    // Overlapping cells of differing reach, deliberately NOT in reach order, plus
+    // a degenerate one (2-point ring: the ray cast skips it, so must the bbox).
+    const cells = try a.dupe(geometry.plane.Cell, &.{
+        .{ .cscl = 1, .band_floor = 0, .order = 0, .reach = 9, .cov1 = try sq(a, 0, 0, 100_000) },
+        .{ .cscl = 2, .band_floor = 0, .order = 1, .reach = 14, .cov1 = try sq(a, 20_000, 20_000, 30_000) },
+        .{ .cscl = 3, .band_floor = 0, .order = 2, .reach = 11, .cov1 = try sq(a, 10_000, 10_000, 80_000) },
+        .{ .cscl = 4, .band_floor = 0, .order = 3, .reach = 0, .cov1 = try sq(a, 0, 0, 100_000) },
+        .{ .cscl = 5, .band_floor = 0, .order = 4, .reach = 20, .cov1 = &.{} },
+    });
+
+    const mzi = try buildMaxZoomIndex(a, cells);
+    var src: ComposeSource = .{
+        .gpa = gpa,
+        .arena = std.heap.ArenaAllocator.init(gpa),
+        .maps = &.{},
+        .readers = &.{},
+        .part = .{ .gpa = gpa, .cells = cells, .tiers = &.{}, .maps = &.{} },
+        .mz_order = mzi.order,
+        .mz_bbox = mzi.bbox,
+        .minz = 0,
+        .maxz = 0,
+        .loop_max = 7,
+        .bounds = .{ 0, 0, 0, 0 },
+    };
+    defer src.arena.deinit();
+
+    // The pre-index implementation, kept here as the oracle.
+    const exhaustive = struct {
+        fn f(s: *const ComposeSource, px: i64, py: i64) u8 {
+            var best: u8 = 0;
+            for (s.part.cells) |c| {
+                if (c.reach <= best) continue;
+                if (pointInCoverage(px, py, c.cov1)) best = c.reach;
+            }
+            return if (best == 0) s.loop_max else best;
+        }
+    }.f;
+
+    // Deepest cell, mid cell, coarse-only ground, and off-coverage (-> loop_max).
+    const probes = [_][2]i64{
+        .{ 30_000, 30_000 }, .{ 60_000, 60_000 },   .{ 5_000, 5_000 },
+        .{ 95_000, 95_000 }, .{ 200_000, 200_000 }, .{ -5_000, 50_000 },
+    };
+    for (probes) |p| {
+        const lon = @as(f64, @floatFromInt(p[0])) / 1e7;
+        const lat = @as(f64, @floatFromInt(p[1])) / 1e7;
+        try std.testing.expectEqual(exhaustive(&src, p[0], p[1]), src.maxZoomAt(lon, lat));
+    }
+    try std.testing.expectEqual(@as(u8, 14), src.maxZoomAt(3e-3, 3e-3)); // inside the reach-14 square
+    try std.testing.expectEqual(@as(u8, 7), src.maxZoomAt(2e-2, 2e-2)); // outside every cell -> loop_max
 }
 
 // The integer value of `key` on a decoded feature, or null if absent.

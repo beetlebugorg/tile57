@@ -27,6 +27,32 @@ const colorprofile_registry = @import("colorprofile_registry");
 const gpa = std.heap.c_allocator;
 const Chart = chart.Chart;
 
+// One std.Io for the whole C ABI, stood up on first use and kept for the life
+// of the library.
+//
+// std.Io.Threaded.init installs PROCESS-GLOBAL SIGIO/SIGPIPE handlers and
+// deinit restores them. One per call therefore costs two sigaction round-trips
+// and a getCpuCount on EVERY entry — tile57_chart_open runs once per cell, so
+// thousands of times to open a library — and, worse, two threads opening at
+// once interleave those save/restores: a thread can capture the other's
+// temporary handler as "old" and reinstall it permanently. Sharing one instance
+// removes both. Threaded carries its own mutex for concurrent use.
+var io_inst: std.Io.Threaded = undefined;
+/// 0 = untouched, 1 = a thread is standing it up, 2 = ready.
+var io_state = std.atomic.Value(u8).init(0);
+
+fn sharedIo() std.Io {
+    if (io_state.load(.acquire) != 2) {
+        if (io_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            io_inst = .init(gpa, .{});
+            io_state.store(2, .release);
+        } else {
+            while (io_state.load(.acquire) != 2) {} // the winner is microseconds away
+        }
+    }
+    return io_inst.io();
+}
+
 // Wall-clock time for "today" date resolution in tile57_style_build. Zig 0.16
 // keeps the clock behind Io; the lib links libc, so call time(3) directly.
 extern fn time(tloc: ?*c_long) callconv(.c) c_long;
@@ -350,9 +376,7 @@ export fn tile57_bake_tree(
     const in_d = spanOpt(in_dir) orelse return failWith(err, .badarg, "in_dir must not be null");
     const out_d = spanOpt(out_dir) orelse return failWith(err, .badarg, "out_dir must not be null");
     // Stand up a threaded std.Io for the tree walk + the workers' file writes.
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const baked = chart.bakeTree(threaded.io(), in_d, out_d, null, workers, progress, progress_ctx) catch |e| return failCtx(err, e, in_d);
+    const baked = chart.bakeTree(sharedIo(), in_d, out_d, null, workers, progress, progress_ctx) catch |e| return failCtx(err, e, in_d);
     if (out_baked) |p| p.* = @intCast(baked);
     return OK;
 }
@@ -388,9 +412,7 @@ export fn tile57_bake_partition_debug(
     // The debug bake does filesystem I/O (read ENC_ROOT, write the pmtiles); the lib
     // has no std.process.Init, so stand up a threaded std.Io for the call. It streams
     // internally (StreamWriter over gpa), so pass the real gpa, not a scratch arena.
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const nc = bundle.bakePartitionDebug(threaded.io(), gpa, root, outp, minzoom, maxzoom, band) catch |e| {
+    const nc = bundle.bakePartitionDebug(sharedIo(), gpa, root, outp, minzoom, maxzoom, band) catch |e| {
         if (e == error.NoGeometry) return OK; // nothing covered: count stays 0
         return failCtx(err, e, root);
     };
@@ -408,9 +430,7 @@ export fn tile57_chart_open(path: ?[*:0]const u8, out: ?*?*Chart, err: ?*CError)
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = null;
     const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    o.* = chart.openPmtilesPath(threaded.io(), p) catch |e| return failCtx(err, e, p);
+    o.* = chart.openPmtilesPath(sharedIo(), p) catch |e| return failCtx(err, e, p);
     return OK;
 }
 
@@ -899,7 +919,14 @@ fn discoverSidecar(io: std.Io, chart_path: []const u8) Sidecar {
     while (dir) |d| : (up += 1) {
         if (up > 3) break; // <archive>/../../.. is as far as any sane layout nests
         const p = std.fs.path.join(gpa, &.{ d, "partition.tpart" }) catch return .{};
-        if (readSidecar(io, p)) |b| return .{ .bytes = b, .path = p } else |_| {}
+        if (readSidecar(io, p)) |b| {
+            std.debug.print("compose: sidecar {s} ({d} bytes)\n", .{ p, b.len });
+            return .{ .bytes = b, .path = p };
+        } else |e| if (e != error.FileNotFound) {
+            // A sidecar that EXISTS but cannot be read is a field fact worth a
+            // line — a silent miss here costs a full rebuild every open.
+            std.debug.print("compose: sidecar {s} unreadable ({s})\n", .{ p, @errorName(e) });
+        }
         gpa.free(p);
         dir = std.fs.path.dirname(d);
     }
@@ -926,7 +953,11 @@ const Sidecar = struct {
         const p = self.path orelse return;
         const bytes = src.serializePartition(gpa) catch return;
         defer gpa.free(bytes);
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = bytes }) catch {};
+        if (std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = bytes })) |_| {
+            std.debug.print("compose: sidecar refreshed {s}\n", .{p});
+        } else |e| {
+            std.debug.print("compose: sidecar refresh failed {s} ({s})\n", .{ p, @errorName(e) });
+        }
     }
 };
 
@@ -954,17 +985,16 @@ export fn tile57_compose_open(
 
     // Find the partition beside the archives. The lib has no std.process.Init, so
     // stand up a threaded std.Io for the read (nothing else here does file I/O).
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
+    const io = sharedIo();
     var sidecar: Sidecar = .{};
     defer sidecar.deinit();
     if (cs[0]) |c0| {
-        if (c0.source_path) |sp| sidecar = discoverSidecar(threaded.io(), sp);
+        if (c0.source_path) |sp| sidecar = discoverSidecar(io, sp);
     }
 
     const src = (compose.ComposeSource.open(gpa, archives[0..na], sidecar.bytes) catch |e| return fail(err, e)) orelse
         return failWith(err, .unsupported, "no chart carries per-cell coverage");
-    sidecar.refresh(threaded.io(), src);
+    sidecar.refresh(io, src);
     o.* = src;
     return OK;
 }
@@ -989,9 +1019,7 @@ export fn tile57_compose_tree(
 
     // The lib has no std.process.Init; stand up a threaded std.Io for the tree walk,
     // the per-archive mmaps and the partition-sidecar read.
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = sharedIo();
 
     // Collect every *.pmtiles path under `dir` — the SAME walk tile57_bake_tree uses,
     // matching *.pmtiles instead of *.000. Arena-owned; only live for the open below.
@@ -1283,9 +1311,7 @@ export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: ?*CAssets, err: ?
     o.* = .{};
     // The bundle emitters do filesystem I/O for an on-disk catalogue; the lib has no
     // std.process.Init, so stand up a threaded std.Io for the call.
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = sharedIo();
     // Scratch arena for generation; the final buffers are duped into gpa (C-owned).
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1310,9 +1336,7 @@ export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: ?*CAssets, err: ?
 export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, pixel_ratio: f64, out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = .{};
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = sharedIo();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1660,9 +1684,7 @@ export fn tile57_style_template(
     // filesystem I/O for an on-disk catalogue, so stand up a threaded std.Io; "" = embedded.
     var ls_arena = std.heap.ArenaAllocator.init(gpa);
     defer ls_arena.deinit();
-    var ls_threaded: std.Io.Threaded = .init(gpa, .{});
-    defer ls_threaded.deinit();
-    opts.linestyles_json = bundle.linestylesBytes(ls_threaded.io(), ls_arena.allocator(), "") catch null;
+    opts.linestyles_json = bundle.linestylesBytes(sharedIo(), ls_arena.allocator(), "") catch null;
     const style_json = style.json(gpa, opts) catch |e| return fail(err, e);
     return exportOut(err, o, n, style_json);
 }

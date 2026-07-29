@@ -196,12 +196,18 @@ fn overlaps(b0: [4]f64, b1: [4]f64) bool {
 // 65535-vertex-per-fill-segment cap. quantizeRingExact (no DP) is the fallback for
 // a ring DP would collapse below 3 points, so simplification never deletes a whole
 // still-renderable polygon. Returns the simplified ring, or empty if <3 vertices.
-fn clipSimplifyPoly(a: Allocator, proj: []const mvt.Point, box: tile.Box) ![]const mvt.Point {
+//
+// `detail` also carries the sub-pixel floor (tile.ringVisible): on a fill-down
+// tile a ring smaller than a couple of display pixels is dropped outright. The
+// floor is applied to the SIMPLIFIED ring — what would actually be emitted — and
+// only after the DP fallback, so the decision is made on final geometry.
+fn clipSimplifyPoly(a: Allocator, proj: []const mvt.Point, box: tile.Box, detail: tile.Detail) ![]const mvt.Point {
     const clipped = try tile.clipPolygon(a, proj, box);
     if (clipped.len < 3) return clipped[0..0];
-    var ring = try tile.simplifyRing(a, clipped);
+    var ring = try tile.simplifyRing(a, clipped, detail);
     if (ring.len < 3) ring = try tile.dedupCollinear(a, clipped); // DP over-collapsed
-    return if (ring.len >= 3) ring else clipped[0..0];
+    if (ring.len < 3) return clipped[0..0];
+    return if (tile.ringVisible(ring, detail)) ring else clipped[0..0];
 }
 
 // Coverage-clipped best-available composite:
@@ -424,7 +430,31 @@ pub const CellOpts = struct {
     /// ONLY the feature at this index, skipping every other feature in the cell.
     /// null = the normal whole-cell pass. See CellRef.only_fi.
     only_fi: ?usize = null,
+    /// How hard this cell's geometry is generalized into the tile. Set per cell
+    /// per tile by appendCellFeatures from the cell's own band window — full
+    /// resolution inside it, tile.Detail.fill_down below it — so it is never a
+    /// caller's choice and never varies within one cell's pass. See subBandFloor.
+    detail: tile.Detail = .native,
 };
+
+/// The zoom at which a cell of compilation scale `cscl` enters its own band's
+/// native window. At or above it the cell is being displayed at roughly the
+/// scale it was drawn for; below it the baker is filling down far past that
+/// scale, which is what both the sub-band SCAMIN cull and the fill-down
+/// generalization key on.
+pub fn subBandFloor(cscl: i32) u8 {
+    const band = @import("tiles").band;
+    return band.bandZooms(band.bandOf(cscl)).min;
+}
+
+/// The generalization a cell of compilation scale `cscl` gets at zoom `z`.
+/// Inside the cell's band window nothing changes — those tiles stay byte-for-byte
+/// what the baker has always produced. Below it the geometry is being stretched
+/// across a scale it was never compiled for, so it is simplified to the display's
+/// resolution instead of the source's (tile.Detail.fill_down).
+pub fn detailAt(z: u8, cscl: i32) tile.Detail {
+    return if (z < subBandFloor(cscl)) .fill_down else .native;
+}
 
 /// MVT/MLT surface: owns the 11 tile layer lists and implements the rs.Surface
 /// interface. The engine calls Surface methods (fillArea/strokeLine/…); this
@@ -1640,7 +1670,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
     if (f.prim == 3) {
         var rings = std.ArrayList([]const mvt.Point).empty;
         for (projected.items) |proj| {
-            const ring = try clipSimplifyPoly(a, proj, box);
+            const ring = try clipSimplifyPoly(a, proj, box, opts.detail);
             if (ring.len >= 3) try rings.append(a, ring);
         }
         // Best-available: cut this cell's fill where a finer cell covers the ground.
@@ -1723,7 +1753,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         else
             "dashed";
         const dash: rs.Dash = if (std.mem.eql(u8, dash_str, "solid")) .solid else .dashed;
-        try linestyle.drawPlainLine(a, stroke_proj, ln.color, ln.width, dash, box, &fmeta, valdco, surf);
+        try linestyle.drawPlainLine(a, stroke_proj, ln.color, ln.width, dash, box, opts.detail, &fmeta, valdco, surf);
     };
 
     if (!opts.suppress_points and p.texts.len > 0) {
@@ -1801,7 +1831,7 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        var sub = try tile.clipSimplifyLine(a, proj, box);
+        var sub = try tile.clipSimplifyLine(a, proj, box, opts.detail);
         if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -1862,7 +1892,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 
     // The masked complement (cell-limit stretches) rides along tagged, for the
     // meta-bounds view; the standard display filters the class out anyway.
-    if (masked_boundary) try emitMaskedBoundary(a, cell, f, fmeta, z, x, y, tb, box, surf);
+    if (masked_boundary) try emitMaskedBoundary(a, cell, f, fmeta, z, x, y, tb, box, opts.detail, surf);
     if (geo_parts.len == 0) return;
 
     // Best-available: cut the covered stretches before tessellating/stroking.
@@ -1880,7 +1910,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try tile.clipSimplifyLine(a, proj, box);
+        const sub = try tile.clipSimplifyLine(a, proj, box, opts.detail);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -1895,7 +1925,7 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
 /// masking alone leaves the toggle nothing to show. The standard display never
 /// renders it (the meta classes are filtered out unless meta-bounds is on), and
 /// the tag keeps the masked pieces letter-free in the styled view too.
-fn emitMaskedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, base: rs.FeatureMeta, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, surf: rs.Surface) !void {
+fn emitMaskedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, base: rs.FeatureMeta, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, detail: tile.Detail, surf: rs.Surface) !void {
     const masked_parts = cell.maskedLineParts(a, f) catch return;
     if (masked_parts.len == 0) return;
     var fmeta = base;
@@ -1912,7 +1942,7 @@ fn emitMaskedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, base: rs.Fea
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        const sub = try tile.clipSimplifyLine(a, proj, box);
+        const sub = try tile.clipSimplifyLine(a, proj, box, detail);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
         for (sub, 0..) |s, i| parts[i] = s;
@@ -1954,7 +1984,7 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |pt, i| proj[i] = tile.project(pt.lon(), pt.lat(), z, x, y, tile.EXTENT);
-        var sub = try tile.clipSimplifyLine(a, proj, box);
+        var sub = try tile.clipSimplifyLine(a, proj, box, opts.detail);
         if (opts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
         if (sub.len == 0) continue;
         const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -1990,7 +2020,7 @@ fn emitOverscaleHatch(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         if (!overlaps(geomBounds(gp), tb)) continue;
         const proj = try a.alloc(mvt.Point, gp.len);
         for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-        const ring = try clipSimplifyPoly(a, proj, box);
+        const ring = try clipSimplifyPoly(a, proj, box, opts.detail);
         if (ring.len >= 3) try rings.append(a, ring);
     }
     if (rings.items.len == 0) return;
@@ -2297,7 +2327,15 @@ fn appendCellFeatures(
     // tile's most permissive display denominator (its highest-|lat| edge) with
     // one zoom of slack, so the cull stays strictly looser than any client
     // gate-latitude choice; SCAMIN-less features always pass.
-    const subband_floor = @import("tiles").band.bandZooms(@import("tiles").band.bandOf(cell.params.cscl)).min;
+    const subband_floor = subBandFloor(cell.params.cscl);
+    // Sub-band generalization: the same fill-up tiles the SCAMIN cull thins also
+    // carry their surviving geometry at the source's resolution rather than the
+    // display's — a coastline digitized for 1:20,000 keeps every half-pixel wiggle
+    // when it is drawn at 1:35,000,000, and thousands of islands, obstructions and
+    // depth-area slivers tessellate to triangles under a pixel. Below the band
+    // window the geometry is generalized to what the display can resolve; inside
+    // it nothing changes (see detailAt).
+    const detail = detailAt(z, cell.params.cscl);
     const subband_min_denom: f64 = if (z < subband_floor) blk: {
         const max_abs_lat = @max(@abs(tb[1]), @abs(tb[3]));
         const k = @import("style").scaminGateK(max_abs_lat);
@@ -2333,6 +2371,7 @@ fn appendCellFeatures(
             if (b[2] < tb[0] - ml or b[0] > tb[2] + ml or b[3] < tb[1] - mt or b[1] > tb[3] + mt) continue;
         };
         var fopts = opts;
+        fopts.detail = detail;
         // Coverage-clipped best-available composite (point half): where a finer
         // cell's M_COVR contains this feature's position, drop its symbols/text.
         // A POINT tests its own node geometry — exact, and independent of the
@@ -2441,7 +2480,7 @@ fn appendCellFeatures(
                 if (!overlaps(geomBounds(gp), tb)) continue;
                 const proj = try a.alloc(mvt.Point, gp.len);
                 for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-                const ring = try clipSimplifyPoly(a, proj, box);
+                const ring = try clipSimplifyPoly(a, proj, box, fopts.detail);
                 if (ring.len >= 3) try rings.append(a, ring);
             }
             if (rings.items.len == 0) continue;
@@ -2463,7 +2502,7 @@ fn appendCellFeatures(
             if (!overlaps(geomBounds(gp), tb)) continue;
             const proj = try a.alloc(mvt.Point, gp.len);
             for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
-            var sub = try tile.clipSimplifyLine(a, proj, box);
+            var sub = try tile.clipSimplifyLine(a, proj, box, fopts.detail);
             if (fopts.cover_clip) |cc| sub = clipRunsOutsideCover(a, sub, cc);
             if (sub.len == 0) continue;
             const parts = try a.alloc([]const mvt.Point, sub.len);
@@ -2786,6 +2825,98 @@ test "processFeatureInstr tags bnd 1/0 when an area's plain boundary differs" {
     try std.testing.expectEqual(@as(usize, 2), ms.lines.items.len);
     try std.testing.expectEqual(@as(i64, 1), findProp(ms.lines.items[0].properties, "bnd").?.int);
     try std.testing.expectEqual(@as(i64, 0), findProp(ms.lines.items[1].properties, "bnd").?.int);
+}
+
+test "detailAt: generalize only BELOW the chart's own band window" {
+    const t = std.testing;
+    // A general-band chart (1:1,200,000) opens its window at z7.
+    try t.expectEqual(@as(u8, 7), subBandFloor(1_200_000));
+    try t.expectEqual(tile.Detail.fill_down, detailAt(0, 1_200_000));
+    try t.expectEqual(tile.Detail.fill_down, detailAt(6, 1_200_000));
+    try t.expectEqual(tile.Detail.native, detailAt(7, 1_200_000)); // the floor is native
+    try t.expectEqual(tile.Detail.native, detailAt(9, 1_200_000));
+    try t.expectEqual(tile.Detail.native, detailAt(14, 1_200_000)); // and so is overzoom
+    // A harbour chart (1:20,000) opens at z13, so its whole low-zoom fill generalizes.
+    try t.expectEqual(@as(u8, 13), subBandFloor(20_000));
+    try t.expectEqual(tile.Detail.fill_down, detailAt(12, 20_000));
+    try t.expectEqual(tile.Detail.native, detailAt(13, 20_000));
+    // An overview chart's window starts at z0: it has no fill-down zooms at all,
+    // so nothing it bakes is ever generalized.
+    try t.expectEqual(@as(u8, 0), subBandFloor(3_000_000));
+    try t.expectEqual(tile.Detail.native, detailAt(0, 3_000_000));
+    try t.expectEqual(tile.Detail.native, detailAt(4, 3_000_000));
+}
+
+test "fill-down drops a sub-pixel ring; the band window keeps it, byte for byte" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var cell = s57.Cell{
+        .params = .{ .cscl = 1_200_000 }, // general band: window opens at z7
+        .vectors = &.{},
+        .features = &.{},
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(gpa),
+        .edges = std.AutoHashMap(u32, usize).init(gpa),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(gpa),
+        .arena = std.heap.ArenaAllocator.init(gpa),
+    };
+    defer cell.deinit();
+
+    // Two depth areas over the same spot: a 1-degree square (huge at any zoom) and
+    // a 0.01-degree speck. At z7 the speck is ~14 extent units on a side — over the
+    // 2 display px^2 floor; at z6 it is half that, a quarter of the area, under it.
+    const square = struct {
+        fn at(alloc: Allocator, lon: f64, lat: f64, side: f64) ![]s57.LonLat {
+            return alloc.dupe(s57.LonLat, &[_]s57.LonLat{
+                s57.LonLat.init(lon, lat),               s57.LonLat.init(lon + side, lat),
+                s57.LonLat.init(lon + side, lat + side), s57.LonLat.init(lon, lat + side),
+                s57.LonLat.init(lon, lat),
+            });
+        }
+    }.at;
+    const geo = try a.alloc(?[][]s57.LonLat, 2);
+    for ([_]f64{ 1.0, 0.01 }, 0..) |side, i| {
+        const parts = try a.alloc([]s57.LonLat, 1);
+        parts[0] = try square(a, 0.02, 0.02, side);
+        geo[i] = parts;
+    }
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 42 },
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 42 },
+    };
+    cell.features = &feats;
+    const streams = [_]?[]const u8{ "ColorFill:DEPVS", "ColorFill:DEPVS" };
+
+    const areaCount = struct {
+        fn f(alloc: Allocator, bytes: []const u8) !usize {
+            var n: usize = 0;
+            for (try mvt.decode(alloc, bytes)) |layer| {
+                if (!std.mem.eql(u8, layer.name, "areas")) continue;
+                n += layer.features.len;
+            }
+            return n;
+        }
+    }.f;
+
+    const one = [_]CellRef{.{ .cell = &cell, .portrayal = &streams, .geo = geo }};
+    // z7/64/63 and z6/32/31 both contain 0.02 N, 0.02 E.
+    const native = try encodeTile(a, a, &one, 7, 64, 63, .mvt, true);
+    const filled = try encodeTile(a, a, &one, 6, 32, 31, .mvt, true);
+    try std.testing.expectEqual(@as(usize, 2), try areaCount(a, native)); // both kept
+    try std.testing.expectEqual(@as(usize, 1), try areaCount(a, filled)); // speck culled
+
+    // The native tile is bit-stable: re-encoding it byte-for-byte reproduces it, and
+    // — the scope guarantee — so does encoding it as an OVERVIEW chart, for which
+    // the very same z6 tile is inside the band window. Generalization is reachable
+    // only below a chart's own window; nothing at or above it moves.
+    try std.testing.expectEqualSlices(u8, native, try encodeTile(a, a, &one, 7, 64, 63, .mvt, true));
+    cell.params.cscl = 3_000_000; // overview: window opens at z0
+    try std.testing.expectEqualSlices(u8, native, try encodeTile(a, a, &one, 7, 64, 63, .mvt, true));
+    const overview_z6 = try encodeTile(a, a, &one, 6, 32, 31, .mvt, true);
+    try std.testing.expectEqual(@as(usize, 2), try areaCount(a, overview_z6));
+    try std.testing.expect(overview_z6.len != filled.len);
 }
 
 test "generate a tile from a cell is well-formed MVT" {

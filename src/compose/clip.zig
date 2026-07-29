@@ -69,17 +69,99 @@ pub fn isMaskedBoundary(feat: mvt.DecodedFeature) bool {
     return false;
 }
 
+/// A feature whose bbox, grown by FAR_TEST, meets no face edge lies wholly on one
+/// side of the face boundary — so clipping it to the face is decided without ANY
+/// geometry: wholly outside clips to nothing, wholly inside is the identity and
+/// the feature passes through untouched. Only boundary-NEAR features (a small
+/// minority on a real seam tile) pay the real clip. The margin keeps the deciding
+/// vertex clear of the boundary, where an even-odd test would be edge-dependent.
+const FAR_TEST: i64 = 20;
+
+fn featureBox(feat: mvt.DecodedFeature) ?plane.Box {
+    var bb: ?plane.Box = null;
+    for (feat.parts) |part| for (part) |p| {
+        if (bb) |*b| {
+            b.min_x = @min(b.min_x, p.x);
+            b.min_y = @min(b.min_y, p.y);
+            b.max_x = @max(b.max_x, p.x);
+            b.max_y = @max(b.max_y, p.y);
+        } else bb = .{ .min_x = p.x, .min_y = p.y, .max_x = p.x, .max_y = p.y };
+    };
+    return bb;
+}
+
+/// Where a feature stands relative to the face boundary. `.near` also covers
+/// "no grid" and "no geometry" — anything that must take the real clip.
+const FaceSide = enum { near, outside, inside };
+
+fn faceSide(feat: mvt.DecodedFeature, face: []const []const Pt, grid: ?*const plane.EdgeGrid) FaceSide {
+    const g = grid orelse return .near;
+    const bb = featureBox(feat) orelse return .near;
+    if (g.crossesBox(.{
+        .min_x = bb.min_x - FAR_TEST,
+        .min_y = bb.min_y - FAR_TEST,
+        .max_x = bb.max_x + FAR_TEST,
+        .max_y = bb.max_y + FAR_TEST,
+    })) return .near;
+    // The whole bbox is on one side of the boundary, so any vertex decides —
+    // and it is FAR_TEST clear of every face edge, never on one.
+    const p0 = for (feat.parts) |part| {
+        if (part.len > 0) break part[0];
+    } else return .near;
+    return if (boolean.pointInEvenOdd(face, p0.x, p0.y)) .inside else .outside;
+}
+
+/// Pass a wholly-inside feature through the clip untouched: geometry duped into
+/// `a` (properties stay borrowed, as with every clipped survivor). Parts below
+/// the geometry's minimum arity are dropped, exactly as the real clip would.
+fn passThrough(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature), feat: mvt.DecodedFeature) !void {
+    const min_len: usize = switch (feat.geom_type) {
+        .polygon => 3,
+        .linestring => 2,
+        else => 1,
+    };
+    var parts = std.ArrayList([]const mvt.Point).empty;
+    for (feat.parts) |part| {
+        if (part.len < min_len) continue;
+        try parts.append(a, try a.dupe(mvt.Point, part));
+    }
+    if (parts.items.len == 0) return;
+    try out.append(a, .{ .geom_type = feat.geom_type, .parts = try parts.toOwnedSlice(a), .properties = feat.properties });
+}
+
 /// Clip `feat` (tile-pixel space) to `face` (the cell's owned rings, tile-pixel space) and
 /// append the surviving feature(s) to `out`, or nothing if the feature is entirely outside
 /// the face. Geometry is freshly allocated in `a`; `properties` are borrowed from `feat`.
 /// `face` must be a simple even-odd ring-set (as `partition.ownedFace` emits). One
 /// exception to face ownership: LIGHTS sector figures are kept whole (see isLightFigure).
-pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature), feat: mvt.DecodedFeature, face: []const []const Pt) !void {
+/// `grid`, when supplied, must index exactly `face`'s edges (plane.EdgeGrid over the same
+/// rings); it lets boundary-far features skip the clip machinery entirely (see faceSide).
+pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature), feat: mvt.DecodedFeature, face: []const []const Pt, grid: ?*const plane.EdgeGrid) !void {
     switch (feat.geom_type) {
         .polygon => {
+            switch (faceSide(feat, face, grid)) {
+                .outside => return,
+                .inside => return passThrough(a, out, feat),
+                .near => {},
+            }
             const poly = try a.alloc([]const Pt, feat.parts.len);
             for (feat.parts, 0..) |ring, i| poly[i] = try widenRing(a, ring);
-            const clipped = try boolean.compute(a, poly, face, .intersect);
+            // The intersection lives inside the feature's bbox, so the sweep
+            // only ever needs the face's geometry THERE: rect-clipping the face
+            // to the bbox first is linear and exact (poly ⊆ rect makes
+            // poly ∩ (face ∩ rect) = poly ∩ face), and a boundary-near feature
+            // then sweeps against dozens of face edges instead of the whole
+            // face's hundreds.
+            const f = if (featureBox(feat)) |bb| blk: {
+                const clipped_face = try plane.rectClipRings(a, face, .{
+                    .min_x = bb.min_x - FAR_TEST,
+                    .min_y = bb.min_y - FAR_TEST,
+                    .max_x = bb.max_x + FAR_TEST,
+                    .max_y = bb.max_y + FAR_TEST,
+                });
+                break :blk @as([]const []const Pt, clipped_face);
+            } else face;
+            const clipped = try boolean.compute(a, poly, f, .intersect);
             if (clipped.len == 0) return;
             const parts = try a.alloc([]const mvt.Point, clipped.len);
             for (clipped, 0..) |ring, i| parts[i] = try narrowRing(a, ring);
@@ -97,9 +179,17 @@ pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature),
                 try out.append(a, .{ .geom_type = .linestring, .parts = parts, .properties = feat.properties });
                 return;
             }
+            switch (faceSide(feat, face, grid)) {
+                .outside => return,
+                .inside => return passThrough(a, out, feat),
+                .near => {},
+            }
             var parts = std.ArrayList([]const mvt.Point).empty;
             for (feat.parts) |part| {
-                const runs = try plane.clipLineInsidePolys(a, try widenRing(a, part), face);
+                const runs = if (grid) |g|
+                    try plane.clipLineInsidePolysGrid(a, try widenRing(a, part), face, g)
+                else
+                    try plane.clipLineInsidePolys(a, try widenRing(a, part), face);
                 for (runs) |run| {
                     if (run.len >= 2) try parts.append(a, try narrowRing(a, run));
                 }
@@ -109,6 +199,11 @@ pub fn clipFeatureToFace(a: std.mem.Allocator, out: *std.ArrayList(mvt.Feature),
         },
         .point => {
             // MVT points: one part per point. Keep the parts whose node is inside the face.
+            switch (faceSide(feat, face, grid)) {
+                .outside => return,
+                .inside => return passThrough(a, out, feat),
+                .near => {},
+            }
             var parts = std.ArrayList([]const mvt.Point).empty;
             for (feat.parts) |part| {
                 if (part.len == 0) continue;
@@ -195,7 +290,7 @@ test "clipFeatureToFace: area is intersected with the face" {
     const face = try boxFace(a, 1000, 1000, 3000, 3000);
 
     var out = std.ArrayList(mvt.Feature).empty;
-    try clipFeatureToFace(a, &out, feat, face);
+    try clipFeatureToFace(a, &out, feat, face, null);
     try testing.expectEqual(@as(usize, 1), out.items.len);
 
     // Widen the output back and check: (2000,2000) inside, (500,500) outside.
@@ -219,7 +314,7 @@ test "clipFeatureToFace: point kept iff inside the face" {
     const face = try boxFace(a, 1000, 1000, 3000, 3000);
 
     var out = std.ArrayList(mvt.Feature).empty;
-    try clipFeatureToFace(a, &out, feat, face);
+    try clipFeatureToFace(a, &out, feat, face, null);
     try testing.expectEqual(@as(usize, 1), out.items.len); // the feature survives
     try testing.expectEqual(@as(usize, 1), out.items[0].parts.len); // only the inside point
     try testing.expectEqual(@as(i32, 2000), out.items[0].parts[0][0].x);
@@ -238,7 +333,7 @@ test "clipFeatureToFace: line clipped to the part inside the face" {
     const face = try boxFace(a, 1000, 1000, 3000, 3000);
 
     var out = std.ArrayList(mvt.Feature).empty;
-    try clipFeatureToFace(a, &out, feat, face);
+    try clipFeatureToFace(a, &out, feat, face, null);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     const kept = out.items[0].parts[0];
     try testing.expectEqual(@as(i32, 1000), @min(kept[0].x, kept[kept.len - 1].x));
@@ -261,7 +356,7 @@ test "clipFeatureToFace: a masked meta-bounds outline is kept whole, not clipped
     const face = try boxFace(a, 1000, 1000, 3000, 3000);
 
     var out = std.ArrayList(mvt.Feature).empty;
-    try clipFeatureToFace(a, &out, feat, face);
+    try clipFeatureToFace(a, &out, feat, face, null);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     const kept = out.items[0].parts[0];
     try testing.expectEqual(@as(usize, 2), kept.len); // untouched: both original endpoints survive
@@ -279,8 +374,105 @@ test "clipFeatureToFace: feature entirely outside the face is dropped" {
     const face = try boxFace(a, 1000, 1000, 3000, 3000);
 
     var out = std.ArrayList(mvt.Feature).empty;
-    try clipFeatureToFace(a, &out, feat, face);
+    try clipFeatureToFace(a, &out, feat, face, null);
     try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+fn expectSameFeatures(x: []const mvt.Feature, y: []const mvt.Feature) !void {
+    try testing.expectEqual(x.len, y.len);
+    for (x, y) |fx, fy| {
+        try testing.expectEqual(fx.geom_type, fy.geom_type);
+        try testing.expectEqual(fx.parts.len, fy.parts.len);
+        for (fx.parts, fy.parts) |px, py| {
+            try testing.expectEqual(px.len, py.len);
+            for (px, py) |pa, pb| {
+                try testing.expectEqual(pa.x, pb.x);
+                try testing.expectEqual(pa.y, pb.y);
+            }
+        }
+    }
+}
+
+test "clipFeatureToFace: boundary-far features pass through whole; outside drops" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A jagged face: the tile-sized box with a notch cut into its top edge, so
+    // the boundary is not a plain rect. Every feature below keeps >= FAR_TEST
+    // clear of all of it (or sits inside the notch, wholly outside the face).
+    const fr = try a.alloc(Pt, 8);
+    fr[0] = .{ .x = 0, .y = 0 };
+    fr[1] = .{ .x = 4000, .y = 0 };
+    fr[2] = .{ .x = 4000, .y = 4000 };
+    fr[3] = .{ .x = 2100, .y = 4000 };
+    fr[4] = .{ .x = 2100, .y = 3500 };
+    fr[5] = .{ .x = 1900, .y = 3500 };
+    fr[6] = .{ .x = 1900, .y = 4000 };
+    fr[7] = .{ .x = 0, .y = 4000 };
+    const face = try a.alloc([]const Pt, 1);
+    face[0] = fr;
+    var grid = try plane.EdgeGrid.init(a, face, 512);
+    defer grid.deinit();
+
+    // Wholly-inside features come back geometry-identical to their input — the
+    // clip is the identity there, holes, duplicate vertices, tangles and all.
+    const bowtie = try boxRing(a, 0, 0, 0, 0);
+    bowtie[0] = .{ .x = 1000, .y = 1000 };
+    bowtie[1] = .{ .x = 1400, .y = 1400 };
+    bowtie[2] = .{ .x = 1400, .y = 1000 };
+    bowtie[3] = .{ .x = 1000, .y = 1400 };
+    const outer = try boxRing(a, 1000, 1000, 1400, 1400);
+    const hole = try boxRing(a, 1100, 1100, 1300, 1300);
+    const line = try a.alloc(mvt.Point, 4);
+    line[0] = .{ .x = 1000, .y = 1000 };
+    line[1] = .{ .x = 1000, .y = 1000 };
+    line[2] = .{ .x = 1200, .y = 1250 };
+    line[3] = .{ .x = 1399, .y = 1001 };
+    const pt0 = try a.alloc(mvt.Point, 1);
+    pt0[0] = .{ .x = 1050, .y = 1050 };
+    const pt1 = try a.alloc(mvt.Point, 1);
+    pt1[0] = .{ .x = 1350, .y = 1350 };
+    const inside_feats = [_]mvt.DecodedFeature{
+        try decoded(a, .polygon, &.{bowtie}),
+        try decoded(a, .polygon, &.{ outer, hole }),
+        try decoded(a, .linestring, &.{line}),
+        try decoded(a, .point, &.{ pt0, pt1 }),
+    };
+    for (inside_feats) |feat| {
+        var fast = std.ArrayList(mvt.Feature).empty;
+        try clipFeatureToFace(a, &fast, feat, face, &grid);
+        try testing.expectEqual(@as(usize, 1), fast.items.len);
+        const got = fast.items[0];
+        try testing.expectEqual(feat.parts.len, got.parts.len);
+        for (feat.parts, got.parts) |want, have| {
+            try testing.expectEqual(want.len, have.len);
+            for (want, have) |wp, hp| {
+                try testing.expectEqual(wp.x, hp.x);
+                try testing.expectEqual(wp.y, hp.y);
+            }
+        }
+    }
+
+    // Inside the notch: wholly outside the face, still far from its edges — dropped.
+    const in_notch = try boxRing(a, 1950, 3600, 2050, 3700);
+    var dropped = std.ArrayList(mvt.Feature).empty;
+    try clipFeatureToFace(a, &dropped, try decoded(a, .polygon, &.{in_notch}), face, &grid);
+    try testing.expectEqual(@as(usize, 0), dropped.items.len);
+
+    // Boundary-NEAR (straddles the notch edge): the grid path falls through to
+    // the real clip and matches the no-grid result exactly.
+    const straddle = try boxRing(a, 1800, 3300, 2000, 3800);
+    const nf = try decoded(a, .polygon, &.{straddle});
+    var with_grid = std.ArrayList(mvt.Feature).empty;
+    try clipFeatureToFace(a, &with_grid, nf, face, &grid);
+    var no_grid = std.ArrayList(mvt.Feature).empty;
+    try clipFeatureToFace(a, &no_grid, nf, face, null);
+    try testing.expectEqual(no_grid.items.len, with_grid.items.len);
+    for (no_grid.items, with_grid.items) |want, have| {
+        try testing.expectEqual(want.parts.len, have.parts.len);
+        for (want.parts, have.parts) |wp, hp| try testing.expectEqual(wp.len, hp.len);
+    }
 }
 
 test "projectFace: a lon/lat face box inside the tile lands vertex-for-vertex at tile.project" {

@@ -78,6 +78,8 @@ pub const TextStyle = struct {
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
 /// beginFeature / endFeature. All pick data is pre-computed by the engine so
 /// surfaces need not import s57/s101.
+pub const BAND_UNKNOWN: u8 = 255;
+
 pub const FeatureMeta = struct {
     display_priority: i64 = 0,
     /// S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar. Outranks
@@ -97,7 +99,9 @@ pub const FeatureMeta = struct {
     class: []const u8 = "", // S-57 object-class acronym (e.g. "LIGHTS")
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""
     cell_name: []const u8 = "", // source ENC cell name or ""
-    band: u8 = 0, // NOAA navigational band (0 = finest)
+    /// Usage band (tiles.band.Band ordinal) of the SOURCE cell, or BAND_UNKNOWN
+    /// when the feature carries none — unknown never counts as fill-down.
+    band: u8 = BAND_UNKNOWN,
     date_start: []const u8 = "",
     date_end: []const u8 = "",
     // S-52 boundary (§8.6.1) and point-symbol (§11.2.2) variant tags:
@@ -178,16 +182,23 @@ pub const Surface = struct {
     }
 
     /// The S-52 effective safety contour against a tile's ladder: the least
-    /// available value >= the mariner's, else the deepest available, else the
-    /// mariner's own (no ladder to snap to). Shared by every render surface.
+    /// available value >= the mariner's, else the mariner's own. Shared by every
+    /// render surface.
+    ///
+    /// The snap only ever goes DEEPER. Falling back to the deepest available rung
+    /// (the old behaviour) could only fire when EVERY rung is shallower than the
+    /// mariner asked for — if any were deeper, `next` would have matched it — so
+    /// it always snapped the split DOWN and shaded water as safer than requested.
+    /// The ladder is scanned per TILE, which made that misfire constantly: a tile
+    /// holding only a drval1=0 depth area (open sound, contours all in the
+    /// neighbouring tiles) snapped safety to 0 and painted every fill DEPMD, one
+    /// tile-shaped box of wrong shade against its neighbours.
     pub fn effectiveSafety(safety: f64, ladder: []const f64) f64 {
         var next: ?f64 = null;
-        var deepest: ?f64 = null;
         for (ladder) |v| {
-            if (deepest == null or v > deepest.?) deepest = v;
             if (v >= safety and (next == null or v < next.?)) next = v;
         }
-        return next orelse (deepest orelse safety);
+        return next orelse safety;
     }
 
     pub fn beginScene(self: Surface, z: u8) anyerror!void {
@@ -235,7 +246,7 @@ pub const Surface = struct {
     }
 };
 
-test "effectiveSafety: next-deeper snap, deepest fallback, empty ladder" {
+test "effectiveSafety: next-deeper snap, never shallower, empty ladder" {
     const t = @import("std").testing;
     const ladder = [_]f64{ 2, 5.4, 9.1, 18.2, 30 };
     // exact hit stays
@@ -243,8 +254,11 @@ test "effectiveSafety: next-deeper snap, deepest fallback, empty ladder" {
     // between rungs -> next DEEPER
     try t.expectEqual(@as(f64, 18.2), Surface.effectiveSafety(10, &ladder));
     try t.expectEqual(@as(f64, 5.4), Surface.effectiveSafety(2.2, &ladder));
-    // deeper than everything -> deepest available
-    try t.expectEqual(@as(f64, 30), Surface.effectiveSafety(50, &ladder));
+    // deeper than everything -> the mariner's own value, NEVER a shallower rung:
+    // snapping down would shade unsafe water in a safe shade
+    try t.expectEqual(@as(f64, 50), Surface.effectiveSafety(50, &ladder));
+    // a lone shallow rung (the tile-shaped-box case) must not drag the split to 0
+    try t.expectEqual(@as(f64, 10), Surface.effectiveSafety(10, &.{0}));
     // no ladder -> the mariner's own value
     try t.expectEqual(@as(f64, 7), Surface.effectiveSafety(7, &.{}));
 }

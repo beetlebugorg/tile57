@@ -1,4 +1,4 @@
-//! `compose-tile <archive-dir> <z> <x> <y> [--load-partition FILE] [-o out] [--bench N]` — serve one
+//! `compose-tile <archive-dir> <z> <x> <y> [--load-partition FILE] [--save-partition FILE] [-o out] [--bench N]` — serve one
 //! composed tile ON DEMAND from a resident ownership partition + mmap'd per-cell archives (the
 //! runtime-compositor path), byte-identical to the batch. `--bench N` then serves an N×N tile block
 //! around (x,y) to report per-tile serving latency, amortising the one-time open.
@@ -30,6 +30,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var ys: ?[]const u8 = null;
     var out: ?[]const u8 = null;
     var load_partition: ?[]const u8 = null;
+    var save_partition: ?[]const u8 = null;
     var bench: u32 = 0;
     var scan: ?[]const u8 = null;
 
@@ -39,6 +40,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             out = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--load-partition")) {
             load_partition = f.val(arg) orelse return;
+        } else if (std.mem.eql(u8, arg, "--save-partition")) {
+            save_partition = f.val(arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--bench")) {
             bench = f.int(u32, arg) orelse return;
         } else if (std.mem.eql(u8, arg, "--scan")) {
@@ -118,6 +121,15 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer src.deinit();
     const open_ms = @as(f64, @floatFromInt(nowNs(io) - open_t0)) / 1e6;
     std.debug.print("opened {d} cell(s), partition {s}, in {d:.1} ms (serve z {d}..{d})\n", .{ src.readers.len, if (load_bytes != null) "loaded" else "built", open_ms, src.minz, src.loop_max });
+
+    // Byte-comparison oracle for partition-build changes: dump the resident
+    // partition exactly as a sidecar write would.
+    if (save_partition) |sp| {
+        const blob = try src.serializePartition(a);
+        defer a.free(blob);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = blob });
+        std.debug.print("saved partition: {s} ({d} bytes)\n", .{ sp, blob.len });
+    }
 
     // Artifact sweep: compose every in-bounds tile at the scan zooms and report
     // each one whose clip dead-ended a ring walk (open chain ⇒ chord artifact).

@@ -4,6 +4,7 @@ const style = @import("style");
 const sprite = @import("sprite");
 const render = @import("render");
 const chart = @import("chart");
+const compose = @import("compose"); // the runtime compositor, for a whole baked library
 const catalog_embed = @import("catalog"); // embedded portrayal assets (colour profile)
 const common = @import("common.zig");
 const Flags = common.Flags;
@@ -14,8 +15,24 @@ const usageErr = common.usageErr;
 extern fn tg_colorprofile_override(len: *usize) callconv(.c) ?[*]const u8;
 const resolveRulesDir = common.resolveRulesDir;
 
+/// Every *.pmtiles under `dir`, recursively — the charts a baked library's
+/// compositor is opened over.
+fn archivePaths(io: std.Io, a: std.mem.Allocator, dir: []const u8) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return out.items;
+    defer d.close(io);
+    var walker = d.walk(a) catch return out.items;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".pmtiles")) continue;
+        try out.append(a, try std.fs.path.join(a, &.{ dir, entry.path }));
+    }
+    return out.items;
+}
+
 // tile57 png|pdf <cell.000 | bundle.pmtiles> <z> <x> <y> -o <out> [flags]  (one tile)
 // tile57 png|pdf <source> --view <lon,lat,zoom> --size WxH -o <out> [flags] (a view)
+// tile57 png|pdf <baked-library-dir> --view <lon,lat,zoom> -o <out> [flags]  (composed)
 // The render-engine pixel path: parse + portray a cell (or replay a baked
 // PMTiles bundle), drive the engine through PixelSurface -> RasterCanvas ->
 // PNG, or the same op stream -> PdfCanvas -> a deterministic vector PDF with
@@ -114,16 +131,31 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
     const out = out_path orelse return usageErr("-o <out.png> is required");
     if (!tile_mode and view == null) return usageErr("--view lon,lat,zoom is required without z x y");
 
-    // Baked tiles are the only multi-cell path: an ENC_ROOT is baked first,
-    // then the bundle's .pmtiles is rendered (tile replay) — the live quilted
-    // view renderer is gone with the rest of the live tile path.
+    // Baked tiles are the only multi-cell path: an ENC_ROOT is baked first, then
+    // rendered — either one chart's .pmtiles (tile replay) or, for a whole baked
+    // library directory, the compositor's view over every chart in it.
     const is_dir = blk: {
         var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch break :blk false;
         d.close(io);
         break :blk true;
     };
     if (is_dir) {
-        std.debug.print("ENC_ROOT live rendering removed — bake first:\n  tile57 bake {s} -o <out>\n  tile57 {s} <out>/tiles/chart.pmtiles --view ... -o {s}\n", .{ path, @tagName(output), out });
+        const v = view orelse return usageErr("a baked library directory needs --view lon,lat,zoom");
+        const paths = try archivePaths(io, a, path);
+        if (paths.len == 0) {
+            std.debug.print("no *.pmtiles under {s} — bake first:\n  tile57 bake {s} -o <out>\n  tile57 {s} <out> --view {d},{d},{d} -o {s}\n", .{ path, path, @tagName(output), v.lon, v.lat, v.zoom, out });
+            return;
+        }
+        const src = (compose.ComposeSource.openFiles(io, a, paths, null) catch return usageErr("cannot open the baked library")) orelse
+            return usageErr("no chart in the library carries coverage");
+        defer src.deinit();
+        m.data_quality = dq;
+        m.size_scale = size_scale;
+        const settings = m;
+        const bytes = try chart.renderComposeView(src, v.lon, v.lat, v.zoom, size_w, size_h, palette, &settings, output, null);
+        defer chart.freeBytes(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out, .data = bytes });
+        std.debug.print("{s}: {d} chart(s), {d}x{d} at {d},{d} z{d} -> {d} bytes\n", .{ out, paths.len, size_w, size_h, v.lon, v.lat, v.zoom, bytes.len });
         return;
     }
 

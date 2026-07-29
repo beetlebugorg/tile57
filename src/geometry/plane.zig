@@ -24,6 +24,7 @@
 //! and unit-testable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const boolean = @import("boolean.zig");
 
@@ -203,6 +204,216 @@ fn bboxOverlap(a: [4]i64, b: [4]i64) bool {
     return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3];
 }
 
+/// For each order position k: the ascending positions j<k whose bbox overlaps
+/// k's — the cell's diff subtrahends, in application order. A uniform grid over
+/// the bboxes makes enumeration output-sensitive instead of the O(m²) all-pairs
+/// scan; the lists are IDENTICAL to that scan's (asserted by the test below),
+/// so the diff chains — and their bytes — are unchanged.
+pub fn subtrahendLists(sa: Allocator, bbs: []const [4]i64) ![]const []const u32 {
+    const m = bbs.len;
+    const lists = try sa.alloc([]const u32, m);
+    for (lists) |*l| l.* = &.{};
+    if (m == 0) return lists;
+
+    // Data extent over valid bboxes. A cell whose coverage emptied has an
+    // inverted bbox: it overlaps nothing and nothing overlaps it — skipped on
+    // insert, and its own query yields the empty list, exactly like the scan.
+    var ext = [4]i64{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+    var any = false;
+    for (bbs) |b| {
+        if (b[0] > b[2] or b[1] > b[3]) continue;
+        any = true;
+        ext[0] = @min(ext[0], b[0]);
+        ext[1] = @min(ext[1], b[1]);
+        ext[2] = @max(ext[2], b[2]);
+        ext[3] = @max(ext[3], b[3]);
+    }
+    if (!any) return lists;
+
+    // ~256 buckets per axis. A cell spanning more than 64 buckets per axis
+    // (an overview cell over the whole extent) would flood thousands of
+    // buckets; it goes on the linear whale list instead — there are few, and
+    // they overlap nearly everything anyway.
+    const GRID: i64 = 256;
+    const OVERSIZE: i64 = 64;
+    const cw = @max(1, @divTrunc(ext[2] - ext[0], GRID) + 1);
+    const ch = @max(1, @divTrunc(ext[3] - ext[1], GRID) + 1);
+
+    var buckets = std.AutoHashMap([2]i32, std.ArrayList(u32)).init(sa);
+    var whales = std.ArrayList(u32).empty;
+
+    for (bbs, 0..) |b, k| {
+        if (b[0] > b[2] or b[1] > b[3]) continue;
+        const gx0 = @divFloor(b[0] - ext[0], cw);
+        const gx1 = @divFloor(b[2] - ext[0], cw);
+        const gy0 = @divFloor(b[1] - ext[1], ch);
+        const gy1 = @divFloor(b[3] - ext[1], ch);
+        if (gx1 - gx0 > OVERSIZE or gy1 - gy0 > OVERSIZE) {
+            try whales.append(sa, @intCast(k));
+            continue;
+        }
+        var gy = gy0;
+        while (gy <= gy1) : (gy += 1) {
+            var gx = gx0;
+            while (gx <= gx1) : (gx += 1) {
+                const gop = try buckets.getOrPut(.{ @intCast(gx), @intCast(gy) });
+                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(u32).empty;
+                try gop.value_ptr.append(sa, @intCast(k));
+            }
+        }
+    }
+
+    // Generation-stamped dedup across the buckets one query touches.
+    const stamp = try sa.alloc(u32, m);
+    @memset(stamp, 0);
+    var gen: u32 = 0;
+    var hits = std.ArrayList(u32).empty;
+
+    for (bbs, 0..) |b, k| {
+        if (b[0] > b[2] or b[1] > b[3]) continue;
+        hits.clearRetainingCapacity();
+        const gx0 = @divFloor(b[0] - ext[0], cw);
+        const gx1 = @divFloor(b[2] - ext[0], cw);
+        const gy0 = @divFloor(b[1] - ext[1], ch);
+        const gy1 = @divFloor(b[3] - ext[1], ch);
+        if (gx1 - gx0 > OVERSIZE or gy1 - gy0 > OVERSIZE) {
+            // A whale's own query would walk most buckets anyway — plain scan.
+            for (0..k) |j| {
+                if (bboxOverlap(bbs[j], b)) try hits.append(sa, @intCast(j));
+            }
+        } else {
+            gen += 1;
+            // Whale and bucket lists are both ascending in k: prefix cut at k.
+            for (whales.items) |j| {
+                if (j >= k) break;
+                if (bboxOverlap(bbs[j], b)) {
+                    stamp[j] = gen;
+                    try hits.append(sa, j);
+                }
+            }
+            var gy = gy0;
+            while (gy <= gy1) : (gy += 1) {
+                var gx = gx0;
+                while (gx <= gx1) : (gx += 1) {
+                    const bucket = buckets.get(.{ @intCast(gx), @intCast(gy) }) orelse continue;
+                    for (bucket.items) |j| {
+                        if (j >= k) break;
+                        if (stamp[j] != gen and bboxOverlap(bbs[j], b)) {
+                            stamp[j] = gen;
+                            try hits.append(sa, j);
+                        }
+                    }
+                }
+            }
+            std.mem.sort(u32, hits.items, {}, comptime std.sort.asc(u32));
+        }
+        lists[k] = try sa.dupe(u32, hits.items);
+    }
+    return lists;
+}
+
+/// Monotonic ns for the TILE57_PARTITION_STATS harness — a dev tool; plane has
+/// no std.Io handle, so posix, and 0 where that clock doesn't exist.
+pub fn statNow() u64 {
+    if (builtin.os.tag == .windows) return 0;
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// Worker count for the parallel partition passes. Overridable because the
+/// passes' correctness claim IS that they serialize byte-identically to a
+/// serial run, and checking that means forcing both over the same input.
+fn workerCount(m: usize) usize {
+    if (std.c.getenv("TILE57_PARTITION_WORKERS")) |w| {
+        if (std.fmt.parseInt(usize, std.mem.sliceTo(w, 0), 10) catch null) |n|
+            return @max(1, @min(n, 64));
+    }
+    if (m < 64) return 1; // not worth the threads
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @max(1, @min(cpus, 8));
+}
+
+/// Every cell's coverage (∪cov1 \ ∪cov2) and its bbox, keyed by GLOBAL cell
+/// index. Coverage is tier-invariant, so the multi-tier build computes it once
+/// here instead of once per tier. Ring geometry lives in per-worker arenas over
+/// the page allocator; the slices live in `gpa`. Free with `deinit`.
+pub const CoverageIndex = struct {
+    covs: []Poly,
+    bbs: [][4]i64,
+    arenas: []std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *CoverageIndex, gpa: Allocator) void {
+        for (self.arenas) |*ar| ar.deinit();
+        gpa.free(self.arenas);
+        gpa.free(self.covs);
+        gpa.free(self.bbs);
+    }
+};
+
+pub fn buildCoverageIndex(gpa: Allocator, cells: []const Cell) !CoverageIndex {
+    const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
+    const t0 = if (stats) statNow() else 0;
+
+    const n = cells.len;
+    const covs = try gpa.alloc(Poly, n);
+    errdefer gpa.free(covs);
+    const bbs = try gpa.alloc([4]i64, n);
+    errdefer gpa.free(bbs);
+
+    const workers = workerCount(n);
+    const arenas = try gpa.alloc(std.heap.ArenaAllocator, workers);
+    for (arenas) |*ar| ar.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer {
+        for (arenas) |*ar| ar.deinit();
+        gpa.free(arenas);
+    }
+
+    var next = std.atomic.Value(usize).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+
+    const Job = struct {
+        cells: []const Cell,
+        covs: []Poly,
+        bbs: [][4]i64,
+        arenas: []std.heap.ArenaAllocator,
+        next: *std.atomic.Value(usize),
+        failed: *std.atomic.Value(bool),
+
+        fn run(j: *const @This(), w: usize) void {
+            // The worker's own arena: the caller's allocator may be an arena
+            // and is not required to be thread-safe.
+            const ka = j.arenas[w].allocator();
+            while (true) {
+                const i = j.next.fetchAdd(1, .monotonic);
+                if (i >= j.cells.len) return;
+                if (j.failed.load(.acquire)) return;
+                const cov = cellCoverage(ka, j.cells[i]) catch
+                    return j.failed.store(true, .release);
+                j.covs[i] = cov;
+                j.bbs[i] = polyBbox(cov);
+            }
+        }
+    };
+
+    const job = Job{ .cells = cells, .covs = covs, .bbs = bbs, .arenas = arenas, .next = &next, .failed = &failed };
+    {
+        var threads: [63]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |t| t.join();
+        while (spawned < workers - 1) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, Job.run, .{ &job, spawned + 1 }) catch break;
+        }
+        job.run(0); // this thread takes a share too
+    }
+    if (failed.load(.acquire)) return error.OutOfMemory;
+
+    if (stats) std.debug.print("partition coverage index: {d} cells workers={d} {d:.0} ms\n", .{
+        n, workers, @as(f64, @floatFromInt(statNow() - t0)) / 1e6,
+    });
+    return .{ .covs = covs, .bbs = bbs, .arenas = arenas };
+}
+
 /// Identical result to `ownedAtTier`, built for scale. `ownedAtTier` accumulates a
 /// GLOBAL union of every finer cell and differences each cell against it — the
 /// operands grow to the whole nation, so it is O(cells²) in operand size (a
@@ -212,10 +423,93 @@ fn bboxOverlap(a: [4]i64, b: [4]i64) bool {
 /// (cross-checked by the test below); charts overlap locally, so the per-cell
 /// subtrahend stays small. Use this variant for real ENC data.
 pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]OwnedCell {
+    var idx = try buildCoverageIndex(gpa, cells);
+    defer idx.deinit(gpa);
+    return ownedAtTierWithIndex(gpa, cells, tier, &idx);
+}
+
+/// `ownedAtTierIndexed` with the coverage precomputed — the multi-tier caller
+/// (`partition.build`) shares one CoverageIndex across every tier.
+pub fn ownedAtTierWithIndex(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex) ![]OwnedCell {
+    return ownedAtTierImpl(gpa, cells, tier, idx, null, null);
+}
+
+/// Cross-tier face reuse. A face is a pure function of the cell's own coverage
+/// (tier-invariant, shared via the CoverageIndex) and its ordered subtrahend
+/// list AS GLOBAL INDICES: if a later tier produces the same list for the same
+/// cell, the diff chain — and therefore the face bytes — is identical, so the
+/// earlier face is duped instead of recomputed.
+const ReuseCtx = struct {
+    /// Build-lifetime storage for the cached lists.
+    arena: Allocator,
+    /// Per GLOBAL cell index: one entry per distinct subtrahend list seen.
+    caches: []std.ArrayList(Entry),
+    /// Faces of the tiers already built (gpa memory, owned by the caller).
+    prior: *std.ArrayList([]OwnedCell),
+    /// Index of the tier being built, into `prior` once it lands there.
+    cur_tier: u32 = 0,
+    hits: u64 = 0,
+
+    const Entry = struct {
+        hash: u64,
+        glist: []const u32,
+        tier_idx: u32,
+        /// Slot in that tier's faces, or -1: the face was empty and dropped
+        /// (a fully-covered gap-filler).
+        slot: i32,
+    };
+};
+
+/// Sidecar adoption. A stored face carries a digest of everything its diff
+/// chain read — its own cell's content and every subtrahend's, in order. If a
+/// cell's CURRENT face input digest matches a stored one, the stored geometry
+/// IS what the sweep would recompute, and is adopted verbatim.
+pub const AdoptCtx = struct {
+    /// Per GLOBAL cell index: identity-stable content digest
+    /// (partition.contentDigest — no order rank, it shifts under insertion).
+    digests: []const u64,
+    /// (global cell index, face input digest) → geometry to adopt. An empty
+    /// Poly is a real entry: the face was empty (a fully-covered gap-filler).
+    pool: std.AutoHashMap(PoolKey, Poly),
+    adopted: u64 = 0,
+    /// Face slots that ran a diff chain — neither adopted nor tier-reused.
+    /// Zero ⇒ the sidecar already IS this partition.
+    swept: u64 = 0,
+
+    pub const PoolKey = struct { ci: u32, fdig: u64 };
+};
+
+/// The digest a face's diff chain is a pure function of: own content digest,
+/// then each subtrahend's, in application order.
+pub fn faceInputDigest(digests: []const u64, ci: usize, glist: []const u32) u64 {
+    var h = std.hash.Wyhash.init(0x7457_4644_4947_5354); // face-digest seed
+    h.update(std.mem.asBytes(&digests[ci]));
+    for (glist) |g| h.update(std.mem.asBytes(&digests[g]));
+    return h.final();
+}
+
+const HitSrc = union(enum) {
+    /// A face already built at an earlier tier of this run.
+    prior: struct { tier_idx: u32, slot: i32 },
+    /// A face adopted verbatim from a sidecar (borrowed; duped on assembly).
+    ext: Poly,
+};
+
+/// One tier's walk: every cell in priority order (position IS priority), and
+/// how many lead it as eligible. Eligible cells (band_floor ≤ tier, surviving
+/// the reach cut) come first, finest→coarsest; then the fill-up gap-fillers —
+/// FINER cells (band_floor > tier) that own ground at this coarser tier only
+/// where NO eligible cell covers. Among the fillers the COARSEST wins (closest
+/// to this tier's display scale), equal scales by the usual tie-break. So a
+/// harbor-only region still has an owner at z4, scamin-thinned by the bake.
+/// The serializer re-derives face digests through this same walk.
+pub const TierWalk = struct { order: []usize, n_eligible: usize };
+
+pub fn tierWalk(a: Allocator, cells: []const Cell, tier: u8) !TierWalk {
     var order = std.ArrayList(usize).empty;
-    defer order.deinit(gpa);
+    errdefer order.deinit(a);
     for (cells, 0..) |c, i| {
-        if (c.band_floor <= tier) try order.append(gpa, i);
+        if (c.band_floor <= tier) try order.append(a, i);
     }
     std.mem.sort(usize, order.items, cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
@@ -224,16 +518,9 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
     }.lt);
     reachCut(cells, &order, tier);
 
-    // Fill-up gap-fillers: FINER cells (band_floor > tier) own ground at this
-    // coarser tier only where NO eligible cell covers — appended after every
-    // eligible cell, so they can never take ground from the band's own cells
-    // (position in `order` is priority: each cell's face is its coverage minus
-    // every earlier cell's). Among the fillers the COARSEST wins (closest to
-    // this tier's display scale), equal scales by the usual tie-break. So a
-    // harbor-only region still has an owner at z4, scamin-thinned by the bake.
     const n_eligible = order.items.len;
     for (cells, 0..) |c, i| {
-        if (c.band_floor > tier) try order.append(gpa, i);
+        if (c.band_floor > tier) try order.append(a, i);
     }
     std.mem.sort(usize, order.items[n_eligible..], cells, struct {
         fn lt(cs: []const Cell, ia: usize, ib: usize) bool {
@@ -241,19 +528,92 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
             return cs[ia].order < cs[ib].order;
         }
     }.lt);
+    return .{ .order = try order.toOwnedSlice(a), .n_eligible = n_eligible };
+}
 
+fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const CoverageIndex, reuse: ?*ReuseCtx, adopt: ?*AdoptCtx) ![]OwnedCell {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
 
-    // Coverage + bbox per eligible cell (in finest→coarsest order), computed once.
-    const m = order.items.len;
-    const covs = try sa.alloc([][]Pt, m);
+    const walk = try tierWalk(sa, cells, tier);
+    const order = walk.order;
+    const n_eligible = walk.n_eligible;
+
+    // TILE57_PARTITION_STATS=1: per-tier phase timings + worst per-cell diff
+    // chains, for aiming optimization work at what the profile actually says.
+    const stats = std.c.getenv("TILE57_PARTITION_STATS") != null;
+
+    // Order-position views into the shared index (the sweep addresses cells by
+    // their position in this tier's walk).
+    const m = order.len;
+    const covs = try sa.alloc(Poly, m);
     const bbs = try sa.alloc([4]i64, m);
-    for (order.items, 0..) |ci, k| {
-        covs[k] = try cellCoverage(sa, cells[ci]);
-        bbs[k] = polyBbox(covs[k]);
+    for (order, 0..) |ci, k| {
+        covs[k] = idx.covs[ci];
+        bbs[k] = idx.bbs[ci];
     }
+
+    const t_lists0 = if (stats) statNow() else 0;
+    const lists = try subtrahendLists(sa, bbs);
+    const lists_ns = if (stats) statNow() - t_lists0 else 0;
+
+    // Reuse/adoption lookup: rewrite each list to global indices, hash it, and
+    // match it (a) against the cell's lists from earlier tiers, (b) against the
+    // sidecar adoption pool by face input digest. Either hit skips the sweep
+    // for that cell entirely; only misses go on the todo list.
+    var hitv: []?HitSrc = &.{};
+    var glists: [][]u32 = &.{};
+    var hashes: []u64 = &.{};
+    if (reuse != null or adopt != null) {
+        hitv = try sa.alloc(?HitSrc, m);
+        @memset(hitv, null);
+        glists = try sa.alloc([]u32, m);
+        hashes = try sa.alloc(u64, m);
+    }
+    var todo = std.ArrayList(u32).empty;
+    if (reuse != null or adopt != null) {
+        var reuse_hits: u64 = 0;
+        for (0..m) |k| {
+            const ci = order[k];
+            const gl = try sa.alloc(u32, lists[k].len);
+            for (lists[k], 0..) |j, x| gl[x] = @intCast(order[j]);
+            glists[k] = gl;
+            hashes[k] = std.hash.Wyhash.hash(0x7457_5245, std.mem.sliceAsBytes(gl));
+            if (reuse) |rc| {
+                for (rc.caches[ci].items) |e| {
+                    if (e.hash == hashes[k] and std.mem.eql(u32, e.glist, gl)) {
+                        hitv[k] = .{ .prior = .{ .tier_idx = e.tier_idx, .slot = e.slot } };
+                        reuse_hits += 1;
+                        break;
+                    }
+                }
+            }
+            if (hitv[k] == null) if (adopt) |ac| {
+                if (ac.pool.get(.{ .ci = @intCast(ci), .fdig = faceInputDigest(ac.digests, ci, gl) })) |face| {
+                    hitv[k] = .{ .ext = face };
+                    ac.adopted += 1;
+                }
+            };
+            if (hitv[k] == null) try todo.append(sa, @intCast(k));
+        }
+        if (reuse) |rc| rc.hits += reuse_hits;
+        if (adopt) |ac| ac.swept += todo.items.len;
+    } else {
+        try todo.ensureTotalCapacity(sa, m);
+        for (0..m) |k| todo.appendAssumeCapacity(@intCast(k));
+    }
+
+    // Claim order = longest chain first. A chain's cost tracks its subtrahend
+    // count, and the count is known up front now — better than the coarse-end
+    // heuristic at keeping a whale off one worker's tail. Pure scheduling:
+    // results land by index, so any deterministic order is byte-safe.
+    std.mem.sort(u32, todo.items, lists, struct {
+        fn lt(ls: []const []const u32, x: u32, y: u32) bool {
+            if (ls[x].len != ls[y].len) return ls[x].len > ls[y].len;
+            return x > y; // tie: coarse end first, as before
+        }
+    }.lt);
 
     var out = std.ArrayList(OwnedCell).empty;
     errdefer {
@@ -261,59 +621,224 @@ pub fn ownedAtTierIndexed(gpa: Allocator, cells: []const Cell, tier: u8) ![]Owne
         out.deinit(gpa);
     }
 
-    // Subtrahend pointer list, reused (cleared) each iteration — it only holds borrowed
-    // pointers into `covs`, so it stays tiny.
-    var subtr = std.ArrayList(Poly).empty;
-    defer subtr.deinit(gpa);
+    // Every cell's face is its coverage minus the coverage of the earlier cells
+    // that overlap it — and `covs`/`bbs` above are INPUTS, computed for all m
+    // cells before any face is. No iteration reads another's result, so the
+    // whole sweep is parallel across cells. Results are placed BY INDEX and the
+    // output assembled in order afterwards, so a parallel build serializes to
+    // the same bytes as a serial one.
+    const results = try sa.alloc(Poly, m);
+    for (results) |*r| r.* = &.{};
 
-    // Boolean intermediates (the per-cell union of overlapping finer coverage, and the
-    // diff) live in a scratch arena that is RESET — not freed to the OS — after each cell.
-    // The old code freed each intermediate straight back to the page allocator to keep RSS
-    // down, but on a national NOAA build that was ~a quarter of the wall-clock spent in the
-    // kernel doing mmap/munmap + faulting the fresh pages (perf). Resetting the arena with
-    // retained capacity reuses the pages across cells, so there is no syscall churn — and
-    // RSS is still bounded: it caps at the single LARGEST cell's union (one coarse cell's
-    // overlap set), not the whole-district accumulation the earlier GPA-parking blowup came
-    // from. Only the finished `owned` polygon is copied into `gpa` (held by the partition).
-    var work = std.heap.ArenaAllocator.init(gpa);
-    defer work.deinit();
+    // Per-cell stat slots: workers write only their claimed index — race-free.
+    const stat_ns: ?[]u64 = if (stats) try sa.alloc(u64, m) else null;
+    const stat_nsub: ?[]u32 = if (stats) try sa.alloc(u32, m) else null;
+    if (stat_ns) |v| @memset(v, 0);
+    if (stat_nsub) |v| @memset(v, 0);
 
-    for (order.items, 0..) |ci, k| {
-        // owned = cov \ (∪ finer cells whose bbox overlaps this one).
-        subtr.clearRetainingCapacity();
-        for (0..k) |j| {
-            if (bboxOverlap(bbs[j], bbs[k])) try subtr.append(gpa, covs[j]);
-        }
-        const owned = if (subtr.items.len == 0)
-            try dupePolygonGpa(gpa, covs[k])
-        else blk: {
-            // A \ (B ∪ C ∪ …) = ((A \ B) \ C) \ … : sequential small diffs instead
-            // of unioning every overlapping finer cell first and diffing once. The
-            // pairwise-fold union grew its accumulator toward whole-district size —
-            // O(N²) sweep work for a coarse cell overlapped by hundreds of finer
-            // ones, and the dominant cost of a national partition build (perf: the
-            // boolean sweep was ~40% of wall-clock). Here the subject only SHRINKS
-            // (it starts as ONE cell's coverage), every subtrahend is one cell's
-            // coverage, and a subject emptied early — a gap-filler fully covered by
-            // the eligible cells, the common case — exits without touching the rest.
-            const wa = work.allocator();
-            var cur: [][]Pt = covs[k];
-            for (subtr.items) |sub| {
-                cur = try boolean.compute(wa, cur, sub, .diff);
-                if (cur.len == 0) break;
+    const workers = workerCount(todo.items.len);
+
+    var next = std.atomic.Value(usize).init(0);
+    var failed = std.atomic.Value(bool).init(false);
+
+    const Sweep = struct {
+        covs: []const Poly,
+        lists: []const []const u32,
+        todo: []const u32,
+        results: []Poly,
+        keeps: []std.heap.ArenaAllocator,
+        next: *std.atomic.Value(usize),
+        failed: *std.atomic.Value(bool),
+        stat_ns: ?[]u64,
+        stat_nsub: ?[]u32,
+
+        fn run(s: *const @This(), w: usize) void {
+            // Both arenas are the worker's own, over the page allocator: the
+            // caller's allocator may be an arena and is not required to be
+            // thread-safe, so nothing here may touch it. `work` holds the
+            // boolean intermediates and is reset per cell — the RSS bound the
+            // serial sweep relied on, now per worker. `keep` holds the finished
+            // faces, which must outlive the join.
+            var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer work.deinit();
+            const ka = s.keeps[w].allocator();
+
+            // Subtrahend pointer list, reused (cleared) each iteration — it only
+            // holds borrowed pointers into `covs`, so it stays tiny.
+            var subtr = std.ArrayList(Poly).empty;
+
+            while (true) {
+                // `todo` is presorted longest-chain-first; claim in order.
+                const claimed = s.next.fetchAdd(1, .monotonic);
+                if (claimed >= s.todo.len) return;
+                const k = s.todo[claimed];
+                if (s.failed.load(.acquire)) return;
+                const c0 = if (s.stat_ns != null) statNow() else 0;
+
+                subtr.clearRetainingCapacity();
+                for (s.lists[k]) |j| {
+                    subtr.append(ka, s.covs[j]) catch return s.failed.store(true, .release);
+                }
+                // A \ (B ∪ C ∪ …) = ((A \ B) \ C) \ … : sequential small diffs
+                // instead of unioning every overlapping finer cell first and
+                // diffing once. The pairwise-fold union grew its accumulator
+                // toward whole-district size — O(N²) sweep work for a coarse
+                // cell overlapped by hundreds of finer ones. Here the subject
+                // only SHRINKS, every subtrahend is one cell's coverage, and a
+                // subject emptied early — a gap-filler fully covered by the
+                // eligible cells, the common case — exits without the rest.
+                var cur: Poly = s.covs[k];
+                if (subtr.items.len != 0) {
+                    const wa = work.allocator();
+                    for (subtr.items) |sub| {
+                        cur = boolean.compute(wa, cur, sub, .diff) catch
+                            return s.failed.store(true, .release);
+                        if (cur.len == 0) break;
+                    }
+                }
+                // Into `keep` before the reset below reclaims `work`.
+                s.results[k] = dupePolygonGpa(ka, cur) catch
+                    return s.failed.store(true, .release);
+                if (s.stat_ns) |ns| {
+                    ns[k] = statNow() - c0;
+                    s.stat_nsub.?[k] = @intCast(subtr.items.len);
+                }
+                _ = work.reset(.retain_capacity); // reuse the pages next cell; no munmap
             }
-            break :blk try dupePolygonGpa(gpa, cur);
-        };
-        _ = work.reset(.retain_capacity); // reuse the pages next cell; no munmap
+        }
+    };
+
+    const keeps = try sa.alloc(std.heap.ArenaAllocator, workers);
+    for (keeps) |*ka| ka.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer for (keeps) |*ka| ka.deinit();
+
+    const sweep = Sweep{
+        .covs = covs,
+        .lists = lists,
+        .todo = todo.items,
+        .results = results,
+        .keeps = keeps,
+        .next = &next,
+        .failed = &failed,
+        .stat_ns = stat_ns,
+        .stat_nsub = stat_nsub,
+    };
+
+    const t_sweep0 = if (stats) statNow() else 0;
+    {
+        var threads = try sa.alloc(std.Thread, workers - 1);
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |t| t.join();
+        while (spawned < workers - 1) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, Sweep.run, .{ &sweep, spawned + 1 }) catch break;
+        }
+        sweep.run(0); // this thread takes a share too
+    }
+    if (failed.load(.acquire)) return error.OutOfMemory;
+
+    if (stats) {
+        const sweep_ns = statNow() - t_sweep0;
+        std.debug.print("partition tier {d}: m={d} ({d} eligible, {d} reused) workers={d} lists={d:.0} ms sweep={d:.0} ms\n", .{
+            tier,                                    m,                                       n_eligible, m - todo.items.len, workers,
+            @as(f64, @floatFromInt(lists_ns)) / 1e6, @as(f64, @floatFromInt(sweep_ns)) / 1e6,
+        });
+        const by_ns = try sa.alloc(usize, m);
+        for (by_ns, 0..) |*v, i| v.* = i;
+        std.mem.sort(usize, by_ns, stat_ns.?, struct {
+            fn gt(ns: []const u64, x: usize, y: usize) bool {
+                return ns[x] > ns[y];
+            }
+        }.gt);
+        for (by_ns[0..@min(m, 20)]) |k| {
+            std.debug.print("  cell[{d}] {s} subs={d} diff={d:.1} ms\n", .{
+                order[k],
+                if (k >= n_eligible) @as([]const u8, "fill") else "elig",
+                stat_nsub.?[k],
+                @as(f64, @floatFromInt(stat_ns.?[k])) / 1e6,
+            });
+        }
+    }
+
+    for (order, 0..) |ci, k| {
+        const poly: Poly = if (hitv.len != 0 and hitv[k] != null) switch (hitv[k].?) {
+            // Same cell, same subtrahend content at an earlier tier or in the
+            // sidecar: the diff chain is identical, so the face bytes are —
+            // dupe, don't diff.
+            .prior => |hs| if (hs.slot < 0)
+                &.{} // was an empty (dropped) face
+            else
+                reuse.?.prior.items[hs.tier_idx][@intCast(hs.slot)].owned,
+            .ext => |face| face,
+        } else results[k];
+
         // A gap-filler fully covered by the eligible cells owns nothing here —
         // drop its empty face so a nested finer cell adds no face at all.
-        if (k >= n_eligible and owned.len == 0) {
-            boolean.freePolygon(gpa, owned);
-            continue;
+        const dropped = k >= n_eligible and poly.len == 0;
+        if (!dropped) {
+            const owned = try dupePolygonGpa(gpa, poly);
+            out.append(gpa, .{ .index = ci, .owned = owned }) catch |e| {
+                boolean.freePolygon(gpa, owned);
+                return e;
+            };
         }
-        try out.append(gpa, .{ .index = ci, .owned = owned });
+        if (reuse) |rc| if (hitv[k] == null) {
+            // First time this cell produced this list — remember the face.
+            try rc.caches[ci].append(rc.arena, .{
+                .hash = hashes[k],
+                .glist = try rc.arena.dupe(u32, glists[k]),
+                .tier_idx = rc.cur_tier,
+                .slot = if (dropped) -1 else @intCast(out.items.len - 1),
+            });
+        };
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// The whole band stack in one call: one faces slice per tier, with cross-tier
+/// face reuse (see ReuseCtx). Each tier's slice has the same element semantics
+/// as `ownedAtTierIndexed`; free each with `freeOwned` and the outer slice with
+/// `gpa.free`. TILE57_PARTITION_NO_REUSE=1 disables the reuse path — the A/B
+/// switch for proving it changes nothing.
+pub fn ownedTiers(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex) ![][]OwnedCell {
+    const use_reuse = std.c.getenv("TILE57_PARTITION_NO_REUSE") == null;
+    return ownedTiersOpt(gpa, cells, tiers, idx, use_reuse, null);
+}
+
+/// `ownedTiers` with a sidecar adoption pool: faces whose input digest matches
+/// a pool entry are adopted verbatim instead of swept. Adoption changes only
+/// HOW a face is produced, never its bytes — the pool key IS the proof.
+pub fn ownedTiersAdopt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex, adopt: ?*AdoptCtx) ![][]OwnedCell {
+    const use_reuse = std.c.getenv("TILE57_PARTITION_NO_REUSE") == null;
+    return ownedTiersOpt(gpa, cells, tiers, idx, use_reuse, adopt);
+}
+
+fn ownedTiersOpt(gpa: Allocator, cells: []const Cell, tiers: []const u8, idx: *const CoverageIndex, use_reuse: bool, adopt: ?*AdoptCtx) ![][]OwnedCell {
+    var prior = std.ArrayList([]OwnedCell).empty;
+    errdefer {
+        for (prior.items) |faces| freeOwned(gpa, faces);
+        prior.deinit(gpa);
+    }
+    try prior.ensureTotalCapacity(gpa, tiers.len);
+
+    var cache_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer cache_arena.deinit();
+    const ca = cache_arena.allocator();
+
+    var rc = ReuseCtx{
+        .arena = ca,
+        .caches = try ca.alloc(std.ArrayList(ReuseCtx.Entry), cells.len),
+        .prior = &prior,
+    };
+    for (rc.caches) |*c| c.* = std.ArrayList(ReuseCtx.Entry).empty;
+
+    for (tiers, 0..) |tier, ti| {
+        rc.cur_tier = @intCast(ti);
+        const faces = try ownedAtTierImpl(gpa, cells, tier, idx, if (use_reuse) &rc else null, adopt);
+        prior.appendAssumeCapacity(faces);
+    }
+    if (std.c.getenv("TILE57_PARTITION_STATS") != null and use_reuse)
+        std.debug.print("partition reuse: {d} faces duped across {d} tiers\n", .{ rc.hits, tiers.len });
+    return prior.toOwnedSlice(gpa);
 }
 
 fn dupePolygonGpa(gpa: Allocator, poly: Poly) ![][]Pt {
@@ -323,6 +848,48 @@ fn dupePolygonGpa(gpa: Allocator, poly: Poly) ![][]Pt {
     errdefer for (out[0..n]) |r| gpa.free(r);
     while (n < poly.len) : (n += 1) out[n] = try gpa.dupe(Pt, poly[n]);
     return out;
+}
+
+/// Sutherland–Hodgman rect clip of a ring bag: cuts boolean operands to tile
+/// size in LINEAR time, so the cross-band fill's cost per tile is bounded by
+/// the tile — never by the face. A tier-0 face is a whole coastal cell
+/// (hundreds of thousands of points); exact booleans against it requested
+/// oversized allocations that FAILED tile-by-tile on a memory-limited device,
+/// at exactly the coarse zooms.
+pub fn rectClipRings(a: std.mem.Allocator, rings: []const []const Pt, box: Box) ![][]Pt {
+    var out = std.ArrayList([]Pt).empty;
+    for (rings) |ring| {
+        var cur = std.ArrayList(Pt).empty;
+        try cur.appendSlice(a, ring);
+        inline for (.{
+            .{ .axis = 0, .lim = "min_x", .keep_ge = true },
+            .{ .axis = 0, .lim = "max_x", .keep_ge = false },
+            .{ .axis = 1, .lim = "min_y", .keep_ge = true },
+            .{ .axis = 1, .lim = "max_y", .keep_ge = false },
+        }) |cl| {
+            if (cur.items.len == 0) break;
+            const lim: i64 = @field(box, cl.lim);
+            var nxt = std.ArrayList(Pt).empty;
+            const npts = cur.items.len;
+            for (cur.items, 0..) |p, k| {
+                const q = cur.items[(k + 1) % npts];
+                const pv: i64 = if (cl.axis == 0) p.x else p.y;
+                const qv: i64 = if (cl.axis == 0) q.x else q.y;
+                const pin = if (cl.keep_ge) pv >= lim else pv <= lim;
+                const qin = if (cl.keep_ge) qv >= lim else qv <= lim;
+                if (pin) try nxt.append(a, p);
+                if (pin != qin) {
+                    const t = @as(f64, @floatFromInt(lim - pv)) / @as(f64, @floatFromInt(qv - pv));
+                    const ox: i64 = if (cl.axis == 0) lim else p.x + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.x - p.x)))));
+                    const oy: i64 = if (cl.axis == 1) lim else p.y + @as(i64, @intFromFloat(@round(t * @as(f64, @floatFromInt(q.y - p.y)))));
+                    try nxt.append(a, .{ .x = ox, .y = oy });
+                }
+            }
+            cur = nxt;
+        }
+        if (cur.items.len >= 3) try out.append(a, try cur.toOwnedSlice(a));
+    }
+    return out.toOwnedSlice(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,8 +924,11 @@ fn pointInEvenOddF(rings: Poly, x: f64, y: f64) bool {
 /// sub-run whose midpoint is on the wanted side — INSIDE `covered` when `keep_inside`,
 /// else OUTSIDE. Returns a list of poly-lines allocated in `gpa`. The line analogue of
 /// a polygon intersect/difference: no polygon boolean, so a line crossing the boundary
-/// is cut cleanly, not offset-doubled.
-fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_inside: bool) ![][]Pt {
+/// is cut cleanly, not offset-doubled. `grid`, when supplied, must index exactly
+/// `covered`'s edges: splits then come from the buckets near each segment and the
+/// midpoint parity from the grid's ray walk, so the cost per segment is the
+/// geometry NEAR it — never the whole coverage. Output is identical either way.
+fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_inside: bool, grid: ?*const EdgeGrid) ![][]Pt {
     var out = std.ArrayList([]Pt).empty;
     errdefer {
         for (out.items) |r| gpa.free(r);
@@ -383,7 +953,32 @@ fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_insi
         var splits = std.ArrayList(SplitPt).empty;
         try splits.append(sc, .{ .key = keyOf(a, a, b), .p = a });
         try splits.append(sc, .{ .key = keyOf(b, a, b), .p = b });
-        for (covered) |ring| {
+        if (grid) |g| {
+            const Gather = struct {
+                sc: Allocator,
+                splits: *std.ArrayList(SplitPt),
+                a: Pt,
+                b: Pt,
+                fn each(ctx: *const @This(), e: EdgeGrid.Seg) error{OutOfMemory}!void {
+                    const it = boolean.segIntersect(ctx.a, ctx.b, e.a, e.b);
+                    switch (it.n) {
+                        1 => try ctx.splits.append(ctx.sc, .{ .key = keyOf(it.p0, ctx.a, ctx.b), .p = it.p0 }),
+                        2 => {
+                            try ctx.splits.append(ctx.sc, .{ .key = keyOf(it.p0, ctx.a, ctx.b), .p = it.p0 });
+                            try ctx.splits.append(ctx.sc, .{ .key = keyOf(it.p1, ctx.a, ctx.b), .p = it.p1 });
+                        },
+                        else => {},
+                    }
+                }
+            };
+            const g_ctx = Gather{ .sc = sc, .splits = &splits, .a = a, .b = b };
+            try g.eachNearBox(.{
+                .min_x = @min(a.x, b.x),
+                .min_y = @min(a.y, b.y),
+                .max_x = @max(a.x, b.x),
+                .max_y = @max(a.y, b.y),
+            }, &g_ctx, Gather.each);
+        } else for (covered) |ring| {
             if (ring.len < 2) continue;
             var j = ring.len - 1;
             for (ring, 0..) |c, k| {
@@ -411,7 +1006,8 @@ fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_insi
             if (q.eql(prev)) continue;
             const mx = (@as(f64, @floatFromInt(prev.x)) + @as(f64, @floatFromInt(q.x))) / 2;
             const my = (@as(f64, @floatFromInt(prev.y)) + @as(f64, @floatFromInt(q.y))) / 2;
-            if (pointInEvenOddF(covered, mx, my) != keep_inside) {
+            const mid_in = if (grid) |g| g.parityF(mx, my) else pointInEvenOddF(covered, mx, my);
+            if (mid_in != keep_inside) {
                 // Sub-run is on the unwanted side: flush the kept run (ends at prev), skip.
                 try flushRun(gpa, &out, &run);
                 try run.append(gpa, q);
@@ -428,20 +1024,34 @@ fn clipLineByCoverage(gpa: Allocator, line: []const Pt, covered: Poly, keep_insi
 /// Keep the parts of `line` OUTSIDE `covered` — the parts a cell owns when `covered`
 /// is the finer coverage that beats it (the seam stroke stays on the covered side).
 pub fn clipLineOutsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
-    return clipLineByCoverage(gpa, line, covered, false);
+    return clipLineByCoverage(gpa, line, covered, false, null);
 }
 
 /// Keep the parts of `line` INSIDE `covered` — clips a cell's line features to its
 /// owned face at compose time (`covered` = the cell's owned region).
 pub fn clipLineInsidePolys(gpa: Allocator, line: []const Pt, covered: Poly) ![][]Pt {
-    return clipLineByCoverage(gpa, line, covered, true);
+    return clipLineByCoverage(gpa, line, covered, true, null);
+}
+
+/// clipLineInsidePolys with the caller's edge grid over the SAME coverage —
+/// identical output, cost bounded by the geometry near the line.
+pub fn clipLineInsidePolysGrid(gpa: Allocator, line: []const Pt, covered: Poly, grid: *const EdgeGrid) ![][]Pt {
+    return clipLineByCoverage(gpa, line, covered, true, grid);
 }
 
 const SplitPt = struct {
     key: i128,
     p: Pt,
+    // Total order: key first (position along the segment), then the point
+    // itself. Two DISTINCT crossings can share a key (the key projects onto
+    // the dominant axis, and near-tangent crossings collide on it) — under a
+    // key-only sort their order is whatever the sort felt like, and duplicate
+    // gatherings (the grid path sees an edge once per bucket it spans)
+    // interleave instead of collapsing against the consecutive-equal dedup.
     fn lt(_: void, a: SplitPt, b: SplitPt) bool {
-        return a.key < b.key;
+        if (a.key != b.key) return a.key < b.key;
+        if (a.p.x != b.p.x) return a.p.x < b.p.x;
+        return a.p.y < b.p.y;
     }
 };
 
@@ -487,6 +1097,9 @@ pub const EdgeGrid = struct {
     buckets: std.AutoHashMap(BKey, std.ArrayList(Seg)),
     covered: Poly,
     gpa: Allocator,
+    // Occupied bucket bounds, so a ray walk knows where the geometry ends.
+    min_gx: i64 = std.math.maxInt(i64),
+    max_gx: i64 = std.math.minInt(i64),
 
     const BKey = struct { gx: i64, gy: i64 };
     pub const Seg = struct { a: Pt, b: Pt };
@@ -525,6 +1138,8 @@ pub const EdgeGrid = struct {
     fn insert(self: *EdgeGrid, s: Seg) !void {
         const gx0 = self.gridOf(@min(s.a.x, s.b.x));
         const gx1 = self.gridOf(@max(s.a.x, s.b.x));
+        self.min_gx = @min(self.min_gx, gx0);
+        self.max_gx = @max(self.max_gx, gx1);
         const gy0 = self.gridOf(@min(s.a.y, s.b.y));
         const gy1 = self.gridOf(@max(s.a.y, s.b.y));
         var gx = gx0;
@@ -555,6 +1170,55 @@ pub const EdgeGrid = struct {
             }
         }
         return false;
+    }
+
+    /// Even-odd containment of a float point against the indexed coverage,
+    /// equal by construction to the brute-force scan: the +x ray visits the
+    /// bucket row once per column, applies the SAME per-edge crossing predicate,
+    /// and counts each crossing exactly once — in the one column that contains
+    /// the crossing's x (an edge spanning several buckets is seen in each, and
+    /// skipped in all but that one). Touches only edges near the ray instead of
+    /// every edge of the coverage.
+    pub fn parityF(self: *const EdgeGrid, x: f64, y: f64) bool {
+        if (self.max_gx < self.min_gx) return false; // no edges at all
+        const fx: i64 = @intFromFloat(@floor(x));
+        const gy = self.gridOf(@intFromFloat(@floor(y)));
+        var inside = false;
+        var gx = @max(self.gridOf(fx), self.min_gx);
+        while (gx <= self.max_gx) : (gx += 1) {
+            const list = self.buckets.get(.{ .gx = gx, .gy = gy }) orelse continue;
+            for (list.items) |e| {
+                const yi: f64 = @floatFromInt(e.a.y);
+                const yj: f64 = @floatFromInt(e.b.y);
+                if ((yi > y) == (yj > y)) continue;
+                const xi: f64 = @floatFromInt(e.a.x);
+                const xj: f64 = @floatFromInt(e.b.x);
+                const xint = xi + (y - yi) * (xj - xi) / (yj - yi);
+                if (x >= xint) continue;
+                if (self.gridOf(@intFromFloat(@floor(xint))) != gx) continue;
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    /// Visit every indexed edge whose bucket range meets `box`, possibly more
+    /// than once (an edge lives in each bucket its bbox spans). Callers that
+    /// split at intersections tolerate the duplicates — identical split points
+    /// collapse in their sort — so no dedup set is paid here.
+    pub fn eachNearBox(self: *const EdgeGrid, box: Box, ctx: anytype, comptime f: fn (@TypeOf(ctx), Seg) error{OutOfMemory}!void) !void {
+        const gx0 = self.gridOf(box.min_x);
+        const gx1 = self.gridOf(box.max_x);
+        const gy0 = self.gridOf(box.min_y);
+        const gy1 = self.gridOf(box.max_y);
+        var gx = gx0;
+        while (gx <= gx1) : (gx += 1) {
+            var gy = gy0;
+            while (gy <= gy1) : (gy += 1) {
+                const list = self.buckets.get(.{ .gx = gx, .gy = gy }) orelse continue;
+                for (list.items) |e| try f(ctx, e);
+            }
+        }
     }
 
     /// Classify a tile against the coverage this grid indexes.
@@ -855,6 +1519,64 @@ test "fuzz: partition == per-point finest-eligible-covering, zero overlap, zero 
     }
 }
 
+test "fuzz: ownedTiers with reuse is byte-identical to reuse off" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0xFACE5EED);
+    const rnd = prng.random();
+    const grid: i64 = 64;
+
+    var trial: usize = 0;
+    while (trial < 120) : (trial += 1) {
+        const ncells = rnd.intRangeAtMost(usize, 1, 8);
+        var cells = std.ArrayList(Cell).empty;
+        for (0..ncells) |k| {
+            const x0 = rnd.intRangeAtMost(i64, -6, 4) * grid;
+            const y0 = rnd.intRangeAtMost(i64, -6, 4) * grid;
+            const w = rnd.intRangeAtMost(i64, 1, 6) * grid;
+            const h = rnd.intRangeAtMost(i64, 1, 6) * grid;
+            const cov = try boxPoly(a, x0, y0, x0 + w, y0 + h);
+            const covs = try a.alloc(Poly, 1);
+            covs[0] = cov;
+            try cells.append(a, .{
+                .cscl = @intCast(1000 + k * 100),
+                .band_floor = rnd.intRangeAtMost(u8, 0, 13),
+                .order = k,
+                // Some cells reach-capped so the pool flips across tiers.
+                .reach = if (rnd.uintLessThan(u8, 4) == 0) rnd.intRangeAtMost(u8, 5, 13) else 255,
+                .cov1 = covs,
+            });
+        }
+        // Distinct floors, descending — the band stack partition.build derives.
+        var tier_set = std.ArrayList(u8).empty;
+        for (cells.items) |c| {
+            if (std.mem.indexOfScalar(u8, tier_set.items, c.band_floor) == null)
+                try tier_set.append(a, c.band_floor);
+        }
+        std.mem.sort(u8, tier_set.items, {}, comptime std.sort.desc(u8));
+
+        var idx = try buildCoverageIndex(a, cells.items);
+
+        const with = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, true, null);
+        const without = try ownedTiersOpt(a, cells.items, tier_set.items, &idx, false, null);
+
+        try testing.expectEqual(without.len, with.len);
+        for (without, with) |w0, w1| {
+            try testing.expectEqual(w0.len, w1.len);
+            for (w0, w1) |f0, f1| {
+                try testing.expectEqual(f0.index, f1.index);
+                try testing.expectEqual(f0.owned.len, f1.owned.len);
+                for (f0.owned, f1.owned) |r0, r1|
+                    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(r0), std.mem.sliceAsBytes(r1));
+            }
+        }
+        idx.deinit(a); // release its page-allocator worker arenas before the reset
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
 test "clipLineOutsidePolys: keeps the outside, drops the covered middle" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -997,6 +1719,93 @@ test "quadrant-split partition stitches to the same result (shared integer grid)
             }
         }
         _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "subtrahendLists: grid equals the all-pairs scan, element for element" {
+    var prng = std.Random.DefaultPrng.init(0xA3B0C5);
+    const rnd = prng.random();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for (0..60) |trial| {
+        _ = arena.reset(.retain_capacity);
+        const n = 1 + rnd.uintLessThan(usize, 150);
+        const bbs = try a.alloc([4]i64, n);
+        for (bbs) |*b| {
+            if (rnd.uintLessThan(u8, 12) == 0) {
+                // Emptied coverage: inverted bbox, overlaps nothing.
+                b.* = .{ std.math.maxInt(i64), std.math.maxInt(i64), std.math.minInt(i64), std.math.minInt(i64) };
+            } else if (trial % 3 == 0 and rnd.uintLessThan(u8, 8) == 0) {
+                // Whale: spans the whole extent (exercises the oversize path).
+                b.* = .{ -2000, -2000, 2000, 2000 };
+            } else {
+                const x0 = rnd.intRangeAtMost(i64, -1000, 1000);
+                const y0 = rnd.intRangeAtMost(i64, -1000, 1000);
+                b.* = .{ x0, y0, x0 + rnd.intRangeAtMost(i64, 0, 400), y0 + rnd.intRangeAtMost(i64, 0, 400) };
+            }
+        }
+        const lists = try subtrahendLists(a, bbs);
+        for (bbs, 0..) |b, k| {
+            var want = std.ArrayList(u32).empty;
+            for (0..k) |j| {
+                if (bboxOverlap(bbs[j], b)) try want.append(a, @intCast(j));
+            }
+            try testing.expectEqualSlices(u32, want.items, lists[k]);
+        }
+    }
+}
+
+test "EdgeGrid.parityF and grid line clip match their brute-force twins" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(57);
+    const rnd = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        // A random jagged multi-ring coverage in a 4096 box.
+        const nrings = 1 + rnd.uintLessThan(usize, 3);
+        const rings = try a.alloc([]const Pt, nrings);
+        for (rings) |*ring| {
+            const n = 4 + rnd.uintLessThan(usize, 12);
+            const r = try a.alloc(Pt, n);
+            for (r) |*pp| pp.* = .{
+                .x = @as(i64, rnd.uintLessThan(u16, 4097)),
+                .y = @as(i64, rnd.uintLessThan(u16, 4097)),
+            };
+            ring.* = r;
+        }
+        var grid = try EdgeGrid.init(a, rings, 512);
+        defer grid.deinit();
+
+        // Parity at scattered float points (the .0/.5 midpoint lattice the
+        // line clip actually queries).
+        var q: usize = 0;
+        while (q < 50) : (q += 1) {
+            const x = @as(f64, @floatFromInt(rnd.uintLessThan(u16, 8193))) / 2.0 - 64.0;
+            const y = @as(f64, @floatFromInt(rnd.uintLessThan(u16, 8193))) / 2.0 - 64.0;
+            try testing.expectEqual(pointInEvenOddF(rings, x, y), grid.parityF(x, y));
+        }
+
+        // A random polyline clipped with and without the grid: identical runs.
+        const ln = try a.alloc(Pt, 2 + rnd.uintLessThan(usize, 6));
+        for (ln) |*pp| pp.* = .{
+            .x = @as(i64, rnd.uintLessThan(u16, 4097)),
+            .y = @as(i64, rnd.uintLessThan(u16, 4097)),
+        };
+        const plain = try clipLineInsidePolys(a, ln, rings);
+        const via_grid = try clipLineInsidePolysGrid(a, ln, rings, &grid);
+        try testing.expectEqual(plain.len, via_grid.len);
+        for (plain, via_grid) |pr, gr| {
+            try testing.expectEqual(pr.len, gr.len);
+            for (pr, gr) |pp, gp| {
+                try testing.expectEqual(pp.x, gp.x);
+                try testing.expectEqual(pp.y, gp.y);
+            }
+        }
     }
 }
 

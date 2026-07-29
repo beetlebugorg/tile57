@@ -56,7 +56,8 @@ pub const Op = enum { intersect, unite, diff, sym_diff };
 /// closing chord slices across the region (the visible "wedge" artifact). On a
 /// parity-correct survivor graph a dead end can never happen, so any increase
 /// marks a boolean bug at the exact tile being composed. Callers snapshot
-/// before/after (single-threaded per compute).
+/// before/after; updates are atomic (computes run concurrently in the
+/// partition sweep) but snapshot-delta reads assume no concurrent compute.
 pub var open_chain_walks: u64 = 0;
 /// Diagnostic: how many compute() calls fell back to the region-sampled
 /// in_result recomputation because the sweep-flag pass dead-ended a walk.
@@ -439,10 +440,21 @@ const Sweeper = struct {
 /// subdivided like any crossing. Coincident edges across the two operands are
 /// the designed-for seam case, typed once. `unionAll` remains the way to fold
 /// many mutually-overlapping coverages into one region whose rings are clean.
+/// How much scratch a sweep keeps mapped between its phases. Big enough that an
+/// ordinary tile never re-maps, small enough that one monster tile's peak goes
+/// back to the OS instead of becoming the process's new floor.
+const SCRATCH_RETAIN: usize = 1 << 20;
+
 pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // One scratch arena for the whole sweep: addOperand (x2) and connectEdges
+    // (x1-2) each used to map and unmap their own. Their scratch lifetimes do
+    // not overlap, so they share this one and reset it on entry.
+    var scratch_state = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_state.deinit();
 
     var sw = Sweeper{
         .arena = arena,
@@ -462,8 +474,12 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
     // the operand's region exactly and guarantees the sweep never sees more
     // than one subject plus one clip edge coincident, which is the pair case
     // its overlap typing resolves.
-    try addOperand(&sw, subject, true, gpa);
-    try addOperand(&sw, clip, false, gpa);
+    try addOperand(&sw, subject, true, gpa, &scratch_state);
+    try addOperand(&sw, clip, false, gpa, &scratch_state);
+
+    // Every queued event is processed; splits add more, but this skips the
+    // doublings from empty that a 4000-range tile pays on the way up.
+    try sw.processed.ensureTotalCapacity(gpa, sw.queue.count());
 
     while (sw.queue.pop()) |se| {
         try sw.processed.append(gpa, se);
@@ -508,14 +524,17 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
     // midpoint test is unambiguous (coincident seam edges keep their typing,
     // which the sampling cannot decide and the sweep handles well). Both
     // passes are pure functions of the input geometry, so determinism holds.
-    const chains_before = open_chain_walks;
-    const large_before = large_open_chains;
-    const first = try connectEdges(gpa, sw.processed.items, false);
-    if (open_chain_walks == chains_before) return first;
+    // The retry decision reads THIS call's walk stats, never the shared
+    // counters: computes run concurrently (the partition sweep), and another
+    // thread's dead end must not trigger — or mask — a retry here.
+    var first_stats: WalkStats = .{};
+    const first = try connectEdges(gpa, sw.processed.items, false, &first_stats, &scratch_state);
+    if (first_stats.chains == 0) {
+        publishWalkStats(.{ .stitched = first_stats.stitched });
+        return first;
+    }
     freePolygon(gpa, first);
-    robust_retries += 1;
-    open_chain_walks = chains_before; // the retry's own walk re-judges health
-    large_open_chains = large_before;
+    _ = @atomicRmw(u64, &robust_retries, .Add, 1, .monotonic);
     for (sw.processed.items) |e| {
         if (!(e.left and e.edge_type == .normal)) continue;
         const other: Polygon = if (e.subject) clip else subject;
@@ -534,24 +553,53 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
             .sym_diff => true,
         };
     }
-    return connectEdges(gpa, sw.processed.items, true);
+    var retry_stats: WalkStats = .{};
+    const res = try connectEdges(gpa, sw.processed.items, true, &retry_stats, &scratch_state);
+    // Chains/large report the FINAL walk only (the retry re-judges health);
+    // stitches from both walks really happened.
+    retry_stats.stitched += first_stats.stitched;
+    publishWalkStats(retry_stats);
+    return res;
+}
+
+/// Per-compute walk outcome; folded into the shared counters at the end of the
+/// call so concurrent computes never read each other's in-flight state.
+const WalkStats = struct {
+    chains: u64 = 0,
+    large: u64 = 0,
+    stitched: u64 = 0,
+};
+
+fn publishWalkStats(s: WalkStats) void {
+    if (s.chains != 0) _ = @atomicRmw(u64, &open_chain_walks, .Add, s.chains, .monotonic);
+    if (s.large != 0) _ = @atomicRmw(u64, &large_open_chains, .Add, s.large, .monotonic);
+    if (s.stitched != 0) _ = @atomicRmw(u64, &stitched_gaps, .Add, s.stitched, .monotonic);
 }
 
 /// Add one operand's rings to the sweep with its self-overlapping collinear
 /// runs cancelled (reduceEdges). Survivors are added in reduceEdges' sorted
 /// order so event ids — the deterministic tie-break — are a function of
 /// geometry alone.
-fn addOperand(sw: *Sweeper, rings: Polygon, subject: bool, gpa: Allocator) !void {
-    var scratch = std.heap.ArenaAllocator.init(gpa);
-    defer scratch.deinit();
+fn addOperand(sw: *Sweeper, rings: Polygon, subject: bool, gpa: Allocator, scratch: *std.heap.ArenaAllocator) !void {
+    // Everything below dies at return (addEdge copies into the sweep arena), so
+    // the caller's scratch is reused rather than mapped and unmapped per call.
+    _ = scratch.reset(.{ .retain_with_limit = SCRATCH_RETAIN });
     const sa = scratch.allocator();
 
+    // At most one edge per ring vertex. Reserving matters more than usual here:
+    // `sa` is an arena, so every doubling STRANDS the old buffer as well as
+    // copying it, and this was the largest single copy site in a cold compose.
+    var upper: usize = 0;
+    for (rings) |ring| {
+        if (ring.len >= 3) upper += ring.len;
+    }
     var raw = std.ArrayList(HEdge).empty;
+    try raw.ensureTotalCapacityPrecise(sa, upper);
     for (rings) |ring| {
         if (ring.len < 3) continue;
         var j = ring.len - 1;
         for (ring, 0..) |p, i| {
-            if (!ring[j].eql(p)) try raw.append(sa, .{ .a = ring[j], .b = p });
+            if (!ring[j].eql(p)) raw.appendAssumeCapacity(.{ .a = ring[j], .b = p });
             j = i;
         }
     }
@@ -738,9 +786,10 @@ fn nearSegment(v: Pt, a: Pt, b: Pt) bool {
     return dot >= 0 and dot <= len2;
 }
 
-fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt {
-    var scratch = std.heap.ArenaAllocator.init(gpa);
-    defer scratch.deinit();
+fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool, stats: *WalkStats, scratch: *std.heap.ArenaAllocator) ![][]Pt {
+    // Scratch holds only temporaries — the returned contours are gpa-owned — so
+    // this reuses the caller's arena instead of mapping a fresh one per call.
+    _ = scratch.reset(.{ .retain_with_limit = SCRATCH_RETAIN });
     const sa = scratch.allocator();
 
     // (1) Collect the result edges and reduce them to the even-odd boundary:
@@ -750,10 +799,11 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt 
     // fixes the trace order (ring order / start vertex) as a function of
     // geometry alone — the byte-stability the bake==live contract needs.
     var raw = std.ArrayList(HEdge).empty;
+    try raw.ensureTotalCapacity(sa, all.len);
     for (all) |e| {
         if (!(e.left and e.in_result)) continue;
         if (e.p.eql(e.other.p)) continue;
-        try raw.append(sa, .{ .a = e.p, .b = e.other.p });
+        raw.appendAssumeCapacity(.{ .a = e.p, .b = e.other.p });
     }
     var edges = std.ArrayList(HEdge).empty;
     try edges.appendSlice(sa, try reduceEdges(sa, raw.items));
@@ -919,7 +969,7 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt 
             const j = best orelse continue;
             paired[i] = true;
             paired[j] = true;
-            stitched_gaps += 1;
+            stats.stitched += 1;
             const idx = edges.items.len;
             try edges.append(sa, .{ .a = v, .b = odd.items[j] });
             for ([_]Pt{ v, odd.items[j] }) |pp| {
@@ -955,10 +1005,10 @@ fn connectEdges(gpa: Allocator, all: []const *SweepEvent, stitch: bool) ![][]Pt 
                 }
             }
             const ei = picked orelse {
-                open_chain_walks += 1; // dead end: the emitted chain closes on a chord
+                stats.chains += 1; // dead end: the emitted chain closes on a chord
                 const cdx: i128 = cur.x - loop_start.x;
                 const cdy: i128 = cur.y - loop_start.y;
-                if (cdx * cdx + cdy * cdy > 32 * 32) large_open_chains += 1;
+                if (cdx * cdx + cdy * cdy > 32 * 32) stats.large += 1;
                 break;
             };
             edges.items[ei].used = true;

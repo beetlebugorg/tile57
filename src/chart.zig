@@ -1551,6 +1551,84 @@ pub fn renderComposeGpuScene(src: *compose_mod.ComposeSource, lon: f64, lat: f64
     };
 }
 
+// ---- parallel per-tile portrayal (the view build's fan-out) -------------------
+// A coarse view portrays 28-35 tiles and they do not interact: each is composed
+// from the partition and tessellated into its own arena. Serially that was the
+// whole cost of a zoom-out (885/1101/1442 ms for z7/z6/z4 on a Tab M9), on ONE
+// core of eight. Only the misses fan out — see renderComposeGpuSceneInner.
+
+const MAX_COMPOSE_WORKERS = 8;
+
+const TileSlot = struct {
+    t: scene.ViewTiles.Tile,
+    key: GeomKey,
+    /// Non-null when the cache already had it: the workers skip this slot.
+    hit: ?*GpuScene,
+    built: ?*GpuScene = null,
+    err: ?[]const u8 = null,
+};
+
+const ComposeTileCtx = struct {
+    next: std.atomic.Value(usize),
+    slots: []TileSlot,
+    src: *compose_mod.ComposeSource,
+    palette: render.resolve.PaletteId,
+    settings: *const render.resolve.Settings,
+    pixel_ratio: f64,
+};
+
+/// How many threads to portray `fresh` misses with. The frame-critical render
+/// thread needs a core of its own — on the 2-big/6-little phones this targets,
+/// taking every core just moves the stall — so this leaves one behind and caps
+/// at 4: each worker holds a whole tile's compose working set, and the app has
+/// been lmkd-killed on this workload before. TILE57_COMPOSE_WORKERS overrides.
+fn composeWorkerCount(fresh: u32) usize {
+    if (std.c.getenv("TILE57_COMPOSE_WORKERS")) |v| {
+        const s = std.mem.span(v);
+        if (std.fmt.parseInt(usize, s, 10)) |n| {
+            return @max(1, @min(n, MAX_COMPOSE_WORKERS));
+        } else |_| {}
+    }
+    const cpus = std.Thread.getCpuCount() catch 2;
+    const n = @min(@max(cpus -| 1, 1), 4);
+    return @max(1, @min(n, fresh));
+}
+
+fn composeTileWorker(ctx: *ComposeTileCtx) void {
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.slots.len) return;
+        const s = &ctx.slots[i];
+        if (s.hit != null) continue; // cache hit — nothing to portray
+        if (composeTileGpuScene(ctx.src, s.t.z, s.t.x, s.t.y, ctx.palette, ctx.settings, ctx.pixel_ratio, false)) |built| {
+            s.built = built;
+        } else |err| {
+            s.err = @errorName(err);
+        }
+    }
+}
+
+fn runComposeTileWorkers(ctx: *ComposeTileCtx, n: usize) void {
+    if (n <= 1) return composeTileWorker(ctx);
+    var threads: [MAX_COMPOSE_WORKERS]std.Thread = undefined;
+    var spawned: usize = 0;
+    while (spawned < n - 1) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, composeTileWorker, .{ctx}) catch break;
+    }
+    composeTileWorker(ctx); // this thread portrays too
+    for (threads[0..spawned]) |t| t.join();
+}
+
+/// Populate the process-wide lazies a portrayal reads, on THIS thread, before any
+/// worker touches them. sharedColors/sharedGpuAtlases guard their own init with an
+/// atomic state machine, but sharedGpuAtlases' ratio-change reset is plain stores —
+/// warming at the ratio the workers will ask for keeps them all on the read path.
+fn warmSharedForCompose(a: std.mem.Allocator, palette: render.resolve.PaletteId, pixel_ratio: f64) void {
+    _ = sharedColors() catch {};
+    _ = sharedGpuAtlases(pixel_ratio);
+    if (viewSymbolStore(a, palette)) |st| st.deinit() else |_| {}
+}
+
 fn renderComposeGpuSceneInner(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zoom: f64, w: u32, h: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
     geomInvalidate(settings);
     g_geom_floor = g_geom_gen + 1; // eviction never touches this walk's tiles
@@ -1582,28 +1660,67 @@ fn renderComposeGpuSceneInner(src: *compose_mod.ComposeSource, lon: f64, lat: f6
     // assemble copies out of them.
     var ephemeral = std.ArrayList(*GpuScene).empty;
     defer for (ephemeral.items) |e| e.deinit();
+
+    // The view's tiles are INDEPENDENT of one another, so the misses portray in
+    // parallel; the cache and the paint order stay strictly serial around that.
+    // Three phases:
+    //   1. serial   — walk ViewTiles, take the cache hits (LRU touch included)
+    //   2. parallel — portray only the misses, each into its own slot
+    //   3. serial   — publish in TILE ORDER: put, count, append
+    // Phase 3 in the original walk order is what keeps `parts` (and therefore the
+    // scene digest) identical to the one-thread build; the workers touch nothing
+    // shared but their own slot.
+    var slots = std.ArrayList(TileSlot).empty;
     while (vt.next()) |t| {
         total += 1;
         const key = GeomKey{ .handle = @intFromPtr(src), .z = t.z, .x = t.x, .y = t.y };
-        if (geomGet(key) == null) {
-            fresh += 1;
-            if (renderComposeTileGpuScene(src, t.z, t.x, t.y, palette, settings, pixel_ratio)) |built| {
-                if (built.scene.vertices.len == 0 and built.scene.quads.len == 0) {
-                    empty += 1;
-                    if (ephemeral.append(sa, built)) |_| {
-                        parts.append(sa, built.scene) catch {};
-                        cands.appendSlice(sa, built.candidates) catch {};
-                    } else |_| built.deinit();
-                    continue;
-                }
-                geomPut(key, built);
-            } else |err| {
+        const hit = geomGet(key);
+        if (hit == null) fresh += 1;
+        try slots.append(sa, .{ .t = t, .key = key, .hit = hit });
+    }
+    if (fresh > 0) {
+        warmSharedForCompose(sa, palette, pixel_ratio);
+        var ctx = ComposeTileCtx{
+            .next = std.atomic.Value(usize).init(0),
+            .slots = slots.items,
+            .src = src,
+            .palette = palette,
+            .settings = settings,
+            .pixel_ratio = pixel_ratio,
+        };
+        runComposeTileWorkers(&ctx, composeWorkerCount(fresh));
+    }
+    for (slots.items) |*s| {
+        if (s.hit == null) {
+            // A worker that ran out of memory could not reclaim (the cache is
+            // this thread's alone) — retry it here, where geomDropCold is safe.
+            if (s.err != null and s.built == null and std.mem.eql(u8, s.err.?, "OutOfMemory")) {
+                if (renderComposeTileGpuScene(src, s.t.z, s.t.x, s.t.y, palette, settings, pixel_ratio)) |b| {
+                    s.built = b;
+                    s.err = null;
+                } else |e2| s.err = @errorName(e2);
+            }
+            if (s.err) |e| {
                 failed += 1;
-                last_err = @errorName(err);
+                last_err = e;
                 continue;
             }
+            const built = s.built orelse {
+                failed += 1;
+                last_err = "NoResult";
+                continue;
+            };
+            if (built.scene.vertices.len == 0 and built.scene.quads.len == 0) {
+                empty += 1;
+                if (ephemeral.append(sa, built)) |_| {
+                    parts.append(sa, built.scene) catch {};
+                    cands.appendSlice(sa, built.candidates) catch {};
+                } else |_| built.deinit();
+                continue;
+            }
+            geomPut(s.key, built);
         }
-        if (geomGet(key)) |g| {
+        if (geomGet(s.key)) |g| {
             if (g.scene.vertices.len == 0 and g.scene.quads.len == 0) empty += 1;
             parts.append(sa, g.scene) catch {};
             cands.appendSlice(sa, g.candidates) catch {};
@@ -1626,6 +1743,13 @@ fn renderComposeGpuSceneInner(src: *compose_mod.ComposeSource, lon: f64, lat: f6
 /// ONE composed tile into a draw-ready scene — the per-tile twin of
 /// renderComposeGpuScene, for a host that caches tiles (see Chart.renderTileGpuScene).
 pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64) !*GpuScene {
+    return composeTileGpuScene(src, z, x, y, palette, settings, pixel_ratio, true);
+}
+
+/// `may_reclaim` is FALSE on the view build's worker threads: the geometry cache
+/// belongs to the calling thread, so a worker must not geomDropCold to satisfy its
+/// own OOM. It reports the error instead and the serial phase retries with reclaim.
+fn composeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32, y: u32, palette: render.resolve.PaletteId, settings: *const render.resolve.Settings, pixel_ratio: f64, may_reclaim: bool) !*GpuScene {
     const out = try gpa.create(GpuScene);
     errdefer gpa.destroy(out);
     out.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .scene = undefined };
@@ -1652,15 +1776,20 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
     // A per-tile OutOfMemory reclaims the biggest pool and retries once —
     // without this, coarse tiles vanished one by one on a memory-limited
     // device while every counter upstream read healthy.
-    const tile_res = src.tile(sa, z, x, y) catch |err| blk: {
-        if (err == error.OutOfMemory) {
+    const tile_res = src.tileContent(sa, z, x, y) catch |err| blk: {
+        if (err == error.OutOfMemory and may_reclaim) {
             geomDropCold(); // NOT geomDropAll: the walk's own tiles are still referenced
-            break :blk src.tile(sa, z, x, y);
+            break :blk src.tileContent(sa, z, x, y);
         }
         break :blk err;
     };
-    if (tile_res) |res| {
-        if (res.tile) |bytes| {
+    if (tile_res) |res| switch (res.content) {
+        // Seam-composed: the features come back decoded — portray them as-is.
+        .layers => |layers| scene.replayTile(sa, surf, layers) catch |err| {
+            std.debug.print("TILE LOST z{d}/{d}/{d}: replay FAILED ({s}) on composed layers\n", .{ z, x, y, @errorName(err) });
+        },
+        // Verbatim single-owner blob: decode the stored MLT, then portray.
+        .bytes => |bytes| {
             if (mlt.decode(sa, bytes)) |layers| {
                 scene.replayTile(sa, surf, layers) catch |err| {
                     std.debug.print("TILE LOST z{d}/{d}/{d}: replay FAILED ({s}) after {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
@@ -1668,11 +1797,10 @@ pub fn renderComposeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32,
             } else |err| {
                 std.debug.print("TILE LOST z{d}/{d}/{d}: decode FAILED ({s}) on {d} served bytes\n", .{ z, x, y, @errorName(err), bytes.len });
             }
-        } else {
-            // Nothing served: say why — the owner with no tile, or charted
-            // ground the tier map gave to nobody. (True ocean stays silent.)
-            src.explainEmpty(z, x, y);
-        }
+        },
+        // Nothing served: say why — the owner with no tile, or charted
+        // ground the tier map gave to nobody. (True ocean stays silent.)
+        .none => src.explainEmpty(z, x, y),
     } else |err| {
         std.debug.print("TILE LOST z{d}/{d}/{d}: compose FAILED ({s})\n", .{ z, x, y, @errorName(err) });
     }
@@ -1708,10 +1836,15 @@ pub fn composeQueryPoint(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     };
     const surf = qs.asSurface();
     try surf.beginScene(z);
-    const res = src.tile(a, z, tx, ty) catch return;
-    const bytes = res.tile orelse return;
-    const layers = mlt.decode(a, bytes) catch return;
-    scene.replayTile(a, surf, layers) catch return;
+    const res = src.tileContent(a, z, tx, ty) catch return;
+    switch (res.content) {
+        .layers => |layers| scene.replayTile(a, surf, layers) catch return,
+        .bytes => |bytes| {
+            const layers = mlt.decode(a, bytes) catch return;
+            scene.replayTile(a, surf, layers) catch return;
+        },
+        .none => return,
+    }
     _ = surf.endScene(a) catch {};
 }
 

@@ -760,7 +760,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
     });
     addCatalogueJson(b, s101_test); // catalogue.zig @embedFile's the JSON
+    // pmtiles.zig's reader lock drops to raw pthread on POSIX, so this needs libc too.
     const tiles_test = addPkgTest(b, test_step, "src/tiles/tiles.zig", target, optimize, &.{});
+    tiles_test.link_libc = true;
     addMvtFixture(b, tiles_test); // pmtiles.zig's round-trip test embeds it
     _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
@@ -772,8 +774,10 @@ pub fn build(b: *std.Build) void {
     });
     _ = addPkgTest(b, test_step, "src/style/style.zig", target, optimize, &.{});
     _ = addPkgTest(b, test_step, "src/errors.zig", target, optimize, &.{});
-    // Geometry core for the cross-band composition (pure, std-only).
-    _ = addPkgTest(b, test_step, "src/geometry/geometry.zig", target, optimize, &.{});
+    // Geometry core for the cross-band composition. No longer std-only: plane.zig
+    // reads its partition tuning/stats valves via std.c.getenv, so the test binary
+    // needs libc for the same reason compose's does, below.
+    addPkgTest(b, test_step, "src/geometry/geometry.zig", target, optimize, &.{}).link_libc = true;
     // The runtime compositor + its clip core: pure over tiles + geometry + coverage.
     // Its own step for fast iteration, and part of the main suite.
     const compose_deps = [_]std.Build.Module.Import{

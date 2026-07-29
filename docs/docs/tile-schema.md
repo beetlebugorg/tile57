@@ -61,6 +61,15 @@ drop out at their own thresholds and the chart never clutters. (Earlier schema
 versions split these into separate `*_scamin` layers; `tile57/2` folds them back
 into the base layers, gated by the per-feature property.)
 
+A chart also bakes the zooms *below* its band, so a region covered only by
+harbour charts still has something to draw at overview zoom. Those fill-down
+tiles are generalized to what the display resolves rather than what the source
+holds: the per-tile simplification runs at one display pixel instead of a half,
+and a polygon ring enclosing less than two display pixels squared is dropped
+outright — at that size it is a triangle pair nobody can see, and a coastline
+compiled for 1:20,000 carries thousands of them into a 1:35,000,000 tile.
+Zooms inside a chart's own band are untouched, at full source resolution.
+
 ## The six layers
 
 Every feature also carries shared metadata the style and the pick report read,
