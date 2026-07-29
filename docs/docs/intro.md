@@ -101,6 +101,8 @@ hex, so a renderer can switch palette without regenerating tiles.
 - [**C API**](./c-api.md) — the `tile57_*` C ABI (`include/tile57.h`).
 - [**Architecture**](./architecture.md) — the pipeline and the Zig packages.
 - [**Tile Schema**](./tile-schema.md) — the vector-tile layer contract.
-- [**The Rendering Engine**](./rendering.md) — the native S-52 pixel path: PNG/PDF
+- [**Rendering Engine**](./rendering.md) — the native S-52 pixel path: PNG/PDF
   renders, the Surface/Canvas architecture, and how to extend it.
+- [**GPU Rendering**](./gpu-rendering.md) — draw-ready buffers, the uniform block,
+  the shaders and the batcher: what a 60 fps chartplotter host actually needs.
 - [**Known Limitations**](./limitations.md) — what does not render yet.
