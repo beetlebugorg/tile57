@@ -760,7 +760,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
     });
     addCatalogueJson(b, s101_test); // catalogue.zig @embedFile's the JSON
+    // pmtiles.zig's reader lock drops to raw pthread on POSIX, so this needs libc too.
     const tiles_test = addPkgTest(b, test_step, "src/tiles/tiles.zig", target, optimize, &.{});
+    tiles_test.link_libc = true;
     addMvtFixture(b, tiles_test); // pmtiles.zig's round-trip test embeds it
     _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
