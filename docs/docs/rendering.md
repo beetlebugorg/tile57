@@ -1,9 +1,14 @@
-# The Rendering Engine
+# Rendering Engine
 
 tile57 contains a full **native S-52 rendering engine**: it draws a finished
 chart — raster PNG or vector PDF — straight from ENC charts, with no MapLibre,
 browser, or GPU involved. This page explains how it works, how to use it, and
 how to extend it.
+
+> Drawing the chart on a GPU instead? That has its own contract — draw-ready
+> buffers, the uniform block the shaders read, the shaders themselves, and a
+> batcher that turns ranges into draw calls. See
+> [GPU Rendering](./gpu-rendering.md).
 
 ## The one-paragraph version
 

@@ -72,7 +72,7 @@ of them, the same picture a client sees. `--palette day|dusk|night` picks the
 colour scheme, `--dq` overlays data quality, `--scale F` multiplies physical
 symbol size, and the mariner settings flags (`--safety`, `--feet`,
 `--no-names`, …) are shown in
-[The Rendering Engine](./rendering.md#from-the-command-line).
+[Rendering Engine](./rendering.md#from-the-command-line).
 
 ### `ascii`
 

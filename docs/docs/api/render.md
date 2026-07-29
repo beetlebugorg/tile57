@@ -328,6 +328,10 @@ encode. Both callback forms have composed twins (`tile57_compose_canvas` /
 
 ### Draw-ready GPU scenes (batched buffers)
 
+> This section is the struct reference. For the whole GPU contract end to end —
+> these buffers plus the uniform block, the shaders, `tile57_gpu_batch`, and a
+> worked frame loop — see [GPU Rendering](../gpu-rendering.md).
+
 The [host surface callback](#host-surface-vector-callbacks) hands back a *stream* of
 draw calls in paint order. A GPU host can't draw that stream directly — it must batch
 by pipeline, and batching reorders it (see [Paint order](#paint-order)). Rebuilding

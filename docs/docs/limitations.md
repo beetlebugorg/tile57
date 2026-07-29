@@ -111,7 +111,7 @@ result is **best effort**:
 The `tile57` CLI baker runs the same full S-101 portrayal as the live chart
 path, so a baked archive matches live generation. The native PNG/PDF renderer
 has its own short list of deliberate gaps — see
-[The Rendering Engine](./rendering.md#whats-deliberately-not-here-yet).
+[Rendering Engine](./rendering.md#whats-deliberately-not-here-yet).
 
 ## ENC_ROOT loading
 

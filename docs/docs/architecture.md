@@ -72,7 +72,7 @@ resolves them (tokens → RGB, symbol names → vector outlines) and paints PNG
 raster or deterministic vector PDF, and the **ASCII surface** lowers them to a
 Unicode terminal grid (with optional ANSI colour, or real pixels inline via the
 kitty graphics protocol). One engine, pluggable outputs — see
-[The Rendering Engine](./rendering.md).
+[Rendering Engine](./rendering.md).
 
 ### Tile formats: MLT by default, MVT optional
 

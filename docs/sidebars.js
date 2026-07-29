@@ -36,6 +36,7 @@ const sidebars = {
     },
     'architecture',
     'rendering',
+    'gpu-rendering',
     'tile-schema',
     'limitations',
     'contributing',

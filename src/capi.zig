@@ -727,6 +727,7 @@ export fn tile57_chart_labels(
 // ---- draw-ready GPU scenes (mirrors tile57_gpu_* in tile57.h) --------------
 
 const gpu = @import("render").gpu;
+const batch_mod = @import("render").batch;
 
 /// The C-facing scene structs live in render/gpu.zig, beside the Vertex/Range
 /// they mirror, so the layout assertions guarding them against tile57.h run in
@@ -1746,14 +1747,40 @@ export fn tile57_trim_caches() callconv(.c) void {
 }
 
 /// GPU-scene ABI self-description: sizeof(vertex) | sizeof(quad)<<8 |
-/// sizeof(range)<<16. A host compiled against a NEWER tile57.h than the
-/// library it links renders GARBAGE (a 28-byte shader stride over a 24-byte
-/// stream shears every vertex after the first) — comparing this at open turns
-/// silent shear into a loud refusal, and a host calling it against a library
-/// too old to export it fails at LINK time, which is better still.
+/// sizeof(range)<<16 | sizeof(uniforms)<<24. A host compiled against a NEWER
+/// tile57.h than the library it links renders GARBAGE (a 28-byte shader stride
+/// over a 24-byte stream shears every vertex after the first) — comparing this
+/// at open turns silent shear into a loud refusal, and a host calling it
+/// against a library too old to export it fails at LINK time, which is better
+/// still. Uniforms rides in the top byte: 128 fits, and a block the shaders
+/// read past the end of is the same class of silent corruption.
 export fn tile57_abi_gpu_layout() callconv(.c) u32 {
     const g = @import("render").gpu;
-    return @as(u32, @sizeOf(g.Vertex)) | (@as(u32, @sizeOf(g.Quad)) << 8) | (@as(u32, @sizeOf(g.Range)) << 16);
+    return @as(u32, @sizeOf(g.Vertex)) | (@as(u32, @sizeOf(g.Quad)) << 8) |
+        (@as(u32, @sizeOf(g.Range)) << 16) | (@as(u32, @sizeOf(g.Uniforms)) << 24);
+}
+
+/// Batch a scene's ranges into draw calls: which pipeline, which atlas, what
+/// the uniform block says, and which neighbours fold into one call. Pure — it
+/// reads the scene and writes `out`, allocating nothing and touching no GPU.
+///
+/// Returns how many draws the batch HAS. A return greater than `out_cap` means
+/// the buffer was too small and NOTHING should be drawn from it: a truncated
+/// batch is missing chart, silently. Size it from `scene->range_count`, which
+/// is the ceiling (draws only ever merge, never split).
+export fn tile57_gpu_batch(
+    ranges: ?[*]const gpu.Range,
+    range_count: usize,
+    opts: ?*const batch_mod.Opts,
+    out: ?[*]batch_mod.Draw,
+    out_cap: usize,
+) callconv(.c) usize {
+    const rs = if (ranges) |p| p[0..range_count] else return 0;
+    const o = if (opts) |p| p.* else batch_mod.Opts{};
+    // A null `out` is legal: it asks how many draws the batch would have.
+    var none: [0]batch_mod.Draw = .{};
+    const dst: []batch_mod.Draw = if (out) |p| p[0..out_cap] else &none;
+    return batch_mod.batch(rs, o, dst);
 }
 
 export fn tile57_warmup() callconv(.c) void {
