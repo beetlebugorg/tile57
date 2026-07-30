@@ -104,9 +104,12 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
                     const p = std.fs.path.join(a, &.{ base_path, entry.path }) catch continue;
                     const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, a, .unlimited) catch continue;
                     // The exchange set puts a cell's files in the cell's own
-                    // directory, so that directory names the owner.
-                    const owner = std.fs.path.basename(std.fs.path.dirname(entry.path) orelse "");
-                    aux_files.append(a, .{ .owner = owner, .name = entry.path, .bytes = bytes }) catch {};
+                    // directory, so that directory names the owner. Both names
+                    // must be COPIED: the walker reuses one buffer for the path,
+                    // so a borrowed slice becomes the next entry's name.
+                    const owner = a.dupe(u8, std.fs.path.basename(std.fs.path.dirname(entry.path) orelse "")) catch continue;
+                    const name = a.dupe(u8, entry.path) catch continue;
+                    aux_files.append(a, .{ .owner = owner, .name = name, .bytes = bytes }) catch {};
                     continue;
                 }
                 if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
