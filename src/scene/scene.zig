@@ -698,6 +698,10 @@ pub const TileSurface = struct {
         const safcon = try safconSyms(s.a, valdco_m, false);
         if (safcon.len == 0) return; // out of SAFCON01's range: nothing to draw
         var props = std.ArrayList(mvt.Prop).empty;
+        // The metric run also rides as symbol_name, so a style that knows
+        // nothing of depth units still draws the label — the same way a
+        // sounding's sym_s run serves as its icon-image.
+        try props.append(s.a, .{ .key = "symbol_name", .value = .{ .string = safcon } });
         try props.append(s.a, .{ .key = "safcon", .value = .{ .string = safcon } });
         try props.append(s.a, .{ .key = "safcon_ft", .value = .{
             .string = try safconSyms(s.a, valdco_m * M_TO_FT, true),
