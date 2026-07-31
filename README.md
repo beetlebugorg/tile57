@@ -1,10 +1,12 @@
 <h1 align="center">tile57</h1>
 
 <p align="center">
-  <b>⚓ An S-101 / S-57 chart engine: vector tiles, S-52 styles, PNG and PDF.</b><br>
-  tile57 reads native IHO <b>S-101</b> ENC charts — and legacy <b>S-57</b> cells — and turns
-  them into vector tiles (MLT or MVT) with a matching MapLibre S-52 style, or renders finished
-  charts directly to PNG and PDF — one Zig library with a C ABI, compiled natively or to WASM.
+  <b>⚓ Official nautical charts, ready to draw.</b><br>
+  tile57 reads IHO <b>S-101</b> and <b>S-57</b> charts and gives a renderer what it
+  needs: vector tiles with a matching MapLibre S-52 style, a draw-ready GPU scene,
+  pixel draw calls, or finished PNG and PDF. It reports the objects under a point,
+  and the text and pictures a chart carries. One Zig library with a C ABI, compiled
+  natively or to WASM.
 </p>
 
 <p align="center">
@@ -16,43 +18,78 @@
 ---
 
 > [!WARNING]
-> **Not for navigation.** This is not a certified or tested navigation product. Do not rely
-> on it for real-world navigation. See [Known limitations](docs/docs/limitations.md).
+> **Not for navigation.** This is not a certified navigation product. Do not use it
+> to navigate. Refer to [Known limitations](docs/docs/limitations.md).
 
 ---
 
-**tile57** reads native IHO **S-101** ENC charts (S-100 Part 10a) *and* legacy
-NOAA/IHO **S-57** ENC cells — the format is detected from the `.000` file itself —
-and generates **vector tiles** by `(z, x, y)`: MapLibre Tiles (MLT, the default;
-MapLibre GL JS ≥ 5.12 decodes them natively) or Mapbox Vector Tiles. A native
-S-101 dataset feeds the portrayal engine directly; an S-57 cell is converted to
-the S-101 model first. Either way, the official IHO **S-101 Portrayal Catalogue**
-runs in embedded Lua to produce S-52 nautical portrayal. Alongside the tiles it
-emits a **MapLibre GL style** and the portrayal **assets** it references — colour
-tables, line styles, and the sprite + area-fill pattern atlases — so a renderer
-like [MapLibre](https://github.com/maplibre/maplibre-native) can draw a chart
-directly.
+Hydrographic offices publish charts as S-101 and S-57 datasets. Those formats
+carry the survey, not a picture of it. tile57 reads them and produces the picture,
+in the form your renderer wants: vector tiles, a draw-ready GPU scene, pixel draw
+calls, or a finished page. It also answers questions about the chart — which
+objects sit under a point, what the chart states about them, and the notes and
+diagrams it carries.
 
-It holds only its working set:
+## Why it is different
 
-- **Lazy, per-cell work.** A multi-cell ENC_ROOT is indexed cheaply (band + bbox);
-  cells are parsed and portrayed only when a requested tile needs them, then held
-  under an LRU bound. A **streaming** open reads a cell's bytes on demand (and
-  frees them on eviction), so a host holds only the working set — not the whole
-  catalogue.
-- **Per-cell bakes.** Each ENC cell bakes to its own PMTiles at its compilation
-  scale, so a bake holds one cell at a time; the runtime compositor stitches the
-  cells by `(z, x, y)` on demand.
-- **Pure-Zig core.** The foundational format/encode packages have no libc; only
-  the Lua portrayal + sprite rasterizer pull in C.
+- **The portrayal is official, not an imitation.** tile57 runs the IHO **S-101
+  Portrayal Catalogue** against the feature records in the chart. No symbol is a
+  look-alike. You get depth areas and contours, buoys and beacons with correct
+  symbols, lights with sector lines, soundings, and place names.
+- **It reads the format the world is moving to.** A native S-101 chart feeds the
+  portrayal engine directly. tile57 converts an S-57 chart to the same S-101 model
+  first, so everything above the conversion sees one model.
+- **It renders more than tiles.** The same engine writes PNG, PDF, and a callback
+  stream your own renderer can paint. It also answers cursor picks.
+- **It feeds a GPU directly.** tile57 portrays a whole view into one draw-ready
+  scene: vertex and quad buffers, a uniform block, and ranges already sorted into
+  paint order. A host uploads it once, then walks the ranges. Geometry stays
+  north-up in world space and the host applies the view rotation, so a course-up
+  view that turns continuously never rebuilds its scene. The repo ships reference
+  shaders for Metal, Direct3D and Vulkan.
+- **It embeds anywhere.** The core is pure Zig with a C ABI. It compiles natively
+  and to WASM.
 
-## Pipeline
+## Start here
 
-Both source formats converge on the same S-101 feature records — a native S-101
-dataset produces them directly; an S-57 cell is adapted into them:
+```sh
+git submodule update --init --recursive       # the vendored S-101 catalogue
+zig build                                     # writes zig-out/bin/tile57
+
+tile57 bake ENC_ROOT -o out/                  # every chart -> its own archive
+tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
+```
+
+The first command bakes a catalogue. The second draws a chart straight to a PNG.
+
+## What you can get
+
+| Output | Call | What it is |
+|---|---|---|
+| **Vector tiles** | `tile57_compose_tile` | MapLibre Tiles (MLT) or Mapbox Vector Tiles, by `(z, x, y)` |
+| **Style + assets** | `tile57_style_build`, `tile57_bake_assets` | A MapLibre GL style, colour tables, line styles, sprite and pattern atlases |
+| **PNG** | `tile57_chart_png` | A finished raster view |
+| **PDF** | `tile57_chart_pdf` | A vector page, 1 px = 1 pt |
+| **Draw calls** | `tile57_chart_canvas` | Pixel-space paint calls for your own rasterizer |
+| **Tagged geometry** | `tile57_chart_surface` | World-space geometry, each call tagged with its S-57 class |
+| **GPU scene** | `tile57_chart_gpu_scene` | Draw-ready vertex, quad and range buffers, plus the sprite and SDF atlases |
+| **Pick** | `tile57_chart_query` | The objects under a point, with their attributes |
+| **Notes and diagrams** | `tile57_aux_get` | The text and picture files a chart's features point at |
+
+MLT is the default tile encoding. MapLibre GL JS 5.12 and later decode it natively.
+
+---
+
+# Technical reference
+
+## How it works
+
+tile57 reads two source formats. Both are `.000` files — a *cell*, in the spec's
+vocabulary — and tile57 detects which one it holds from the file itself. Both
+converge on the same S-101 feature records.
 
 ```
-S-101 ENC (.000)              S-57 ENC cell (.000)
+S-101 ENC (.000)              S-57 ENC chart (.000)
    │ ISO 8211 decode             │ ISO 8211 decode          src/iso8211/
    ▼                             ▼
 S-100 spatial + feature       S-57 feature + geometry       src/s57/  ·  src/s101/
@@ -67,26 +104,39 @@ portrayal instruction stream             src/s101/ (instructions)
    │  scene generation                   src/scene/  (project + clip + draw calls)
    ▼
 render Surface ──► MVT / MLT tiles (src/tiles/)  +  MapLibre style.json + assets
-             └───► PNG raster / vector PDF / terminal text (src/render/)
+             ├───► PNG raster / vector PDF / terminal text (src/render/)
+             └───► draw-ready GPU scene (src/render/gpu.zig)  +  shaders/
 ```
 
-A native S-101 chart is read straight into the S-101 model — its in-band code
-tables already carry the S-101 class and attribute names — so no conversion runs;
-its `.001…` update files are applied on load. An S-57 cell is read into the S-57
-model and adapted (a best-effort, S-65-guided step; see
-[limitations](docs/docs/limitations.md)). The stages are separate Zig modules —
-`iso8211`, `s57`, `s101`, `tiles`, `render`, `scene`, `style` — pure Zig with no
-libc; only the Lua portrayal (`portray`) and the sprite rasterizer (`sprite`) pull
-in C. See [the architecture docs](docs/docs/architecture.md).
+tile57 reads a native S-101 chart straight into the S-101 model. That chart's
+in-band code tables already carry the S-101 class and attribute names, so no
+conversion runs. tile57 applies the chart's update files on load. tile57 reads an
+S-57 chart into the S-57 model and adapts it. The adaptation follows S-65 and is
+best-effort. Refer to [limitations](docs/docs/limitations.md).
+
+Each stage is a separate Zig module: `iso8211`, `s57`, `s101`, `tiles`, `render`,
+`scene`, and `style`. Those modules need no libc. Only the Lua portrayal
+(`portray`) and the sprite rasterizer (`sprite`) use C. Refer to
+[the architecture docs](docs/docs/architecture.md).
+
+## How it holds memory
+
+- **Work is lazy, and it is per chart.** tile57 indexes a multi-chart ENC_ROOT by
+  band and bounding box. It parses and portrays a chart only when a requested tile
+  needs it. An LRU bound caps how many it holds. A streaming open reads a chart's
+  bytes on demand and frees them on eviction.
+- **Each chart bakes on its own.** Each chart bakes to its own PMTiles archive at
+  its compilation scale. A bake holds one chart at a time. The runtime compositor
+  stitches the archives by `(z, x, y)` on demand. There is no merged archive.
 
 ## Use it from Zig
 
-Add tile57 as a dependency, then `@import("tile57")`:
+Add tile57 as a dependency, then import it:
 
 ```zig
 const tile57 = @import("tile57");
 
-// Open an on-disk ENC_ROOT directory (or a single .000 file) as a streaming chart.
+// Open an ENC_ROOT directory, or a single .000 file, as a streaming chart.
 var chart = try tile57.Chart.openPath("ENC_ROOT/", null, true);
 defer chart.deinit();
 
@@ -94,44 +144,45 @@ const bbox = chart.bounds();   // geographic extent [w, s, e, n], or null
 // … render a view (chart.renderView), query features, or bake an archive …
 ```
 
-`Chart` renders views, queries features, and reads metadata. The runtime tile
-path — bake each cell, then compose by `(z, x, y)` on demand — is exposed through
-the [C ABI](include/tile57.h). See [the Zig API docs](docs/docs/zig-api.md).
+`Chart` renders views, queries features, and reads metadata. Refer to
+[the Zig API docs](docs/docs/zig-api.md).
 
 ## Use it from C
 
-The same engine behind a thin C ABI ([`include/tile57.h`](include/tile57.h)).
-Tiles are made one way — bake each cell to its own PMTiles, then compose on
-demand — the structure `tile57 bake ENC_ROOT -o out/` writes:
+The same engine sits behind a thin C ABI
+([`include/tile57.h`](include/tile57.h)). `tile57 bake ENC_ROOT -o out/` writes one
+directory per chart. `tile57_compose_tree` opens that whole tree in one call and
+serves any tile on demand.
 
 ```c
-// out/ holds <CELL>/<CELL>.pmtiles (one directory per cell, with the files it
-// references) + partition.tpart
-const char *paths[] = { "out/US5MD1MC/US5MD1MC.pmtiles" };
-tile57_compose_source *src = tile57_compose_open(paths, 1, "out/partition.tpart");
+// out/ holds <CHART>/<CHART>.pmtiles per chart, with the files that chart
+// references, plus out/partition.tpart.
+tile57_compose *c = NULL;
+uint32_t charts = 0;
+if (tile57_compose_tree("out/", &c, &charts, NULL) != TILE57_OK)
+    return 1;
 
-uint8_t *tile; size_t n;
-if (tile57_compose_serve(src, z, x, y, &tile, &n) == 1) {   /* decompressed MLT */
-    /* … hand the tile to your renderer … */
-    tile57_free(tile, n);
+uint8_t *tile = NULL;
+size_t len = 0;
+if (tile57_compose_tile(c, z, x, y, &tile, &len, NULL, NULL) == TILE57_OK && tile) {
+    /* … hand the decompressed MLT tile to your renderer … */
+    tile57_free(tile);
 }
-tile57_compose_close(src);
+tile57_compose_close(c);
 ```
 
-A separate `tile57_chart` handle renders finished PNG/PDF views and answers
-metadata + object queries; `libtile57.a` also exposes the MapLibre style builder
-and the asset/atlas generators. See [the C API docs](docs/docs/c-api.md).
+A `tile57_chart` handle renders PNG and PDF views and answers metadata and object
+queries. `libtile57.a` also exposes the MapLibre style builder and the asset
+generators. Refer to [the C API docs](docs/docs/c-api.md).
 
 ## The `tile57` CLI
 
-The offline tool bakes charts and emits portrayal assets:
-
-Any `.000` — native S-101 or S-57 — works everywhere; the format is auto-detected.
+The offline tool bakes charts and emits portrayal assets. Every command takes a
+native S-101 or an S-57 `.000` file, and tile57 detects the format.
 
 ```sh
-zig build                                    # builds zig-out/bin/tile57
-tile57 bake CELL.000 -o out/                 # one cell -> out/<CELL>/<CELL>.pmtiles + partition.tpart
-tile57 bake ENC_ROOT -o out/                 # whole catalogue -> one directory per cell + partition.tpart
+tile57 bake CELL.000 -o out/                 # one chart -> out/<CELL>/<CELL>.pmtiles
+tile57 bake ENC_ROOT -o out/                 # a catalogue -> one directory per chart
 tile57 assets   -o assets/                   # colortables + linestyles + sprite + patterns
 tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
 tile57 pdf ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf
@@ -141,18 +192,18 @@ tile57 s101 CELL.000                         # inspect a native S-101 dataset
 
 ## Build
 
-The Zig engine + CLI need only **Zig 0.16**:
+The Zig engine and the CLI need Zig 0.16 only:
 
 ```sh
-git submodule update --init --recursive   # vendored S-101 catalogue
+git submodule update --init --recursive   # the vendored S-101 catalogue
 zig build && zig build test
 ```
 
-Full instructions: [docs/installation](docs/docs/installation.md).
+Refer to [docs/installation](docs/docs/installation.md) for full instructions.
 
 ## Documentation
 
-Docs source lives in [`docs/`](docs/): [intro](docs/docs/intro.md),
+The docs source is in [`docs/`](docs/): [intro](docs/docs/intro.md),
 [getting started](docs/docs/getting-started.md), the
 [Zig API](docs/docs/zig-api.md), the [C API](docs/docs/c-api.md),
 the [architecture](docs/docs/architecture.md), and the
@@ -160,12 +211,13 @@ the [architecture](docs/docs/architecture.md), and the
 
 ## AI-First Development
 
-This project is built with AI assistance. We encourage contributors to use AI tools for
-development and to contribute by providing clear requirements and/or a prototype of what
-they'd like rather than code. See the [contributing guide](docs/docs/contributing.md).
+This project is built with AI assistance. Use AI tools freely. The most useful
+contribution is a clear set of requirements, or a rough prototype of what you
+want, rather than a patch. Refer to the
+[contributing guide](docs/docs/contributing.md).
 
 ## License
 
 tile57's own code is [MIT](LICENSE) © Jeremy Collins. It embeds the IHO S-101
-Portrayal Catalogue (© IHO) and vendors nanosvg (zlib) + stb_image_write (public
+Portrayal Catalogue (© IHO). It vendors nanosvg (zlib) and stb_image_write (public
 domain). NOAA ENC charts are U.S. public domain and **not for navigation**.
