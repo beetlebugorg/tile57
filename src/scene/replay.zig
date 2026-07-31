@@ -158,6 +158,22 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
                 try surf.strokeLine(propStr(f.properties, "color_token"), propF64(f.properties, "width_px") orelse 1, dash, f.parts, propF64(f.properties, "valdco"));
             } else if (is_points) {
                 if (f.parts.len == 0 or f.parts[0].len == 0) continue;
+                // A contour label was baked as its raw metres, not as glyphs, so
+                // the surface composes it in the mariner's unit (scene.zig
+                // drawContourLabel). Surfaces that cannot get the metric run
+                // straight from the tile.
+                if (propF64(f.properties, "valdco")) |valdco| {
+                    if (surf.wantsContourLabel()) {
+                        try surf.drawContourLabel(valdco, f.parts[0][0]);
+                        continue;
+                    }
+                    var it = std.mem.splitScalar(u8, propStr(f.properties, "safcon"), ',');
+                    while (it.next()) |glyph| {
+                        if (glyph.len == 0) continue;
+                        try surf.drawSymbol(glyph, f.parts[0][0], 0, propF64(f.properties, "scale") orelse SYMBOL_SCALE, false, .point, null);
+                    }
+                    continue;
+                }
                 try surf.drawSymbol(
                     propStr(f.properties, "symbol_name"),
                     f.parts[0][0],

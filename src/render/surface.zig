@@ -183,7 +183,32 @@ pub const Surface = struct {
         /// query-only layer and the query surface tests them, so the area
         /// answers anywhere inside it. Null on render surfaces: nothing draws.
         pick_area: ?*const fn (*anyopaque, rings: []const []const TilePoint) anyerror!void = null,
+        /// Draw a depth contour's VALUE, in the surface's own depth unit.
+        ///
+        /// The catalogue composes that label itself — DEPCNT03 calls SAFCON01,
+        /// which picks one glyph per digit — but only ever in metres, because
+        /// S-52 has no other unit. A chart shown in feet then drew a metric
+        /// contour label beside feet soundings. So a surface that composes the
+        /// label itself declares it here, the emitter SKIPS the catalogue's
+        /// SAFCON glyphs, and the surface composes the same glyphs through
+        /// sndfrm.safconSyms at its own unit. `valdco_m` is always metres; the
+        /// surface converts.
+        ///
+        /// The contour twin of drawSounding, and optional for the same reason:
+        /// null leaves the catalogue's metric glyphs in place, so a surface with
+        /// no unit of its own (ascii, query, inspect) needs no change.
+        draw_contour_label: ?*const fn (*anyopaque, valdco_m: f64, at: TilePoint) anyerror!void = null,
     };
+
+    /// True when the surface composes contour labels itself, so the emitter
+    /// drops the catalogue's metres-only SAFCON glyphs.
+    pub fn wantsContourLabel(self: Surface) bool {
+        return self.vtable.draw_contour_label != null;
+    }
+
+    pub fn drawContourLabel(self: Surface, valdco_m: f64, at: TilePoint) anyerror!void {
+        if (self.vtable.draw_contour_label) |f| try f(self.ptr, valdco_m, at);
+    }
 
     pub fn setContourLadder(self: Surface, ladder: []const f64) void {
         if (self.vtable.set_contour_ladder) |f| f(self.ptr, ladder);
