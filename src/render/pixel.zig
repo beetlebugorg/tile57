@@ -207,6 +207,7 @@ pub const PixelSurface = struct {
         .endScene = endScene,
         .size_scale = sizeScale,
         .set_contour_ladder = setContourLadder,
+        .draw_contour_label = drawContourLabel,
     };
 
     fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
@@ -428,6 +429,29 @@ pub const PixelSurface = struct {
             if (glyph.len == 0) continue;
             // Each digit glyph self-positions by its pivot: draw all at the point.
             if (store.get(glyph)) |s| try self.pushSymbol(.sounding, s, at, 0, sndfrm.SYMBOL_SCALE);
+        }
+    }
+
+    /// A depth contour's value, composed in the mariner's unit. The catalogue's
+    /// SAFCON01 composes metres only, so the emitter hands the raw value here
+    /// instead (see Surface.draw_contour_label). The glyphs are the same ones
+    /// the rule would have picked — a contour reads identically in metres, and
+    /// correctly in feet.
+    ///
+    /// Drawn on the plain symbol layer, not the sounding one: the sounding
+    /// layer carries the mariner's extra sounding multiplier, which a contour
+    /// label does not take.
+    fn drawContourLabel(ctx: *anyopaque, valdco_m: f64, at: rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        const store = self.store orelse return;
+        if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;
+        const feet = self.settings.depth_unit == .feet;
+        const shown = if (feet) valdco_m * sndfrm.M_TO_FT else valdco_m;
+        const list = try sndfrm.safconSyms(self.a, shown, feet);
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |glyph| {
+            if (glyph.len == 0) continue;
+            if (store.get(glyph)) |s| try self.pushSymbol(.symbol, s, at, 0, sndfrm.SYMBOL_SCALE);
         }
     }
 

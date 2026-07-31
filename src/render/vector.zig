@@ -368,6 +368,7 @@ pub const VectorSurface = struct {
         // (No store_complex_run — this surface WALKS/renders runs, never stores.)
         .size_scale = sizeScale,
         .set_contour_ladder = setContourLadder,
+        .draw_contour_label = drawContourLabel,
     };
 
     fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
@@ -817,6 +818,31 @@ pub const VectorSurface = struct {
             // Sounding digits read upright under a rotated view (screen-referenced),
             // sized by soundingDev so digit + spacing scale together.
             if (self.cb.draw_sprite != null) try self.emitSprite(.sounding, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport) else try self.emitSymbol(.sounding, s, at, 0, sndfrm.SYMBOL_SCALE, self.soundingDev(), .viewport);
+        }
+    }
+
+    /// A depth contour's value, composed in the mariner's unit. SAFCON01 in the
+    /// catalogue composes metres only, so the emitter hands the raw value here
+    /// (see Surface.draw_contour_label). Same glyphs the rule would have picked.
+    ///
+    /// Drawn on the plain symbol layer at the plain device scale: the sounding
+    /// layer's extra multiplier belongs to soundings, not to a contour label.
+    fn drawContourLabel(ctx: *anyopaque, valdco_m: f64, at: rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        if (self.labels_only) return; // glyphs, not text — never in the pool
+        const store = self.store orelse return;
+        if (!resolve.visible(&self.cur, null, GATE_ZOOM, self.settings)) return;
+        const feet = self.settings.depth_unit == .feet;
+        const shown = if (feet) valdco_m * sndfrm.M_TO_FT else valdco_m;
+        const list = try sndfrm.safconSyms(self.a, shown, feet);
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |glyph| {
+            if (glyph.len == 0) continue;
+            const s = store.get(glyph) orelse continue;
+            if (self.cb.draw_sprite != null)
+                try self.emitSprite(.symbol, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), .viewport)
+            else
+                try self.emitSymbol(.symbol, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), .viewport);
         }
     }
 

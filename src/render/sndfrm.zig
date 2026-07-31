@@ -101,3 +101,91 @@ pub fn syms(a: Allocator, prefix: []const u8, depth: f64, swept: bool, low_acc: 
     }
     return std.mem.join(a, ",", toks.items);
 }
+
+/// Port of SAFCON01's depth-contour glyph composition: the comma-joined
+/// glyph-name string for a contour value.
+///
+/// The catalogue's rule (Rules/SAFCON01.lua, reached from DEPCNT03) is
+/// metres-only, because S-52 knows no other unit — it splits the value and picks
+/// a glyph per digit. A chart shown in FEET therefore needs a second
+/// composition, exactly as SNDFRM04 needs `syms(..., whole_feet = true)`, and
+/// for the same reason: the unit is a recreational display option, not ECDIS
+/// behaviour, so the rule cannot be asked to produce it.
+///
+/// Truncation matches `syms`: whole feet, rounded DOWN, so a contour always errs
+/// SHALLOW. A 5.4 m contour reads 17 ft (17.71 floored), never 18.
+///
+/// The digit CODE says how many digits the value has and which position this one
+/// is, which is what makes the glyphs kern into a single number — so the code
+/// table below is the rule's, not a choice.
+pub fn safconSyms(a: Allocator, depth: f64, whole_feet: bool) ![]const u8 {
+    // The rule's own guard: outside this range it draws nothing.
+    if (depth < 0 or depth > 99999) return "";
+    const raw_tenths: i64 = @intFromFloat(@floor(depth * 10.0 + 1e-6));
+    const tenths: i64 = if (whole_feet) @divTrunc(raw_tenths, 10) * 10 else raw_tenths;
+    const idepth: i64 = @divTrunc(tenths, 10);
+    const frac: u8 = @intCast(@mod(tenths, 10));
+    var dbuf: [12]u8 = undefined;
+    const ds = std.fmt.bufPrint(&dbuf, "{d}", .{idepth}) catch return "";
+    var toks = std.ArrayList([]const u8).empty;
+    const add = struct {
+        fn go(al: Allocator, t: *std.ArrayList([]const u8), code: u8, digit: u8) !void {
+            try t.append(al, try std.fmt.allocPrint(al, "SAFCON{c}{c}", .{ code, digit }));
+        }
+    }.go;
+
+    if (idepth < 10 and frac != 0) {
+        try add(a, &toks, '0', ds[0]);
+        try add(a, &toks, '6', '0' + frac); // the tenth, drawn small
+    } else if (idepth < 10) {
+        try add(a, &toks, '0', ds[0]);
+    } else if (idepth < 31 and frac != 0) {
+        try add(a, &toks, '2', ds[0]);
+        try add(a, &toks, '1', ds[1]);
+        try add(a, &toks, '5', '0' + frac);
+    } else if (idepth < 100) {
+        try add(a, &toks, '2', ds[0]);
+        try add(a, &toks, '1', ds[1]);
+    } else if (idepth < 1000) {
+        try add(a, &toks, '8', ds[0]);
+        try add(a, &toks, '0', ds[1]);
+        try add(a, &toks, '9', ds[2]);
+    } else if (idepth < 10000) {
+        try add(a, &toks, '3', ds[0]);
+        try add(a, &toks, '2', ds[1]);
+        try add(a, &toks, '1', ds[2]);
+        try add(a, &toks, '7', ds[3]);
+    } else {
+        try add(a, &toks, '4', ds[0]);
+        try add(a, &toks, '3', ds[1]);
+        try add(a, &toks, '2', ds[2]);
+        try add(a, &toks, '1', ds[3]);
+        try add(a, &toks, '7', ds[4]);
+    }
+    return std.mem.join(a, ",", toks.items);
+}
+
+test "safconSyms composes a contour value in metres and in whole feet" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    // The 5.4 m contour on US5MD1MC: the catalogue draws "5" + a small "4".
+    try std.testing.expectEqualStrings("SAFCON05,SAFCON64", try safconSyms(al, 5.4, false));
+    // The same contour in feet is 17.71 -> 17, TRUNCATED down (never 18).
+    try std.testing.expectEqualStrings("SAFCON21,SAFCON17", try safconSyms(al, 5.4 * M_TO_FT, true));
+
+    // A whole metric contour keeps the one-digit form; its feet twin is two.
+    try std.testing.expectEqualStrings("SAFCON05", try safconSyms(al, 5.0, false));
+    try std.testing.expectEqualStrings("SAFCON21,SAFCON16", try safconSyms(al, 5.0 * M_TO_FT, true));
+
+    // Two digits with a tenth take the 2/1/5 codes; three and four digits climb
+    // the table. 10 m -> 32 ft stays two digits.
+    try std.testing.expectEqualStrings("SAFCON21,SAFCON10,SAFCON55", try safconSyms(al, 10.5, false));
+    try std.testing.expectEqualStrings("SAFCON23,SAFCON12", try safconSyms(al, 10.0 * M_TO_FT, true));
+    try std.testing.expectEqualStrings("SAFCON81,SAFCON00,SAFCON90", try safconSyms(al, 100.0, false));
+
+    // Out of range draws nothing, as the rule does.
+    try std.testing.expectEqualStrings("", try safconSyms(al, -1.0, false));
+}

@@ -345,9 +345,18 @@ pub fn soundingsIconImage(b: B, m: *const Settings) !Value {
 
 // OBSTRN06/WRECKS05: a danger symbol deeper than the live safety contour swaps to
 // the less-prominent DANGER02 (sym_deep). pivot_center draws the "ctr:" variant.
+//
+// A depth-contour label rides this layer too, as the composed SAFCON glyph run
+// its unit calls for — safcon in metres, safcon_ft in feet, the same swap
+// soundingsIconImage makes between sym_s and sym_s_ft. symbol_name carries the
+// metric run, so a chart baked before the feet run existed still draws its
+// label rather than nothing.
 pub fn pointSymbolImage(b: B, m: *const Settings) !Value {
+    const contour = if (m.depth_unit == .feet) "safcon_ft" else "safcon";
     const name = try b.arr(&.{
         b.s("case"),
+        try b.arr(&.{ b.s("has"), b.s(contour) }),
+        try b.get(contour),
         try b.arr(&.{
             b.s("all"),
             try b.arr(&.{ b.s("has"), b.s("sym_deep") }),

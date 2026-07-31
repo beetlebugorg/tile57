@@ -119,6 +119,8 @@ fn listHasAny(csv: []const u8, targets: []const i64) bool {
 // (render.sndfrm) so the pixel path composes the SAME glyph lists this engine
 // bakes into sym_s/sym_g. Aliased here; all call sites unchanged.
 const sndfrmSyms = @import("render").sndfrm.syms;
+/// SAFCON01's contour-label composition, aliased the same way.
+const safconSyms = @import("render").sndfrm.safconSyms;
 
 /// SNDFRM04 quality flags for the whole feature: swept (TECSOU∈{4,18}) → B1 ring;
 /// low-accuracy (QUASOU∈{3,4,8,9}, no-bottom, or STATUS∈{18}) → C2/C3 ring.
@@ -167,6 +169,13 @@ fn appendSoundingProps(a: Allocator, props: *std.ArrayList(mvt.Prop), depth_m: f
 /// SOUNDG* faint/deep). Mirrors the oracle's isSoundingName (bake.go:2628).
 fn isSoundingName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "SOUNDS") or std.mem.startsWith(u8, name, "SOUNDG");
+}
+
+/// True for a SAFCON01 depth-contour digit-glyph symbol name. DEPCNT03 calls
+/// SAFCON01 to compose a contour's value one glyph per digit, in metres only —
+/// see Surface.draw_contour_label for why the emitter drops them.
+fn isSafconName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "SAFCON");
 }
 
 /// Emit a SOUNDG feature's multipoint soundings into the `soundings` layer, one
@@ -507,6 +516,7 @@ pub const TileSurface = struct {
         // native; replay re-walks the period display-scaled).
         .store_complex_run = storeComplexRun,
         .pick_area = pickArea,
+        .draw_contour_label = drawContourLabel,
     };
 
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
@@ -676,6 +686,34 @@ pub const TileSurface = struct {
         single[0] = at;
         parts[0] = single;
         try s.soundings.append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+    }
+
+    /// BAKE: a depth contour's value, stored so it can be shown in either unit.
+    /// `valdco` is the raw metres a render surface converts at draw time;
+    /// safcon/safcon_ft are the composed glyph runs the generated STYLE swaps
+    /// between, mirroring sym_s/sym_s_ft for soundings. The tile therefore stays
+    /// unit-independent, as it must — it is baked once and read by every unit.
+    fn drawContourLabel(ctx: *anyopaque, valdco_m: f64, at: rs.TilePoint) anyerror!void {
+        const s = sp(ctx);
+        const safcon = try safconSyms(s.a, valdco_m, false);
+        if (safcon.len == 0) return; // out of SAFCON01's range: nothing to draw
+        var props = std.ArrayList(mvt.Prop).empty;
+        // The metric run also rides as symbol_name, so a style that knows
+        // nothing of depth units still draws the label — the same way a
+        // sounding's sym_s run serves as its icon-image.
+        try props.append(s.a, .{ .key = "symbol_name", .value = .{ .string = safcon } });
+        try props.append(s.a, .{ .key = "safcon", .value = .{ .string = safcon } });
+        try props.append(s.a, .{ .key = "safcon_ft", .value = .{
+            .string = try safconSyms(s.a, valdco_m * M_TO_FT, true),
+        } });
+        try props.append(s.a, .{ .key = "valdco", .value = .{ .double = valdco_m } });
+        try props.append(s.a, .{ .key = "scale", .value = .{ .double = SYMBOL_SCALE } });
+        try appendMeta(s.a, &props, s.cur);
+        const parts = try s.a.alloc([]const mvt.Point, 1);
+        const single = try s.a.alloc(mvt.Point, 1);
+        single[0] = at;
+        parts[0] = single;
+        try s.pointsL().append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
     }
 
     fn drawText(ctx: *anyopaque, text: []const u8, text_style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
@@ -1804,8 +1842,29 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                         routed_sounding = true;
                     }
                 }
+                // The catalogue composed this contour's value in metres. A
+                // surface that composes it itself takes the raw value instead,
+                // so a chart shown in feet reads in feet; its SAFCON glyphs are
+                // then dropped below. Surfaces without a unit keep them.
+                var routed_contour = false;
+                if (valdco) |v| {
+                    if (surf.wantsContourLabel()) {
+                        for (p.points) |sym| {
+                            if (isSafconName(sym.symbol)) {
+                                routed_contour = true;
+                                break;
+                            }
+                        }
+                        if (routed_contour) {
+                            try surf.beginFeature(&fmeta);
+                            try surf.drawContourLabel(v, cpt);
+                            try surf.endFeature();
+                        }
+                    }
+                }
                 for (p.points) |sym| {
                     if (routed_sounding and isSoundingName(sym.symbol)) continue;
+                    if (routed_contour and isSafconName(sym.symbol)) continue;
                     const is_d12 = std.mem.eql(u8, sym.symbol, "DANGER01") or std.mem.eql(u8, sym.symbol, "DANGER02");
                     const danger_class = f.objl == 86 or f.objl == 153 or f.objl == 159;
                     const danger_depth: ?f64 = if (is_d12 and danger_class) f.attrFloat(s57.ATTR_VALSOU) else null;
