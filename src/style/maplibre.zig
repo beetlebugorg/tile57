@@ -1581,6 +1581,20 @@ test "buildFromTemplate: feet picks the sounding feet glyph variant; metres does
     try std.testing.expect(std.mem.indexOf(u8, metres, "sym_s") != null);
 }
 
+test "buildFromTemplate: feet picks the contour-label feet glyph run; metres doesn't" {
+    const a = std.testing.allocator;
+    const feet = try buildFromTemplate(a, cs_template, &.{ .depth_unit = .feet }, cs_ct, null, 1700000000);
+    defer a.free(feet);
+    try std.testing.expect(std.mem.indexOf(u8, feet, "safcon_ft") != null);
+
+    // Metres reads the plain run, so a contour label matches the soundings
+    // beside it in either unit.
+    const metres = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
+    defer a.free(metres);
+    try std.testing.expect(std.mem.indexOf(u8, metres, "safcon_ft") == null);
+    try std.testing.expect(std.mem.indexOf(u8, metres, "safcon") != null);
+}
+
 test "buildFromTemplate: enabled bands add a band filter" {
     const a = std.testing.allocator;
     const m = mariner.Settings{};
