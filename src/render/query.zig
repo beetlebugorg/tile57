@@ -36,6 +36,7 @@ pub const QuerySurface = struct {
         .drawText = drawText,
         .endFeature = endFeature,
         .endScene = endScene,
+        .pick_area = pickArea,
     };
 
     pub fn asSurface(self: *QuerySurface) rs.Surface {
@@ -121,6 +122,12 @@ pub const QuerySurface = struct {
         const self = sp(ctx);
         if (self.pointInRings(rings)) self.hit = true;
     }
+    /// An area the chart does not fill: a note area answers a pick anywhere
+    /// inside it, not only under its INFORM01 marker.
+    fn pickArea(ctx: *anyopaque, rings: []const []const rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        if (self.pointInRings(rings)) self.hit = true;
+    }
     fn strokeLine(ctx: *anyopaque, _: rs.ColorToken, _: f64, _: rs.Dash, lines: []const []const rs.TilePoint, _: ?f64) anyerror!void {
         const self = sp(ctx);
         if (self.nearLines(lines)) self.hit = true;
@@ -138,3 +145,30 @@ pub const QuerySurface = struct {
         if (self.nearPoint(at)) self.hit = true;
     }
 };
+
+test "a note area answers a pick inside it, and only inside it" {
+    const Seen = struct {
+        var n: usize = 0;
+        fn feature(_: ?*anyopaque, _: [*]const u8, _: usize, _: [*]const u8, _: usize, _: [*]const u8, _: usize) callconv(.c) void {
+            n += 1;
+        }
+    };
+    const cb = QueryCb{ .ctx = null, .feature = Seen.feature };
+    // A square from (100,100) to (900,900) — the note area, which draws no fill.
+    const ring = [_]rs.TilePoint{
+        .{ .x = 100, .y = 100 }, .{ .x = 900, .y = 100 },
+        .{ .x = 900, .y = 900 }, .{ .x = 100, .y = 900 },
+    };
+    const rings = [_][]const rs.TilePoint{&ring};
+    const meta = rs.FeatureMeta{ .class = "M_NPUB" };
+
+    for ([_][2]f64{ .{ 500, 500 }, .{ 2000, 500 } }, [_]usize{ 1, 0 }) |at, want| {
+        Seen.n = 0;
+        var qs = QuerySurface{ .qx = at[0], .qy = at[1], .radius = 96, .view_zoom = 12, .cb = &cb };
+        const surf = qs.asSurface();
+        try surf.beginFeature(&meta);
+        try surf.pickArea(&rings);
+        try surf.endFeature();
+        try std.testing.expectEqual(want, Seen.n);
+    }
+}

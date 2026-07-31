@@ -105,8 +105,9 @@ Tiles are made one way — bake each cell to its own PMTiles, then compose on
 demand — the structure `tile57 bake ENC_ROOT -o out/` writes:
 
 ```c
-// out/ holds tiles/<CELL>.pmtiles (one per cell) + partition.tpart
-const char *paths[] = { "out/tiles/US5MD1MC.pmtiles" };
+// out/ holds <CELL>/<CELL>.pmtiles (one directory per cell, with the files it
+// references) + partition.tpart
+const char *paths[] = { "out/US5MD1MC/US5MD1MC.pmtiles" };
 tile57_compose_source *src = tile57_compose_open(paths, 1, "out/partition.tpart");
 
 uint8_t *tile; size_t n;
@@ -129,8 +130,8 @@ Any `.000` — native S-101 or S-57 — works everywhere; the format is auto-det
 
 ```sh
 zig build                                    # builds zig-out/bin/tile57
-tile57 bake CELL.000 -o out/                 # one cell -> out/tiles/<CELL>.pmtiles + partition.tpart
-tile57 bake ENC_ROOT -o out/                 # whole catalogue -> per-cell tiles/ + partition.tpart
+tile57 bake CELL.000 -o out/                 # one cell -> out/<CELL>/<CELL>.pmtiles + partition.tpart
+tile57 bake ENC_ROOT -o out/                 # whole catalogue -> one directory per cell + partition.tpart
 tile57 assets   -o assets/                   # colortables + linestyles + sprite + patterns
 tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
 tile57 pdf ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.pdf

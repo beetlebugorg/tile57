@@ -1187,6 +1187,37 @@ tile57_status tile57_compose_labels(tile57_compose *c, double lon, double lat, d
                                     const tile57_mariner *m,
                                     const tile57_surface_cb *surface, tile57_error *err);
 
+/* ---- auxiliary files -------------------------------------------------------
+ *
+ * A feature can point at a text file or a picture instead of carrying it:
+ * TXTDSC and NTXTDS name a text file, PICREP names a picture, and S-101 puts the
+ * same thing in a `fileReference`. `tile57 bake` writes those files beside the
+ * chart they belong to, in the shape an exchange set uses:
+ *
+ *     out/US5GU3TC/US5GU3TC.pmtiles
+ *     out/US5GU3TC/US299TCA.TXT
+ *     out/US5GU3TC/index.json
+ *
+ * Read them through these calls rather than off the disk, so the layout can
+ * change without breaking a client. */
+
+typedef struct tile57_aux tile57_aux;
+
+/* Open the auxiliary files of a chart directory. *out is NULL with TILE57_OK
+ * when the chart references nothing. Close with tile57_aux_close. */
+tile57_status tile57_aux_open(const char *dir, tile57_aux **out, tile57_error *err);
+
+/* The bytes and the MIME type of one referenced file, by the name the feature
+ * carries. The match ignores case and any directory part. *bytes is NULL and
+ * *len is 0 when the chart has no such file. The bytes belong to the handle and
+ * stay valid until tile57_aux_close; *mime is a static string. */
+tile57_status tile57_aux_get(tile57_aux *a, const char *name,
+                             const uint8_t **bytes, size_t *len,
+                             const char **mime, tile57_error *err);
+
+/* Release the handle and every file read through it. */
+void tile57_aux_close(tile57_aux *a);
+
 /* The composed cursor pick (S-52 §10.8, across chart boundaries): tile57_chart_query across
  * the whole composed set. */
 tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, double zoom,

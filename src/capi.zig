@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const chart = @import("chart.zig");
+const auxfiles = @import("engine").auxfiles; // via the named module: engine owns the file
 const s57 = @import("s57");
 const bundle = @import("bundle"); // portrayal-asset emitters + the partition debug bake
 const compose = @import("compose"); // the runtime tile compositor (tile57_compose_*)
@@ -873,6 +874,58 @@ export fn tile57_render_mlt_tile(
 /// (a compositor, a renderer) may still read from it. See tile57.h.
 export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {
     if (handle) |s| s.deinit();
+}
+
+// ---- auxiliary files (the text and pictures a cell points at) --------------
+
+/// Open the auxiliary files of a chart directory. The handle owns the manifest
+/// and every file it has read. See tile57.h.
+export fn tile57_aux_open(dir: ?[*:0]const u8, out: ?*?*auxfiles.Reader, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const d = spanOpt(dir) orelse return failWith(err, .badarg, "dir must not be null");
+    const opened = auxfiles.Reader.open(sharedIo(), gpa, d) catch |e| return failCtx(err, e, d);
+    const r = opened orelse return OK; // no manifest: the chart references nothing
+    const handle = gpa.create(auxfiles.Reader) catch return failWith(err, .nomem, "out of memory");
+    handle.* = r;
+    o.* = handle;
+    return OK;
+}
+
+/// The bytes and the MIME type for a referenced file, by the name the feature
+/// carries (TXTDSC, PICREP, or an S-101 fileReference). The bytes stay valid
+/// until tile57_aux_close. NULL/0 when the chart has no such file. See tile57.h.
+export fn tile57_aux_get(handle: ?*auxfiles.Reader, name: ?[*:0]const u8, bytes: ?*?[*]const u8, len: ?*usize, mime: ?*?[*:0]const u8, err: ?*CError) callconv(.c) c_int {
+    const h = handle orelse return failWith(err, .badarg, "aux must not be null");
+    const b = bytes orelse return failWith(err, .badarg, "bytes must not be null");
+    const n = len orelse return failWith(err, .badarg, "len must not be null");
+    b.* = null;
+    n.* = 0;
+    if (mime) |m| m.* = null;
+    const nm = spanOpt(name) orelse return failWith(err, .badarg, "name must not be null");
+    const found = (h.get(sharedIo(), nm) catch |e| return fail(err, e)) orelse return OK;
+    b.* = found.bytes.ptr;
+    n.* = found.bytes.len;
+    if (mime) |m| m.* = mimeZ(found.mime);
+    return OK;
+}
+
+/// A static NUL-terminated string for a MIME type the manifest holds, so the
+/// caller gets a C string without owning it.
+fn mimeZ(m: []const u8) [*:0]const u8 {
+    if (std.mem.eql(u8, m, "text/plain")) return "text/plain";
+    if (std.mem.eql(u8, m, "image/png")) return "image/png";
+    if (std.mem.eql(u8, m, "image/jpeg")) return "image/jpeg";
+    if (std.mem.eql(u8, m, "image/tiff")) return "image/tiff";
+    return "application/octet-stream";
+}
+
+/// Release the auxiliary files of a chart, and every file read through it.
+export fn tile57_aux_close(handle: ?*auxfiles.Reader) callconv(.c) void {
+    if (handle) |h| {
+        h.deinit();
+        gpa.destroy(h);
+    }
 }
 
 // ===========================================================================

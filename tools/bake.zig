@@ -1,6 +1,6 @@
 //! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]` — produce a
 //! LIVE-composite structure on disk. Bake each chart to its OWN native-scale PMTiles under
-//! `<out-dir>/tiles/` (with its M_COVR coverage embedded in the metadata), then open a resident
+//! `<out-dir>/<STEM>/` (with its M_COVR coverage embedded in the metadata), then open a resident
 //! compositor over them and write the ownership partition to `<out-dir>/partition.tpart`. There is
 //! NO merged archive: a runtime compositor (`ComposeSource` / the `compose-tile` command / the C
 //! ABI `tile57_compose_*`) serves any tile ON DEMAND from this structure, so the per-chart bakes stay
@@ -11,6 +11,7 @@ const std = @import("std");
 const chart = @import("chart"); // per-chart bake (bakeChartBytes) + freeBytes
 const compose = @import("compose"); // openComposeSourceFiles + serializePartition (the resident compositor)
 const common = @import("common.zig");
+const auxfiles = @import("engine").auxfiles;
 const Flags = common.Flags;
 const usageErr = common.usageErr;
 const resolveRulesDir = common.resolveRulesDir;
@@ -32,6 +33,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     // rather than one thread per core. Tile generation within a cell is serial, so N
     // workers stay N threads.
     var workers: usize = defaultWorkers();
+    // The text and pictures the cells point at travel with the chart by default:
+    // a pick report that cannot read its caution note is worth less than the
+    // few kilobytes.
+    var want_aux = true;
 
     var f = Flags{ .args = args };
     while (f.next()) |arg| {
@@ -43,6 +48,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             const v = f.val(arg) orelse return;
             workers = std.fmt.parseInt(usize, v, 10) catch return usageErr("-j/--workers expects a positive integer");
             if (workers == 0) return usageErr("-j/--workers must be >= 1");
+        } else if (std.mem.eql(u8, arg, "--no-aux")) {
+            want_aux = false;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return usageErr("unknown flag");
         } else if (base == null) {
@@ -57,16 +64,34 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // The per-chart archive paths that back the compositor.
     var archive_paths = std.ArrayList([]const u8).empty;
+    var aux_written: usize = 0;
 
     {
         // Bake each chart (dedup by stem — a boundary chart shared by two districts bakes once)
-        // to its own <out-dir>/tiles/<STEM>.pmtiles.
-        const tiles_dir = try std.fs.path.join(a, &.{ out_dir, "tiles" });
-        try std.Io.Dir.cwd().createDirPath(io, tiles_dir);
+        // to its own <out-dir>/<STEM>/<STEM>.pmtiles, the shape an exchange set uses.
+        try std.Io.Dir.cwd().createDirPath(io, out_dir);
 
         var cell_paths = std.ArrayList([]const u8).empty;
+        var aux_files = std.ArrayList(auxfiles.File).empty;
         if (std.mem.endsWith(u8, base_path, ".000")) {
             try cell_paths.append(a, base_path);
+            // The cell's own directory holds the files it references.
+            if (want_aux) {
+                const stem = std.fs.path.stem(std.fs.path.basename(base_path));
+                if (std.fs.path.dirname(base_path)) |cell_dir| {
+                    var dir = std.Io.Dir.cwd().openDir(io, cell_dir, .{ .iterate = true }) catch null;
+                    if (dir) |*d| {
+                        defer d.close(io);
+                        var it = d.iterate();
+                        while (it.next(io) catch null) |entry| {
+                            if (entry.kind != .file or !auxfiles.isContent(entry.name)) continue;
+                            const p = std.fs.path.join(a, &.{ cell_dir, entry.name }) catch continue;
+                            const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, a, .unlimited) catch continue;
+                            aux_files.append(a, .{ .owner = stem, .name = entry.name, .bytes = bytes }) catch {};
+                        }
+                    }
+                }
+            }
         } else {
             var dir = std.Io.Dir.cwd().openDir(io, base_path, .{ .iterate = true }) catch return usageErr("cannot open ENC_ROOT");
             defer dir.close(io);
@@ -74,7 +99,20 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
             defer walker.deinit();
             while (walker.next(io) catch null) |entry| {
-                if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".000")) continue;
+                if (entry.kind != .file) continue;
+                if (want_aux and auxfiles.isContent(entry.path)) {
+                    const p = std.fs.path.join(a, &.{ base_path, entry.path }) catch continue;
+                    const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, a, .unlimited) catch continue;
+                    // The exchange set puts a cell's files in the cell's own
+                    // directory, so that directory names the owner. Both names
+                    // must be COPIED: the walker reuses one buffer for the path,
+                    // so a borrowed slice becomes the next entry's name.
+                    const owner = a.dupe(u8, std.fs.path.basename(std.fs.path.dirname(entry.path) orelse "")) catch continue;
+                    const name = a.dupe(u8, entry.path) catch continue;
+                    aux_files.append(a, .{ .owner = owner, .name = name, .bytes = bytes }) catch {};
+                    continue;
+                }
+                if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
                 const stem = std.fs.path.stem(std.fs.path.basename(entry.path));
                 if (seen.contains(stem)) continue;
                 seen.put(a.dupe(u8, stem) catch continue, {}) catch {};
@@ -89,10 +127,29 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         var out_paths = std.ArrayList([]const u8).empty;
         for (cell_paths.items) |cp| {
             const stem = std.fs.path.stem(std.fs.path.basename(cp));
+            // One directory per chart, as the exchange set does it: the archive
+            // and the files that chart references travel together.
+            const chart_dir = std.fs.path.join(a, &.{ out_dir, stem }) catch continue;
+            std.Io.Dir.cwd().createDirPath(io, chart_dir) catch continue;
             const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
-            out_paths.append(a, std.fs.path.join(a, &.{ tiles_dir, name }) catch continue) catch {};
+            out_paths.append(a, std.fs.path.join(a, &.{ chart_dir, name }) catch continue) catch {};
         }
         if (out_paths.items.len != cell_paths.items.len) return usageErr("out of memory naming archives");
+
+        // The referenced text and pictures, beside the chart that names them.
+        for (cell_paths.items) |cp| {
+            const stem = std.fs.path.stem(std.fs.path.basename(cp));
+            var mine = std.ArrayList(auxfiles.File).empty;
+            for (aux_files.items) |af| {
+                if (std.mem.eql(u8, af.owner, stem)) mine.append(a, af) catch {};
+            }
+            if (mine.items.len == 0) continue;
+            const chart_dir = std.fs.path.join(a, &.{ out_dir, stem }) catch continue;
+            aux_written += auxfiles.writeDir(io, a, chart_dir, mine.items) catch |err| blk: {
+                std.debug.print("warning: aux files not written for {s} ({s})\n", .{ stem, @errorName(err) });
+                break :blk 0;
+            };
+        }
 
         const n_workers = @min(workers, cell_paths.items.len);
         if (cell_paths.items.len > 1) {
@@ -135,8 +192,12 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     const part_path = try std.fs.path.join(a, &.{ out_dir, "partition.tpart" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_path, .data = part_bytes });
 
+    if (aux_written > 0) {
+        std.debug.print("  {d} auxiliary file(s) beside their charts\n", .{aux_written});
+    }
+
     std.debug.print(
-        "live structure -> {s}/\n  {d} per-chart archive(s){s} + partition.tpart (serve z {d}..{d})\n",
-        .{ out_dir, src.readers.len, " under tiles/", src.minz, src.loop_max },
+        "live structure -> {s}/\n  {d} per-chart directory(s) + partition.tpart (serve z {d}..{d})\n",
+        .{ out_dir, src.readers.len, src.minz, src.loop_max },
     );
 }

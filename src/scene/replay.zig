@@ -116,11 +116,17 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
         const is_points = std.mem.startsWith(u8, layer.name, "point_symbols");
         const is_soundings = std.mem.eql(u8, layer.name, "soundings");
         const is_text = std.mem.startsWith(u8, layer.name, "text");
+        // Query-only rings (a note area the chart does not fill). A render
+        // surface has nothing to do with them.
+        const is_pick = std.mem.eql(u8, layer.name, "pick_areas");
+        if (is_pick and !surf.wantsPickArea()) continue;
         for (layer.features) |f| {
             const meta = metaFromProps(f.properties);
             try surf.beginFeature(&meta);
             defer surf.endFeature() catch {};
-            if (is_patterns) {
+            if (is_pick) {
+                try surf.pickArea(f.parts);
+            } else if (is_patterns) {
                 try surf.fillPattern(propStr(f.properties, "pattern_name"), f.parts);
             } else if (is_areas) {
                 const d1 = propF64(f.properties, "drval1");

@@ -46,3 +46,6 @@ __pycache__/
 # Fetched zig packages, materialized per-project (the S-101 catalogue lands
 # here when the submodule is not initialized).
 zig-pkg/
+
+# Local work in progress.
+scratchpad/

@@ -485,6 +485,10 @@ pub const TileSurface = struct {
     // property in the style). SOUNDG multipoints and wreck/obstruction/rock depth
     // glyphs (coalesced from the portrayal via drawSounding) both land here.
     soundings: std.ArrayList(mvt.Feature) = .empty,
+    // The `pick_areas` layer: rings the cursor pick tests and no renderer draws
+    // (see Surface.pick_area). One list — a note area gates on its own `scamin`
+    // property like a sounding does.
+    pick_areas: std.ArrayList(mvt.Feature) = .empty,
     /// Current feature meta, set by beginFeature; the draw methods read it.
     cur: Meta = .{ .display_priority = 0 },
 
@@ -502,6 +506,7 @@ pub const TileSurface = struct {
         // Bake path: store complex runs un-tessellated (no size_scale set — bake is
         // native; replay re-walks the period display-scaled).
         .store_complex_run = storeComplexRun,
+        .pick_area = pickArea,
     };
 
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
@@ -570,6 +575,13 @@ pub const TileSurface = struct {
         if (s.cur.oscl > 0) try props.append(s.a, .{ .key = "oscl", .value = .{ .int = s.cur.oscl } });
         try appendMeta(s.a, &props, s.cur);
         try s.areasL().append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
+    }
+
+    fn pickArea(ctx: *anyopaque, rings: []const []const rs.TilePoint) anyerror!void {
+        const s = sp(ctx);
+        var props = std.ArrayList(mvt.Prop).empty;
+        try appendMeta(s.a, &props, s.cur);
+        try s.pick_areas.append(s.a, .{ .geom_type = .polygon, .parts = rings, .properties = props.items });
     }
 
     fn fillPattern(ctx: *anyopaque, name: rs.SymbolName, rings: []const []const rs.TilePoint) anyerror!void {
@@ -700,6 +712,7 @@ pub const TileSurface = struct {
         if (s.points.items.len > 0) try layers.append(s.a, .{ .name = "point_symbols", .features = s.points.items });
         if (s.soundings.items.len > 0) try layers.append(s.a, .{ .name = "soundings", .features = s.soundings.items });
         if (s.texts.items.len > 0) try layers.append(s.a, .{ .name = "text", .features = s.texts.items });
+        if (s.pick_areas.items.len > 0) try layers.append(s.a, .{ .name = "pick_areas", .features = s.pick_areas.items });
         if (layers.items.len == 0) return out.alloc(u8, 0);
         return switch (s.format) {
             .mvt => mvt.encode(out, .{ .layers = layers.items }),
@@ -2289,6 +2302,37 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
     try surf.endFeature();
 }
 
+/// The rings a cursor pick needs from an area the chart does not fill. The pick
+/// replays the drawing, so a note area — M_NPUB, and any area carrying INFORM or
+/// TXTDSC — answers only under its INFORM01 marker, and a click one glyph away
+/// reports the water under it. Emit the clipped rings for EVERY tile the area
+/// spans (the marker rides one tile only), so the note answers across its own
+/// ground. Only the bake encoder and the query surface take the call.
+fn emitPickArea(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, z: u8, x: u32, y: u32, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+    const parts = featureParts(a, cell, geo, fi, f) catch return;
+    var rings = std.ArrayList([]const mvt.Point).empty;
+    for (parts) |gp| {
+        if (gp.len < 3) continue;
+        const proj = try a.alloc(mvt.Point, gp.len);
+        for (gp, 0..) |p, i| proj[i] = tile.project(p.lon(), p.lat(), z, x, y, tile.EXTENT);
+        const ring = try clipSimplifyPoly(a, proj, box, opts.detail);
+        if (ring.len >= 3) try rings.append(a, ring);
+    }
+    if (rings.items.len == 0) return;
+    const fmeta = rs.FeatureMeta{
+        .display_priority = 8,
+        .display_category = 2,
+        .scamin = effScamin(f, opts),
+        .class = pickClass(cell, f, fi),
+        .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
+        .cell_name = if (opts.pick_attrs) cell.name else "",
+        .band = opts.band,
+    };
+    try surf.beginFeature(&fmeta);
+    try surf.pickArea(try mvt.orientAreaRings(a, rings.items));
+    try surf.endFeature();
+}
+
 /// Append one cell's features for tile (z,x,y), driving the Surface interface:
 /// the S-101 portrayal path through processFeatureInstr, native S-52 fallbacks
 /// (SWPARE / NEWOBJ / M_NSYS / INFORM01 / QUESMRK1 / SOUNDG) through their emit*
@@ -2399,6 +2443,8 @@ fn appendCellFeatures(
         };
         if (!fopts.suppress_points and hasAdditionalInfo(f)) {
             try emitCentredSymbol(a, cell.*, f, fi, geo, "INFORM01", 8, 2, z, x, y, tb, fopts, surf);
+            if (f.prim == 3 and surf.wantsPickArea())
+                try emitPickArea(a, cell.*, f, fi, geo, z, x, y, box, fopts, surf);
         }
         // S-52 §10.1.10.2 overscale area at a chart scale boundary:
         // a cell's M_COVR (CATCOV=1) coverage polygon rides
