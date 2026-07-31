@@ -877,9 +877,15 @@ pub const GpuSurface = struct {
     /// (see Surface.draw_contour_label) and this picks the same glyphs the rule
     /// would have picked — identical in metres, correct in feet.
     ///
-    /// Emitted on the plain symbol layer at refDev: the sounding layer's extra
-    /// multiplier is the mariner's sounding preference, which a contour label
-    /// does not take.
+    /// Emitted as a SOUNDING kind, though it is not a sounding: that kind means
+    /// "a digit run whose glyphs share one anchor". Each digit self-positions by
+    /// its own pivot, so the whole number sits at one point, and a `.symbol`
+    /// below its band window is a collision candidate (see emitSprite) that
+    /// reads digits at a shared anchor as an overlap.
+    ///
+    /// The size stays refDev. The sounding kind's extra multiplier is the
+    /// mariner's sounding preference and rides on the `dev` argument, not on the
+    /// kind, so a contour label does not take it.
     fn drawContourLabel(ctx: *anyopaque, valdco_m: f64, at: rs.TilePoint) anyerror!void {
         const self = sp(ctx);
         const store = self.store orelse return;
@@ -891,7 +897,7 @@ pub const GpuSurface = struct {
         while (it.next()) |glyph| {
             if (glyph.len == 0) continue;
             const s = store.get(glyph) orelse continue;
-            try self.emitSprite(.symbol, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), false);
+            try self.emitSprite(.sounding, glyph, s, at, 0, sndfrm.SYMBOL_SCALE, self.refDev(), false);
         }
     }
 

@@ -187,12 +187,11 @@ pub const Surface = struct {
         ///
         /// The catalogue composes that label itself — DEPCNT03 calls SAFCON01,
         /// which picks one glyph per digit — but only ever in metres, because
-        /// S-52 has no other unit. A chart shown in feet then drew a metric
-        /// contour label beside feet soundings. So a surface that composes the
-        /// label itself declares it here, the emitter SKIPS the catalogue's
-        /// SAFCON glyphs, and the surface composes the same glyphs through
-        /// sndfrm.safconSyms at its own unit. `valdco_m` is always metres; the
-        /// surface converts.
+        /// S-52 has no other unit, so on a chart shown in feet it disagrees with
+        /// the soundings beside it. A surface that composes the label itself
+        /// declares it here: the emitter SKIPS the catalogue's SAFCON glyphs and
+        /// the surface composes the same glyphs through sndfrm.safconSyms at its
+        /// own unit. `valdco_m` is always metres; the surface converts.
         ///
         /// The contour twin of drawSounding, and optional for the same reason:
         /// null leaves the catalogue's metric glyphs in place, so a surface with
