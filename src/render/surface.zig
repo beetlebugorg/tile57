@@ -197,7 +197,27 @@ pub const Surface = struct {
         /// null leaves the catalogue's metric glyphs in place, so a surface with
         /// no unit of its own (ascii, query, inspect) needs no change.
         draw_contour_label: ?*const fn (*anyopaque, valdco_m: f64, at: TilePoint) anyerror!void = null,
+        /// Draw a dredged area's depth text, in the surface's own depth unit.
+        ///
+        /// DredgedArea composes that text as "%gm" — the value and a literal "m"
+        /// — and appends " (date)" when the cell carries a dredged date. The
+        /// value is metres only, for the same reason SAFCON01's is, so on a
+        /// chart shown in feet it disagrees with the soundings beside it. A
+        /// surface that formats the text itself declares this: the emitter
+        /// passes the raw value and whatever followed the depth, and the surface
+        /// writes the number, the unit and the trailer.
+        draw_depth_text: ?*const fn (*anyopaque, value_m: f64, trailer: []const u8, style: *const TextStyle, at: TilePoint) anyerror!void = null,
     };
+
+    /// True when the surface formats depth text itself, so the emitter replaces
+    /// the catalogue's metres-only string.
+    pub fn wantsDepthText(self: Surface) bool {
+        return self.vtable.draw_depth_text != null;
+    }
+
+    pub fn drawDepthText(self: Surface, value_m: f64, trailer: []const u8, style: *const TextStyle, at: TilePoint) anyerror!void {
+        if (self.vtable.draw_depth_text) |f| try f(self.ptr, value_m, trailer, style, at);
+    }
 
     /// True when the surface composes contour labels itself, so the emitter
     /// drops the catalogue's metres-only SAFCON glyphs.

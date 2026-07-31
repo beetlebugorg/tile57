@@ -10,7 +10,8 @@ const mvt = @import("tiles").mvt;
 const tile = @import("tiles").tile;
 const rs = @import("render").surface;
 const linestyle = @import("linestyle.zig");
-const SYMBOL_SCALE: f64 = @import("render").sndfrm.SYMBOL_SCALE;
+const sndfrm = @import("render").sndfrm;
+const SYMBOL_SCALE: f64 = sndfrm.SYMBOL_SCALE;
 
 //
 // The tile schema is a serialized Surface-call stream, so a baked tile can be
@@ -216,7 +217,19 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
                     .offset_y = oy,
                     .group = propInt(f.properties, "tgrp", 0),
                 };
-                try surf.drawText(propStr(f.properties, "text"), &ts, f.parts[0][0]);
+                // A dredged area's depth was baked as its raw metres beside the
+                // metric string, so the surface writes it in the mariner's unit.
+                // Surfaces that do not format depth text take the metric string.
+                const text = propStr(f.properties, "text");
+                if (propF64(f.properties, "drval1")) |drval1| {
+                    if (surf.wantsDepthText()) {
+                        if (sndfrm.depthTrailer(text)) |trailer| {
+                            try surf.drawDepthText(drval1, trailer, &ts, f.parts[0][0]);
+                            continue;
+                        }
+                    }
+                }
+                try surf.drawText(text, &ts, f.parts[0][0]);
             }
         }
     }

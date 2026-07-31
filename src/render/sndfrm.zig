@@ -165,6 +165,47 @@ pub fn safconSyms(a: Allocator, depth: f64, whole_feet: bool) ![]const u8 {
     return std.mem.join(a, ",", toks.items);
 }
 
+/// The part of a dredged area's label that follows the depth, or null when the
+/// text does not open with one. DredgedArea composes the depth as "%gm" and may
+/// append " (date)" after it. The depth is re-formatted per unit by depthText;
+/// the trailer is carried across unchanged.
+pub fn depthTrailer(text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < text.len and (std.ascii.isDigit(text[i]) or text[i] == '.')) i += 1;
+    if (i == 0 or i >= text.len or text[i] != 'm') return null;
+    return text[i + 1 ..];
+}
+
+/// A dredged area's depth text in a display unit: the value, its unit, and
+/// whatever the rule appended after the depth — a dredged date, usually.
+///
+/// DredgedArea writes metres as "%gm". Feet read as WHOLE feet, truncated down
+/// so the depth errs shallow, the rule the soundings and the contour labels
+/// already follow. A 4.6 m dredged area reads "15ft" (15.09 floored).
+pub fn depthText(a: Allocator, value_m: f64, trailer: []const u8, feet: bool) ![]const u8 {
+    if (feet) {
+        const ft = @floor(value_m * M_TO_FT + 1e-6);
+        return std.fmt.allocPrint(a, "{d}ft{s}", .{ ft, trailer });
+    }
+    return std.fmt.allocPrint(a, "{d}m{s}", .{ value_m, trailer });
+}
+
+test "depthText writes a dredged depth in metres and in whole feet" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    try std.testing.expectEqualStrings("4.6m", try depthText(al, 4.6, "", false));
+    try std.testing.expectEqualStrings("15ft", try depthText(al, 4.6, "", true));
+    // A whole metric depth keeps no decimal, as the rule's %g does.
+    try std.testing.expectEqualStrings("12m", try depthText(al, 12.0, "", false));
+    try std.testing.expectEqualStrings("39ft", try depthText(al, 12.0, "", true));
+    // The dredged date rides along untouched.
+    try std.testing.expectEqualStrings("4.6m (20220506)", try depthText(al, 4.6, " (20220506)", false));
+    try std.testing.expectEqualStrings("15ft (20220506)", try depthText(al, 4.6, " (20220506)", true));
+}
+
 test "safconSyms composes a contour value in metres and in whole feet" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);

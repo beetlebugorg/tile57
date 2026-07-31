@@ -391,6 +391,16 @@ pub fn contourLabelField(b: B, m: *const Settings) !Value {
     });
 }
 
+// A dredged area's depth text. DredgedArea composes it in metres, and the bake
+// stores the feet twin beside it as text_ft. Feet reads that twin and falls back
+// to the metric string, so a chart baked before the twin existed still labels
+// its dredged areas.
+pub fn depthTextField(b: B, m: *const Settings) !Value {
+    if (m.depth_unit != .feet)
+        return b.arr(&.{ b.s("coalesce"), try b.get("text"), b.s("") });
+    return b.arr(&.{ b.s("coalesce"), try b.get("text_ft"), try b.get("text"), b.s("") });
+}
+
 // ---- client-side display filters -------------------------------------------
 
 // Display category (S-52 §10.3.4) + M_QUAL data-quality overlay.
