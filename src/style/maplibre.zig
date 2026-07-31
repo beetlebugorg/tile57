@@ -259,6 +259,7 @@ const SCtx = struct {
     sound_img: std.json.Value, // soundings icon-image (SNDFRM04 safety split)
     point_img: std.json.Value, // point icon-image (OBSTRN/WRECKS danger swap + ctr:)
     contour_field: std.json.Value, // DEPCNT label text-field (SAFCON01 unit)
+    text_field: std.json.Value, // label text-field (dredged depth unit)
     common: []const std.json.Value, // filters AND-ed onto every chart layer ([] = template)
     text_group: ?std.json.Value, // extra filter for text layers (null = template)
     size_scale: f64, // §4 physical-scale multiplier for icon/line/text sizes (1.0 = verbatim)
@@ -590,7 +591,7 @@ fn textLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket, id: []
     try js.objectField("layout");
     try js.beginObject();
     try js.objectField("text-field");
-    try js.write(.{ "coalesce", .{ "get", "text" }, "" });
+    try js.write(s.text_field);
     try js.objectField("text-font");
     try js.write(TEXT_FONT);
     try js.objectField("text-size");
@@ -945,6 +946,7 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
         .sound_img = try mariner.soundingsIconImage(b, &m),
         .point_img = try mariner.pointSymbolImage(b, &m),
         .contour_field = try mariner.contourLabelField(b, &m),
+        .text_field = try mariner.depthTextField(b, &m),
         .common = if (filters_on) try mariner.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
         .text_group = if (filters_on) try mariner.textGroupFilter(b, &m) else null,
         .size_scale = opts.size_scale,
@@ -1593,6 +1595,18 @@ test "buildFromTemplate: feet picks the contour-label feet glyph run; metres doe
     defer a.free(metres);
     try std.testing.expect(std.mem.indexOf(u8, metres, "safcon_ft") == null);
     try std.testing.expect(std.mem.indexOf(u8, metres, "safcon") != null);
+}
+
+test "buildFromTemplate: feet reads a dredged area's feet depth text; metres doesn't" {
+    const a = std.testing.allocator;
+    const feet = try buildFromTemplate(a, cs_template, &.{ .depth_unit = .feet }, cs_ct, null, 1700000000);
+    defer a.free(feet);
+    try std.testing.expect(std.mem.indexOf(u8, feet, "text_ft") != null);
+
+    // Metres reads the string the rule composed, with no feet twin in the style.
+    const metres = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
+    defer a.free(metres);
+    try std.testing.expect(std.mem.indexOf(u8, metres, "text_ft") == null);
 }
 
 test "buildFromTemplate: enabled bands add a band filter" {

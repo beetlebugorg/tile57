@@ -121,6 +121,9 @@ fn listHasAny(csv: []const u8, targets: []const i64) bool {
 const sndfrmSyms = @import("render").sndfrm.syms;
 /// SAFCON01's contour-label composition, aliased the same way.
 const safconSyms = @import("render").sndfrm.safconSyms;
+/// A dredged area's depth text and the split that re-formats it.
+const depthText = @import("render").sndfrm.depthText;
+const depthTrailer = @import("render").sndfrm.depthTrailer;
 
 /// SNDFRM04 quality flags for the whole feature: swept (TECSOU∈{4,18}) → B1 ring;
 /// low-accuracy (QUASOU∈{3,4,8,9}, no-bottom, or STATUS∈{18}) → C2/C3 ring.
@@ -176,6 +179,22 @@ fn isSoundingName(name: []const u8) bool {
 /// see Surface.draw_contour_label for why the emitter drops them.
 fn isSafconName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "SAFCON");
+}
+
+/// A dredged area's depth text split for re-formatting: the metres the cell
+/// states, and whatever the rule appended. Null unless this feature is a dredged
+/// area, the surface formats depth text itself, and the label opens with the
+/// depth the rule composed.
+fn dredgedDepth(f: s57.Feature, surf: rs.Surface, text: []const u8) ?struct { value: f64, trailer: []const u8 } {
+    if (!surf.wantsDepthText()) return null;
+    const v = f.attrFloat(s57.ATTR_DRVAL1) orelse return null;
+    const trailer = depthTrailer(text) orelse return null;
+    // The label opens with a depth token. Confirm it IS this feature's depth
+    // before rewriting it, so a class whose label merely starts with a number
+    // keeps whatever its rule wrote.
+    const shown = std.fmt.parseFloat(f64, text[0 .. text.len - trailer.len - 1]) catch return null;
+    if (@abs(shown - v) > 0.05) return null;
+    return .{ .value = v, .trailer = trailer };
 }
 
 /// Emit a SOUNDG feature's multipoint soundings into the `soundings` layer, one
@@ -517,6 +536,7 @@ pub const TileSurface = struct {
         .store_complex_run = storeComplexRun,
         .pick_area = pickArea,
         .draw_contour_label = drawContourLabel,
+        .draw_depth_text = drawDepthText,
     };
 
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
@@ -720,6 +740,26 @@ pub const TileSurface = struct {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try appendTextProps(s.a, &props, text, text_style); // text already shortened by engine
+        try appendMeta(s.a, &props, s.cur);
+        const parts = try s.a.alloc([]const mvt.Point, 1);
+        const single = try s.a.alloc(mvt.Point, 1);
+        single[0] = at;
+        parts[0] = single;
+        try s.textsL().append(s.a, .{ .geom_type = .point, .parts = parts, .properties = props.items });
+    }
+
+    /// BAKE: a dredged area's depth text, stored so it reads in either unit. The
+    /// metric string stays the feature's `text`, so a consumer that knows
+    /// nothing of depth units renders what it always did; `text_ft` carries the
+    /// feet twin and `drval1` the raw metres a render surface formats from.
+    fn drawDepthText(ctx: *anyopaque, value_m: f64, trailer: []const u8, text_style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
+        const s = sp(ctx);
+        var props = std.ArrayList(mvt.Prop).empty;
+        try appendTextProps(s.a, &props, try depthText(s.a, value_m, trailer, false), text_style);
+        try props.append(s.a, .{ .key = "text_ft", .value = .{
+            .string = try depthText(s.a, value_m, trailer, true),
+        } });
+        try props.append(s.a, .{ .key = "drval1", .value = .{ .double = value_m } });
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
         const single = try s.a.alloc(mvt.Point, 1);
@@ -1813,8 +1853,13 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 for (p.texts) |t| {
                     const ts = textStyleFor(t, f, fmeta);
+                    const body = try expandSeabedText(a, fmeta.class, stripNameTag(t.text));
                     try surf.beginFeature(&fmeta);
-                    try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, cpt);
+                    if (dredgedDepth(f, surf, body)) |d| {
+                        try surf.drawDepthText(d.value, d.trailer, &ts, cpt);
+                    } else {
+                        try surf.drawText(body, &ts, cpt);
+                    }
                     try surf.endFeature();
                 }
             }

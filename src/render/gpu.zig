@@ -466,6 +466,7 @@ pub const GpuSurface = struct {
         .size_scale = sizeScale,
         .set_contour_ladder = setContourLadder,
         .draw_contour_label = drawContourLabel,
+        .draw_depth_text = drawDepthText,
     };
 
     fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
@@ -1009,6 +1010,15 @@ pub const GpuSurface = struct {
     /// get is the host's own text pipeline: these are filled outlines, not an SDF
     /// atlas, and no halo is emitted (the style carries none; the pixel path
     /// resolves its own).
+    /// A dredged area's depth text in the mariner's unit. DredgedArea composes
+    /// it in metres only, so the emitter passes the raw value and whatever
+    /// followed it (see Surface.draw_depth_text).
+    fn drawDepthText(ctx: *anyopaque, value_m: f64, trailer: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        const feet = self.settings.depth_unit == .feet;
+        try drawText(ctx, try sndfrm.depthText(self.a, value_m, trailer, feet), style, at);
+    }
+
     fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, null, self.zoom, self.settings)) return;

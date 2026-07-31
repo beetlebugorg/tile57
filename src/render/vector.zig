@@ -369,6 +369,7 @@ pub const VectorSurface = struct {
         .size_scale = sizeScale,
         .set_contour_ladder = setContourLadder,
         .draw_contour_label = drawContourLabel,
+        .draw_depth_text = drawDepthText,
     };
 
     fn setContourLadder(ctx: *anyopaque, ladder: []const f64) void {
@@ -869,6 +870,15 @@ pub const VectorSurface = struct {
             if (p.fill) |color| try self.push(layer, .{ .symbol = .{ .anchor = anchor, .rings = lr, .color = ccolor(color), .even_odd = 1, .stroke_w = 0, .rot_align = rot_align } });
             if (p.stroke) |st| try self.push(layer, .{ .symbol = .{ .anchor = anchor, .rings = lr, .color = ccolor(st.color), .even_odd = 0, .stroke_w = st.width * k, .rot_align = rot_align } });
         }
+    }
+
+    /// A dredged area's depth text in the mariner's unit. DredgedArea composes
+    /// it in metres only, so the emitter passes the raw value and whatever
+    /// followed it (see Surface.draw_depth_text).
+    fn drawDepthText(ctx: *anyopaque, value_m: f64, trailer: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
+        const self = sp(ctx);
+        const feet = self.settings.depth_unit == .feet;
+        try drawText(ctx, try sndfrm.depthText(self.a, value_m, trailer, feet), style, at);
     }
 
     fn drawText(ctx: *anyopaque, text: []const u8, style: *const rs.TextStyle, at: rs.TilePoint) anyerror!void {
