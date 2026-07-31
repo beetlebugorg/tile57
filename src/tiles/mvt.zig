@@ -577,8 +577,12 @@ test "zigzag" {
 
 /// The MVT source-layer set of the tile57/2 schema, in emit order. The scene
 /// emitter fills these layers and the compositor stitches them by name.
+///
+/// `pick_areas` carries no style: it holds the rings of an area that the chart
+/// does not fill (a note area), so the cursor pick can find it anywhere inside
+/// it. A renderer never reads that layer.
 pub const VECTOR_LAYERS = [_][]const u8{
-    "areas", "area_patterns", "lines", "point_symbols", "soundings", "text",
+    "areas", "area_patterns", "lines", "point_symbols", "soundings", "text", "pick_areas",
 };
 
 /// Shoelace signed area (x2) of a ring in tile space; only its sign is used.

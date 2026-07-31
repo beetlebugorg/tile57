@@ -60,6 +60,7 @@ test {
     _ = labelcache;
     _ = noop;
     _ = inspect;
+    _ = query;
     _ = resolve;
     _ = canvas;
     _ = raster;

@@ -175,10 +175,28 @@ pub const Surface = struct {
         /// coincide). replayTile calls this per tile before emitting; the
         /// slice is valid only for the call. Null on the bake encoder.
         set_contour_ladder: ?*const fn (*anyopaque, ladder: []const f64) void = null,
+        /// Cursor-pick geometry for an area the chart does not fill. The pick
+        /// (§10.8) replays the DRAWING, so an area whose only mark is the
+        /// INFORM01 marker — M_NPUB, and any note area — answers a pick under
+        /// that marker alone, and a click inside the area reports the water
+        /// under it instead. The bake encoder stores these rings on a
+        /// query-only layer and the query surface tests them, so the area
+        /// answers anywhere inside it. Null on render surfaces: nothing draws.
+        pick_area: ?*const fn (*anyopaque, rings: []const []const TilePoint) anyerror!void = null,
     };
 
     pub fn setContourLadder(self: Surface, ladder: []const f64) void {
         if (self.vtable.set_contour_ladder) |f| f(self.ptr, ladder);
+    }
+
+    /// True when the surface takes pick geometry — the bake encoder and the
+    /// query surface. The emitter skips the work for every other surface.
+    pub fn wantsPickArea(self: Surface) bool {
+        return self.vtable.pick_area != null;
+    }
+
+    pub fn pickArea(self: Surface, rings: []const []const TilePoint) !void {
+        if (self.vtable.pick_area) |f| try f(self.ptr, rings);
     }
 
     /// The S-52 effective safety contour against a tile's ladder: the least
