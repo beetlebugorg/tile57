@@ -44,6 +44,40 @@ pub fn halfExtent(s: *const Symbol, k: f64) [2]f32 {
     return .{ @floatCast(hw), @floatCast(hh) };
 }
 
+/// The PAINTED box of a symbol's outline about its pivot, scaled by `k` (the
+/// same `scale * 100 * dev` a mark is drawn at): { min_x, min_y, max_x, max_y }.
+/// Null when the symbol carries no geometry.
+///
+/// This box is ASYMMETRIC, unlike halfExtent. An aid to navigation draws nearly
+/// all of its mark ABOVE the pivot, so the cursor pick tests this box and not a
+/// radius around the anchor. The stroke half-width counts: the mariner sees the
+/// stroked mark, and a symbol built from open strokes alone encloses no area.
+/// Keep this separate from halfExtent — halfExtent sizes the sprite quads on the
+/// callback and GPU paths, so a change there moves rendered output.
+pub fn bounds(s: *const Symbol, k: f64) ?[4]f64 {
+    var b = [4]f64{ 0, 0, 0, 0 };
+    var any = false;
+    for (s.paths) |p| {
+        // Stroke width is in the same user units as the geometry (pushSymbol
+        // strokes at `st.width * k`), so it scales by the same k.
+        const pad: f64 = if (p.stroke) |st| @as(f64, st.width) / 2 * k else 0;
+        for (p.contours) |contour| for (contour) |c| {
+            const x = (@as(f64, c.x) - @as(f64, s.pivot.x)) * k;
+            const y = (@as(f64, c.y) - @as(f64, s.pivot.y)) * k;
+            if (!any) {
+                b = .{ x - pad, y - pad, x + pad, y + pad };
+                any = true;
+            } else {
+                b[0] = @min(b[0], x - pad);
+                b[1] = @min(b[1], y - pad);
+                b[2] = @max(b[2], x + pad);
+                b[3] = @max(b[3], y + pad);
+            }
+        };
+    }
+    return if (any) b else null;
+}
+
 /// The lookup seam: name -> parsed symbol / rendered pattern cell (null =
 /// unknown; the caller decides the fallback). Implementations own caching and
 /// the returned memory.
@@ -107,6 +141,32 @@ pub fn flattenCubics(a: std.mem.Allocator, pts: []const f32, closed: bool) ![]cv
         if (first.x != last.x or first.y != last.y) out.appendAssumeCapacity(first);
     }
     return out.toOwnedSlice(a);
+}
+
+test "bounds: asymmetric about the pivot, stroke included, null when empty" {
+    // A 2x4 box whose pivot sits on its BOTTOM edge — the shape of an aid to
+    // navigation, which draws its mark above the charted position.
+    const ring = [_]cv.Point{ .{ .x = 0, .y = 0 }, .{ .x = 2, .y = 0 }, .{ .x = 2, .y = 4 }, .{ .x = 0, .y = 4 } };
+    const contours = [_][]const cv.Point{&ring};
+    const filled = Symbol{
+        .paths = &.{.{ .fill = .{ .r = 0, .g = 0, .b = 0 }, .contours = &contours }},
+        .pivot = .{ .x = 1, .y = 4 },
+    };
+    // k = 2: x -1..1 mm -> -2..2, y -4..0 mm -> -8..0. The box is NOT mirrored
+    // the way halfExtent is: it reaches above the pivot and not below.
+    const b = bounds(&filled, 2).?;
+    try std.testing.expectEqual([4]f64{ -2, -8, 2, 0 }, b);
+
+    // A stroke of width 1 pads every side by half a width, scaled the same way.
+    const stroked = Symbol{
+        .paths = &.{.{ .stroke = .{ .color = .{ .r = 0, .g = 0, .b = 0 }, .width = 1 }, .contours = &contours }},
+        .pivot = .{ .x = 1, .y = 4 },
+    };
+    try std.testing.expectEqual([4]f64{ -3, -9, 3, 1 }, bounds(&stroked, 2).?);
+
+    // No geometry: no box.
+    const empty = Symbol{ .paths = &.{}, .pivot = .{ .x = 0, .y = 0 } };
+    try std.testing.expectEqual(@as(?[4]f64, null), bounds(&empty, 2));
 }
 
 test "flattenCubics: line-as-cubic stays straight, closed ring closes" {

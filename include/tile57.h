@@ -359,8 +359,10 @@ tile57_status tile57_chart_tile(tile57_chart *chart, uint8_t z, uint32_t x, uint
                           uint8_t **out, size_t *out_len, tile57_error *err);
 
 /* Cursor object-query (S-52 §10.8 pick): feature() is invoked once per feature
- * the point (lon,lat) falls in — area point-in-polygon, line/point within a
- * small radius — with the S-57 object-class acronym, the attribute JSON
+ * the point (lon,lat) falls in — an area you are inside, a line within a small
+ * radius, or a symbol whose drawn mark covers the point. A buoy's or beacon's
+ * mark stands above its charted position, and the pick follows what is drawn.
+ * Each call carries the S-57 object-class acronym, the attribute JSON
  * (acronym -> value), and the source chart name. Pointers are valid only for
  * the duration of the call. */
 typedef struct {

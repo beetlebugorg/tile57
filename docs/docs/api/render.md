@@ -72,10 +72,11 @@ void tile57_chart_close(tile57_chart *chart);
 
 The S-52 cursor pick. Given a lon/lat and the current view `zoom`, tile57 replays
 the tile at that zoom and reports every feature the point falls in — an area you
-are inside, or a line or point symbol within a small radius. Each hit calls you
-back with the S-57 object-class acronym, the attribute JSON (acronym to value),
-and the source chart name. This is what a chart application shows when you tap a
-feature to see what it is.
+are inside, a line within a small radius, or a symbol whose drawn mark covers the
+point. A buoy's or beacon's mark stands above its charted position, and the pick
+follows what is drawn. Each hit calls you back with the S-57 object-class acronym,
+the attribute JSON (acronym to value), and the source chart name. This is what a
+chart application shows when you tap a feature to see what it is.
 
 Passing the view zoom matters: the query reports the features actually DISPLAYED
 at that zoom (it applies the same SCAMIN cull the renderer does), and the pick
