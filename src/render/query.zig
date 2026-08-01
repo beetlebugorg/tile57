@@ -17,6 +17,19 @@ pub const QueryCb = extern struct {
     feature: *const fn (?*anyopaque, cls: [*]const u8, cls_len: usize, s57: [*]const u8, s57_len: usize, cell: [*]const u8, cell_len: usize) callconv(.c) void,
 };
 
+/// Tile units per reference pixel for a tile of level `tile_z` shown at
+/// `view_zoom`.
+///
+/// A tile is `extent` units wide and covers 256 reference px at its own level,
+/// so the ratio is extent/256 there. The pick replays the tile at a ROUNDED and
+/// CLAMPED zoom, so the view is usually not at that level: every zoom level
+/// above it doubles the px the tile covers and halves the units per px. Without
+/// this the box for a symbol is 2^(view_zoom - tile_z) times too large, without
+/// bound once the view runs past the archive's deepest zoom.
+pub fn unitsPerPx(extent: i32, tile_z: f64, view_zoom: f64) f64 {
+    return @as(f64, @floatFromInt(extent)) / 256.0 / std.math.exp2(view_zoom - tile_z);
+}
+
 pub const QuerySurface = struct {
     qx: f64,
     qy: f64,
@@ -26,10 +39,11 @@ pub const QuerySurface = struct {
     /// Catalogue symbol geometry, so a pick answers on the mark that is DRAWN.
     /// Null falls back to the anchor radius alone.
     store: ?sym.SymbolStore = null,
-    /// Tile units per reference pixel: the tile extent over the 256-px native
-    /// tile pitch (4096/256 = 16). A symbol's drawn size is fixed in reference
-    /// px and the pick works in tile units, so the box test needs the ratio.
-    /// The caller sets it from the extent it projected the query point into.
+    /// Tile units per reference pixel AT THE VIEW ZOOM. A symbol's drawn size is
+    /// fixed in reference px and the pick works in tile units, so the box test
+    /// needs the ratio. It is not a constant: the query replays the tile at a
+    /// rounded, clamped zoom, and a tile displayed above its own level is
+    /// stretched. Callers set it with unitsPerPx.
     units_per_px: f64 = 16.0,
     cur: rs.FeatureMeta = .{},
     hit: bool = false,
@@ -190,6 +204,18 @@ pub const QuerySurface = struct {
         if (self.nearPoint(at)) self.hit = true;
     }
 };
+
+test "a stretched tile carries fewer tile units per pixel" {
+    // At the tile's own level, 4096 units span the 256-px native pitch.
+    try std.testing.expectEqual(@as(f64, 16), unitsPerPx(4096, 16, 16));
+    // The query rounds and clamps the tile level, so the view sits above it far
+    // more often than not. Every level above halves the units per pixel.
+    try std.testing.expectEqual(@as(f64, 8), unitsPerPx(4096, 16, 17));
+    try std.testing.expectEqual(@as(f64, 4), unitsPerPx(4096, 16, 18));
+    try std.testing.expectEqual(@as(f64, 2), unitsPerPx(4096, 16, 19));
+    // Rounding puts the view half a level below the tile just as often.
+    try std.testing.expectEqual(@as(f64, 32), unitsPerPx(4096, 16, 15));
+}
 
 test "a symbol answers a pick on the mark it draws, above the anchor" {
     const cv = @import("canvas.zig");
