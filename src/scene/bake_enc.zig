@@ -745,7 +745,14 @@ const TileGenCtx = struct {
             // still owns some of it (its fills aren't fully clipped away).
             const oscl: i64 = overscaleGateDenom(be.cscl);
             const wins_somewhere = cover_clip == null or !tileFullyCovered(scratch, cover_clip.?, box);
-            refs[nrefs] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .sounding_scamin = scene.soundingScamin(be.cscl), .light_range_m = be.light_range_m };
+            // The band comes from THIS cell's own compilation scale, not from the
+            // pass band: a quilted tile carries cells from several bands (carry
+            // riders, hole-fill). The archive is replayed without the cell
+            // (scene/replay.zig), so the band must ride on the feature as a tile
+            // property — the renderer gates symbol declutter on it (render/gpu.zig
+            // belowBandWindow). A cell with no compilation scale gets bandOf's 1:50k
+            // default, the same default effScaminFloor uses above.
+            refs[nrefs] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .band = @intFromEnum(bandOf(be.cscl)), .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .sounding_scamin = scene.soundingScamin(be.cscl), .light_range_m = be.light_range_m };
             nrefs += 1;
         }
         const mvt_bytes = scene.encodeTile(scratch, scratch, refs[0..nrefs], z, x, y, c.format, c.pick_attrs) catch return;
@@ -1401,6 +1408,68 @@ test "composite floor tile: the finer cell owns the ground (no carried smax copy
     // coarsest-band extension even though nothing coarser was baked).
     const t7 = lonLatToTile(0.35, 0.35, 7);
     try std.testing.expect(sink.tiles.get(tileKey(7, t7[0], t7[1])) != null);
+}
+
+test "bake stamps the cell's own navigational band on every feature" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Every baked feature carries a `band` tile property. scene/replay.zig reads it
+    // back (the archive has no cell to ask) and render/gpu.zig belowBandWindow gates
+    // symbol declutter on it. The value must be the band of the cell's OWN
+    // compilation scale. CellRef.band's 0 default is the berthing band, whose zoom
+    // window starts at 16, so an unstamped harbor cell loses its symbols below z16.
+    const feats = [_]s57.Feature{.{
+        .rcnm = 0,
+        .rcid = 1,
+        .prim = 1,
+        .objl = 14,
+        .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
+    }};
+    const ring = [_]s57.LonLat{
+        s57.LonLat.init(-2, -2), s57.LonLat.init(3, -2),
+        s57.LonLat.init(3, 3),   s57.LonLat.init(-2, 3),
+        s57.LonLat.init(-2, -2),
+    };
+    const rings = [_][]const s57.LonLat{&ring};
+    const cover = [_][]const []const s57.LonLat{&rings};
+    const bounds = [4]f64{ 0.2, 0.2, 0.5, 0.5 };
+    const streams = [_]?[]const u8{"DrawingPriority:7;PointInstruction:BOYLAT01"};
+
+    // Two compilation scales, so a hardcoded band cannot pass: 1:12,000 is the
+    // harbor band (ordinal 1) and 1:200,000 is the coastal band (ordinal 3). Each
+    // bakes over one zoom inside its own band window, so the tile is singular.
+    const Case = struct { cscl: i32, band: Band, z: u8 };
+    const cases = [_]Case{
+        .{ .cscl = 12_000, .band = .harbor, .z = 13 },
+        .{ .cscl = 200_000, .band = .coastal, .z = 11 },
+    };
+    for (cases) |c| {
+        var cell = try testCell(gpa, 0.35, 0.35, c.cscl, &feats);
+        defer cell.deinit();
+        var be = Backend{ .cell = cell, .portrayal = &streams, .bounds = bounds, .cscl = c.cscl, .coverage = &cover };
+
+        var sink = CollectSink{ .a = a, .tiles = std.AutoHashMap(u64, []u8).init(a) };
+        var baker = Baker.init(gpa, c.z, c.z, .{ .ctx = &sink, .func = CollectSink.run });
+        defer baker.deinit();
+        try baker.bakeBand(c.band, (&be)[0..1], 1, .extend_min, null, null, null);
+
+        const t = lonLatToTile(0.35, 0.35, c.z);
+        const bytes = sink.tiles.get(tileKey(c.z, t[0], t[1])) orelse return error.TestUnexpectedResult;
+        const raw = try gzip.decompress(a, bytes);
+        const layers = try mvt.decode(a, raw);
+        var n: usize = 0;
+        for (layers) |L| {
+            for (L.features) |f| {
+                try std.testing.expectEqual(@as(?i64, @intFromEnum(c.band)), findIntProp(f.properties, "band"));
+                n += 1;
+            }
+        }
+        // An empty tile must not pass the loop above by having nothing to check.
+        try std.testing.expect(n > 0);
+    }
 }
 
 test "fillDownZooms / coveredByCoarser" {
