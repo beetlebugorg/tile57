@@ -1827,12 +1827,20 @@ pub fn composeQueryPoint(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     const tx: u32 = @intFromFloat(@floor(world[0] * n));
     const ty: u32 = @intFromFloat(@floor(world[1] * n));
     const local = tile.project(lon, lat, z, tx, ty, tile.EXTENT);
+    // Symbol geometry, so the pick answers on the mark a symbol draws and not on
+    // its anchor alone. The store is per-palette but the geometry is not — a
+    // palette supplies only fill and stroke colours — so the day store serves
+    // every pick. A store failure degrades to the anchor radius.
+    const store: ?*sprite.CatalogStore = sharedStore(.day) catch null;
+    const upp = render.query.unitsPerPx(tile.EXTENT, zc, zoom);
     var qs = render.query.QuerySurface{
         .qx = @floatFromInt(local.x),
         .qy = @floatFromInt(local.y),
-        .radius = 96.0, // ~6 px at native tile scale
+        .radius = 6.0 * upp, // 6 px, whatever the tile is stretched to
         .view_zoom = zoom, // raw view zoom for the SCAMIN cull
         .cb = cb,
+        .store = if (store) |st| st.asStore() else null,
+        .units_per_px = upp,
     };
     const surf = qs.asSurface();
     try surf.beginScene(z);
@@ -2770,12 +2778,20 @@ pub const Chart = struct {
         const tx: u32 = @intFromFloat(@floor(world[0] * n));
         const ty: u32 = @intFromFloat(@floor(world[1] * n));
         const local = t.project(lon, lat, z, tx, ty, t.EXTENT);
+        // Symbol geometry, so the pick answers on the mark a symbol draws and not
+        // on its anchor alone. Symbol geometry is palette-independent — a palette
+        // supplies only fill and stroke colours — so the day store serves every
+        // pick. A store failure degrades to the anchor radius.
+        const store: ?*sprite.CatalogStore = self.viewStoreFor(.day) catch null;
+        const upp = render.query.unitsPerPx(t.EXTENT, zc, zoom);
         var qs = render.query.QuerySurface{
             .qx = @floatFromInt(local.x),
             .qy = @floatFromInt(local.y),
-            .radius = 96.0, // ~6 px at native tile scale
+            .radius = 6.0 * upp, // 6 px, whatever the tile is stretched to
             .view_zoom = zoom, // raw view zoom for the SCAMIN cull
             .cb = cb,
+            .store = if (store) |st| st.asStore() else null,
+            .units_per_px = upp,
         };
         const surf = qs.asSurface();
         try surf.beginScene(z);
