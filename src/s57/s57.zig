@@ -14,6 +14,10 @@ const Allocator = std.mem.Allocator;
 /// that want the raw records. It is its own module (`@import("iso8211")`), so a
 /// caller can depend on the 8211 layer without pulling in S-57 semantics.
 pub const iso8211 = @import("iso8211");
+/// The IHO attribute catalogue as data, and the mariner's decode over it —
+/// the pick report's language, served to every shell from here.
+pub const catalog = @import("catalog.zig");
+pub const decode = @import("decode.zig");
 const iso = iso8211;
 
 // Geographic coordinate stored in S-57's native integer ×1e7 units (lon ±1.8e9,
@@ -2473,4 +2477,5 @@ test "pointInRings: inside, outside, and inside a hole" {
 
 test {
     _ = iso8211;
+    _ = decode;
 }
