@@ -377,6 +377,21 @@ typedef struct {
 tile57_status tile57_chart_query(tile57_chart *chart, double lon, double lat, double zoom,
                            const tile57_query_cb *cb, tile57_error *err);
 
+/* The decoded pick report for one queried feature. Compose it from the class,
+ * the cell name, and the attribute JSON of a query callback. *out is JSON
+ * (free with tile57_free):
+ *   {"title","subtitle","chip","notes":[...],
+ *    "rows":[{"label","value","depth","file","picture"}...],
+ *    "footnote","empty":"none"|"source"}
+ * The title is the object's key fact (a light's characteristic, a depth
+ * area's range). The rows are decoded through the S-57 and S-101 catalogues.
+ * A value that no catalogue contains passes through unchanged. The "empty"
+ * field appears only when there is nothing to read. */
+tile57_status tile57_s57_report(const char *cls, size_t cls_len,
+                          const char *cell, size_t cell_len,
+                          const char *attrs, size_t attrs_len,
+                          uint8_t **out, size_t *out_len, tile57_error *err);
+
 /* ---- mariner settings ------------------------------------------------------
  *
  * The mariner's S-52 display options: shared by the view renderers below
