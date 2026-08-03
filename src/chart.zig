@@ -1833,25 +1833,33 @@ pub fn composeQueryPoint(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     // every pick. A store failure degrades to the anchor radius.
     const store: ?*sprite.CatalogStore = sharedStore(.day) catch null;
     const upp = render.query.unitsPerPx(tile.EXTENT, zc, zoom);
+    var dedupe = Chart.PickDedupe{ .inner = cb, .alloc = a };
+    const inner_cb = dedupe.cb();
     var qs = render.query.QuerySurface{
         .qx = @floatFromInt(local.x),
         .qy = @floatFromInt(local.y),
         .radius = 6.0 * upp, // 6 px, whatever the tile is stretched to
         .view_zoom = zoom, // raw view zoom for the SCAMIN cull
-        .cb = cb,
+        .cb = &inner_cb,
         .store = if (store) |st| st.asStore() else null,
         .units_per_px = upp,
     };
     const surf = qs.asSurface();
     try surf.beginScene(z);
-    const res = src.tileContent(a, z, tx, ty) catch return;
-    switch (res.content) {
-        .layers => |layers| scene.replayTile(a, surf, layers) catch return,
-        .bytes => |bytes| {
-            const layers = mlt.decode(a, bytes) catch return;
-            scene.replayTile(a, surf, layers) catch return;
-        },
-        .none => return,
+    var slots: [4]Chart.QueryTile = undefined;
+    const tiles = Chart.pickQueryTiles(@floatFromInt(local.x), @floatFromInt(local.y), tx, ty, z, Chart.pickReach(upp), &slots);
+    for (tiles) |qt| {
+        qs.qx = qt.qx;
+        qs.qy = qt.qy;
+        const res = src.tileContent(a, z, qt.tx, qt.ty) catch continue;
+        switch (res.content) {
+            .layers => |layers| scene.replayTile(a, surf, layers) catch continue,
+            .bytes => |bytes| {
+                const layers = mlt.decode(a, bytes) catch continue;
+                scene.replayTile(a, surf, layers) catch continue;
+            },
+            .none => continue,
+        }
     }
     _ = surf.endScene(a) catch {};
 }
@@ -2762,6 +2770,96 @@ pub const Chart = struct {
     /// Cursor object-query: replay the finest tile covering (lon,lat) through a
     /// QuerySurface and report each feature the point falls in (class + S-57
     /// attribute JSON + source cell) via `cb`. Used for the S-52 §10.8 pick.
+
+/// The tiles a pick must replay: the one under the point, and every
+/// neighbour whose edge stands within `reach` tile units of it. A symbol is
+/// drawn AROUND its anchor and its mark overhangs its tile's edge, but the
+/// feature lives in the tile that holds the anchor — a pick on the overhang
+/// answered nothing. Each entry carries the query point expressed in that
+/// tile's own frame (outside [0,extent] there, which the point tests take).
+const QueryTile = struct { tx: u32, ty: u32, qx: f64, qy: f64 };
+
+fn pickQueryTiles(local_x: f64, local_y: f64, tx: u32, ty: u32, z: u8, reach: f64, out: *[4]QueryTile) []QueryTile {
+    const ext: f64 = @floatFromInt(tile.EXTENT);
+    const n: u32 = @as(u32, 1) << @intCast(z);
+    var count: usize = 0;
+    out[count] = .{ .tx = tx, .ty = ty, .qx = local_x, .qy = local_y };
+    count += 1;
+    const west = local_x < reach and tx > 0;
+    const east = ext - local_x < reach and tx + 1 < n;
+    const north = local_y < reach and ty > 0;
+    const south = ext - local_y < reach and ty + 1 < n;
+    if (west) {
+        out[count] = .{ .tx = tx - 1, .ty = ty, .qx = local_x + ext, .qy = local_y };
+        count += 1;
+    }
+    if (east) {
+        out[count] = .{ .tx = tx + 1, .ty = ty, .qx = local_x - ext, .qy = local_y };
+        count += 1;
+    }
+    if (north) {
+        out[count] = .{ .tx = tx, .ty = ty - 1, .qx = local_x, .qy = local_y + ext };
+        count += 1;
+    }
+    if (south) {
+        out[count] = .{ .tx = tx, .ty = ty + 1, .qx = local_x, .qy = local_y - ext };
+        count += 1;
+    }
+    // At a corner both edges are near, and the diagonal neighbour's symbol
+    // can reach the point too. reach stays far below a half tile, so at most
+    // one diagonal joins and the four slots hold.
+    if (west and north) {
+        out[count] = .{ .tx = tx - 1, .ty = ty - 1, .qx = local_x + ext, .qy = local_y + ext };
+        count += 1;
+    } else if (west and south) {
+        out[count] = .{ .tx = tx - 1, .ty = ty + 1, .qx = local_x + ext, .qy = local_y - ext };
+        count += 1;
+    } else if (east and north) {
+        out[count] = .{ .tx = tx + 1, .ty = ty - 1, .qx = local_x - ext, .qy = local_y + ext };
+        count += 1;
+    } else if (east and south) {
+        out[count] = .{ .tx = tx + 1, .ty = ty + 1, .qx = local_x - ext, .qy = local_y - ext };
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// How far past a tile's edge a drawn mark can reach, in tile units: the
+/// biggest S-52 point symbols stand under 40 reference px tall.
+fn pickReach(units_per_px: f64) f64 {
+    return 48.0 * units_per_px;
+}
+
+/// A query across several tiles answers once per feature, as the single-tile
+/// query did: a feature near an edge is baked into both tiles' buffers and
+/// would answer twice. Emit first, then record — a full table must not eat
+/// a hit.
+const PickDedupe = struct {
+    inner: *const render.query.QueryCb,
+    alloc: std.mem.Allocator,
+    seen: std.ArrayList([3][]const u8) = .empty,
+
+    fn feature(ctx: ?*anyopaque, cls: [*]const u8, cls_len: usize, attrs: [*]const u8, attrs_len: usize, cell: [*]const u8, cell_len: usize) callconv(.c) void {
+        const self: *PickDedupe = @ptrCast(@alignCast(ctx orelse return));
+        const c = cls[0..cls_len];
+        const s = attrs[0..attrs_len];
+        const ch = cell[0..cell_len];
+        for (self.seen.items) |e| {
+            if (std.mem.eql(u8, e[0], c) and std.mem.eql(u8, e[1], s) and
+                std.mem.eql(u8, e[2], ch)) return;
+        }
+        self.inner.feature(self.inner.ctx, cls, cls_len, attrs, attrs_len, cell, cell_len);
+        const dc = self.alloc.dupe(u8, c) catch return;
+        const ds = self.alloc.dupe(u8, s) catch return;
+        const dch = self.alloc.dupe(u8, ch) catch return;
+        self.seen.append(self.alloc, .{ dc, ds, dch }) catch {};
+    }
+
+    fn cb(self: *PickDedupe) render.query.QueryCb {
+        return .{ .ctx = self, .feature = feature };
+    }
+};
+
     pub fn queryPoint(self: *Chart, lon: f64, lat: f64, zoom: f64, cb: *const render.query.QueryCb) !void {
         const t = @import("tiles").tile;
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -2784,38 +2882,46 @@ pub const Chart = struct {
         // pick. A store failure degrades to the anchor radius.
         const store: ?*sprite.CatalogStore = self.viewStoreFor(.day) catch null;
         const upp = render.query.unitsPerPx(t.EXTENT, zc, zoom);
+        var dedupe = PickDedupe{ .inner = cb, .alloc = a };
+        const inner_cb = dedupe.cb();
         var qs = render.query.QuerySurface{
             .qx = @floatFromInt(local.x),
             .qy = @floatFromInt(local.y),
             .radius = 6.0 * upp, // 6 px, whatever the tile is stretched to
             .view_zoom = zoom, // raw view zoom for the SCAMIN cull
-            .cb = cb,
+            .cb = &inner_cb,
             .store = if (store) |st| st.asStore() else null,
             .units_per_px = upp,
         };
         const surf = qs.asSurface();
         try surf.beginScene(z);
-        switch (self.backend) {
-            .reader => |*rd| {
-                const is_mlt = rd.header.tile_type == .mlt;
-                const bytes = (rd.getTile(a, z, tx, ty) catch return) orelse return;
-                if (bytes.len == 0) return;
-                const layers = if (is_mlt)
-                    @import("tiles").mlt.decode(a, bytes) catch return
-                else
-                    @import("tiles").mvt.decode(a, bytes) catch return;
-                scene.replayTile(a, surf, layers) catch return;
-            },
-            .cell => |*cb2| {
-                const one = [_]scene.CellRef{.{
-                    .cell = &cb2.cell,
-                    .portrayal = cb2.portrayal,
-                    .portrayal_plain = cb2.portrayal_plain,
-                    .portrayal_simplified = cb2.portrayal_simplified,
-                }};
-                scene.appendTile(surf, a, &one, z, tx, ty, self.pick_attrs) catch return;
-            },
-            .cells => return,
+        var slots: [4]QueryTile = undefined;
+        const tiles = pickQueryTiles(@floatFromInt(local.x), @floatFromInt(local.y), tx, ty, z, pickReach(upp), &slots);
+        for (tiles) |qt| {
+            qs.qx = qt.qx;
+            qs.qy = qt.qy;
+            switch (self.backend) {
+                .reader => |*rd| {
+                    const is_mlt = rd.header.tile_type == .mlt;
+                    const bytes = (rd.getTile(a, z, qt.tx, qt.ty) catch continue) orelse continue;
+                    if (bytes.len == 0) continue;
+                    const layers = if (is_mlt)
+                        @import("tiles").mlt.decode(a, bytes) catch continue
+                    else
+                        @import("tiles").mvt.decode(a, bytes) catch continue;
+                    scene.replayTile(a, surf, layers) catch continue;
+                },
+                .cell => |*cb2| {
+                    const one = [_]scene.CellRef{.{
+                        .cell = &cb2.cell,
+                        .portrayal = cb2.portrayal,
+                        .portrayal_plain = cb2.portrayal_plain,
+                        .portrayal_simplified = cb2.portrayal_simplified,
+                    }};
+                    scene.appendTile(surf, a, &one, z, qt.tx, qt.ty, self.pick_attrs) catch continue;
+                },
+                .cells => return,
+            }
         }
         _ = surf.endScene(a) catch {};
     }
