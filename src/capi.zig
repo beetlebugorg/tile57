@@ -559,6 +559,18 @@ export fn tile57_chart_tile(handle: ?*Chart, z: u8, x: u32, y: u32, out: ?*?[*]u
     return exportOut(err, o, n, bytes);
 }
 
+/// The decoded pick report for one queried feature, as JSON: title, rows,
+/// notes and provenance, composed from the class, the cell name and the
+/// attribute payload of a query callback. See tile57.h.
+export fn tile57_s57_report(cls: ?[*]const u8, cls_len: usize, cell: ?[*]const u8, cell_len: usize, attrs: ?[*]const u8, attrs_len: usize, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const c = cls orelse return failWith(err, .badarg, "cls must not be null");
+    const ch = cell orelse return failWith(err, .badarg, "cell must not be null");
+    const s = attrs orelse return failWith(err, .badarg, "attrs must not be null");
+    const bytes = s57.decode.report(gpa, c[0..cls_len], ch[0..cell_len], s[0..attrs_len]) catch |e| return fail(err, e);
+    return exportOut(err, o, n, bytes);
+}
+
 const CQueryCb = @import("render").query.QueryCb;
 
 /// Cursor object-query at (lon,lat) for the view `zoom` (web-mercator): invokes

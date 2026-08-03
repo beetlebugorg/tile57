@@ -14,8 +14,8 @@ const Allocator = std.mem.Allocator;
 /// that want the raw records. It is its own module (`@import("iso8211")`), so a
 /// caller can depend on the 8211 layer without pulling in S-57 semantics.
 pub const iso8211 = @import("iso8211");
-/// The IHO attribute catalogue as data, and the mariner's decode over it —
-/// the pick report's language, served to every shell from here.
+/// The attribute catalogues as data, and the pick-report decode over
+/// them. Every shell reads the same decode.
 pub const catalog = @import("catalog.zig");
 pub const catalog_s101 = @import("catalog_s101.zig");
 pub const decode = @import("decode.zig");

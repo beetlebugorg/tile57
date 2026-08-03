@@ -284,3 +284,384 @@ test "the signature is the chart's shorthand" {
     const sig = lightSignature(a, &parsed.value.object).?;
     try std.testing.expectEqualStrings("Q G 1s", sig);
 }
+
+// ---- the report -------------------------------------------------------------
+
+/// Classes the generated table cannot name: the S-57 meta and collection
+/// objects that S-101 does not contain, and the classes whose S-57 alias
+/// is claimed by more than one S-101 feature.
+const class_leftovers = [_]catalog.AttrName{
+    .{ .acronym = "ADMARE", .name = "Administration area" },
+    .{ .acronym = "BRIDGE", .name = "Bridge" },
+    .{ .acronym = "CTNARE", .name = "Caution area" },
+    .{ .acronym = "LIGHTS", .name = "Light" },
+    .{ .acronym = "RESARE", .name = "Restricted area" },
+    .{ .acronym = "M_NPUB", .name = "Nautical publication note" },
+    .{ .acronym = "M_COVR", .name = "Chart coverage" },
+    .{ .acronym = "M_QUAL", .name = "Data quality" },
+    .{ .acronym = "M_NSYS", .name = "Buoyage system" },
+    .{ .acronym = "M_ACCY", .name = "Data accuracy" },
+    .{ .acronym = "M_SREL", .name = "Survey reliability" },
+    .{ .acronym = "M_CSCL", .name = "Compilation scale" },
+    .{ .acronym = "C_AGGR", .name = "Aggregation" },
+    .{ .acronym = "C_ASSO", .name = "Association" },
+};
+
+/// The chart's name for an object class, or the class itself.
+pub fn className(cls: []const u8) []const u8 {
+    for (class_leftovers) |e| if (std.mem.eql(u8, e.acronym, cls)) return e.name;
+    for (catalog_s101.class_names) |e| if (std.mem.eql(u8, e.acronym, cls)) return e.name;
+    return cls;
+}
+
+/// One attribute of the payload, flattened. A complex attribute becomes a
+/// heading with its parts indented under it.
+const Row = struct { name: []const u8, value: []const u8, depth: u8 };
+
+fn flatten(a: std.mem.Allocator, rows: *std.ArrayList(Row), v: std.json.Value, name: ?[]const u8, depth: u8) !void {
+    switch (v) {
+        .object => |obj| {
+            if (name) |n| try rows.append(a, .{ .name = n, .value = "", .depth = depth });
+            // Alphabetical order first; the reading order sorts the top
+            // level after.
+            var keys = std.ArrayList([]const u8).empty;
+            var it = obj.iterator();
+            while (it.next()) |e| try keys.append(a, e.key_ptr.*);
+            std.mem.sort([]const u8, keys.items, {}, struct {
+                fn lt(_: void, x: []const u8, y: []const u8) bool {
+                    return std.mem.lessThan(u8, x, y);
+                }
+            }.lt);
+            for (keys.items) |k| {
+                try flatten(a, rows, obj.get(k).?, k, if (name == null) depth else depth + 1);
+            }
+        },
+        .array => |arr| {
+            if (name) |n| try rows.append(a, .{ .name = n, .value = "", .depth = depth });
+            for (arr.items) |item| try flatten(a, rows, item, null, depth + 1);
+        },
+        .string => |s| try rows.append(a, .{ .name = name orelse "", .value = s, .depth = depth }),
+        .integer => |i| try rows.append(a, .{ .name = name orelse "", .value = try std.fmt.allocPrint(a, "{d}", .{i}), .depth = depth }),
+        .float => |f| try rows.append(a, .{ .name = name orelse "", .value = try std.fmt.allocPrint(a, "{d}", .{f}), .depth = depth }),
+        .bool => |b| try rows.append(a, .{ .name = name orelse "", .value = if (b) "true" else "false", .depth = depth }),
+        else => {},
+    }
+}
+
+/// The reading order of the top-level rows: the name first, then the
+/// signal, then the shape, then the depths, then the rest in cell order.
+const reading_order = [_][]const u8{
+    "OBJNAM", "NOBJNM",
+    "LITCHR", "COLOUR",
+    "SIGPER", "SIGSEQ",
+    "SIGGRP", "EXCLIT",
+    "SECTR1", "SECTR2",
+    "HEIGHT", "VALNMR",
+    "CATLAM", "CATCAM",
+    "CATLIT", "CATWRK",
+    "CATOBS", "BOYSHP",
+    "BCNSHP", "TOPSHP",
+    "COLPAT", "VALSOU",
+    "DRVAL1", "DRVAL2",
+    "WATLEV", "NATSUR",
+};
+
+fn readingRank(name: []const u8) usize {
+    for (reading_order, 0..) |n, i| if (std.mem.eql(u8, n, name)) return i;
+    return reading_order.len;
+}
+
+const RowGroup = enum { note, source, detail };
+
+fn groupOf(name: []const u8) RowGroup {
+    const notes = [_][]const u8{ "INFORM", "NINFOM" };
+    const source = [_][]const u8{ "SCAMIN", "SORDAT", "SORIND", "RECDAT", "RECIND" };
+    for (notes) |n| if (std.mem.eql(u8, n, name)) return .note;
+    for (source) |n| if (std.mem.eql(u8, n, name)) return .source;
+    return .detail;
+}
+
+fn isFileRef(name: []const u8, value: []const u8) bool {
+    if (value.len == 0) return false;
+    const refs = [_][]const u8{ "TXTDSC", "NTXTDS", "PICREP", "fileReference" };
+    for (refs) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+fn isPicture(value: []const u8) bool {
+    const exts = [_][]const u8{ ".tif", ".tiff", ".jpg", ".jpeg", ".png", ".TIF", ".TIFF", ".JPG", ".JPEG", ".PNG" };
+    for (exts) |e| if (std.mem.endsWith(u8, value, e)) return true;
+    return false;
+}
+
+/// A top-level scalar's text from the flattened rows.
+fn rowValue(rows: []const Row, name: []const u8) ?[]const u8 {
+    for (rows) |r| {
+        if (r.depth == 0 and r.value.len > 0 and std.mem.eql(u8, r.name, name)) return r.value;
+    }
+    return null;
+}
+
+fn decodedOrNull(a: std.mem.Allocator, rows: []const Row, name: []const u8) ?[]const u8 {
+    const raw = rowValue(rows, name) orelse return null;
+    return decodeValue(a, name, raw);
+}
+
+const Header = struct { title: []const u8, subtitle: ?[]const u8 };
+
+/// The title and subtitle for a feature. A class with a rule leads with
+/// its key fact: a light's characteristic, a wreck's least depth, a depth
+/// area's range. Other classes lead with the name or the class.
+fn header(a: std.mem.Allocator, cls: []const u8, rows: []const Row) Header {
+    const name = className(cls);
+    if (std.mem.eql(u8, cls, "LIGHTS")) {
+        if (lightSignatureRows(a, rows)) |sig| {
+            var phrase: []const u8 = name;
+            if (decodedOrNull(a, rows, "LITCHR")) |chr| {
+                if (decodedOrNull(a, rows, "COLOUR")) |col| {
+                    phrase = std.fmt.allocPrint(a, "{s} — {s} {s}", .{ name, lowered(a, chr), lowered(a, col) }) catch name;
+                }
+            }
+            return .{ .title = sig, .subtitle = phrase };
+        }
+    }
+    if (std.mem.eql(u8, cls, "WRECKS")) {
+        if (rowValue(rows, "VALSOU")) |sou| {
+            const v = decodeValue(a, "VALSOU", sou) orelse sou;
+            return .{
+                .title = std.fmt.allocPrint(a, "Wreck, {s}", .{v}) catch name,
+                .subtitle = if (decodedOrNull(a, rows, "CATWRK")) |c|
+                    std.fmt.allocPrint(a, "Wreck — {s}", .{c}) catch name
+                else
+                    name,
+            };
+        }
+    }
+    if (std.mem.eql(u8, cls, "DEPARE") or std.mem.eql(u8, cls, "DRGARE")) {
+        if (rowValue(rows, "DRVAL1")) |d1| if (rowValue(rows, "DRVAL2")) |d2| {
+            return .{ .title = std.fmt.allocPrint(a, "{s}–{s}", .{ d1, d2 }) catch name, .subtitle = name };
+        };
+    }
+    const phrase = markPhrase(a, cls, rows) orelse areaPhrase(a, rows);
+    if (rowValue(rows, "OBJNAM")) |objnam| {
+        return .{ .title = objnam, .subtitle = phrase orelse name };
+    }
+    return .{ .title = name, .subtitle = phrase };
+}
+
+/// A mark's subtitle from shape, colour and category: "Buoy, lateral —
+/// green can · port hand".
+fn markPhrase(a: std.mem.Allocator, cls: []const u8, rows: []const Row) ?[]const u8 {
+    const marky = std.mem.startsWith(u8, cls, "BOY") or std.mem.startsWith(u8, cls, "BCN") or
+        std.mem.eql(u8, cls, "TOPMAR") or std.mem.eql(u8, cls, "DAYMAR");
+    if (!marky) return null;
+    const name = className(cls);
+    const col = decodedOrNull(a, rows, "COLOUR");
+    const shp = decodedOrNull(a, rows, "BOYSHP") orelse decodedOrNull(a, rows, "BCNSHP") orelse decodedOrNull(a, rows, "TOPSHP");
+    const cat = decodedOrNull(a, rows, "CATLAM") orelse decodedOrNull(a, rows, "CATCAM");
+    var lead: ?[]const u8 = null;
+    if (col != null and shp != null) {
+        lead = std.fmt.allocPrint(a, "{s} {s}", .{ lowered(a, col.?), shp.? }) catch null;
+    } else if (col) |c| {
+        lead = lowered(a, c);
+    } else if (shp) |sh| {
+        lead = sh;
+    }
+    if (lead != null and cat != null)
+        return std.fmt.allocPrint(a, "{s} — {s} · {s}", .{ name, lead.?, cat.? }) catch null;
+    if (lead) |l| return std.fmt.allocPrint(a, "{s} — {s}", .{ name, l }) catch null;
+    if (cat) |c| return std.fmt.allocPrint(a, "{s} — {s}", .{ name, c }) catch null;
+    return null;
+}
+
+/// An area's subtitle: its category, or its restriction.
+fn areaPhrase(a: std.mem.Allocator, rows: []const Row) ?[]const u8 {
+    return decodedOrNull(a, rows, "CATREA") orelse decodedOrNull(a, rows, "RESTRN");
+}
+
+fn lowered(a: std.mem.Allocator, s: []const u8) []const u8 {
+    const out = a.dupe(u8, s) catch return s;
+    for (out) |*c| c.* = std.ascii.toLower(c.*);
+    return out;
+}
+
+/// The light's characteristic from flattened rows. The ObjectMap variant
+/// serves callers that hold parsed JSON.
+fn lightSignatureRows(a: std.mem.Allocator, rows: []const Row) ?[]const u8 {
+    const chr_raw = rowValue(rows, "LITCHR") orelse return null;
+    const chr = std.fmt.parseInt(u16, chr_raw, 10) catch return null;
+    const abbr = abbrevOf(litchr_abbrev, chr) orelse return null;
+    var out = std.ArrayList(u8).empty;
+    out.appendSlice(a, abbr) catch return null;
+    if (rowValue(rows, "SIGGRP")) |grp| {
+        if (!std.mem.eql(u8, grp, "(1)") and !std.mem.eql(u8, grp, "()"))
+            out.appendSlice(a, grp) catch return null;
+    }
+    if (rowValue(rows, "COLOUR")) |col_raw| {
+        if (std.fmt.parseInt(u16, col_raw, 10) catch null) |col| {
+            if (abbrevOf(colour_abbrev, col)) |letter| {
+                out.append(a, ' ') catch return null;
+                out.appendSlice(a, letter) catch return null;
+            }
+        }
+    }
+    appendNumUnitRows(a, &out, rows, "SIGPER", "s");
+    appendNumUnitRows(a, &out, rows, "HEIGHT", "m");
+    appendNumUnitRows(a, &out, rows, "VALNMR", "M");
+    return out.items;
+}
+
+fn appendNumUnitRows(a: std.mem.Allocator, out: *std.ArrayList(u8), rows: []const Row, name: []const u8, unit: []const u8) void {
+    const raw = rowValue(rows, name) orelse return;
+    const n = std.fmt.parseFloat(f64, raw) catch return;
+    const printed = std.fmt.allocPrint(a, " {d}{s}", .{ n, unit }) catch return;
+    out.appendSlice(a, printed) catch {};
+}
+
+/// The chip: the short name for a list row.
+fn chipTitle(a: std.mem.Allocator, cls: []const u8, rows: []const Row) []const u8 {
+    if (std.mem.eql(u8, cls, "LIGHTS")) {
+        if (lightSignatureRows(a, rows)) |sig| return sig;
+    }
+    if (std.mem.eql(u8, cls, "M_NPUB")) return "Chart notes";
+    return className(cls);
+}
+
+/// The report a shell renders for one picked feature, as JSON:
+/// {"title","subtitle","chip","notes":[…],"rows":[{"label","value","depth",
+/// "file","picture"}…],"footnote","empty":"none"|"source"}. The "empty"
+/// field appears only when there is nothing to read. The caller frees the
+/// bytes.
+pub fn report(alloc: std.mem.Allocator, cls: []const u8, cell: []const u8, s57_json: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var rows = std.ArrayList(Row).empty;
+    if (std.json.parseFromSlice(std.json.Value, a, s57_json, .{})) |parsed| {
+        try flatten(a, &rows, parsed.value, null, 0);
+    } else |_| {}
+
+    // Sort the top-level blocks into reading order. Sub-rows stay under
+    // their parents. The sort is stable for rows the order does not name.
+    var blocks = std.ArrayList([]const Row).empty;
+    {
+        var i: usize = 0;
+        while (i < rows.items.len) {
+            var j = i + 1;
+            while (j < rows.items.len and rows.items[j].depth > 0) : (j += 1) {}
+            try blocks.append(a, rows.items[i..j]);
+            i = j;
+        }
+        std.mem.sort([]const Row, blocks.items, {}, struct {
+            fn lt(_: void, x: []const Row, y: []const Row) bool {
+                return readingRank(x[0].name) < readingRank(y[0].name);
+            }
+        }.lt);
+    }
+
+    const hdr = header(a, cls, rows.items);
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &aw.writer };
+    const js = &stringify;
+
+    try js.beginObject();
+    try js.objectField("title");
+    try js.write(hdr.title);
+    if (hdr.subtitle) |sub| {
+        try js.objectField("subtitle");
+        try js.write(sub);
+    }
+    try js.objectField("chip");
+    try js.write(chipTitle(a, cls, rows.items));
+
+    try js.objectField("notes");
+    try js.beginArray();
+    for (rows.items) |r| {
+        if (r.depth == 0 and groupOf(r.name) == .note and r.value.len > 0) try js.write(r.value);
+    }
+    try js.endArray();
+
+    var n_detail: usize = 0;
+    try js.objectField("rows");
+    try js.beginArray();
+    for (blocks.items) |block| {
+        if (groupOf(block[0].name) != .detail) continue;
+        for (block) |r| {
+            n_detail += 1;
+            try js.beginObject();
+            try js.objectField("label");
+            try js.write(attrName(r.name));
+            try js.objectField("value");
+            try js.write(decodeValue(a, r.name, r.value) orelse r.value);
+            if (r.depth > 0) {
+                try js.objectField("depth");
+                try js.write(r.depth);
+            }
+            if (isFileRef(r.name, r.value)) {
+                try js.objectField("file");
+                try js.write(true);
+                if (isPicture(r.value)) {
+                    try js.objectField("picture");
+                    try js.write(true);
+                }
+            }
+            try js.endObject();
+        }
+    }
+    try js.endArray();
+
+    // The provenance as one line: the cell, the source, the source date,
+    // and the charted scale range.
+    var foot = std.ArrayList(u8).empty;
+    try foot.appendSlice(a, cell);
+    const source_attrs = [_][]const u8{ "SORIND", "SORDAT", "SCAMIN" };
+    for (source_attrs) |sn| {
+        if (rowValue(rows.items, sn)) |raw| {
+            try foot.appendSlice(a, "  ·  ");
+            try foot.appendSlice(a, decodeValue(a, sn, raw) orelse raw);
+        }
+    }
+    try js.objectField("footnote");
+    try js.write(foot.items);
+
+    var n_notes: usize = 0;
+    for (rows.items) |r| {
+        if (r.depth == 0 and groupOf(r.name) == .note and r.value.len > 0) n_notes += 1;
+    }
+    if (n_detail == 0 and n_notes == 0) {
+        try js.objectField("empty");
+        try js.write(if (rows.items.len == 0) "none" else "source");
+    }
+    try js.endObject();
+
+    return aw.toOwnedSlice();
+}
+
+test "report composes the page" {
+    const a = std.testing.allocator;
+    const json =
+        \\{"COLOUR":"4","LITCHR":"4","SIGPER":"1","SIGGRP":"(1)","SIGSEQ":"00.3+(00.7)",
+        \\"EXCLIT":"4","SCAMIN":"29999","SORDAT":"20010106","SORIND":"US,US,graph,Chart 12283",
+        \\"INFORM":"Seasonal aid"}
+    ;
+    const out = try report(a, "LIGHTS", "US5MD1MC", json);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"title\":\"Q G 1s\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Seasonal aid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Quick-flashing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1:30,000 and larger") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Chart 12283 (US)") != null);
+}
+
+test "report marks an empty body" {
+    const a = std.testing.allocator;
+    const out = try report(a, "SLCONS", "C", "{\"SORDAT\":\"20010106\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"empty\":\"source\"") != null);
+    const none = try report(a, "LNDARE", "C", "{}");
+    defer a.free(none);
+    try std.testing.expect(std.mem.indexOf(u8, none, "\"empty\":\"none\"") != null);
+}

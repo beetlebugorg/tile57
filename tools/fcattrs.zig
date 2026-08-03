@@ -78,8 +78,63 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     try out.appendSlice(a, enums.items);
     try out.appendSlice(a, "};\n");
 
+    // Feature types: the object-class names. Emit the S-101 code always.
+    // Emit the S-57 alias only when exactly one feature type claims it and
+    // it has the shape of an S-57 acronym. S-101 splits some S-57 classes
+    // into several features (CTNARE becomes Caution Area and Discoloured
+    // Water), and an alias with several claims does not name one class.
+    try out.appendSlice(a,
+        \\
+        \\/// Object class (S-57 acronym or S-101 code) -> the chart's name.
+        \\pub const class_names = [_]catalog.AttrName{
+        \\
+    );
+    var n_classes: usize = 0;
+    // First pass: count the claims on each alias.
+    var claims = std.StringHashMap(usize).init(a);
+    var crest: []const u8 = xml;
+    while (indexAfter(crest, "<S100FC:S100_FC_FeatureType ")) |start| {
+        const end = std.mem.indexOf(u8, crest[start..], "</S100FC:S100_FC_FeatureType>") orelse break;
+        const head = crest[start .. start + (std.mem.indexOf(u8, crest[start .. start + end], "<S100FC:attributeBinding") orelse end)];
+        crest = crest[start + end ..];
+        if (element(head, "S100FC:alias")) |al| {
+            const g = try claims.getOrPut(al);
+            if (!g.found_existing) g.value_ptr.* = 0;
+            g.value_ptr.* += 1;
+        }
+    }
+    var frest: []const u8 = xml;
+    while (indexAfter(frest, "<S100FC:S100_FC_FeatureType ")) |start| {
+        const end = std.mem.indexOf(u8, frest[start..], "</S100FC:S100_FC_FeatureType>") orelse break;
+        const block = frest[start .. start + end];
+        frest = frest[start + end ..];
+        const head = block[0 .. std.mem.indexOf(u8, block, "<S100FC:attributeBinding") orelse block.len];
+        const name = element(head, "S100FC:name") orelse continue;
+        const code = element(head, "S100FC:code") orelse continue;
+        try emitName(a, &out, code, name);
+        n_classes += 1;
+        if (element(head, "S100FC:alias")) |al| {
+            if ((claims.get(al) orelse 0) == 1 and isAcronym(al)) {
+                try emitName(a, &out, al, name);
+                n_classes += 1;
+            }
+        }
+    }
+    try out.appendSlice(a, "};\n");
+    std.debug.print("fcattrs: {d} class names\n", .{n_classes});
+
     std.debug.print("fcattrs: {d} attribute names, {d} enum values\n", .{ n_attrs, n_vals });
     std.Io.File.stdout().writeStreamingAll(io, out.items) catch {};
+}
+
+/// True for the shape of an S-57 acronym: six characters, upper case,
+/// digits, or underscore.
+fn isAcronym(s: []const u8) bool {
+    if (s.len != 6) return false;
+    for (s) |c| {
+        if (!std.ascii.isUpper(c) and !std.ascii.isDigit(c) and c != '_') return false;
+    }
+    return true;
 }
 
 fn indexAfter(hay: []const u8, needle: []const u8) ?usize {
