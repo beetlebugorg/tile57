@@ -13,12 +13,20 @@
 
 const std = @import("std");
 const catalog = @import("catalog.zig");
+const catalog_s101 = @import("catalog_s101.zig");
 
 // ---- catalogue lookups ------------------------------------------------------
 
-/// The label a mariner reads for an attribute acronym, or the acronym itself.
+/// The label for an attribute, or the attribute itself when no catalogue
+/// contains it. S-57 acronyms read the S-57 catalogue. S-101 codes read
+/// the generated Feature Catalogue tables. The two stay separate: S-101
+/// changed attributes that it took from S-57, so an S-57 code must not
+/// read the S-101 tables.
 pub fn attrName(acronym: []const u8) []const u8 {
     for (catalog.attribute_names) |e| {
+        if (std.mem.eql(u8, e.acronym, acronym)) return e.name;
+    }
+    for (catalog_s101.attribute_names) |e| {
         if (std.mem.eql(u8, e.acronym, acronym)) return e.name;
     }
     return acronym;
@@ -26,6 +34,9 @@ pub fn attrName(acronym: []const u8) []const u8 {
 
 fn enumValue(acronym: []const u8, code: u16) ?[]const u8 {
     for (catalog.enum_values) |e| {
+        if (e.code == code and std.mem.eql(u8, e.acronym, acronym)) return e.value;
+    }
+    for (catalog_s101.enum_values) |e| {
         if (e.code == code and std.mem.eql(u8, e.acronym, acronym)) return e.value;
     }
     return null;

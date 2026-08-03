@@ -17,6 +17,7 @@ pub const iso8211 = @import("iso8211");
 /// The IHO attribute catalogue as data, and the mariner's decode over it —
 /// the pick report's language, served to every shell from here.
 pub const catalog = @import("catalog.zig");
+pub const catalog_s101 = @import("catalog_s101.zig");
 pub const decode = @import("decode.zig");
 const iso = iso8211;
 

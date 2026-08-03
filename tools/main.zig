@@ -35,6 +35,7 @@ const ascii = @import("ascii.zig");
 const explore = @import("explore.zig");
 const cells = @import("cells.zig");
 const catalog = @import("catalog.zig");
+const fcattrs = @import("fcattrs.zig");
 const features = @import("features.zig");
 const inspect = @import("inspect.zig");
 const zoomsizes = @import("zoomsizes.zig");
@@ -114,6 +115,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "cells")) {
         return cells.run(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "fcattrs")) {
+        return fcattrs.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "catalog")) {
