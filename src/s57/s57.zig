@@ -1174,6 +1174,17 @@ fn toUtf8(a: Allocator, s: []const u8) ![]const u8 {
 /// ATTF/NATF: repeated [ATTL(2 LE), ATVL(ASCII, UT-terminated)]. Values are copied
 /// into `a` (the source field bytes are not retained) and transcoded to UTF-8.
 fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
+    return parseAttrs(a, data, false);
+}
+
+/// parseATTF with the DEL (0x7F) tombstones KEPT — only for an update MODIFY's
+/// attribute delta, where a lone-DEL ATVL means "remove this attribute from the
+/// base record" and the merge must see it (parseATTF drops it as absent).
+fn parseAttrsKeepDel(a: Allocator, data: []const u8) ![]Attr {
+    return parseAttrs(a, data, true);
+}
+
+fn parseAttrs(a: Allocator, data: []const u8, keep_del: bool) ![]Attr {
     var list = std.ArrayList(Attr).empty;
     // One attribute per UT terminator, so size the list once up front (absent /
     // DEL-marker values are skipped below, making this an upper bound) instead
@@ -1199,7 +1210,7 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
             const end = std.mem.indexOfScalarPos(u8, copy, off, iso.UT) orelse copy.len;
             const val = copy[off..end];
             // Same absent-value skip as below (empty ATVL / DEL marker).
-            if (val.len > 0 and !isDelMarker(val))
+            if (val.len > 0 and (keep_del or !isDelMarker(val)))
                 try list.append(a, .{ .code = code, .value = val });
             off = end + 1; // skip UT
         }
@@ -1218,7 +1229,8 @@ fn parseATTF(a: Allocator, data: []const u8) ![]Attr {
         // (e.g. a light demoted from sectored carries SECTR1/SECTR2 = 0x7F). Storing DEL
         // verbatim made the S-101 framework build a malformed ScaledDecimal{Value=nil}
         // that crashed the rule -> QUESMRK1. Either way attr()/attrFloat() see it absent.
-        if (val.len > 0 and !isDelMarker(val))
+        // (keep_del: an update MODIFY's delta parse keeps the tombstone instead.)
+        if (val.len > 0 and (keep_del or !isDelMarker(val)))
             try list.append(a, .{ .code = code, .value = try toUtf8(a, val) });
         off = end + 1; // skip UT
     }
@@ -1241,6 +1253,45 @@ fn mergeNatf(a: Allocator, attf: []const Attr, natf_data: []const u8) ![]Attr {
             if (x.code == n.code) continue :outer;
         }
         try list.append(a, n);
+    }
+    return list.items;
+}
+
+/// The attribute DELTA an update's MODIFY carries: ATTF + NATF parsed with the
+/// DEL (0x7F) tombstones kept, so mergeAttrDelta can see deletions. ATTF wins
+/// on a code NATF repeats, like mergeNatf. Empty ATVLs stay dropped — an empty
+/// value is "absent", not "delete"; removal is the DEL marker (§8.4.2.2).
+fn parseAttrDelta(a: Allocator, attf: ?[]const u8, natf: ?[]const u8) ![]Attr {
+    const at: []Attr = if (attf) |d| try parseAttrsKeepDel(a, d) else &.{};
+    const nd = natf orelse return at;
+    const nt = try parseAttrsKeepDel(a, nd);
+    var list = std.ArrayList(Attr).empty;
+    try list.appendSlice(a, at);
+    outer: for (nt) |n| {
+        for (at) |x| {
+            if (x.code == n.code) continue :outer;
+        }
+        try list.append(a, n);
+    }
+    return list.items;
+}
+
+/// Apply a MODIFY's attribute delta ONTO the base set (S-57 §8.4.2.1: the
+/// update carries only the changed attributes; the rest remain). A delta code
+/// replaces the base value, a DEL-valued one removes it, and base attributes
+/// the delta never names pass through untouched.
+fn mergeAttrDelta(a: Allocator, base: []const Attr, delta: []const Attr) ![]Attr {
+    var list = std.ArrayList(Attr).empty;
+    try list.ensureTotalCapacity(a, base.len + delta.len);
+    outer: for (base) |b| {
+        for (delta) |d| {
+            if (d.code == b.code) continue :outer; // superseded: re-added or deleted below
+        }
+        list.appendAssumeCapacity(b);
+    }
+    for (delta) |d| {
+        if (!isDelMarker(d.value))
+            list.appendAssumeCapacity(d);
     }
     return list.items;
 }
@@ -1836,11 +1887,15 @@ fn mergeFile(
                     } else if (flds.ffpt != null) {
                         ex.frefs = f.frefs;
                     }
-                    // Gate on the PARSED attribute count, not ATTF field presence: the
-                    // oracle (updates.go:228) replaces attributes only when the update
-                    // carries at least one, so a present-but-empty ATTF preserves the
-                    // existing set instead of clobbering it.
-                    if (f.attrs.len > 0) ex.attrs = f.attrs;
+                    // §8.4.2.1: a MODIFY's ATTF/NATF carry ONLY the changed
+                    // attributes — merge them ONTO the base set (a code upserts;
+                    // a lone-DEL (0x7F) ATVL removes; the rest survive). The old
+                    // whole-set replace (oracle updates.go:228 parity) stripped
+                    // every attribute an update didn't restate: an LNM buoy
+                    // reposition kept OBJNAM/SORDAT/SORIND/STATUS, lost
+                    // BOYSHP/COLOUR/SCAMIN, and portrayed as QUESMRK1 for good.
+                    const delta = try parseAttrDelta(a, flds.attf, flds.natf);
+                    if (delta.len > 0) ex.attrs = try mergeAttrDelta(a, ex.attrs, delta);
                 } else return error.ModifyMissingFeature;
                 continue;
             }
@@ -2139,6 +2194,58 @@ test "update DELETE by bare FRID (no FOID) removes the base feature" {
 
     try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd.items, 1, 1, true);
     try std.testing.expect(feats.items[0] == null); // deleted — must not survive
+}
+
+test "update MODIFY merges the attribute delta onto the base set" {
+    // The LNM shape that stripped NOAA aids (US5MD1MC.004 "Lighted Buoy 9"):
+    // the base BOYLAT carries shape/colour/SCAMIN; the reposition update's
+    // MODIFY restates only OBJNAM + STATUS. §8.4.2.1: attributes the update
+    // does not name remain — replacing the whole set left the buoy shapeless
+    // and it portrayed as the QUESMRK1 "?" from then on. A DEL(0x7F) ATVL
+    // must still remove exactly its attribute.
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // FRID: RCNM=100 RCID=9 PRIM=1 GRUP=2 OBJL=17(BOYLAT) RVER RUIN
+    const frid_base = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 1, 0, 1 }; // RUIN=insert
+    const frid_mod = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 }; // RUIN=modify
+    // Base ATTF: BOYSHP(4)="1", COLOUR(75)="3", SCAMIN(133)="29999", OBJNAM(116)="Buoy 9".
+    const attf_base = [_]u8{ 4, 0 } ++ "1".* ++ [_]u8{iso.UT} ++
+        [_]u8{ 75, 0 } ++ "3".* ++ [_]u8{iso.UT} ++
+        [_]u8{ 133, 0 } ++ "29999".* ++ [_]u8{iso.UT} ++
+        [_]u8{ 116, 0 } ++ "Buoy 9".* ++ [_]u8{iso.UT};
+    // Update ATTF: OBJNAM(116)="Lighted Buoy 9", STATUS(149)="1", COLOUR(75)=DEL.
+    const attf_mod = [_]u8{ 116, 0 } ++ "Lighted Buoy 9".* ++ [_]u8{iso.UT} ++
+        [_]u8{ 149, 0 } ++ "1".* ++ [_]u8{iso.UT} ++
+        [_]u8{ 75, 0, 0x7f, iso.UT };
+
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "ATTF", .data = &attf_base } });
+    var upd = std.ArrayList(u8).empty;
+    defer upd.deinit(gpa);
+    try iso.writeRecord(gpa, &upd, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_mod } });
+
+    var feats = std.ArrayList(?Feature).empty;
+    var fidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer fidx.deinit();
+    var vecs = std.ArrayList(?VectorRecord).empty;
+    var vidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer vidx.deinit();
+
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, base.items, 1, 1, false);
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd.items, 1, 1, true);
+
+    const f = feats.items[0].?;
+    try std.testing.expectEqualStrings("1", f.attr(4).?); // BOYSHP survives the update
+    try std.testing.expectEqualStrings("29999", f.attr(133).?); // SCAMIN survives
+    try std.testing.expectEqualStrings("Lighted Buoy 9", f.attr(116).?); // OBJNAM updated
+    try std.testing.expectEqualStrings("1", f.attr(149).?); // STATUS added
+    try std.testing.expectEqual(@as(?[]const u8, null), f.attr(75)); // COLOUR DEL'd
 }
 
 test "mergeNatf appends national attrs, ATTF wins on code overlap" {
