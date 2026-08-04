@@ -1809,6 +1809,13 @@ fn composeTileGpuScene(src: *compose_mod.ComposeSource, z: u8, x: u32, y: u32, p
     return out;
 }
 
+/// The pick's tolerance in px, and the contract a shell's mark makes.
+///
+/// A shell marks the pick with a circle 34 px across. Everything under that
+/// circle must be in the report, so the tolerance is the mark's radius. A
+/// smaller tolerance misses objects the circle plainly covers.
+pub const PICK_RADIUS_PX = 17.0;
+
 /// Cursor object-query over a runtime compositor (the S-52 §10.8 pick across the
 /// whole composed set — seams included): replay the composed tile covering
 /// (lon,lat) at the view zoom through a QuerySurface and report each feature the
@@ -1838,7 +1845,7 @@ pub fn composeQueryPoint(src: *compose_mod.ComposeSource, lon: f64, lat: f64, zo
     var qs = render.query.QuerySurface{
         .qx = @floatFromInt(local.x),
         .qy = @floatFromInt(local.y),
-        .radius = 6.0 * upp, // 6 px, whatever the tile is stretched to
+        .radius = PICK_RADIUS_PX * upp, // whatever the tile is stretched to
         .view_zoom = zoom, // raw view zoom for the SCAMIN cull
         .cb = &inner_cb,
         .store = if (store) |st| st.asStore() else null,
@@ -2886,7 +2893,7 @@ pub const Chart = struct {
         var qs = render.query.QuerySurface{
             .qx = @floatFromInt(local.x),
             .qy = @floatFromInt(local.y),
-            .radius = 6.0 * upp, // 6 px, whatever the tile is stretched to
+            .radius = PICK_RADIUS_PX * upp, // whatever the tile is stretched to
             .view_zoom = zoom, // raw view zoom for the SCAMIN cull
             .cb = &inner_cb,
             .store = if (store) |st| st.asStore() else null,
