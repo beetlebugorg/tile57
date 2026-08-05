@@ -47,6 +47,10 @@ diagrams it carries.
   north-up in world space and the host applies the view rotation, so a course-up
   view that turns continuously never rebuilds its scene. The repo ships reference
   shaders for Metal, Direct3D and Vulkan.
+- **It reads raster charts too.** A chart made of pictures — satellite imagery a
+  mariner supplies as MBTiles, or a BSB/KAP sheet — opens beside the vector one.
+  The chart can drop its opaque area fills so the picture shows through, keeping
+  every contour, symbol, light and sounding. See [Raster charts](docs/docs/raster-charts.md).
 - **It embeds anywhere.** The core is pure Zig with a C ABI. It compiles natively
   and to WASM.
 
@@ -75,6 +79,7 @@ The first command bakes a catalogue. The second draws a chart straight to a PNG.
 | **GPU scene** | `tile57_chart_gpu_scene` | Draw-ready vertex, quad and range buffers, plus the sprite and SDF atlases |
 | **Pick** | `tile57_chart_query` | The objects under a point, with their attributes |
 | **Notes and diagrams** | `tile57_aux_get` | The text and picture files a chart's features point at |
+| **Raster charts** | `tile57_raster_chart_*` | Picture tiles from an MBTiles a mariner supplies, read in place |
 
 MLT is the default tile encoding. MapLibre GL JS 5.12 and later decode it natively.
 

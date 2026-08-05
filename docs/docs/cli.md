@@ -22,7 +22,7 @@ automatically); `ENC_ROOT` is a whole catalogue directory.
 ### `bake`
 
 ```
-tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]
+tile57 bake <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT> -o <out-dir> [--rules DIR] [-j N]
 ```
 
 Produces the **live-composite structure** every other output is served from:
@@ -32,6 +32,13 @@ metadata), and the ownership partition is written to `<out>/partition.tpart`.
 There is no merged archive — a runtime compositor serves any tile on demand —
 and re-runs are incremental: an archive already newer than its whole input
 (`.000` + update chain) is skipped.
+
+A `.KAP` sheet or a `BSB_ROOT` of them bakes the same structure with PNG tiles,
+warped to web mercator through the sheet's own control points and clipped to its
+`PLY` border. Each archive carries the sheet's coverage, compilation scale and
+edition date, so a folder of RNCs quilts the way a folder of cells does — see
+[Raster charts](raster-charts). One bake writes one kind of library: a directory
+holding both `.000` cells and `.KAP` sheets is refused.
 
 `-j`/`--workers` sets the bake thread count (default `min(cores/2, 8)`). Each
 worker holds a whole cell's parse + portray + raster working set, so this is a

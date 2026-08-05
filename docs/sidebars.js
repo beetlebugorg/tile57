@@ -38,6 +38,7 @@ const sidebars = {
     'rendering',
     'gpu-rendering',
     'tile-schema',
+    'raster-charts',
     'limitations',
     'contributing',
   ],

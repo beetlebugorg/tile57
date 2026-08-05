@@ -184,7 +184,7 @@ tile57 is built to hold only its working set:
 
 ## The live-composite bake
 
-One `bake` command (`tile57 bake <cell.000 | ENC_ROOT> -o out/`) writes the
+One `bake` command (`tile57 bake <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT> -o out/`) writes the
 live-composite structure — per-chart tiles plus the ownership partition a runtime
 compositor serves them from:
 
