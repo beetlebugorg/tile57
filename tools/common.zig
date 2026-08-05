@@ -142,13 +142,16 @@ pub fn printUsage() void {
         \\{s} — offline S-57 -> PMTiles baker / inspector
         \\
         \\usage:
-        \\  tile57 bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]
+        \\  tile57 bake <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT> -o <out-dir> [--rules DIR] [-j N]
         \\      Produce a live-composite structure: bake each chart (a single .000 +
         \\      its auto-discovered updates, OR every <CELL>.000 in an ENC_ROOT, at
         \\      native band scale) to its own <out>/tiles/<STEM>.pmtiles with M_COVR
         \\      coverage embedded, then write the ownership partition to
         \\      <out>/partition.tpart. A runtime compositor (compose-tile / the C ABI)
         \\      serves any tile ON DEMAND from this structure — there is no merged archive.
+        \\      A .KAP sheet or a BSB_ROOT of them bakes the same structure with PNG
+        \\      tiles, clipped to each sheet's PLY border and carrying its scale and
+        \\      edition date. One bake writes one kind of library.
         \\      -o, --output DIR    output directory (required)
         \\      --rules DIR         S-101 portrayal rules directory (default: embedded)
         \\      -j, --workers N     bake threads (default: min(cores/2, 8)). A MEMORY
