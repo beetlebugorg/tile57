@@ -14,6 +14,7 @@ the same change (see the polylabel entry as the worked example).
 | Library | Version | Where | License |
 | --- | --- | --- | --- |
 | Lua | 5.4.7 | `vendor/lua/` | MIT (© 1994–2024 Lua.org, PUC-Rio) |
+| SQLite | 3.50.4 | `vendor/sqlite/` | public domain |
 | nanosvg | 2013–14 (Mikko Mononen) | `vendor/nanosvg/` | zlib |
 | stb_image_write | v1.16 (Sean Barrett) | `vendor/stb/` | public domain (MIT alternative) |
 | Noto Sans Regular | 2026.05.01 (Google) | `vendor/fonts/NotoSans-Regular.ttf` | SIL Open Font License 1.1 |
@@ -30,9 +31,13 @@ the same change (see the polylabel entry as the worked example).
   are parsed by `src/render/font.zig`, a from-scratch TrueType outline reader — no
   font library is vendored.
 - **stb_image_write** writes the PNG sprite atlases.
+- **SQLite** reads MBTiles raster charts (`src/raster/mbtiles.zig`) where the
+  mariner left them. Built read-only from the amalgamation; see `addSqlite` in
+  build.zig for the trimmed feature set. The authors have dedicated it to the
+  public domain — no attribution is required, and this entry is a courtesy.
 
-`vendor/lua/LICENSE.html` carries Lua's full notice; the nanosvg and stb licenses
-are in the headers themselves.
+`vendor/lua/LICENSE.html` carries Lua's full notice; the nanosvg, stb and SQLite
+licenses are in the headers themselves.
 
 ## Ported algorithms
 

@@ -10,7 +10,8 @@
 //!              colors + flattened geometry only; ≈ the original Go
 //!              RenderSurface). One new pixel format = one new Canvas.
 //!   raster   — RasterCanvas: scanline-AA software rasterizer (RGBA8).
-//!   png      — RGBA8 -> PNG encoder (pure std, deterministic bytes).
+//!   png      — RGBA8 -> PNG (re-exported from `tiles`, where the picture-tile
+//!              codec lives; same name, same calls).
 //!   pixel    — PixelSurface: the resolve-and-draw Surface implementation
 //!              (buffers ops, sorts by display_priority, paints through a Canvas).
 //!   ascii    — AsciiSurface: the chart as a Unicode text grid (optional
@@ -29,7 +30,7 @@ pub const query = @import("query.zig"); // point-query surface (cursor object-qu
 pub const resolve = @import("resolve.zig");
 pub const canvas = @import("canvas.zig");
 pub const raster = @import("raster.zig");
-pub const png = @import("png.zig");
+pub const png = @import("tiles").png;
 pub const pixel = @import("pixel.zig");
 pub const ascii = @import("ascii.zig");
 pub const tess = @import("tess.zig");
@@ -64,7 +65,6 @@ test {
     _ = resolve;
     _ = canvas;
     _ = raster;
-    _ = png;
     _ = pixel;
     _ = ascii;
     _ = symbols;

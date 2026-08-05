@@ -98,6 +98,5 @@ pub const Canvas = struct {
 
 test {
     _ = @import("raster.zig");
-    _ = @import("png.zig");
     _ = @import("symbols.zig");
 }

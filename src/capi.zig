@@ -16,6 +16,7 @@ const compose = @import("compose"); // the runtime tile compositor (tile57_compo
 const mariner = @import("style").mariner;
 const style = @import("style");
 const errors = @import("errors"); // the engine error taxonomy + describe()
+const raster = @import("raster"); // raster charts (tile57_raster_chart_*)
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
@@ -823,6 +824,7 @@ export fn tile57_compose_gpu_scene(
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = .{};
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
@@ -886,6 +888,129 @@ export fn tile57_render_mlt_tile(
 /// (a compositor, a renderer) may still read from it. See tile57.h.
 export fn tile57_chart_close(handle: ?*Chart) callconv(.c) void {
     if (handle) |s| s.deinit();
+}
+
+// ---- raster charts (a chart made of pictures) ------------------------------
+
+const RasterChart = raster.RasterChart;
+
+// Fixed-size raster-chart metadata (mirrors tile57_raster_chart_info in tile57.h).
+const CRasterInfo = extern struct {
+    min_zoom: u8,
+    max_zoom: u8,
+    encoding: u8,
+    tile_size: u32,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    scale: u32,
+    zooms_declared: bool,
+    bounds_declared: bool,
+};
+
+/// Open a raster chart from a file path, read-only and never fully resident.
+/// See tile57.h.
+export fn tile57_raster_chart_open(path: ?[*:0]const u8, out: ?*?*RasterChart, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const p = path orelse return failWith(err, .badarg, "path must not be null");
+    // The reader's own text is the only thing that says WHY a file would not
+    // open — "file is encrypted", "database disk image is malformed" — so carry
+    // it rather than the taxonomy's generic reason.
+    var msg: raster.ErrMsg = .{};
+    const opened = RasterChart.open(sharedIo(), gpa, p, &msg) catch |e| {
+        if (msg.len > 0) return failWith(err, statusOfRaster(e), msg.slice());
+        return failWith(err, statusOfRaster(e), rasterReason(e));
+    };
+    const rc = gpa.create(RasterChart) catch |e| return fail(err, e);
+    rc.* = opened;
+    o.* = rc;
+    return OK;
+}
+
+/// Release a raster chart. See tile57.h.
+export fn tile57_raster_chart_close(handle: ?*RasterChart) callconv(.c) void {
+    const rc = handle orelse return;
+    rc.close();
+    gpa.destroy(rc);
+}
+
+/// Fill *out with what the chart declares. See tile57.h.
+export fn tile57_raster_chart_get_info(handle: ?*RasterChart, out: ?*CRasterInfo) callconv(.c) void {
+    const o = out orelse return;
+    o.* = std.mem.zeroes(CRasterInfo);
+    const rc = handle orelse return;
+    const i = rc.getInfo();
+    o.* = .{
+        .min_zoom = i.min_zoom,
+        .max_zoom = i.max_zoom,
+        .encoding = @intFromEnum(i.encoding),
+        .tile_size = i.tile_size,
+        .west = i.west,
+        .south = i.south,
+        .east = i.east,
+        .north = i.north,
+        .scale = i.scale,
+        .zooms_declared = i.zooms_declared,
+        .bounds_declared = i.bounds_declared,
+    };
+}
+
+/// The encoded picture at (z,x,y), XYZ addressing. NULL/0 with OK where the
+/// chart has no tile — the ordinary case, not a failure. See tile57.h.
+export fn tile57_raster_chart_tile(handle: ?*RasterChart, z: u8, x: u32, y: u32, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const rc = handle orelse return failWith(err, .badarg, "raster chart must not be null");
+    const bytes = (rc.tile(gpa, z, x, y) catch |e| return failWith(err, statusOfRaster(e), rasterReason(e))) orelse return OK;
+    return exportOut(err, o, n, bytes);
+}
+
+/// What the chart calls itself. Borrowed, static for the life of the handle.
+/// None of these is a capture date — no MBTiles carries one. See tile57.h.
+export fn tile57_raster_chart_name(handle: ?*RasterChart, out_len: ?*usize) callconv(.c) [*:0]const u8 {
+    return borrowedText(if (handle) |rc| rc.name() else "", out_len);
+}
+
+export fn tile57_raster_chart_description(handle: ?*RasterChart, out_len: ?*usize) callconv(.c) [*:0]const u8 {
+    return borrowedText(if (handle) |rc| rc.description() else "", out_len);
+}
+
+export fn tile57_raster_chart_attribution(handle: ?*RasterChart, out_len: ?*usize) callconv(.c) [*:0]const u8 {
+    return borrowedText(if (handle) |rc| rc.attribution() else "", out_len);
+}
+
+// The reader terminates its metadata strings when it dupes them, so the ABI
+// hands back a pointer into the handle's arena with no copy and no lifetime rule
+// beyond the handle's own. A null handle or an absent field is the static "".
+fn borrowedText(s: [:0]const u8, out_len: ?*usize) [*:0]const u8 {
+    if (out_len) |n| n.* = s.len;
+    return s.ptr;
+}
+
+// A raster-reader failure is not in the engine's taxonomy, so map it here rather
+// than widening errors.zig with SQLite's vocabulary.
+fn statusOfRaster(e: anyerror) Status {
+    return switch (e) {
+        error.OutOfMemory => .nomem,
+        error.UnknownFormat, error.VectorTileset => .unsupported,
+        error.OpenFailed => .io,
+        error.NotADatabase, error.NotMbtiles, error.NoTiles, error.QueryFailed => .parse,
+        else => statusOf(e),
+    };
+}
+
+fn rasterReason(e: anyerror) []const u8 {
+    return switch (e) {
+        error.OpenFailed => "raster chart could not be opened",
+        error.UnknownFormat => "not a raster chart in any format tile57 reads",
+        error.NotADatabase => "not an MBTiles database",
+        error.NotMbtiles => "a database, but not a tileset",
+        error.NoTiles => "the tileset holds no tiles",
+        error.VectorTileset => "a vector tileset, not a raster chart",
+        error.QueryFailed => "the tileset could not be read (truncated or corrupt?)",
+        else => errors.describe(e),
+    };
 }
 
 // ---- auxiliary files (the text and pictures a cell points at) --------------
@@ -1027,6 +1152,13 @@ const Sidecar = struct {
     }
 };
 
+// One compositor holds one kind. Composing raster charts stitches PICTURES
+// across a seam and vector charts clip GEOMETRY at one; the two paths share the
+// ownership partition and nothing above it. A host wanting both opens two
+// compositors — two layers, which is what the mariner wants anyway.
+const mixed_kinds = "a compositor holds one kind of chart: open the picture charts with tile57_compose_rasters";
+const raster_tiles_only = "a raster compositor serves tile57_compose_tile only: a chart made of pictures portrays nothing";
+
 export fn tile57_compose_open(
     charts: ?[*]const ?*Chart,
     n: usize,
@@ -1058,8 +1190,13 @@ export fn tile57_compose_open(
         if (c0.source_path) |sp| sidecar = discoverSidecar(io, sp);
     }
 
-    const src = (compose.ComposeSource.open(gpa, archives[0..na], sidecar.bytes) catch |e| return fail(err, e)) orelse
-        return failWith(err, .unsupported, "no chart carries per-cell coverage");
+    const src = (compose.ComposeSource.open(gpa, archives[0..na], sidecar.bytes) catch |e| return switch (e) {
+        // A picture archive (a baked RNC) opened as a vector chart would pass
+        // every check above — it carries coverage and a scale — and then compose
+        // as nonsense, because its tiles are PNGs and this path decodes MLT.
+        error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
+        else => fail(err, e),
+    }) orelse return failWith(err, .unsupported, "no chart carries per-cell coverage");
     sidecar.refresh(io, src);
     o.* = src;
     return OK;
@@ -1123,6 +1260,45 @@ export fn tile57_compose_tree(
     return OK;
 }
 
+/// Open a compositor over `n` open RASTER charts, BORROWING their archives +
+/// embedded coverage (the charts must outlive it; close the compositor first).
+/// Charts declaring no compilation scale or embedding no coverage are skipped —
+/// they can own no ground, which is the rule tile57_compose_open already applies;
+/// none at all is TILE57_ERR_UNSUPPORTED. See tile57.h.
+export fn tile57_compose_rasters(
+    charts: ?[*]const ?*RasterChart,
+    n: usize,
+    out: ?*?*compose.ComposeSource,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const cs = charts orelse return failWith(err, .badarg, "charts must not be null");
+    if (n == 0) return failWith(err, .badarg, "n must not be zero");
+
+    const archives = gpa.alloc(compose.ChartArchive, n) catch |e| return fail(err, e);
+    defer gpa.free(archives);
+    var na: usize = 0;
+    for (0..n) |i| {
+        const rc = cs[i] orelse return failWith(err, .badarg, "a chart in charts is null");
+        // A community MBTiles has no archive and no coverage: it is a pyramid the
+        // mariner points at, not a chart that can own ground.
+        const rd = rc.pmtilesReader() orelse continue;
+        const cov = rc.decodedCoverage() orelse continue;
+        if (cov.cscl == 0 or cov.cov1.len == 0) continue;
+        archives[na] = .{ .reader = rd, .cov = cov };
+        na += 1;
+    }
+    if (na == 0) return failWith(err, .unsupported, "no raster chart carries a compilation scale and coverage");
+
+    const src = (compose.ComposeSource.openRasters(gpa, archives[0..na], null) catch |e| return switch (e) {
+        error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
+        else => fail(err, e),
+    }) orelse return failWith(err, .unsupported, "no raster chart carries a compilation scale and coverage");
+    o.* = src;
+    return OK;
+}
+
 /// Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out / *out_len
 /// (free with tile57_free) — the HTTP layer gzips on the wire. NULL/0 out with OK =
 /// no bytes; *out_owned (NULL to ignore) then distinguishes true empty ocean (false,
@@ -1165,6 +1341,7 @@ export fn tile57_compose_png(
 ) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
@@ -1188,6 +1365,7 @@ export fn tile57_compose_pdf(
 ) callconv(.c) c_int {
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
     const settings: mariner.Settings = if (m) |p| marinerFromC(p) else .{};
@@ -1209,6 +1387,7 @@ export fn tile57_compose_canvas(
     err: ?*CError,
 ) callconv(.c) c_int {
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
     const cb = canvas orelse return failWith(err, .badarg, "canvas must not be null");
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
@@ -1235,6 +1414,7 @@ export fn tile57_compose_surface(
 ) callconv(.c) c_int {
     syncLabelDebug();
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
     const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
@@ -1263,6 +1443,7 @@ export fn tile57_compose_labels(
 ) callconv(.c) c_int {
     syncLabelDebug();
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
     const sfc = surface orelse return failWith(err, .badarg, "surface must not be null");
     if (width == 0 or height == 0 or width > MAX_RENDER_PX or height > MAX_RENDER_PX)
         return failWith(err, .badarg, bad_size);
@@ -1276,6 +1457,7 @@ export fn tile57_compose_labels(
 /// tile57.h.
 export fn tile57_compose_query(handle: ?*compose.ComposeSource, lon: f64, lat: f64, zoom: f64, cb: ?*const CQueryCb, err: ?*CError) callconv(.c) c_int {
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    if (src.kind == .raster) return failWith(err, .unsupported, raster_tiles_only);
     const cbp = cb orelse return failWith(err, .badarg, "cb must not be null");
     src.explainPoint(gpa, lon, lat, zoom); // every tap logs the serving story of that spot
     chart.composeQueryPoint(src, lon, lat, zoom, cbp) catch |e| return fail(err, e);
@@ -1549,6 +1731,10 @@ const CMariner = extern struct {
     // size_scale. Appended for ABI-append-safety; marinerFromC reads 0 (an un-set
     // field) as 1.0 = a 1x framebuffer.
     device_scale: f64,
+    // Chart over picture: drop the opaque water/land fills and the no-data
+    // background so a raster chart beneath shows through, and engage the
+    // DisplayPlane precedence. See tile57.h. Appended for ABI-append-safety.
+    chart_over_image: bool,
 };
 
 /// The tri-state `soundings` field as the engine's optional bool.
@@ -1610,6 +1796,7 @@ fn marinerFromC(cm: *const CMariner) mariner.Settings {
         .text_size_scale = if (cm.text_size_scale > 0) cm.text_size_scale else 1.0,
         .sounding_size_scale = if (cm.sounding_size_scale > 0) cm.sounding_size_scale else 1.0,
         .device_scale = if (cm.device_scale > 0) cm.device_scale else 1.0,
+        .chart_over_image = cm.chart_over_image,
         .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
             cm.viewing_groups_off[0..cm.viewing_groups_off_len]
         else
@@ -1793,7 +1980,14 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
         .text_size_scale = d.text_size_scale,
         .sounding_size_scale = d.sounding_size_scale,
         .device_scale = d.device_scale,
+        .chart_over_image = d.chart_over_image,
     };
+}
+
+/// How far to dim a picture drawn beneath the chart, for this scheme. See tile57.h.
+export fn tile57_mariner_image_dim(cm: ?*const CMariner) callconv(.c) f32 {
+    const m = cm orelse return 1.0;
+    return marinerFromC(m).imageDim();
 }
 
 // ===========================================================================

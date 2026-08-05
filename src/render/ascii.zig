@@ -503,7 +503,7 @@ pub const AsciiSurface = struct {
         // Paint order = the pixel surface's exact sort: (DrawingPriority,
         // emission order), text last. See pixel.zig OpLayer for why geometry
         // class is not a key.
-        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
+        std.mem.sort(Op, self.ops.items, self.settings.imageBeneath(), orderLt);
 
         const grid = try self.a.alloc(Cell, @as(usize, self.cols) * self.rows);
         @memset(grid, .{});
