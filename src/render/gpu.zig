@@ -1512,7 +1512,19 @@ pub const GpuSurface = struct {
     /// Expand a polyline into quads. The width is in REFERENCE PIXELS and goes
     /// into the local offset, not the world position, so a line keeps its screen
     /// width at every zoom without re-tessellating.
-    fn emitStroke(_: *GpuSurface, arena: Allocator, verts: *std.ArrayList(Vertex), indices: *std.ArrayList(u32), op: Op, lines: []const []const rs.TilePoint, half_w: f32) !void {
+    ///
+    /// A stroke is always MAP-ALIGNED. The offset below is the segment's normal
+    /// taken in WORLD space, and the host applies the offset AFTER the
+    /// projection; a rotated view turns the segment but would leave the offset
+    /// where it was, so the quad shears and the drawn width falls to
+    /// |cos(rotation)| of the pen — faint at 45 degrees and ZERO at 90, which
+    /// erased every coastline, every depth contour and the base line of every
+    /// complex linestyle in a course-up view. Setting map_align makes the host
+    /// turn the offset by the same angle as the segment, so the normal stays a
+    /// normal at every heading.
+    fn emitStroke(_: *GpuSurface, arena: Allocator, verts: *std.ArrayList(Vertex), indices: *std.ArrayList(u32), op_in: Op, lines: []const []const rs.TilePoint, half_w: f32) !void {
+        var op = op_in;
+        op.map_align = 1;
         for (lines) |line| {
             if (line.len < 2) continue;
             var i: usize = 0;
@@ -1525,10 +1537,10 @@ pub const GpuSurface = struct {
                 if (len == 0) continue;
                 dx /= len;
                 dy /= len;
-                // Normal in screen space: the segment direction is a world
-                // direction, but the offset is applied post-projection, so this
-                // is only exact for uniform scale — which web-mercator is,
-                // locally.
+                // Normal in the CHART's frame: the segment direction is a world
+                // direction and the offset is applied post-projection, so the
+                // host turns it by the view rotation (map_align above). Exact
+                // only for a uniform scale — which web-mercator is, locally.
                 const nx = -dy * half_w;
                 const ny = dx * half_w;
                 const base: u32 = @intCast(verts.items.len);
@@ -1960,6 +1972,84 @@ test "gpu: a stroke's width lives in the local offset, not the world position" {
     try testing.expectEqual(scene.vertices[0].y, scene.vertices[1].y);
     try testing.expectApproxEqAbs(scene.vertices[0].oy, -scene.vertices[1].oy, 1e-6);
     try testing.expect(@abs(scene.vertices[0].oy) > 0);
+}
+
+/// The host vertex shader in miniature: the world position goes through the
+/// rotated view, and the reference-px offset is added AFTER it — turned by the
+/// same rotation only when the vertex is map-aligned. Every backend's shader
+/// (Metal, HLSL, SPIR-V) does exactly this, so a scene that reads wrong here
+/// reads wrong on all three.
+fn shadeToScreen(v: Vertex, rot_rad: f64, world_px: f64) [2]f64 {
+    const c = @cos(rot_rad);
+    const s = @sin(rot_rad);
+    const wx = @as(f64, v.x) * world_px;
+    const wy = @as(f64, v.y) * world_px;
+    var ox: f64 = v.ox;
+    var oy: f64 = v.oy;
+    if (v.map_align != 0) {
+        ox = @as(f64, v.ox) * c - @as(f64, v.oy) * s;
+        oy = @as(f64, v.ox) * s + @as(f64, v.oy) * c;
+    }
+    return .{ wx * c - wy * s + ox, wx * s + wy * c + oy };
+}
+
+test "gpu: a stroke keeps its pen width in a rotated view" {
+    // A stroke's half-width offset is a normal taken in WORLD space and applied
+    // in SCREEN space. Unless the host turns it with the view, the quad shears
+    // as the chart rotates and the drawn width falls to |cos(rotation)| of the
+    // pen: half gone at 60 degrees, ALL gone at 90 — coastlines, depth contours
+    // and complex-linestyle base lines all vanish in a course-up view while
+    // their symbols stay. Measure the width the way the screen sees it, at a
+    // full turn of headings.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var colors = try resolve.Colors.init(a, "");
+    const settings = resolve.Settings{};
+    var gs = try testSurface(a, &colors, &settings);
+    defer gs.deinit();
+    const surf = gs.asSurface();
+
+    // Two segments at right angles: whatever the view rotation, one of them is
+    // at the worst angle for the other, so no single heading can pass by luck.
+    const line = [_]rs.TilePoint{ .{ .x = 0, .y = 0 }, .{ .x = 400, .y = 0 }, .{ .x = 400, .y = 400 } };
+    const lines = [_][]const rs.TilePoint{&line};
+    const meta = rs.FeatureMeta{ .class = "COALNE", .display_priority = 15 };
+    try surf.beginFeature(&meta);
+    try surf.strokeLine("CHBLK", 4.0, .solid, &lines, null);
+    try surf.endFeature();
+
+    const scene = try gs.build(a);
+    try testing.expectEqual(@as(usize, 8), scene.vertices.len); // 2 segments x 4
+
+    const world_px: f64 = 256.0 * 4096.0; // a plausible worldToPx at chart scale
+    for ([_]f64{ 0, 30, 45, 60, 90, 135, 180, 225, 270, 315 }) |deg| {
+        const rot = deg * std.math.pi / 180.0;
+        var seg: usize = 0;
+        while (seg < 2) : (seg += 1) {
+            const q = seg * 4; // a+n, a-n, b+n, b-n
+            const p0 = shadeToScreen(scene.vertices[q + 0], rot, world_px);
+            const p1 = shadeToScreen(scene.vertices[q + 1], rot, world_px);
+            const p2 = shadeToScreen(scene.vertices[q + 2], rot, world_px);
+            // The drawn width is the span PERPENDICULAR to the drawn segment,
+            // not the raw distance between the two edges: a sheared quad keeps
+            // that distance and still covers no pixels.
+            const ex = p2[0] - p0[0];
+            const ey = p2[1] - p0[1];
+            const elen = @sqrt(ex * ex + ey * ey);
+            try testing.expect(elen > 1.0);
+            const ux = ex / elen;
+            const uy = ey / elen;
+            const wx = p1[0] - p0[0];
+            const wy = p1[1] - p0[1];
+            const along = wx * ux + wy * uy;
+            const width = @sqrt(@max(0.0, wx * wx + wy * wy - along * along));
+            try testing.expectApproxEqAbs(@as(f64, 4.0), width, 1e-3);
+        }
+    }
+    // The flag the width above depends on, asserted last so a regression
+    // reports the width it cost rather than only the bit that was missing.
+    for (scene.vertices) |v| try testing.expectEqual(@as(u8, 1), v.map_align);
 }
 
 /// Emit one sounding and return its finished scene.
