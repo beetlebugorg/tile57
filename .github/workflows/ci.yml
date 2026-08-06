@@ -31,10 +31,9 @@ jobs:
           version: 0.16.0
       - name: Format check
         run: zig fmt --check src/ tools/ build.zig
-      - name: Build (native)
-        run: zig build -Doptimize=ReleaseFast
-      - name: Test
-        run: zig build test
+      # Debug keeps the tests' safety checks. The matrix below covers ReleaseFast.
+      - name: Build and test
+        run: zig build install test
 
   cross-compile:
     runs-on: ubuntu-latest
