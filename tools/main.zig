@@ -1,15 +1,19 @@
 //! tile57 — the offline S-57 -> PMTiles baker / inspector CLI.
 //!
 //! Subcommands:
-//!   bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]
+//!   bake <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT> -o <out-dir> [--rules DIR] [-j N]
 //!       Bake each chart to <out-dir>/tiles/<STEM>.pmtiles and write the ownership
 //!       partition to <out-dir>/partition.tpart — the live-composite structure a
-//!       runtime compositor serves tiles from on demand.
+//!       runtime compositor serves tiles from on demand. A BSB/KAP sheet bakes the
+//!       same structure with PNG tiles (a raster chart, which quilts the same way).
 //!   inspect <file.pmtiles> [z x y]
 //!       Parse a PMTiles archive (header + directory) and, if z/x/y is given,
 //!       read+gunzip+decode that tile and list its MVT layers.
 //!   cell <file.000>
 //!       Decode + summarise an S-57 chart (record tally, bounds, topology).
+//!   raster info <chart.mbtiles>
+//!       What a raster chart declares — zoom range, encoding, coverage, tile
+//!       count — beside what its file name claims. They disagree constantly.
 //!   version
 //!       Print the baker version.
 //!   help
@@ -47,6 +51,7 @@ const s101dump = @import("s101dump.zig");
 const glyphs = @import("glyphs.zig");
 const gpudbg = @import("gpudbg.zig");
 const partdbg_png = @import("partdbg_png.zig");
+const raster = @import("raster.zig");
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -155,6 +160,10 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, sub, "s101")) {
         return s101dump.run(io, arena, args);
+    }
+
+    if (std.mem.eql(u8, sub, "raster")) {
+        return raster.run(io, arena, args);
     }
 
     if (std.mem.eql(u8, sub, "version") or std.mem.eql(u8, sub, "--version")) {

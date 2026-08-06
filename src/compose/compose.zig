@@ -9,6 +9,12 @@
 //!   openComposeSourceFiles  — open archives from disk, load or build the partition
 //!   openComposeSourceCharts — same, borrowing already-open charts' readers + coverage
 //!   clip                    — the per-face clip-to-owned-geometry core (submodule)
+//!   raster                  — the same partition over PICTURE tiles (submodule)
+//!
+//! ONE COMPOSITOR HOLDS ONE KIND. Vector charts clip geometry at a seam; raster
+//! charts stack pixels at one. Above the partition the two paths share nothing,
+//! and a host wanting both opens two compositors — which is what the mariner
+//! wants anyway: two layers, not one blended chart.
 
 const std = @import("std");
 const pmtiles = @import("tiles").pmtiles;
@@ -25,6 +31,10 @@ const s57 = @import("s57");
 /// The per-face clip-to-owned-geometry core: project an owned face to tile space
 /// and clip each feature to it. Pure over tiles + geometry.
 pub const clip = @import("clip.zig");
+
+/// The picture-tile seam: the same ownership partition, resolved by stacking
+/// tiles instead of clipping features. Pure over tiles + geometry.
+pub const raster = @import("raster.zig");
 
 pub const LoadedCov = struct {
     name: []const u8, // DSNM stem
@@ -623,6 +633,10 @@ pub const ComposeSource = struct {
     arena: std.heap.ArenaAllocator, // owns the readers/maps arrays + adapted cells (borrowed by part)
     maps: []const []align(std.heap.page_size_min) const u8,
     readers: []const *pmtiles.Reader,
+    /// What the composed charts ARE. A compositor holds one kind: the partition
+    /// is common, and everything above it — clip a feature or stack a picture,
+    /// portray or not — is not. Set at open and never changed.
+    kind: Kind = .vector,
     // A files-open owns its readers + mmaps (deinit closes them); a charts-open
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
@@ -658,7 +672,14 @@ pub const ComposeSource = struct {
     /// Compose one tile → raw (decompressed) MLT + the ownership flag (gpa-owned bytes; null when
     /// nothing rendered — `owned` then says whether a cell SHOULD have). This is what a live tile
     /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
+    ///
+    /// A RASTER compositor returns an encoded picture here instead — the one
+    /// output the two kinds share, and the only one a raster compositor has.
     pub fn tile(self: *ComposeSource, gpa: std.mem.Allocator, z: u8, tx: u32, ty: u32) !TileResult {
+        if (self.kind == .raster) {
+            const r = try raster.tile(gpa, &self.part, self.readers, z, tx, ty);
+            return .{ .tile = r.tile, .owned = r.owned };
+        }
         return composeTile(gpa, &self.part, self.readers, z, tx, ty, false);
     }
 
@@ -807,7 +828,24 @@ pub const ComposeSource = struct {
     /// Open over already-open charts' archives (everything is BORROWED — the
     /// charts must outlive this source). Null when no archive carries coverage.
     pub const open = openSourceCharts;
+    /// The same, over already-open RASTER charts' archives. Ownership resolves
+    /// identically — the partition sees only coverage and scale — and the
+    /// resulting compositor serves pictures from `tile` and nothing else.
+    pub const openRasters = openSourceRasters;
 };
+
+/// Which kind of chart a compositor holds. See the module comment: one
+/// compositor, one kind.
+pub const Kind = enum { vector, raster };
+
+/// What an archive holds, by the tile type it declares. The only thing that
+/// decides a chart's kind — never a file name, never an extension.
+pub fn kindOf(r: *const pmtiles.Reader) Kind {
+    return switch (r.header.tile_type) {
+        .png, .jpeg, .webp, .avif => .raster,
+        else => .vector,
+    };
+}
 
 /// Open a resident ComposeSource over per-cell PMTiles at `paths` (mmap'd, so the cell set is never
 /// fully resident). If `load_partition` is non-null and valid for this cell set the partition is
@@ -831,6 +869,12 @@ fn openSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8
         for (readers.items) |rp| rp.deinit();
         for (maps.items) |m| filemap.unmap(m);
     }
+    // A directory names no kind, so the ARCHIVES do: the first one that carries
+    // coverage decides, and anything of the other kind is skipped with a line
+    // saying so. One compositor holds one kind — a picture archive read as MLT
+    // is not a degraded chart, it is nonsense.
+    var kind: ?Kind = null;
+    var wrong_kind: usize = 0;
     for (paths) |path| {
         var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch continue;
         const st = f.stat(io) catch {
@@ -868,6 +912,14 @@ fn openSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8
             filemap.unmap(map);
             continue;
         };
+        const k = kindOf(rp);
+        if (kind == null) kind = k;
+        if (kind != k) {
+            wrong_kind += 1;
+            rp.deinit();
+            filemap.unmap(map);
+            continue;
+        }
         try maps.append(a, map);
         try readers.append(a, rp);
         try shims.append(a, .{ .name = cc.name, .date = cc.date, .cscl = cc.cscl, .coverage = cc.cov1, .bounds = covDegBounds(cc), .light_reach = cc.light_reach });
@@ -877,6 +929,8 @@ fn openSourceFiles(io: std.Io, gpa: std.mem.Allocator, paths: []const []const u8
         gpa.destroy(src);
         return null;
     }
+    if (wrong_kind > 0) std.debug.print("compose: {d} archive(s) of the other chart kind skipped (a compositor holds one kind)\n", .{wrong_kind});
+    src.kind = kind orelse .vector;
     return try finishOpen(gpa, src, readers.items, maps.items, shims.items, load_partition, true);
 }
 
@@ -894,6 +948,17 @@ pub const ChartArchive = struct {
 /// skipped (they can own no ground); returns null if none carries coverage.
 /// `load_partition` as in `openFiles`.
 fn openSourceCharts(gpa: std.mem.Allocator, archives: []const ChartArchive, load_partition: ?[]const u8) !?*ComposeSource {
+    return openBorrowed(gpa, archives, load_partition, .vector);
+}
+
+/// A compositor over baked RNC archives. Identical to the vector open in every
+/// respect the partition can see — which is the point of baking an RNC into the
+/// per-chart archive shape: quilting comes free, and only the seam differs.
+fn openSourceRasters(gpa: std.mem.Allocator, archives: []const ChartArchive, load_partition: ?[]const u8) !?*ComposeSource {
+    return openBorrowed(gpa, archives, load_partition, .raster);
+}
+
+fn openBorrowed(gpa: std.mem.Allocator, archives: []const ChartArchive, load_partition: ?[]const u8, kind: Kind) !?*ComposeSource {
     const src = try gpa.create(ComposeSource);
     src.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa), .maps = &.{}, .readers = &.{}, .part = undefined, .minz = 0, .maxz = 0, .loop_max = 0, .bounds = .{ 0, 0, 0, 0 } };
     errdefer {
@@ -904,6 +969,11 @@ fn openSourceCharts(gpa: std.mem.Allocator, archives: []const ChartArchive, load
     var readers = std.ArrayList(*pmtiles.Reader).empty;
     var shims = std.ArrayList(LoadedCov).empty;
     for (archives) |ar| {
+        // A caller that hands a picture archive to a vector compositor (or the
+        // reverse) has made a category error, not a recoverable one: the tiles
+        // would be decoded as a format they are not. Say so rather than
+        // composing nonsense.
+        if (kindOf(ar.reader) != kind) return error.MixedChartKinds;
         if (ar.cov.cov1.len == 0) continue;
         try readers.append(a, ar.reader);
         try shims.append(a, .{ .name = ar.cov.name, .date = ar.cov.date, .cscl = ar.cov.cscl, .coverage = ar.cov.cov1, .bounds = covDegBounds(ar.cov), .light_reach = ar.cov.light_reach });
@@ -913,6 +983,7 @@ fn openSourceCharts(gpa: std.mem.Allocator, archives: []const ChartArchive, load
         gpa.destroy(src);
         return null;
     }
+    src.kind = kind;
     return try finishOpen(gpa, src, readers.items, &.{}, shims.items, load_partition, false);
 }
 
@@ -1098,7 +1169,13 @@ fn finishOpen(
     }
 
     const cells = try toPlaneCells(a, shims);
-    for (cells, readers) |*c, rp| c.reach = @max(bandReach(c.cscl), rp.header.max_zoom);
+    // How deep each chart can serve. A vector chart's band ladder says; a raster
+    // chart's ARCHIVE says, because the KAP bake stops at the sheet's own
+    // resolution and no band model can know where that fell.
+    for (cells, readers) |*c, rp| c.reach = if (src.kind == .raster)
+        raster.reach(rp)
+    else
+        @max(bandReach(c.cscl), rp.header.max_zoom);
 
     const ids = try a.alloc(geometry.partition.CellId, shims.len);
     for (ids, shims) |*id, sh| id.* = .{ .name = sh.name, .date = sh.date };
@@ -1132,7 +1209,17 @@ fn finishOpen(
     const dates = try a.alloc([]const u8, shims.len);
     for (shims, 0..) |sh, i| dates[i] = sh.date;
 
-    const fill_max = @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
+    // A RASTER chart's zoom window is the ARCHIVE's, not the band model's: the
+    // KAP bake stops at the sheet's own pixel resolution, which is a property of
+    // the paper it was scanned from and no compilation scale can predict.
+    if (src.kind == .raster) {
+        maxz = 0;
+        for (readers) |rp| maxz = @max(maxz, rp.header.max_zoom);
+    }
+    const fill_max = if (src.kind == .raster)
+        maxz +| raster.OVERSCALE_DZ
+    else
+        @min(maxz + band.FILLUP_DZ, band.FILLUP_CEIL);
     src.maps = maps;
     src.readers = readers;
     src.names = names;
@@ -1290,6 +1377,11 @@ fn testCovRect(a: std.mem.Allocator, w: f64, s: f64, e: f64, n: f64) ![]const []
 // declutter, which gates candidates on it before the collision pool) silently
 // stops working, with no error anywhere. Two cells split this tile, so the
 // VERBATIM byte-copy fast path cannot fire and the real seam path runs.
+test {
+    _ = clip;
+    _ = raster;
+}
+
 test "composeTile carries per-feature SCAMIN through the seam clip + re-encode" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

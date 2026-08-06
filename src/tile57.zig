@@ -52,11 +52,26 @@ pub const freeBytes = chart.freeBytes;
 /// Warm the embedded S-101 catalogue + Lua rules once, before serving.
 pub const warmup = chart.warmup;
 
+// ---- RasterChart: a chart made of pictures ---------------------------------
+/// A georeferenced pyramid of picture tiles — satellite imagery a mariner
+/// supplies as MBTiles, another vendor's chart rendered to tiles, or an RNC
+/// baked from a BSB/KAP sheet. A PEER of `Chart`, not a kind of one: it serves
+/// tiles and nothing else — no portrayal, no pick, no view output. Open with
+/// `RasterChart.open`, read with `.tile`.
+pub const RasterChart = raster.RasterChart;
+/// What a raster chart declares: zoom range, encoding, tile size, coverage, and
+/// the compilation scale that decides whether it can own ground (0 = it cannot).
+pub const RasterChartInfo = raster.Info;
+pub const RasterEncoding = raster.Encoding;
+/// The raster-chart readers (`raster.mbtiles`, `raster.bakebsb`) and their error set.
+pub const raster = @import("raster");
+
 // ---- Bake: charts -> per-chart PMTiles archives ----------------------------
 /// Bake each chart to its own PMTiles at its compilation scale — the input the
 /// compositor serves from. Strictly one chart, one archive.
 pub const bake = struct {
     pub const chartBytes = chart.bakeChartBytes; // one chart + updates -> PMTiles bytes
+    pub const sheetBytes = raster.bakebsb.bakeBytes; // one BSB/KAP sheet -> PMTiles bytes (PNG tiles)
     pub const chartsParallel = chart.bakeChartsParallel; // N charts -> N archives, threaded
     pub const chartsToFiles = chart.bakeChartsToFiles; // N charts -> files under a dir
     pub const tree = chart.bakeTree; // walk an ENC_ROOT, bake each chart to a mirrored path
@@ -76,6 +91,10 @@ pub const compose = struct {
     const mod = @import("compose");
     pub const ComposeSource = mod.ComposeSource;
     pub const ChartArchive = mod.ChartArchive;
+    /// Which kind of chart a compositor holds — one compositor, one kind.
+    pub const Kind = mod.Kind;
+    /// The picture-tile seam (`ComposeSource.openRasters` composes through it).
+    pub const raster = mod.raster;
     pub const TileResult = mod.TileResult;
     pub const LoadedCov = mod.LoadedCov;
     pub const tile = mod.composeTile; // the stateless core ComposeSource.tile uses

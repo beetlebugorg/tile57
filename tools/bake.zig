@@ -1,5 +1,5 @@
-//! `bake <cell.000 | ENC_ROOT> -o <out-dir> [--rules DIR] [-j N]` — produce a
-//! LIVE-composite structure on disk. Bake each chart to its OWN native-scale PMTiles under
+//! `bake <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT> -o <out-dir> [--rules DIR]
+//! [-j N]` — produce a LIVE-composite structure on disk. Bake each chart to its OWN native-scale PMTiles under
 //! `<out-dir>/<STEM>/` (with its M_COVR coverage embedded in the metadata), then open a resident
 //! compositor over them and write the ownership partition to `<out-dir>/partition.tpart`. There is
 //! NO merged archive: a runtime compositor (`ComposeSource` / the `compose-tile` command / the C
@@ -10,6 +10,7 @@
 const std = @import("std");
 const chart = @import("chart"); // per-chart bake (bakeChartBytes) + freeBytes
 const compose = @import("compose"); // openComposeSourceFiles + serializePartition (the resident compositor)
+const raster = @import("raster"); // the BSB/KAP bake + the raster chart handle
 const common = @import("common.zig");
 const auxfiles = @import("engine").auxfiles;
 const Flags = common.Flags;
@@ -58,9 +59,21 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             return usageErr("unexpected argument (cell updates are auto-discovered next to the .000)");
         }
     }
-    const base_path = base orelse return usageErr("missing <cell.000 | ENC_ROOT> input");
+    const base_path = base orelse return usageErr("missing <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT> input");
     const out_dir = out orelse return usageErr("missing -o/--output <out-dir>");
     const rules_dir = resolveRulesDir(rules);
+
+    // Which kind of library is this? A compositor holds ONE kind, so a bake
+    // writes one: vector charts from .000 cells, raster charts from BSB/KAP
+    // sheets. A directory holding both cannot be one library, and quietly
+    // baking half of it would be worse than saying so.
+    {
+        const sheets = try findSheets(io, a, base_path);
+        if (sheets.len > 0) {
+            if (try holdsCells(io, base_path)) return usageErr("this directory holds both .000 cells and .KAP sheets; bake them separately (a compositor holds one kind of chart)");
+            return bakeSheets(io, a, sheets, out_dir, workers);
+        }
+    }
 
     // The per-chart archive paths that back the compositor.
     var archive_paths = std.ArrayList([]const u8).empty;
@@ -200,4 +213,232 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         "live structure -> {s}/\n  {d} per-chart directory(s) + partition.tpart (serve z {d}..{d})\n",
         .{ out_dir, src.readers.len, src.minz, src.loop_max },
     );
+}
+
+// ---- the raster half: BSB/KAP sheets --------------------------------------
+
+/// Case-insensitive suffix test. NOAA ships `.KAP`; other producers (and any
+/// mariner who has renamed a file) ship `.kap`.
+fn endsWithIgnoreCase(path: []const u8, ext: []const u8) bool {
+    if (path.len < ext.len) return false;
+    return std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext);
+}
+
+/// Every KAP sheet at `base`: the file itself, or every `*.KAP` under a
+/// BSB_ROOT. Empty when this is not a raster input at all.
+fn findSheets(io: std.Io, a: std.mem.Allocator, base: []const u8) ![]const []const u8 {
+    var found = std.ArrayList([]const u8).empty;
+    if (endsWithIgnoreCase(base, ".kap")) {
+        try found.append(a, base);
+        return found.toOwnedSlice(a);
+    }
+    var dir = std.Io.Dir.cwd().openDir(io, base, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+    var walker = dir.walk(a) catch return &.{};
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file or !endsWithIgnoreCase(entry.path, ".kap")) continue;
+        // The walker reuses one buffer for the path, so a borrowed slice becomes
+        // the next entry's name.
+        found.append(a, std.fs.path.join(a, &.{ base, entry.path }) catch continue) catch {};
+    }
+    std.mem.sort([]const u8, found.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return found.toOwnedSlice(a);
+}
+
+/// Does `base` hold any S-57 cell? Used only to refuse a mixed directory.
+fn holdsCells(io: std.Io, base: []const u8) !bool {
+    var dir = std.Io.Dir.cwd().openDir(io, base, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".000")) return true;
+    }
+    return false;
+}
+
+/// Bake each sheet to its own `<out>/<STEM>/<STEM>.pmtiles`, then write the
+/// ownership partition over the lot — the same structure the ENC bake writes,
+/// which is the whole point: a folder of RNCs composes the way a folder of cells
+/// does, through `tile57_compose_rasters`.
+fn bakeSheets(io: std.Io, a: std.mem.Allocator, sheets: []const []const u8, out_dir: []const u8, workers: usize) !void {
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    // A sheet bake holds a whole decoded raster (a large ocean sheet is ~180 Mpx)
+    // plus the pyramid it warps into, so the CLI's process arena is the wrong
+    // home for it — and a worker thread must not share it anyway. Everything
+    // per-sheet goes through libc's allocator and is freed as each sheet lands.
+    const gpa = std.heap.c_allocator;
+
+    var ctx = SheetCtx{
+        .next = std.atomic.Value(usize).init(0),
+        .sheets = sheets,
+        .out_dir = out_dir,
+        .out = try a.alloc(?[]const u8, sheets.len),
+    };
+    for (ctx.out) |*o| o.* = null;
+
+    // Sheets are independent, so this is a plain fan-out. `workers` is a MEMORY
+    // bound, exactly as it is for cells: each thread holds one whole sheet.
+    var n = @max(@min(workers, sheets.len), 1);
+    if (n > MAX_SHEET_WORKERS) n = MAX_SHEET_WORKERS;
+    if (sheets.len > 1) std.debug.print("baking {d} sheet(s) across {d} worker(s)…\n", .{ sheets.len, n });
+    if (n <= 1) {
+        sheetWorker(&ctx);
+    } else {
+        var threads: [MAX_SHEET_WORKERS]std.Thread = undefined;
+        var spawned: usize = 0;
+        while (spawned < n - 1) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{}, sheetWorker, .{&ctx}) catch break;
+        }
+        sheetWorker(&ctx); // this thread is a worker too
+        for (threads[0..spawned]) |t| t.join();
+    }
+
+    var archive_paths = std.ArrayList([]const u8).empty;
+    for (ctx.out) |o| {
+        if (o) |arc_path| archive_paths.append(a, arc_path) catch {};
+    }
+    if (archive_paths.items.len == 0) return usageErr("no sheet baked");
+
+    // The partition, over the archives as a HOST sees them: opened as raster
+    // charts and composed through tile57_compose_rasters' own path, so the
+    // sidecar this writes is the partition that open will build.
+    var charts = std.ArrayList(*raster.RasterChart).empty;
+    var archives = std.ArrayList(compose.ChartArchive).empty;
+    defer for (charts.items) |rc| {
+        rc.close();
+        gpa.destroy(rc);
+    };
+    for (archive_paths.items) |p| {
+        const pz = a.dupeZ(u8, p) catch continue;
+        const opened = raster.RasterChart.open(io, gpa, pz, null) catch |e| {
+            std.debug.print("warning: {s} not reopened ({s})\n", .{ p, @errorName(e) });
+            continue;
+        };
+        const rc = gpa.create(raster.RasterChart) catch continue;
+        rc.* = opened;
+        charts.append(a, rc) catch {};
+        const rd = rc.pmtilesReader() orelse continue;
+        const cov = rc.decodedCoverage() orelse continue;
+        archives.append(a, .{ .reader = rd, .cov = cov }) catch {};
+    }
+    const src = (compose.ComposeSource.openRasters(gpa, archives.items, null) catch |e| {
+        std.debug.print("error: open raster compositor failed ({s})\n", .{@errorName(e)});
+        return;
+    }) orelse return usageErr("no sheet carries a compilation scale and a border polygon");
+    defer src.deinit();
+
+    const part_bytes = src.serializePartition(a) catch |e| {
+        std.debug.print("error: partition serialization failed ({s})\n", .{@errorName(e)});
+        return;
+    };
+    const part_path = try std.fs.path.join(a, &.{ out_dir, "partition.tpart" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_path, .data = part_bytes });
+
+    std.debug.print(
+        "live structure -> {s}/\n  {d} raster chart(s) + partition.tpart (serve z {d}..{d})\n",
+        .{ out_dir, src.readers.len, src.minz, src.loop_max },
+    );
+}
+
+/// A hard ceiling on sheet-bake threads; the CLI normally passes far fewer.
+const MAX_SHEET_WORKERS = 32;
+
+/// The fan-out state: sheets in, one archive path out per sheet (null where the
+/// sheet was refused). Only `next` is shared mutable state — every worker writes
+/// its own slot — so the whole of the synchronisation is one atomic and the
+/// print lock.
+const SheetCtx = struct {
+    next: std.atomic.Value(usize),
+    sheets: []const []const u8,
+    out_dir: []const u8,
+    out: []?[]const u8,
+    /// Serializes the progress lines. A spin is the right shape here — Zig 0.16
+    /// moved std.Thread.Mutex behind an Io this tool does not take, and the
+    /// contended region is one print per sheet against a bake measured in
+    /// hundreds of milliseconds.
+    say: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn lock(ctx: *SheetCtx) void {
+        while (ctx.say.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+    }
+    fn unlock(ctx: *SheetCtx) void {
+        ctx.say.store(false, .release);
+    }
+
+    /// A warning from a worker, printed whole rather than interleaved with
+    /// another thread's.
+    fn warn(ctx: *SheetCtx, comptime fmt: []const u8, args: anytype) void {
+        ctx.lock();
+        defer ctx.unlock();
+        std.debug.print("warning: " ++ fmt ++ "\n", args);
+    }
+};
+
+fn sheetWorker(ctx: *SheetCtx) void {
+    const gpa = std.heap.c_allocator;
+    // Its own std.Io: the CLI's belongs to the main thread's event loop, and a
+    // sheet bake is file reads and one big write.
+    const threaded = gpa.create(std.Io.Threaded) catch return;
+    threaded.* = .init(gpa, .{});
+    defer {
+        threaded.deinit();
+        gpa.destroy(threaded);
+    }
+    const io = threaded.io();
+
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.sheets.len) return;
+        const path = ctx.sheets[i];
+        const stem = std.fs.path.stem(std.fs.path.basename(path));
+        const kap = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |e| {
+            ctx.warn("{s} not read ({s})", .{ path, @errorName(e) });
+            continue;
+        };
+        defer gpa.free(kap);
+        const baked = raster.bakebsb.bakeBytes(gpa, kap, stem) catch |e| {
+            ctx.warn("{s} not baked ({s})", .{ path, reasonOf(e) });
+            continue;
+        };
+        defer gpa.free(baked.bytes);
+
+        // One directory per chart, as the ENC bake does it: the archive and
+        // whatever travels with that chart live together.
+        const chart_dir = std.fs.path.join(gpa, &.{ ctx.out_dir, stem }) catch continue;
+        defer gpa.free(chart_dir);
+        std.Io.Dir.cwd().createDirPath(io, chart_dir) catch {};
+        const name = std.fmt.allocPrint(gpa, "{s}.pmtiles", .{stem}) catch continue;
+        defer gpa.free(name);
+        const arc_path = std.fs.path.join(gpa, &.{ chart_dir, name }) catch continue;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = arc_path, .data = baked.bytes }) catch |e| {
+            gpa.free(arc_path);
+            ctx.warn("{s} not written ({s})", .{ arc_path, @errorName(e) });
+            continue;
+        };
+        ctx.out[i] = arc_path;
+        ctx.lock();
+        defer ctx.unlock();
+        std.debug.print("  {s}: 1:{d}, z{d}..{d}, {d} tiles, fit {d:.2} px -> {s}\n", .{
+            stem, baked.scale, baked.min_zoom, baked.max_zoom, baked.tiles, baked.fit_px, arc_path,
+        });
+    }
+}
+
+/// Why a sheet was refused, in words a mariner can act on.
+fn reasonOf(e: anyerror) []const u8 {
+    return switch (e) {
+        error.NotKap => "not a BSB/KAP sheet",
+        error.BadHeader => "the header says nothing usable about its raster",
+        error.BadRaster => "the run-length data is truncated or malformed",
+        error.NoGeoreference => "too few REF control points to place it",
+        error.FitResidual => "the fit cannot reproduce its own control points",
+        error.NoBorder => "no PLY border polygon, so it can own no ground",
+        error.Empty => "its raster and its stated position do not overlap",
+        else => @errorName(e),
+    };
 }

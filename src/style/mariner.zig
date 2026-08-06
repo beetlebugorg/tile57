@@ -63,6 +63,20 @@ pub const Settings = struct {
     /// must not reorder anything, or an OverRadar feature climbs above every
     /// higher-priority one (a built-up area burying a light sector arc).
     radar_overlay: bool = false,
+    /// CHART OVER PICTURE. A raster chart — satellite imagery the mariner
+    /// supplied, or an RNC — is drawn BENEATH this one, and the chart's opaque
+    /// area fills would hide all of it. With this set the water and land fills
+    /// and the no-data background drop out, and everything the picture cannot
+    /// carry stays: every depth contour (the safety contour with its emphasis),
+    /// every point symbol, lights and their sectors, soundings, text, and every
+    /// boundary already drawn as a line or a pattern.
+    ///
+    /// This is a REAL REDUCTION in what the chart tells a mariner — the
+    /// colour-banded "is this water safe" read goes with the fills, leaving the
+    /// safety contour to carry that message alone — so a host must show that it
+    /// is on. It is not a host-side alpha: S-52 colours are specified values and
+    /// blending them produces colours the spec does not name.
+    chart_over_image: bool = false,
     data_quality: bool = false,
     show_inform_callouts: bool = false,
     show_meta_bounds: bool = false,
@@ -142,6 +156,43 @@ pub const Settings = struct {
     // (PixelSurface.devScale folds in px_per_tile) and applying it again would
     // double-count. 1.0 = a 1x framebuffer (byte-identical output).
     device_scale: f64 = 1.0,
+
+    /// Is an image present beneath the chart? S-52 §10.3.4.2 gives the OVERRADAR
+    /// flag precedence over display priority "when the RADAR overlay is present
+    /// on the ECDIS chart display" — and ONLY then. A raster chart underneath is
+    /// the same situation the clause describes, so both satisfy the gate, and
+    /// `radar_overlay` keeps meaning radar rather than becoming the flag for
+    /// every image.
+    pub fn imageBeneath(self: Settings) bool {
+        return self.radar_overlay or self.chart_over_image;
+    }
+
+    /// Whether an area fill of `class` drops out under chart-over-picture. Only
+    /// the opaque water and land fills do: they are what hides the picture, and
+    /// nothing else the chart draws is opaque enough to matter. Boundaries drawn
+    /// as line or pattern — restricted areas, anchorages, traffic separation,
+    /// the overscale hatch — are untouched, as are the contours, symbols,
+    /// soundings and text that carry what the picture cannot.
+    pub fn fillSuppressed(self: Settings, class: []const u8) bool {
+        if (!self.chart_over_image) return false;
+        for ([_][]const u8{ "DEPARE", "DRGARE", "UNSARE", "LNDARE" }) |c| {
+            if (std.mem.eql(u8, class, c)) return true;
+        }
+        return false;
+    }
+
+    /// How far to dim a picture drawn beneath the chart, 0..1. Stated here so
+    /// every host dims the same way: a daylight photograph at full brightness
+    /// destroys the dark adaptation the dusk and night schemes exist to protect,
+    /// and the chart drawn over it would be the only dark thing on a bright
+    /// display.
+    pub fn imageDim(self: Settings) f32 {
+        return switch (self.scheme) {
+            .day => 1.0,
+            .dusk => 0.59,
+            .night => 0.31,
+        };
+    }
 };
 
 // ---- expression DSL ---------------------------------------------------------

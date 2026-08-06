@@ -574,7 +574,7 @@ pub const GpuSurface = struct {
 
     fn pushPattern(self: *GpuSurface, kind: Kind, color: [4]u8, pattern: u32, geom: Geom) !void {
         try self.ops.append(self.a, .{
-            .paint_key = paint.key(kind, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+            .paint_key = paint.key(kind, self.cur.display_priority, self.cur.display_plane, self.settings.imageBeneath()),
             .seq = self.ops.items.len,
             .kind = kind,
             .color = color,
@@ -611,6 +611,11 @@ pub const GpuSurface = struct {
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
         const self = sp(ctx);
         if (!resolve.visible(&self.cur, "", self.zoom, self.settings)) return;
+        // Chart over picture: the water and land fills are what hide the raster
+        // chart beneath, so they drop out. Everything else this feature draws —
+        // its contours, symbols, soundings, text — arrives through the other
+        // callbacks and is untouched.
+        if (self.settings.fillSuppressed(self.cur.class)) return;
         // Depth areas re-resolve their shade against the LIVE mariner contours
         // (snapped): the baked token was fixed at bake defaults, and using it
         // froze the app's water shading — contour changes moved only danger
@@ -759,7 +764,7 @@ pub const GpuSurface = struct {
         const turns = @mod(tangent / (2.0 * std.math.pi), 1.0);
         const tq: u8 = @intFromFloat(@min(255.0, @floor(turns * 256.0)));
         const op = Op{
-            .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+            .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.imageBeneath()),
             .seq = 0,
             .kind = .text,
             .color = color,
@@ -943,7 +948,7 @@ pub const GpuSurface = struct {
         // unconditionally, exactly as before.
         if (kind == .symbol and self.cur.display_category != 0 and belowBandWindow(self.cur.band, self.zoom)) {
             const op = Op{
-                .paint_key = paint.key(kind, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+                .paint_key = paint.key(kind, self.cur.display_priority, self.cur.display_plane, self.settings.imageBeneath()),
                 .seq = 0,
                 .kind = kind,
                 .color = .{ 255, 255, 255, 255 },
@@ -1091,7 +1096,7 @@ pub const GpuSurface = struct {
         // the pixel/vector paths' declutter). `assembleLabels` boxes it at the
         // live view zoom and runs the pool; nothing here is re-run on a pan.
         const op = Op{
-            .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.radar_overlay),
+            .paint_key = paint.key(.text, self.cur.display_priority, self.cur.display_plane, self.settings.imageBeneath()),
             .seq = 0,
             .kind = .text,
             .color = self.rgba(style.color),

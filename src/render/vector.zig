@@ -624,10 +624,10 @@ pub const VectorSurface = struct {
     /// long before a low-priority depth area in the second. Only the whole scene
     /// can be put in order, and the scene is not known until it has been walked.
     fn emitOps(self: *VectorSurface) !void {
-        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
+        std.mem.sort(Op, self.ops.items, self.settings.imageBeneath(), orderLt);
         for (self.ops.items) |*op| {
             const f = &op.feat;
-            f.paint_key = paintKey(op.*, self.settings.radar_overlay);
+            f.paint_key = paintKey(op.*, self.settings.imageBeneath());
             switch (op.kind) {
                 .fill => |*k| self.cb.fill_area(self.cb.ctx, f, &k.rings, k.color, k.even_odd),
                 .pattern => |*k| self.cb.draw_pattern.?(self.cb.ctx, f, k.name.ptr, k.name.len, &k.rings),
@@ -649,6 +649,8 @@ pub const VectorSurface = struct {
         const self = sp(ctx);
         if (self.labels_only) return; // areas carry no label; skip the tessellation
         if (!self.cur_visible) return;
+        // Chart over picture: see gpu.zig fillArea.
+        if (self.settings.fillSuppressed(self.cur.class)) return;
         const wr = try self.worldRings(rings);
         // ColorFill "NAME[,transparency]": apply the S-101 fill transparency (alpha).
         const ft = rs.fillToken(token);
@@ -962,7 +964,7 @@ pub const VectorSurface = struct {
                 else => .standard,
             },
             // Labels are resolved after the op sort and always paint last.
-            .paint_key = paintKey(.{ .layer = .text, .prio = self.cur.display_priority, .display_plane = self.cur.display_plane, .seq = 0, .feat = undefined, .kind = undefined }, self.settings.radar_overlay),
+            .paint_key = paintKey(.{ .layer = .text, .prio = self.cur.display_priority, .display_plane = self.cur.display_plane, .seq = 0, .feat = undefined, .kind = undefined }, self.settings.imageBeneath()),
             .anchor = self.worldOf(at),
             .text = try a.dupe(u8, text),
             .px = px,

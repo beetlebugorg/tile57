@@ -176,7 +176,16 @@ QuadOut sprite_vs(QuadVin v)
 
 float4 sprite_ps(QuadOut i) : SV_Target
 {
-    return atlas.Sample(smp, i.uv) * i.color;
+    float4 c = atlas.Sample(smp, i.uv) * i.color;
+    // A fully transparent fragment must not reach the depth buffer. The
+// raster underlay draws through this pipeline WITH DEPTH WRITE, to hide the
+// chart's opaque area fills exactly where a picture covers them; a baked RNC is
+// transparent outside its neat line, and without this those transparent pixels
+// wrote depth and cut holes in the chart underneath. Costs nothing for a sprite
+// or a glyph: both draw with depth write off, so this only skips a fragment
+// that would have blended to nothing.
+    clip(c.a - (1.0 / 255.0));
+    return c;
 }
 
 // SDF text: sample the signed-distance field (.r), antialias with the

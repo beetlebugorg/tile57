@@ -116,6 +116,35 @@ fn addSvgRaster(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFile(.{ .file = b.path("src/sprite/svgraster.c"), .flags = &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" } });
 }
 
+// Attach the vendored SQLite amalgamation to a module. Used by the `raster`
+// module, which reads a community raster chart where it sits — MBTiles is a
+// SQLite database, and the library that reads every SQLite database reads every
+// MBTiles. Read-only and trimmed: no extension loading, no shared cache, no
+// deprecated surface. THREADSAFE=1 (serialized) because a host streams tiles
+// from a worker while its UI thread reads metadata, and a per-call mutex is
+// nothing beside a JPEG decode.
+fn addSqlite(b: *std.Build, mod: *std.Build.Module) void {
+    addSysrootIncludes(b, mod);
+    mod.addIncludePath(b.path("vendor/sqlite"));
+    mod.addCSourceFile(.{
+        .file = b.path("vendor/sqlite/sqlite3.c"),
+        .flags = &.{
+            "-std=gnu99",
+            "-O2",
+            "-fno-sanitize=undefined",
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_DEFAULT_MEMSTATUS=0",
+            "-DSQLITE_OMIT_LOAD_EXTENSION",
+            "-DSQLITE_OMIT_DEPRECATED",
+            "-DSQLITE_OMIT_SHARED_CACHE",
+            "-DSQLITE_OMIT_PROGRESS_CALLBACK",
+            "-DSQLITE_OMIT_AUTHORIZATION",
+            "-DSQLITE_OMIT_UTF16",
+        },
+    });
+}
+
 // Re-import the pure packages into a consumer module (engine, libtile57.a, the
 // baker). One list keeps the edge set in sync across all three.
 fn addPkgs(mod: *std.Build.Module, pkgs: []const std.Build.Module.Import) void {
@@ -432,6 +461,27 @@ pub fn build(b: *std.Build) void {
     });
     addSvgRaster(b, sprite_mod);
 
+    // Raster charts (vendored SQLite): a chart made of pictures, read in place.
+    // libc + pic like `portray`, so SQLite is encapsulated here rather than
+    // spread across the lib and the baker, and the same objects link into both
+    // the PIE C++ host (libtile57.a) and the static baker. Target-less so it
+    // inherits the consumer's. NOT in pure_pkgs — `zig build test` stays
+    // libc-free, and the `tiles` module stays pure std.
+    const raster_mod = b.addModule("raster", .{
+        .root_source_file = b.path("src/raster/raster.zig"),
+        .link_libc = true,
+        .pic = true,
+        // The RNC bake writes the same per-chart archive the ENC bake does:
+        // PMTiles + PNG tiles (tiles) carrying the chart's own coverage
+        // (coverage, over s57's integer lon/lat point).
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "s57", .module = s57_mod },
+        },
+    });
+    addSqlite(b, raster_mod);
+
     // All pure packages, imported by name into engine / libtile57.a / the baker.
     // (portray is libc, wired separately into the lib + baker only.)
     const pure_pkgs = [_]std.Build.Module.Import{
@@ -517,6 +567,7 @@ pub fn build(b: *std.Build) void {
     tile57_mod.addImport("coverage", coverage_mod); // per-cell coverage sidecar
     tile57_mod.addImport("compose", compose_mod); // the runtime compositor
     tile57_mod.addImport("errors", errors_mod); // the error taxonomy
+    tile57_mod.addImport("raster", raster_mod); // raster charts (MBTiles today)
 
     // Static library (libtile57.a): C ABI + embedded Lua. Its own root so
     // the C sources / libc only land in the archive (linked by the C++ host),
@@ -539,6 +590,7 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("compose", compose_mod); // C ABI: tile57_compose_* (the runtime compositor)
     lib_mod.addImport("coverage", coverage_mod); // the tile57 public root re-exports it
     lib_mod.addImport("errors", errors_mod); // C ABI: error taxonomy -> tile57_status
+    lib_mod.addImport("raster", raster_mod); // C ABI: tile57_raster_chart_* (MBTiles)
     // The full engine surface as a NAMED import (not a root.zig file-import), so the
     // single root.zig file isn't claimed by both lib_mod and engine_full (which bundle
     // pulls in) — Zig requires each file to belong to exactly one module per artifact.
@@ -657,6 +709,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "geometry", .module = geometry_mod }, // compose-tile --scan reads the boolean diagnostics
                 .{ .name = "render", .module = render_mod }, // renderpng pixel path
                 .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
+                .{ .name = "raster", .module = raster_mod }, // `raster info`
             },
         }),
     });
@@ -764,6 +817,16 @@ pub fn build(b: *std.Build) void {
     const tiles_test = addPkgTest(b, test_step, "src/tiles/tiles.zig", target, optimize, &.{});
     tiles_test.link_libc = true;
     addMvtFixture(b, tiles_test); // pmtiles.zig's round-trip test embeds it
+    // The raster charts link the vendored SQLite. Their real-file tests skip
+    // unless TILE57_MBTILES points at a chart — community files are hundreds of
+    // megabytes and cannot live in the repo.
+    const raster_test = addPkgTest(b, test_step, "src/raster/raster.zig", target, optimize, &.{
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "coverage", .module = coverage_mod },
+        .{ .name = "s57", .module = s57_mod },
+    });
+    raster_test.link_libc = true;
+    addSqlite(b, raster_test);
     _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
         .{ .name = "s101", .module = s101_mod },

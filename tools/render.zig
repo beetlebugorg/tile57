@@ -120,6 +120,15 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             m.text_other = false;
         } else if (std.mem.eql(u8, arg, "--no-other")) {
             m.display_other = false;
+        } else if (std.mem.eql(u8, arg, "--over-image")) {
+            // Chart over picture: drop the opaque water/land fills so a raster
+            // chart beneath shows through. Renders on a transparent background
+            // here, which is how you see what actually survives.
+            m.chart_over_image = true;
+        } else if (std.mem.eql(u8, arg, "--soundings")) {
+            m.show_soundings = true; // the everyday setting: STANDARD, soundings on
+        } else if (std.mem.eql(u8, arg, "--no-soundings")) {
+            m.show_soundings = false;
         } else if (std.mem.eql(u8, arg, "--plain")) {
             m.boundary_style = .plain;
         } else if (std.mem.eql(u8, arg, "--simplified")) {

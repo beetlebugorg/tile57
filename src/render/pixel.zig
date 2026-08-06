@@ -21,7 +21,7 @@ const paint = @import("paint.zig");
 const resolve = @import("resolve.zig");
 const cv = @import("canvas.zig");
 const raster = @import("raster.zig");
-const png = @import("png.zig");
+const png = @import("tiles").png;
 const sym = @import("symbols.zig");
 const sndfrm = @import("sndfrm.zig");
 const dc = @import("declutter.zig");
@@ -299,6 +299,8 @@ pub const PixelSurface = struct {
     fn fillArea(ctx: *anyopaque, token: rs.ColorToken, rings: []const []const rs.TilePoint, depth: ?rs.DepthRange) anyerror!void {
         const self = sp(ctx);
         if (!self.cur_visible) return;
+        // Chart over picture: see gpu.zig fillArea.
+        if (self.settings.fillSuppressed(self.cur.class)) return;
         // ColorFill "NAME[,transparency]": apply the S-101 fill transparency (alpha).
         const ft = rs.fillToken(token);
         // A depth area re-shades LIVE against the mariner's contours (SEABED01) — the
@@ -688,7 +690,7 @@ pub const PixelSurface = struct {
 
         // Paint order = (DrawingPriority, emission order). See OpLayer for why
         // geometry class is NOT a key.
-        std.mem.sort(Op, self.ops.items, self.settings.radar_overlay, orderLt);
+        std.mem.sort(Op, self.ops.items, self.settings.imageBeneath(), orderLt);
 
         switch (self.output) {
             .png => {

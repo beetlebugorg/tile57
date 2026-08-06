@@ -183,7 +183,16 @@ vertex QuadOut sprite_vert(uint vid [[vertex_id]],
 fragment float4 sprite_frag(QuadOut in [[stage_in]],
                             texture2d<float> atlas [[texture(0)]],
                             sampler smp [[sampler(0)]]) {
-    return atlas.sample(smp, in.uv) * in.color;
+    float4 c = atlas.sample(smp, in.uv) * in.color;
+    // A fully transparent fragment must not reach the depth buffer. The
+// raster underlay draws through this pipeline WITH DEPTH WRITE, to hide the
+// chart's opaque area fills exactly where a picture covers them; a baked RNC is
+// transparent outside its neat line, and without this those transparent pixels
+// wrote depth and cut holes in the chart underneath. Costs nothing for a sprite
+// or a glyph: both draw with depth write off, so this only skips a fragment
+// that would have blended to nothing.
+    if (c.a < (1.0 / 255.0)) discard_fragment();
+    return c;
 }
 
 // SDF text: sample the signed-distance field (.r), antialias with the

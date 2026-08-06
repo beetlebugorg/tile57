@@ -467,7 +467,7 @@ pub const WriteOptions = struct {
 pub const StreamWriter = struct {
     gpa: Allocator,
     data: std.ArrayList(u8) = .empty, // in-memory data section (sink == null)
-    sink: ?Sink = null, // else: gzipped tiles streamed straight to this file
+    sink: ?Sink = null, // else: tiles streamed straight to this file
     data_len: u64 = 0, // bytes written to the data section so far (== next offset)
     entries: std.ArrayList(Entry) = .empty, // one per addressed tile (pre-sort)
     hash_to_off: std.AutoHashMap(u64, Off),
@@ -475,6 +475,13 @@ pub const StreamWriter = struct {
     num_contents: u64 = 0,
     min_z: u8 = 255,
     max_z: u8 = 0,
+    /// Whether `add` gzips a tile on the way in, and what the header then
+    /// declares. Set FALSE for a payload that is already compressed: a raster
+    /// chart's PNG tiles are deflate streams, and gzipping them again costs a
+    /// second pass over every tile in the bake, a gunzip on every tile served,
+    /// and buys about a percent. Tiles handed to `addCompressed` must match
+    /// whatever this says.
+    compress_tiles: bool = true,
 
     const Off = struct { off: u64, len: u32 };
 
@@ -506,8 +513,10 @@ pub const StreamWriter = struct {
         return gzip.compress(gpa, mvt);
     }
 
-    /// Add one tile (gzipped + deduped). Tiles may arrive in any order.
+    /// Add one tile (gzipped unless `compress_tiles` says otherwise, then
+    /// deduped). Tiles may arrive in any order.
     pub fn add(self: *StreamWriter, z: u8, x: u32, y: u32, mvt: []const u8) !void {
+        if (!self.compress_tiles) return self.addCompressed(z, x, y, mvt);
         const comp = try gzip.compress(self.gpa, mvt);
         defer self.gpa.free(comp);
         try self.addCompressed(z, x, y, comp);
@@ -584,7 +593,7 @@ pub const StreamWriter = struct {
             .num_tile_contents = self.num_contents,
             .clustered = 0, // data in arrival order, not tile-id order
             .internal_compression = .none,
-            .tile_compression = .gzip,
+            .tile_compression = if (self.compress_tiles) .gzip else .none,
             .tile_type = opts.tile_type,
             .min_zoom = min_z,
             .max_zoom = self.max_z,

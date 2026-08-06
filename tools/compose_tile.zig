@@ -180,7 +180,11 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     const tile = res.tile;
     const serve_ms = @as(f64, @floatFromInt(nowNs(io) - serve_t0)) / 1e6;
     if (tile) |t| {
-        std.debug.print("served z{d}/{d}/{d}: {d} bytes (raw MLT, owned={}) in {d:.3} ms\n", .{ z, tx, ty, t.len, res.owned, serve_ms });
+        // Name what actually came back: a raster structure composes to a PNG,
+        // and a log line claiming MLT would send the reader looking for a
+        // decoder that will never work on it.
+        const form = if (src.kind == .raster) "PNG" else "raw MLT";
+        std.debug.print("served z{d}/{d}/{d}: {d} bytes ({s}, owned={}) in {d:.3} ms\n", .{ z, tx, ty, t.len, form, res.owned, serve_ms });
         if (out) |op| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = op, .data = t }) catch |err|
             std.debug.print("  warn: could not write {s} ({s})\n", .{ op, @errorName(err) });
         a.free(t);

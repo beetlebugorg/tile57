@@ -476,11 +476,42 @@ typedef struct tile57_mariner {
                          * engine rasterizes those itself, so the density is already in
                          * the width/height asked for.
                          * Appended for ABI-append-safety; 0 is read as 1.0. */
+    bool chart_over_image; /* CHART OVER PICTURE. A raster chart — satellite
+                         * imagery the mariner supplied, or an RNC — is drawn
+                         * BENEATH this one (see tile57_raster_chart_*), and the
+                         * chart's opaque area fills would hide all of it. With
+                         * this set the DEPARE / DRGARE / UNSARE / LNDARE fills
+                         * and the no-data background drop out, and everything
+                         * the picture cannot carry stays: every depth contour
+                         * (the safety contour with its emphasis), every point
+                         * symbol, lights and their sectors, soundings, text, and
+                         * every boundary already drawn as a line or a pattern.
+                         *
+                         * It also engages the S-52 §10.3.4.2 DisplayPlane
+                         * precedence, which the clause conditions on an image
+                         * being present beneath the chart. `radar_overlay` keeps
+                         * meaning radar; both satisfy the same gate.
+                         *
+                         * This is a REAL REDUCTION in what the chart tells a
+                         * mariner — the colour-banded "is this water safe" read
+                         * goes with the fills, leaving the safety contour to
+                         * carry that message alone — so a host MUST show that it
+                         * is on. It is not a host-side alpha: S-52 colours are
+                         * specified values and blending them produces colours the
+                         * spec does not name.
+                         * Appended for ABI-append-safety; a zeroed struct is off. */
 } tile57_mariner;
 
 /* Fill *m with the canonical default mariner settings (so a host needn't
  * hardcode them). date_view is set to "" (today). */
 void tile57_mariner_defaults(tile57_mariner *m);
+
+/* How far to dim a picture drawn beneath the chart, 0..1, for `m`'s colour
+ * scheme. Stated here so every host dims the same way: a daylight photograph at
+ * full brightness destroys the dark adaptation the dusk and night schemes exist
+ * to protect, and the chart drawn over it would be the only dark thing on a
+ * bright display. Multiply the picture's RGB by this. */
+float tile57_mariner_image_dim(const tile57_mariner *m);
 
 /* ---- view renders ----------------------------------------------------------
  *
@@ -1095,6 +1126,93 @@ tile57_status tile57_chart_labels(tile57_chart *chart, double lon, double lat, d
  * (a compositor, a renderer thread) may still read from it. */
 void tile57_chart_close(tile57_chart *chart);
 
+/* ---- raster charts ---------------------------------------------------------
+ *
+ * A chart made of PICTURES rather than features: satellite imagery the mariner
+ * supplies as MBTiles, another vendor's chart rendered to tiles, or an RNC baked
+ * from a BSB/KAP sheet. A PEER of tile57_chart, not a kind of one — it serves
+ * tiles and nothing else. There is no portrayal to run, no feature to pick and
+ * no view to render, so this family has none of section 4's outputs.
+ *
+ * The kinds differ on ONE axis, and it is the axis that decides quilting: a
+ * compilation scale and a coverage polygon. A baked RNC carries both, so it
+ * composes through the ownership partition by scale band and edition date,
+ * exactly as a vector chart does. A community MBTiles carries neither, reports
+ * scale 0, and can own no ground — which is already how the compositor treats a
+ * chart embedding no coverage.
+ *
+ * The format is decided by what the file IS, never by its extension: community
+ * files arrive named .mbtiles, unpacked from a .zip to no extension at all, and
+ * whatever else the contributor felt like.
+ */
+
+/* Opaque raster-chart handle: one open pyramid of picture tiles. */
+typedef struct tile57_raster_chart tile57_raster_chart;
+
+/* How the pictures in a raster chart are encoded. */
+typedef enum {
+    TILE57_RASTER_UNKNOWN = 0,
+    TILE57_RASTER_PNG     = 1,
+    TILE57_RASTER_JPEG    = 2,
+    TILE57_RASTER_WEBP    = 3
+} tile57_raster_encoding;
+
+/* What a raster chart declares about itself. */
+typedef struct {
+    uint8_t min_zoom;
+    uint8_t max_zoom;
+    uint8_t encoding;                /* tile57_raster_encoding */
+    uint32_t tile_size;              /* edge in pixels; 256 in every measured file */
+    double west, south, east, north; /* coverage, degrees */
+    /* Compilation scale denominator, or 0 when the chart declares none. A baked
+     * RNC carries its SC; a community MBTiles has no such thing. 0 means the
+     * chart can own no ground and takes no part in ownership resolution. */
+    uint32_t scale;
+    /* Whether the zoom range / coverage above came from the file, or was
+     * recomputed from its tile index because the file omitted them. A host that
+     * reports provenance wants to know which it is showing. A file NAME is never
+     * evidence either way: both community charts measured while this was
+     * specified declare minzoom 9 / maxzoom 17 and are named "Z10-Z18". */
+    bool zooms_declared;
+    bool bounds_declared;
+} tile57_raster_chart_info;
+
+/* Open a raster chart from a file path, read-only and never fully resident (the
+ * file must stay in place while it is open). Either kind: a community MBTiles, or
+ * an archive `tile57 bake` produced from a BSB/KAP sheet. A file that is not a
+ * raster chart in any format tile57 reads is TILE57_ERR_UNSUPPORTED. TILE57_OK
+ * with *out set (close with tile57_raster_chart_close). */
+tile57_status tile57_raster_chart_open(const char *path, tile57_raster_chart **out,
+                                       tile57_error *err);
+
+/* Release a raster chart. */
+void tile57_raster_chart_close(tile57_raster_chart *rc);
+
+/* Fill *out with what the chart declares. */
+void tile57_raster_chart_get_info(tile57_raster_chart *rc, tile57_raster_chart_info *out);
+
+/* The encoded picture at (z,x,y) in XYZ addressing (the reader flips y for a
+ * source that counts its rows from the south). Allocates *out; free with
+ * tile57_free.
+ *
+ * NULL/0 with TILE57_OK means the chart has no tile there, which is the ORDINARY
+ * case and NOT a failure: these pyramids are clipped to a coastline and run about
+ * 38% dense inside their own bounds, so a view crossing one meets holes and edges
+ * constantly. Draw the vector chart alone there.
+ *
+ * The handle is not internally synchronized; a host streaming tiles from a worker
+ * serializes its own access, as it does for a chart. */
+tile57_status tile57_raster_chart_tile(tile57_raster_chart *rc, uint8_t z, uint32_t x, uint32_t y,
+                                       uint8_t **out, size_t *out_len, tile57_error *err);
+
+/* What the chart calls itself, for a host that has to label it. Static for the
+ * life of the handle; any may be empty, and *out_len (NULL to ignore) gives the
+ * length. All are what the FILE claims — NONE IS A CAPTURE DATE. No MBTiles
+ * records when its pictures were taken, so a host must not state or imply one. */
+const char *tile57_raster_chart_name(tile57_raster_chart *rc, size_t *out_len);
+const char *tile57_raster_chart_description(tile57_raster_chart *rc, size_t *out_len);
+const char *tile57_raster_chart_attribution(tile57_raster_chart *rc, size_t *out_len);
+
 /* ======================================================================== *
  * 5. Compose
  *
@@ -1109,6 +1227,14 @@ void tile57_chart_close(tile57_chart *chart);
  * The compositor BORROWS its charts (their mmap'd archives and decoded
  * coverage): every chart must outlive the compositor, and while it serves, do
  * not call those charts' own methods from other threads.
+ *
+ * ONE COMPOSITOR HOLDS ONE KIND. Raster charts quilt through the same ownership
+ * partition (tile57_compose_rasters), but composing them stitches PIXELS across a
+ * seam where a vector chart clips GEOMETRY at one, and the two paths share
+ * nothing above the partition. A host showing an RNC quilt beneath a vector quilt
+ * opens two compositors — which is what the mariner wants anyway: two layers, not
+ * one blended chart. A raster compositor serves tile57_compose_tile and returns
+ * TILE57_ERR_UNSUPPORTED from every portrayal output below it.
  * ======================================================================== */
 
 /* (tile57_compose is forward-declared near tile57_chart at the top.) */
@@ -1128,9 +1254,25 @@ typedef struct {
  * found beside the archives, reused when it still matches the cell set, and
  * rebuilt (and refreshed on disk) when it does not. Nothing to pass, nothing to
  * manage. TILE57_OK with *out set (close with tile57_compose_close — BEFORE
- * closing the charts). */
+ * closing the charts). A chart whose archive holds PICTURES (a baked RNC) is
+ * TILE57_ERR_UNSUPPORTED here: open those with tile57_compose_rasters. */
 tile57_status tile57_compose_open(tile57_chart *const *charts, size_t n,
                                   tile57_compose **out, tile57_error *err);
+
+/* Open a compositor over `n` open RASTER charts. Ownership resolves exactly as it
+ * does for vector charts — same compilation-scale bands, same date tie-break,
+ * same seam — because the partition sees only coverage and scale. Charts
+ * declaring scale 0 or embedding no coverage are skipped: they can own no ground,
+ * which is the rule tile57_compose_open already applies. None at all is
+ * TILE57_ERR_UNSUPPORTED.
+ *
+ * The result serves tile57_compose_tile — an encoded PICTURE for (z,x,y), the
+ * owning sheets stacked best-on-top — and returns TILE57_ERR_UNSUPPORTED from
+ * _png, _pdf, _canvas, _surface, _labels, _query and _gpu_scene: a chart made of
+ * pictures portrays nothing. The compositor BORROWS the charts; close it before
+ * them. */
+tile57_status tile57_compose_rasters(tile57_raster_chart *const *charts, size_t n,
+                                     tile57_compose **out, tile57_error *err);
 
 /* Open a WHOLE baked tree in one call: recursively walk `dir` for the *.pmtiles
  * archives a bake produced, mmap and open each (the cell set is never fully
@@ -1144,13 +1286,20 @@ tile57_status tile57_compose_open(tile57_chart *const *charts, size_t n,
  * *out_chart_count (NULL to ignore) receives the number of archives composed. No
  * *.pmtiles under `dir`, or none carrying coverage, is TILE57_ERR_UNSUPPORTED with
  * *out = NULL; an unreadable `dir` errors. TILE57_OK with *out set (close with
- * tile57_compose_close). */
+ * tile57_compose_close).
+ *
+ * A directory names no kind, so the archives do: a tree of baked RNCs opens as a
+ * RASTER compositor (tile57_compose_tile serves pictures, the portrayal outputs
+ * report TILE57_ERR_UNSUPPORTED). The first coverage-carrying archive decides,
+ * and archives of the other kind are skipped — one compositor, one kind. */
 tile57_status tile57_compose_tree(const char *dir,
                                   tile57_compose **out, uint32_t *out_chart_count,
                                   tile57_error *err);
 
 /* Compose the tile (z,x,y) on demand into RAW (decompressed) MLT in *out /
- * *out_len (free with tile57_free) — the HTTP layer gzips on the wire. NULL/0
+ * *out_len (free with tile57_free) — the HTTP layer gzips on the wire. A RASTER
+ * compositor returns an encoded PICTURE here instead (PNG), which is the one
+ * output the two kinds share. NULL/0
  * out with TILE57_OK means no bytes for this tile; *out_owned (NULL to ignore)
  * then distinguishes the two empties:
  *   owned = false: no chart owns this ground — true empty ocean, safe to cache.
@@ -1165,7 +1314,8 @@ tile57_status tile57_compose_tile(tile57_compose *c, uint8_t z, uint32_t x, uint
  * tile57_chart_surface across the WHOLE composed set: every covering tile is
  * composed on demand (stitched through the ownership partition) and
  * replayed through the native S-52 pixel path. Same parameters, limits, and
- * ownership as the single-chart forms in section 4. */
+ * ownership as the single-chart forms in section 4. Every one of these is
+ * TILE57_ERR_UNSUPPORTED on a raster compositor. */
 tile57_status tile57_compose_png(tile57_compose *c, double lon, double lat, double zoom,
                                  uint32_t width, uint32_t height,
                                  const tile57_mariner *m,
