@@ -4,9 +4,10 @@
   <b>⚓ Official nautical charts, ready to draw.</b><br>
   tile57 reads IHO <b>S-101</b> and <b>S-57</b> charts and gives a renderer what it
   needs: vector tiles with a matching MapLibre S-52 style, a draw-ready GPU scene,
-  pixel draw calls, or finished PNG and PDF. It reports the objects under a point,
-  and the text and pictures a chart carries. One Zig library with a C ABI, compiled
-  natively or to WASM.
+  pixel draw calls, or finished PNG and PDF. It also reads <b>raster charts</b> —
+  satellite photos and RNC sheets — and draws the official chart on top of them.
+  It reports the objects under a point, and the text and pictures a chart carries.
+  One Zig library with a C ABI.
 </p>
 
 <p align="center">
@@ -47,12 +48,18 @@ diagrams it carries.
   north-up in world space and the host applies the view rotation, so a course-up
   view that turns continuously never rebuilds its scene. The repo ships reference
   shaders for Metal, Direct3D and Vulkan.
-- **It reads raster charts too.** A chart made of pictures — satellite imagery a
-  mariner supplies as MBTiles, or a BSB/KAP sheet — opens beside the vector one.
-  The chart can drop its opaque area fills so the picture shows through, keeping
-  every contour, symbol, light and sounding. See [Raster charts](docs/docs/raster-charts.md).
-- **It embeds anywhere.** The core is pure Zig with a C ABI. It compiles natively
-  and to WASM.
+- **It combines raster charts and satellite photos with the official chart.**
+  Add your own satellite photos as MBTiles, or an RNC sheet as BSB/KAP. tile57
+  draws them below the official chart. The official chart then removes its solid
+  blue and yellow areas, so you can see the photo through them. All the depth
+  contours, buoys, lights and soundings stay on top. If your chart is old, you
+  see the place as it is today, and you read the official marks over it. On a
+  GPU this happens pixel by pixel, so the chart keeps its colors everywhere the
+  photo does not reach. tile57 also quilts many RNC sheets into one map. For
+  each area it uses the sheet with the correct scale for your zoom. Where two
+  sheets cover the same water at that scale, it uses the newer edition. This is
+  the rule it uses for official charts. See [Raster charts](docs/docs/raster-charts.md).
+- **It embeds anywhere.** The core is pure Zig with a C ABI.
 
 ## Start here
 
@@ -62,9 +69,14 @@ zig build                                     # writes zig-out/bin/tile57
 
 tile57 bake ENC_ROOT -o out/                  # every chart -> its own archive
 tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
+
+tile57 raster info photos.mbtiles             # what the file really contains
+tile57 bake harbour.KAP -o out/               # an RNC sheet -> the same archive
+tile57 png ENC_ROOT --over-image --view -76.48,38.974,15 -o over.png
 ```
 
 The first command bakes a catalogue. The second draws a chart straight to a PNG.
+The last one removes the chart's solid areas, so you can draw it over a photo.
 
 ## What you can get
 
@@ -79,7 +91,8 @@ The first command bakes a catalogue. The second draws a chart straight to a PNG.
 | **GPU scene** | `tile57_chart_gpu_scene` | Draw-ready vertex, quad and range buffers, plus the sprite and SDF atlases |
 | **Pick** | `tile57_chart_query` | The objects under a point, with their attributes |
 | **Notes and diagrams** | `tile57_aux_get` | The text and picture files a chart's features point at |
-| **Raster charts** | `tile57_raster_chart_*` | Picture tiles from an MBTiles a mariner supplies, read in place |
+| **Raster charts** | `tile57_raster_chart_*` | Tiles from a satellite photo file or a BSB/KAP RNC sheet |
+| **Quilted RNC** | `tile57_compose_rasters` | Many RNC sheets as one quilted map |
 
 MLT is the default tile encoding. MapLibre GL JS 5.12 and later decode it natively.
 
