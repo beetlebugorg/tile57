@@ -38,6 +38,7 @@
         "vendor/lua",
         "vendor/nanosvg",
         "vendor/s101",
+        "vendor/sqlite",
         "vendor/stb",
         "LICENSE",
         "THIRD_PARTY_LICENSES.md",
