@@ -781,7 +781,12 @@ tile57_status tile57_chart_surface(tile57_chart *chart, double lon, double lat, 
  * SCREEN space after projection: zero for area interiors, +/- half-width for
  * line edges, and the glyph or symbol outline for marks. Keeping the two apart
  * is what lets a symbol hold a constant on-screen size while its anchor moves
- * with the chart, with no re-tessellation on zoom. */
+ * with the chart, with no re-tessellation on zoom.
+ *
+ * A LINE EDGE always has map_align set. Its offset is the segment normal taken
+ * in the chart's frame, so the host must turn it by the view rotation: turn it
+ * and the line holds the pen width at every heading; leave it and the quad
+ * shears to |cos(rotation)| of the pen — to nothing at all at 90 degrees. */
 typedef struct {
     float x, y;      /* world position, [0,1] */
     float ox, oy;    /* screen-space offset, reference px */
@@ -1027,7 +1032,9 @@ typedef struct {
  * tile57_chart_tile_surface has none: geometry stays north-up in world space
  * and the host applies the view rotation, so a course-up view that turns
  * continuously never has to have its scene rebuilt. The per-vertex map_align
- * flag is what keeps that invariant for marks that must turn with the chart.
+ * flag is what keeps that invariant: it marks every offset that is stated in
+ * the chart's frame — each line edge, and each mark that must turn with the
+ * chart — and the host turns those, and only those, by the view rotation.
  *
  * pixel_ratio is the host's display density (1 standard, 2 Retina/HiDPI, ...).
  * The sprite quads' texture UVs are for a sprite atlas baked at this ratio, so
