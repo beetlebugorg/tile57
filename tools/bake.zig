@@ -81,6 +81,41 @@ fn onCell(ctx: ?*anyopaque, idx: u32) callconv(.c) void {
     self.cell(idx);
 }
 
+/// The walk that finds the charts, counted as it goes. A walk cannot know its
+/// total until it ends, so this counts rather than fills a bar: the charts
+/// found, and the referenced files read beside them. An exchange set is tens of
+/// thousands of entries and every referenced file is read here, so the walk is
+/// the part of a bake that was silent longest.
+///
+/// A terminal redraws one line in place and erases it when the bake starts,
+/// which announces the same chart count. A pipe gets one line at the end,
+/// because a line per file would bury the bake below it.
+const Scan = struct {
+    tty: bool,
+    charts: u32 = 0,
+    files: u32 = 0,
+    /// Entries seen, for the redraw interval below.
+    seen: u32 = 0,
+
+    /// Redraw every this many entries. The walk visits far more entries than it
+    /// keeps, and a write per entry costs more than the walk.
+    const EVERY = 16;
+
+    fn step(self: *Scan) void {
+        self.seen += 1;
+        if (!self.tty or self.seen % EVERY != 0) return;
+        std.debug.print("\r\x1b[2K  scanning… {d} chart(s), {d} file(s)", .{ self.charts, self.files });
+    }
+
+    fn finish(self: *Scan) void {
+        if (self.tty) {
+            std.debug.print("\r\x1b[2K", .{});
+            return;
+        }
+        std.debug.print("  scanned {d} chart(s), {d} file(s)\n", .{ self.charts, self.files });
+    }
+};
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
@@ -167,7 +202,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             var seen = std.StringHashMap(void).init(a);
             var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
             defer walker.deinit();
+            var scan = Scan{ .tty = std.Io.File.stderr().isTty(io) catch false };
+            defer scan.finish();
             while (walker.next(io) catch null) |entry| {
+                scan.step();
                 if (entry.kind != .file) continue;
                 if (want_aux and auxfiles.isContent(entry.path)) {
                     const p = std.fs.path.join(a, &.{ base_path, entry.path }) catch continue;
@@ -179,6 +217,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
                     const owner = a.dupe(u8, std.fs.path.basename(std.fs.path.dirname(entry.path) orelse "")) catch continue;
                     const name = a.dupe(u8, entry.path) catch continue;
                     aux_files.append(a, .{ .owner = owner, .name = name, .bytes = bytes }) catch {};
+                    scan.files += 1;
                     continue;
                 }
                 if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
@@ -186,6 +225,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
                 if (seen.contains(stem)) continue;
                 seen.put(a.dupe(u8, stem) catch continue, {}) catch {};
                 cell_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
+                scan.charts += 1;
             }
         }
         if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
