@@ -17,6 +17,9 @@ cache.sqlite
 /.zig-cache/
 /zig-out/
 
+# Release archives staged by scripts/package-release.sh
+/dist/
+
 # Editor / OS
 *.swp
 .DS_Store

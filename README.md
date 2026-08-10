@@ -64,8 +64,7 @@ diagrams it carries.
 ## Start here
 
 ```sh
-git submodule update --init --recursive       # the vendored S-101 catalogue
-zig build                                     # writes zig-out/bin/tile57
+brew install beetlebugorg/tap/tile57          # or grab a binary from Releases
 
 tile57 bake ENC_ROOT -o out/                  # every chart -> its own archive
 tile57 png ENC_ROOT --view -76.48,38.974,15 --size 1600x1200 -o chart.png
@@ -75,8 +74,14 @@ tile57 bake harbour.KAP -o out/               # an RNC sheet -> the same archive
 tile57 png ENC_ROOT --over-image --view -76.48,38.974,15 -o over.png
 ```
 
-The first command bakes a catalogue. The second draws a chart straight to a PNG.
-The last one removes the chart's solid areas, so you can draw it over a photo.
+`bake` turns a catalogue into per-chart archives. `png` draws a chart straight to
+an image. `--over-image` removes the chart's solid areas, so you can draw it over
+a photo.
+
+Binaries for macOS, Linux and Windows are attached to every
+[release](https://github.com/beetlebugorg/tile57/releases), alongside a `.deb`
+and the static library. To build it yourself you need Zig 0.16 and the
+submodules — see [Installation](docs/docs/installation.md).
 
 ## What you can get
 

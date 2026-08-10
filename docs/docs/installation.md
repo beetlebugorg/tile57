@@ -6,63 +6,94 @@ sidebar_position: 2
 
 # Installation
 
-tile57 builds from source with **Zig 0.16** — no CMake, no system libraries
-beyond Zig itself. There are no pre-built binaries.
+Every [release](https://github.com/beetlebugorg/tile57/releases) ships pre-built
+binaries for macOS, Linux and Windows on x86-64 and arm64. Each archive carries
+the `tile57` CLI, the static library `libtile57.a`, and the C header
+`include/tile57.h`. The IHO S-101 Portrayal Catalogue is embedded in both, so
+nothing else has to be on disk at run time.
 
-## 1. Clone + fetch the submodules
+## Homebrew (macOS and Linux)
+
+```sh
+brew install beetlebugorg/tap/tile57
+```
+
+## Debian and Ubuntu
+
+```sh
+curl -LO https://github.com/beetlebugorg/tile57/releases/latest/download/tile57_0.3.0_amd64.deb
+sudo apt install ./tile57_0.3.0_amd64.deb
+```
+
+`arm64` is published alongside `amd64`. There is no apt repository — the `.deb`
+is a release asset, so upgrades mean downloading the next one.
+
+## Direct download
+
+Pick the archive for your platform from the
+[latest release](https://github.com/beetlebugorg/tile57/releases/latest) —
+`tile57-<version>-<arch>-<os>.tar.gz`, or `.zip` for Windows — and put `bin/tile57`
+on your `PATH`:
+
+```sh
+tar xzf tile57-0.3.0-aarch64-macos.tar.gz
+sudo install -m755 tile57-0.3.0-aarch64-macos/bin/tile57 /usr/local/bin/
+tile57 version
+```
+
+Every release includes a `SHA256SUMS` file. Verify before installing:
+
+```sh
+curl -LO https://github.com/beetlebugorg/tile57/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+macOS binaries are not notarized. Gatekeeper quarantines a downloaded archive, so
+clear it once — `xattr -d com.apple.quarantine ./tile57` — or install through
+Homebrew, which does it for you.
+
+## Build from source
+
+Building needs **Zig 0.16.0** and nothing else — no CMake, no system libraries.
+Install Zig from [ziglang.org/download](https://ziglang.org/download/) (pin
+0.16.0) and put it on your `PATH`.
 
 ```sh
 git clone https://github.com/beetlebugorg/tile57.git
 cd tile57
-git submodule update --init --recursive
+git submodule update --init --recursive   # the vendored S-101 catalogue
+zig build                                 # builds zig-out/bin/tile57 + libtile57.a
+zig build test                            # runs the test suite
 ```
-
-The vendored **IHO S-101 Portrayal Catalogue** comes in as a submodule (under
-`vendor/`). It is a **build-time** dependency: `zig build` embeds the
-catalogue (the Lua portrayal rules plus the symbols, line styles, area fills and
-colour profile) directly into the binary via `@embedFile`, so the resulting
-`tile57` needs no on-disk catalogue at runtime. Lua 5.4 is vendored under
-`vendor/lua` and compiled in, so no system Lua is needed either.
-
-## 2. Zig 0.16.0 (required)
-
-The engine, the `tile57` CLI, and the static library all need **Zig 0.16.0**.
-Install it from [ziglang.org/download](https://ziglang.org/download/) (pin
-0.16.0) and put it on your `PATH`.
-
-## 3. Build + test
-
-```sh
-zig build         # builds zig-out/bin/tile57 + libtile57.a
-zig build test    # runs the test suite
-```
-
-`zig build` produces:
 
 | Target | What it is |
 |--------|-----------|
 | `tile57` (`zig-out/bin/tile57`) | the offline CLI: bake charts/ENC_ROOTs to PMTiles or a chart bundle, and emit portrayal assets. |
 | `libtile57.a` | the static library behind the [C ABI](./c-api.md) (`include/tile57.h`). |
 
-The engine is also a Zig package named `tile57` (v0.3.0); a Zig consumer
-depends on it and uses `@import("tile57")` — see the [Zig API](./zig-api.md).
+The **IHO S-101 Portrayal Catalogue** comes in as a git submodule under `vendor/`.
+It is a *build-time* dependency: `zig build` embeds the catalogue — the Lua
+portrayal rules plus the symbols, line styles, area fills and colour profile —
+directly into the binary via `@embedFile`. Lua 5.4 is vendored under `vendor/lua`
+and compiled in, so no system Lua is needed either.
 
-:::note Consume it as a path dependency (for now)
-Depend on a local clone via a `.path` dependency in your `build.zig.zon`,
-with the clone's submodules initialised:
+## As a Zig package
 
-```zig
-.dependencies = .{
-    .tile57 = .{ .path = "../tile57" },
-},
+The engine is a Zig package named `tile57` (v0.3.0). Fetch it by tag:
+
+```sh
+zig fetch --save "https://github.com/beetlebugorg/tile57/archive/refs/tags/v0.3.0.tar.gz"
 ```
 
-**Known issue:** fetching by URL/hash (`zig fetch --save <url>`) does not work
-yet — `build.zig.zon`'s `.paths` currently ships only `build.zig`,
-`build.zig.zon`, and `src/`, so a fetched package is missing `vendor/` (the
-embedded catalogue + Lua), `include/`, `tools/`, and the LICENSE, and cannot
-build. Until that's fixed, use a path dependency.
-:::
+```zig
+const tile57 = b.dependency("tile57", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("tile57", tile57.module("tile57"));
+```
+
+A fetched package carries its own copy of the portrayal catalogue (Zig's fetcher
+does not follow git submodules, so the catalogue arrives as a lazy package
+dependency instead) — no submodule init needed. See the
+[Zig API](./zig-api.md) for what the module exposes.
 
 ## Runtime knob
 

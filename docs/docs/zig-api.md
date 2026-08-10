@@ -14,10 +14,9 @@ source charts bake once to per-chart archives, and every output is produced
 from baked archives. These pages are grouped the same way as the [C API](./c-api.md).
 
 :::note
-Add it as a **path dependency** on a local clone (submodules initialised) —
-`zig fetch` by URL/hash is currently broken because the package's declared
-`.paths` omit `vendor/` and `include/`. See
-[Installation](./installation.md).
+`zig fetch --save "https://github.com/beetlebugorg/tile57/archive/refs/tags/v0.3.0.tar.gz"`
+adds it. A fetched package carries the S-101 catalogue as a lazy dependency, so
+there are no submodules to initialise. See [Installation](./installation.md).
 :::
 
 ## Sections

@@ -76,6 +76,32 @@ Direct pull requests are welcome. Please:
   [Installation](./installation.md)).
 - Expect review for correctness and safety, the same as AI-assisted changes.
 
+## Cutting a release
+
+The version lives in three files and has to agree with the tag — the release
+build checks all three and stops if they diverge:
+
+- `build.zig.zon` — `.version`
+- `src/tile57.zig` — `pub const version`
+- `tools/common.zig` — `pub const VERSION`
+
+Bump them, commit, then tag and push:
+
+```sh
+git tag v0.4.0 && git push origin v0.4.0
+```
+
+`.github/workflows/release.yml` builds macOS, Linux and Windows on x86-64 and
+arm64, attaches the archives, the `.deb`s and `SHA256SUMS` to a GitHub release,
+and updates the Homebrew tap. A tag with a suffix — `v0.4.0-rc1` — publishes as
+a prerelease and leaves the tap alone; use one to exercise the matrix before the
+real tag. `scripts/package-release.sh <version> <target>` produces the same
+archive locally after a `zig build`.
+
+The tap lives in [beetlebugorg/homebrew-tap](https://github.com/beetlebugorg/homebrew-tap)
+and its formula is generated, not hand-edited; the release workflow needs a
+`HOMEBREW_TAP_TOKEN` secret with write access to it.
+
 ## The process
 
 1. **Open** an issue or a requirement/prototype.
