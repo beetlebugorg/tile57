@@ -1445,8 +1445,17 @@ tile57_status tile57_bake_assets(const char *catalog_dir, tile57_assets *out,
  * (a GPU-scene quad is sized from the symbol's reference-px half-extent, not the
  * texture). A GPU-scene host MUST pass the same pixel_ratio to the
  * tile57_*_gpu_scene calls, or the scene's UVs will not index this texture.
- * 0 is treated as 1. */
+ * 0 is treated as 1.
+ *
+ * scheme is a tile57_scheme and picks the palette the artwork is COLOURED with.
+ * A symbol carries its own colours, and a QUADS range's color[4] does not reach
+ * them, so this texture is the only thing that decides what a symbol and a
+ * complex line style look like: bake under DAY and the symbols stay day-bright
+ * over a night chart. Cell sizes are geometry and identical under all three
+ * palettes, so one scene's UVs index any of them and a host may swap the
+ * texture on a scheme change without rebuilding the scene for it. */
 tile57_status tile57_bake_sprite_mln(const char *catalog_dir, double pixel_ratio,
+                                     tile57_scheme scheme,
                                      tile57_assets *out, tile57_error *err);
 /* SDF glyph atlas for GPU text: sprite_png is the RGBA signed-distance-field atlas
  * of the label font; sprite_json is {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,
