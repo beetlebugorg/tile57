@@ -25,6 +25,97 @@ fn defaultWorkers() usize {
     return @max(1, @min(cpus / 2, 8));
 }
 
+// ---- bake progress ---------------------------------------------------------
+// Charts bake in parallel, so the unit of progress is charts done, not tiles.
+// The engine's per-chart label callback fires (ctx, index) as each one finishes,
+// from worker threads and out of order, so the index maps back to a name through
+// the input list this tool owns. A terminal gets one \r bar tagged with the chart
+// that just finished; a pipe gets one line per chart, so a log names everything
+// that was baked.
+
+/// The bar's width in glyphs.
+const BAR_W = 24;
+
+const Prog = struct {
+    tty: bool,
+    total: u32,
+    /// The bake's input paths, in index order. A path's stem names the chart.
+    paths: []const []const u8,
+    done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Serializes the lines, as the sheet bake does: one print per chart against
+    /// a bake measured in hundreds of milliseconds.
+    say: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn cell(self: *Prog, idx: u32) void {
+        const d = self.done.fetchAdd(1, .monotonic) + 1;
+        const name = if (idx < self.paths.len)
+            std.fs.path.stem(std.fs.path.basename(self.paths[idx]))
+        else
+            "?";
+
+        while (self.say.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {}
+        defer self.say.store(false, .release);
+
+        if (!self.tty) {
+            std.debug.print("  [{d}/{d}] {s}\n", .{ d, self.total, name });
+            return;
+        }
+        const pct: u32 = if (self.total == 0) 0 else @min(100, d * 100 / self.total);
+        const filled = BAR_W * pct / 100;
+        var bar: [BAR_W * 3]u8 = undefined; // the block glyphs are three bytes each
+        var w: usize = 0;
+        for (0..BAR_W) |i| {
+            const g = if (i < filled) "█" else "░";
+            @memcpy(bar[w..][0..g.len], g);
+            w += g.len;
+        }
+        // The last chart ends the line, so the bake profile that follows starts
+        // on one of its own.
+        const tail: []const u8 = if (d >= self.total) "\n" else "";
+        std.debug.print("\r\x1b[2K  {s} {d:>3}%  {d}/{d}  ·  {s}{s}", .{ bar[0..w], pct, d, self.total, name, tail });
+    }
+};
+
+fn onCell(ctx: ?*anyopaque, idx: u32) callconv(.c) void {
+    const self: *Prog = @ptrCast(@alignCast(ctx orelse return));
+    self.cell(idx);
+}
+
+/// The walk that finds the charts, counted as it goes. A walk cannot know its
+/// total until it ends, so this counts rather than fills a bar: the charts
+/// found, and the referenced files read beside them. An exchange set is tens of
+/// thousands of entries and every referenced file is read here, so the walk is
+/// the part of a bake that was silent longest.
+///
+/// A terminal redraws one line in place and erases it when the bake starts,
+/// which announces the same chart count. A pipe gets one line at the end,
+/// because a line per file would bury the bake below it.
+const Scan = struct {
+    tty: bool,
+    charts: u32 = 0,
+    files: u32 = 0,
+    /// Entries seen, for the redraw interval below.
+    seen: u32 = 0,
+
+    /// Redraw every this many entries. The walk visits far more entries than it
+    /// keeps, and a write per entry costs more than the walk.
+    const EVERY = 16;
+
+    fn step(self: *Scan) void {
+        self.seen += 1;
+        if (!self.tty or self.seen % EVERY != 0) return;
+        std.debug.print("\r\x1b[2K  scanning… {d} chart(s), {d} file(s)", .{ self.charts, self.files });
+    }
+
+    fn finish(self: *Scan) void {
+        if (self.tty) {
+            std.debug.print("\r\x1b[2K", .{});
+            return;
+        }
+        std.debug.print("  scanned {d} chart(s), {d} file(s)\n", .{ self.charts, self.files });
+    }
+};
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var base: ?[]const u8 = null;
     var out: ?[]const u8 = null;
@@ -111,7 +202,10 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             var seen = std.StringHashMap(void).init(a);
             var walker = dir.walk(a) catch return usageErr("cannot walk ENC_ROOT");
             defer walker.deinit();
+            var scan = Scan{ .tty = std.Io.File.stderr().isTty(io) catch false };
+            defer scan.finish();
             while (walker.next(io) catch null) |entry| {
+                scan.step();
                 if (entry.kind != .file) continue;
                 if (want_aux and auxfiles.isContent(entry.path)) {
                     const p = std.fs.path.join(a, &.{ base_path, entry.path }) catch continue;
@@ -123,6 +217,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
                     const owner = a.dupe(u8, std.fs.path.basename(std.fs.path.dirname(entry.path) orelse "")) catch continue;
                     const name = a.dupe(u8, entry.path) catch continue;
                     aux_files.append(a, .{ .owner = owner, .name = name, .bytes = bytes }) catch {};
+                    scan.files += 1;
                     continue;
                 }
                 if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
@@ -130,6 +225,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
                 if (seen.contains(stem)) continue;
                 seen.put(a.dupe(u8, stem) catch continue, {}) catch {};
                 cell_paths.append(a, std.fs.path.join(a, &.{ base_path, entry.path }) catch continue) catch {};
+                scan.charts += 1;
             }
         }
         if (cell_paths.items.len == 0) return usageErr("no .000 cells found");
@@ -168,7 +264,12 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (cell_paths.items.len > 1) {
             std.debug.print("baking {d} cell(s) across {d} worker(s)…\n", .{ cell_paths.items.len, n_workers });
         }
-        const baked = chart.bakeChartsToFiles(io, cell_paths.items, out_paths.items, rules_dir, n_workers, null, null);
+        var prog = Prog{
+            .tty = std.Io.File.stderr().isTty(io) catch false,
+            .total = @intCast(cell_paths.items.len),
+            .paths = cell_paths.items,
+        };
+        const baked = chart.bakeChartsToFiles(io, cell_paths.items, out_paths.items, rules_dir, n_workers, null, &prog, onCell);
         if (baked == 0) return usageErr("no cells baked (no .000 with M_COVR found)");
 
         // bakeChartsToFiles reports a count, not which ones — a cell with no M_COVR
