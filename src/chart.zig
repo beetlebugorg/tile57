@@ -1088,8 +1088,8 @@ fn viewSymbolStore(a: std.mem.Allocator, palette: render.resolve.PaletteId) !*sp
 
 /// Build the GPU-scene atlases into `a`: the sprite-symbol cell map (same
 /// deterministic pack the host uploads) and the SDF glyph map. Cell SIZES are
-/// geometry, palette-independent, so the day stylesheet gives UVs that match the
-/// host's DEFAULT_CSS atlas PNG.
+/// geometry, palette-independent, so the day stylesheet gives UVs that index the
+/// host's atlas PNG whichever palette the host baked it under.
 /// One SDF glyph atlas from a face, at the em_px/pad tile57_bake_glyph_sdf(_face)
 /// bakes — so the internal metrics match the texture the host uploads.
 fn buildGlyphAtlas(a: std.mem.Allocator, font: []const u8, cps: []const u21) !render.gpu.GlyphAtlas {

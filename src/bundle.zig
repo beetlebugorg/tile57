@@ -25,6 +25,11 @@ pub const LINESTYLES_REL = "LineStyles";
 pub const SYMBOLS_REL = "Symbols";
 pub const AREAFILLS_REL = "AreaFills";
 pub const DEFAULT_CSS = "daySvgStyle.css";
+// The other two palette stylesheets. All three carry the same class names and
+// differ only in colour values, so a symbol rasterizes to the same cell at the
+// same size under any of them and only its colours change.
+pub const DUSK_CSS = "duskSvgStyle.css";
+pub const NIGHT_CSS = "nightSvgStyle.css";
 
 // ---- embedded catalogue assets (the `dir == ""` path of the readers) ---------
 

@@ -1578,10 +1578,22 @@ export fn tile57_bake_assets(catalog_dir: ?[*:0]const u8, out: ?*CAssets, err: ?
     return OK;
 }
 
+/// The palette stylesheet a tile57_scheme rasterizes its symbol artwork with.
+/// Symbol colours live in the artwork, not in the scene's range colours, so an
+/// atlas drawn under one palette keeps that palette's colours whatever the
+/// scene is built for.
+fn svgCssFor(scheme: c_int) []const u8 {
+    return switch (scheme) {
+        1 => bundle.DUSK_CSS,
+        2 => bundle.NIGHT_CSS,
+        else => bundle.DEFAULT_CSS,
+    };
+}
+
 /// Like tile57_bake_assets but the sprite_* fields carry the MapLibre sprite-mln
 /// atlas (pivot-centred cells + {name:{x,y,width,height,pixelRatio}} JSON). Only
 /// sprite_json/sprite_png are filled. Free with tile57_assets_free. See tile57.h.
-export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, pixel_ratio: f64, out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
+export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, pixel_ratio: f64, scheme: c_int, out: ?*CAssets, err: ?*CError) callconv(.c) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = .{};
     const io = sharedIo();
@@ -1590,7 +1602,7 @@ export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, pixel_ratio: f64, 
     const a = arena.allocator();
     const cd = spanOpt(catalog_dir) orelse "";
     const ratio = if (pixel_ratio > 0) pixel_ratio else 1;
-    const spr = bundle.spriteMlnBytes(io, a, cd, bundle.DEFAULT_CSS, &[_][]const u8{}, ratio) catch |e| return fail(err, e);
+    const spr = bundle.spriteMlnBytes(io, a, cd, svgCssFor(scheme), &[_][]const u8{}, ratio) catch |e| return fail(err, e);
     fillAssets(o, "", "", spr.json, spr.png, "", "") catch |e| {
         tile57_assets_free(o);
         return fail(err, e);
