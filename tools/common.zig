@@ -142,7 +142,7 @@ pub fn printUsage() void {
         \\{s} — offline S-57 -> PMTiles baker / inspector
         \\
         \\usage:
-        \\  tile57 bake <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT> -o <out-dir> [--rules DIR] [-j N] [--no-aux]
+        \\  tile57 bake <cell.000 | ENC_ROOT | chart.KAP | BSB_ROOT | archive.zip> -o <out-dir> [--rules DIR] [-j N] [--no-aux]
         \\      Produce a live-composite structure: bake each chart (a single .000 +
         \\      its auto-discovered updates, OR every <CELL>.000 in an ENC_ROOT, at
         \\      native band scale) to its own directory, <out>/<STEM>/<STEM>.pmtiles,

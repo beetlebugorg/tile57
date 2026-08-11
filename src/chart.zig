@@ -35,6 +35,8 @@ const embedded_assets = @import("catalog"); // S-101 portrayal assets (renderVie
 const style = @import("style"); // displayDenomZ (the physical display-scale formula)
 const cell_coverage = @import("coverage"); // per-cell M_COVR coverage embedded in archive metadata
 const compose_mod = @import("compose"); // the runtime compositor (compose-backed view renders)
+const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
+const auxfiles = @import("auxfiles"); // the text and pictures a cell points at
 
 // c_allocator, not smp_allocator: smp's per-CPU slab freelists never return
 // pages to the OS, so a long-lived host process's footprint ratchets up to the
@@ -715,11 +717,13 @@ fn openCell(bytes: []const u8, rules_dir: ?[]const u8) ?*Chart {
     return src;
 }
 
-/// A single ENC cell's on-disk bytes: base .000 + its sequential .001.. update chain.
-const CellFiles = struct {
+/// A single ENC cell's bytes: base .000 + its sequential .001.. update chain.
+/// Where they came from is not recorded, so a cell read out of a directory and
+/// one inflated out of a zip bake through the same path.
+pub const CellFiles = struct {
     base: []u8,
     updates: [][]u8,
-    fn deinit(self: *CellFiles) void {
+    pub fn deinit(self: *CellFiles) void {
         gpa.free(self.base);
         for (self.updates) |u| gpa.free(u);
         gpa.free(self.updates);
@@ -763,6 +767,99 @@ fn readCellFiles(path: []const u8) !CellFiles {
     return .{ .base = base, .updates = try updates.toOwnedSlice(gpa) };
 }
 
+/// The most a single ENC cell may claim to expand to. Cells run to a few MiB;
+/// a header promising more than this is a damaged or hostile archive, and the
+/// point of a cap is to find that out before allocating rather than after.
+pub const MAX_CELL_BYTES: u64 = 256 << 20;
+
+/// `readCellFiles` out of a zip: the base entry plus its update chain, each
+/// inflated on its own. Nothing is written to disk and nothing larger than one
+/// cell is held.
+pub fn readCellFromZip(io: std.Io, arc: *const zipsrc.Archive, idx: usize) !CellFiles {
+    const base = try arc.readAlloc(gpa, io, idx, MAX_CELL_BYTES);
+    errdefer gpa.free(base);
+
+    const up_idx = try arc.updatesFor(gpa, idx);
+    defer gpa.free(up_idx);
+    var updates = std.ArrayList([]u8).empty;
+    errdefer {
+        for (updates.items) |u| gpa.free(u);
+        updates.deinit(gpa);
+    }
+    // A broken update stops the chain rather than the cell: an ENC applied
+    // through update 3 is a chart, and refusing to draw it because update 4
+    // is corrupt leaves the mariner with nothing.
+    for (up_idx) |ui| {
+        const ub = arc.readAlloc(gpa, io, ui, MAX_CELL_BYTES) catch break;
+        updates.append(gpa, ub) catch {
+            gpa.free(ub);
+            break;
+        };
+    }
+    return .{ .base = base, .updates = try updates.toOwnedSlice(gpa) };
+}
+
+/// The directory to write a chart's referenced files into, or null when the
+/// caller did not give this chart a directory of its own.
+///
+/// A cell's .TXT and pictures are named per exchange set, not per chart —
+/// US1EEZ3M references US1EEZ3A.TXT — so several charts baked flat into one
+/// directory would share a manifest and overwrite each other's. Rather than
+/// guess, the rule is explicit: aux files are written only when the archive
+/// sits in a directory named for the chart (<out>/US1EEZ3M/US1EEZ3M.pmtiles),
+/// which is the exchange set's own shape and what tile57_aux_open expects.
+fn auxDirFor(out_path: []const u8, stem: []const u8) ?[]const u8 {
+    const dir = std.fs.path.dirname(out_path) orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(dir), stem)) return null;
+    return dir;
+}
+
+/// Write the text and pictures a cell references beside its baked archive, out
+/// of the cell's own directory in the archive. Best-effort: a chart still
+/// draws without its caution notes, so a failure here is not a bake failure.
+fn writeAuxFromZip(io: std.Io, arc: *const zipsrc.Archive, idx: usize, out_path: []const u8) void {
+    const stem = std.fs.path.stem(std.fs.path.basename(arc.entries[idx].name));
+    const dst = auxDirFor(out_path, stem) orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var files = std.ArrayList(auxfiles.File).empty;
+    for (arc.siblingsOf(idx)) |si| {
+        const name = arc.entries[si].name;
+        if (!auxfiles.isContent(name)) continue;
+        const bytes = arc.readAlloc(a, io, si, MAX_CELL_BYTES) catch continue;
+        files.append(a, .{ .owner = stem, .name = name, .bytes = bytes }) catch continue;
+    }
+    _ = auxfiles.writeDir(io, a, dst, files.items) catch {};
+}
+
+/// The same, for a cell read from a directory: its referenced files are the
+/// aux content sitting beside it.
+fn writeAuxFromDir(io: std.Io, cell_path: []const u8, out_path: []const u8) void {
+    const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
+    const dst = auxDirFor(out_path, stem) orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src_dir = std.fs.path.dirname(cell_path) orelse ".";
+    var dir = std.Io.Dir.cwd().openDir(io, src_dir, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var files = std.ArrayList(auxfiles.File).empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        if (ent.kind != .file or !auxfiles.isContent(ent.name)) continue;
+        // The iterator reuses its name buffer, so both the name and the bytes
+        // must be copied before the next step.
+        const name = a.dupe(u8, ent.name) catch continue;
+        const bytes = dir.readFileAlloc(io, name, a, .unlimited) catch continue;
+        files.append(a, .{ .owner = stem, .name = name, .bytes = bytes }) catch continue;
+    }
+    _ = auxfiles.writeDir(io, a, dst, files.items) catch {};
+}
+
 /// Bake a SINGLE .000 cell (+ updates) to a PMTiles archive over its NATIVE band's
 /// zoom range (`bandZooms(bandOf(cscl))`) and nothing else — the composite model bakes
 /// each cell at its own compilation scale; the stitcher combines them and handles any
@@ -773,13 +870,22 @@ fn readCellFiles(path: []const u8) !CellFiles {
 /// so the composite stitcher rebuilds the ownership partition from the baked archives
 /// without re-parsing the .000. Read it back with `decodedCoverageFromArchive`.
 pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
+    var cf = try readCellFiles(cell_path);
+    defer cf.deinit();
+    return bakeCellFiles(&cf, cell_path, rules_dir);
+}
+
+/// `bakeChartBytes` for a cell ALREADY IN MEMORY. `cell_name` is the cell's
+/// name — a path or a zip entry name; only its stem is read, as the ownership
+/// tie-break and the pick report's source-cell badge. Nothing is read from
+/// disk, so this is the entry point for a cell inflated straight out of an
+/// archive.
+pub fn bakeCellFiles(cf: *const CellFiles, cell_name: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // Populate the read-only portrayal globals (feature catalogue + complex-linestyle table)
     // before portraying: without them, complex lines fall back to plain geometry and their S-52
     // linestyle is dropped from the tile. Idempotent; in the parallel batch path bakeChartsParallel
     // has already warmed up before spawning workers, so this is a no-op there (and race-free).
     warmup();
-    var cf = try readCellFiles(cell_path);
-    defer cf.deinit();
 
     // Capture coverage for the embedded sidecar (one cheap parse). The stem is the
     // ownership tie-break name — matches the coverage loader.
@@ -792,7 +898,7 @@ pub fn bakeChartBytes(cell_path: []const u8, rules_dir: ?[]const u8) !?[]u8 {
     // The dataset stem is the ownership tie-break name AND the pick-report's
     // "source cell" badge — pass it into the tile bake below (bakeArchive borrows
     // it for cell.name), or every feature's `cell` prop bakes empty.
-    const stem = std.fs.path.stem(std.fs.path.basename(cell_path));
+    const stem = std.fs.path.stem(std.fs.path.basename(cell_name));
     var cscl: i32 = s57.peekScale(gpa, cf.base) orelse 0;
     if (parseAnyCell(cf.base, cf.updates)) |loaded| {
         var cell = loaded.cell;
@@ -888,9 +994,14 @@ pub const BakeLabel = ?*const fn (?*anyopaque, u32) callconv(.c) void;
 
 const BakeFileCtx = struct {
     next: std.atomic.Value(usize),
+    /// Cell paths, or — when `zip` is set — names of entries inside it.
     in_paths: []const []const u8,
     out_paths: []const []const u8,
     rules_dir: ?[]const u8,
+    /// The archive the cells are read out of, or null to read from disk. The
+    /// archive is immutable once opened and every read opens its own handle,
+    /// so all the workers share this one.
+    zip: ?*const zipsrc.Archive = null,
     io: std.Io,
     ok: []bool,
     ms: []i64, // per-cell wall time — the bake profiles itself (slowest cells printed at the end)
@@ -900,6 +1011,8 @@ const BakeFileCtx = struct {
     done: std.atomic.Value(u32),
     /// Set when a progress callback returned false; every worker drains out at its next cell.
     cancel: std.atomic.Value(bool),
+    /// Write the text and pictures each cell references beside its archive.
+    aux: bool = true,
 };
 
 fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
@@ -908,9 +1021,30 @@ fn bakeOneToFile(ctx: *BakeFileCtx, i: usize) void {
         const t1 = std.Io.Clock.awake.now(ctx.io);
         ctx.ms[i] = @intCast(@divTrunc(t1.nanoseconds - t0.nanoseconds, 1_000_000));
     }
-    const arc = (bakeChartBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
+    // From the archive or from disk — the bake below cannot tell which.
+    var zip_idx: ?usize = null;
+    const arc = blk: {
+        if (ctx.zip) |z| {
+            const idx = z.find(ctx.in_paths[i]) orelse return;
+            zip_idx = idx;
+            var cf = readCellFromZip(ctx.io, z, idx) catch return;
+            defer cf.deinit();
+            break :blk (bakeCellFiles(&cf, ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
+        }
+        break :blk (bakeChartBytes(ctx.in_paths[i], ctx.rules_dir) catch null) orelse return;
+    };
     defer freeBytes(arc);
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ctx.out_paths[i], .data = arc }) catch return;
+    // The files this cell references, beside it — a pick report resolves
+    // TXTDSC by name, so a chart without them answers "see US1EEZ3A.TXT" and
+    // cannot show it.
+    if (ctx.aux) {
+        if (zip_idx) |idx| {
+            writeAuxFromZip(ctx.io, ctx.zip.?, idx, ctx.out_paths[i]);
+        } else {
+            writeAuxFromDir(ctx.io, ctx.in_paths[i], ctx.out_paths[i]);
+        }
+    }
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(arc, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -945,7 +1079,26 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
 /// after each cell and may CANCEL by returning false (see BakeProgress); `label(progress_ctx, i)`
 /// fires beside it and names the chart that finished. Race-free (warms up first; each bake is
 /// independent). Returns the count written — fewer than in_paths.len when cancelled.
-pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel) usize {
+///
+/// `aux` writes the text and pictures each cell references beside its archive
+/// (see auxDirFor for when that is possible).
+pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel, aux: bool) usize {
+    return bakeToFiles(io, null, in_paths, out_paths, rules_dir, workers, progress, progress_ctx, label, aux);
+}
+
+/// `bakeChartsToFiles` reading every cell STRAIGHT OUT of `arc`: `names` are
+/// entry names inside the archive rather than paths, and nothing is unzipped
+/// — each cell and its updates are inflated when their turn comes and freed
+/// with the archive they bake into. Workers pull from one open archive
+/// concurrently, so this runs at the same rate as the on-disk bake.
+///
+/// A name the archive does not hold is skipped, like a cell that fails to
+/// bake: *out_baked counts what was written.
+pub fn bakeZipChartsToFiles(io: std.Io, arc: *const zipsrc.Archive, names: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel, aux: bool) usize {
+    return bakeToFiles(io, arc, names, out_paths, rules_dir, workers, progress, progress_ctx, label, aux);
+}
+
+fn bakeToFiles(io: std.Io, zip: ?*const zipsrc.Archive, in_paths: []const []const u8, out_paths: []const []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel, aux: bool) usize {
     std.debug.assert(out_paths.len == in_paths.len);
     if (in_paths.len == 0) return 0;
     warmup();
@@ -955,7 +1108,7 @@ pub fn bakeChartsToFiles(io: std.Io, in_paths: []const []const u8, out_paths: []
     const cell_ms = gpa.alloc(i64, in_paths.len) catch return 0;
     defer gpa.free(cell_ms);
     @memset(cell_ms, 0);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false) };
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .zip = zip, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false), .aux = aux };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     if (n <= 1) {
@@ -1038,7 +1191,7 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
         out_paths.append(a, out_path) catch continue;
     }
     if (in_paths.items.len == 0) return 0;
-    return bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx, label);
+    return bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx, label, true);
 }
 
 /// The file's modification time in nanoseconds, or null if it doesn't exist / can't be statted.

@@ -23,7 +23,8 @@ pub const catalogue = s101.catalogue;
 pub const bake_enc = @import("scene").bake_enc; // banded multi-cell ENC_ROOT -> PMTiles
 pub const style = @import("style"); // colortables, line styles, and style.json generation
 pub const mariner = @import("style").mariner; // mariner-driven MapLibre style patching
-pub const auxfiles = @import("auxfiles.zig"); // the text and pictures a cell points at
+pub const auxfiles = @import("auxfiles"); // the text and pictures a cell points at
+pub const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
 // capi (the C ABI) lives in lib_root.zig so the test/bake exes stay pure Zig.
 
 test {
