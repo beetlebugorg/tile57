@@ -385,6 +385,205 @@ export fn tile57_bake_tree(
     return OK;
 }
 
+/// Bake the cells at `in_paths` to the archives at `out_paths`, in parallel.
+/// The CALLER owns the list, so `label` names each finished chart by its index
+/// into it and no string crosses the ABI. See tile57.h.
+export fn tile57_bake_files(
+    in_paths: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const ins = in_paths orelse return failWith(err, .badarg, "in_paths must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ins[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+    const baked = chart.bakeChartsToFiles(sharedIo(), in_list, out_list, null, workers, progress, progress_ctx, label);
+    if (out_baked) |p| p.* = @intCast(baked);
+    return OK;
+}
+
+/// One raster bake in flight, shared by its workers.
+const RasterJob = struct {
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    in: []const []const u8,
+    out: []const []const u8,
+    ok: []bool,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    ctx: ?*anyopaque,
+};
+
+/// One raster chart: read, warp, write. It decodes whole (an ocean sheet is
+/// about 180 Mpx) plus the pyramid it warps into, so this takes libc's
+/// allocator and frees everything before the next one starts.
+fn bakeOneRaster(io: std.Io, job: *RasterJob, i: usize) void {
+    const a = std.heap.c_allocator;
+    const stem = std.fs.path.stem(std.fs.path.basename(job.in[i]));
+    const kap = std.Io.Dir.cwd().readFileAlloc(io, job.in[i], a, .unlimited) catch return;
+    defer a.free(kap);
+    const baked = raster.bakebsb.bakeBytes(a, kap, stem) catch return;
+    defer a.free(baked.bytes);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = job.out[i], .data = baked.bytes }) catch return;
+    job.ok[i] = true;
+}
+
+fn rasterWorker(job: *RasterJob) void {
+    const a = std.heap.c_allocator;
+    // Its own std.Io: a worker must not share the caller's.
+    const threaded = a.create(std.Io.Threaded) catch return;
+    threaded.* = .init(a, .{});
+    defer {
+        threaded.deinit();
+        a.destroy(threaded);
+    }
+    const io = threaded.io();
+    while (true) {
+        if (job.cancel.load(.monotonic)) return; // a peer's progress callback said stop
+        const i = job.next.fetchAdd(1, .monotonic);
+        if (i >= job.in.len) return;
+        bakeOneRaster(io, job, i);
+        if (job.label) |lb| lb(job.ctx, @intCast(i));
+        const d = job.done.fetchAdd(1, .monotonic) + 1;
+        if (job.progress) |cb| {
+            if (!cb(job.ctx, d, @intCast(job.in.len))) {
+                job.cancel.store(true, .monotonic);
+                return;
+            }
+        }
+    }
+}
+
+/// Bake the BSB/KAP charts at `in_paths` to the archives at `out_paths`. This
+/// is tile57_bake_files for raster charts. See tile57.h.
+export fn tile57_bake_rasters(
+    in_paths: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const ins = in_paths orelse return failWith(err, .badarg, "in_paths must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    const ok = gpa.alloc(bool, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(ok);
+    @memset(ok, false);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ins[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+
+    var job = RasterJob{
+        .in = in_list,
+        .out = out_list,
+        .ok = ok,
+        .progress = progress,
+        .label = label,
+        .ctx = progress_ctx,
+    };
+    // A worker holds one whole chart, so `workers` is a MEMORY bound here, as
+    // it is for cells.
+    //
+    // EVERY worker is a thread of ours, and the calling thread only waits.
+    // Warping a sheet needs a deep stack: an ocean sheet decodes to about 180
+    // megapixels. The cell bake can borrow the caller's thread safely, but a
+    // host that calls this from a pool thread with a small stack (libdispatch
+    // gives 512 KB) crashes inside the warp. Asking for the stack here is the
+    // only way to know it is there.
+    const stack = 16 * 1024 * 1024;
+    var threads: [8]std.Thread = undefined;
+    const want = @min(@max(workers, 1), @min(threads.len, n));
+    var spawned: usize = 0;
+    while (spawned < want) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+    }
+    if (spawned == 0) rasterWorker(&job); // nothing would run otherwise
+    for (threads[0..spawned]) |t| t.join();
+
+    var baked: u32 = 0;
+    for (ok) |o| {
+        if (o) baked += 1;
+    }
+    if (out_baked) |p| p.* = baked;
+
+    // The ownership partition, beside the archives, as the ENC bake writes one.
+    // Without it every open rebuilds the quilt in memory, and a host with a
+    // thousand sheets pays for that on the boat instead of here, once.
+    if (baked > 0) writeRasterPartition(out_list, ok);
+    return OK;
+}
+
+/// Build the quilt over the archives just written and leave it beside them.
+/// Best effort: a library with no partition still draws, only slower.
+fn writeRasterPartition(out_list: []const []const u8, ok: []const bool) void {
+    const io = sharedIo();
+    var charts = std.ArrayList(*raster.RasterChart).empty;
+    defer {
+        for (charts.items) |rc| {
+            rc.close();
+            gpa.destroy(rc);
+        }
+        charts.deinit(gpa);
+    }
+    var archives = std.ArrayList(compose.ChartArchive).empty;
+    defer archives.deinit(gpa);
+
+    var dir: []const u8 = "";
+    for (out_list, ok) |path, good| {
+        if (!good) continue;
+        const pz = gpa.dupeZ(u8, path) catch continue;
+        defer gpa.free(pz);
+        const opened = raster.RasterChart.open(io, gpa, pz, null) catch continue;
+        const rc = gpa.create(raster.RasterChart) catch continue;
+        rc.* = opened;
+        charts.append(gpa, rc) catch continue;
+        // One directory per chart, so the library is the directory above.
+        if (dir.len == 0) {
+            const own = std.fs.path.dirname(path) orelse continue;
+            dir = std.fs.path.dirname(own) orelse own;
+        }
+        const rd = rc.pmtilesReader() orelse continue;
+        const cov = rc.decodedCoverage() orelse continue;
+        archives.append(gpa, .{ .reader = rd, .cov = cov }) catch continue;
+    }
+    if (archives.items.len == 0 or dir.len == 0) return;
+
+    const src = (compose.ComposeSource.openRasters(gpa, archives.items, null) catch return) orelse return;
+    defer src.deinit();
+    const bytes = src.serializePartition(gpa) catch return;
+    defer gpa.free(bytes);
+    const path = std.fs.path.join(gpa, &.{ dir, "partition.tpart" }) catch return;
+    defer gpa.free(path);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch {};
+}
+
 /// The metadata JSON blob of a PMTiles archive (decompressed) — e.g. the embedded
 /// per-cell "coverage" a single-cell bake carries — into *out / *out_len (free with
 /// tile57_free); NULL/0 when the archive carries none. See tile57.h.
@@ -464,6 +663,7 @@ const CInfo = extern struct {
     anchor_zoom: f64,
     tile_type: u8, // the archive's stored encoding (TILE57_TILE_TYPE_*)
     native_scale: i32, // embedded compilation scale (1:N); 0 = derive from zoom band
+    is_raster: bool, // the archive stores pictures, not vector tiles
 };
 
 // tile57_tile_type values (keep in sync with tile57.h).
@@ -484,6 +684,14 @@ export fn tile57_chart_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
     o.tile_type = switch (s.tileType()) {
         .mlt => TILE_TYPE_MLT,
         else => TILE_TYPE_MVT,
+    };
+    // A raster archive opens as a chart and carries coverage and a scale, so
+    // nothing above tells it apart from a vector chart. Its tiles are images.
+    // tile_type cannot carry this: TILE57_TILE_TYPE_MLT is 2, and 2 is PNG in
+    // the PMTiles header.
+    o.is_raster = switch (s.tileType()) {
+        .png, .jpeg, .webp, .avif => true,
+        else => false,
     };
     if (s.bounds()) |b| {
         o.has_bounds = true;
