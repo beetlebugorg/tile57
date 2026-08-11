@@ -17,6 +17,7 @@ const mariner = @import("style").mariner;
 const style = @import("style");
 const errors = @import("errors"); // the engine error taxonomy + describe()
 const raster = @import("raster"); // raster charts (tile57_raster_chart_*)
+const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk
 // catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
@@ -412,7 +413,7 @@ export fn tile57_bake_files(
         in_list[i] = std.mem.span(ins[i]);
         out_list[i] = std.mem.span(outs[i]);
     }
-    const baked = chart.bakeChartsToFiles(sharedIo(), in_list, out_list, null, workers, progress, progress_ctx, label);
+    const baked = chart.bakeChartsToFiles(sharedIo(), in_list, out_list, null, workers, progress, progress_ctx, label, true);
     if (out_baked) |p| p.* = @intCast(baked);
     return OK;
 }
@@ -422,9 +423,12 @@ const RasterJob = struct {
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Sheet paths, or — when `zip` is set — names of entries inside it.
     in: []const []const u8,
     out: []const []const u8,
     ok: []bool,
+    /// The archive the sheets are read out of, or null to read from disk.
+    zip: ?*const zipsrc.Archive = null,
     progress: chart.BakeProgress,
     label: chart.BakeLabel,
     ctx: ?*anyopaque,
@@ -436,7 +440,14 @@ const RasterJob = struct {
 fn bakeOneRaster(io: std.Io, job: *RasterJob, i: usize) void {
     const a = std.heap.c_allocator;
     const stem = std.fs.path.stem(std.fs.path.basename(job.in[i]));
-    const kap = std.Io.Dir.cwd().readFileAlloc(io, job.in[i], a, .unlimited) catch return;
+    // From the archive or from disk — the warp below cannot tell which.
+    const kap = blk: {
+        if (job.zip) |z| {
+            const idx = z.find(job.in[i]) orelse return;
+            break :blk z.readAlloc(a, io, idx, MAX_RASTER_BYTES) catch return;
+        }
+        break :blk std.Io.Dir.cwd().readFileAlloc(io, job.in[i], a, .unlimited) catch return;
+    };
     defer a.free(kap);
     const baked = raster.bakebsb.bakeBytes(a, kap, stem) catch return;
     defer a.free(baked.bytes);
@@ -582,6 +593,174 @@ fn writeRasterPartition(out_list: []const []const u8, ok: []const bool) void {
     const path = std.fs.path.join(gpa, &.{ dir, "partition.tpart" }) catch return;
     defer gpa.free(path);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch {};
+}
+
+// ---- charts inside a .zip ----------------------------------------------------
+// A chart archive is opened, read from, and closed within each call. Walking a
+// 27,680-entry central directory costs about 8 ms, so the alternative — an open
+// handle the host must hold, close, and keep off other threads — buys nothing
+// and can be got wrong.
+
+/// The largest a single raster sheet may claim to expand to. A KAP runs to tens
+/// of megabytes; the cap is here so a bad header fails instead of allocating.
+const MAX_RASTER_BYTES: u64 = 512 << 20;
+
+/// List what a .zip holds: [{"name":..,"size":..,"packed":..}, ..] into
+/// *out / *out_len (free with tile57_free). See tile57.h.
+export fn tile57_zip_list(zip_path: ?[*:0]const u8, out: ?*?[*]u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+    const json = arc.toJson(gpa) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(json);
+    // Copied with its terminator: the payload is length-delimited by *out_len
+    // AND readable as a C string, so a host can take either.
+    const p = exportAlloc(json.len + 1) orelse return failWith(err, .nomem, "out of memory");
+    @memcpy(p[0 .. json.len + 1], json[0 .. json.len + 1]);
+    o.* = p;
+    n.* = json.len;
+    return OK;
+}
+
+/// Inflate entries out of a .zip to paths the CALLER names, streaming. See tile57.h.
+export fn tile57_zip_extract(
+    zip_path: ?[*:0]const u8,
+    names: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    progress: chart.BakeProgress,
+    progress_ctx: ?*anyopaque,
+    out_done: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_done) |p| p.* = 0;
+    if (n == 0) return OK;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const ns = names orelse return failWith(err, .badarg, "names must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+
+    // Serial on purpose: this is one file stream to disk per entry, and the
+    // entries that come this way are the big ones (a 4 GiB .mbtiles), where
+    // the disk is the limit and parallel writers only fight over it.
+    var done: u32 = 0;
+    for (0..n) |i| {
+        const name = std.mem.span(ns[i]);
+        const idx = arc.find(name) orelse continue;
+        arc.extractTo(io, idx, std.mem.span(outs[i])) catch continue;
+        done += 1;
+        if (progress) |cb| {
+            if (!cb(progress_ctx, @intCast(i + 1), @intCast(n))) break;
+        }
+    }
+    if (out_done) |p| p.* = done;
+    return OK;
+}
+
+/// tile57_bake_files reading the cells STRAIGHT OUT of a .zip. See tile57.h.
+export fn tile57_bake_zip_charts(
+    zip_path: ?[*:0]const u8,
+    names: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const ns = names orelse return failWith(err, .badarg, "names must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ns[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+    const baked = chart.bakeZipChartsToFiles(io, &arc, in_list, out_list, null, workers, progress, progress_ctx, label, true);
+    if (out_baked) |p| p.* = @intCast(baked);
+    return OK;
+}
+
+/// tile57_bake_rasters reading the sheets STRAIGHT OUT of a .zip. See tile57.h.
+export fn tile57_bake_zip_rasters(
+    zip_path: ?[*:0]const u8,
+    names: ?[*]const [*:0]const u8,
+    out_paths: ?[*]const [*:0]const u8,
+    n: usize,
+    workers: u32,
+    progress: chart.BakeProgress,
+    label: chart.BakeLabel,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    if (n == 0) return OK;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const ns = names orelse return failWith(err, .badarg, "names must not be null");
+    const outs = out_paths orelse return failWith(err, .badarg, "out_paths must not be null");
+
+    const in_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(in_list);
+    const out_list = gpa.alloc([]const u8, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(out_list);
+    const ok = gpa.alloc(bool, n) catch return failWith(err, .nomem, "out of memory");
+    defer gpa.free(ok);
+    @memset(ok, false);
+    for (0..n) |i| {
+        in_list[i] = std.mem.span(ns[i]);
+        out_list[i] = std.mem.span(outs[i]);
+    }
+
+    const io = sharedIo();
+    var arc = zipsrc.Archive.open(gpa, io, zp) catch |e| return failCtx(err, e, zp);
+    defer arc.deinit();
+
+    var job = RasterJob{
+        .in = in_list,
+        .out = out_list,
+        .ok = ok,
+        .zip = &arc,
+        .progress = progress,
+        .label = label,
+        .ctx = progress_ctx,
+    };
+    // Same deep stacks as tile57_bake_rasters: the warp is the same work,
+    // only the bytes arrive from the archive instead of a file.
+    const stack = 16 * 1024 * 1024;
+    var threads: [8]std.Thread = undefined;
+    const want = @min(@max(workers, 1), @min(threads.len, n));
+    var spawned: usize = 0;
+    while (spawned < want) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+    }
+    if (spawned == 0) rasterWorker(&job);
+    for (threads[0..spawned]) |t| t.join();
+
+    var baked: u32 = 0;
+    for (ok) |o| {
+        if (o) baked += 1;
+    }
+    if (out_baked) |p| p.* = baked;
+    if (baked > 0) writeRasterPartition(out_list, ok);
+    return OK;
 }
 
 /// The metadata JSON blob of a PMTiles archive (decompressed) — e.g. the embedded

@@ -484,7 +484,16 @@ pub fn build(b: *std.Build) void {
 
     // All pure packages, imported by name into engine / libtile57.a / the baker.
     // (portray is libc, wired separately into the lib + baker only.)
+    // Charts read straight out of a .zip, and the text/pictures a cell points
+    // at. Both are pure std and both are needed by the engine root AND by the
+    // separately-compiled chart module, so they must be modules: a relative
+    // import from each would put one file in two modules.
+    const zipsrc_mod = b.addModule("zipsrc", .{ .root_source_file = b.path("src/zipsrc.zig") });
+    const auxfiles_mod = b.addModule("auxfiles", .{ .root_source_file = b.path("src/auxfiles.zig") });
+
     const pure_pkgs = [_]std.Build.Module.Import{
+        .{ .name = "zipsrc", .module = zipsrc_mod },
+        .{ .name = "auxfiles", .module = auxfiles_mod },
         .{ .name = "s57", .module = s57_mod },
         .{ .name = "s101", .module = s101_mod },
         .{ .name = "tiles", .module = tiles_mod },
@@ -681,6 +690,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "portray", .module = portray_mod },
             .{ .name = "sprite", .module = sprite_mod },
             .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "zipsrc", .module = zipsrc_mod },
+            .{ .name = "auxfiles", .module = auxfiles_mod },
         },
     });
     chart_mod.addImport("style", style_mod); // linestyle XML analysis
@@ -837,6 +848,10 @@ pub fn build(b: *std.Build) void {
     });
     _ = addPkgTest(b, test_step, "src/style/style.zig", target, optimize, &.{});
     _ = addPkgTest(b, test_step, "src/errors.zig", target, optimize, &.{});
+    // Charts read straight out of a .zip, and the aux files that travel with
+    // them: pure over std, so each tests alone.
+    _ = addPkgTest(b, test_step, "src/zipsrc.zig", target, optimize, &.{});
+    _ = addPkgTest(b, test_step, "src/auxfiles.zig", target, optimize, &.{});
     // Geometry core for the cross-band composition. No longer std-only: plane.zig
     // reads its partition tuning/stats valves via std.c.getenv, so the test binary
     // needs libc for the same reason compose's does, below.

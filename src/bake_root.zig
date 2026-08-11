@@ -29,6 +29,7 @@ pub const s101_adapter = root.s101_adapter;
 pub const catalogue = root.catalogue;
 pub const bake_enc = root.bake_enc;
 pub const auxfiles = root.auxfiles;
+pub const zipsrc = root.zipsrc; // charts read straight out of a .zip
 pub const geometry = @import("geometry"); // integer geometry: boolean, plane, partition
 
 pub const portray = @import("portray");

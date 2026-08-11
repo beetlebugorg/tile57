@@ -290,6 +290,77 @@ tile57_status tile57_bake_rasters(const char *const *in_paths, const char *const
                                   tile57_bake_progress progress, tile57_bake_label label,
                                   void *progress_ctx, uint32_t *out_baked, tile57_error *err);
 
+/* ---- charts inside a .zip ---------------------------------------------------
+ *
+ * A chart archive arrives as one download and is mostly not the file you want:
+ * NOAA's All_ENCs.zip is 788 MB of deflate holding 2.0 GiB across 27,680
+ * entries. Unzipping it costs the mariner 2.0 GiB of disk that is dead the
+ * moment the import ends, on top of the charts they keep. These calls read the
+ * charts out of the archive where they lie: each cell is inflated when its turn
+ * comes, baked, and freed, so peak memory is the worker count times one chart
+ * and no intermediate copy is ever written.
+ *
+ * Every call opens the archive, works, and closes it. Walking the central
+ * directory of that 27,680-entry archive costs about 8 ms, so there is no
+ * handle to hold, close, or keep off another thread.
+ *
+ * `names` are entry names exactly as tile57_zip_list reports them. Destinations
+ * are always the CALLER's `out_paths`, never a name from the archive, so an
+ * entry called "../../etc/rc" cannot choose where anything lands. */
+
+/* List what a .zip holds, into *out / *out_len (free with tile57_free), as
+ * [{"name":..,"size":..,"packed":..}, ..] in central-directory order. Sizes are
+ * uncompressed and compressed bytes. Directory entries are omitted. The buffer
+ * is NUL-terminated past *out_len, so it reads as a C string too.
+ *
+ * This says what is IN the archive, not what is a chart: classification is the
+ * host's, and only the host knows which formats it supports. */
+tile57_status tile57_zip_list(const char *zip_path, uint8_t **out, size_t *out_len,
+                              tile57_error *err);
+
+/* tile57_bake_files, reading each cell straight out of `zip_path`: names[i] is
+ * a .000 entry, out_paths[i] is where its PMTiles goes. Its .001.. updates are
+ * found and applied from the archive, by the same rule the on-disk bake uses on
+ * a cell's directory: sequential from .001, stopping at the first gap.
+ *
+ * The text and pictures a cell references (TXTDSC, PICREP) are written beside
+ * the archive with an index.json manifest, so a pick report can resolve them
+ * through tile57_aux_open — but ONLY when out_paths[i] puts the archive in a
+ * directory named for the chart (<out>/US1EEZ3M/US1EEZ3M.pmtiles). Those files
+ * are named per exchange set rather than per chart, so charts baked flat into
+ * one directory would overwrite each other's manifests; rather than guess, the
+ * rule is the exchange set's own shape. Same contract otherwise — caller-owned
+ * lists, `label` names a finished chart by index, `progress` may cancel,
+ * *out_baked counts what was written. A name the archive does not hold is
+ * skipped, like a cell that fails to bake. */
+tile57_status tile57_bake_zip_charts(const char *zip_path, const char *const *names,
+                                     const char *const *out_paths, size_t n, uint32_t workers,
+                                     tile57_bake_progress progress, tile57_bake_label label,
+                                     void *progress_ctx, uint32_t *out_baked, tile57_error *err);
+
+/* tile57_bake_rasters, reading each BSB/KAP sheet straight out of `zip_path`.
+ * Same contract as tile57_bake_rasters, including that `workers` is a memory
+ * bound: a sheet is decoded whole whether it came from a file or an archive. */
+tile57_status tile57_bake_zip_rasters(const char *zip_path, const char *const *names,
+                                      const char *const *out_paths, size_t n, uint32_t workers,
+                                      tile57_bake_progress progress, tile57_bake_label label,
+                                      void *progress_ctx, uint32_t *out_baked, tile57_error *err);
+
+/* Inflate names[i] out of `zip_path` to out_paths[i], streaming: a 32 KiB
+ * window, whatever the file weighs. This is the path for what the engine can
+ * only read BY PATH — an .mbtiles or .pmtiles it memory-maps — where the file
+ * must exist on disk but a second copy of it need not. A 4 GiB .mbtiles
+ * therefore costs 4 GiB, not 8 GiB.
+ *
+ * Serial by design: these are the big entries, the disk is the limit, and
+ * parallel writers only contend for it. `progress` fires after each file and
+ * may cancel; *out_done counts what was written. An entry the archive does not
+ * hold is skipped. */
+tile57_status tile57_zip_extract(const char *zip_path, const char *const *names,
+                                 const char *const *out_paths, size_t n,
+                                 tile57_bake_progress progress, void *progress_ctx,
+                                 uint32_t *out_done, tile57_error *err);
+
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out /
  * *out_len (free with tile57_free); NULL/0 when the archive carries none. A
  * per-chart bake embeds the chart's M_COVR coverage + cscl + date/name under a
