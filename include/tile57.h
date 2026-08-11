@@ -244,6 +244,52 @@ tile57_status tile57_bake_tree(const char *in_dir, const char *out_dir, uint32_t
                                tile57_bake_progress progress, void *progress_ctx,
                                uint32_t *out_baked, tile57_error *err);
 
+/* Names the chart that just finished, by its INDEX into the caller's in_paths.
+ * Charts bake concurrently, so the count in tile57_bake_progress cannot say
+ * which chart a step belongs to. Called from worker threads, out of order, so
+ * it must be thread-safe. Takes the same context as the progress callback.
+ * NULL to skip. */
+typedef void (*tile57_bake_label)(void *ctx, uint32_t index);
+
+/* Bake in_paths[i] to out_paths[i], in parallel, freeing each archive right
+ * after its write (peak memory is the worker count, not n). Both arrays are
+ * caller-allocated and length `n`; parent directories of the outputs must
+ * exist. Each output gets an <out_path>.sha content-hash sidecar.
+ *
+ * This is tile57_bake_tree with the CALLER choosing the list and its ORDER.
+ * Two things follow from that. `label` can name a finished chart by index, so
+ * no string crosses the ABI. And a host that wants the coarse charts first
+ * sorts its own list that way, which is what makes a partly finished bake
+ * usable: an overview and a coastal chart cover the whole passage, where the
+ * same number of harbor cells covers one river.
+ *
+ * `progress` may CANCEL by returning false, at the next chart boundary, and a
+ * cancelled bake is TILE57_OK with *out_baked counting what finished. Unlike
+ * tile57_bake_tree this does NOT skip work already done: the caller chose the
+ * list, so the caller decides what is already baked. */
+tile57_status tile57_bake_files(const char *const *in_paths, const char *const *out_paths,
+                                size_t n, uint32_t workers,
+                                tile57_bake_progress progress, tile57_bake_label label,
+                                void *progress_ctx, uint32_t *out_baked, tile57_error *err);
+
+/* tile57_bake_files for RASTER charts: BSB/KAP in, one PMTiles archive of PNG
+ * tiles out per chart. Same contract — caller-owned lists, `label` names a
+ * finished chart by index, `progress` may cancel, *out_baked counts what was
+ * written.
+ *
+ * A chart that cannot be baked is SKIPPED, not fatal: a BSB set often carries
+ * a sheet with no georeference or no border, and one of those must not cost
+ * the mariner the rest of the set. Compare *out_baked with `n` to find out.
+ *
+ * What this writes are raster charts: tile57_chart_get_info reports is_raster
+ * on each, and they compose through tile57_compose_rasters, never through the
+ * vector compositor. `workers` is a memory bound and one large ocean sheet
+ * decodes to roughly 180 megapixels, so keep the count small. */
+tile57_status tile57_bake_rasters(const char *const *in_paths, const char *const *out_paths,
+                                  size_t n, uint32_t workers,
+                                  tile57_bake_progress progress, tile57_bake_label label,
+                                  void *progress_ctx, uint32_t *out_baked, tile57_error *err);
+
 /* Read a PMTiles archive's metadata JSON blob (decompressed) into *out /
  * *out_len (free with tile57_free); NULL/0 when the archive carries none. A
  * per-chart bake embeds the chart's M_COVR coverage + cscl + date/name under a
@@ -317,7 +363,14 @@ typedef enum {
  * tile57_tile_type); a host passes it to tile57_style_template so the renderer
  * decodes the tiles correctly. native_scale is the compilation scale (1:N) the
  * bake embedded in the archive metadata; 0 = unknown (a composed/foreign
- * archive — derive the scale from the zoom band instead). */
+ * archive — derive the scale from the zoom band instead).
+ *
+ * is_raster separates a raster archive (a baked RNC, or imagery) from a
+ * vector chart. Both open, and both carry coverage and a scale, so nothing
+ * else here tells them apart. tile_type cannot carry it: TILE57_TILE_TYPE_MLT
+ * is 2, and 2 is PNG in the PMTiles header. A host that composes vector charts
+ * must skip an archive with is_raster set, or the tiles decode as a format
+ * they are not. */
 typedef struct {
     uint8_t  min_zoom, max_zoom;
     uint32_t bands;                                       /* bitmask of navigational bands present */
@@ -325,6 +378,7 @@ typedef struct {
     bool     has_anchor; double anchor_lat, anchor_lon, anchor_zoom;
     uint8_t  tile_type;                                   /* tile57_tile_type */
     int32_t  native_scale;
+    bool     is_raster;                                  /* tiles are images, not vector tiles */
 } tile57_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_info *out);
 

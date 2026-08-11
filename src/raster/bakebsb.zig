@@ -396,6 +396,7 @@ fn warpTile(c: *Ctx, z: u8, x: u32, y: u32) Error!?[]u8 {
     var any = false;
     const src = c.chart.pixels;
     const pal = c.chart.header.palette;
+    const base = c.chart.header.palette_base;
     const stride: usize = c.chart.header.width;
 
     var j: usize = 0;
@@ -423,7 +424,8 @@ fn warpTile(c: *Ctx, z: u8, x: u32, y: u32) Error!?[]u8 {
                     const idx = src[@as(usize, @intFromFloat(sy)) * stride + @as(usize, @intFromFloat(sx))];
                     // The format numbers its palette from 1; 0 and anything past
                     // the end is a malformed run, which shows as black.
-                    const rgb = if (idx >= 1 and idx <= pal.len) pal[idx - 1] else bsb.Rgb{ .r = 0, .g = 0, .b = 0 };
+                    const at = if (idx >= base) idx - base else 255;
+                    const rgb = if (at < pal.len) pal[at] else bsb.Rgb{ .r = 0, .g = 0, .b = 0 };
                     rs += rgb.r;
                     gs += rgb.g;
                     bs += rgb.b;

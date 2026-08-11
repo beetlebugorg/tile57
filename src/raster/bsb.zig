@@ -87,8 +87,15 @@ pub const Header = struct {
     /// sheet already on WGS84.
     dtm_lat: f64 = 0,
     dtm_lon: f64 = 0,
-    /// `RGB/n` — the palette, index 1..n (index 0 is unused by the format).
+    /// `RGB/n` — the palette, in the file's own numbering. Address it as
+    /// `palette[pixel - palette_base]`, or through `rgbAt`.
     palette: []Rgb = &.{},
+    /// The number the file gives its FIRST palette entry. BSB numbers from 1
+    /// and treats pixel value 0 as no data. Sheets in the wild number from 0,
+    /// and then 0 is a real colour. A parser that assumes one of the two reads
+    /// every colour off by one, and on a 0-based sheet indexes before the
+    /// start of the array.
+    palette_base: u8 = 1,
     /// `PLY/n,lat,lon` — the border polygon. Cuts the paper collar off, so
     /// quilted sheets butt at their neat lines instead of overprinting each
     /// other's margins. Stands in for M_COVR in the archive metadata.
@@ -143,9 +150,10 @@ pub const Chart = struct {
     pub fn rgbAt(c: Chart, x: u32, y: u32) Rgb {
         if (x >= c.header.width or y >= c.header.height) return .{ .r = 0, .g = 0, .b = 0 };
         const idx = c.pixels[@as(usize, y) * c.header.width + x];
-        // The format numbers the palette from 1.
-        if (idx == 0 or idx > c.header.palette.len) return .{ .r = 0, .g = 0, .b = 0 };
-        return c.header.palette[idx - 1];
+        if (idx < c.header.palette_base) return .{ .r = 0, .g = 0, .b = 0 };
+        const at = idx - c.header.palette_base;
+        if (at >= c.header.palette.len) return .{ .r = 0, .g = 0, .b = 0 };
+        return c.header.palette[at];
     }
 };
 
@@ -298,6 +306,8 @@ pub fn parseHeader(a: Allocator, bytes: []const u8) Error!Header {
     var h: Header = .{};
 
     var palette = std.ArrayList(Rgb).empty;
+    // The lowest RGB index the file used, which decides the base.
+    var palette_min: u32 = std.math.maxInt(u32);
     var border = std.ArrayList([2]f64).empty;
     var refs = std.ArrayList(Header.Ref).empty;
 
@@ -357,9 +367,12 @@ pub fn parseHeader(a: Allocator, bytes: []const u8) Error!Header {
             const r = parseU32(n.next() orelse "") orelse continue;
             const g = parseU32(n.next() orelse "") orelse continue;
             const b = parseU32(n.next() orelse "") orelse continue;
-            // The format numbers from 1 and is not obliged to be in order.
-            while (palette.items.len < idx) try palette.append(a, .{ .r = 0, .g = 0, .b = 0 });
-            palette.items[idx - 1] = .{ .r = @intCast(r & 255), .g = @intCast(g & 255), .b = @intCast(b & 255) };
+            // Stored at its own number and shifted at the end, because the
+            // base is not known until every RGB line has been read. Entries
+            // are not obliged to be in order either.
+            while (palette.items.len <= idx) try palette.append(a, .{ .r = 0, .g = 0, .b = 0 });
+            palette.items[idx] = .{ .r = @intCast(r & 255), .g = @intCast(g & 255), .b = @intCast(b & 255) };
+            palette_min = @min(palette_min, idx);
         } else if (std.mem.eql(u8, key, "PLY")) {
             var n = std.mem.splitScalar(u8, rest, ',');
             _ = n.next();
@@ -398,6 +411,10 @@ pub fn parseHeader(a: Allocator, bytes: []const u8) Error!Header {
     if (h.depth == 0) return Error.BadHeader;
     h.data_off = off;
 
+    // Nothing wrote slot 0 on a 1-based sheet, so dropping it restores the
+    // numbering the rest of the engine reads.
+    h.palette_base = if (palette_min == 0) 0 else 1;
+    if (h.palette_base == 1 and palette.items.len > 0) _ = palette.orderedRemove(0);
     h.palette = palette.items;
     h.border = border.items;
     h.refs = refs.items;
@@ -532,6 +549,32 @@ test "KNP fields" {
     try testing.expectEqualStrings("MERCATOR", fieldOf(rest, "PR").?);
     // An EMPTY value is still a value, not a miss.
     try testing.expectEqualStrings("", fieldOf(rest, "SP").?);
+}
+
+test "a palette numbered from 0 is read at its own base" {
+    // BSB numbers its palette from 1. Sheets in the wild number from 0, and
+    // then pixel value 0 is a real colour. Reading such a sheet as 1-based
+    // indexes one before the start of the array, which on a release build is a
+    // write to whatever is there.
+    // parseHeader allocates into a caller arena, as decode does.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const zero =
+        "BSB/NA=T,RA=2,2\r\nRGB/0,10,20,30\r\nRGB/1,40,50,60\r\n\x1a\x00\x01";
+    const h0 = try parseHeader(a, zero);
+    try testing.expectEqual(@as(u8, 0), h0.palette_base);
+    try testing.expectEqual(@as(usize, 2), h0.palette.len);
+    try testing.expectEqual(@as(u8, 10), h0.palette[0].r);
+    try testing.expectEqual(@as(u8, 40), h0.palette[1].r);
+
+    const one =
+        "BSB/NA=T,RA=2,2\r\nRGB/1,10,20,30\r\nRGB/2,40,50,60\r\n\x1a\x00\x01";
+    const h1 = try parseHeader(a, one);
+    try testing.expectEqual(@as(u8, 1), h1.palette_base);
+    try testing.expectEqual(@as(usize, 2), h1.palette.len);
+    try testing.expectEqual(@as(u8, 10), h1.palette[0].r);
+    try testing.expectEqual(@as(u8, 40), h1.palette[1].r);
 }
 
 test "polynomial parse and evaluate" {
