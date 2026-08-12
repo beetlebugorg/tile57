@@ -126,11 +126,14 @@ const FILL_SORT = .{ "-", .{ "*", .{ "coalesce", .{ "get", "display_priority" },
 // solid lines EXCLUDE the un-tessellated complex-linestyle runs (tagged ls_style):
 // those get their own dasharray + line-placed symbol layers (linestyleLayers), so a
 // run must not also paint as a plain solid stroke here.
-const FILT_SOLID = .{ "all", .{ "==", .{ "coalesce", .{ "get", "dash" }, "solid" }, "solid" }, .{ "!", .{ "has", "ls_style" } } };
+const FILT_SOLID = .{ "==", .{ "coalesce", .{ "get", "dash" }, "solid" }, "solid" };
 const FILT_DASHED = .{ "==", .{ "get", "dash" }, "dashed" };
 const FILT_DOTTED = .{ "==", .{ "get", "dash" }, "dotted" };
 
-const ICON_SIZE = .{ "/", .{ "coalesce", .{ "get", "scale" }, 0.08 }, 0.08 };
+// The sheet is baked at the drawn scale (sprite.zig mln_drawn_scale), so the
+// engine SYMBOL_SCALE is the unit: a feature at that scale samples 1:1.
+const MLN_BAKE_SCALE: f64 = 0.02834627777338028;
+const ICON_SIZE = .{ "/", .{ "coalesce", .{ "get", "scale" }, 0.08 }, MLN_BAKE_SCALE };
 
 const VROW = .{ "match", .{ "coalesce", .{ "get", "valign" }, "middle" }, "top", "top", "bottom", "bottom", "center" };
 const TEXT_ANCHOR = .{
@@ -267,6 +270,12 @@ const SCtx = struct {
     // DENOM literal under the live filter-gate, else the per-archive K/2^zoom.
     oscl_gate: DenomGate,
     show_overscale: bool, // S-52 §10.1.10 mariner toggle -> the overscale layer's visibility
+    // The mariner's soundings switch -> the soundings layers' visibility.
+    // Resolved as the hosts do (root.zig deriveLive): explicit on/off wins,
+    // auto follows display OTHER (S-52 files SOUNDG under that category).
+    // Visibility, not a filter: a toggle is then a one-op visibility diff
+    // instead of a whole-tile re-layout.
+    soundings_on: bool,
 };
 
 // Display-denominator gate value for the overscale clauses.
@@ -298,10 +307,14 @@ fn writeOsclClause(js: *Stringify, gate: DenomGate, negate: bool) !void {
             try js.write(.{ "!", .{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, d } })
         else
             try js.write(.{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, d }),
-        .zoom_k => |k| if (negate)
-            try js.write(.{ "!", .{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, .{ "/", k, .{ "^", 2, .{"zoom"} } } } })
+        // The bake folded oscl > K/2^zoom into the per-feature `oz` (the
+        // display zoom past which the cell is overscaled — scene.augmentV3);
+        // a feature without oscl coalesces to an unreachable zoom and never
+        // reads overscaled.
+        .zoom_k => if (negate)
+            try js.write(.{ "!", .{ ">", .{"zoom"}, .{ "coalesce", .{ "get", "oz" }, 99 } } })
         else
-            try js.write(.{ ">", .{ "coalesce", .{ "get", "oscl" }, 0 }, .{ "/", k, .{ "^", 2, .{"zoom"} } } }),
+            try js.write(.{ ">", .{"zoom"}, .{ "coalesce", .{ "get", "oz" }, 99 } }),
     }
 }
 
@@ -400,11 +413,13 @@ fn writeScaminClause(js: *Stringify, bkt: Bucket) !void {
         try js.endArray();
         return;
     }
-    // zoom_gate (the only other clause-bearing mode; has_clause guarantees it): static,
-    // latitude-correct gate — show a SCAMIN feature only when the display is at least as
-    // fine as its 1:N, i.e. scamin >= D(zoom) with D = K/2^zoom. Shares the oscl
-    // gate's K (writeSmaxClause/.zoom_k), so the three stay in lockstep.
-    try js.write(.{ ">=", .{ "coalesce", .{ "get", "scamin" }, SCAMIN_COALESCE_MAX }, .{ "/", bkt.zoom_k, .{ "^", 2, .{"zoom"} } } });
+    // zoom_gate (the only other clause-bearing mode; has_clause guarantees it):
+    // the bake already folded scamin >= K/2^zoom into the per-feature `vz`
+    // (the fractional display zoom at which the SCAMIN admits — see
+    // scene.augmentV3), so the gate is one compare instead of a
+    // coalesce/divide/pow tree per feature per layer. A feature without
+    // SCAMIN carries no vz and coalesces to 0: always shown.
+    try js.write(.{ "<=", .{ "coalesce", .{ "get", "vz" }, 0 }, .{"zoom"} });
 }
 
 // Write a layer's `filter`. The filter ANDs together (in order): the `base` predicate
@@ -445,10 +460,16 @@ fn lineLayer(js: *Stringify, s: *const SCtx, sl: []const u8, name: []const u8, f
     try applyBucket(js, filt, true, bkt, s, null); // line: scamin line variants band-independent
     try js.objectField("layout");
     try js.beginObject();
-    // display_priority as the sole intra-layer z-order axis (mirrors fill-/symbol-sort-key),
-    // so a higher-priority line paints over a lower one within a dash class.
+    // display_priority as the primary intra-layer z-order axis (mirrors
+    // fill-/symbol-sort-key), so a higher-priority line paints over a lower
+    // one within a dash class. Width breaks the tie DOWNWARD: at equal
+    // priority a wider stroke draws first, i.e. underneath — which is what an
+    // S-52 outline+ink pair means. A light's sector arc bakes as a wide CHBLK
+    // outline plus a narrower coloured ink stroke at one priority; without
+    // this tiebreak the outline could land on top and every sector read
+    // black.
     try js.objectField("line-sort-key");
-    try js.write(.{ "coalesce", .{ "get", "display_priority" }, 0 });
+    try js.write(.{ "coalesce", .{ "get", "lsk" }, 0 });
     try js.endObject();
     try js.objectField("paint");
     try linePaint(js, s.line_color, dash, s.size_scale);
@@ -500,22 +521,18 @@ const DANGER_CLASSES = .{ "OBSTRN", "WRECKS", "UWTROC" };
 // The soundings DrawingPriority — the z-order boundary the point family partitions on.
 const SOUNDINGS_PRIO = 18;
 
-// `class in DANGER_CLASSES` — the danger-over-sounding deviation (see DANGER_CLASSES).
-const IN_DANGER = .{ "in", .{ "get", "class" }, .{ "literal", DANGER_CLASSES } };
-
-// Effective DrawingPriority = display_priority (the honest catalogue 0..30 tile property,
-// NEVER bucketed) offset by the display plane (plane*64 most-significant; +1 OverRadar
-// / -1 UnderRadar, inert today -> coalesce 0). This is the SOLE point z-order axis:
-// no base/danger/light class TIERS. Used both as the partition threshold and, via
-// SYMBOL_SORT, as the intra-layer sort key.
-const EFF_PRIO = .{ "+", .{ "*", .{ "coalesce", .{ "get", "display_plane" }, 0 }, 64 }, .{ "coalesce", .{ "get", "display_priority" }, 0 } };
+// Effective DrawingPriority, baked per feature as `ep` (scene.augmentV3):
+// display_plane*64 + display_priority, with a danger class (DANGER_CLASSES)
+// folded to 19. The SOLE point z-order axis — the partition threshold and,
+// via SYMBOL_SORT, the intra-layer sort key.
+const EP = .{ "coalesce", .{ "get", "ep" }, 0 };
 
 // symbol-sort-key: display_priority is the sole axis, EXCEPT the S-52 danger deviation is
 // expressed here as a sort VALUE — a danger (OBSTRN/WRECKS/UWTROC) sorts at an
 // effective 19 so it draws just above soundings (18) WITHOUT baking a fake display_priority
 // into the tile (the tile keeps the honest 12, so pick/spec stay correct). A base at
 // display_priority 30 still sorts above the danger's 19; a base at 5 stays under soundings.
-const SYMBOL_SORT = .{ "case", IN_DANGER, 19, EFF_PRIO };
+const SYMBOL_SORT = .{ "coalesce", .{ "get", "ep" }, 0 };
 
 // Which slice of the point family a layer carries. z-order is display_priority ALONE: `base`
 // = effective-prio under soundings (< 18), `dangers_only` = effective-prio at/over
@@ -529,19 +546,24 @@ const PointMode = enum { base, dangers_only, lights_only };
 // bucket filter. rot_north_eq / mode are comptime so each switch arm passes a concrete
 // tuple type to the generic applyBucket.
 fn applyPointBucket(js: *Stringify, s: *const SCtx, bkt: Bucket, comptime rot_north_eq: bool, comptime mode: PointMode) !void {
+    // Absent rot_north reads null: null==1 is false and null!=1 is true in
+    // expression filters, so the common untagged case needs no coalesce.
     const rot = if (rot_north_eq)
-        .{ "==", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 }
+        .{ "==", .{ "get", "rot_north" }, 1 }
     else
-        .{ "!=", .{ "coalesce", .{ "get", "rot_north" }, 0 }, 1 };
-    const not_light = .{ "!=", .{ "get", "class" }, "LIGHTS" };
+        .{ "!=", .{ "get", "rot_north" }, 1 };
+    // The baked `ep` (scene.augmentV3) already folds the danger deviation —
+    // an OBSTRN/WRECKS/UWTROC marker carries ep 19 — so the class-membership
+    // OR the partition used to need is gone; `lt` (1 on LIGHTS) replaces the
+    // class string compare.
+    const not_light = .{ "!=", .{ "get", "lt" }, 1 };
     switch (mode) {
-        // UNDER soundings: effective-prio < 18, and neither a danger (rides the over
-        // pass via its class) nor a light (its own top pass).
-        .base => try applyBucket(js, .{ "all", rot, .{ "<", EFF_PRIO, SOUNDINGS_PRIO }, not_light, .{ "!", IN_DANGER } }, true, bkt, s, null),
-        // OVER soundings: effective-prio >= 18 OR a danger class (the deviation), not a light.
-        .dangers_only => try applyBucket(js, .{ "all", rot, .{ "any", .{ ">=", EFF_PRIO, SOUNDINGS_PRIO }, IN_DANGER }, not_light }, true, bkt, s, null),
+        // UNDER soundings: effective-prio < 18 (dangers carry 19), not a light.
+        .base => try applyBucket(js, .{ "all", rot, .{ "<", EP, SOUNDINGS_PRIO }, not_light }, true, bkt, s, null),
+        // OVER soundings: effective-prio >= 18 (dangers included via ep 19), not a light.
+        .dangers_only => try applyBucket(js, .{ "all", rot, .{ ">=", EP, SOUNDINGS_PRIO }, not_light }, true, bkt, s, null),
         // LIGHTS on top (kept a dedicated pass for legibility order).
-        .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "class" }, "LIGHTS" } }, true, bkt, s, null),
+        .lights_only => try applyBucket(js, .{ "all", rot, .{ "==", .{ "get", "lt" }, 1 } }, true, bkt, s, null),
     }
 }
 
@@ -584,9 +606,19 @@ const LIGHT_TEXT_OFFSET = .{ "match", .{ "coalesce", .{ "get", "loff" }, "0,0" }
 /// resolves collisions layer by layer, top down — that is how the important tier
 /// gets first claim on the space. Inside a layer there is deliberately NO
 /// symbol-sort-key: peers are settled by feature order, the SENC sequence.
-fn textLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket, id: []const u8, filt: anytype) !void {
+fn textLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket, id: []const u8, filt: anytype, minzoom: ?u32) !void {
     try js.beginObject();
     try layerHead(js, id, "symbol", sl);
+    // Live symbol placement is the one per-frame cost that scales with the
+    // CANDIDATE pool, not the drawn count — at coastal zoom every minor
+    // label on half a seaboard entered collision and the pass blocked the
+    // render thread for hundreds of ms. The GPU path declutters at build
+    // time, off-thread, and those labels lose there anyway; a minzoom on the
+    // minor tier is the same outcome for a fraction of the work.
+    if (minzoom) |mz| {
+        try js.objectField("minzoom");
+        try js.write(mz);
+    }
     try applyBucket(js, filt, true, bkt, s, s.text_group); // SCAMIN text band-independent
     try js.objectField("layout");
     try js.beginObject();
@@ -618,8 +650,10 @@ fn textLayers(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket) !void
     var buf2: [96]u8 = undefined;
     // Other text FIRST, important text ABOVE it: the upper layer places first,
     // so IMPORTANT text claims its space before anything else competes for it.
-    try textLayer(js, s, sl, bkt, try std.fmt.bufPrint(&buf, "text{s}", .{bkt.suffix}), FILT_TEXT_OTHER);
-    try textLayer(js, s, sl, bkt, try std.fmt.bufPrint(&buf2, "text-important{s}", .{bkt.suffix}), FILT_TEXT_IMPORTANT);
+    // The minor tier only exists from ~1:56k display (512-zoom 10): coarser
+    // than that it never survives declutter, it only bloats placement.
+    try textLayer(js, s, sl, bkt, try std.fmt.bufPrint(&buf, "text{s}", .{bkt.suffix}), FILT_TEXT_OTHER, 10);
+    try textLayer(js, s, sl, bkt, try std.fmt.bufPrint(&buf2, "text-important{s}", .{bkt.suffix}), FILT_TEXT_IMPORTANT, null);
 }
 
 fn textPaint(js: *Stringify, text_color: std.json.Value, halo: std.json.Value, scale: f64) !void {
@@ -706,24 +740,25 @@ fn overscaleLayer(js: *Stringify, s: *const SCtx) !void {
     try js.endObject();
 }
 
-// Linestyle-embedded symbols draw at the engine's SYMBOL_SCALE (0.028346…, see
-// scene/linestyle.zig drawComplexLine), not the 0.08 point-symbol default the sprite
-// atlas is sized for. Un-tessellated ls_style runs carry no per-symbol `scale` tile
-// property, so ICON_SIZE would coalesce to 0.08/0.08 = 1.0 (full atlas size, ~2.8x
-// too large); this fixed ratio makes the style-placed symbols match the tessellated
-// ones exactly.
-const LS_ICON_SIZE: f64 = 0.02834627777338028 / 0.08;
+// Linestyle-embedded symbols draw at the engine's SYMBOL_SCALE — which is now
+// the sheet's own bake scale, so they sample 1:1.
+const LS_ICON_SIZE: f64 = 1.0;
 
-// One decorated layer set for one analysed complex linestyle: a line layer whose
-// line-dasharray is the pattern's on/off runs in line-width units, and (sprite
-// permitting) a line-placed symbol layer per embedded symbol, spaced one period
-// apart. Colour/width ride the run's own color_token/width_px tile properties, so
-// the palette resolves exactly like every other line. The tiles carry each run
-// UN-tessellated (tagged ls_style); MapLibre walks the dash rhythm + symbol
-// placement at render time — the web analogue of replay.zig's drawComplexRun, and
-// it scales uniformly with zoom/DPR so spacing and glyph size stay locked together.
+// Decorated layers for the analysed complex linestyles, one source-layer per
+// style (tile57/3): the bake routes each ls_style's runs into their own
+// `lines-ls-<STYLE>` source-layer, so a style's dash layer and symbol
+// layer(s) see ONLY their own features — no ls_style membership filter, no
+// icon-image match, and a tile without the style doesn't carry the
+// source-layer at all. (The predecessor kept every decorated line in one
+// `lines` source-layer and merged symbol layers by quantized spacing; every
+// layer still filtered every line feature of every tile, the largest single
+// contributor to layout cost, and the merge cost ~7% spacing error. Per-style
+// source-layers delete the cross-product instead.) symbol-spacing is exact
+// per style again. The tiles carry each run UN-tessellated (tagged ls_style);
+// MapLibre walks the dash rhythm + symbol placement at render time.
 fn linestyleLayers(js: *Stringify, s: *const SCtx, ls: std.json.Value, bkt: Bucket, sprite_on: bool) !void {
     if (ls != .object) return;
+
     var it = ls.object.iterator();
     while (it.next()) |e| {
         const id = e.key_ptr.*;
@@ -736,13 +771,15 @@ fn linestyleLayers(js: *Stringify, s: *const SCtx, ls: std.json.Value, bkt: Buck
         if (dash_v != .array or dash_v.array.items.len == 0) continue;
 
         var buf: [96]u8 = undefined;
+        var slbuf: [80]u8 = undefined;
+        const sl = try std.fmt.bufPrint(&slbuf, "lines-ls-{s}", .{id});
         try js.beginObject();
-        try layerHead(js, try std.fmt.bufPrint(&buf, "lines-ls-{s}{s}", .{ id, bkt.suffix }), "line", "lines");
-        try applyBucket(js, .{ "==", .{ "get", "ls_style" }, id }, true, bkt, s, null);
+        try layerHead(js, try std.fmt.bufPrint(&buf, "lines-ls-{s}{s}", .{ id, bkt.suffix }), "line", sl);
+        try applyBucket(js, .{}, false, bkt, s, null);
         try js.objectField("layout");
         try js.beginObject();
         try js.objectField("line-sort-key");
-        try js.write(.{ "coalesce", .{ "get", "display_priority" }, 0 });
+        try js.write(.{ "coalesce", .{ "get", "lsk" }, 0 });
         try js.endObject();
         try js.objectField("paint");
         try js.beginObject();
@@ -764,19 +801,33 @@ fn linestyleLayers(js: *Stringify, s: *const SCtx, ls: std.json.Value, bkt: Buck
         if (!sprite_on) continue;
         const syms_v = v.object.get("symbols") orelse continue;
         if (syms_v != .array) continue;
+        // Distinct icons only, first-seen order: repeats drew at the same
+        // phase as their first occurrence and added nothing but overdraw.
+        var slot: u32 = 0;
+        const spacing = @max(period * s.size_scale, 1.0);
         for (syms_v.array.items, 0..) |sv, si| {
             if (sv != .object) continue;
             const name_v = sv.object.get("n") orelse continue;
             if (name_v != .string) continue;
+            var dup = false;
+            for (syms_v.array.items[0..si]) |pv| {
+                if (pv != .object) continue;
+                const pn = pv.object.get("n") orelse continue;
+                if (pn == .string and std.mem.eql(u8, pn.string, name_v.string)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
             try js.beginObject();
-            try layerHead(js, try std.fmt.bufPrint(&buf, "lines-ls-{s}-sym{d}{s}", .{ id, si, bkt.suffix }), "symbol", "lines");
-            try applyBucket(js, .{ "==", .{ "get", "ls_style" }, id }, true, bkt, s, null);
+            try layerHead(js, try std.fmt.bufPrint(&buf, "lines-ls-{s}-sym{d}{s}", .{ id, slot, bkt.suffix }), "symbol", sl);
+            try applyBucket(js, .{}, false, bkt, s, null);
             try js.objectField("layout");
             try js.beginObject();
             try js.objectField("symbol-placement");
             try js.write("line");
             try js.objectField("symbol-spacing");
-            try js.write(@max(period * s.size_scale, 1.0));
+            try js.write(spacing);
             try js.objectField("icon-image");
             try js.write(name_v.string);
             try js.objectField("icon-size");
@@ -789,6 +840,7 @@ fn linestyleLayers(js: *Stringify, s: *const SCtx, ls: std.json.Value, bkt: Buck
             try js.write(true);
             try js.endObject(); // layout
             try js.endObject(); // layer
+            slot += 1;
         }
     }
 }
@@ -810,6 +862,10 @@ fn contourLabelLayer(js: *Stringify, s: *const SCtx, sl: []const u8, bkt: Bucket
     var buf: [96]u8 = undefined;
     try js.beginObject();
     try layerHead(js, try std.fmt.bufPrint(&buf, "contour-labels-{s}{s}", .{ sl, bkt.suffix }), "symbol", sl);
+    // Same placement-pool argument as the minor text tier: a contour value
+    // is unreadable coarser than ~1:112k anyway.
+    try js.objectField("minzoom");
+    try js.write(@as(u32, 9));
     try applyBucket(js, .{ "has", "valdco" }, true, bkt, s, null); // contour value labels (scamin text) band-independent
     try js.objectField("layout");
     try js.beginObject();
@@ -865,6 +921,8 @@ fn soundingsLayer(js: *Stringify, s: *const SCtx, bkt: Bucket, id: []const u8, f
     try applyBucket(js, filt, true, bkt, s, null); // soundings (band-quilted)
     try js.objectField("layout");
     try js.beginObject();
+    try js.objectField("visibility");
+    try js.write(if (s.soundings_on) "visible" else "none");
     try js.objectField("icon-image");
     try js.write(s.sound_img);
     try js.objectField("icon-size");
@@ -965,6 +1023,8 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
         else
             .{ .zoom_k = scaminGateK(opts.scamin_lat) },
         .show_overscale = m.show_overscale,
+        // A TEMPLATE (null mariner) keeps soundings visible; the client gates.
+        .soundings_on = if (filters_on) (m.show_soundings orelse m.display_other) else true,
     };
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -1425,10 +1485,11 @@ test "json: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     };
 
     // Manifest present, gating ON -> the merged zoom-gate rides every layer (per-value
-    // #sm buckets are retired — a manifest never buckets now).
+    // #sm buckets are retired — a manifest never buckets now). tile57/3: the
+    // gate compares the baked vz against ["zoom"].
     const gated = try json(a, base);
     defer a.free(gated);
-    try std.testing.expect(std.mem.indexOf(u8, gated, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated, "[\"<=\",[\"coalesce\",[\"get\",\"vz\"],0],[\"zoom\"]]") != null);
     try std.testing.expect(std.mem.indexOf(u8, gated, "#sm") == null);
 
     // Manifest present, ignore_scamin -> no buckets at all.
@@ -1438,13 +1499,12 @@ test "json: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "#sm") == null);
 
-    // No manifest, gating ON -> the static K/2^zoom SCAMIN gate is present (the
-    // scamin>=D(zoom) fallback shape, no per-value buckets).
+    // No manifest, gating ON -> the same vz gate (no per-value buckets).
     var nomanifest = base;
     nomanifest.scamin = &.{};
     const out_fb = try json(a, nomanifest);
     defer a.free(out_fb);
-    try std.testing.expect(std.mem.indexOf(u8, out_fb, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fb, "[\"<=\",[\"coalesce\",[\"get\",\"vz\"],0],[\"zoom\"]]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_fb, "#sm") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_fb, "log2") == null); // old form retired
 
@@ -1453,7 +1513,7 @@ test "json: ignore_scamin drops SCAMIN gating (no buckets, no zoom-gate)" {
     nm_ign.ignore_scamin = true;
     const out_nm_ign = try json(a, nm_ign);
     defer a.free(out_nm_ign);
-    try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "[\"<=\",[\"coalesce\",[\"get\",\"vz\"],0],[\"zoom\"]]") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_nm_ign, "#sm") == null);
 }
 
@@ -1476,15 +1536,16 @@ test "json: point z-order = display_priority alone (threshold partition + danger
     });
     defer a.free(out);
 
-    // symbol-sort-key = display_priority (via plane*64 + display_priority), with dangers mapped to an
-    // effective 19 as a sort VALUE — NOT a baked tile display_priority, NOT a class tier.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"symbol-sort-key\":[\"case\",[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]],19,[\"+\",[\"*\",[\"coalesce\",[\"get\",\"display_plane\"],0],64],[\"coalesce\",[\"get\",\"display_priority\"],0]]]") != null);
-    // The under-soundings pass filters on effective-prio < 18 (the threshold), not class.
-    try std.testing.expect(std.mem.indexOf(u8, out, "[\"<\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"display_plane\"],0],64],[\"coalesce\",[\"get\",\"display_priority\"],0]],18]") != null);
-    // The over-soundings pass = effective-prio >= 18 OR a danger class.
-    try std.testing.expect(std.mem.indexOf(u8, out, "[\"any\",[\">=\",[\"+\",[\"*\",[\"coalesce\",[\"get\",\"display_plane\"],0],64],[\"coalesce\",[\"get\",\"display_priority\"],0]],18],[\"in\",[\"get\",\"class\"],[\"literal\",[\"OBSTRN\",\"WRECKS\",\"UWTROC\"]]]]") != null);
-    // Lines gained a display_priority sort key.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"line-sort-key\":[\"coalesce\",[\"get\",\"display_priority\"],0]") != null);
+    // symbol-sort-key = the baked ep (plane*64 + display_priority, dangers
+    // folded to an effective 19 at bake — scene.augmentV3).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"symbol-sort-key\":[\"coalesce\",[\"get\",\"ep\"],0]") != null);
+    // The under-soundings pass filters on effective-prio < 18 (the threshold).
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"<\",[\"coalesce\",[\"get\",\"ep\"],0],18]") != null);
+    // The over-soundings pass = effective-prio >= 18 (dangers ride via ep 19).
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\">=\",[\"coalesce\",[\"get\",\"ep\"],0],18]") != null);
+    // Lines sort on the baked lsk (display_priority*1000 - width_px, so an
+    // S-52 outline+ink pair at one priority keeps the ink on top).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"line-sort-key\":[\"coalesce\",[\"get\",\"lsk\"],0]") != null);
 
     // z-order (emit order): under-symbols < soundings < over-symbols < lights. So a
     // base at display_priority 30 (over pass, sorts 30) draws above a danger (over pass, sorts
@@ -1500,6 +1561,45 @@ test "json: point z-order = display_priority alone (threshold partition + danger
     try std.testing.expect(i_under < i_snd);
     try std.testing.expect(i_snd < i_over);
     try std.testing.expect(i_over < i_lt);
+}
+
+test "json: the soundings switch drives the soundings layers' visibility" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff"},"dusk":{},"night":{}}
+    ;
+    var base = Options{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+    };
+
+    // A template (no mariner) keeps soundings visible — the client gates live.
+    const tmpl = try json(a, base);
+    defer a.free(tmpl);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"id\":\"soundings\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"soundings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "\"visibility\":\"none\"") == null);
+
+    // soundings OFF hides the layer outright.
+    var m = mariner.Settings{ .show_soundings = false };
+    base.mariner = m;
+    const off = try json(a, base);
+    defer a.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"visibility\":\"none\"") != null);
+
+    // auto (null) follows display OTHER, the category S-52 files SOUNDG under.
+    m = mariner.Settings{ .display_other = false };
+    base.mariner = m;
+    const auto_off = try json(a, base);
+    defer a.free(auto_off);
+    try std.testing.expect(std.mem.indexOf(u8, auto_off, "\"visibility\":\"none\"") != null);
+
+    m = mariner.Settings{ .show_soundings = true, .display_other = false };
+    base.mariner = m;
+    const on = try json(a, base);
+    defer a.free(on);
+    try std.testing.expect(std.mem.indexOf(u8, on, "\"visibility\":\"none\"") == null);
 }
 
 test "json: size_scale wraps icon/line/text sizes in a multiplier" {
@@ -1547,8 +1647,10 @@ test "buildFromTemplate: defaults bake SEABED fill + category/M_QUAL filter (sin
     const out = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "DEPMD") != null); // SEABED01 band
-    try std.testing.expect(std.mem.indexOf(u8, out, "ISODGR01") != null); // category filter
-    try std.testing.expect(std.mem.indexOf(u8, out, "M_QUAL") != null);
+    // Category filter reads the v3 precomputes: iso (ISODGR01) + mq (M_QUAL) ints.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"get\",\"iso\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"get\",\"mq\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"get\",\"display_category\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "10.0") != null); // float depth edges
     try std.testing.expect(std.mem.indexOf(u8, out, "30.0") != null);
 }
@@ -1665,17 +1767,17 @@ test "buildFromTemplate: viewing-group deny-list filter gates by vg" {
 test "buildFromTemplateScamin: a manifest no longer buckets — the merged zoom-gate rides every layer" {
     const a = std.testing.allocator;
     const m = mariner.Settings{};
-    // No manifest -> the static K/2^zoom SCAMIN zoom-gate, no #sm buckets.
+    // No manifest -> the baked-vz SCAMIN zoom-gate, no #sm buckets.
     const plain = try buildFromTemplate(a, cs_template, &m, cs_ct, null, 1700000000);
     defer a.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "[\"<=\",[\"coalesce\",[\"get\",\"vz\"],0],[\"zoom\"]]") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "#sm") == null);
     // With a manifest -> STILL the merged zoom-gate (per-value buckets retired): the
     // manifest no longer produces #sm layers, only the TileJSON ladder (served apart).
     const scamin = [_]u32{ 89999, 259999 };
     const bucketed = try buildFromTemplateScamin(a, cs_template, &m, cs_ct, null, 1700000000, &scamin, 38.0);
     defer a.free(bucketed);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\"<=\",[\"coalesce\",[\"get\",\"vz\"],0],[\"zoom\"]]") != null);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "#sm") == null);
     try std.testing.expect(std.mem.indexOf(u8, bucketed, "log2") == null);
 }
@@ -1819,20 +1921,20 @@ test "json: showOverscale=false hides the hatch layer; ignoreScamin keeps it (de
     defer a.free(hidden);
     try std.testing.expect(std.mem.indexOf(u8, hidden, "\"id\":\"overscale\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, hidden, "{\"visibility\":\"none\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hidden, "\"oscl\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "[\"get\",\"oz\"]") != null);
 
-    // Bucket mode derives the oscl DENOM from zoom (same K as the scamin clause).
+    // The zoom-gate compares ["zoom"] against the baked oz (scene.augmentV3).
     const bucketed = try json(a, base);
     defer a.free(bucketed);
-    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\">\",[\"coalesce\",[\"get\",\"oscl\"],0],[\"/\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bucketed, "[\">\",[\"zoom\"],[\"coalesce\",[\"get\",\"oz\"],99]]") != null);
 
     // ignore_scamin: the overscale indication is DECOUPLED from decluttering
-    // (spec §5) — the oscl clauses + hatch layer survive the debug toggle.
+    // (spec §5) — the oz clauses + hatch layer survive the debug toggle.
     var ign = base;
     ign.ignore_scamin = true;
     const out_ign = try json(a, ign);
     defer a.free(out_ign);
-    try std.testing.expect(std.mem.indexOf(u8, out_ign, "oscl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ign, "[\"get\",\"oz\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "\"id\":\"overscale\",") != null);
 
     // No sprite -> nothing can draw the hatch: single plain fill layer, no sandwich.
@@ -1840,7 +1942,7 @@ test "json: showOverscale=false hides the hatch layer; ignoreScamin keeps it (de
     nospr.sprite = null;
     const out_ns = try json(a, nospr);
     defer a.free(out_ns);
-    try std.testing.expect(std.mem.indexOf(u8, out_ns, "oscl") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_ns, "[\"get\",\"oz\"]") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_ns, "\"id\":\"overscale\",") == null);
 }
 
@@ -1906,7 +2008,7 @@ test "diff: same mariner -> [] (no ops)" {
     try std.testing.expectEqualStrings("[]", ops);
 }
 
-test "diff: display_other flip emits only setFilter ops" {
+test "diff: display_other flip emits setFilter ops + the soundings visibility rider" {
     const a = std.testing.allocator;
     const base = mariner.Settings{};
     const other = mariner.Settings{ .display_other = true };
@@ -1918,8 +2020,22 @@ test "diff: display_other flip emits only setFilter ops" {
     defer a.free(ops);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setFilter") != null);
     try std.testing.expect(std.mem.indexOf(u8, ops, "setPaintProperty") == null);
-    try std.testing.expect(std.mem.indexOf(u8, ops, "setLayoutProperty") == null);
-    try std.testing.expect(!std.mem.eql(u8, ops, "[]"));
+    // Auto soundings ride display OTHER (deriveLive parity), so this flip also
+    // toggles the soundings layers' visibility — a layout op, and nothing else.
+    try std.testing.expect(std.mem.indexOf(u8, ops, "setLayoutProperty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ops, "\"visibility\"") != null);
+    // An explicit soundings switch pins them, and the flip is filter-only again.
+    const base_pinned = mariner.Settings{ .show_soundings = true };
+    const other_pinned = mariner.Settings{ .display_other = true, .show_soundings = true };
+    const p1 = try buildFromTemplate(a, cs_template, &base_pinned, cs_ct, null, 1700000000);
+    defer a.free(p1);
+    const p2 = try buildFromTemplate(a, cs_template, &other_pinned, cs_ct, null, 1700000000);
+    defer a.free(p2);
+    const pops = try diff(a, p1, p2);
+    defer a.free(pops);
+    try std.testing.expect(std.mem.indexOf(u8, pops, "setFilter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pops, "setLayoutProperty") == null);
+    try std.testing.expect(!std.mem.eql(u8, pops, "[]"));
 }
 
 test "diff: day vs night emits setPaintProperty colour ops, no filter change" {
@@ -1944,6 +2060,19 @@ fn layerCount(a: std.mem.Allocator, style: []const u8) !usize {
     return p.value.object.get("layers").?.array.items.len;
 }
 
+/// SCAMIN gating must never appear as native minzoom (that is the per-value
+/// bucket explosion both merged modes exist to avoid). The only minzooms in a
+/// merged style are the fixed placement-pool tiers: 10 on minor text, 9 on
+/// contour labels.
+fn expectOnlyPlacementMinzooms(style_json: []const u8) !void {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, style_json, i, "\"minzoom\":")) |at| {
+        const v = style_json[at + 10 ..];
+        try std.testing.expect(std.mem.startsWith(u8, v, "10") or std.mem.startsWith(u8, v, "9"));
+        i = at + 10;
+    }
+}
+
 test "json: both merged modes (zoom-gate default, filter-gate exact) give one layer per render-type — no per-value buckets" {
     const a = std.testing.allocator;
     const ct =
@@ -1964,8 +2093,8 @@ test "json: both merged modes (zoom-gate default, filter-gate exact) give one la
     const merged = try json(a, base);
     defer a.free(merged);
     try std.testing.expect(std.mem.indexOf(u8, merged, "#sm") == null);
-    try std.testing.expect(std.mem.indexOf(u8, merged, "minzoom") == null);
-    try std.testing.expect(std.mem.indexOf(u8, merged, "[\">=\",[\"coalesce\",[\"get\",\"scamin\"],1000000000000],[\"/\",") != null);
+    try expectOnlyPlacementMinzooms(merged);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "[\"<=\",[\"coalesce\",[\"get\",\"vz\"],0],[\"zoom\"]]") != null);
 
     // Filter-gate (?scaminexact): one live-clause layer per family — the SAME layer
     // set, with the client-driven curDenom clause instead of the zoom expression.
@@ -1974,7 +2103,7 @@ test "json: both merged modes (zoom-gate default, filter-gate exact) give one la
     const gated = try json(a, fg);
     defer a.free(gated);
     try std.testing.expect(std.mem.indexOf(u8, gated, "#sm") == null); // no per-value buckets
-    try std.testing.expect(std.mem.indexOf(u8, gated, "minzoom") == null); // no native minzoom gating
+    try expectOnlyPlacementMinzooms(gated); // no scamin-derived native minzooms
     try std.testing.expect(std.mem.indexOf(u8, gated, "1000000000000") != null);
     try std.testing.expect(std.mem.indexOf(u8, gated, "\"scamin\"") != null);
 
@@ -2011,4 +2140,36 @@ test "json: scamin_filter_gate honors the cur_denom literal + ignore_scamin drop
     defer a.free(out_ign);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "1000000000000") == null);
     try std.testing.expect(std.mem.indexOf(u8, out_ign, "#sm") == null);
+}
+
+test "json: tile57/3 linestyle layers read per-style source-layers, constant icons, exact spacing" {
+    const a = std.testing.allocator;
+    const ct =
+        \\{"day":{"DEPDW":"#c9edff","CHMGD":"#c045d1"},"dusk":{},"night":{}}
+    ;
+    // Two analysed styles with different periods; ACHARE51 places one symbol.
+    const lsj =
+        \\{"ACHARE51":{"period_px":122.08,"dash":[0.0,7.559,22.677,38.552],"color_token":"CHMGD","width_px":1.209,"symbols":[{"o":18.898,"n":"EMAREMG1","r":0.0}]},
+        \\ "CBLSUB06":{"period_px":64.0,"dash":[32.0,32.0],"color_token":"CHMGD","width_px":1.0,"symbols":[{"o":8.0,"n":"CABLES11","r":0.0}]}}
+    ;
+    const out = try json(a, .{
+        .scheme = "day",
+        .colortables_json = ct,
+        .sprite = "sprite",
+        .glyphs = "glyphs/{fontstack}/{range}.pbf",
+        .linestyles_json = lsj,
+    });
+    defer a.free(out);
+    // Dash layer and symbol layer both read the style's OWN source-layer…
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"lines-ls-ACHARE51\",\"type\":\"line\",\"source\":\"chart\",\"source-layer\":\"lines-ls-ACHARE51\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"lines-ls-ACHARE51-sym0\",\"type\":\"symbol\",\"source\":\"chart\",\"source-layer\":\"lines-ls-ACHARE51\"") != null);
+    // …so no layer needs an ls_style membership filter or an icon-image match.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"get\",\"ls_style\"]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[\"match\",[\"get\",\"ls_style\"]") == null);
+    // The icon is the plain sprite name, the spacing the style's exact period.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"icon-image\":\"EMAREMG1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"symbol-spacing\":122.08") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"symbol-spacing\":64") != null);
+    // The base line layers keep the plain `lines` source-layer.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"id\":\"lines-solid\",\"type\":\"line\",\"source\":\"chart\",\"source-layer\":\"lines\"") != null);
 }

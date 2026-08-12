@@ -519,6 +519,11 @@ pub const TileSurface = struct {
     pick_areas: std.ArrayList(mvt.Feature) = .empty,
     /// Current feature meta, set by beginFeature; the draw methods read it.
     cur: Meta = .{ .display_priority = 0 },
+    /// Latitude (degrees) the v3 gate-zoom precomputes correct for — the
+    /// tile's centre. 0 (the equator) when the producer doesn't set it; the
+    /// gates then err late by the cos(lat) factor, exactly like the old
+    /// equator-only DENOM_Z0 did.
+    gate_lat: f64 = 0,
 
     const mvt_vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -783,10 +788,43 @@ pub const TileSurface = struct {
         try s.lines.appendSlice(s.a, s.lines_scamin.items);
         try s.points.appendSlice(s.a, s.points_scamin.items);
         try s.texts.appendSlice(s.a, s.texts_scamin.items);
+        // v3 tile schema (tile57/3): pre-evaluate, per feature, everything the
+        // MapLibre style otherwise re-derives per feature PER LAYER at tile
+        // layout — the gate zooms (vz/oz), the resolved filter flags (mq/iso),
+        // and the sort keys (ep/lsk). See augmentV3.
+        try augmentV3(s.a, s.areas.items, .area, s.gate_lat);
+        try augmentV3(s.a, s.area_patterns.items, .area, s.gate_lat);
+        try augmentV3(s.a, s.lines.items, .line, s.gate_lat);
+        try augmentV3(s.a, s.points.items, .point, s.gate_lat);
+        try augmentV3(s.a, s.soundings.items, .point, s.gate_lat);
+        try augmentV3(s.a, s.texts.items, .text, s.gate_lat);
         var layers = std.ArrayList(mvt.Layer).empty;
         if (s.areas.items.len > 0) try layers.append(s.a, .{ .name = "areas", .features = s.areas.items });
         if (s.area_patterns.items.len > 0) try layers.append(s.a, .{ .name = "area_patterns", .features = s.area_patterns.items });
-        if (s.lines.items.len > 0) try layers.append(s.a, .{ .name = "lines", .features = s.lines.items });
+        // v3: linestyle-decorated lines split out of `lines` into one
+        // `lines-ls-<STYLE>` source-layer per linestyle. MapLibre's layout
+        // evaluates every style layer against every feature of that layer's
+        // source-layer — with all decorated lines in one bucket, ~130 ls
+        // layers each scanned every line feature of every tile. Split, a
+        // linestyle's two or three layers see only their own features, and a
+        // tile without the style doesn't carry the source-layer at all. The
+        // name keeps the `lines` prefix: the native replay/query paths
+        // dispatch on startsWith("lines") and portray them unchanged.
+        var base_lines = std.ArrayList(mvt.Feature).empty;
+        var ls_split: std.StringArrayHashMapUnmanaged(std.ArrayList(mvt.Feature)) = .empty;
+        for (s.lines.items) |f| {
+            const ls_id = propString(f.properties, "ls_style") orelse {
+                try base_lines.append(s.a, f);
+                continue;
+            };
+            const name = try std.fmt.allocPrint(s.a, "lines-ls-{s}", .{ls_id});
+            const g = try ls_split.getOrPut(s.a, name);
+            if (!g.found_existing) g.value_ptr.* = .empty else s.a.free(name);
+            try g.value_ptr.append(s.a, f);
+        }
+        if (base_lines.items.len > 0) try layers.append(s.a, .{ .name = "lines", .features = base_lines.items });
+        var ls_it = ls_split.iterator();
+        while (ls_it.next()) |e| try layers.append(s.a, .{ .name = e.key_ptr.*, .features = e.value_ptr.items });
         if (s.points.items.len > 0) try layers.append(s.a, .{ .name = "point_symbols", .features = s.points.items });
         if (s.soundings.items.len > 0) try layers.append(s.a, .{ .name = "soundings", .features = s.soundings.items });
         if (s.texts.items.len > 0) try layers.append(s.a, .{ .name = "text", .features = s.texts.items });
@@ -798,6 +836,102 @@ pub const TileSurface = struct {
         };
     }
 };
+
+fn propValue(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
+    for (props) |p| if (std.mem.eql(u8, p.key, key)) return p.value;
+    return null;
+}
+
+fn propString(props: []const mvt.Prop, key: []const u8) ?[]const u8 {
+    return switch (propValue(props, key) orelse return null) {
+        .string => |v| v,
+        else => null,
+    };
+}
+
+fn propInt(props: []const mvt.Prop, key: []const u8) ?i64 {
+    return switch (propValue(props, key) orelse return null) {
+        .int => |v| v,
+        .uint => |v| @intCast(v),
+        else => null,
+    };
+}
+
+fn propNum(props: []const mvt.Prop, key: []const u8) ?f64 {
+    return switch (propValue(props, key) orelse return null) {
+        .int => |v| @floatFromInt(v),
+        .uint => |v| @floatFromInt(v),
+        .float => |v| v,
+        .double => |v| v,
+        else => null,
+    };
+}
+
+const AugmentKind = enum { area, line, point, text };
+
+/// v3 (tile57/3) per-feature precomputes. MapLibre evaluates every style
+/// layer's filter, sort key and data-driven layout against every feature of
+/// the layer's source-layer, on every tile layout — so an expression node
+/// there runs |features| × |layers| times. Everything here is a pure function
+/// of properties the feature already carries, folded once at bake:
+///  - vz (f32): the fractional display zoom at which the feature's SCAMIN
+///    admits it — `["<=",["get","vz"],["zoom"]]` replaces the
+///    coalesce/divide/pow clause. Latitude-corrected with the TILE's centre
+///    latitude (finer than the style's one archive-centre latitude).
+///  - oz (f32): the display zoom above which the cell is overscaled — the
+///    same fold of the oscl denominator gate.
+///  - mq (int 1): present on M_QUAL features; the data-quality clause becomes
+///    an int check instead of a string compare.
+///  - iso (int 1): present on ISODGR01 danger symbols; the isolated-danger
+///    category override stops string-comparing symbol_name per feature.
+///  - lt (int 1): present on LIGHTS points; the point-family partition stops
+///    string-comparing class per feature.
+///  - ep (int): the effective DrawingPriority sort value the point layers
+///    order by — display_plane*64 + display_priority, with the S-52
+///    danger-over-sounding deviation (OBSTRN/WRECKS/UWTROC → 19) folded in.
+///  - lsk (int): the line z-order sort value — priority*1000 - width_px, so
+///    an S-52 outline+ink pair keeps the wide outline underneath.
+fn augmentV3(a: Allocator, feats: []mvt.Feature, kind: AugmentKind, gate_lat: f64) !void {
+    for (feats) |*f| {
+        var extra = std.ArrayList(mvt.Prop).empty;
+        if (propNum(f.properties, "scamin")) |sc| if (sc > 0) {
+            const vz: f32 = @floatCast(style.scaminDisplayZoom(sc, gate_lat));
+            try extra.append(a, .{ .key = "vz", .value = .{ .float = vz } });
+        };
+        if (propNum(f.properties, "oscl")) |osc| if (osc > 0) {
+            const oz: f32 = @floatCast(style.scaminDisplayZoom(osc, gate_lat));
+            try extra.append(a, .{ .key = "oz", .value = .{ .float = oz } });
+        };
+        const class = propString(f.properties, "class") orelse "";
+        if (std.mem.eql(u8, class, "M_QUAL"))
+            try extra.append(a, .{ .key = "mq", .value = .{ .int = 1 } });
+        switch (kind) {
+            .point => {
+                if (propString(f.properties, "symbol_name")) |sn| if (std.mem.eql(u8, sn, "ISODGR01"))
+                    try extra.append(a, .{ .key = "iso", .value = .{ .int = 1 } });
+                if (std.mem.eql(u8, class, "LIGHTS"))
+                    try extra.append(a, .{ .key = "lt", .value = .{ .int = 1 } });
+                const danger = std.mem.eql(u8, class, "OBSTRN") or
+                    std.mem.eql(u8, class, "WRECKS") or std.mem.eql(u8, class, "UWTROC");
+                const ep: i64 = if (danger) 19 else (propInt(f.properties, "display_plane") orelse 0) * 64 +
+                    (propInt(f.properties, "display_priority") orelse 0);
+                try extra.append(a, .{ .key = "ep", .value = .{ .int = ep } });
+            },
+            .line => {
+                const w = propNum(f.properties, "width_px") orelse 1;
+                const lsk: i64 = (propInt(f.properties, "display_priority") orelse 0) * 1000 -
+                    @as(i64, @intFromFloat(@round(w)));
+                try extra.append(a, .{ .key = "lsk", .value = .{ .int = lsk } });
+            },
+            .area, .text => {},
+        }
+        if (extra.items.len == 0) continue;
+        var all = try a.alloc(mvt.Prop, f.properties.len + extra.items.len);
+        @memcpy(all[0..f.properties.len], f.properties);
+        @memcpy(all[f.properties.len..], extra.items);
+        f.properties = all;
+    }
+}
 
 /// SCAMIN (1:N) denominator the feature carries, or null when absent/invalid.
 pub fn featureScamin(f: s57.Feature) ?i64 {
@@ -2226,6 +2360,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
     const box = tile.Box.default(tile.EXTENT, tile.BUFFER);
 
     var mvt_surf = TileSurface.init(a, format);
+    mvt_surf.gate_lat = (tb[1] + tb[3]) * 0.5;
     const surf = mvt_surf.asSurface();
     try surf.beginScene(z);
 
@@ -3187,4 +3322,86 @@ test {
     _ = lightreach;
     _ = linestyle;
     _ = replay;
+}
+
+test "endScene v3: ls_style lines split into per-style source-layers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ms = TileSurface.init(a, .mvt);
+    const mk = struct {
+        fn line(al: Allocator, props: []const mvt.Prop) !mvt.Feature {
+            const parts = try al.alloc([]const mvt.Point, 1);
+            const pts = try al.alloc(mvt.Point, 2);
+            pts[0] = .{ .x = 0, .y = 0 };
+            pts[1] = .{ .x = 100, .y = 100 };
+            parts[0] = pts;
+            return .{ .geom_type = .linestring, .parts = parts, .properties = props };
+        }
+    };
+    try ms.lines.append(a, try mk.line(a, &.{.{ .key = "class", .value = .{ .string = "DEPCNT" } }}));
+    try ms.lines.append(a, try mk.line(a, &.{ .{ .key = "class", .value = .{ .string = "CBLSUB" } }, .{ .key = "ls_style", .value = .{ .string = "CBLSUB06" } } }));
+    try ms.lines.append(a, try mk.line(a, &.{ .{ .key = "class", .value = .{ .string = "ACHARE" } }, .{ .key = "ls_style", .value = .{ .string = "ACHARE51" } } }));
+    const bytes = try TileSurface.endScene(&ms, a);
+    const layers = try mvt.decode(a, bytes);
+    var names = std.ArrayList([]const u8).empty;
+    for (layers) |l| try names.append(a, l.name);
+    // One base lines layer (the undecorated contour) + one layer per ls style.
+    var have_lines = false;
+    var have_cbl = false;
+    var have_ach = false;
+    for (layers) |l| {
+        if (std.mem.eql(u8, l.name, "lines")) {
+            have_lines = true;
+            try std.testing.expectEqual(@as(usize, 1), l.features.len);
+        }
+        if (std.mem.eql(u8, l.name, "lines-ls-CBLSUB06")) have_cbl = true;
+        if (std.mem.eql(u8, l.name, "lines-ls-ACHARE51")) have_ach = true;
+    }
+    try std.testing.expect(have_lines and have_cbl and have_ach);
+}
+
+test "augmentV3: vz/ep/lt/iso/mq/lsk precomputes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const findP = struct {
+        fn f(props: []const mvt.Prop, key: []const u8) ?mvt.Value {
+            return propValue(props, key);
+        }
+    }.f;
+
+    // A SCAMIN'd point at the equator: vz must equal the style's display zoom.
+    var pts = [_]mvt.Feature{.{ .geom_type = .point, .parts = &.{}, .properties = &.{
+        .{ .key = "scamin", .value = .{ .int = 45000 } },
+        .{ .key = "class", .value = .{ .string = "LIGHTS" } },
+        .{ .key = "display_priority", .value = .{ .int = 24 } },
+    } }};
+    try augmentV3(a, &pts, .point, 0);
+    const style_mod = @import("style");
+    const want_vz: f32 = @floatCast(style_mod.scaminDisplayZoom(45000, 0));
+    try std.testing.expectEqual(want_vz, findP(pts[0].properties, "vz").?.float);
+    try std.testing.expectEqual(@as(i64, 1), findP(pts[0].properties, "lt").?.int);
+    try std.testing.expectEqual(@as(i64, 24), findP(pts[0].properties, "ep").?.int);
+
+    // A danger class folds to the ep 19 deviation; ISODGR01 carries iso.
+    var dgr = [_]mvt.Feature{.{ .geom_type = .point, .parts = &.{}, .properties = &.{
+        .{ .key = "class", .value = .{ .string = "WRECKS" } },
+        .{ .key = "symbol_name", .value = .{ .string = "ISODGR01" } },
+        .{ .key = "display_priority", .value = .{ .int = 12 } },
+    } }};
+    try augmentV3(a, &dgr, .point, 0);
+    try std.testing.expectEqual(@as(i64, 19), findP(dgr[0].properties, "ep").?.int);
+    try std.testing.expectEqual(@as(i64, 1), findP(dgr[0].properties, "iso").?.int);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findP(dgr[0].properties, "lt"));
+
+    // A line: lsk = priority*1000 - width; M_QUAL carries mq.
+    var lns = [_]mvt.Feature{.{ .geom_type = .linestring, .parts = &.{}, .properties = &.{
+        .{ .key = "class", .value = .{ .string = "M_QUAL" } },
+        .{ .key = "display_priority", .value = .{ .int = 3 } },
+        .{ .key = "width_px", .value = .{ .double = 2.0 } },
+    } }};
+    try augmentV3(a, &lns, .line, 0);
+    try std.testing.expectEqual(@as(i64, 2998), findP(lns[0].properties, "lsk").?.int);
+    try std.testing.expectEqual(@as(i64, 1), findP(lns[0].properties, "mq").?.int);
 }

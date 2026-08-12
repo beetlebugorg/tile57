@@ -1878,7 +1878,7 @@ test "ground-length directional leg bakes across every tile it crosses" {
         const layers = try mvt.decode(a, raw);
         var legs: usize = 0;
         for (layers) |L| {
-            if (std.mem.eql(u8, L.name, "lines")) legs += L.features.len;
+            if (std.mem.startsWith(u8, L.name, "lines")) legs += L.features.len;
         }
         try std.testing.expect(legs > 0);
     }

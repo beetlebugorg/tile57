@@ -291,6 +291,10 @@ fn composeLayers(ra: std.mem.Allocator, part: *const geometry.partition.Partitio
     const compose = clip;
     var buckets: [N_COMPOSE_LAYERS]std.ArrayList(mvt.Feature) = undefined;
     for (&buckets) |*b| b.* = std.ArrayList(mvt.Feature).empty;
+    // tile57/3 splits linestyle-decorated lines into per-style
+    // `lines-ls-<STYLE>` source-layers; the split survives a seam compose by
+    // bucketing those layers by NAME beside the fixed canonical set.
+    var ls_buckets: std.StringArrayHashMapUnmanaged(std.ArrayList(mvt.Feature)) = .empty;
     // EVERY contribution arrives with its region already rect-clipped to the
     // tile, so projection, clipping and memory here are bounded by the TILE —
     // never by the face (whole-cell faces at coarse tiers are hundreds of
@@ -323,10 +327,19 @@ fn composeLayers(ra: std.mem.Allocator, part: *const geometry.partition.Partitio
         var fgrid = try geometry.plane.EdgeGrid.init(sa2, face_px, 512);
         defer fgrid.deinit();
         for (layers) |layer| {
-            const li = layerIndex(layer.name) orelse continue;
+            const bucket: *std.ArrayList(mvt.Feature) = if (layerIndex(layer.name)) |li|
+                &buckets[li]
+            else if (std.mem.startsWith(u8, layer.name, "lines-ls-")) blk: {
+                const g = try ls_buckets.getOrPut(ra, layer.name);
+                if (!g.found_existing) {
+                    g.key_ptr.* = try ra.dupe(u8, layer.name);
+                    g.value_ptr.* = .empty;
+                }
+                break :blk g.value_ptr;
+            } else continue;
             var tmpb = std.ArrayList(mvt.Feature).empty;
             for (layer.features) |feat| try compose.clipFeatureToFace(sa2, &tmpb, feat, face_px, &fgrid);
-            for (tmpb.items) |f| try buckets[li].append(ra, try dupeFeature(ra, f));
+            for (tmpb.items) |f| try bucket.append(ra, try dupeFeature(ra, f));
         }
     }
     // Reach-ring cells: no owned ground in this tile, but their light sector
@@ -352,6 +365,24 @@ fn composeLayers(ra: std.mem.Allocator, part: *const geometry.partition.Partitio
         if (bucket.items.len == 0) continue;
         const feats = try orientPolys(ra, bucket.items);
         try out_layers.append(ra, .{ .name = mvt.VECTOR_LAYERS[li], .features = feats });
+        // The per-style line layers ride right after their base layer, keeping
+        // the canonical order around them.
+        if (std.mem.eql(u8, mvt.VECTOR_LAYERS[li], "lines")) {
+            var it = ls_buckets.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.items.len == 0) continue;
+                try out_layers.append(ra, .{ .name = e.key_ptr.*, .features = e.value_ptr.items });
+            }
+        }
+    }
+    // A tile can carry ls layers with an empty base `lines` bucket; they must
+    // not vanish with it.
+    if (buckets[layerIndex("lines").?].items.len == 0) {
+        var it = ls_buckets.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.items.len == 0) continue;
+            try out_layers.append(ra, .{ .name = e.key_ptr.*, .features = e.value_ptr.items });
+        }
     }
     if (out_layers.items.len == 0) return null;
     return out_layers.items;
