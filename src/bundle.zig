@@ -234,6 +234,19 @@ pub fn spriteMlnBytes(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8,
     return sprite.spriteMln(a, symbols, fills, css, soundings, ratio);
 }
 
+/// Render one comma-joined symbol run (sounding digit stack) to a
+/// pivot-centred RGBA image — the runtime answer to MapLibre's missing-image
+/// event, for the runs no prebaked sheet can enumerate. Null when the run
+/// names no known glyph. Caller owns the pixels (allocated in `a`).
+pub fn symbolRunImage(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, run: []const u8, ratio: f64) !?sprite.RunImage {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const symbols = try readSymbols(io, ar, catalog_dir);
+    const css = try readCss(io, ar, catalog_dir, css_name);
+    return sprite.renderSymbolRun(a, symbols, css, run, ratio);
+}
+
 // Emit sprite-mln.{json,png} + identical @2x copies (MapLibre requests @2x on
 // HiDPI; a missing @2x sheet fails the whole sprite load).
 pub fn emitSpriteMln(io: std.Io, a: std.mem.Allocator, catalog_dir: []const u8, css_name: []const u8, out_dir: []const u8, base: []const u8, soundings: []const []const u8) !sprite.Atlas {

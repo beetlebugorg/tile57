@@ -500,6 +500,17 @@ const MlnCell = struct { name: []const u8, w: u32, h: u32, ratio: f64, rgba: []c
 /// The GPU-scene cell-map (chart.buildGpuAtlases) and a host's uploaded texture
 /// (tile57_bake_sprite_mln) MUST pass the SAME ratio, or the normalized UVs the
 /// scene emits will not index the texture the host uploaded.
+/// Every MapLibre-drawn symbol renders at the engine SYMBOL_SCALE (0.0283…),
+/// measured across a full ENC library (134k features, 4.5k distinct names,
+/// not one above it). The sheet used to rasterize at the 0.08 catalogue scale
+/// — 8x the area anything ever drew at — and the oversize was both the
+/// resident-memory floor (the map clones every image per style) and the
+/// frame-time floor (its atlas churn ran renderUpdate at 60+ ms during a
+/// zoom). Baked at drawn scale, icon-size 1.0 samples the artwork 1:1.
+/// maplibre.zig's icon-size divisor must equal SYMBOL_SCALE for that to hold;
+/// a test there asserts the pairing.
+pub const mln_drawn_scale: f64 = 0.02834627777338028 / 0.08;
+
 pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8, soundings: []const []const u8, ratio: f64) !Atlas {
     return spriteMlnOpts(a, symbols, fills, css_data, soundings, ratio, true);
 }
@@ -512,7 +523,10 @@ pub fn spriteMlnOpts(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []con
     defer arena_state.deinit();
     const ar = arena_state.allocator();
     var css = try loadCss(ar, css_data);
-    const ppm = px_per_mm * ratio; // device px per mm at this display ratio
+    // Drawn scale folded in: cells carry exactly the pixels the display uses
+    // (see mln_drawn_scale). The GPU-scene atlas takes a different path and
+    // keeps its own scale model.
+    const ppm = px_per_mm * ratio * mln_drawn_scale; // device px per mm as DRAWN
     const cell_cap: f64 = @as(f64, @floatFromInt(max_cell_side)) * ratio;
     const atlas_w: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(sprite_atlas_width)) * ratio));
 
@@ -572,6 +586,57 @@ pub fn spriteMlnOpts(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []con
     }
 
     return packMlnOpts(a, ar, cells.items, atlas_w, want_pixels);
+}
+
+/// Render ONE comma-joined glyph run (a sounding digit stack, a contour label
+/// composite) to a pivot-centred RGBA image at `ratio`, from the symbol SVG
+/// set + palette css. The runtime path behind MapLibre's missing-image event:
+/// a library carries far more distinct runs than any prebaked sheet can, so
+/// the host renders each one the map actually asks for. Caller owns rgba.
+pub const RunImage = struct { w: u32, h: u32, rgba: []u8 };
+pub fn renderSymbolRun(a: std.mem.Allocator, symbols: []const SvgSrc, css_data: []const u8, run: []const u8, ratio: f64) !?RunImage {
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const ar = arena_state.allocator();
+    var css = try loadCss(ar, css_data);
+    const ppm = px_per_mm * ratio;
+
+    var rendered = std.StringHashMap(RenderedSym).init(ar);
+    var it = std.mem.tokenizeScalar(u8, run, ',');
+    while (it.next()) |name| {
+        if (rendered.contains(name)) continue;
+        for (symbols) |s| {
+            if (!std.mem.eql(u8, s.id, name)) continue;
+            const sym = renderSymAt(ar, s.svg, &css, ppm * mln_drawn_scale) orelse break;
+            try rendered.put(s.id, sym);
+            break;
+        }
+    }
+    const t = compositeSounding(ar, &rendered, run) orelse return null;
+    return .{ .w = t.w, .h = t.h, .rgba = try a.dupe(u8, t.rgba) };
+}
+
+test "renderSymbolRun composites a two-glyph run pivot-centred" {
+    const a = std.testing.allocator;
+    // Two tiny synthetic glyphs with distinct pivots; the composite must be
+    // non-empty and sized to hold both about the shared pivot.
+    const svg1 =
+        \\<svg width="4mm" height="4mm" viewBox="0 0 4 4"><rect x="0" y="0" width="4" height="4" class="sl"/><circle id="p" cx="1" cy="2" r="0"/></svg>
+    ;
+    const svg2 =
+        \\<svg width="4mm" height="4mm" viewBox="0 0 4 4"><rect x="0" y="0" width="4" height="4" class="sl"/><circle id="p" cx="3" cy="2" r="0"/></svg>
+    ;
+    const syms = [_]SvgSrc{ .{ .id = "GA", .svg = svg1 }, .{ .id = "GB", .svg = svg2 } };
+    const css = ".sl{fill:#112233}";
+    const img = try renderSymbolRun(a, &syms, css, "GA,GB", 1.0);
+    if (img) |i| {
+        defer a.free(i.rgba);
+        try std.testing.expect(i.w > 0 and i.h > 0);
+        try std.testing.expect(i.rgba.len == @as(usize, i.w) * i.h * 4);
+    }
+    // A run of unknown glyphs renders nothing rather than failing.
+    const none = try renderSymbolRun(a, &syms, css, "NOPE1,NOPE2", 1.0);
+    try std.testing.expect(none == null);
 }
 
 // Composite a comma-joined glyph list (e.g. "SOUNDSC3,SOUNDS12,SOUNDS54") into

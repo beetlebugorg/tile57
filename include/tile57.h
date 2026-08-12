@@ -1582,6 +1582,17 @@ tile57_status tile57_bake_assets(const char *catalog_dir, tile57_assets *out,
 tile57_status tile57_bake_sprite_mln(const char *catalog_dir, double pixel_ratio,
                                      tile57_scheme scheme,
                                      tile57_assets *out, tile57_error *err);
+/* Render ONE comma-joined symbol run (a sounding digit stack such as
+ * "SOUNDG11,SOUNDG53") to a pivot-centred RGBA image at pixel_ratio, coloured
+ * for `scheme`. The runtime path behind a map client's missing-image event: a
+ * chart library carries more distinct runs than any prebaked sheet can
+ * enumerate, so the host renders exactly the ones the display asks for.
+ * TILE57_OK with *out_rgba NULL when the run names no known glyph (absent,
+ * not an error). Free *out_rgba with tile57_free. */
+tile57_status tile57_render_symbol_run(const char *catalog_dir, const char *run,
+                                       double pixel_ratio, int scheme,
+                                       uint8_t **out_rgba, uint32_t *out_w,
+                                       uint32_t *out_h, tile57_error *err);
 /* SDF glyph atlas for GPU text: sprite_png is the RGBA signed-distance-field atlas
  * of the label font; sprite_json is {"em_px","pad","glyphs":{codepoint:[u0,v0,u1,
  * v1,off_x,off_y,w,h,advance]}} with the quad geometry in EM units (multiply by the

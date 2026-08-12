@@ -20,7 +20,9 @@ const raster = @import("raster"); // raster charts (tile57_raster_chart_*)
 const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
 // The S-52 ColorProfiles/colorProfile.xml baked into the library (build.zig), so
 // the style C ABI generates colortables + a base style template with no on-disk
-// catalogue. Symbols/linestyles are NOT embedded here (only the bake exe needs them).
+// catalogue. The full catalogue (symbols, linestyles, css) is embedded too, via
+// the `catalog` module bundle.zig imports — tile57_style_template reads the
+// analysed linestyles from it and tile57_bake_sprite_mln the symbol SVGs.
 const colorprofile_registry = @import("colorprofile_registry");
 
 // c_allocator, not smp_allocator: smp never returns freed slabs to the OS, so
@@ -1996,6 +1998,46 @@ export fn tile57_bake_sprite_mln(catalog_dir: ?[*:0]const u8, pixel_ratio: f64, 
         tile57_assets_free(o);
         return fail(err, e);
     };
+    return OK;
+}
+
+/// Render one comma-joined symbol run (a sounding digit stack like
+/// "SOUNDG11,SOUNDG53") to a pivot-centred RGBA image at `pixel_ratio`, in
+/// the palette of `scheme`. The runtime path behind MapLibre's missing-image
+/// event: a chart library carries more distinct runs than a prebaked sheet
+/// can enumerate, so the host renders exactly the ones the map asks for.
+/// TILE57_OK with *out_rgba NULL when the run names no known glyph (absent,
+/// not an error). Free *out_rgba with tile57_free.
+export fn tile57_render_symbol_run(
+    catalog_dir: ?[*:0]const u8,
+    run: ?[*:0]const u8,
+    pixel_ratio: f64,
+    scheme: c_int,
+    out_rgba: ?*?[*]u8,
+    out_w: ?*u32,
+    out_h: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out_rgba orelse return failWith(err, .badarg, "out_rgba must not be null");
+    const ow = out_w orelse return failWith(err, .badarg, "out_w must not be null");
+    const oh = out_h orelse return failWith(err, .badarg, "out_h must not be null");
+    o.* = null;
+    ow.* = 0;
+    oh.* = 0;
+    const r = run orelse return failWith(err, .badarg, "run must not be null");
+    const cd = spanOpt(catalog_dir) orelse "";
+    const ratio = if (pixel_ratio > 0) pixel_ratio else 1;
+    const img = bundle.symbolRunImage(sharedIo(), gpa, cd, svgCssFor(scheme), std.mem.span(r), ratio) catch |e| return fail(err, e);
+    if (img) |i| {
+        // Through the export-header convention (exportAlloc/tile57_free) like
+        // every other buffer this ABI hands out; the engine copy is freed here.
+        defer gpa.free(i.rgba);
+        const p = exportAlloc(i.rgba.len) orelse return failWith(err, .nomem, "out of memory");
+        @memcpy(p[0..i.rgba.len], i.rgba);
+        o.* = p;
+        ow.* = i.w;
+        oh.* = i.h;
+    }
     return OK;
 }
 
