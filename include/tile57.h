@@ -1467,6 +1467,29 @@ tile57_status tile57_compose_tile(tile57_compose *c, uint8_t z, uint32_t x, uint
                                    uint8_t **out, size_t *out_len, bool *out_owned,
                                    tile57_error *err);
 
+/* How wide YOU draw a tile: 256 (the default, the native convention) or 512 (the
+ * MapLibre style spec's world tile).
+ *
+ * A vector tile from tile57_compose_tile has its complex (symbolised) linestyles
+ * WALKED into plain geometry — each dash "on" run a solid line, each embedded
+ * symbol a point rotated to the local tangent at its own offset in the period,
+ * phased from the run's arc origin. S-101 lays those figures out in
+ * 256-px-per-tile space, so this is what the rhythm is restated in. It moves
+ * spacing only: never stroke width, never symbol size. The wrong value is
+ * invisible in the geometry and plain on the chart, as the right rhythm at the
+ * wrong spacing.
+ *
+ * A composed tile is drawn from a style, and a style cannot say where in a
+ * period a symbol sits, which is why the walk is not optional: ACHARE51 places
+ * four symbols at 5, 13.1, 21.2 and 29.3 mm of its 32.3 mm period, and a style
+ * can only ask for "one per period". The archives are untouched — they keep the
+ * stored run, which is display-independent, and the engine's own replay walks it
+ * at whatever scale it draws at.
+ *
+ * 0 is ignored. A raster compositor ignores this entirely; pictures carry no
+ * linestyles. */
+void tile57_compose_set_px_per_tile(tile57_compose *c, uint32_t px_per_tile);
+
 /* The composed view outputs — tile57_chart_png / tile57_chart_pdf / tile57_chart_canvas /
  * tile57_chart_surface across the WHOLE composed set: every covering tile is
  * composed on demand (stitched through the ownership partition) and

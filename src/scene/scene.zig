@@ -524,6 +524,22 @@ pub const TileSurface = struct {
     /// gates then err late by the cos(lat) factor, exactly like the old
     /// equator-only DENOM_Z0 did.
     gate_lat: f64 = 0,
+    /// Walk complex linestyles into plain geometry instead of storing the run
+    /// un-tessellated. See `walk_vtable`; set by walkTile, never by the bake.
+    walk_linestyles: bool = false,
+    /// What the walk multiplies its period, dash offsets and symbol offsets by
+    /// — reported through the Surface's size_scale, which is the only channel
+    /// drawComplexRun reads. It scales the RHYTHM only: the stroke width comes
+    /// from the run's own width_px and the symbol size from SYMBOL_SCALE, and
+    /// neither passes through here.
+    ///
+    /// It exists because S-101 lays its linestyle figures out in 256-px-per-tile
+    /// space, and a consumer that draws a tile WIDER needs the period in FEWER
+    /// tile units to come out the same size on glass: 1.0 for a 256 px tile,
+    /// 0.5 for the style spec's 512. Getting it wrong is invisible in the
+    /// geometry and obvious on the chart — the rhythm is right, the spacing is
+    /// doubled (or halved).
+    linestyle_scale: f64 = 1.0,
 
     const mvt_vtable = rs.Surface.VTable{
         .beginScene = beginScene,
@@ -544,12 +560,37 @@ pub const TileSurface = struct {
         .draw_depth_text = drawDepthText,
     };
 
+    /// The same table with `store_complex_run` withheld, which is how
+    /// drawComplexLine is told to WALK a complex linestyle instead of storing
+    /// it: the period is stepped here and the tile receives the result as
+    /// ordinary geometry — each dash on-run a solid line, each embedded symbol
+    /// a rotated point at its own offset in the period.
+    ///
+    /// The bake never wants this (a stored run keeps the archive
+    /// display-independent, so spacing and symbol size scale together at
+    /// render). A COMPOSE does: it runs per session at a known display scale,
+    /// and its consumer may be a style-driven renderer with no way to express
+    /// where in a period a symbol sits — S-52 puts several at different
+    /// offsets (ACHARE51: 5, 13.1, 21.2, 29.3 mm) and the MapLibre style spec
+    /// has no property for it. Walking here settles it in the geometry, which
+    /// is the same answer tile57's own renderer draws.
+    const walk_vtable = blk: {
+        var v = mvt_vtable;
+        v.store_complex_run = null;
+        v.size_scale = walkSizeScale;
+        break :blk v;
+    };
+
+    fn walkSizeScale(ctx: *anyopaque) f64 {
+        return sp(ctx).linestyle_scale;
+    }
+
     pub fn init(a: Allocator, format: TileFormat) TileSurface {
         return .{ .a = a, .format = format };
     }
 
     pub fn asSurface(self: *TileSurface) rs.Surface {
-        return .{ .ptr = self, .vtable = &mvt_vtable };
+        return .{ .ptr = self, .vtable = if (self.walk_linestyles) &walk_vtable else &mvt_vtable };
     }
 
     fn sp(ctx: *anyopaque) *TileSurface {
@@ -2383,6 +2424,37 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
         try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 
+    return surf.endScene(out);
+}
+
+/// Re-encode a decoded tile with every complex linestyle WALKED into plain
+/// geometry: each dash on-run becomes a solid line, each embedded symbol a
+/// point rotated to the local tangent, at its own offset in the period and
+/// phased from the run's `ls_arc0`. Everything else replays verbatim.
+///
+/// This is the same walk tile57's own renderer does — replay.zig routes an
+/// `ls_style` run through linestyle.drawComplexRun — pointed at a tile
+/// surface instead of a pixel one. It exists for a consumer that draws from a
+/// MapLibre style: the style spec cannot say where in a period a symbol sits,
+/// so a style-driven renderer stacks every symbol of a linestyle on one phase.
+/// Walking here puts the answer in the geometry, where any renderer can read
+/// it, and the `lines-ls-*` decoration layers become unnecessary.
+///
+/// The archive is untouched and stays display-independent; only this composed
+/// copy is walked.
+///
+/// `px_per_tile` is how wide the CONSUMER draws a tile, because S-101 lays its
+/// linestyle figures out in 256-px-per-tile space and the walk has to restate
+/// the period in the consumer's: 256 for the native path, 512 for a MapLibre
+/// style-spec renderer. It moves the rhythm only, never the stroke width or
+/// the symbol size.
+pub fn walkTile(scratch: Allocator, out: Allocator, layers: []const mvt.DecodedLayer, format: TileFormat, z: u8, px_per_tile: f64) ![]u8 {
+    var ts = TileSurface.init(scratch, format);
+    ts.walk_linestyles = true;
+    ts.linestyle_scale = if (px_per_tile > 0) 256.0 / px_per_tile else 1.0;
+    const surf = ts.asSurface();
+    try surf.beginScene(z);
+    try replay.replayTile(scratch, surf, layers);
     return surf.endScene(out);
 }
 

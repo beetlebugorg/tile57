@@ -10,6 +10,8 @@
 const std = @import("std");
 const chart = @import("chart.zig");
 const auxfiles = @import("engine").auxfiles; // via the named module: engine owns the file
+const scene = @import("engine").scene; // tile surface + the complex-linestyle walk
+const mlt_dec = @import("tiles").mlt; // decoding a verbatim composed tile
 const s57 = @import("s57");
 const bundle = @import("bundle"); // portrayal-asset emitters + the partition debug bake
 const compose = @import("compose"); // the runtime tile compositor (tile57_compose_*)
@@ -1731,16 +1733,63 @@ export fn tile57_compose_tile(
     const o, const n = bytesOut(out, out_len) catch return failWith(err, .badarg, bad_out);
     if (out_owned) |p| p.* = false;
     const src = handle orelse return failWith(err, .badarg, "compose handle must not be null");
+    // Pictures carry no linestyles, so a raster compositor takes the plain path.
+    if (src.kind == .vector) return composeWalked(src, z, x, y, o, n, out_owned, err);
     const res = src.tile(gpa, z, x, y) catch |e| return fail(err, e);
     if (out_owned) |p| p.* = res.owned;
     if (res.tile) |t| return exportOut(err, o, n, t);
     return OK;
 }
 
-/// Render a VIEW over the compositor to PNG — the composed twin of tile57_chart_png:
-/// every covering tile is composed on demand (seams stitched through the
-/// ownership partition) and replayed through the native S-52 pixel path. See
-/// tile57.h.
+/// tile57_compose_tile's body for a vector compositor: compose to FEATURES,
+/// step every complex linestyle into plain geometry, re-encode.
+///
+/// Always, rather than on request. A composed tile is drawn from a STYLE, and a
+/// style cannot say where in a linestyle period a symbol sits — so the
+/// un-walked form draws every symbol of a style at one phase and loses the S-52
+/// rhythm. The only thing that can re-walk a stored run is the engine's own
+/// replay, which reads tileContent directly and never comes through here.
+///
+/// The compositor answers `.layers` where a tile seam-composes and `.bytes`
+/// where one cell owns the whole tile and its stored blob passes through
+/// verbatim. Both must be walked, or every tile away from a cell boundary
+/// silently goes missing.
+fn composeWalked(
+    src: *compose.ComposeSource,
+    z: u8,
+    x: u32,
+    y: u32,
+    o: *?[*]u8,
+    n: *usize,
+    out_owned: ?*bool,
+    err: ?*CError,
+) c_int {
+    // The decoded features live only long enough to be walked: an arena for
+    // the compose and the walk's scratch, the encoded tile alone in gpa.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ta = arena.allocator();
+    const px: f64 = @floatFromInt(src.draw_px_per_tile);
+
+    const res = src.tileContent(ta, z, x, y) catch |e| return fail(err, e);
+    const layers = switch (res.content) {
+        .layers => |l| l,
+        .bytes => |b| mlt_dec.decode(ta, b) catch |e| return fail(err, e),
+        .none => return OK,
+    };
+    const bytes = scene.walkTile(ta, gpa, layers, .mlt, z, px) catch |e| return fail(err, e);
+    if (out_owned) |p| p.* = true;
+    return exportOut(err, o, n, bytes);
+}
+
+/// How wide the caller draws a tile: 256 for the native convention, 512 for the
+/// MapLibre style spec's world tile. Sets what composed linestyle rhythms are
+/// restated in. See tile57.h.
+export fn tile57_compose_set_px_per_tile(handle: ?*compose.ComposeSource, px_per_tile: u32) void {
+    const src = handle orelse return;
+    if (px_per_tile != 0) src.draw_px_per_tile = px_per_tile;
+}
+
 export fn tile57_compose_png(
     handle: ?*compose.ComposeSource,
     lon: f64,

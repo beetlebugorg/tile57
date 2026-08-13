@@ -700,6 +700,17 @@ pub const ComposeSource = struct {
     render_cache: ?*anyopaque = null,
     render_cache_free: ?*const fn (*anyopaque) void = null,
 
+    /// How wide the CONSUMER draws a tile. Complex linestyles are walked into
+    /// plain geometry on the way out, and S-101 lays their figures out in
+    /// 256-px-per-tile space, so this is what the rhythm is restated in: 256
+    /// for that native convention, 512 for the MapLibre style spec's world
+    /// tile. It moves spacing only, never stroke width or symbol size.
+    ///
+    /// Held as a plain number because the compositor sits below the render
+    /// path and cannot name what does the walking; the C entry point reads
+    /// this and does the work.
+    draw_px_per_tile: u32 = 256,
+
     /// Compose one tile → raw (decompressed) MLT + the ownership flag (gpa-owned bytes; null when
     /// nothing rendered — `owned` then says whether a cell SHOULD have). This is what a live tile
     /// server hands its HTTP layer, which gzips on the wire. Byte-faithful to the batch.
