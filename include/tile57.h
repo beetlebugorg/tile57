@@ -244,6 +244,31 @@ tile57_status tile57_bake_tree(const char *in_dir, const char *out_dir, uint32_t
                                tile57_bake_progress progress, void *progress_ctx,
                                uint32_t *out_baked, tile57_error *err);
 
+/* tile57_bake_tree for an exchange set STILL IN ITS .zip: find the cells, name
+ * every output, bake. Nothing is unpacked — each cell is inflated as its turn
+ * comes, so importing an 800 MB archive never costs the disk a second copy of
+ * the source.
+ *
+ * Outputs mirror each entry's path BELOW the directory the archive wraps
+ * everything in. NOAA's All_ENCs.zip puts every cell under `ENC_ROOT/`, and
+ * that name belongs to the archive rather than to the library being built: an
+ * `out_dir` of `.../ENC_ROOT` writes `.../ENC_ROOT/US5MD12M/US5MD12M.pmtiles`,
+ * NOT a second ENC_ROOT inside the first. The prefix is computed from what the
+ * cells actually share, so an archive holding two districts keeps them apart —
+ * two districts carrying the same boundary cell keep their own copies, and
+ * each cell's referenced text lands beside the right chart. A cell sharing its
+ * directory with no other gets a directory named for itself.
+ *
+ * Same contract as tile57_bake_tree otherwise: `workers` is a MEMORY bound,
+ * `progress` (NULL to skip) fires per chart and may CANCEL by returning false,
+ * *out_baked (NULL to ignore) counts what was written. An archive holding no
+ * .000 is TILE57_OK with *out_baked 0 — nothing to do is not a failure. A host
+ * that wants each finished chart NAMED owns the list itself and calls
+ * tile57_bake_zip_charts. */
+tile57_status tile57_bake_zip(const char *zip_path, const char *out_dir, uint32_t workers,
+                              tile57_bake_progress progress, void *progress_ctx,
+                              uint32_t *out_baked, tile57_error *err);
+
 /* Names the chart that just finished, by its INDEX into the caller's in_paths.
  * Charts bake concurrently, so the count in tile57_bake_progress cannot say
  * which chart a step belongs to. Called from worker threads, out of order, so

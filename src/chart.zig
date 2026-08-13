@@ -1194,11 +1194,158 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
     return bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx, label, true);
 }
 
+/// Bake a whole exchange set STILL IN ITS ARCHIVE: find the cells, name every
+/// output, bake. The zip twin of `bakeTree`, and for the same reason — working
+/// out where each chart goes is this engine's job, not a thing every host
+/// reinvents. It had been reinvented three times before this existed (the CLI,
+/// the macOS shell, an Android path), and two of the three carried the
+/// archive's own wrapper directory into the output.
+///
+/// THE NAMING RULE. Mirror each entry's path BELOW the directory the archive
+/// wraps everything in. NOAA's All_ENCs.zip puts every cell under `ENC_ROOT/`;
+/// that name belongs to the archive, not to the library being built, so an
+/// `out_dir` of `.../ENC_ROOT` must not produce `.../ENC_ROOT/ENC_ROOT/`. The
+/// prefix is COMPUTED — the longest whole-component prefix the cells share —
+/// rather than assumed to be one level, so an archive holding two districts
+/// keeps them apart. That is what the mirroring is for: two districts carrying
+/// the same boundary cell keep their own copies instead of overwriting each
+/// other, and each cell's referenced text lands beside the right chart.
+///
+/// A cell sharing its directory with no other (a single-cell archive) gets a
+/// directory named for itself — the layout the aux manifest needs, and what a
+/// bake from a loose `.000` already writes.
+pub fn bakeZip(io: std.Io, zip_path: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel) !usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var arc = try zipsrc.Archive.open(a, io, zip_path);
+    defer arc.deinit();
+
+    var names = std.ArrayList([]const u8).empty;
+    for (arc.entries) |e| {
+        if (std.mem.endsWith(u8, e.name, ".000")) names.append(a, e.name) catch continue;
+    }
+    if (names.items.len == 0) return 0;
+
+    // Say the count the moment it is known, before the pass below decides what
+    // is already done. That pass stats one file per chart, which on a phone or
+    // tablet is slow enough to look like a hang — and until this fired the host
+    // had no denominator to draw anything but a spinner with.
+    if (progress) |p| {
+        if (!p(progress_ctx, 0, @intCast(names.items.len))) return 0;
+    }
+
+    const root = archiveRootPrefix(names.items);
+
+    // The cells this run will actually bake, and where each goes. `kept` is a
+    // subset of `names` once the incremental skip below has had its say, and
+    // the two lists must stay index-aligned: `label` names a chart by its index
+    // into what was HANDED to the bake, not into the archive.
+    var kept = std.ArrayList([]const u8).empty;
+    var out_paths = std.ArrayList([]const u8).empty;
+    for (names.items) |n| {
+        const base = std.fs.path.basename(n);
+        const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+        const dir = zipDirOf(n);
+        var rel = dir[@min(root.len, dir.len)..];
+        while (rel.len != 0 and rel[0] == '/') rel = rel[1..];
+        const chart_dir = if (rel.len == 0)
+            std.fs.path.join(a, &.{ out_dir, stem }) catch continue
+        else
+            std.fs.path.join(a, &.{ out_dir, rel }) catch continue;
+        const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
+        const out_path = std.fs.path.join(a, &.{ chart_dir, name }) catch continue;
+        // INCREMENTAL, as bakeTree is: an archive already newer than the zip it
+        // came from is done. A national exchange set is hours of work on a
+        // tablet and WILL be interrupted — the app is backgrounded, the battery
+        // goes, the mariner stops it to sail — and without this every resume
+        // starts from the first cell again and never finishes.
+        if (fileModNs(io, out_path)) |out_ns| {
+            if (fileModNs(io, zip_path)) |zip_ns| {
+                if (out_ns >= zip_ns) continue;
+            }
+        }
+        std.Io.Dir.cwd().createDirPath(io, chart_dir) catch {};
+        kept.append(a, n) catch continue;
+        out_paths.append(a, out_path) catch continue;
+    }
+    if (out_paths.items.len != kept.items.len) return error.OutOfMemory;
+    if (kept.items.len == 0) return 0; // everything already prepared
+
+    // Correct the count to the work actually left. A resumed import skips what
+    // it already baked, so the number from the listing was the archive's size,
+    // not this run's.
+    if (progress) |p| {
+        if (!p(progress_ctx, 0, @intCast(kept.items.len))) return 0;
+    }
+
+    return bakeZipChartsToFiles(io, &arc, kept.items, out_paths.items, rules_dir, workers, progress, progress_ctx, label, true);
+}
+
+/// Zip entry names always use '/', whatever the platform, so these split on
+/// that rather than on the host separator.
+fn zipDirOf(path: []const u8) []const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
+    return path[0..at];
+}
+
+/// The directory every one of `paths` sits under, as whole path components.
+pub fn archiveRootPrefix(paths: []const []const u8) []const u8 {
+    if (paths.len == 0) return "";
+    var pre: []const u8 = zipDirOf(paths[0]);
+    for (paths[1..]) |p| {
+        pre = commonComponents(pre, zipDirOf(p));
+        if (pre.len == 0) break;
+    }
+    return pre;
+}
+
+/// The longest common prefix of `a` and `b` ending on a component boundary, so
+/// `ENC_ROOT/US5` and `ENC_ROOT/US4` share `ENC_ROOT`, not `ENC_ROOT/US`.
+fn commonComponents(a: []const u8, b: []const u8) []const u8 {
+    var i: usize = 0;
+    var boundary: usize = 0;
+    while (i < a.len and i < b.len and a[i] == b[i]) : (i += 1) {
+        if (a[i] == '/') boundary = i;
+    }
+    if (i == a.len and (i == b.len or b[i] == '/')) return a;
+    if (i == b.len and a[i] == '/') return b;
+    return a[0..boundary];
+}
+
+test "an archive's own root directory is not part of the output path" {
+    // NOAA's All_ENCs.zip: every cell under one ENC_ROOT/. Carrying that
+    // through made `-o ~/Charts/ENC_ROOT` write ~/Charts/ENC_ROOT/ENC_ROOT/ — a
+    // second library beside the real one, which a host that opens the parent
+    // then composes together with it, one vintage silently winning per tile.
+    const noaa = [_][]const u8{ "ENC_ROOT/US5MD12M/US5MD12M.000", "ENC_ROOT/US4MD11M/US4MD11M.000" };
+    try std.testing.expectEqualStrings("ENC_ROOT", archiveRootPrefix(&noaa));
+
+    // What the mirroring is FOR survives it: two districts carrying the same
+    // boundary cell keep their own copies.
+    const districts = [_][]const u8{ "ENC_ROOT/D1/US5MD12M/US5MD12M.000", "ENC_ROOT/D2/US5MD12M/US5MD12M.000" };
+    try std.testing.expectEqualStrings("ENC_ROOT", archiveRootPrefix(&districts));
+
+    // A near-miss must not split mid-component.
+    const near = [_][]const u8{ "ENC_ROOT/US5/a.000", "ENC_ROOT/US4/b.000" };
+    try std.testing.expectEqualStrings("ENC_ROOT", archiveRootPrefix(&near));
+
+    // A flat archive shares nothing; one cell under one directory shares all of
+    // it, and both fall back to a directory named for the chart.
+    const flat = [_][]const u8{ "a.000", "b.000" };
+    try std.testing.expectEqualStrings("", archiveRootPrefix(&flat));
+    const one = [_][]const u8{"ENC_ROOT/US5MD12M/US5MD12M.000"};
+    try std.testing.expectEqualStrings("ENC_ROOT/US5MD12M", archiveRootPrefix(&one));
+}
+
 /// The file's modification time in nanoseconds, or null if it doesn't exist / can't be statted.
 fn fileModNs(io: std.Io, path: []const u8) ?i96 {
-    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer f.close(io);
-    const st = f.stat(io) catch return null;
+    // statFile, not open+fstat+close: this runs once per chart before any bake
+    // starts, and on Android's FUSE-backed storage those three syscalls are
+    // three round trips each. Over a 7,217-cell exchange set that was minutes
+    // of the import spent deciding what was already done.
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
     return st.mtime.nanoseconds;
 }
 

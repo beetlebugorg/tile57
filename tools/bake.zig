@@ -225,6 +225,12 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
         // parallel bake. It writes and frees each archive as it finishes, so peak
         // memory tracks the worker count rather than the cell count.
         var out_paths = std.ArrayList([]const u8).empty;
+        // The directory the archive wraps its cells in, dropped from every
+        // output path below. The rule is the ENGINE's (chart.bakeZip applies
+        // the same one for a caller who wants the whole archive in one call);
+        // this command only keeps its own list so it can name each finished
+        // chart as it lands.
+        const zip_root = if (zip_arc != null) chart.archiveRootPrefix(cell_paths.items) else "";
         for (cell_paths.items) |cp| {
             const stem = std.fs.path.stem(std.fs.path.basename(cp));
             // One directory per chart, as the exchange set does it: the archive
@@ -237,10 +243,21 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             // referenced text beside the right chart — and two districts that
             // share a boundary cell keep their own copies instead of one
             // overwriting the other.
-            const chart_dir = if (zip_arc != null)
-                std.fs.path.join(a, &.{ out_dir, std.fs.path.dirname(cp) orelse "" }) catch continue
-            else
-                std.fs.path.join(a, &.{ out_dir, stem }) catch continue;
+            const chart_dir = if (zip_arc != null) blk: {
+                // …BELOW the archive's own root, which is not part of what the
+                // mariner asked for. `-o <dir>` names the library; carrying
+                // the zip's wrapper directory through made
+                // `-o ~/Charts/ENC_ROOT` write ~/Charts/ENC_ROOT/ENC_ROOT/,
+                // a second library beside the real one that the app then
+                // opened together with it.
+                const dir = std.fs.path.dirname(cp) orelse "";
+                var rel = dir[@min(zip_root.len, dir.len)..];
+                while (rel.len != 0 and rel[0] == '/') rel = rel[1..];
+                // Nothing left to mirror (a flat archive, or one cell under
+                // one directory): fall back to the per-chart directory the
+                // ENC_ROOT path uses, so every cell still gets its own.
+                break :blk std.fs.path.join(a, &.{ out_dir, if (rel.len == 0) stem else rel }) catch continue;
+            } else std.fs.path.join(a, &.{ out_dir, stem }) catch continue;
             std.Io.Dir.cwd().createDirPath(io, chart_dir) catch continue;
             const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
             out_paths.append(a, std.fs.path.join(a, &.{ chart_dir, name }) catch continue) catch {};

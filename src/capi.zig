@@ -388,6 +388,29 @@ export fn tile57_bake_tree(
     return OK;
 }
 
+/// Bake a whole exchange set out of its .zip in one call — the archive twin of
+/// tile57_bake_tree, naming every output itself. See tile57.h.
+export fn tile57_bake_zip(
+    zip_path: ?[*:0]const u8,
+    out_dir: ?[*:0]const u8,
+    workers: u32,
+    progress: chart.BakeProgress,
+    progress_ctx: ?*anyopaque,
+    out_baked: ?*u32,
+    err: ?*CError,
+) callconv(.c) c_int {
+    if (out_baked) |p| p.* = 0;
+    const zp = spanOpt(zip_path) orelse return failWith(err, .badarg, "zip_path must not be null");
+    const out_d = spanOpt(out_dir) orelse return failWith(err, .badarg, "out_dir must not be null");
+    // No label callback, for the same reason tile57_bake_tree has none: this
+    // ABI reports progress as a count, and naming a chart would put a string
+    // across the seam. A caller that wants names owns the list and calls
+    // tile57_bake_zip_charts instead.
+    const baked = chart.bakeZip(sharedIo(), zp, out_d, null, workers, progress, progress_ctx, null) catch |e| return failCtx(err, e, zp);
+    if (out_baked) |p| p.* = @intCast(baked);
+    return OK;
+}
+
 /// Bake the cells at `in_paths` to the archives at `out_paths`, in parallel.
 /// The CALLER owns the list, so `label` names each finished chart by its index
 /// into it and no string crosses the ABI. See tile57.h.
