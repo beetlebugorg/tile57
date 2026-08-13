@@ -1339,6 +1339,25 @@ test "an archive's own root directory is not part of the output path" {
     try std.testing.expectEqualStrings("ENC_ROOT/US5MD12M", archiveRootPrefix(&one));
 }
 
+test "the GPU atlas declares the scale its cells were baked at" {
+    // A sprite quad is sized cell px x scale/ppm, so the ppm buildGpuAtlases
+    // declares must be the one spriteMlnOpts rasterized the cells at.
+    for ([_]f64{ 1.0, 2.0, 3.0 }) |ratio| {
+        try std.testing.expectApproxEqRel(
+            sprite.mlnPpm(ratio),
+            sprite.px_per_unit * 100.0 * ratio * sprite.mln_drawn_scale,
+            1e-12,
+        );
+    }
+    // The drawn scale is the engine's symbol scale, so a cell measured through
+    // that ppm is the size drawSymbol tessellates.
+    try std.testing.expectApproxEqRel(
+        sprite.mln_drawn_scale * sprite.px_per_unit,
+        render.sndfrm.SYMBOL_SCALE,
+        1e-12,
+    );
+}
+
 /// The file's modification time in nanoseconds, or null if it doesn't exist / can't be statted.
 fn fileModNs(io: std.Io, path: []const u8) ?i96 {
     // statFile, not open+fstat+close: this runs once per chart before any bake
@@ -1439,8 +1458,11 @@ fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.g
     // Layout only: the scene consumer reads cells + dims, never the pixels —
     // the full bake here (composite + zlib) was ~2/3 of the render path's
     // cycles in a field profile whenever the shared atlases (re)built.
+    // The ppm must be the one the cells were rasterized at: render/gpu.zig
+    // sizes a sprite quad as cell px x scale/ppm, so a mismatch draws every
+    // symbol, sounding and linestyle brick at the ratio between the two.
     var atlas = try sprite.spriteMlnOpts(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio, false);
-    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.px_per_unit * 100.0 * ratio) };
+    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.mlnPpm(ratio)) };
     var cit = atlas.cells.iterator();
     while (cit.next()) |e| {
         const r = e.value_ptr.*;

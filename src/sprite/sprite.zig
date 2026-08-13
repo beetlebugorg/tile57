@@ -507,9 +507,15 @@ const MlnCell = struct { name: []const u8, w: u32, h: u32, ratio: f64, rgba: []c
 /// resident-memory floor (the map clones every image per style) and the
 /// frame-time floor (its atlas churn ran renderUpdate at 60+ ms during a
 /// zoom). Baked at drawn scale, icon-size 1.0 samples the artwork 1:1.
-/// maplibre.zig's icon-size divisor must equal SYMBOL_SCALE for that to hold;
-/// a test there asserts the pairing.
+/// maplibre.zig's icon-size divisor must equal SYMBOL_SCALE for that to hold.
 pub const mln_drawn_scale: f64 = 0.02834627777338028 / 0.08;
+
+/// The px per mm this builder rasterizes at, for `ratio`. A consumer that
+/// converts a cell back to a size reads this, and does not recompute it. The
+/// two must be the same number or symbols draw at the difference.
+pub fn mlnPpm(ratio: f64) f64 {
+    return px_per_mm * ratio * mln_drawn_scale;
+}
 
 pub fn spriteMln(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []const AreaFillSrc, css_data: []const u8, soundings: []const []const u8, ratio: f64) !Atlas {
     return spriteMlnOpts(a, symbols, fills, css_data, soundings, ratio, true);
@@ -524,9 +530,9 @@ pub fn spriteMlnOpts(a: std.mem.Allocator, symbols: []const SvgSrc, fills: []con
     const ar = arena_state.allocator();
     var css = try loadCss(ar, css_data);
     // Drawn scale folded in: cells carry exactly the pixels the display uses
-    // (see mln_drawn_scale). The GPU-scene atlas takes a different path and
-    // keeps its own scale model.
-    const ppm = px_per_mm * ratio * mln_drawn_scale; // device px per mm as DRAWN
+    // (see mln_drawn_scale). The GPU-scene atlas comes through this same
+    // builder, so it reads the scale from mlnPpm rather than restating it.
+    const ppm = mlnPpm(ratio); // device px per mm as DRAWN
     const cell_cap: f64 = @as(f64, @floatFromInt(max_cell_side)) * ratio;
     const atlas_w: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(sprite_atlas_width)) * ratio));
 
