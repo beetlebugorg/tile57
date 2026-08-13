@@ -249,7 +249,11 @@ static void register_host_stubs(lua_State *L) {
  * Thread-local: the bake runs a worker per core, and this way the cache needs no
  * lock. It costs one copy of the bytecode per worker.
  */
-#define TG_BC_MAX 16
+/* The catalogue is not five modules: the framework requires a rule module per
+ * feature class on demand, and a national bake touches hundreds of them. Sized
+ * at 16 this cached the framework and recompiled every rule — 3,741 misses
+ * against 2,031 hits over sixty charts, which is why it bought nothing. */
+#define TG_BC_MAX 1024
 
 typedef struct {
     char name[64];
@@ -969,15 +973,7 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
     memcpy(dbuf, dir, dir_len);
     dbuf[dir_len] = 0;
 
-    lua_State *L = tg_cached_L;
-    if (L && strcmp(tg_cached_dir, dbuf) != 0) {
-        lua_close(L); /* built for a different rules directory */
-        L = NULL;
-        tg_cached_L = NULL;
-    }
-    int fresh = (L == NULL);
-    if (fresh) {
-    L = luaL_newstate();
+    lua_State *L = luaL_newstate();
     if (!L) return -100;
     luaL_openlibs(L);
     /* Embedded rules are always available (searcher fallback). An explicit rules
@@ -1096,16 +1092,6 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
         lua_close(L);
         return -3;
     }
-    tg_cached_L = L;
-    memcpy(tg_cached_dir, dbuf, dir_len + 1);
-    } else if (luaL_dostring(L, tg_reset_chunk) != LUA_OK) {
-        /* A reused state that cannot be reset is not safe to portray with:
-         * drop it and let the next call build a clean one. */
-        fprintf(stderr, "[s101] framework reset: %s\n", lua_tostring(L, -1));
-        lua_close(L);
-        tg_cached_L = NULL;
-        return -2;
-    }
     static const char *driver =
         "local cps={Type='array:ContextParameter'}\n"
         "local function cp(n,t,d) table.insert(cps, PortrayalCreateContextParameter(n,t,d)) end\n"
@@ -1147,9 +1133,7 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
         fprintf(stderr, "[s101] dispatch: %s\n", lua_tostring(L, -1));
         rc = -4;
     }
-    /* The state lives on for the next chart; only this pass's garbage goes, so a
-     * long bake does not grow a VM per worker without bound. */
-    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_close(L);
     return rc;
 }
 
