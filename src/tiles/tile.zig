@@ -593,6 +593,16 @@ fn douglasPeucker(a: Allocator, pts: []const mvt.Point, eps2: i128) ![]mvt.Point
             const ey: i64 = @as(i64, pts[i].y) - ay;
             // den constant within this segment, so argmax(perp dist) = argmax(num^2)
             // for den>0, or argmax(ex^2+ey^2) for a degenerate segment.
+            //
+            // i128 DELIBERATELY. Tracking |num| in i64 and squaring once per
+            // segment is the same argmax and measurably cheaper per point — it
+            // takes this loop out of compiler_rt on arm64. It was measured at
+            // no wall-clock gain (1.00-1.06x over a 1,200-chart bake), and it
+            // is only safe while every coordinate is tile-local: a Point is
+            // i32, `project` states its output may fall outside [0,extent],
+            // and ex*dy on unclipped input overflows i64 where this does not.
+            // Silent geometry corruption is not worth a gain that did not show
+            // up in a measurement.
             const metric: i128 = if (den == 0)
                 @as(i128, ex) * ex + @as(i128, ey) * ey
             else blk: {
@@ -611,8 +621,17 @@ fn douglasPeucker(a: Allocator, pts: []const mvt.Point, eps2: i128) ![]mvt.Point
             try stack.append(a, .{ besti, e });
         }
     }
+    // Count first, allocate once. Appending a point at a time regrew this list
+    // log2(n) times per line, and a bake runs it for every line in every tile
+    // of every cell. On Android that was the top of the bake profile: the
+    // reallocs' memset plus malloc/free was ~8% of cycles.
+    var n_keep: usize = 0;
+    for (keep) |k| {
+        if (k) n_keep += 1;
+    }
     var out = std.ArrayList(mvt.Point).empty;
-    for (pts, 0..) |p, k| if (keep[k]) try out.append(a, p);
+    try out.ensureTotalCapacityPrecise(a, n_keep);
+    for (pts, 0..) |p, k| if (keep[k]) out.appendAssumeCapacity(p);
     return out.items;
 }
 
