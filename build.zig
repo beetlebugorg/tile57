@@ -585,10 +585,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib_root.zig"),
         .target = target,
         .optimize = optimize,
-        // iOS: std.debug's stack-trace machinery references
-        // _dyld_get_image_header_containing_address, which iOS' libdyld doesn't
-        // export — strip so the panic path never pulls it in.
-        .strip = target.result.os.tag == .ios,
+        // iOS and visionOS: std.debug's stack-trace machinery references
+        // _dyld_get_image_header_containing_address, which those libdylds do
+        // not export. Strip so the panic path never pulls it in.
+        .strip = target.result.os.tag == .ios or target.result.os.tag == .visionos,
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
