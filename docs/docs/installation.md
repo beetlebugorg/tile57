@@ -32,8 +32,10 @@ is a release asset, so upgrades mean downloading the next one.
 
 Pick the archive for your platform from the
 [latest release](https://github.com/beetlebugorg/tile57/releases/latest) —
-`tile57-<version>-<arch>-<os>.tar.gz`, or `.zip` for Windows — and put `bin/tile57`
-on your `PATH`:
+`tile57-<version>-<target>.tar.gz`, or `.zip` for Windows — and put `bin/tile57`
+on your `PATH`. `<target>` is the Zig target triple: `aarch64-macos`,
+`x86_64-macos`, `aarch64-linux-gnu`, `x86_64-linux-gnu`, `aarch64-windows-gnu`,
+or `x86_64-windows-gnu`.
 
 ```sh
 tar xzf tile57-0.3.0-aarch64-macos.tar.gz
@@ -48,9 +50,14 @@ curl -LO https://github.com/beetlebugorg/tile57/releases/latest/download/SHA256S
 shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
-macOS binaries are not notarized. Gatekeeper quarantines a downloaded archive, so
-clear it once — `xattr -d com.apple.quarantine ./tile57` — or install through
-Homebrew, which does it for you.
+macOS binaries are not notarized. If Gatekeeper refuses to run one, clear the
+quarantine flag on the extracted directory before installing:
+
+```sh
+xattr -dr com.apple.quarantine tile57-0.3.0-aarch64-macos
+```
+
+Homebrew does this for you.
 
 ## Build from source
 

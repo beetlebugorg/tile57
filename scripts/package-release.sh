@@ -35,6 +35,10 @@ esac
 # The same payload under /usr, for `apt install ./tile57_*.deb`. There is no
 # apt repository — the .deb is a release asset.
 if [ -n "$deb_arch" ]; then
+  # dpkg reads `0.4.0-rc1` as upstream 0.4.0 with revision rc1, which sorts
+  # AFTER plain 0.4.0 and makes the final release look like a downgrade. `~`
+  # is the separator that sorts before, so 0.4.0~rc1 upgrades to 0.4.0.
+  deb_version="$(printf '%s' "$version" | sed 's/-/~/')"
   pkg="$out/deb"
   rm -rf "$pkg"
   mkdir -p "$pkg/DEBIAN" "$pkg/usr/bin" "$pkg/usr/lib" "$pkg/usr/include" \
@@ -45,7 +49,7 @@ if [ -n "$deb_arch" ]; then
   install -m644 "$root/LICENSE" "$pkg/usr/share/doc/tile57/copyright"
   cat > "$pkg/DEBIAN/control" <<EOF
 Package: tile57
-Version: $version
+Version: $deb_version
 Architecture: $deb_arch
 Maintainer: Jeremy Collins <jeremy.collins@beetlebug.org>
 Section: science
@@ -60,7 +64,7 @@ Description: Nautical chart engine for IHO S-101 and S-57 charts
  .
  Not for navigation.
 EOF
-  dpkg-deb --build --root-owner-group "$pkg" "$out/tile57_${version}_${deb_arch}.deb"
+  dpkg-deb --build --root-owner-group "$pkg" "$out/tile57_${deb_version}_${deb_arch}.deb"
   rm -rf "$pkg"
 fi
 
