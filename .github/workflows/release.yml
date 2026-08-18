@@ -114,7 +114,7 @@ jobs:
           fi
           v="${GITHUB_REF_NAME#v}"
           git clone --depth 1 \
-            "https://x-access-token:$TAP_TOKEN@github.com/beetlebugorg/homebrew-tap" tap
+            "https://x-access-token:$TAP_TOKEN@github.com/${{ github.repository_owner }}/homebrew-tap" tap
           mkdir -p tap/Formula
           scripts/brew-formula.sh "$v" dist > tap/Formula/tile57.rb
           cd tap

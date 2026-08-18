@@ -8,7 +8,10 @@ set -euo pipefail
 
 version="$1"
 dist="$2"
-base="https://github.com/beetlebugorg/tile57/releases/download/v$version"
+# The repo the release lives in, so a fork's test release yields a formula
+# pointing at the fork's own downloads.
+repo="${GITHUB_REPOSITORY:-beetlebugorg/tile57}"
+base="https://github.com/$repo/releases/download/v$version"
 
 sha() { shasum -a 256 "$dist/tile57-$version-$1.tar.gz" | cut -d' ' -f1; }
 
