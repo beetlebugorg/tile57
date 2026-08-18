@@ -1,0 +1,125 @@
+name: Release
+
+# Push a `vX.Y.Z` tag to cut a release: every supported target is built, the
+# archives are attached to a GitHub release, and the Homebrew tap is updated.
+# A tag carrying a suffix (`v0.3.0-rc1`) publishes as a prerelease and leaves
+# the tap alone — use one to prove the matrix before the real tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS builds run natively per arch. scripts/macho-align.sh (the
+          # ld64 repack of libtile57.a) invokes `ld -r` and libtool without
+          # -arch, so it can only repack for the host.
+          - { target: aarch64-macos, os: macos-latest }
+          - { target: x86_64-macos, os: macos-15-intel }
+          # -gnu, not -musl: build.zig retargets the CLI to static musl on a
+          # glibc host anyway, so these carry a portable `tile57` AND a
+          # libtile57.a that a glibc C host can link.
+          - { target: x86_64-linux-gnu, os: ubuntu-latest, deb: amd64 }
+          - { target: aarch64-linux-gnu, os: ubuntu-latest, deb: arm64 }
+          - { target: x86_64-windows-gnu, os: ubuntu-latest }
+          - { target: aarch64-windows-gnu, os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The version is written in three places and the tag is a fourth. A
+      # mismatch ships a binary whose `tile57 version` contradicts its download.
+      - name: Check the tag against the version in the source
+        run: |
+          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
+          grep -q "\.version = \"$v\"" build.zig.zon
+          grep -q "pub const version = \"$v\"" src/tile57.zig
+          grep -q "pub const VERSION = \"tile57 $v\"" tools/common.zig
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package
+        run: scripts/package-release.sh "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" "${{ matrix.deb }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && shasum -a 256 tile57* > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A release may already exist: cutting one from the web UI is what
+          # created the tag that started this run, and a re-run after a failed
+          # leg lands here twice. Attach to it instead of failing on the 422,
+          # and leave hand-written notes alone.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag \
+              ${{ contains(github.ref_name, '-') && '--prerelease' || '' }} \
+              dist/*
+          fi
+
+  homebrew:
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A token with write access to the tap repo. Without it the release still
+      # stands; only the tap goes stale.
+      - name: Update the Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set — skipping the tap update"
+            exit 0
+          fi
+          v="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 \
+            "https://x-access-token:$TAP_TOKEN@github.com/${{ github.repository_owner }}/homebrew-tap" tap
+          mkdir -p tap/Formula
+          scripts/brew-formula.sh "$v" dist > tap/Formula/tile57.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/tile57.rb
+          git diff --cached --quiet || git commit -m "tile57 $v"
+          git push
