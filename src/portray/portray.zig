@@ -423,6 +423,9 @@ pub const CellPortrayal = struct {
     base: []const ?[]const u8,
     plain: ?[]const ?[]const u8 = null,
     simplified: ?[]const ?[]const u8 = null,
+    /// FullLightLines=true pass over sectored-light points only (S-52 §12.2.4
+    /// full-length sector legs); the sect tag's variant axis.
+    lights: ?[]const ?[]const u8 = null,
 };
 
 /// Portray a cell three ways so the client can toggle boundary style (areas) and
@@ -447,11 +450,16 @@ pub fn portrayCellVariantsAdapted(arena: std.mem.Allocator, cell: *const s57.Cel
     // (SOUNDG is already excluded from `adapted`, and "Curve" varies under neither).
     var areas = std.ArrayList(adapter.Adapted).empty;
     var points = std.ArrayList(adapter.Adapted).empty;
+    // The sectored lights alone: LightSectored is the one rule that reads
+    // FullLightLines, so the variant pass is bounded to the features whose
+    // legs it lengthens.
+    var lights = std.ArrayList(adapter.Adapted).empty;
     for (adapted) |ad| {
         if (std.mem.eql(u8, ad.primitive, "Surface")) {
             try areas.append(arena, ad);
         } else if (std.mem.eql(u8, ad.primitive, "Point")) {
             try points.append(arena, ad);
+            if (std.mem.eql(u8, ad.code, "LightSectored")) try lights.append(arena, ad);
         }
     }
 
@@ -460,5 +468,7 @@ pub fn portrayCellVariantsAdapted(arena: std.mem.Allocator, cell: *const s57.Cel
         cp.plain = runAdapted(arena, cell, areas.items, rules_dir, .{ .plain_boundaries = true }) catch null;
     if (points.items.len > 0)
         cp.simplified = runAdapted(arena, cell, points.items, rules_dir, .{ .simplified_symbols = true }) catch null;
+    if (lights.items.len > 0)
+        cp.lights = runAdapted(arena, cell, lights.items, rules_dir, .{ .full_light_lines = true }) catch null;
     return cp;
 }

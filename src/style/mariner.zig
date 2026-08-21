@@ -507,6 +507,18 @@ pub fn pointStyleFilter(b: B, m: *const Settings) !Value {
     });
 }
 
+// Sector-leg length (S-52 §12.2.4 full sector lines): show common (2) + the
+// active length. A pre-sect bake carries no tag and coalesces to 2, so its
+// 25 mm legs keep drawing whichever way the switch stands.
+pub fn sectorFilter(b: B, m: *const Settings) !Value {
+    const rank: i64 = if (m.show_full_sector_lines) 1 else 0;
+    return b.arr(&.{
+        b.s("in"),
+        try b.coalesce(try b.get("sect"), b.int(2)),
+        try b.arr(&.{ b.s("literal"), try b.arr(&.{ b.int(2), b.int(rank) }) }),
+    });
+}
+
 // S-52 §14.5 text-group selection. Important text (11) is always on.
 pub fn textGroupFilter(b: B, m: *const Settings) !Value {
     const g = try b.coalesce(try b.get("tgrp"), b.int(-1));
@@ -630,6 +642,7 @@ pub fn commonChartFilters(a: std.mem.Allocator, m: *const Settings, enabled_band
     if (enabled_bands) |eb| try clauses.append(try bandFilter(b, eb));
     try clauses.append(try boundaryFilter(b, m));
     try clauses.append(try pointStyleFilter(b, m));
+    try clauses.append(try sectorFilter(b, m));
     if (try viewingGroupFilter(b, m)) |vgf| try clauses.append(vgf); // §14.5 (future use; no-op when null)
     if (!m.show_inform_callouts)
         try clauses.append(try b.arr(&.{ b.s("!="), try b.coalesce(try b.get("symbol_name"), b.s("")), b.s("INFORM01") }));

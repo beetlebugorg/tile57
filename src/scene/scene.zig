@@ -633,6 +633,7 @@ pub const TileSurface = struct {
             .date_end = meta.date_end,
             .bnd = meta.bnd,
             .pts = meta.pts,
+            .sect = meta.sect,
         };
     }
 
@@ -1143,6 +1144,9 @@ const Meta = struct {
     // 2), 0/1 = the plain/symbolized boundary or paper/simplified point pass.
     bnd: i64 = 2,
     pts: i64 = 2,
+    /// Sector-leg length (S-52 §12.2.4): 2 = length-independent, 0/1 = the
+    /// 25 mm / full-length pass; the client's sectorFilter keys off it.
+    sect: i64 = 2,
 };
 
 /// Append the shared metadata tags: S-52 draw priority + display category + band
@@ -1372,6 +1376,7 @@ fn appendMeta(a: Allocator, props: *std.ArrayList(mvt.Prop), m: Meta) !void {
     // (2) is left off so the client coalesces to 2 (always shown) — keeping every
     // unvarying feature's tile footprint unchanged.
     if (m.bnd != 2) try props.append(a, .{ .key = "bnd", .value = .{ .int = m.bnd } });
+    if (m.sect != 2) try props.append(a, .{ .key = "sect", .value = .{ .int = m.sect } });
     if (m.pts != 2) try props.append(a, .{ .key = "pts", .value = .{ .int = m.pts } });
     // §8.6.2-suppressed boundary piece — present only on the meta-bounds extras,
     // so every normally-drawn feature's tile footprint is unchanged.
@@ -1688,25 +1693,32 @@ fn variantDiffers(base: []const u8, variant: ?[]const u8) bool {
 /// display variants) through the Surface: parse each pass and hand it to
 /// processFeatureParsed, splitting into two passes only when a variant differs
 /// (S-52 boundary §8.6.1 / point-symbol §11.2.2 axes -> the bnd/pts tags).
-fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, lights: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const base = try instructions.parse(a, instr);
     if (f.prim == 1) {
-        if (variantDiffers(instr, simplified)) {
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 0, z, x, y, tb, box, opts, surf);
+        // The sector-leg axis first: only LightSectored features carry a
+        // lights variant, and none of those carries a simplified one, so the
+        // two point axes never need a four-way split.
+        if (variantDiffers(instr, lights)) {
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, 0, z, x, y, tb, box, opts, surf);
+            const lp = try instructions.parse(a, lights.?);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, lp, 2, 2, 1, z, x, y, tb, box, opts, surf);
+        } else if (variantDiffers(instr, simplified)) {
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 0, 2, z, x, y, tb, box, opts, surf);
             const sp2 = try instructions.parse(a, simplified.?);
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, sp2, 2, 1, z, x, y, tb, box, opts, surf);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, sp2, 2, 1, 2, z, x, y, tb, box, opts, surf);
         } else {
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, opts, surf);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, 2, z, x, y, tb, box, opts, surf);
         }
         return;
     }
     if (f.prim == 3 and variantDiffers(instr, plain)) {
-        try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 1, 2, z, x, y, tb, box, opts, surf);
+        try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 1, 2, 2, z, x, y, tb, box, opts, surf);
         const pl = try instructions.parse(a, plain.?);
-        try processFeatureParsed(a, cell, f, fi, geo, geo_world, pl, 0, 2, z, x, y, tb, box, opts, surf);
+        try processFeatureParsed(a, cell, f, fi, geo, geo_world, pl, 0, 2, 2, z, x, y, tb, box, opts, surf);
         return;
     }
-    try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, z, x, y, tb, box, opts, surf);
+    try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, 2, z, x, y, tb, box, opts, surf);
 }
 
 // Web-mercator equatorial circumference (m): converts a ground-distance sector leg
@@ -1835,7 +1847,7 @@ fn pickJson(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, pick: bool)
     return encodeS57Attrs(a, f) catch "";
 }
 
-fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: instructions.Portrayal, bnd: i64, pts: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: instructions.Portrayal, bnd: i64, pts: i64, sect: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const scamin = effScamin(f, opts);
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
@@ -1853,6 +1865,7 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         .date_end = p.date_end,
         .bnd = bnd,
         .pts = pts,
+        .sect = sect,
     };
 
     // ── Point features ──────────────────────────────────────────────────────────
@@ -2341,6 +2354,7 @@ pub const CellRef = struct {
     portrayal: ?[]const ?[]const u8 = null,
     portrayal_plain: ?[]const ?[]const u8 = null,
     portrayal_simplified: ?[]const ?[]const u8 = null,
+    portrayal_lights: ?[]const ?[]const u8 = null,
     geo: ?GeoParts = null,
     /// World coords parallel to `geo` (precomputed projection) — lets the baker
     /// reproject line/area geometry per tile without per-point tan/log.
@@ -2421,7 +2435,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
         };
-        try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.portrayal_lights, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 
     return surf.endScene(out);
@@ -2482,7 +2496,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
         };
-        try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.portrayal_lights, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 }
 
@@ -2660,6 +2674,7 @@ fn appendCellFeatures(
     portrayal: ?[]const ?[]const u8,
     portrayal_plain: ?[]const ?[]const u8,
     portrayal_simplified: ?[]const ?[]const u8,
+    portrayal_lights: ?[]const ?[]const u8,
     geo: ?GeoParts,
     geo_world: ?GeoWorld,
     feat_bbox: ?[]const ?[4]f64,
@@ -2786,7 +2801,7 @@ fn appendCellFeatures(
         }
         if (f.objl == 163) {
             if (try symins.buildSyminsPortrayal(a, f)) |sp| {
-                try processFeatureParsed(a, cell.*, f, fi, geo, geo_world, sp, 2, 2, z, x, y, tb, box, fopts, surf);
+                try processFeatureParsed(a, cell.*, f, fi, geo, geo_world, sp, 2, 2, 2, z, x, y, tb, box, fopts, surf);
                 continue;
             }
         }
@@ -2796,7 +2811,8 @@ fn appendCellFeatures(
             if (!errored) {
                 const plain: ?[]const u8 = if (portrayal_plain) |pp| (if (fi < pp.len) pp[fi] else null) else null;
                 const simplified: ?[]const u8 = if (portrayal_simplified) |pp| (if (fi < pp.len) pp[fi] else null) else null;
-                try processFeatureInstr(a, cell.*, f, fi, geo, geo_world, s, plain, simplified, z, x, y, tb, box, fopts, surf);
+                const lights: ?[]const u8 = if (portrayal_lights) |pp| (if (fi < pp.len) pp[fi] else null) else null;
+                try processFeatureInstr(a, cell.*, f, fi, geo, geo_world, s, plain, simplified, lights, z, x, y, tb, box, fopts, surf);
                 continue;
             }
         }
@@ -3056,7 +3072,7 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries display_pr
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
     };
-    try processFeatureInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 0), ms.points.items.len);
     try std.testing.expectEqual(@as(usize, 1), ms.points_scamin.items.len);
     try std.testing.expectEqual(@as(i64, 7), findProp(ms.points_scamin.items[0].properties, "display_priority").?.int);
@@ -3070,7 +3086,7 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries display_pr
         .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try processFeatureInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 1), ms.points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "display_priority").?.int);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "scamin"));
@@ -3124,7 +3140,7 @@ test "processFeatureInstr tags pts 0/1 when a point's simplified symbol differs"
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
     // Paper -> BOYLAT01; simplified -> BOYLAT11. Two passes: pts=0 then pts=1.
-    try processFeatureInstr(a, cell, f, 0, null, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f, 0, null, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 2), ms.points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "pts").?.int);
     try std.testing.expectEqualStrings("BOYLAT01", findProp(ms.points.items[0].properties, "symbol_name").?.string);
@@ -3173,7 +3189,7 @@ test "processFeatureInstr tags bnd 1/0 when an area's plain boundary differs" {
     // Symbolized boundary draws a complex line; plain draws a simple stroke.
     const symbolized = "ColorFill:DEPMS;LineStyle:CTNARE51,,1,CHMGD;LineInstruction:CTNARE51";
     const plain = "ColorFill:DEPMS;LineStyle:_simple_,,1,CHMGD;LineInstruction:_simple_";
-    try processFeatureInstr(a, cell, f, 0, geo_one, null, symbolized, plain, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f, 0, geo_one, null, symbolized, plain, null, null, 0, 0, 0, tb, box, .{}, surf);
     // Both passes emit the fill: one tagged bnd=1 (symbolized), one bnd=0 (plain).
     try std.testing.expectEqual(@as(usize, 2), ms.areas.items.len);
     try std.testing.expectEqual(@as(i64, 1), findProp(ms.areas.items[0].properties, "bnd").?.int);
@@ -3355,7 +3371,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "15.1" }},
     };
-    try processFeatureInstr(a, cell, f_wreck, 0, null, null, "DrawingPriority:12;PointInstruction:DANGER02", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_wreck, 0, null, null, "DrawingPriority:12;PointInstruction:DANGER02", null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 1), ms.points.items.len);
     try std.testing.expectEqualStrings("DANGER01", findProp(ms.points.items[0].properties, "symbol_name").?.string);
     try std.testing.expectEqual(@as(f64, 15.1), findProp(ms.points.items[0].properties, "danger_depth").?.double);
@@ -3369,7 +3385,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .objl = 159,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try processFeatureInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 2), ms.points.items.len);
     try std.testing.expectEqualStrings("DANGER01", findProp(ms.points.items[1].properties, "symbol_name").?.string);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[1].properties, "danger_depth"));
@@ -3383,7 +3399,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "4" }},
     };
-    try processFeatureInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 3), ms.points.items.len);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[2].properties, "sym_deep"));
 }

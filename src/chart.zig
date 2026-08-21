@@ -228,6 +228,7 @@ const CellBackend = struct {
     portrayal: ?[]const ?[]const u8 = null, // per-feature default S-101 instruction stream
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
+    portrayal_lights: ?[]const ?[]const u8 = null, // FullLightLines variant (sectored lights)
     portray_arena: ?*std.heap.ArenaAllocator = null,
     coverage: []const []const []const s57.LonLat = &.{}, // M_COVR (in portray_arena)
     cscl: i32 = 0, // compilation scale (DSPM CSCL, 1:N)
@@ -264,6 +265,7 @@ fn cellRef(cb: *CellBackend) scene.CellRef {
         .portrayal = cb.portrayal,
         .portrayal_plain = cb.portrayal_plain,
         .portrayal_simplified = cb.portrayal_simplified,
+        .portrayal_lights = cb.portrayal_lights,
         .geo = cb.geo,
         .geo_world = cb.geo_world,
         .feat_bbox = cb.feat_bbox,
@@ -286,6 +288,7 @@ const LazyCell = struct {
     portrayal: ?[]const ?[]const u8 = null,
     portrayal_plain: ?[]const ?[]const u8 = null,
     portrayal_simplified: ?[]const ?[]const u8 = null,
+    portrayal_lights: ?[]const ?[]const u8 = null,
     arena: ?*std.heap.ArenaAllocator = null,
     tick: u64 = 0, // LRU: last tile that used this cell
     // M_COVR(CATCOV=1) coverage polygons, assembled once from `cell` for best-band
@@ -519,6 +522,7 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
             lc.portrayal = cp.base;
             lc.portrayal_plain = cp.plain;
             lc.portrayal_simplified = cp.simplified;
+            lc.portrayal_lights = cp.lights;
             lc.arena = p;
         } else |_| {
             p.deinit();
@@ -547,6 +551,7 @@ fn lazyUnload(lc: *LazyCell) void {
     lc.scamins = &.{}; // ditto (cell.arena)
     lc.portrayal_plain = null;
     lc.portrayal_simplified = null;
+    lc.portrayal_lights = null;
     if (lc.arena) |p| {
         p.deinit();
         gpa.destroy(p);
@@ -687,6 +692,7 @@ fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const 
         cb.portrayal = cp.base;
         cb.portrayal_plain = cp.plain;
         cb.portrayal_simplified = cp.simplified;
+        cb.portrayal_lights = cp.lights;
     } else |_| {}
     // Assemble geometry + its projection + per-feature bboxes ONCE (the baker's
     // per-cell caches) so live per-view rendering reuses them across the view's tiles
@@ -2833,6 +2839,7 @@ pub const Chart = struct {
                     .portrayal = cb.portrayal,
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
+                    .portrayal_lights = cb.portrayal_lights,
                 }};
                 return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
             },
@@ -3094,6 +3101,7 @@ pub const Chart = struct {
                     .portrayal = cb2.portrayal,
                     .portrayal_plain = cb2.portrayal_plain,
                     .portrayal_simplified = cb2.portrayal_simplified,
+                    .portrayal_lights = cb2.portrayal_lights,
                     .geo = cb2.geo,
                     .geo_world = cb2.geo_world,
                     .feat_bbox = cb2.feat_bbox,
@@ -3255,6 +3263,7 @@ pub const Chart = struct {
                         .portrayal = cb2.portrayal,
                         .portrayal_plain = cb2.portrayal_plain,
                         .portrayal_simplified = cb2.portrayal_simplified,
+                        .portrayal_lights = cb2.portrayal_lights,
                     }};
                     scene.appendTile(surf, a, &one, z, qt.tx, qt.ty, self.pick_attrs) catch continue;
                 },
@@ -3307,6 +3316,7 @@ pub const Chart = struct {
                     .portrayal = cb.portrayal,
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
+                    .portrayal_lights = cb.portrayal_lights,
                 }};
                 return scene.generateView(&as, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
             },
@@ -3881,6 +3891,7 @@ const BakeWork = struct {
         var portrayal: ?[]const ?[]const u8 = null;
         var portrayal_plain: ?[]const ?[]const u8 = null;
         var portrayal_simplified: ?[]const ?[]const u8 = null;
+        var portrayal_lights: ?[]const ?[]const u8 = null;
         var geo: ?scene.GeoParts = null;
         var geo_world: ?scene.GeoWorld = null;
         var feat_bbox: ?[]const ?[4]f64 = null;
@@ -3891,6 +3902,7 @@ const BakeWork = struct {
                 portrayal = cp.base;
                 portrayal_plain = cp.plain;
                 portrayal_simplified = cp.simplified;
+                portrayal_lights = cp.lights;
             } else |_| {}
             // Build the geometry cache for EVERY cell, unconditionally.
             // `build_geo` (cacheGeoForBand) gated it to the finer bands, but coarse cells are
@@ -3929,7 +3941,7 @@ const BakeWork = struct {
         // Sector-figure reach (exact, from the portrayal streams): buildTileMap
         // addresses the neighbouring tiles the cell's light legs/arcs cross.
         const lr = scene.collectLightReach(&cell, portrayal);
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .geo_world = geo_world, .feat_bbox = feat_bbox, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .portrayal_lights = portrayal_lights, .geo = geo, .geo_world = geo_world, .feat_bbox = feat_bbox, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
         c.arenas[i] = pa;
     }
 };
