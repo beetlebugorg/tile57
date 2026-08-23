@@ -540,3 +540,10 @@ fn emitFacesZoom(sw: *engine.pmtiles.StreamWriter, sa: std.mem.Allocator, faces:
         try sw.add(z, kv.key_ptr.x, kv.key_ptr.y, enc);
     }
 }
+
+test {
+    // A test binary rooted here links lua_shim.c through engine's portray
+    // module but analyses only what its tests reach. Referencing engine scans
+    // bake_root.zig, whose comptime block emits the shim's C-ABI accessors.
+    _ = engine;
+}
