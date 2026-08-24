@@ -11,12 +11,18 @@
 const KEY = "tile57.mariner";
 const M_TO_FT = 3.28084;
 
+// Recreational depth defaults over the engine's ship-scale canon. The S-52
+// defaults (safety contour 10 m) suit SOLAS drafts; a sailboat draws about
+// 2 m, and a 10 m safety contour paints most of a harbor as unsafe. The
+// mariner's own stored settings still win over these.
+const RECREATIONAL = { shallowContour: 2, safetyContour: 3, deepContour: 10, safetyDepth: 3 };
+
 export function loadStored(defaults) {
   let stored = {};
   try {
     stored = JSON.parse(localStorage.getItem(KEY)) || {};
   } catch { /* first visit */ }
-  return { ...defaults, ...stored };
+  return { ...defaults, ...RECREATIONAL, ...stored };
 }
 export function saveStored(m) {
   try {
