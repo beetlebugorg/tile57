@@ -26,8 +26,9 @@ export const STYLE = `
     --ui-accent-text:#0a0e11; --ui-shadow:rgba(0,0,0,.6); }
 
   /* Full-bleed map; everything else floats over it. */
+  /* Crosshair, the pick cursor - the hand only while actually grabbing. */
   #map, #mapimg { position:absolute; inset:0; width:100%; height:100%;
-    touch-action:none; cursor:grab; user-select:none; }
+    touch-action:none; cursor:crosshair; user-select:none; }
   #mapimg { display:none; }
   #root.dragging #map, #root.dragging #mapimg { cursor:grabbing; }
 
