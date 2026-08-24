@@ -700,23 +700,6 @@ pub fn build(b: *std.Build) void {
     // would be undefined at link time. Static libs default to NOT bundling it; force it on so
     // libtile57.a is self-contained for C consumers.
     lib.bundle_compiler_rt = true;
-    if (target.result.os.tag == .macos) {
-        // Apple's ld64 rejects 64-bit mach-o archive members whose offsets aren't
-        // 8-byte aligned, and Zig's archiver doesn't align them — so the raw
-        // `zig build` archive fails to link into the CGO host ("... not 8-byte
-        // aligned"). Re-pack it here, as part of the build, so a plain `zig build`
-        // alone emits an ld64-compatible libtile57.a (no wrapper needed):
-        // scripts/macho-align.sh partial-links every member into one relocatable
-        // object and re-wraps it with Apple's libtool. See the script for why.
-        const repack = b.addSystemCommand(&.{b.pathFromRoot("scripts/macho-align.sh")});
-        repack.setEnvironmentVariable("ZIG", b.graph.zig_exe); // `zig ar` need not be on PATH
-        repack.addFileArg(lib.getEmittedBin());
-        const aligned = repack.addOutputFileArg("libtile57.a");
-        b.getInstallStep().dependOn(&b.addInstallLibFile(aligned, "libtile57.a").step);
-    } else {
-        b.installArtifact(lib);
-    }
-
     // `zig build lib` installs only libtile57.a for the resolved target. The
     // default install also builds the host-only bake CLI (which force-links
     // static musl and so can't cross-compile); an embedder cross-building the
@@ -724,7 +707,26 @@ pub fn build(b: *std.Build) void {
     // tablet (arm-linux-gnueabihf / aarch64-linux-gnu) — uses this step to get
     // just the archive without the CLI.
     const lib_only_step = b.step("lib", "Build only libtile57.a for the target");
-    lib_only_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+    if (target.result.os.tag == .macos) {
+        // Apple's ld64 rejects 64-bit mach-o archive members whose offsets aren't
+        // 8-byte aligned, and Zig's archiver doesn't align them — so the raw
+        // `zig build` archive fails to link into the CGO host ("... not 8-byte
+        // aligned"). Re-pack it here, as part of the build, so a plain `zig build`
+        // or `zig build lib` alone emits an ld64-compatible libtile57.a (no
+        // wrapper needed): scripts/macho-align.sh partial-links every member into
+        // one relocatable object and re-wraps it with Apple's libtool. See the
+        // script for why.
+        const repack = b.addSystemCommand(&.{b.pathFromRoot("scripts/macho-align.sh")});
+        repack.setEnvironmentVariable("ZIG", b.graph.zig_exe); // `zig ar` need not be on PATH
+        repack.addFileArg(lib.getEmittedBin());
+        const aligned = repack.addOutputFileArg("libtile57.a");
+        const install_aligned = b.addInstallLibFile(aligned, "libtile57.a");
+        b.getInstallStep().dependOn(&install_aligned.step);
+        lib_only_step.dependOn(&install_aligned.step);
+    } else {
+        b.installArtifact(lib);
+        lib_only_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+    }
 
     // The offline baker / inspector CLI. It runs the embedded-Lua S-101 portrayal
     // so baked tiles get full S-101 styling (not the classify() fallback), so —
