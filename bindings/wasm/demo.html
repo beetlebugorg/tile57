@@ -63,6 +63,7 @@
                 background: var(--uibck); border: 1px solid var(--uibdr);
                 border-radius: 4px; cursor: pointer; }
   #ctl button:hover { background: color-mix(in srgb, var(--uibck) 82%, var(--uibdr)); }
+  #needle { display: inline-block; color: var(--cursr); }
 
   #hint { position: fixed; inset: 0; z-index: 2; display: flex;
           align-items: center; justify-content: center; pointer-events: none; }
@@ -108,6 +109,7 @@
   <div id="status">starting engine…</div>
 </div>
 <div id="ctl">
+  <button id="north" title="north up"><span id="needle">▲</span></button>
   <button id="zi" title="zoom in">+</button>
   <button id="zo" title="zoom out">&minus;</button>
   <button id="fs" title="full screen">⛶</button>
@@ -115,6 +117,7 @@
 </div>
 <div id="hint"><div>Drop S-57 charts here<br>
   <small>.000 cells (with their update files), or an exchange-set .zip<br>
+  Drag to pan (flick works) · wheel to zoom · Shift-drag or pinch-twist rotates<br>
   The charts are baked and rendered in this page — nothing is uploaded.<br>
   Free official cells: <a href="https://charts.noaa.gov/ENCs/ENCs.shtml"
   target="_blank" rel="noopener">NOAA ENC downloads</a> — drop a downloaded zip
@@ -290,11 +293,14 @@ async function registerChart(name, archive, info) {
 // scale suits the zoom — an overview chart under a harbor view, or a harbor
 // cell under a world view, only wastes memory. The engine quilts whatever
 // set it is given; this picks that set.
-function viewBounds(marginFrac = 0.3) {
+function viewBounds() {
   const s = cssWorld();
   const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
-  const hw = (viewW() * (0.5 + marginFrac)) / s;
-  const hh = (viewH() * (0.5 + marginFrac)) / s;
+  const c = Math.abs(Math.cos(cam.rot)), sn = Math.abs(Math.sin(cam.rot));
+  // The same box the scene request covers (rotation bounding box + margin),
+  // so a chart is resident before the scene needs it.
+  const hw = ((viewW() * c + viewH() * sn) * SCENE_MARGIN) / 2 / s;
+  const hh = ((viewW() * sn + viewH() * c) * SCENE_MARGIN) / 2 / s;
   const [west, north] = worldToLonLat(cx - hw, Math.max(0.0001, cy - hh));
   const [east, south] = worldToLonLat(cx + hw, Math.min(0.9999, cy + hh));
   return { west, south, east, north };
@@ -354,7 +360,7 @@ async function ensureView() {
   const sole = sel.length === 1 ? (openMap.get(sel[0].name) ?? 0) : 0;
   return { compose, chart: compose ? 0 : sole };
 }
-const cam = { lon: -73.16, lat: 41.14, zoom: 13 };
+const cam = { lon: -73.16, lat: 41.14, zoom: 13, rot: 0 };
 // The last view, restored across reloads (localStorage survives the library).
 function restoreView() {
   try {
@@ -363,17 +369,30 @@ function restoreView() {
     cam.lat = Math.max(-85, Math.min(85, v.lat));
     cam.lon = Math.max(-180, Math.min(180, v.lon));
     cam.zoom = Math.max(2, Math.min(18, v.zoom));
+    cam.rot = Number.isFinite(v.rot) ? v.rot : 0;
     return true;
   } catch { return false; }
 }
 function saveView() {
   try {
-    localStorage.setItem("tile57.view", JSON.stringify({ lat: cam.lat, lon: cam.lon, zoom: cam.zoom }));
+    localStorage.setItem("tile57.view", JSON.stringify({ lat: cam.lat, lon: cam.lon, zoom: cam.zoom, rot: cam.rot }));
   } catch { /* private mode; the view just does not persist */ }
 }
 let sceneCam = null; // camera the current scene / PNG was built for
 
 const viewW = () => innerWidth, viewH = () => innerHeight;
+// The scene/PNG request size: the rotated viewport's bounding box, inflated
+// by the prefetch margin — a pan, zoom-out, or twist shows real chart from
+// the standing scene while a sharper one streams in. ?margin=K tunes it.
+const SCENE_MARGIN = Math.min(3, Math.max(1, parseFloat(q.get("margin")) || 1.6));
+function renderDims() {
+  const w = Math.round(viewW() * dpr), h = Math.round(viewH() * dpr);
+  const c = Math.abs(Math.cos(cam.rot)), sn = Math.abs(Math.sin(cam.rot));
+  return [
+    Math.min(4096, Math.round((w * c + h * sn) * SCENE_MARGIN)),
+    Math.min(4096, Math.round((w * sn + h * c) * SCENE_MARGIN)),
+  ];
+}
 function sizeCanvas() {
   canvas.width = Math.max(1, Math.round(viewW() * dpr));
   canvas.height = Math.max(1, Math.round(viewH() * dpr));
@@ -386,7 +405,9 @@ function hud() {
     : savedCatalog.length
       ? `${savedCatalog.length} chart${savedCatalog.length > 1 ? "s" : ""} stored (${fmtBytes(storedBytes)})`
       : "no charts";
-  $("center").textContent = `${cam.lat.toFixed(4)}, ${cam.lon.toFixed(4)}  z${cam.zoom.toFixed(1)}  ≈1:${Math.round(scaleDenom(cam.zoom)).toLocaleString()}`;
+  const hdg = Math.round((((-cam.rot * 180) / Math.PI) % 360 + 360) % 360);
+  $("center").textContent = `${cam.lat.toFixed(4)}, ${cam.lon.toFixed(4)}  z${cam.zoom.toFixed(1)}  ≈1:${Math.round(scaleDenom(cam.zoom)).toLocaleString()}${hdg ? `  ↑${String(hdg).padStart(3, "0")}°` : ""}`;
+  $("needle").style.transform = `rotate(${cam.rot}rad)`;
   $("hint").style.display = catalog.length || savedCatalog.length ? "none" : "flex";
 }
 loader.hide();
@@ -404,7 +425,7 @@ async function rebuild() {
   if (rebuilding) { rebuildAgain = true; return; }
   rebuilding = true;
   const t0 = performance.now();
-  const [w, h] = [Math.round(viewW() * dpr), Math.round(viewH() * dpr)];
+  const [w, h] = renderDims();
   try {
     const set = await ensureView();
     if (!set.compose && !set.chart) {
@@ -427,10 +448,16 @@ async function rebuild() {
       if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
       img.dataset.url = URL.createObjectURL(new Blob([png], { type: "image/png" }));
       img.src = img.dataset.url;
-      img.style.transform = "";
+      // The render is north-up and margin-sized; centre the element and let
+      // pngPlace turn/scale it for whatever the camera is by then.
+      img.style.width = `${w / dpr}px`;
+      img.style.height = `${h / dpr}px`;
+      img.style.left = `${(viewW() - w / dpr) / 2}px`;
+      img.style.top = `${(viewH() - h / dpr) / 2}px`;
       $("perf").textContent = `render ${(performance.now() - t0).toFixed(0)} ms @${w}×${h}`;
     }
     sceneCam = { ...cam };
+    if (!gpu) pngPlace();
     saveView();
   } catch (e) {
     console.error(e);
@@ -465,66 +492,171 @@ function redraw() {
 
 // ---- mouse / touch navigation --------------------------------------------
 const cssWorld = () => 256 * 2 ** cam.zoom; // CSS px per world unit
-function panBy(dxCss, dyCss) {
+const rotCS = () => [Math.cos(cam.rot), Math.sin(cam.rot)];
+const clampY = (y) => Math.min(0.9999, Math.max(0.0001, y));
+
+// Screen (CSS px) <-> world, honouring the view rotation.
+function screenToWorld(mx, my) {
+  const S = cssWorld(), [c, sn] = rotCS();
+  const dx = mx - viewW() / 2, dy = my - viewH() / 2;
   const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
-  const s = cssWorld();
-  [cam.lon, cam.lat] = worldToLonLat(cx - dxCss / s, Math.min(0.9999, Math.max(0.0001, cy - dyCss / s)));
+  return [cx + (c * dx + sn * dy) / S, cy + (-sn * dx + c * dy) / S];
+}
+function worldToScreen(wx, wy) {
+  const S = cssWorld(), [c, sn] = rotCS();
+  const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
+  const rx = (wx - cx) * S, ry = (wy - cy) * S;
+  return [viewW() / 2 + c * rx - sn * ry, viewH() / 2 + sn * rx + c * ry];
+}
+// Re-centre so world point `p` lands at screen (mx, my).
+function centerOn(p, mx, my) {
+  const S = cssWorld(), [c, sn] = rotCS();
+  const dx = mx - viewW() / 2, dy = my - viewH() / 2;
+  [cam.lon, cam.lat] = worldToLonLat(p[0] - (c * dx + sn * dy) / S, clampY(p[1] - (-sn * dx + c * dy) / S));
+}
+function panBy(dxCss, dyCss) {
+  const S = cssWorld(), [c, sn] = rotCS();
+  const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
+  [cam.lon, cam.lat] = worldToLonLat(cx - (c * dxCss + sn * dyCss) / S, clampY(cy - (-sn * dxCss + c * dyCss) / S));
 }
 function zoomAt(mx, my, dz) {
-  const oldS = cssWorld();
-  const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
-  const wx = cx + (mx - viewW() / 2) / oldS, wy = cy + (my - viewH() / 2) / oldS;
+  const p = screenToWorld(mx, my);
   cam.zoom = Math.min(18, Math.max(2, cam.zoom + dz));
-  const s = cssWorld();
-  [cam.lon, cam.lat] = worldToLonLat(wx - (mx - viewW() / 2) / s, Math.min(0.9999, Math.max(0.0001, wy - (my - viewH() / 2) / s)));
+  centerOn(p, mx, my);
 }
 
-let drag = null;
+// A camera change during a gesture: GPU redraws the uploaded scene at the
+// new camera (and streams in a sharper one); the PNG path re-places the last
+// render as a CSS similarity transform.
+function afterCamera() {
+  hud();
+  if (gpu) { redraw(); liveRebuild(); }
+  else pngPlace();
+}
+// Place the last north-up PNG render for the CURRENT camera: put its centre
+// where that world point now sits, turn it by the view rotation, scale it by
+// the zoom delta. At rest this is translate(0,0) rotate(cam.rot) scale(1).
+function pngPlace() {
+  if (!sceneCam) return;
+  const [px, py] = worldToScreen(...lonLatToWorld(sceneCam.lon, sceneCam.lat));
+  const k = 2 ** (cam.zoom - sceneCam.zoom);
+  img.style.transform = `translate(${px - viewW() / 2}px, ${py - viewH() / 2}px) rotate(${cam.rot}rad) scale(${k})`;
+}
+
+// One pointer pans (shift: rotates about the screen centre); two pointers
+// pinch — zoom, twist, and pan anchored on the midpoint. A fast pan release
+// flicks: the camera keeps its velocity and decays.
+const pointers = new Map(); // pointerId -> {x, y}
+let drag = null, pinch = null, flick = 0;
+
+function stopFlick() {
+  if (flick) cancelAnimationFrame(flick);
+  flick = 0;
+}
+function startFlick(vx, vy) {
+  let last = performance.now();
+  const step = (now) => {
+    const dt = Math.min(64, now - last);
+    last = now;
+    panBy(vx * dt, vy * dt);
+    const f = Math.exp(-dt / 280);
+    vx *= f; vy *= f;
+    afterCamera();
+    if (Math.hypot(vx, vy) > 0.02) flick = requestAnimationFrame(step);
+    else { flick = 0; scheduleRebuild(0); }
+  };
+  stopFlick();
+  flick = requestAnimationFrame(step);
+}
+
+const pinchState = () => {
+  const [p1, p2] = [...pointers.values()];
+  return {
+    dist: Math.max(1, Math.hypot(p2.x - p1.x, p2.y - p1.y)),
+    ang: Math.atan2(p2.y - p1.y, p2.x - p1.x),
+    mx: (p1.x + p2.x) / 2, my: (p1.y + p2.y) / 2,
+  };
+};
+
 surface.addEventListener("pointerdown", (e) => {
   if (!catalog.length) return;
+  stopFlick();
   surface.setPointerCapture(e.pointerId);
-  surface.classList.add("dragging");
-  drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY };
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 2) {
+    pinch = pinchState();
+    drag = null;
+  } else if (pointers.size === 1) {
+    surface.classList.add("dragging");
+    drag = { x: e.clientX, y: e.clientY, mode: e.shiftKey ? "rotate" : "pan", vx: 0, vy: 0, t: performance.now() };
+  }
 });
 surface.addEventListener("pointermove", (e) => {
-  const [wcx, wcy] = lonLatToWorld(cam.lon, cam.lat);
-  const px = wcx + (e.clientX - viewW() / 2) / cssWorld();
-  const py = wcy + (e.clientY - viewH() / 2) / cssWorld();
-  const [lon, lat] = worldToLonLat(px, Math.min(0.9999, Math.max(0.0001, py)));
+  const [lon, lat] = worldToLonLat(...screenToWorld(e.clientX, e.clientY));
   $("cursor").textContent = `cursor ${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+  if (pointers.has(e.pointerId)) pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinch && pointers.size === 2) {
+    const now = pinchState();
+    panBy(now.mx - pinch.mx, now.my - pinch.my);
+    const p = screenToWorld(now.mx, now.my);
+    cam.zoom = Math.min(18, Math.max(2, cam.zoom + Math.log2(now.dist / pinch.dist)));
+    cam.rot += now.ang - pinch.ang;
+    centerOn(p, now.mx, now.my);
+    pinch = now;
+    afterCamera();
+    scheduleRebuild(gpu ? 300 : 350);
+    return;
+  }
   if (!drag) return;
-  panBy(e.clientX - drag.x, e.clientY - drag.y);
-  drag.x = e.clientX; drag.y = e.clientY;
-  if (gpu) { redraw(); liveRebuild(); }
-  else img.style.transform = `translate(${e.clientX - drag.sx}px, ${e.clientY - drag.sy}px)`;
+  const now = performance.now(), dt = Math.max(1, now - drag.t);
+  if (drag.mode === "rotate") {
+    const a0 = Math.atan2(drag.y - viewH() / 2, drag.x - viewW() / 2);
+    const a1 = Math.atan2(e.clientY - viewH() / 2, e.clientX - viewW() / 2);
+    cam.rot += a1 - a0;
+  } else {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    panBy(dx, dy);
+    drag.vx = 0.8 * drag.vx + 0.2 * (dx / dt); // px/ms, smoothed for the flick
+    drag.vy = 0.8 * drag.vy + 0.2 * (dy / dt);
+  }
+  drag.x = e.clientX; drag.y = e.clientY; drag.t = now;
+  afterCamera();
 });
-surface.addEventListener("pointerup", () => {
-  if (!drag) return;
+function endPointer(e) {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 1) {
+    // A pinch collapsed to one finger: continue as a pan from it.
+    const [p] = pointers.values();
+    drag = { x: p.x, y: p.y, mode: "pan", vx: 0, vy: 0, t: performance.now() };
+    return;
+  }
+  if (!drag) { scheduleRebuild(gpu ? 200 : 0); return; }
   surface.classList.remove("dragging");
+  const { mode, vx, vy } = drag;
   drag = null;
-  scheduleRebuild(gpu ? 250 : 0);
-});
+  if (mode === "pan" && Math.hypot(vx, vy) > 0.15) startFlick(vx, vy);
+  else scheduleRebuild(gpu ? 200 : 0);
+}
+surface.addEventListener("pointerup", endPointer);
+surface.addEventListener("pointercancel", endPointer);
 surface.addEventListener("wheel", (e) => {
   if (!catalog.length) return;
   e.preventDefault();
   const dz = -e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0022);
   zoomAt(e.clientX, e.clientY, dz);
-  if (gpu) { redraw(); liveRebuild(); }
-  else {
-    const k = 2 ** (cam.zoom - (sceneCam?.zoom ?? cam.zoom));
-    img.style.transformOrigin = `${e.clientX}px ${e.clientY}px`;
-    img.style.transform = `scale(${k})`;
-  }
+  afterCamera();
   scheduleRebuild(gpu ? 300 : 350);
 }, { passive: false });
 surface.addEventListener("dblclick", (e) => {
   if (!catalog.length) return;
   zoomAt(e.clientX, e.clientY, 1);
-  if (gpu) redraw();
+  afterCamera();
   scheduleRebuild(0);
 });
-$("zi").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, 1); if (gpu) redraw(); scheduleRebuild(0); };
-$("zo").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, -1); if (gpu) redraw(); scheduleRebuild(0); };
+$("zi").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, 1); afterCamera(); scheduleRebuild(0); };
+$("zo").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, -1); afterCamera(); scheduleRebuild(0); };
+$("north").onclick = () => { cam.rot = 0; afterCamera(); scheduleRebuild(0); };
 $("fs").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 addEventListener("resize", () => { sizeCanvas(); if (gpu) redraw(); scheduleRebuild(200); });
 addEventListener("keydown", (e) => {
@@ -541,7 +673,7 @@ addEventListener("keydown", (e) => {
   if (!move) return;
   e.preventDefault();
   move();
-  if (gpu) redraw();
+  afterCamera();
   scheduleRebuild(gpu ? 250 : 300);
 });
 

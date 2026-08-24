@@ -398,7 +398,12 @@ export class GpuRenderer {
 
     const S = 256 * 2 ** cam.zoom * this.pixelRatio; // framebuffer px per world unit
     const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
-    const sx = (S * 2) / w, sy = (-S * 2) / h;
+    // View rotation (cam.rot, radians): the scene stays north-up in world
+    // space — the camera turns, and the shaders turn the map-aligned local
+    // offsets by the same angle (that is the whole GPU-scene contract).
+    const rot = cam.rot || 0;
+    const rc = Math.cos(rot), rs = Math.sin(rot);
+    const a = (2 * S) / w, b = (2 * S) / h;
     // Longitude wrap: each vertex draws at the world copy nearest the camera,
     // which keeps a zoomed-in view seamless across the antimeridian. In a
     // WIDE view the seam meridian (half a world from the camera) falls onto
@@ -412,20 +417,28 @@ export class GpuRenderer {
       const d = this.draws[i];
       const f = new Float32Array(slots, i * UNIFORM_SLOT, 32);
       const u = new Uint32Array(slots, i * UNIFORM_SLOT, 32);
-      f.set([sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, 0, 0, -cx * sx, -cy * sy, 0, 1]); // mvp
+      // mvp = P·R·T: world, centered on the camera, rotated in y-down screen
+      // space, scaled to clip.
+      f.set([
+        a * rc, -b * rs, 0, 0,
+        -a * rs, -b * rc, 0, 0,
+        0, 0, 0, 0,
+        -a * (rc * cx - rs * cy), b * (rs * cx + rc * cy), 0, 1,
+      ]);
       f[16] = 2 / w; f[17] = -2 / h;         // px_to_clip
       f[18] = this.pixelRatio;               // size_scale
       f[19] = scaleDenom(cam.zoom);          // current_scale
       u[20] = 7 | d.catMaskOr;               // cat_mask
       f[21] = wrapX;                         // wrap_x
-      f[22] = 0; f[23] = 1;                  // rot_sin, rot_cos (north-up)
+      f[22] = rs; f[23] = rc;                // rot_sin, rot_cos
       f[24] = d.color[0]; f[25] = d.color[1]; f[26] = d.color[2]; f[27] = d.color[3];
       if (d.pipeline === PIPE.PATTERN) {
         const tex = this.patternTex[d.pattern];
         if (tex) {
           // Phase origin = world (0,0) in framebuffer px, reduced mod the cell
           // so f32 keeps the phase exact far from the origin.
-          const ox = -cx * S + w / 2, oy = -cy * S + h / 2;
+          const dx0 = -cx * S, dy0 = -cy * S;
+          const ox = rc * dx0 - rs * dy0 + w / 2, oy = rs * dx0 + rc * dy0 + h / 2;
           f[28] = ((ox % tex.width) + tex.width) % tex.width;
           f[29] = ((oy % tex.height) + tex.height) % tex.height;
           f[30] = tex.width; f[31] = tex.height; // cell_px

@@ -87,11 +87,15 @@ and stages the app; `src/pages/demo.jsx` frames it). Drop S-57 charts on it —
 from [NOAA's ENC downloads](https://charts.noaa.gov/ENCs/ENCs.shtml). The
 charts never leave the page: baking and rendering happen in the browser.
 
-Drag to pan, wheel to zoom, double-click to zoom in; arrow keys pan and
-`+`/`-` zoom. It renders with WebGPU where the browser has it, and falls
-back to PNG views (`?png=1` forces the fallback; the HUD names the reason
-when the fallback engages). WebGPU needs a secure context — `https://`, or
-`localhost` for a local server.
+Drag to pan (a fast release flicks), wheel to zoom, double-click to zoom
+in; Shift-drag or a two-finger twist rotates the view and the compass
+control resets north-up; arrow keys pan and `+`/`-` zoom. Scenes build
+larger than the viewport (`?margin=K`), so a pan, zoom, or turn shows chart
+from the standing scene while a sharper one streams in. It renders with
+WebGPU where the browser has it, and falls back to PNG views (`?png=1`
+forces the fallback; the HUD names the reason when the fallback engages).
+WebGPU needs a secure context — `https://`, or `localhost` for a local
+server.
 
 The demo runs the engine in a Web Worker (`engine-worker.mjs`): a bake holds
 the CPU for seconds, and off the main thread the map and the loader stay
