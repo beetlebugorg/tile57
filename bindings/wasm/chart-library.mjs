@@ -15,34 +15,41 @@ export class ChartLibrary {
     if (!navigator.storage?.getDirectory) return null;
     try {
       const root = await navigator.storage.getDirectory();
-      return new ChartLibrary(await root.getDirectoryHandle("charts", { create: true }));
+      return new ChartLibrary(root, await root.getDirectoryHandle("charts", { create: true }));
     } catch (e) {
       console.warn("chart library unavailable:", e);
       return null;
     }
   }
-  constructor(dir) {
+  constructor(root, dir) {
+    this.root = root;
     this.dir = dir;
   }
 
-  /** The catalog: [{name, info|null, size}], sorted by name. `info` is null
-   * only for archives saved before metadata rode along; `size` is the
-   * archive's bytes on disk. */
+  /** Bytes this origin stores (the library dominates it). One instant call —
+   * per-file sizing crawls once a library holds thousands of charts. */
+  async usage() {
+    try {
+      return (await navigator.storage.estimate())?.usage ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** The catalog: [{name, info|null}], sorted by name. `info` is null only
+   * for archives saved before metadata rode along. */
   async list() {
-    const stems = [], metas = new Map(), sizes = new Map();
+    const stems = [], metas = new Map();
     for await (const [name, handle] of this.dir.entries()) {
       if (handle.kind !== "file") continue;
-      if (name.endsWith(".pmtiles")) {
-        const stem = name.slice(0, -".pmtiles".length);
-        stems.push(stem);
-        try { sizes.set(stem, (await handle.getFile()).size); } catch { /* size stays 0 */ }
-      } else if (name.endsWith(".json")) {
+      if (name.endsWith(".pmtiles")) stems.push(name.slice(0, -".pmtiles".length));
+      else if (name.endsWith(".json")) {
         try {
           metas.set(name.slice(0, -".json".length), JSON.parse(await (await handle.getFile()).text()));
         } catch { /* a bad sidecar reads as missing */ }
       }
     }
-    return stems.sort().map((name) => ({ name, info: metas.get(name) ?? null, size: sizes.get(name) ?? 0 }));
+    return stems.sort().map((name) => ({ name, info: metas.get(name) ?? null }));
   }
 
   /** One archive's bytes, or null when absent. */
@@ -78,8 +85,9 @@ export class ChartLibrary {
     await this.dir.removeEntry(`${stem}.json`).catch(() => {});
   }
 
-  /** Delete every archive. */
+  /** Delete every archive — one recursive remove, not thousands of calls. */
   async clear() {
-    for (const { name } of await this.list()) await this.remove(name);
+    await this.root.removeEntry("charts", { recursive: true });
+    this.dir = await this.root.getDirectoryHandle("charts", { create: true });
   }
 }

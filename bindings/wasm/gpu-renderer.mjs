@@ -399,6 +399,14 @@ export class GpuRenderer {
     const S = 256 * 2 ** cam.zoom * this.pixelRatio; // framebuffer px per world unit
     const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
     const sx = (S * 2) / w, sy = (-S * 2) / h;
+    // Longitude wrap: each vertex draws at the world copy nearest the camera,
+    // which keeps a zoomed-in view seamless across the antimeridian. In a
+    // WIDE view the seam meridian (half a world from the camera) falls onto
+    // geometry, and a primitive straddling it gets its vertices wrapped to
+    // OPPOSITE copies — it tears into full-width streaks. Once the viewport
+    // spans a large share of a world, draw everything in its home copy
+    // instead: wrap_x = 0.5 makes the shader's round() zero for all x.
+    const wrapX = w / S > 0.4 ? 0.5 : cx;
     const slots = new ArrayBuffer(Math.max(1, this.draws.length) * UNIFORM_SLOT);
     for (let i = 0; i < this.draws.length; i++) {
       const d = this.draws[i];
@@ -409,7 +417,7 @@ export class GpuRenderer {
       f[18] = this.pixelRatio;               // size_scale
       f[19] = scaleDenom(cam.zoom);          // current_scale
       u[20] = 7 | d.catMaskOr;               // cat_mask
-      f[21] = cx;                            // wrap_x
+      f[21] = wrapX;                         // wrap_x
       f[22] = 0; f[23] = 1;                  // rot_sin, rot_cos (north-up)
       f[24] = d.color[0]; f[25] = d.color[1]; f[26] = d.color[2]; f[27] = d.color[3];
       if (d.pipeline === PIPE.PATTERN) {

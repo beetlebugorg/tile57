@@ -192,7 +192,7 @@ const initPromise = rpc("init", { wasmUrl });
 // ---- the chart library: show what is stored before the engine is up -------
 const library = await ChartLibrary.open();
 const savedCatalog = library ? await library.list() : [];
-let storedBytes = savedCatalog.reduce((n, c) => n + (c.size || 0), 0);
+let storedBytes = library ? await library.usage() : 0;
 const fmtBytes = (n) =>
   n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(0)} MB` : `${Math.max(1, Math.round(n / 1e3))} kB`;
 if (savedCatalog.length) {
@@ -689,6 +689,7 @@ async function loadFiles(files) {
   if (failed.length) status(failed.slice(0, 2).join("; ") + (failed.length > 2 ? ` (+${failed.length - 2} more, see console)` : ""), true);
   if (!added.length) { hud(); return; }
 
+  if (library) storedBytes = await library.usage(); // refresh the real total
   fitTo(added);
   status(`${catalog.length} chart${catalog.length > 1 ? "s" : ""} in the library${failed.length ? ` (${failed.length} failed)` : ""}${skipped ? ` (${skipped} already loaded)` : ""}`);
   await rebuild();
