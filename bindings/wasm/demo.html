@@ -531,14 +531,21 @@ addEventListener("keydown", (e) => {
 
 // ---- loading charts -------------------------------------------------------
 function fitTo(list) {
-  let west = 180, south = 90, east = -180, north = -90, ok = false;
-  for (const c of list) {
-    if (!c.info.hasBounds) continue;
-    ok = true;
+  const bounded = list.filter((c) => c.info?.hasBounds);
+  if (!bounded.length) return;
+  // Fit where the charts actually ARE: one overview chart can span an ocean
+  // and drag the union's centre far off the detailed cluster, so charts with
+  // a footprint over ~8x the median stay out of the fit (they still draw).
+  const area = (c) => Math.max(0, c.info.east - c.info.west) * Math.max(0, c.info.north - c.info.south);
+  const sorted = bounded.map(area).sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  let fit = bounded.filter((c) => area(c) <= median * 8);
+  if (!fit.length) fit = bounded;
+  let west = 180, south = 90, east = -180, north = -90;
+  for (const c of fit) {
     west = Math.min(west, c.info.west); south = Math.min(south, c.info.south);
     east = Math.max(east, c.info.east); north = Math.max(north, c.info.north);
   }
-  if (!ok) return;
   const [wx0, wy0] = lonLatToWorld(west, north), [wx1, wy1] = lonLatToWorld(east, south);
   const z = Math.log2(Math.min((viewW() * 0.9) / (256 * (wx1 - wx0)), (viewH() * 0.9) / (256 * (wy1 - wy0))));
   cam.zoom = Math.min(16, Math.max(3, z));
