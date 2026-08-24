@@ -30,52 +30,68 @@
 <title>tile57 wasm chartplotter</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E%E2%9A%93%3C/text%3E%3C/svg%3E">
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #10141a;
+  /* The S-52 day colour tokens, replaced at runtime from the engine's own
+     colour tables (the `palette` worker op), so the chrome wears the spec's
+     colours: NODTA surround, UIBCK panels, UIBDR borders, UINF* text. */
+  :root {
+    --nodta: #93aebb; --uibck: #c9edff; --uibdr: #4c5b63;
+    --uinfd: #000000; --uinff: #4c5b63; --uinfb: #2e7bff;
+    --uinfr: #ea5471; --cursr: #e38039;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--nodta);
                font: 13px system-ui, sans-serif; }
   #map, #mapimg { position: fixed; inset: 0; width: 100vw; height: 100vh;
-                  touch-action: none; cursor: grab; user-select: none; }
+                  touch-action: none; cursor: grab; user-select: none;
+                  background: var(--nodta); }
   #mapimg { object-fit: cover; display: none; }
   .dragging { cursor: grabbing !important; }
 
   #hud { position: fixed; top: 10px; left: 10px; z-index: 3;
-         background: rgba(12, 16, 22, 0.78); color: #dde3ea; border-radius: 8px;
+         background: var(--uibck); color: var(--uinfd);
+         border: 1px solid var(--uibdr); border-radius: 4px;
          padding: 8px 12px; font-family: ui-monospace, monospace; font-size: 12px;
          line-height: 1.5; pointer-events: none; max-width: 46ch; }
-  #hud b { color: #fff; font-weight: 600; }
-  #status { color: #8fd3a7; }
+  #hud b { color: var(--uinfd); font-weight: 600; }
+  #mode, #perf { color: var(--uinff); }
+  #cursor { color: var(--cursr); }
+  #status { color: var(--uinff); }
+  #status.bad { color: var(--uinfr); }
 
   #ctl { position: fixed; right: 14px; bottom: 18px; z-index: 3;
          display: flex; flex-direction: column; gap: 8px; }
-  #ctl button { width: 42px; height: 42px; font-size: 20px; color: #dde3ea;
-                background: rgba(12, 16, 22, 0.85); border: 1px solid #3a4450;
-                border-radius: 8px; cursor: pointer; }
-  #ctl button:hover { background: #2a323d; }
+  #ctl button { width: 42px; height: 42px; font-size: 20px; color: var(--uinfd);
+                background: var(--uibck); border: 1px solid var(--uibdr);
+                border-radius: 4px; cursor: pointer; }
+  #ctl button:hover { background: color-mix(in srgb, var(--uibck) 82%, var(--uibdr)); }
 
   #hint { position: fixed; inset: 0; z-index: 2; display: flex;
           align-items: center; justify-content: center; pointer-events: none; }
-  #hint > div { background: rgba(12, 16, 22, 0.85); color: #dde3ea;
-                border: 2px dashed #4a5561; border-radius: 12px;
+  #hint > div { background: var(--uibck); color: var(--uinfd);
+                border: 2px dashed var(--uibdr); border-radius: 6px;
                 padding: 28px 40px; font-size: 16px; text-align: center;
                 line-height: 1.7; }
-  #hint small { color: #9aa7b4; }
-  #hint a { color: #8fd3a7; pointer-events: auto; }
-  body.droptarget #hint > div { border-color: #8fd3a7; color: #8fd3a7; }
+  #hint small { color: var(--uinff); }
+  #hint a { color: var(--uinfb); pointer-events: auto; }
+  body.droptarget #hint > div { border-color: var(--uinfb); color: var(--uinfb); }
 
   /* The loader: alive while the worker bakes. */
   #loader { position: fixed; inset: 0; z-index: 4; display: none;
             align-items: center; justify-content: center;
-            background: rgba(8, 10, 14, 0.45); pointer-events: none; }
+            background: color-mix(in srgb, var(--uibdr) 30%, transparent);
+            pointer-events: none; }
   #loader.show { display: flex; }
-  #loader .box { background: rgba(12, 16, 22, 0.92); color: #dde3ea;
-                 border: 1px solid #3a4450; border-radius: 12px;
+  #loader .box { background: var(--uibck); color: var(--uinfd);
+                 border: 1px solid var(--uibdr); border-radius: 6px;
                  padding: 22px 30px; min-width: 34ch; text-align: center; }
   #spin { width: 28px; height: 28px; margin: 0 auto 12px;
-          border: 3px solid #3a4450; border-top-color: #8fd3a7;
+          border: 3px solid color-mix(in srgb, var(--uibck) 60%, var(--uibdr));
+          border-top-color: var(--uinfb);
           border-radius: 50%; animation: spin 0.9s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   #loadlabel { margin-bottom: 10px; }
-  #bar { height: 6px; background: #232a33; border-radius: 3px; overflow: hidden; }
-  #bar div { height: 100%; width: 0; background: #8fd3a7; transition: width 0.15s; }
+  #bar { height: 6px; border-radius: 3px; overflow: hidden;
+         background: color-mix(in srgb, var(--uibck) 60%, var(--uibdr)); }
+  #bar div { height: 100%; width: 0; background: var(--uinfb); transition: width 0.15s; }
   #bar.indeterminate div { width: 30%; animation: slide 1.1s ease-in-out infinite alternate; }
   @keyframes slide { from { margin-left: 0; } to { margin-left: 70%; } }
 </style>
@@ -129,7 +145,10 @@ import { GpuRenderer, lonLatToWorld, worldToLonLat, scaleDenom } from "./gpu-ren
 
 const $ = (id) => document.getElementById(id);
 const q = new URLSearchParams(location.search);
-const status = (s) => { $("status").textContent = s; };
+const status = (s, bad = false) => {
+  $("status").textContent = s;
+  $("status").classList.toggle("bad", bad);
+};
 
 const loader = {
   show(label) {
@@ -166,7 +185,7 @@ const rpc = (op, args, transfer = []) =>
 
 worker.onerror = (e) => {
   console.error(e);
-  status(`engine worker failed: ${e.message ?? "see console"}`);
+  status(`engine worker failed: ${e.message ?? "see console"}`, true);
 };
 
 loader.show("downloading the engine (a few MB on first visit)…");
@@ -178,8 +197,22 @@ try {
   $("loadlabel").textContent = `engine failed to start: ${e.message}`;
   $("spin").style.display = "none";
   $("bar").style.display = "none";
-  status("engine failed to start");
+  status("engine failed to start", true);
   throw e;
+}
+
+// Theme the chrome from the engine's own S-52 colour table (day). The CSS
+// fallbacks carry the same values, so this only matters if they drift.
+try {
+  const day = (await rpc("palette")).day;
+  const root = document.documentElement.style;
+  for (const [token, cssVar] of [
+    ["NODTA", "--nodta"], ["UIBCK", "--uibck"], ["UIBDR", "--uibdr"],
+    ["UINFD", "--uinfd"], ["UINFF", "--uinff"], ["UINFB", "--uinfb"],
+    ["UINFR", "--uinfr"], ["CURSR", "--cursr"],
+  ]) if (day?.[token]) root.setProperty(cssVar, day[token]);
+} catch (e) {
+  console.warn("palette theming skipped:", e);
 }
 
 // ---- renderer: WebGPU, or PNG views ---------------------------------------
@@ -257,7 +290,7 @@ async function rebuild() {
     sceneCam = { ...cam };
   } catch (e) {
     console.error(e);
-    status(`render failed: ${e.message}`);
+    status(`render failed: ${e.message}`, true);
   }
   rebuilding = false;
   if (rebuildAgain) { rebuildAgain = false; scheduleRebuild(0); }
@@ -475,7 +508,7 @@ async function loadFiles(files) {
     loading = false;
   }
 
-  if (failed.length) status(failed.slice(0, 2).join("; ") + (failed.length > 2 ? ` (+${failed.length - 2} more, see console)` : ""));
+  if (failed.length) status(failed.slice(0, 2).join("; ") + (failed.length > 2 ? ` (+${failed.length - 2} more, see console)` : ""), true);
   if (!added.length) { hud(); return; }
 
   // Rebuild the composite over everything loaded (it borrows the charts).
@@ -498,7 +531,7 @@ if (preload) {
   for (const cell of preload.split(",")) {
     status(`fetching ${cell}…`);
     const r = await fetch(`${encBase}/${cell}`);
-    if (!r.ok) { status(`fetch ${cell}: ${r.status}`); continue; }
+    if (!r.ok) { status(`fetch ${cell}: ${r.status}`, true); continue; }
     files.push(new File([await r.blob()], cell.replace(/^.*\//, "")));
   }
   if (files.length) await loadFiles(files);

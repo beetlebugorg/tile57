@@ -39,6 +39,10 @@ const ops = {
     return [r, [r.spritePng.buffer, r.glyphPng.buffer, r.glyphBoldPng.buffer, r.glyphItalicPng.buffer]];
   },
 
+  // The S-52 colour tables ({day, dusk, night} token maps) — the page themes
+  // its own chrome from them, so the UI colours are the spec's, not ours.
+  palette() { return JSON.parse(t.colortablesDefault()); },
+
   addFile({ path, bytes }) { fsys.add(path, bytes); },
 
   zipList({ path }) { return t.zipList(path); },
