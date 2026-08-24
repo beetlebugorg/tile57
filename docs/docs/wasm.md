@@ -6,6 +6,10 @@ sidebar_position: 10
 
 # WebAssembly
 
+Try it first: the [live demo](/demo) is the browser demo below, embedded in
+these docs. Drop a NOAA ENC zip on it and the page bakes and renders the
+charts itself.
+
 The full engine compiles to one wasm module:
 
 ```sh
@@ -76,11 +80,18 @@ rebuilds.
 
 ## Browser demo
 
-`bindings/wasm/demo.html` is a complete in-page chartplotter. Drop S-57
-charts on it — `.000` cells with their update files, or an exchange-set
-`.zip`. Drag to pan, wheel to zoom, double-click to zoom in. It renders with
-WebGPU where the browser has it, and falls back to PNG views (`?png=1`
-forces the fallback; the HUD names the reason when the fallback engages).
+`bindings/wasm/demo.html` is a complete in-page chartplotter, embedded in
+these docs as the [live demo](/demo) (the docs workflow builds the engine
+and stages the app; `src/pages/demo.jsx` frames it). Drop S-57 charts on it —
+`.000` cells with their update files, or an exchange-set `.zip` straight
+from [NOAA's ENC downloads](https://charts.noaa.gov/ENCs/ENCs.shtml). The
+charts never leave the page: baking and rendering happen in the browser.
+
+Drag to pan, wheel to zoom, double-click to zoom in; arrow keys pan and
+`+`/`-` zoom. It renders with WebGPU where the browser has it, and falls
+back to PNG views (`?png=1` forces the fallback; the HUD names the reason
+when the fallback engages). WebGPU needs a secure context — `https://`, or
+`localhost` for a local server.
 
 The demo runs the engine in a Web Worker (`engine-worker.mjs`): a bake holds
 the CPU for seconds, and off the main thread the map and the loader stay

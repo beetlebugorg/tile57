@@ -8,6 +8,10 @@
 .docusaurus
 .cache-loader
 
+# The wasm demo app is STAGED here by .github/workflows/docs.yml (and by hand
+# for local testing) — the engine wasm is a build artifact, never committed.
+/static/demo-app
+
 # Misc
 .DS_Store
 .env.local

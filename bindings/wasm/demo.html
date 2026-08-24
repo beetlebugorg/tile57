@@ -26,7 +26,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="A chartplotter that runs entirely in this page: tile57 compiled to WebAssembly bakes S-57 charts and renders S-52 views, with no server.">
 <title>tile57 wasm chartplotter</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E%E2%9A%93%3C/text%3E%3C/svg%3E">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #10141a;
                font: 13px system-ui, sans-serif; }
@@ -51,10 +53,13 @@
 
   #hint { position: fixed; inset: 0; z-index: 2; display: flex;
           align-items: center; justify-content: center; pointer-events: none; }
-  #hint div { background: rgba(12, 16, 22, 0.85); color: #dde3ea;
-              border: 2px dashed #4a5561; border-radius: 12px;
-              padding: 28px 40px; font-size: 16px; text-align: center; }
-  body.droptarget #hint div { border-color: #8fd3a7; color: #8fd3a7; }
+  #hint > div { background: rgba(12, 16, 22, 0.85); color: #dde3ea;
+                border: 2px dashed #4a5561; border-radius: 12px;
+                padding: 28px 40px; font-size: 16px; text-align: center;
+                line-height: 1.7; }
+  #hint small { color: #9aa7b4; }
+  #hint a { color: #8fd3a7; pointer-events: auto; }
+  body.droptarget #hint > div { border-color: #8fd3a7; color: #8fd3a7; }
 
   /* The loader: alive while the worker bakes. */
   #loader { position: fixed; inset: 0; z-index: 4; display: none;
@@ -92,7 +97,11 @@
   <button id="fs" title="full screen">⛶</button>
 </div>
 <div id="hint"><div>Drop S-57 charts here<br>
-  <small>.000 cells (with their update files), or an exchange-set .zip</small></div></div>
+  <small>.000 cells (with their update files), or an exchange-set .zip<br>
+  The charts are baked and rendered in this page — nothing is uploaded.<br>
+  Free official cells: <a href="https://charts.noaa.gov/ENCs/ENCs.shtml"
+  target="_blank" rel="noopener">NOAA ENC downloads</a> — drop a downloaded zip
+  straight in.</small></div></div>
 <div id="loader"><div class="box">
   <div id="spin"></div>
   <div id="loadlabel">starting engine…</div>
@@ -155,8 +164,23 @@ const rpc = (op, args, transfer = []) =>
     worker.postMessage({ id, op, args }, transfer);
   });
 
-loader.show("starting engine…");
-const { version } = await rpc("init", { wasmUrl: new URL(q.get("wasm") || "./tile57-engine.wasm", location.href).href });
+worker.onerror = (e) => {
+  console.error(e);
+  status(`engine worker failed: ${e.message ?? "see console"}`);
+};
+
+loader.show("downloading the engine (a few MB on first visit)…");
+let version;
+try {
+  ({ version } = await rpc("init", { wasmUrl: new URL(q.get("wasm") || "./tile57-engine.wasm", location.href).href }));
+} catch (e) {
+  console.error(e);
+  $("loadlabel").textContent = `engine failed to start: ${e.message}`;
+  $("spin").style.display = "none";
+  $("bar").style.display = "none";
+  status("engine failed to start");
+  throw e;
+}
 
 // ---- renderer: WebGPU, or PNG views ---------------------------------------
 const dpr = Math.min(devicePixelRatio || 1, 2);
@@ -313,6 +337,23 @@ $("zi").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, 1); if (gpu) redraw()
 $("zo").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, -1); if (gpu) redraw(); scheduleRebuild(0); };
 $("fs").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 addEventListener("resize", () => { sizeCanvas(); if (gpu) redraw(); scheduleRebuild(200); });
+addEventListener("keydown", (e) => {
+  if (!charts.length) return;
+  const pan = 120;
+  const moves = {
+    ArrowLeft: () => panBy(pan, 0), ArrowRight: () => panBy(-pan, 0),
+    ArrowUp: () => panBy(0, pan), ArrowDown: () => panBy(0, -pan),
+    "+": () => zoomAt(viewW() / 2, viewH() / 2, 1),
+    "=": () => zoomAt(viewW() / 2, viewH() / 2, 1),
+    "-": () => zoomAt(viewW() / 2, viewH() / 2, -1),
+  };
+  const move = moves[e.key];
+  if (!move) return;
+  e.preventDefault();
+  move();
+  if (gpu) redraw();
+  scheduleRebuild(gpu ? 250 : 300);
+});
 
 // ---- loading charts -------------------------------------------------------
 function fitTo(list) {
@@ -434,7 +475,7 @@ async function loadFiles(files) {
     loading = false;
   }
 
-  for (const f of failed.slice(0, 3)) status(f);
+  if (failed.length) status(failed.slice(0, 2).join("; ") + (failed.length > 2 ? ` (+${failed.length - 2} more, see console)` : ""));
   if (!added.length) { hud(); return; }
 
   // Rebuild the composite over everything loaded (it borrows the charts).
