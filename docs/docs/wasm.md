@@ -22,8 +22,8 @@ client-side: a chartplotter with no server.
 
 - **Target**: `wasm32-wasi`. The module imports only `wasi_snapshot_preview1`
   functions. In node, the built-in `node:wasi` host provides them. In a
-  browser, a small WASI shim provides them (for example
-  `@bjorn3/browser_wasi_shim`, with an in-memory file system).
+  browser, `bindings/wasm/wasi-shim.mjs` provides them: a dependency-free shim
+  with an in-memory file tree for the source cells.
 - **Reactor model**: the module has no `_start`. Call the exported
   `_initialize` once after instantiation, then call the `tile57_*` exports.
 - **Exception handling**: Lua and libtess2 keep their setjmp/longjmp error
@@ -45,6 +45,13 @@ client-side: a chartplotter with no server.
   `tile57_chart_open_bytes` and keeps residency under its own control.
 - SQLite (raster charts) is built single-thread (`SQLITE_THREADSAFE=0`).
 
+## The JS wrapper
+
+`bindings/wasm/tile57.mjs` wraps the exports one-to-one for a JS host: it
+handles linear-memory allocation, C strings, out-parameters, and the
+`tile57_error` decode, and returns engine outputs as `Uint8Array` copies.
+Browser and node both run it.
+
 ## Smoke test
 
 `bindings/wasm/engine-smoke.mjs` drives the real pipeline under node's WASI
@@ -55,6 +62,23 @@ vector tile, render a PNG view:
 zig build wasm-engine
 node bindings/wasm/engine-smoke.mjs <ENC_ROOT> \
     US5BDRAB/US5BDRAB.000 US5BDRBB/US5BDRBB.000 --png out.png
+```
+
+## Browser demo
+
+`bindings/wasm/demo.html` is a complete in-page chartplotter: it fetches S-57
+cells over HTTP, bakes them, composes them, and renders every pan/zoom view —
+all inside the page. Serve a directory that holds the page, the two `.mjs`
+modules, `tile57-engine.wasm`, and an `enc/` tree with the cells:
+
+```sh
+zig build wasm-engine
+mkdir demo && cd demo
+ln -s ../bindings/wasm/{demo.html,tile57.mjs,wasi-shim.mjs} .
+ln -s ../zig-out/bin/tile57-engine.wasm .
+ln -s <ENC_ROOT> enc
+python3 -m http.server 8080
+# open http://localhost:8080/demo.html?cells=US5BDRAB/US5BDRAB.000
 ```
 
 ## The style-only module

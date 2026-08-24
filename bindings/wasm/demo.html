@@ -1,0 +1,110 @@
+<!doctype html>
+<!--
+  tile57 wasm chartplotter demo. Everything runs in this page: the engine
+  bakes the S-57 cells to PMTiles archives, composes them, and renders every
+  view — no server-side chart work at all.
+
+  Serve a directory that holds this page, the two .mjs modules beside it,
+  tile57-engine.wasm (zig build wasm-engine), and the source cells:
+
+    ?cells=US5BDRAB/US5BDRAB.000,US5BDRBB/US5BDRBB.000   cells under ./enc/
+    ?wasm=./tile57-engine.wasm                            engine module URL
+    ?enc=./enc                                            cell base URL
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tile57 wasm chartplotter</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 1rem; background: #10141a; color: #dde3ea; }
+  h1 { font-size: 1.1rem; margin: 0 0 .5rem; }
+  #view { border: 1px solid #333; image-rendering: auto; display: block; }
+  #bar { margin: .5rem 0; display: flex; gap: .4rem; align-items: center; }
+  button { font: inherit; padding: .2rem .7rem; background: #232a33; color: inherit; border: 1px solid #444; border-radius: 4px; cursor: pointer; }
+  #log { white-space: pre-wrap; font-family: monospace; font-size: 12px; color: #9aa7b4; margin-top: .6rem; }
+  #pos { margin-left: auto; font-family: monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>tile57 — charts baked and rendered in this page</h1>
+<div id="bar">
+  <button id="w">&larr;</button><button id="e">&rarr;</button>
+  <button id="n">&uarr;</button><button id="s">&darr;</button>
+  <button id="zi">+</button><button id="zo">&minus;</button>
+  <span id="pos"></span>
+</div>
+<img id="view" width="800" height="600" alt="chart view">
+<div id="log"></div>
+<script type="module">
+import { MemFS, WasiShim } from "./wasi-shim.mjs";
+import { Tile57 } from "./tile57.mjs";
+
+const q = new URLSearchParams(location.search);
+const cells = (q.get("cells") || "US5BDRAB/US5BDRAB.000,US5BDRBB/US5BDRBB.000").split(",");
+const wasmUrl = q.get("wasm") || "./tile57-engine.wasm";
+const encBase = q.get("enc") || "./enc";
+
+const logEl = document.getElementById("log");
+const log = (s) => { logEl.textContent += s + "\n"; };
+
+const fsys = new MemFS("/enc");
+for (const cell of cells) {
+  const r = await fetch(`${encBase}/${cell}`);
+  if (!r.ok) { log(`fetch ${cell}: ${r.status}`); throw new Error(cell); }
+  fsys.add(cell, new Uint8Array(await r.arrayBuffer()));
+  log(`fetched ${cell}`);
+}
+
+const t0 = performance.now();
+const mod = await WebAssembly.compileStreaming(fetch(wasmUrl));
+const wasi = new WasiShim(fsys);
+const inst = await WebAssembly.instantiate(mod, wasi.imports());
+wasi.start(inst);
+const t = new Tile57(inst.exports);
+log(`engine ${t.version()} up in ${(performance.now() - t0).toFixed(0)} ms`);
+t.warmup();
+
+const charts = [];
+let west = 180, south = 90, east = -180, north = -90;
+for (const cell of cells) {
+  const t1 = performance.now();
+  const arc = t.bakeChartBytes("/enc/" + cell);
+  const chart = t.chartOpenBytes(arc);
+  const info = t.chartGetInfo(chart);
+  if (info.hasBounds) {
+    west = Math.min(west, info.west); south = Math.min(south, info.south);
+    east = Math.max(east, info.east); north = Math.max(north, info.north);
+  }
+  charts.push(chart);
+  log(`baked ${cell}: ${arc.length} bytes, 1:${info.nativeScale}, ${(performance.now() - t1).toFixed(0)} ms`);
+}
+const compose = charts.length > 1 ? t.composeOpen(charts) : 0;
+if (compose) log(`composed ${charts.length} charts`);
+
+const view = { lat: (south + north) / 2, lon: (west + east) / 2, zoom: 14 };
+const img = document.getElementById("view");
+let url = null;
+function render() {
+  const t1 = performance.now();
+  const png = compose
+    ? t.composePng(compose, view.lon, view.lat, view.zoom, 800, 600)
+    : t.chartPng(charts[0], view.lon, view.lat, view.zoom, 800, 600);
+  if (url) URL.revokeObjectURL(url);
+  url = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+  img.src = url;
+  document.getElementById("pos").textContent =
+    `${view.lat.toFixed(4)}, ${view.lon.toFixed(4)} z${view.zoom.toFixed(1)} — ${(performance.now() - t1).toFixed(0)} ms`;
+}
+const step = () => 200 / 2 ** view.zoom; // ~quarter-view pan
+const move = (dlat, dlon, dz) => { view.lat += dlat; view.lon += dlon; view.zoom = Math.max(2, Math.min(18, view.zoom + dz)); render(); };
+document.getElementById("w").onclick = () => move(0, -step(), 0);
+document.getElementById("e").onclick = () => move(0, step(), 0);
+document.getElementById("n").onclick = () => move(step() * 0.75, 0, 0);
+document.getElementById("s").onclick = () => move(-step() * 0.75, 0, 0);
+document.getElementById("zi").onclick = () => move(0, 0, 1);
+document.getElementById("zo").onclick = () => move(0, 0, -1);
+render();
+log("ready");
+</script>
+</body>
+</html>
