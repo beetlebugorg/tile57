@@ -300,7 +300,10 @@ async function applyMariner(patch) {
     applySchemeChrome();
     if (gpu) {
       try {
-        gpu.setScheme(mariner.scheme, await rpc("spriteAtlas", { pixelRatio: dpr, scheme: schemeIdx() }));
+        // Await the swap: the rebuild below reads gpu.halo for the SDF text
+        // pass and the clear colour, and an un-awaited swap left them one
+        // scheme behind until the next camera move rebuilt again.
+        await gpu.setScheme(mariner.scheme, await rpc("spriteAtlas", { pixelRatio: dpr, scheme: schemeIdx() }));
       } catch (e) {
         console.warn("scheme atlas:", e);
       }
