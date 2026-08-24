@@ -135,7 +135,7 @@ export class WasiShim {
   str(ptr, len) { return new TextDecoder().decode(this.bytes().subarray(ptr, ptr + len)); }
 
   // The tree path a (dirfd, path string) pair names, or null on a bad dirfd.
-  // Paths arrive relative to the dirfd OR absolute ("/enc/x" — Zig's std
+  // Paths arrive relative to the dirfd OR absolute ("/enc/x" - Zig's std
   // resolves some opens that way); an absolute path resolves against the
   // preopen root, and one outside it stays unresolvable (NOENT at lookup).
   at(dirfd, ptr, len) {

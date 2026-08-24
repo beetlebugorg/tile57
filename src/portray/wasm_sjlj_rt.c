@@ -1,6 +1,6 @@
 /*
  * The setjmp/longjmp runtime for wasm, vendored from wasi-libc
- * (libc-top-half/musl/src/setjmp/wasm32/rt.c, MIT/Apache-2.0 — see
+ * (libc-top-half/musl/src/setjmp/wasm32/rt.c, MIT/Apache-2.0 - see
  * THIRD_PARTY_LICENSES.md).
  *
  * Lua's error path is setjmp/longjmp. On wasm, clang lowers those calls to
@@ -14,7 +14,7 @@
  * tag the helpers throw with). It must be vendored: the copy inside Zig's
  * bundled wasi-libc only enters libc.a when the exception-handling feature is
  * enabled TARGET-wide, and that build crashes in zig 0.16 (zig compiles it
- * without the sjlj pass, which leaves the tag undefined-weak — rejected by
+ * without the sjlj pass, which leaves the tag undefined-weak - rejected by
  * the wasm object writer). Per-file flags on our own objects sidestep the
  * libc build entirely.
  *

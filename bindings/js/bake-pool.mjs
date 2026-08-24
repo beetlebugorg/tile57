@@ -1,5 +1,5 @@
 // A pool of engine workers for parallel cell bakes. One wasm instance is
-// single-threaded, so parallel baking means N instances — each pool slot runs
+// single-threaded, so parallel baking means N instances - each pool slot runs
 // its own engine-worker.mjs with its own engine and file tree. A cell bake is
 // pure (cell bytes in, archive bytes out), so the slots share nothing; chart
 // handles, the compositor, and rendering stay on the page's PRIMARY engine

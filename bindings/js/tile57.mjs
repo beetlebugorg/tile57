@@ -23,7 +23,7 @@ export class Tile57 {
     this.errPtr = this.scratch + 16;
   }
 
-  // memory.buffer detaches on growth — always re-view.
+  // memory.buffer detaches on growth - always re-view.
   bytes() { return new Uint8Array(this.e.memory.buffer); }
   view() { return new DataView(this.e.memory.buffer); }
 
@@ -70,6 +70,107 @@ export class Tile57 {
   version() { return this.cstr(this.e.tile57_version() >>> 0); }
   warmup() { this.e.tile57_warmup(); }
 
+  // ---- mariner settings (tile57_mariner, 144 B on wasm32) -----------------
+  // Offsets mirror include/tile57.h field by field; marinerDefaults() decodes
+  // the struct the ENGINE fills, so a layout skew shows up immediately as
+  // absurd defaults (the node test asserts the canonical values).
+  //
+  // The JS shape folds the three display_* booleans into one cumulative
+  // `detailLevel` (base | standard | other) and the soundings tri-state into
+  // auto | on | off. Viewing groups, size scales, and the host debug valves
+  // stay at the engine defaults.
+
+  static SCHEMES = ["day", "dusk", "night"];
+
+  decodeMariner(p) {
+    const d = this.view(), m = this.bytes();
+    let dateView = "";
+    for (let i = 0; i < 8; i++) {
+      const b = m[p + 67 + i];
+      if (!b) break;
+      dateView += String.fromCharCode(b);
+    }
+    return {
+      scheme: Tile57.SCHEMES[d.getUint32(p, true)] ?? "day",
+      shallowContour: d.getFloat64(p + 8, true),
+      safetyContour: d.getFloat64(p + 16, true),
+      deepContour: d.getFloat64(p + 24, true),
+      safetyDepth: d.getFloat64(p + 32, true),
+      fourShadeWater: !!m[p + 40],
+      depthUnit: d.getUint32(p + 44, true) === 1 ? "ft" : "m",
+      detailLevel: m[p + 50] ? "other" : m[p + 49] ? "standard" : "base",
+      dataQuality: !!m[p + 51],
+      showInformCallouts: !!m[p + 52],
+      showMetaBounds: !!m[p + 53],
+      showIsolatedDangersShallow: !!m[p + 54],
+      boundaryStyle: d.getUint32(p + 56, true) === 1 ? "plain" : "symbolized",
+      simplifiedPoints: !!m[p + 60],
+      showFullSectorLines: !!m[p + 61],
+      textNames: !!m[p + 62],
+      showLightDescriptions: !!m[p + 63],
+      textOther: !!m[p + 64],
+      dateDependent: !!m[p + 65],
+      highlightDateDependent: !!m[p + 66],
+      dateView,
+      showOverscale: !!m[p + 97],
+      soundings: ["auto", "on", "off"][m[p + 120]] ?? "auto",
+    };
+  }
+
+  /** The engine's canonical default mariner settings, as a JS object. */
+  marinerDefaults() {
+    const p = this.walloc(144);
+    this.bytes().fill(0, p, p + 144);
+    this.e.tile57_mariner_defaults(p);
+    const out = this.decodeMariner(p);
+    this.wasmFree(p);
+    return out;
+  }
+
+  /** Encode settings over the engine defaults into a tile57_mariner in
+   * linear memory. Release with wasmFree. Null/undefined settings -> 0
+   * (the calls treat NULL as canonical defaults). */
+  encodeMariner(s) {
+    if (!s) return 0;
+    const p = this.walloc(144);
+    this.bytes().fill(0, p, p + 144);
+    this.e.tile57_mariner_defaults(p);
+    const d = this.view(), m = this.bytes();
+    const has = (k) => s[k] !== undefined;
+    if (has("scheme")) d.setUint32(p, Math.max(0, Tile57.SCHEMES.indexOf(s.scheme)), true);
+    if (has("shallowContour")) d.setFloat64(p + 8, s.shallowContour, true);
+    if (has("safetyContour")) d.setFloat64(p + 16, s.safetyContour, true);
+    if (has("deepContour")) d.setFloat64(p + 24, s.deepContour, true);
+    if (has("safetyDepth")) d.setFloat64(p + 32, s.safetyDepth, true);
+    if (has("fourShadeWater")) m[p + 40] = s.fourShadeWater ? 1 : 0;
+    if (has("depthUnit")) d.setUint32(p + 44, s.depthUnit === "ft" ? 1 : 0, true);
+    if (has("detailLevel")) {
+      m[p + 48] = 1; // display_base is the permanent minimum
+      m[p + 49] = s.detailLevel !== "base" ? 1 : 0;
+      m[p + 50] = s.detailLevel === "other" ? 1 : 0;
+    }
+    if (has("dataQuality")) m[p + 51] = s.dataQuality ? 1 : 0;
+    if (has("showInformCallouts")) m[p + 52] = s.showInformCallouts ? 1 : 0;
+    if (has("showMetaBounds")) m[p + 53] = s.showMetaBounds ? 1 : 0;
+    if (has("showIsolatedDangersShallow")) m[p + 54] = s.showIsolatedDangersShallow ? 1 : 0;
+    if (has("boundaryStyle")) d.setUint32(p + 56, s.boundaryStyle === "plain" ? 1 : 0, true);
+    if (has("simplifiedPoints")) m[p + 60] = s.simplifiedPoints ? 1 : 0;
+    if (has("showFullSectorLines")) m[p + 61] = s.showFullSectorLines ? 1 : 0;
+    if (has("textNames")) m[p + 62] = s.textNames ? 1 : 0;
+    if (has("showLightDescriptions")) m[p + 63] = s.showLightDescriptions ? 1 : 0;
+    if (has("textOther")) m[p + 64] = s.textOther ? 1 : 0;
+    if (has("dateDependent")) m[p + 65] = s.dateDependent ? 1 : 0;
+    if (has("highlightDateDependent")) m[p + 66] = s.highlightDateDependent ? 1 : 0;
+    if (has("dateView")) {
+      m.fill(0, p + 67, p + 76);
+      const v = String(s.dateView || "").slice(0, 8);
+      for (let i = 0; i < v.length; i++) m[p + 67 + i] = v.charCodeAt(i);
+    }
+    if (has("showOverscale")) m[p + 97] = s.showOverscale ? 1 : 0;
+    if (has("soundings")) m[p + 120] = { auto: 0, on: 1, off: 2 }[s.soundings] ?? 0;
+    return p;
+  }
+
   /** Bake one S-57 cell (a path in the WASI file tree) to archive bytes. */
   bakeChartBytes(cellPath) {
     const p = this.allocCString(cellPath);
@@ -80,7 +181,7 @@ export class Tile57 {
 
   /** Bake every chart in an exchange-set zip to <outDir>/<CELL>/<CELL>.pmtiles
    * in the WASI file tree (updates applied from the archive). Returns how many
-   * charts were baked. One call for the whole set — a host that wants per-cell
+   * charts were baked. One call for the whole set - a host that wants per-cell
    * progress lists the zip, extracts each cell, and bakes it itself. */
   bakeZip(zipPath, outDir) {
     const zp = this.allocCString(zipPath);
@@ -152,9 +253,12 @@ export class Tile57 {
     this.check("chart_tile", this.e.tile57_chart_tile(chart, z, x, y, this.outPtr, this.outLen, this.errPtr));
     return this.takeOut();
   }
-  /** A PNG view render from an open chart (canonical mariner settings). */
-  chartPng(chart, lon, lat, zoom, width, height) {
-    this.check("chart_png", this.e.tile57_chart_png(chart, lon, lat, zoom, width, height, 0, this.outPtr, this.outLen, this.errPtr));
+  /** A PNG view render from an open chart. `mariner` (optional) is the JS
+   * settings object encodeMariner takes; absent -> canonical defaults. */
+  chartPng(chart, lon, lat, zoom, width, height, mariner) {
+    const mp = this.encodeMariner(mariner);
+    this.check("chart_png", this.e.tile57_chart_png(chart, lon, lat, zoom, width, height, mp, this.outPtr, this.outLen, this.errPtr));
+    if (mp) this.wasmFree(mp);
     return this.takeOut();
   }
 
@@ -200,16 +304,20 @@ export class Tile57 {
   }
 
   /** Portray a chart view into draw-ready GPU buffers. Call .free() on the
-   * result once uploaded. */
-  chartGpuScene(chart, lon, lat, zoom, width, height, pixelRatio) {
+   * result once uploaded. `mariner` as chartPng. */
+  chartGpuScene(chart, lon, lat, zoom, width, height, pixelRatio, mariner) {
     const sp = this.walloc(44);
-    this.check("chart_gpu_scene", this.e.tile57_chart_gpu_scene(chart, lon, lat, zoom, width, height, 0, pixelRatio, sp, this.errPtr));
+    const mp = this.encodeMariner(mariner);
+    this.check("chart_gpu_scene", this.e.tile57_chart_gpu_scene(chart, lon, lat, zoom, width, height, mp, pixelRatio, sp, this.errPtr));
+    if (mp) this.wasmFree(mp);
     return this.sceneView(sp);
   }
   /** The composed twin of chartGpuScene. */
-  composeGpuScene(compose, lon, lat, zoom, width, height, pixelRatio) {
+  composeGpuScene(compose, lon, lat, zoom, width, height, pixelRatio, mariner) {
     const sp = this.walloc(44);
-    this.check("compose_gpu_scene", this.e.tile57_compose_gpu_scene(compose, lon, lat, zoom, width, height, 0, pixelRatio, sp, this.errPtr));
+    const mp = this.encodeMariner(mariner);
+    this.check("compose_gpu_scene", this.e.tile57_compose_gpu_scene(compose, lon, lat, zoom, width, height, mp, pixelRatio, sp, this.errPtr));
+    if (mp) this.wasmFree(mp);
     return this.sceneView(sp);
   }
 
@@ -282,6 +390,36 @@ export class Tile57 {
     return new TextDecoder().decode(this.takeOut());
   }
 
+  /** The cursor pick at (lon, lat): the features under the point, as
+   * [{cls, s57, chart}] - s57 is the attribute object. Pass a compose handle
+   * OR a chart handle (compose wins when both). `zoom` is the view's zoom, so
+   * the pick reads what is actually displayed. */
+  pick({ compose = 0, chart = 0, lon, lat, zoom }) {
+    const st = this.e.tile57_wasm_query(compose, chart, lon, lat, zoom, this.outPtr, this.outLen);
+    if (st !== 0) throw new Error(`wasm_query: status ${st}`);
+    const d = this.view();
+    const ptr = d.getUint32(this.outPtr, true), len = d.getUint32(this.outLen, true);
+    if (!ptr) return [];
+    const text = new TextDecoder().decode(this.bytes().subarray(ptr, ptr + len));
+    this.wasmFree(ptr);
+    return JSON.parse(text);
+  }
+
+  /** The decoded pick report for one queried feature: {title, subtitle, chip,
+   * notes, rows, footnote, empty?} plus the raw payload under `s57`. */
+  s57Report(cls, cell, attrs) {
+    const clsB = new TextEncoder().encode(cls);
+    const cellB = new TextEncoder().encode(cell);
+    const attrsB = new TextEncoder().encode(typeof attrs === "string" ? attrs : JSON.stringify(attrs ?? {}));
+    const p = this.alloc(new Uint8Array([...clsB, ...cellB, ...attrsB]));
+    this.check("s57_report", this.e.tile57_s57_report(
+      p, clsB.length, p + clsB.length, cellB.length, p + clsB.length + cellB.length, attrsB.length,
+      this.outPtr, this.outLen, this.errPtr));
+    this.wasmFree(p);
+    const out = this.takeOut();
+    return out ? JSON.parse(new TextDecoder().decode(out)) : null;
+  }
+
   /** Compose open charts (BORROWED: close the compositor before them). */
   composeOpen(charts) {
     const list = this.walloc(4 * charts.length);
@@ -298,9 +436,11 @@ export class Tile57 {
     this.check("compose_tile", this.e.tile57_compose_tile(compose, z, x, y, this.outPtr, this.outLen, this.outFlag, this.errPtr));
     return this.takeOut();
   }
-  /** A PNG view render from the composite (canonical mariner settings). */
-  composePng(compose, lon, lat, zoom, width, height) {
-    this.check("compose_png", this.e.tile57_compose_png(compose, lon, lat, zoom, width, height, 0, this.outPtr, this.outLen, this.errPtr));
+  /** A PNG view render from the composite. `mariner` as chartPng. */
+  composePng(compose, lon, lat, zoom, width, height, mariner) {
+    const mp = this.encodeMariner(mariner);
+    this.check("compose_png", this.e.tile57_compose_png(compose, lon, lat, zoom, width, height, mp, this.outPtr, this.outLen, this.errPtr));
+    if (mp) this.wasmFree(mp);
     return this.takeOut();
   }
 }

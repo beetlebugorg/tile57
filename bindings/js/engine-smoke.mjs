@@ -1,8 +1,8 @@
 // Smoke test for the full-engine wasm reactor (zig build wasm-engine).
 //
 // Runs the real chartplotter pipeline inside node's WASI host: bake S-57
-// cells to per-chart PMTiles archives, open each archive from bytes, and —
-// with two or more cells — compose them and serve tiles from the composite.
+// cells to per-chart PMTiles archives, open each archive from bytes, and -
+// with two or more cells - compose them and serve tiles from the composite.
 // This is the same call sequence a browser chartplotter makes; only the WASI
 // shim differs.
 //
@@ -33,7 +33,7 @@ const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
 wasi.initialize(inst); // reactor: run the wasi/libc constructors once
 const E = inst.exports;
 
-// memory.buffer detaches on growth — always re-view.
+// memory.buffer detaches on growth - always re-view.
 const u8 = () => new Uint8Array(E.memory.buffer);
 const dv = () => new DataView(E.memory.buffer);
 

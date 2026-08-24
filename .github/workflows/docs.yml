@@ -58,7 +58,16 @@ jobs:
              bindings/js/worker-rpc.mjs bindings/js/bake-pool.mjs \
              bindings/js/chart-library.mjs \
              docs/static/demo-app/
+          cp -r bindings/js/demo docs/static/demo-app/demo
           cp zig-out/bin/tile57-engine.wasm docs/static/demo-app/
+
+      # A first visit with no charts offers this NOAA cell (public domain,
+      # ~120 kB) as "try a sample harbor". Best effort: without it the
+      # welcome card just keeps the download link alone.
+      - name: Fetch the sample harbor
+        run: |
+          curl -fsSL -o docs/static/demo-app/sample.zip \
+            https://charts.noaa.gov/ENCs/US5MD12M.zip || true
 
       # No committed lockfile, so `npm install` (not `npm ci`).
       - name: Install

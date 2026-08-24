@@ -127,7 +127,7 @@ Serve a directory that holds the page, the `.mjs` modules, and the engine:
 ```sh
 zig build wasm-engine
 mkdir demo && cd demo
-ln -s ../bindings/js/{demo.html,tile57.mjs,wasi-shim.mjs,gpu-renderer.mjs,engine-worker.mjs} .
+ln -s ../bindings/js/{demo.html,demo,tile57.mjs,wasi-shim.mjs,gpu-renderer.mjs,engine-worker.mjs,worker-rpc.mjs,bake-pool.mjs,chart-library.mjs} .
 ln -s ../zig-out/bin/tile57-engine.wasm .
 python3 -m http.server 8080
 # open http://localhost:8080/demo.html and drop charts on it

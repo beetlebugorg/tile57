@@ -1,5 +1,5 @@
 // The engine, off the main thread. Every tile57 call is synchronous wasm and
-// a bake can hold the CPU for seconds — run here, the page stays live and a
+// a bake can hold the CPU for seconds - run here, the page stays live and a
 // loader can actually animate. The page talks RPC: {id, op, args} in,
 // {id, ok, result} | {id, ok: false, error} out, with large byte buffers
 // transferred rather than copied.
@@ -24,13 +24,15 @@ const ops = {
     return { version: t.version() };
   },
 
-  // Everything the WebGPU renderer needs, baked once: the ABI layout, the
-  // four atlas PNGs at the page's pixel ratio, and the colortables the halo
-  // and clear colours come from.
-  gpuAssets({ pixelRatio }) {
+  // Everything the WebGPU renderer needs, baked once per scheme: the ABI
+  // layout, the four atlas PNGs at the page's pixel ratio, and the
+  // colortables the halo and clear colours come from. Symbols carry their
+  // OWN colours, so a scheme change re-bakes the sprite atlas; the SDF glyph
+  // atlases are colourless and scheme-independent.
+  gpuAssets({ pixelRatio, scheme = 0 }) {
     const r = {
       layout: t.abiGpuLayout(),
-      spritePng: t.bakeSpriteMln(pixelRatio, 0).png,
+      spritePng: t.bakeSpriteMln(pixelRatio, scheme).png,
       glyphPng: t.bakeGlyphSdf(0).png,
       glyphBoldPng: t.bakeGlyphSdf(1).png,
       glyphItalicPng: t.bakeGlyphSdf(2).png,
@@ -39,19 +41,38 @@ const ops = {
     return [r, [r.spritePng.buffer, r.glyphPng.buffer, r.glyphBoldPng.buffer, r.glyphItalicPng.buffer]];
   },
 
-  // The S-52 colour tables ({day, dusk, night} token maps) — the page themes
+  // The sprite atlas alone, for a scheme change on a standing renderer.
+  spriteAtlas({ pixelRatio, scheme = 0 }) {
+    const png = t.bakeSpriteMln(pixelRatio, scheme).png;
+    return [png, [png.buffer]];
+  },
+
+  // The engine's canonical default mariner settings.
+  marinerDefaults() { return t.marinerDefaults(); },
+
+  // The cursor pick + the decoded report for each feature, in one round trip.
+  pick({ compose, chart, lon, lat, zoom }) {
+    return t.pick({ compose, chart, lon, lat, zoom }).map((f) => ({
+      ...f,
+      report: (() => {
+        try { return t.s57Report(f.cls, f.chart, f.s57); } catch { return null; }
+      })(),
+    }));
+  },
+
+  // The S-52 colour tables ({day, dusk, night} token maps) - the page themes
   // its own chrome from them, so the UI colours are the spec's, not ours.
   palette() { return JSON.parse(t.colortablesDefault()); },
 
   addFile({ path, bytes }) { fsys.add(path, bytes); },
 
-  // Drop a file or subtree from the tree — a zip or a cell's extracted files
+  // Drop a file or subtree from the tree - a zip or a cell's extracted files
   // free as soon as their bake is done, so a big batch stays flat in memory.
   remove({ path }) {
     fsys.remove(path.startsWith(fsys.root + "/") ? path.slice(fsys.root.length + 1) : path);
   },
 
-  // Read one file back out of the tree (transferred) — how the page shuttles
+  // Read one file back out of the tree (transferred) - how the page shuttles
   // zip-extracted cell files from this worker to a bake-pool worker.
   readFile({ path }) {
     const rel = path.startsWith(fsys.root + "/") ? path.slice(fsys.root.length + 1) : path;
@@ -90,20 +111,20 @@ const ops = {
   composeOpen({ handles }) { return t.composeOpen(handles); },
   composeClose({ handle }) { t.composeClose(handle); },
 
-  png({ compose, chart, lon, lat, zoom, w, h }) {
+  png({ compose, chart, lon, lat, zoom, w, h, mariner }) {
     const png = compose
-      ? t.composePng(compose, lon, lat, zoom, w, h)
-      : t.chartPng(chart, lon, lat, zoom, w, h);
+      ? t.composePng(compose, lon, lat, zoom, w, h, mariner)
+      : t.chartPng(chart, lon, lat, zoom, w, h, mariner);
     return [png, [png.buffer]];
   },
 
   // Build a scene, batch it, and hand the page plain draw-ready data: the
   // three buffers and the pattern cells COPIED out of wasm memory (and
   // transferred), the draw list as objects.
-  gpuScene({ compose, chart, lon, lat, zoom, w, h, pixelRatio, atlasHave, halo }) {
+  gpuScene({ compose, chart, lon, lat, zoom, w, h, pixelRatio, atlasHave, halo, mariner }) {
     const scene = compose
-      ? t.composeGpuScene(compose, lon, lat, zoom, w, h, pixelRatio)
-      : t.chartGpuScene(chart, lon, lat, zoom, w, h, pixelRatio);
+      ? t.composeGpuScene(compose, lon, lat, zoom, w, h, pixelRatio, mariner)
+      : t.chartGpuScene(chart, lon, lat, zoom, w, h, pixelRatio, mariner);
     const r = {
       vertex: scene.vertexBytes().slice(),
       index: scene.indexBytes().slice(),

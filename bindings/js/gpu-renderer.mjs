@@ -1,4 +1,4 @@
-// WebGPU renderer for tile57 GPU scenes — the browser sibling of the
+// WebGPU renderer for tile57 GPU scenes - the browser sibling of the
 // reference shaders in shaders/ (lookout.metal, vk/*.vert|frag). The WGSL
 // below is a port of those programs over the same tile57_gpu_vertex /
 // tile57_gpu_quad / tile57_gpu_uniforms layouts; hold every change against
@@ -9,14 +9,14 @@
 // This renderer uploads the buffers once per scene and redraws every frame
 // from uniforms alone, so pan and zoom are live between scene rebuilds.
 //
-// The renderer holds no engine handle — it consumes plain data, so the
+// The renderer holds no engine handle - it consumes plain data, so the
 // engine can live in a Web Worker while the device and buffers live here.
 //
 // usage:
 //   const r = await GpuRenderer.create(canvas, pixelRatio, assets);
 //     // assets: {layout, spritePng, glyphPng, glyphBoldPng, glyphItalicPng,
-//     //          colortables} — the engine-worker's gpuAssets op
-//   r.setScene(data);   // {vertex, index, quad, patterns, draws} — its gpuScene op
+//     //          colortables} - the engine-worker's gpuAssets op
+//   r.setScene(data);   // {vertex, index, quad, patterns, draws} - its gpuScene op
 //   r.draw(camera);     // {lon, lat, zoom}, any frame
 
 export const ATLAS = { NONE: 0, SPRITE: 1, GLYPH: 2, GLYPH_BOLD: 3, GLYPH_ITALIC: 4 };
@@ -162,7 +162,7 @@ struct QuadOut {
 }
 `;
 
-// tile57_gpu_vertex (32 B) — see chart.vert's layout comment.
+// tile57_gpu_vertex (32 B) - see chart.vert's layout comment.
 const VERTEX_LAYOUT = {
   arrayStride: 32,
   attributes: [
@@ -174,7 +174,7 @@ const VERTEX_LAYOUT = {
     { shaderLocation: 5, offset: 28, format: "float32" },
   ],
 };
-// tile57_gpu_quad (44 B) — see sprite.vert's layout comment.
+// tile57_gpu_quad (44 B) - see sprite.vert's layout comment.
 const QUAD_LAYOUT = {
   arrayStride: 44,
   attributes: [
@@ -302,11 +302,22 @@ export class GpuRenderer {
     r.atlases[ATLAS.GLYPH_BOLD] = await texFromPng(device, assets.glyphBoldPng);
     r.atlases[ATLAS.GLYPH_ITALIC] = await texFromPng(device, assets.glyphItalicPng);
     r.atlasHave = (1 << ATLAS.SPRITE) | (1 << ATLAS.GLYPH) | (1 << ATLAS.GLYPH_BOLD) | (1 << ATLAS.GLYPH_ITALIC);
+    r.colortables = assets.colortables;
     r.halo = nodataColor(assets.colortables);
     r.msaa = null;
     r.buffers = null;
     r.draws = [];
     return r;
+  }
+
+  /** Swap to another colour scheme: the sprite atlas re-baked for it (the
+   * engine-worker's spriteAtlas op) and the halo/clear colour from that
+   * scheme's NODTA. Scenes rebuilt with the new mariner bring the rest. */
+  async setScheme(scheme, spritePng) {
+    const old = this.atlases[ATLAS.SPRITE];
+    this.atlases[ATLAS.SPRITE] = await texFromPng(this.device, spritePng);
+    old?.destroy();
+    this.halo = nodataColor(this.colortables, scheme.toUpperCase());
   }
 
   // Upload one buffer (padded to 4 bytes) or null when empty.
@@ -370,7 +381,7 @@ export class GpuRenderer {
   }
 
   /** Redraw the uploaded scene for `cam` ({lon, lat, zoom}). Geometry is
-   * world-anchored, so any camera renders correctly — a pan or zoom between
+   * world-anchored, so any camera renders correctly - a pan or zoom between
    * scene rebuilds is just new uniforms. */
   draw(cam) {
     const w = this.canvas.width, h = this.canvas.height;
@@ -399,7 +410,7 @@ export class GpuRenderer {
     const S = 256 * 2 ** cam.zoom * this.pixelRatio; // framebuffer px per world unit
     const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
     // View rotation (cam.rot, radians): the scene stays north-up in world
-    // space — the camera turns, and the shaders turn the map-aligned local
+    // space - the camera turns, and the shaders turn the map-aligned local
     // offsets by the same angle (that is the whole GPU-scene contract).
     const rot = cam.rot || 0;
     const rc = Math.cos(rot), rs = Math.sin(rot);
@@ -408,7 +419,7 @@ export class GpuRenderer {
     // which keeps a zoomed-in view seamless across the antimeridian. In a
     // WIDE view the seam meridian (half a world from the camera) falls onto
     // geometry, and a primitive straddling it gets its vertices wrapped to
-    // OPPOSITE copies — it tears into full-width streaks. Once the viewport
+    // OPPOSITE copies - it tears into full-width streaks. Once the viewport
     // spans a large share of a world, draw everything in its home copy
     // instead: wrap_x = 0.5 makes the shader's round() zero for all x.
     const wrapX = w / S > 0.4 ? 0.5 : cx;

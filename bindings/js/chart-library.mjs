@@ -1,6 +1,6 @@
 // A persistent chart library over OPFS (the browser's origin-private file
 // system): baked PMTiles archives are written here as cells finish, and a
-// page load opens the library instead of re-baking — baking is the expensive
+// page load opens the library instead of re-baking - baking is the expensive
 // step, and it should happen once per chart, not once per session.
 //
 // Layout: one OPFS directory, `charts/`, holding `<CELL>.pmtiles` plus a
@@ -26,7 +26,7 @@ export class ChartLibrary {
     this.dir = dir;
   }
 
-  /** Bytes this origin stores (the library dominates it). One instant call —
+  /** Bytes this origin stores (the library dominates it). One instant call -
    * per-file sizing crawls once a library holds thousands of charts. */
   async usage() {
     try {
@@ -85,7 +85,7 @@ export class ChartLibrary {
     await this.dir.removeEntry(`${stem}.json`).catch(() => {});
   }
 
-  /** Delete every archive — one recursive remove, not thousands of calls. */
+  /** Delete every archive - one recursive remove, not thousands of calls. */
   async clear() {
     await this.root.removeEntry("charts", { recursive: true });
     this.dir = await this.root.getDirectoryHandle("charts", { create: true });

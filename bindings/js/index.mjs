@@ -1,7 +1,7 @@
 // tile57 for JavaScript: the full chart engine, compiled to WebAssembly.
 //
 // The engine bakes S-57/S-101 charts to PMTiles archives, composes them, and
-// renders tiles, PNG views, and draw-ready WebGPU scenes — in the browser or
+// renders tiles, PNG views, and draw-ready WebGPU scenes - in the browser or
 // in node. `createEngine` stands one up in the current context; the other
 // exports are the pieces a real app composes:
 //
