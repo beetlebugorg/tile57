@@ -16,7 +16,7 @@ export class Tile57 {
     this.e = exports;
     // One scratch block: two 4-byte out-slots, one flag byte, the error
     // struct (status i32 + 256-byte message).
-    this.scratch = exports.tile57_wasm_alloc(16 + 260);
+    this.scratch = this.walloc(16 + 260);
     this.outPtr = this.scratch;
     this.outLen = this.scratch + 4;
     this.outFlag = this.scratch + 8;
@@ -33,10 +33,17 @@ export class Tile57 {
     while (m[end] !== 0) end++;
     return new TextDecoder().decode(m.subarray(ptr, end));
   }
+  /** Allocate `len` bytes of linear memory. The mask matters: wasm i32
+   * return values arrive SIGNED, so past 2 GiB of memory every pointer
+   * looks negative without it. */
+  walloc(len) {
+    const p = this.e.tile57_wasm_alloc(len) >>> 0;
+    if (!p) throw new Error("out of wasm memory");
+    return p;
+  }
   /** Copy `bytes` into linear memory. Release with `wasmFree`. */
   alloc(bytes) {
-    const p = this.e.tile57_wasm_alloc(bytes.length);
-    if (!p) throw new Error("tile57_wasm_alloc failed");
+    const p = this.walloc(bytes.length);
     this.bytes().set(bytes, p);
     return p;
   }
@@ -60,7 +67,7 @@ export class Tile57 {
     return copy;
   }
 
-  version() { return this.cstr(this.e.tile57_version()); }
+  version() { return this.cstr(this.e.tile57_version() >>> 0); }
   warmup() { this.e.tile57_warmup(); }
 
   /** Bake one S-57 cell (a path in the WASI file tree) to archive bytes. */
@@ -98,7 +105,7 @@ export class Tile57 {
   zipExtract(zipPath, names, outPaths) {
     const zp = this.allocCString(zipPath);
     const strs = names.concat(outPaths).map((s) => this.allocCString(s));
-    const list = this.e.tile57_wasm_alloc(4 * strs.length);
+    const list = this.walloc(4 * strs.length);
     const d = this.view();
     strs.forEach((p, i) => d.setUint32(list + 4 * i, p, true));
     this.check("zip_extract", this.e.tile57_zip_extract(zp, list, list + 4 * names.length, names.length, 0, 0, this.outPtr, this.errPtr));
@@ -120,7 +127,7 @@ export class Tile57 {
 
   /** Decode tile57_info for a chart. */
   chartGetInfo(chart) {
-    const info = this.e.tile57_wasm_alloc(96);
+    const info = this.walloc(96);
     this.e.tile57_chart_get_info(chart, info);
     const d = this.view();
     const out = {
@@ -195,13 +202,13 @@ export class Tile57 {
   /** Portray a chart view into draw-ready GPU buffers. Call .free() on the
    * result once uploaded. */
   chartGpuScene(chart, lon, lat, zoom, width, height, pixelRatio) {
-    const sp = this.e.tile57_wasm_alloc(44);
+    const sp = this.walloc(44);
     this.check("chart_gpu_scene", this.e.tile57_chart_gpu_scene(chart, lon, lat, zoom, width, height, 0, pixelRatio, sp, this.errPtr));
     return this.sceneView(sp);
   }
   /** The composed twin of chartGpuScene. */
   composeGpuScene(compose, lon, lat, zoom, width, height, pixelRatio) {
-    const sp = this.e.tile57_wasm_alloc(44);
+    const sp = this.walloc(44);
     this.check("compose_gpu_scene", this.e.tile57_compose_gpu_scene(compose, lon, lat, zoom, width, height, 0, pixelRatio, sp, this.errPtr));
     return this.sceneView(sp);
   }
@@ -210,7 +217,7 @@ export class Tile57 {
    * is a bitmask over the tile57_gpu_atlas ids the host uploaded; `halo` is
    * the palette background RGBA (0..1) for SDF label halos. */
   gpuBatch(scene, { textOn = true, soundOn = true, excludeOpaque = false, atlasHave = 0, halo = [1, 1, 1, 1] } = {}) {
-    const op = this.e.tile57_wasm_alloc(20);
+    const op = this.walloc(20);
     {
       const d = this.view();
       d.setUint8(op, textOn ? 1 : 0);
@@ -220,7 +227,7 @@ export class Tile57 {
       for (let i = 0; i < 4; i++) d.setFloat32(op + 4 + 4 * i, halo[i], true);
     }
     const cap = scene.rangeCount;
-    const dp = this.e.tile57_wasm_alloc(Math.max(1, cap * 36));
+    const dp = this.walloc(Math.max(1, cap * 36));
     const n = this.e.tile57_gpu_batch(scene.ranges, scene.rangeCount, op, dp, cap);
     if (n > cap) throw new Error("gpu_batch: draw buffer too small");
     const d = this.view(), draws = [];
@@ -249,7 +256,7 @@ export class Tile57 {
    * 2 night), rasterized at pixelRatio. Pass the SAME pixelRatio to the
    * gpu-scene calls, or the UVs will not index the texture. */
   bakeSpriteMln(pixelRatio, scheme = 0) {
-    const ap = this.e.tile57_wasm_alloc(48);
+    const ap = this.walloc(48);
     this.check("bake_sprite_mln", this.e.tile57_bake_sprite_mln(0, pixelRatio, scheme, ap, this.errPtr));
     const out = { json: this.assetField(ap, 16), png: this.assetField(ap, 24) };
     this.e.tile57_assets_free(ap);
@@ -261,7 +268,7 @@ export class Tile57 {
    * 2 italic. The png is the RGBA signed-distance field the SDF pipeline
    * samples. */
   bakeGlyphSdf(face = 0) {
-    const ap = this.e.tile57_wasm_alloc(48);
+    const ap = this.walloc(48);
     this.check("bake_glyph_sdf", this.e.tile57_bake_glyph_sdf_face(ap, face, this.errPtr));
     const out = { json: this.assetField(ap, 16), png: this.assetField(ap, 24) };
     this.e.tile57_assets_free(ap);
@@ -277,7 +284,7 @@ export class Tile57 {
 
   /** Compose open charts (BORROWED: close the compositor before them). */
   composeOpen(charts) {
-    const list = this.e.tile57_wasm_alloc(4 * charts.length);
+    const list = this.walloc(4 * charts.length);
     const d = this.view();
     charts.forEach((c, i) => d.setUint32(list + 4 * i, c, true));
     this.check("compose_open", this.e.tile57_compose_open(list, charts.length, this.outPtr, this.errPtr));

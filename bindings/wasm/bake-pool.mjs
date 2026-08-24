@@ -52,6 +52,9 @@ export class BakePool {
         await slot.rpc("addFile", { path: `drops/${stem}/${f.name}`, bytes: f.bytes }, [f.bytes.buffer]);
       return await slot.rpc("bakeCell", { path: `/enc/drops/${stem}/${stem}.000` });
     } finally {
+      // Free the cell's files before the next cell lands on this slot. The
+      // worker runs its queue in order, so no await is needed here.
+      slot.rpc("remove", { path: `drops/${stem}` }).catch(() => {});
       this.release(slot);
     }
   }

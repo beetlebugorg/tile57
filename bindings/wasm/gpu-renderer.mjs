@@ -379,6 +379,23 @@ export class GpuRenderer {
       this.msaa = this.device.createTexture({ size: [w, h], format: this.format, sampleCount: 4, usage: GPUTextureUsage.RENDER_ATTACHMENT });
     }
 
+    // No scene uploaded (or the last rebuild failed): paint the NODTA ground
+    // alone rather than touching buffers that are not there.
+    if (!this.buffers || !this.uniforms) {
+      const enc = this.device.createCommandEncoder();
+      enc.beginRenderPass({
+        colorAttachments: [{
+          view: this.msaa.createView(),
+          resolveTarget: this.context.getCurrentTexture().createView(),
+          loadOp: "clear",
+          clearValue: { r: this.halo[0], g: this.halo[1], b: this.halo[2], a: 1 },
+          storeOp: "discard",
+        }],
+      }).end();
+      this.device.queue.submit([enc.finish()]);
+      return;
+    }
+
     const S = 256 * 2 ** cam.zoom * this.pixelRatio; // framebuffer px per world unit
     const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
     const sx = (S * 2) / w, sy = (-S * 2) / h;

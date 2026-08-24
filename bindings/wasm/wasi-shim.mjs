@@ -63,6 +63,11 @@ export class MemFS {
     }
     dir.set(p[p.length - 1], new FileNode(bytes));
   }
+  /** Remove the file or subtree at `rel`. A missing path is fine. */
+  remove(rel) {
+    const at = this.parent(rel);
+    if (at) at[0].delete(at[1]);
+  }
   /** Create directory `rel` and its parents. */
   mkdirs(rel) {
     let dir = this.tree;
@@ -193,8 +198,13 @@ export class WasiShim {
       const f = shim.fds.get(fd);
       return f && f.node instanceof FileNode ? f : null;
     };
+    // wasm i32 arguments arrive SIGNED: past 2 GiB of linear memory every
+    // pointer looks negative. Mask every numeric argument back to u32 before
+    // an op touches memory (BigInt i64 arguments pass through untouched).
+    const mask = (fn) => (...a) => fn(...a.map((x) => (typeof x === "number" ? x >>> 0 : x)));
+    const masked = (ops) => Object.fromEntries(Object.entries(ops).map(([k, f]) => [k, mask(f)]));
     return {
-      wasi_snapshot_preview1: {
+      wasi_snapshot_preview1: masked({
         environ_sizes_get: (count, size) => {
           shim.view().setUint32(count, 0, true);
           shim.view().setUint32(size, 0, true);
@@ -418,7 +428,7 @@ export class WasiShim {
         path_readlink: nosys,
         path_symlink: nosys,
         poll_oneoff: nosys,
-      },
+      }),
     };
   }
 }

@@ -45,6 +45,12 @@ const ops = {
 
   addFile({ path, bytes }) { fsys.add(path, bytes); },
 
+  // Drop a file or subtree from the tree — a zip or a cell's extracted files
+  // free as soon as their bake is done, so a big batch stays flat in memory.
+  remove({ path }) {
+    fsys.remove(path.startsWith(fsys.root + "/") ? path.slice(fsys.root.length + 1) : path);
+  },
+
   // Read one file back out of the tree (transferred) — how the page shuttles
   // zip-extracted cell files from this worker to a bake-pool worker.
   readFile({ path }) {

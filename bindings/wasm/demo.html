@@ -444,9 +444,13 @@ async function loadFiles(files) {
             bytes: new Uint8Array(await f.arrayBuffer()),
           })));
           if (pool) return pool.bake(stem, bytes);
-          for (const f of bytes)
-            await rpc("addFile", { path: `drops/${stem}/${f.name}`, bytes: f.bytes }, [f.bytes.buffer]);
-          return rpc("bakeCell", { path: `/enc/drops/${stem}/${stem}.000` });
+          try {
+            for (const f of bytes)
+              await rpc("addFile", { path: `drops/${stem}/${f.name}`, bytes: f.bytes }, [f.bytes.buffer]);
+            return await rpc("bakeCell", { path: `/enc/drops/${stem}/${stem}.000` });
+          } finally {
+            rpc("remove", { path: `drops/${stem}` }).catch(() => {});
+          }
         },
       });
     }
@@ -454,10 +458,12 @@ async function loadFiles(files) {
     // Cells inside each dropped zip. The zip lives in the primary engine
     // (which lists and extracts it); each cell's extracted files shuttle to a
     // pool slot for the bake, so extraction streams while bakes run wide.
+    const zipPaths = [];
     for (const zf of zips) {
       const id = `z${dropSeq++}`;
       const bytes = new Uint8Array(await zf.arrayBuffer());
       await rpc("addFile", { path: `zips/${id}.zip`, bytes }, [bytes.buffer]);
+      zipPaths.push(`zips/${id}.zip`);
       loader.show(`reading ${zf.name}…`);
       const entries = await rpc("zipList", { path: `/enc/zips/${id}.zip` });
       const byDir = new Map();
@@ -476,13 +482,19 @@ async function loadFiles(files) {
         work.push({
           stem,
           run: async (pool) => {
-            await rpc("zipExtract", { path: `/enc/zips/${id}.zip`, names, outPaths });
-            if (!pool) return rpc("bakeCell", { path: `/enc/drops/${id}/${stem}/${stem}.000` });
-            const files = await Promise.all(outPaths.map(async (p) => ({
-              name: p.replace(/^.*\//, ""),
-              bytes: await rpc("readFile", { path: p }),
-            })));
-            return pool.bake(stem, files);
+            try {
+              await rpc("zipExtract", { path: `/enc/zips/${id}.zip`, names, outPaths });
+              if (!pool) return await rpc("bakeCell", { path: `/enc/drops/${id}/${stem}/${stem}.000` });
+              const files = await Promise.all(outPaths.map(async (p) => ({
+                name: p.replace(/^.*\//, ""),
+                bytes: await rpc("readFile", { path: p }),
+              })));
+              return await pool.bake(stem, files);
+            } finally {
+              // The extracted files are done with as soon as the bake is —
+              // a big exchange set must not accumulate in the primary.
+              rpc("remove", { path: `/enc/drops/${id}/${stem}` }).catch(() => {});
+            }
           },
         });
       }
@@ -517,6 +529,10 @@ async function loadFiles(files) {
       await Promise.all(Array.from({ length: Math.max(1, lanes) }, lane));
     } finally {
       pool?.close();
+      // The batch is over: the zips (and anything left under drops/) are done
+      // with. Chart archives live inside the engine, not the file tree.
+      for (const p of zipPaths) rpc("remove", { path: p }).catch(() => {});
+      rpc("remove", { path: "drops" }).catch(() => {});
     }
   } finally {
     loader.hide();
