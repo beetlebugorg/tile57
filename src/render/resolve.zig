@@ -236,6 +236,12 @@ pub fn visible(meta: *const rs.FeatureMeta, symbol_name: ?[]const u8, zoom: f64,
     if (meta.bnd != 2 and meta.bnd != bnd_rank) return false;
     const pts_rank: i64 = if (m.simplified_points) 1 else 0;
     if (meta.pts != 2 and meta.pts != pts_rank) return false;
+    // Sector-leg length (S-52 §12.2.4, mirrors mariner.sectorFilter): a
+    // sectored light portrays its legs twice — sect 0 (the 25 mm stubs) and
+    // sect 1 (the full-length pass) — and without this gate both drew, so
+    // full sector lines showed whichever way the switch stood.
+    const sect_rank: i64 = if (m.show_full_sector_lines) 1 else 0;
+    if (meta.sect != 2 and meta.sect != sect_rank) return false;
     return true;
 }
 

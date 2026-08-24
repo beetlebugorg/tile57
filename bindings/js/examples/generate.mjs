@@ -9,7 +9,7 @@
 // Exits non-zero if any assertion fails (usable as a CI smoke test).
 
 import assert from 'node:assert/strict';
-import { loadStyleEngine, DEFAULT_SETTINGS } from '../index.js';
+import { loadStyleEngine, DEFAULT_SETTINGS } from '../style.js';
 
 const engine = await loadStyleEngine();
 

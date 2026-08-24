@@ -1,0 +1,446 @@
+// A thin JS wrapper over the tile57-engine.wasm exports. It mirrors the C API
+// one-to-one (see include/tile57.h for semantics) and only handles the
+// boundary work: linear-memory allocation, C strings, out-parameters, and the
+// tile57_error decode. Browser and node both run it; pair it with any WASI
+// preview1 host (node:wasi, or wasi-shim.mjs in a browser).
+//
+// usage:
+//   const engine = new Tile57(instance.exports);  // after _initialize ran
+//   engine.warmup();
+//   const archive = engine.bakeChartBytes("/enc/US5BDRAB/US5BDRAB.000");
+//   const chart = engine.chartOpenBytes(archive);
+//   const png = engine.chartPng(chart, lon, lat, zoom, 800, 600);
+
+export class Tile57 {
+  constructor(exports) {
+    this.e = exports;
+    // One scratch block: two 4-byte out-slots, one flag byte, the error
+    // struct (status i32 + 256-byte message).
+    this.scratch = this.walloc(16 + 260);
+    this.outPtr = this.scratch;
+    this.outLen = this.scratch + 4;
+    this.outFlag = this.scratch + 8;
+    this.errPtr = this.scratch + 16;
+  }
+
+  // memory.buffer detaches on growth - always re-view.
+  bytes() { return new Uint8Array(this.e.memory.buffer); }
+  view() { return new DataView(this.e.memory.buffer); }
+
+  cstr(ptr) {
+    const m = this.bytes();
+    let end = ptr;
+    while (m[end] !== 0) end++;
+    return new TextDecoder().decode(m.subarray(ptr, end));
+  }
+  /** Allocate `len` bytes of linear memory. The mask matters: wasm i32
+   * return values arrive SIGNED, so past 2 GiB of memory every pointer
+   * looks negative without it. */
+  walloc(len) {
+    const p = this.e.tile57_wasm_alloc(len) >>> 0;
+    if (!p) throw new Error("out of wasm memory");
+    return p;
+  }
+  /** Copy `bytes` into linear memory. Release with `wasmFree`. */
+  alloc(bytes) {
+    const p = this.walloc(bytes.length);
+    this.bytes().set(bytes, p);
+    return p;
+  }
+  allocCString(s) {
+    const b = new TextEncoder().encode(s + "\0");
+    return this.alloc(b);
+  }
+  wasmFree(ptr) { this.e.tile57_wasm_free(ptr); }
+
+  check(name, status) {
+    if (status !== 0) throw new Error(`${name}: status ${status}: ${this.cstr(this.errPtr + 4)}`);
+  }
+  /** Copy an engine output buffer out of linear memory and tile57_free it. */
+  takeOut() {
+    const d = this.view();
+    const ptr = d.getUint32(this.outPtr, true);
+    const len = d.getUint32(this.outLen, true);
+    if (!ptr) return null;
+    const copy = this.bytes().slice(ptr, ptr + len);
+    this.e.tile57_free(ptr);
+    return copy;
+  }
+
+  version() { return this.cstr(this.e.tile57_version() >>> 0); }
+  warmup() { this.e.tile57_warmup(); }
+
+  // ---- mariner settings (tile57_mariner, 144 B on wasm32) -----------------
+  // Offsets mirror include/tile57.h field by field; marinerDefaults() decodes
+  // the struct the ENGINE fills, so a layout skew shows up immediately as
+  // absurd defaults (the node test asserts the canonical values).
+  //
+  // The JS shape folds the three display_* booleans into one cumulative
+  // `detailLevel` (base | standard | other) and the soundings tri-state into
+  // auto | on | off. Viewing groups, size scales, and the host debug valves
+  // stay at the engine defaults.
+
+  static SCHEMES = ["day", "dusk", "night"];
+
+  decodeMariner(p) {
+    const d = this.view(), m = this.bytes();
+    let dateView = "";
+    for (let i = 0; i < 8; i++) {
+      const b = m[p + 67 + i];
+      if (!b) break;
+      dateView += String.fromCharCode(b);
+    }
+    return {
+      scheme: Tile57.SCHEMES[d.getUint32(p, true)] ?? "day",
+      shallowContour: d.getFloat64(p + 8, true),
+      safetyContour: d.getFloat64(p + 16, true),
+      deepContour: d.getFloat64(p + 24, true),
+      safetyDepth: d.getFloat64(p + 32, true),
+      fourShadeWater: !!m[p + 40],
+      depthUnit: d.getUint32(p + 44, true) === 1 ? "ft" : "m",
+      detailLevel: m[p + 50] ? "other" : m[p + 49] ? "standard" : "base",
+      dataQuality: !!m[p + 51],
+      showInformCallouts: !!m[p + 52],
+      showMetaBounds: !!m[p + 53],
+      showIsolatedDangersShallow: !!m[p + 54],
+      boundaryStyle: d.getUint32(p + 56, true) === 1 ? "plain" : "symbolized",
+      simplifiedPoints: !!m[p + 60],
+      showFullSectorLines: !!m[p + 61],
+      textNames: !!m[p + 62],
+      showLightDescriptions: !!m[p + 63],
+      textOther: !!m[p + 64],
+      dateDependent: !!m[p + 65],
+      highlightDateDependent: !!m[p + 66],
+      dateView,
+      showOverscale: !!m[p + 97],
+      soundings: ["auto", "on", "off"][m[p + 120]] ?? "auto",
+    };
+  }
+
+  /** The engine's canonical default mariner settings, as a JS object. */
+  marinerDefaults() {
+    const p = this.walloc(144);
+    this.bytes().fill(0, p, p + 144);
+    this.e.tile57_mariner_defaults(p);
+    const out = this.decodeMariner(p);
+    this.wasmFree(p);
+    return out;
+  }
+
+  /** Encode settings over the engine defaults into a tile57_mariner in
+   * linear memory. Release with wasmFree. Null/undefined settings -> 0
+   * (the calls treat NULL as canonical defaults). */
+  encodeMariner(s) {
+    if (!s) return 0;
+    const p = this.walloc(144);
+    this.bytes().fill(0, p, p + 144);
+    this.e.tile57_mariner_defaults(p);
+    const d = this.view(), m = this.bytes();
+    const has = (k) => s[k] !== undefined;
+    if (has("scheme")) d.setUint32(p, Math.max(0, Tile57.SCHEMES.indexOf(s.scheme)), true);
+    if (has("shallowContour")) d.setFloat64(p + 8, s.shallowContour, true);
+    if (has("safetyContour")) d.setFloat64(p + 16, s.safetyContour, true);
+    if (has("deepContour")) d.setFloat64(p + 24, s.deepContour, true);
+    if (has("safetyDepth")) d.setFloat64(p + 32, s.safetyDepth, true);
+    if (has("fourShadeWater")) m[p + 40] = s.fourShadeWater ? 1 : 0;
+    if (has("depthUnit")) d.setUint32(p + 44, s.depthUnit === "ft" ? 1 : 0, true);
+    if (has("detailLevel")) {
+      m[p + 48] = 1; // display_base is the permanent minimum
+      m[p + 49] = s.detailLevel !== "base" ? 1 : 0;
+      m[p + 50] = s.detailLevel === "other" ? 1 : 0;
+    }
+    if (has("dataQuality")) m[p + 51] = s.dataQuality ? 1 : 0;
+    if (has("showInformCallouts")) m[p + 52] = s.showInformCallouts ? 1 : 0;
+    if (has("showMetaBounds")) m[p + 53] = s.showMetaBounds ? 1 : 0;
+    if (has("showIsolatedDangersShallow")) m[p + 54] = s.showIsolatedDangersShallow ? 1 : 0;
+    if (has("boundaryStyle")) d.setUint32(p + 56, s.boundaryStyle === "plain" ? 1 : 0, true);
+    if (has("simplifiedPoints")) m[p + 60] = s.simplifiedPoints ? 1 : 0;
+    if (has("showFullSectorLines")) m[p + 61] = s.showFullSectorLines ? 1 : 0;
+    if (has("textNames")) m[p + 62] = s.textNames ? 1 : 0;
+    if (has("showLightDescriptions")) m[p + 63] = s.showLightDescriptions ? 1 : 0;
+    if (has("textOther")) m[p + 64] = s.textOther ? 1 : 0;
+    if (has("dateDependent")) m[p + 65] = s.dateDependent ? 1 : 0;
+    if (has("highlightDateDependent")) m[p + 66] = s.highlightDateDependent ? 1 : 0;
+    if (has("dateView")) {
+      m.fill(0, p + 67, p + 76);
+      const v = String(s.dateView || "").slice(0, 8);
+      for (let i = 0; i < v.length; i++) m[p + 67 + i] = v.charCodeAt(i);
+    }
+    if (has("showOverscale")) m[p + 97] = s.showOverscale ? 1 : 0;
+    if (has("soundings")) m[p + 120] = { auto: 0, on: 1, off: 2 }[s.soundings] ?? 0;
+    return p;
+  }
+
+  /** Bake one S-57 cell (a path in the WASI file tree) to archive bytes. */
+  bakeChartBytes(cellPath) {
+    const p = this.allocCString(cellPath);
+    this.check("bake_chart_bytes", this.e.tile57_bake_chart_bytes(p, this.outPtr, this.outLen, this.errPtr));
+    this.wasmFree(p);
+    return this.takeOut();
+  }
+
+  /** Bake every chart in an exchange-set zip to <outDir>/<CELL>/<CELL>.pmtiles
+   * in the WASI file tree (updates applied from the archive). Returns how many
+   * charts were baked. One call for the whole set - a host that wants per-cell
+   * progress lists the zip, extracts each cell, and bakes it itself. */
+  bakeZip(zipPath, outDir) {
+    const zp = this.allocCString(zipPath);
+    const op = this.allocCString(outDir);
+    this.check("bake_zip", this.e.tile57_bake_zip(zp, op, 1, 0, 0, this.outPtr, this.errPtr));
+    this.wasmFree(zp);
+    this.wasmFree(op);
+    return this.view().getUint32(this.outPtr, true);
+  }
+
+  /** List a zip's entries: [{name, size, packed}, ...] in central-directory
+   * order. */
+  zipList(zipPath) {
+    const zp = this.allocCString(zipPath);
+    this.check("zip_list", this.e.tile57_zip_list(zp, this.outPtr, this.outLen, this.errPtr));
+    this.wasmFree(zp);
+    return JSON.parse(new TextDecoder().decode(this.takeOut()));
+  }
+
+  /** Extract named zip entries to paths in the WASI file tree. `names[i]`
+   * lands at `outPaths[i]`. Returns how many were written. */
+  zipExtract(zipPath, names, outPaths) {
+    const zp = this.allocCString(zipPath);
+    const strs = names.concat(outPaths).map((s) => this.allocCString(s));
+    const list = this.walloc(4 * strs.length);
+    const d = this.view();
+    strs.forEach((p, i) => d.setUint32(list + 4 * i, p, true));
+    this.check("zip_extract", this.e.tile57_zip_extract(zp, list, list + 4 * names.length, names.length, 0, 0, this.outPtr, this.errPtr));
+    const done = this.view().getUint32(this.outPtr, true);
+    for (const p of strs) this.wasmFree(p);
+    this.wasmFree(list);
+    this.wasmFree(zp);
+    return done;
+  }
+
+  /** Open a baked archive from bytes; returns the chart handle. */
+  chartOpenBytes(archive) {
+    const p = this.alloc(archive);
+    this.check("chart_open_bytes", this.e.tile57_chart_open_bytes(p, archive.length, this.outPtr, this.errPtr));
+    this.wasmFree(p);
+    return this.view().getUint32(this.outPtr, true);
+  }
+  chartClose(chart) { this.e.tile57_chart_close(chart); }
+
+  /** Decode tile57_info for a chart. */
+  chartGetInfo(chart) {
+    const info = this.walloc(96);
+    this.e.tile57_chart_get_info(chart, info);
+    const d = this.view();
+    const out = {
+      minZoom: d.getUint8(info), maxZoom: d.getUint8(info + 1),
+      bands: d.getUint32(info + 4, true),
+      hasBounds: !!d.getUint8(info + 8),
+      west: d.getFloat64(info + 16, true), south: d.getFloat64(info + 24, true),
+      east: d.getFloat64(info + 32, true), north: d.getFloat64(info + 40, true),
+      hasAnchor: !!d.getUint8(info + 48),
+      anchorLat: d.getFloat64(info + 56, true), anchorLon: d.getFloat64(info + 64, true),
+      anchorZoom: d.getFloat64(info + 72, true),
+      tileType: d.getUint8(info + 80),
+      nativeScale: d.getInt32(info + 84, true),
+      isRaster: !!d.getUint8(info + 88),
+    };
+    this.wasmFree(info);
+    return out;
+  }
+
+  /** One vector tile from an open chart, or null where the archive has none. */
+  chartTile(chart, z, x, y) {
+    this.check("chart_tile", this.e.tile57_chart_tile(chart, z, x, y, this.outPtr, this.outLen, this.errPtr));
+    return this.takeOut();
+  }
+  /** A PNG view render from an open chart. `mariner` (optional) is the JS
+   * settings object encodeMariner takes; absent -> canonical defaults. */
+  chartPng(chart, lon, lat, zoom, width, height, mariner) {
+    const mp = this.encodeMariner(mariner);
+    this.check("chart_png", this.e.tile57_chart_png(chart, lon, lat, zoom, width, height, mp, this.outPtr, this.outLen, this.errPtr));
+    if (mp) this.wasmFree(mp);
+    return this.takeOut();
+  }
+
+  // ---- draw-ready GPU scenes (see the tile57.h GPU section) ---------------
+
+  /** {vertex, quad, range, uniforms} struct sizes the engine compiled with.
+   * Compare against the constants the renderer assumes. */
+  abiGpuLayout() {
+    const v = this.e.tile57_abi_gpu_layout();
+    return { vertex: v & 0xff, quad: (v >>> 8) & 0xff, range: (v >>> 16) & 0xff, uniforms: (v >>> 24) & 0xff };
+  }
+
+  // Decode a tile57_gpu_scene struct into wasm-memory views. The views BORROW
+  // linear memory: use them before free(), and re-take them after any call
+  // that can grow the memory.
+  sceneView(sp) {
+    const d = this.view();
+    const s = {
+      vertices: d.getUint32(sp, true), vertexCount: d.getUint32(sp + 4, true),
+      indices: d.getUint32(sp + 8, true), indexCount: d.getUint32(sp + 12, true),
+      quads: d.getUint32(sp + 16, true), quadCount: d.getUint32(sp + 20, true),
+      ranges: d.getUint32(sp + 24, true), rangeCount: d.getUint32(sp + 28, true),
+      patterns: d.getUint32(sp + 32, true), patternCount: d.getUint32(sp + 36, true),
+    };
+    const self = this;
+    return {
+      ...s,
+      vertexBytes: () => self.bytes().subarray(s.vertices, s.vertices + s.vertexCount * 32),
+      indexBytes: () => self.bytes().subarray(s.indices, s.indices + s.indexCount * 4),
+      quadBytes: () => self.bytes().subarray(s.quads, s.quads + s.quadCount * 44),
+      patternList: () => {
+        const dv = self.view(), out = [];
+        for (let i = 0; i < s.patternCount; i++) {
+          const p = s.patterns + 16 * i;
+          const w = dv.getUint32(p, true), h = dv.getUint32(p + 4, true);
+          const rgba = dv.getUint32(p + 8, true), len = dv.getUint32(p + 12, true);
+          out.push({ w, h, rgba: self.bytes().subarray(rgba, rgba + len) });
+        }
+        return out;
+      },
+      free: () => { self.e.tile57_gpu_scene_free(sp); self.wasmFree(sp); },
+    };
+  }
+
+  /** Portray a chart view into draw-ready GPU buffers. Call .free() on the
+   * result once uploaded. `mariner` as chartPng. */
+  chartGpuScene(chart, lon, lat, zoom, width, height, pixelRatio, mariner) {
+    const sp = this.walloc(44);
+    const mp = this.encodeMariner(mariner);
+    this.check("chart_gpu_scene", this.e.tile57_chart_gpu_scene(chart, lon, lat, zoom, width, height, mp, pixelRatio, sp, this.errPtr));
+    if (mp) this.wasmFree(mp);
+    return this.sceneView(sp);
+  }
+  /** The composed twin of chartGpuScene. */
+  composeGpuScene(compose, lon, lat, zoom, width, height, pixelRatio, mariner) {
+    const sp = this.walloc(44);
+    const mp = this.encodeMariner(mariner);
+    this.check("compose_gpu_scene", this.e.tile57_compose_gpu_scene(compose, lon, lat, zoom, width, height, mp, pixelRatio, sp, this.errPtr));
+    if (mp) this.wasmFree(mp);
+    return this.sceneView(sp);
+  }
+
+  /** Batch a scene's ranges into draw calls (tile57_gpu_batch). `atlasHave`
+   * is a bitmask over the tile57_gpu_atlas ids the host uploaded; `halo` is
+   * the palette background RGBA (0..1) for SDF label halos. */
+  gpuBatch(scene, { textOn = true, soundOn = true, excludeOpaque = false, atlasHave = 0, halo = [1, 1, 1, 1] } = {}) {
+    const op = this.walloc(20);
+    {
+      const d = this.view();
+      d.setUint8(op, textOn ? 1 : 0);
+      d.setUint8(op + 1, soundOn ? 1 : 0);
+      d.setUint8(op + 2, excludeOpaque ? 1 : 0);
+      d.setUint8(op + 3, atlasHave);
+      for (let i = 0; i < 4; i++) d.setFloat32(op + 4 + 4 * i, halo[i], true);
+    }
+    const cap = scene.rangeCount;
+    const dp = this.walloc(Math.max(1, cap * 36));
+    const n = this.e.tile57_gpu_batch(scene.ranges, scene.rangeCount, op, dp, cap);
+    if (n > cap) throw new Error("gpu_batch: draw buffer too small");
+    const d = this.view(), draws = [];
+    for (let i = 0; i < n; i++) {
+      const p = dp + 36 * i;
+      draws.push({
+        first: d.getUint32(p, true), count: d.getUint32(p + 4, true),
+        prim: d.getUint8(p + 8), pipeline: d.getUint8(p + 9), atlas: d.getUint8(p + 10),
+        pattern: d.getUint32(p + 12, true), catMaskOr: d.getUint32(p + 16, true),
+        color: [0, 1, 2, 3].map((j) => d.getFloat32(p + 20 + 4 * j, true)),
+      });
+    }
+    this.wasmFree(op);
+    this.wasmFree(dp);
+    return draws;
+  }
+
+  // Read a tile57_assets struct field pair; copy out of linear memory.
+  assetField(ap, off) {
+    const d = this.view();
+    const ptr = d.getUint32(ap + off, true), len = d.getUint32(ap + off + 4, true);
+    return ptr ? this.bytes().slice(ptr, ptr + len) : null;
+  }
+
+  /** The MapLibre-style symbol atlas {json, png} for a scheme (0 day, 1 dusk,
+   * 2 night), rasterized at pixelRatio. Pass the SAME pixelRatio to the
+   * gpu-scene calls, or the UVs will not index the texture. */
+  bakeSpriteMln(pixelRatio, scheme = 0) {
+    const ap = this.walloc(48);
+    this.check("bake_sprite_mln", this.e.tile57_bake_sprite_mln(0, pixelRatio, scheme, ap, this.errPtr));
+    const out = { json: this.assetField(ap, 16), png: this.assetField(ap, 24) };
+    this.e.tile57_assets_free(ap);
+    this.wasmFree(ap);
+    return out;
+  }
+
+  /** The SDF label-glyph atlas {json, png} for a face: 0 regular, 1 bold,
+   * 2 italic. The png is the RGBA signed-distance field the SDF pipeline
+   * samples. */
+  bakeGlyphSdf(face = 0) {
+    const ap = this.walloc(48);
+    this.check("bake_glyph_sdf", this.e.tile57_bake_glyph_sdf_face(ap, face, this.errPtr));
+    const out = { json: this.assetField(ap, 16), png: this.assetField(ap, 24) };
+    this.e.tile57_assets_free(ap);
+    this.wasmFree(ap);
+    return out;
+  }
+
+  /** The embedded S-52 colortables JSON (all three palettes). */
+  colortablesDefault() {
+    this.check("colortables_default", this.e.tile57_colortables_default(this.outPtr, this.outLen, this.errPtr));
+    return new TextDecoder().decode(this.takeOut());
+  }
+
+  /** The cursor pick at (lon, lat): the features under the point, as
+   * [{cls, s57, chart}] - s57 is the attribute object. Pass a compose handle
+   * OR a chart handle (compose wins when both). `zoom` is the view's zoom, so
+   * the pick reads what is actually displayed. */
+  pick({ compose = 0, chart = 0, lon, lat, zoom }) {
+    const st = this.e.tile57_wasm_query(compose, chart, lon, lat, zoom, this.outPtr, this.outLen);
+    if (st !== 0) throw new Error(`wasm_query: status ${st}`);
+    const d = this.view();
+    const ptr = d.getUint32(this.outPtr, true), len = d.getUint32(this.outLen, true);
+    if (!ptr) return [];
+    const text = new TextDecoder().decode(this.bytes().subarray(ptr, ptr + len));
+    this.wasmFree(ptr);
+    return JSON.parse(text);
+  }
+
+  /** The decoded pick report for one queried feature: {title, subtitle, chip,
+   * notes, rows, footnote, empty?} plus the raw payload under `s57`. */
+  s57Report(cls, cell, attrs) {
+    const clsB = new TextEncoder().encode(cls);
+    const cellB = new TextEncoder().encode(cell);
+    const attrsB = new TextEncoder().encode(typeof attrs === "string" ? attrs : JSON.stringify(attrs ?? {}));
+    const p = this.alloc(new Uint8Array([...clsB, ...cellB, ...attrsB]));
+    this.check("s57_report", this.e.tile57_s57_report(
+      p, clsB.length, p + clsB.length, cellB.length, p + clsB.length + cellB.length, attrsB.length,
+      this.outPtr, this.outLen, this.errPtr));
+    this.wasmFree(p);
+    const out = this.takeOut();
+    return out ? JSON.parse(new TextDecoder().decode(out)) : null;
+  }
+
+  /** Compose open charts (BORROWED: close the compositor before them). */
+  composeOpen(charts) {
+    const list = this.walloc(4 * charts.length);
+    const d = this.view();
+    charts.forEach((c, i) => d.setUint32(list + 4 * i, c, true));
+    this.check("compose_open", this.e.tile57_compose_open(list, charts.length, this.outPtr, this.errPtr));
+    this.wasmFree(list);
+    return this.view().getUint32(this.outPtr, true);
+  }
+  composeClose(compose) { this.e.tile57_compose_close(compose); }
+
+  /** One composed vector tile, or null where no chart owns ground. */
+  composeTile(compose, z, x, y) {
+    this.check("compose_tile", this.e.tile57_compose_tile(compose, z, x, y, this.outPtr, this.outLen, this.outFlag, this.errPtr));
+    return this.takeOut();
+  }
+  /** A PNG view render from the composite. `mariner` as chartPng. */
+  composePng(compose, lon, lat, zoom, width, height, mariner) {
+    const mp = this.encodeMariner(mariner);
+    this.check("compose_png", this.e.tile57_compose_png(compose, lon, lat, zoom, width, height, mp, this.outPtr, this.outLen, this.errPtr));
+    if (mp) this.wasmFree(mp);
+    return this.takeOut();
+  }
+}

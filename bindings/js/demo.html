@@ -1,0 +1,49 @@
+<!doctype html>
+<!--
+  tile57 wasm chartplotter demo. Everything runs in this page: the engine
+  bakes S-57 cells (or whole exchange-set zips) to PMTiles archives, composes
+  them, and renders every view. Nothing is uploaded; there is no server.
+
+  This file is only the shell. The app lives in ./demo/ as focused modules:
+  app.mjs (wiring), view.mjs (chrome), camera.mjs, gestures.mjs,
+  chart-store.mjs, import.mjs, mariner.mjs, settings-panel.mjs, and the
+  cursor pick (pick-model.mjs, pick-report.mjs). The engine modules they
+  build on sit one directory up (tile57.mjs, engine-worker.mjs, ...).
+
+  Optional query parameters:
+    ?png=1        force the PNG render path (no WebGPU)
+    ?workers=N    bake-pool size          ?open=N     resident-chart cap
+    ?margin=K     scene prefetch factor   ?wasm=URL   engine module URL
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="A chartplotter that runs entirely in this page: tile57 compiled to WebAssembly bakes S-57 charts and renders S-52 views, with no server.">
+<title>tile57 wasm chartplotter</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E%E2%9A%93%3C/text%3E%3C/svg%3E">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #93aebb; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  // Catch drops from the first paint. The module below spends seconds
+  // fetching and compiling the engine, and a drop the page does not cancel
+  // navigates the tab to the file. Files dropped before the engine is up are
+  // queued and processed once it is.
+  window.tile57Drops = { pending: [], handler: null };
+  addEventListener("dragover", (e) => { e.preventDefault(); dispatchEvent(new Event("t57-dragover")); });
+  addEventListener("dragleave", () => dispatchEvent(new Event("t57-dragleave")));
+  addEventListener("drop", (e) => {
+    e.preventDefault();
+    dispatchEvent(new Event("t57-dragleave"));
+    const files = [...e.dataTransfer.files];
+    if (window.tile57Drops.handler) window.tile57Drops.handler(files);
+    else window.tile57Drops.pending.push(...files);
+  });
+</script>
+<script type="module" src="./demo/app.mjs"></script>
+</body>
+</html>

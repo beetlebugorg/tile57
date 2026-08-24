@@ -581,6 +581,9 @@ pub fn serialFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *cons
 pub fn parallelFor(gpa: std.mem.Allocator, n: usize, user: *anyopaque, func: *const fn (*anyopaque, usize, std.mem.Allocator) void) void {
     if (n == 0) return;
     var pc = ParCtx{ .next = std.atomic.Value(usize).init(0), .n = n, .user = user, .func = func, .gpa = gpa };
+    // Single-threaded build (wasm): spawn is a compile error, so the whole
+    // fan-out is comptime-gated and every item runs on the calling thread.
+    if (@import("builtin").single_threaded) return parWorker(&pc);
     const cpus = std.Thread.getCpuCount() catch 1;
     var nthreads = @min(@max(cpus, 1), n);
     if (nthreads > 64) nthreads = 64;

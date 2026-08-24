@@ -73,6 +73,7 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
         .band = @intCast(std.math.clamp(propInt(props, "band", rs.BAND_UNKNOWN), 0, 255)),
         .bnd = propInt(props, "bnd", 2),
         .pts = propInt(props, "pts", 2),
+        .sect = propInt(props, "sect", 2),
         .masked = propInt(props, "masked", 0) != 0,
         .date_start = propStr(props, "date_start"),
         .date_end = propStr(props, "date_end"),

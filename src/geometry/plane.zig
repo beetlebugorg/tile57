@@ -329,6 +329,7 @@ fn workerCount(m: usize) usize {
         if (std.fmt.parseInt(usize, std.mem.sliceTo(w, 0), 10) catch null) |n|
             return @max(1, @min(n, 64));
     }
+    if (@import("builtin").single_threaded) return 1; // wasm: no threads at all
     if (m < 64) return 1; // not worth the threads
     const cpus = std.Thread.getCpuCount() catch 1;
     return @max(1, @min(cpus, 8));
@@ -401,8 +402,12 @@ pub fn buildCoverageIndex(gpa: Allocator, cells: []const Cell) !CoverageIndex {
         var threads: [63]std.Thread = undefined;
         var spawned: usize = 0;
         defer for (threads[0..spawned]) |t| t.join();
-        while (spawned < workers - 1) : (spawned += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Job.run, .{ &job, spawned + 1 }) catch break;
+        // Comptime-gated: spawn is a compile error on a single-threaded build
+        // (wasm), where workerCount() already pinned workers to 1.
+        if (!@import("builtin").single_threaded) {
+            while (spawned < workers - 1) : (spawned += 1) {
+                threads[spawned] = std.Thread.spawn(.{}, Job.run, .{ &job, spawned + 1 }) catch break;
+            }
         }
         job.run(0); // this thread takes a share too
     }
@@ -729,8 +734,11 @@ fn ownedAtTierImpl(gpa: Allocator, cells: []const Cell, tier: u8, idx: *const Co
         var threads = try sa.alloc(std.Thread, workers - 1);
         var spawned: usize = 0;
         defer for (threads[0..spawned]) |t| t.join();
-        while (spawned < workers - 1) : (spawned += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Sweep.run, .{ &sweep, spawned + 1 }) catch break;
+        // Same comptime gate as the coverage-index fan-out above.
+        if (!@import("builtin").single_threaded) {
+            while (spawned < workers - 1) : (spawned += 1) {
+                threads[spawned] = std.Thread.spawn(.{}, Sweep.run, .{ &sweep, spawned + 1 }) catch break;
+            }
         }
         sweep.run(0); // this thread takes a share too
     }

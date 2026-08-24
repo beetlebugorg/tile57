@@ -34,6 +34,9 @@ jobs:
       # Debug keeps the tests' safety checks. The matrix below covers ReleaseFast.
       - name: Build and test
         run: zig build install test
+      # The full-engine wasm reactor (docs.yml ships it as the live demo).
+      - name: Build wasm engine
+        run: zig build wasm-engine
 
   cross-compile:
     runs-on: ubuntu-latest

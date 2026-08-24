@@ -3,8 +3,14 @@ name: Docs
 on:
   push:
     branches: [main]
+    # The site ships the live wasm chartplotter demo, so engine changes
+    # redeploy it too — the demo always runs the current engine.
     paths:
       - "docs/**"
+      - "bindings/js/**"
+      - "src/**"
+      - "build.zig"
+      - "build.zig.zon"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -22,14 +28,56 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Recursive: the wasm engine embeds the portrayal catalogue submodule.
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: actions/setup-node@v7
         with:
           node-version: "20"
 
-      # No committed lockfile, so `npm install` (not `npm ci`). The site is
-      # content-only — no submodules, no app build needed.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # The live demo: the full engine as wasm plus the demo page, staged
+      # under static/demo-app/ and embedded by src/pages/demo.jsx at /demo.
+      # GitHub Pages is https, so WebGPU is available to it. ReleaseSmall:
+      # one third the download, and this workload runs just as fast.
+      - name: Build wasm engine
+        run: zig build wasm-engine -Doptimize=ReleaseSmall
+
+      - name: Stage demo
+        run: |
+          mkdir -p docs/static/demo-app
+          cp bindings/js/demo.html docs/static/demo-app/index.html
+          cp bindings/js/wasi-shim.mjs bindings/js/tile57.mjs \
+             bindings/js/gpu-renderer.mjs bindings/js/engine-worker.mjs \
+             bindings/js/worker-rpc.mjs bindings/js/bake-pool.mjs \
+             bindings/js/chart-library.mjs \
+             docs/static/demo-app/
+          cp -r bindings/js/demo docs/static/demo-app/demo
+          cp zig-out/bin/tile57-engine.wasm docs/static/demo-app/
+
+      # A first visit with no charts offers a sample: Annapolis (public
+      # domain NOAA cells) - the harbor at 1:12,000, the Severn and bay
+      # approaches at 1:40,000, and the band-3/4 context so zooming out
+      # still shows chart. Best effort: without it the welcome card just
+      # keeps the download link alone.
+      - name: Fetch the sample charts
+        continue-on-error: true
+        run: |
+          tmp=$(mktemp -d)
+          for c in US5MD1MB US5MD1MC US5MD1MD US5MD1LC US5MD13M US5MD12M US4MD1DD US3EC08M; do
+            curl -fsSL -o "$tmp/$c.zip" "https://charts.noaa.gov/ENCs/$c.zip"
+            unzip -q -o "$tmp/$c.zip" -d "$tmp/enc"
+          done
+          (cd "$tmp/enc" && zip -qr "$tmp/sample.zip" .)
+          cp "$tmp/sample.zip" docs/static/demo-app/sample.zip
+
+      # No committed lockfile, so `npm install` (not `npm ci`).
       - name: Install
         working-directory: docs
         run: npm install

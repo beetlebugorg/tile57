@@ -1,6 +1,6 @@
 //! settings — parse a mariner-settings JSON blob into `mariner.Settings`.
 //!
-//! Shared by the wasm entry point (bindings/wasm/style_wasm.zig) and the native
+//! Shared by the wasm entry point (bindings/js/style_wasm.zig) and the native
 //! parity harness (bindings/parity/parity.zig) so the two CANNOT drift: a parity
 //! diff then exercises the identical settings->buildStyle path on both targets.
 //!

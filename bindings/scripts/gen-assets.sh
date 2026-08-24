@@ -2,7 +2,7 @@
 # Regenerate the embedded base template + S-52 colortables for the wasm style
 # engine. Run this whenever the catalogue or the style/colortable generators
 # change. Outputs are committed (so the npm package is self-contained) into
-# bindings/wasm/assets/. They are then @embedFile'd by build.zig into the wasm.
+# bindings/js/assets/. They are then @embedFile'd by build.zig into the wasm.
 #
 # The template is the output of `tile57 style` (assets.styleJson) — the base style
 # that chartstyle.buildStyle then PATCHES with the mariner settings. We generate it
@@ -12,7 +12,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PATH="$HOME/.local/bin:$PATH"
-ASSETS="$ROOT/bindings/wasm/assets"
+ASSETS="$ROOT/bindings/js/assets"
 BAKE="$ROOT/zig-out/bin/tile57"
 
 [[ -x "$BAKE" ]] || ( cd "$ROOT" && zig build )

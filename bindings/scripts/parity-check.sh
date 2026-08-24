@@ -2,7 +2,7 @@
 # Parity check: for several mariner-setting combinations, generate the MapLibre
 # style.json via BOTH backends and assert they are byte-identical:
 #   - native:  zig-out/bin/style-parity  (chartstyle.buildStyle, native target)
-#   - wasm/JS: bindings/js/index.js       (chartstyle.buildStyle, wasm32 target)
+#   - wasm/JS: bindings/js/style.js       (chartstyle.buildStyle, wasm32 target)
 # Both embed the SAME template + colortables and share the SAME settings parser
 # (bindings/shared/settings.zig), so any difference is a real backend divergence.
 #
@@ -35,7 +35,7 @@ for c in "${cases[@]}"; do
   echo "$c" > "$TMP/settings.json"
   "$ROOT/zig-out/bin/style-parity" "$TMP/settings.json" "$NOW" "$TMP/native.json" >/dev/null
   node --input-type=module -e '
-    import { loadStyleEngine } from "'"$ROOT"'/bindings/js/index.js";
+    import { loadStyleEngine } from "'"$ROOT"'/bindings/js/style.js";
     import { readFileSync, writeFileSync } from "node:fs";
     const s = JSON.parse(readFileSync("'"$TMP"'/settings.json","utf8"));
     const engine = await loadStyleEngine();

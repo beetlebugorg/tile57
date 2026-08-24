@@ -8,7 +8,8 @@ PORT="${PORT:-3000}"
 # Vendor the npm module (index.js + .wasm) into ./engine so the demo loads it from
 # the served root. In a real app you'd `npm install @beetlebug/tile57-style-engine`.
 mkdir -p engine
-cp -f ../../index.js ../../index.d.ts ../../style-engine.wasm engine/
+cp -f ../../style.js ../../style.d.ts ../../style-engine.wasm engine/
+mv -f engine/style.js engine/index.js
 
 if [ ! -f chart-mlt/tiles/chart.pmtiles ] && [ ! -f chart/tiles/chart.pmtiles ]; then
   echo "no baked tiles yet — run e.g.:" >&2

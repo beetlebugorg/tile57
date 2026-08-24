@@ -52,3 +52,6 @@ zig-pkg/
 
 # Local work in progress.
 scratchpad/
+
+# The full-engine wasm in the JS package is a build artifact (npm run build)
+bindings/js/tile57-engine.wasm

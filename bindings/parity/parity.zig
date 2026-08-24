@@ -1,6 +1,6 @@
 //! style-parity — the NATIVE oracle for the wasm style engine.
 //!
-//! It embeds the SAME template + colortables as bindings/wasm/style_wasm.zig and
+//! It embeds the SAME template + colortables as bindings/js/style_wasm.zig and
 //! drives the SAME `the mariner builders` through the SAME shared settings
 //! parser — only the compilation target differs (native vs wasm32). So a diff of
 //! this tool's output against the wasm/JS output for identical settings + now_unix

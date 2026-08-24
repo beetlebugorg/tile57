@@ -1,38 +1,64 @@
 {
-  "name": "@beetlebug/tile57-style-engine",
-  "version": "0.1.0",
-  "description": "Generate a MapLibre style.json from S-52 mariner settings, client-side, via the tile57 chartstyle engine compiled to WebAssembly.",
+  "name": "tile57",
+  "version": "0.3.0",
+  "description": "Official nautical charts, ready to draw — the tile57 engine compiled to WebAssembly, with JavaScript bindings for the browser and node.",
   "type": "module",
-  "main": "index.js",
-  "module": "index.js",
-  "types": "index.d.ts",
+  "main": "index.mjs",
+  "types": "style.d.ts",
   "exports": {
-    ".": {
-      "types": "./index.d.ts",
-      "import": "./index.js"
+    ".": "./index.mjs",
+    "./style": {
+      "types": "./style.d.ts",
+      "import": "./style.js"
     },
+    "./tile57.mjs": "./tile57.mjs",
+    "./wasi-shim.mjs": "./wasi-shim.mjs",
+    "./gpu-renderer.mjs": "./gpu-renderer.mjs",
+    "./engine-worker.mjs": "./engine-worker.mjs",
+    "./worker-rpc.mjs": "./worker-rpc.mjs",
+    "./bake-pool.mjs": "./bake-pool.mjs",
+    "./chart-library.mjs": "./chart-library.mjs",
+    "./tile57-engine.wasm": "./tile57-engine.wasm",
     "./style-engine.wasm": "./style-engine.wasm"
   },
   "files": [
-    "index.js",
-    "index.d.ts",
+    "index.mjs",
+    "tile57.mjs",
+    "wasi-shim.mjs",
+    "gpu-renderer.mjs",
+    "engine-worker.mjs",
+    "worker-rpc.mjs",
+    "bake-pool.mjs",
+    "chart-library.mjs",
+    "style.js",
+    "style.d.ts",
+    "tile57-engine.wasm",
     "style-engine.wasm",
     "README.md"
   ],
   "scripts": {
-    "example": "node examples/generate.mjs",
-    "test": "node examples/generate.mjs"
+    "build": "cd ../.. && zig build wasm-engine -Doptimize=ReleaseSmall && cp zig-out/bin/tile57-engine.wasm bindings/js/ && bindings/scripts/build-wasm.sh",
+    "prepack": "npm run build",
+    "smoke": "node engine-smoke.mjs",
+    "example": "node examples/generate.mjs"
   },
   "keywords": [
-    "maplibre",
-    "s-52",
-    "s-57",
-    "enc",
     "nautical-chart",
     "chartplotter",
-    "wasm",
-    "style"
+    "enc",
+    "s-57",
+    "s-101",
+    "s-52",
+    "maplibre",
+    "webgpu",
+    "wasm"
   ],
   "license": "SEE LICENSE IN ../../LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/beetlebugorg/tile57",
+    "directory": "bindings/js"
+  },
+  "homepage": "https://beetlebugorg.github.io/tile57/wasm",
   "sideEffects": false
 }

@@ -51,6 +51,12 @@ const config = {
         title: 'tile57',
         items: [
           {
+            // The wasm chartplotter, embedded by src/pages/demo.jsx.
+            to: '/demo',
+            label: 'Live Demo',
+            position: 'right',
+          },
+          {
             to: '/contributing',
             label: 'Contributing',
             position: 'right',
