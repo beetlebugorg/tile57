@@ -325,6 +325,13 @@ $("settings").addEventListener("click", () => {
 });
 $("drawer-close").addEventListener("click", () => drawer.classList.remove("open"));
 
+// Esc closes the topmost surface: settings first, then the pick report.
+addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (drawer.classList.contains("open")) drawer.classList.remove("open");
+  else if (pick.open) pick.hide();
+});
+
 // ---- land on the library --------------------------------------------------
 splash("Opening the chart library…");
 await store.loadSaved((n, total) => splash(`Indexing the library - ${n} of ${total}…`));
