@@ -38,6 +38,10 @@ uploaded and there is no server.
 
 - **Build a chartplotter** for desktop, mobile, embedded, or pure web. Point
   tile57 at a folder of charts and it becomes one seamless, queryable map.
+- **Quilt a whole library.** Charts at every scale stitch into one chart: the
+  most detailed chart wins each stretch of water, the general chart fills
+  around it, and a newer edition wins an overlap. Harbor to ocean is one
+  continuous map, the way an ECDIS quilts.
 - **Serve charts to any map client.** Bake once and serve standard vector
   tiles with a matching style; MapLibre draws them out of the box.
 - **Draw at full speed.** tile57 hands your GPU a ready-to-draw scene. Pan,

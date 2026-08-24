@@ -70,7 +70,7 @@ jobs:
         continue-on-error: true
         run: |
           tmp=$(mktemp -d)
-          for c in US5MD1MC US5MD13M US5MD12M US4MD1DD US3EC08M; do
+          for c in US5MD1MB US5MD1MC US5MD1MD US5MD1LC US5MD13M US5MD12M US4MD1DD US3EC08M; do
             curl -fsSL -o "$tmp/$c.zip" "https://charts.noaa.gov/ENCs/$c.zip"
             unzip -q -o "$tmp/$c.zip" -d "$tmp/enc"
           done
