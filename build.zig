@@ -59,9 +59,9 @@ fn addSysrootIncludes(b: *std.Build, mod: *std.Build.Module) void {
 // driver-level -mexception-handling still matters: it defines
 // __wasm_exception_handling__, which wasi's setjmp.h gates on.
 const wasm_sjlj_flags = [_][]const u8{
-    "-mexception-handling",           "-mllvm",
-    "-wasm-enable-sjlj",              "-Xclang",
-    "-target-feature",                "-Xclang",
+    "-mexception-handling", "-mllvm",
+    "-wasm-enable-sjlj",    "-Xclang",
+    "-target-feature",      "-Xclang",
     "+exception-handling",
 };
 

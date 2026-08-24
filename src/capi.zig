@@ -63,9 +63,12 @@ fn sharedIo() std.Io {
 
 // Wall-clock time for "today" date resolution in tile57_style_build. Zig 0.16
 // keeps the clock behind Io; the lib links libc, so call time(3) directly.
-// time_t, not c_long: wasm32's c_long is 32-bit while wasi's time_t is 64-bit,
-// and wasm-ld rejects the signature mismatch against libc's definition.
-extern fn time(tloc: ?*std.c.time_t) callconv(.c) std.c.time_t;
+// std.c.time_t where the target defines it — wasi's is 64-bit while wasm32's
+// c_long is 32-bit, and wasm-ld rejects the signature mismatch against libc.
+// Windows leaves std.c.time_t void, so the binding keeps the c_long it always
+// used there (mingw maps time() onto its 64-bit variant itself).
+const CTimeT = if (std.c.time_t == void) c_long else std.c.time_t;
+extern fn time(tloc: ?*CTimeT) callconv(.c) CTimeT;
 
 // Keep in sync with the TILE57_VERSION_* macros in tile57.h.
 const version_string = "0.3.0";
