@@ -111,6 +111,7 @@
   <button id="zi" title="zoom in">+</button>
   <button id="zo" title="zoom out">&minus;</button>
   <button id="fs" title="full screen">⛶</button>
+  <button id="lib" title="clear the chart library">🗑</button>
 </div>
 <div id="hint"><div>Drop S-57 charts here<br>
   <small>.000 cells (with their update files), or an exchange-set .zip<br>
@@ -144,6 +145,7 @@
 import { GpuRenderer, lonLatToWorld, worldToLonLat, scaleDenom } from "./gpu-renderer.mjs";
 import { makeRpc } from "./worker-rpc.mjs";
 import { BakePool } from "./bake-pool.mjs";
+import { ChartLibrary } from "./chart-library.mjs";
 
 const $ = (id) => document.getElementById(id);
 const q = new URLSearchParams(location.search);
@@ -233,8 +235,107 @@ $("mode").textContent = `${version} wasm — ${gpu ? "WebGPU" : "PNG"}`;
 if (!gpu && gpuWhy) status(`PNG fallback: ${gpuWhy}`);
 
 // ---- state ----------------------------------------------------------------
-const charts = []; // {name, handle, info}
-let compose = 0;
+// The chart CATALOG: every chart the page knows, as {name, info} — no open
+// handle. Archives live on disk (OPFS) and only the charts the current view
+// needs are resident in the engine; a whole district must never sit in one
+// 4 GiB wasm space at once.
+const catalog = [];
+const openMap = new Map(); // name -> engine chart handle (the resident set)
+const lastUsed = new Map(); // name -> viewSeq, for eviction
+const sessionStore = new Map(); // archives when OPFS is unavailable
+const MAX_OPEN = 32; // residency cap: LRU beyond the current view's set
+let compose = 0, composeKey = null, viewSeq = 0;
+
+// The persistent chart library (OPFS): archives land here as they bake, and
+// a page load catalogs them from the metadata sidecars alone. Null where
+// OPFS is missing — the session then keeps archives in page memory instead.
+const library = await ChartLibrary.open();
+if (!library) $("lib").style.display = "none";
+$("lib").onclick = async () => {
+  if (!library || !confirm("Clear the chart library and reload the page?")) return;
+  await library.clear();
+  location.reload();
+};
+
+async function libGet(name) {
+  if (library) return library.get(name);
+  const b = sessionStore.get(name);
+  return b ? b.slice() : null; // a copy: opening transfers the buffer away
+}
+
+/** Save + catalog a baked chart. Returns the catalog entry, or null when the
+ * name is already present. */
+async function registerChart(name, archive, info) {
+  if (catalog.some((c) => c.name === name)) return null;
+  if (library) await library.put(name, archive, info).catch((e) => console.warn(`library save ${name}:`, e));
+  else sessionStore.set(name, archive);
+  const entry = { name, info };
+  catalog.push(entry);
+  return entry;
+}
+
+// ---- the view's chart set -------------------------------------------------
+// A view needs the charts whose bounds intersect it AND whose compilation
+// scale suits the zoom — an overview chart under a harbor view, or a harbor
+// cell under a world view, only wastes memory. The engine quilts whatever
+// set it is given; this picks that set.
+function viewBounds(marginFrac = 0.3) {
+  const s = cssWorld();
+  const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
+  const hw = (viewW() * (0.5 + marginFrac)) / s;
+  const hh = (viewH() * (0.5 + marginFrac)) / s;
+  const [west, north] = worldToLonLat(cx - hw, Math.max(0.0001, cy - hh));
+  const [east, south] = worldToLonLat(cx + hw, Math.min(0.9999, cy + hh));
+  return { west, south, east, north };
+}
+function selectCharts() {
+  const vb = viewBounds();
+  const denom = scaleDenom(cam.zoom);
+  const hits = catalog.filter(({ info }) => info?.hasBounds
+    && info.west < vb.east && info.east > vb.west
+    && info.south < vb.north && info.north > vb.south);
+  const scored = hits.map((c) => ({ c, d: Math.abs(Math.log2((c.info.nativeScale || denom) / denom)) }));
+  // Within ~11x of the view's scale; when nothing is, the nearest few charts
+  // still draw (better an overscaled chart than a blank sea).
+  let keep = scored.filter((s) => s.d <= 3.5);
+  if (!keep.length) keep = scored.sort((a, b) => a.d - b.d).slice(0, 8);
+  return keep.sort((a, b) => a.d - b.d).slice(0, MAX_OPEN).map((s) => s.c);
+}
+
+/** Make the view's charts resident and composed; evict beyond the cap.
+ * Returns {compose, chart} — one of them nonzero when anything covers the
+ * view. */
+async function ensureView() {
+  const sel = selectCharts();
+  viewSeq++;
+  for (const c of sel) lastUsed.set(c.name, viewSeq);
+  const key = sel.map((c) => c.name).sort().join(",");
+  if (key !== composeKey) {
+    if (compose) { await rpc("composeClose", { handle: compose }); compose = 0; }
+    for (const c of sel) {
+      if (openMap.has(c.name)) continue;
+      const bytes = await libGet(c.name);
+      if (!bytes) continue;
+      const { handle } = await rpc("openChartBytes", { bytes }, [bytes.buffer]);
+      openMap.set(c.name, handle);
+    }
+    const handles = sel.map((c) => openMap.get(c.name)).filter((h) => h !== undefined);
+    compose = handles.length > 1 ? await rpc("composeOpen", { handles }) : 0;
+    composeKey = key;
+    if (openMap.size > MAX_OPEN) {
+      const inUse = new Set(sel.map((c) => c.name));
+      const victims = [...openMap.keys()].filter((n) => !inUse.has(n))
+        .sort((a, b) => (lastUsed.get(a) || 0) - (lastUsed.get(b) || 0));
+      while (openMap.size > MAX_OPEN && victims.length) {
+        const n = victims.shift();
+        rpc("closeChart", { handle: openMap.get(n) }).catch(() => {});
+        openMap.delete(n);
+      }
+    }
+  }
+  const sole = sel.length === 1 ? (openMap.get(sel[0].name) ?? 0) : 0;
+  return { compose, chart: compose ? 0 : sole };
+}
 const cam = { lon: -73.16, lat: 41.14, zoom: 13 };
 let sceneCam = null; // camera the current scene / PNG was built for
 
@@ -246,11 +347,11 @@ function sizeCanvas() {
 sizeCanvas();
 
 function hud() {
-  $("charts").textContent = charts.length
-    ? `${charts.length} chart${charts.length > 1 ? "s" : ""}: ${charts.map((c) => c.name).slice(0, 4).join(", ")}${charts.length > 4 ? ", …" : ""}`
+  $("charts").textContent = catalog.length
+    ? `${catalog.length} chart${catalog.length > 1 ? "s" : ""} (${openMap.size} open): ${catalog.map((c) => c.name).slice(0, 3).join(", ")}${catalog.length > 3 ? ", …" : ""}`
     : "no charts";
   $("center").textContent = `${cam.lat.toFixed(4)}, ${cam.lon.toFixed(4)}  z${cam.zoom.toFixed(1)}  ≈1:${Math.round(scaleDenom(cam.zoom)).toLocaleString()}`;
-  $("hint").style.display = charts.length ? "none" : "flex";
+  $("hint").style.display = catalog.length ? "none" : "flex";
 }
 loader.hide();
 hud();
@@ -263,13 +364,23 @@ function scheduleRebuild(ms = 250) {
   rebuildTimer = setTimeout(rebuild, ms);
 }
 async function rebuild() {
-  if (!charts.length) return;
+  if (!catalog.length) return;
   if (rebuilding) { rebuildAgain = true; return; }
   rebuilding = true;
   const t0 = performance.now();
   const [w, h] = [Math.round(viewW() * dpr), Math.round(viewH() * dpr)];
-  const view = { compose, chart: charts[0]?.handle, lon: cam.lon, lat: cam.lat, zoom: cam.zoom, w, h };
   try {
+    const set = await ensureView();
+    if (!set.compose && !set.chart) {
+      if (gpu) { gpu.disposeScene(); gpu.draw(cam); } else img.removeAttribute("src");
+      sceneCam = { ...cam };
+      status("no charts cover this view");
+      rebuilding = false;
+      if (rebuildAgain) { rebuildAgain = false; scheduleRebuild(0); }
+      hud();
+      return;
+    }
+    const view = { compose: set.compose, chart: set.chart, lon: cam.lon, lat: cam.lat, zoom: cam.zoom, w, h };
     if (gpu) {
       const scene = await rpc("gpuScene", { ...view, pixelRatio: dpr, atlasHave: gpu.atlasHave, halo: gpu.halo });
       gpu.setScene(scene);
@@ -293,11 +404,24 @@ async function rebuild() {
   hud();
 }
 
+// GPU: while a gesture runs, refresh the scene continuously too — rebuilds
+// run in the worker, so a sharper scene lands mid-gesture instead of waiting
+// for the debounce to settle. The rebuilding flag itself is the throttle;
+// the timer only spaces out back-to-back kicks.
+let lastLive = 0;
+function liveRebuild() {
+  if (!gpu || rebuilding) return;
+  const now = performance.now();
+  if (now - lastLive < 250) return;
+  lastLive = now;
+  rebuild();
+}
+
 // GPU: any camera change redraws the uploaded scene immediately.
 let rafPending = false;
 function redraw() {
   hud();
-  if (!gpu || !charts.length || rafPending) return;
+  if (!gpu || !catalog.length || rafPending) return;
   rafPending = true;
   requestAnimationFrame(() => { rafPending = false; gpu.draw(cam); });
 }
@@ -320,7 +444,7 @@ function zoomAt(mx, my, dz) {
 
 let drag = null;
 surface.addEventListener("pointerdown", (e) => {
-  if (!charts.length) return;
+  if (!catalog.length) return;
   surface.setPointerCapture(e.pointerId);
   surface.classList.add("dragging");
   drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY };
@@ -334,7 +458,7 @@ surface.addEventListener("pointermove", (e) => {
   if (!drag) return;
   panBy(e.clientX - drag.x, e.clientY - drag.y);
   drag.x = e.clientX; drag.y = e.clientY;
-  if (gpu) redraw();
+  if (gpu) { redraw(); liveRebuild(); }
   else img.style.transform = `translate(${e.clientX - drag.sx}px, ${e.clientY - drag.sy}px)`;
 });
 surface.addEventListener("pointerup", () => {
@@ -344,11 +468,11 @@ surface.addEventListener("pointerup", () => {
   scheduleRebuild(gpu ? 250 : 0);
 });
 surface.addEventListener("wheel", (e) => {
-  if (!charts.length) return;
+  if (!catalog.length) return;
   e.preventDefault();
   const dz = -e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0022);
   zoomAt(e.clientX, e.clientY, dz);
-  if (gpu) redraw();
+  if (gpu) { redraw(); liveRebuild(); }
   else {
     const k = 2 ** (cam.zoom - (sceneCam?.zoom ?? cam.zoom));
     img.style.transformOrigin = `${e.clientX}px ${e.clientY}px`;
@@ -357,7 +481,7 @@ surface.addEventListener("wheel", (e) => {
   scheduleRebuild(gpu ? 300 : 350);
 }, { passive: false });
 surface.addEventListener("dblclick", (e) => {
-  if (!charts.length) return;
+  if (!catalog.length) return;
   zoomAt(e.clientX, e.clientY, 1);
   if (gpu) redraw();
   scheduleRebuild(0);
@@ -367,7 +491,7 @@ $("zo").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, -1); if (gpu) redraw(
 $("fs").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 addEventListener("resize", () => { sizeCanvas(); if (gpu) redraw(); scheduleRebuild(200); });
 addEventListener("keydown", (e) => {
-  if (!charts.length) return;
+  if (!catalog.length) return;
   const pan = 120;
   const moves = {
     ArrowLeft: () => panBy(pan, 0), ArrowRight: () => panBy(-pan, 0),
@@ -400,14 +524,6 @@ function fitTo(list) {
   [cam.lon, cam.lat] = worldToLonLat((wx0 + wx1) / 2, (wy0 + wy1) / 2);
 }
 
-async function openArchive(name, archive) {
-  if (charts.some((c) => c.name === name)) return null; // already loaded
-  const { handle, info } = await rpc("openChartBytes", { bytes: archive }, [archive.buffer]);
-  const chart = { name, handle, info };
-  charts.push(chart);
-  return chart;
-}
-
 // One unit of load work per cell: [stem, doneLabel] generator-style entries so
 // the loader can show N of M across plain cells and zip members alike.
 let loading = false, dropSeq = 0;
@@ -415,6 +531,7 @@ async function loadFiles(files) {
   if (loading) { status("still loading the previous drop…"); return; }
   loading = true;
   const added = [], failed = [];
+  let skipped = 0; // cells already in this session's chart set
   try {
     // Classify the drop: zips, and .000 cells grouped with their updates.
     const groups = new Map();
@@ -436,6 +553,7 @@ async function loadFiles(files) {
         failed.push(`${stem}: update files without the .000 base`);
         continue;
       }
+      if (catalog.some((c) => c.name === stem)) { skipped++; continue; } // already loaded
       work.push({
         stem,
         run: async (pool) => {
@@ -475,6 +593,7 @@ async function loadFiles(files) {
       for (const en of entries) {
         if (!/\.000$/.test(en.name)) continue;
         const stem = en.name.replace(/^.*\//, "").replace(/\.000$/, "");
+        if (catalog.some((c) => c.name === stem)) { skipped++; continue; } // already loaded
         const dir = en.name.replace(/[^/]*$/, "");
         // The cell and everything beside it (updates, referenced text).
         const names = byDir.get(dir).filter((n) => !n.endsWith("/"));
@@ -512,9 +631,9 @@ async function loadFiles(files) {
         status(`baking ${stem}…`);
         try {
           const t0 = performance.now();
-          const arc = await run(pool);
-          if (!arc) { failed.push(`${stem}: produced no archive`); continue; }
-          const c = await openArchive(stem, arc);
+          const res = await run(pool);
+          if (!res) { failed.push(`${stem}: produced no archive`); continue; }
+          const c = await registerChart(stem, res.archive, res.info);
           if (c) { added.push(c); status(`${stem}: baked in ${(performance.now() - t0).toFixed(0)} ms`); }
         } catch (e) {
           console.error(e);
@@ -542,12 +661,38 @@ async function loadFiles(files) {
   if (failed.length) status(failed.slice(0, 2).join("; ") + (failed.length > 2 ? ` (+${failed.length - 2} more, see console)` : ""), true);
   if (!added.length) { hud(); return; }
 
-  // Rebuild the composite over everything loaded (it borrows the charts).
-  if (compose) await rpc("composeClose", { handle: compose });
-  compose = charts.length > 1 ? await rpc("composeOpen", { handles: charts.map((c) => c.handle) }) : 0;
   fitTo(added);
-  status(`${charts.length} chart${charts.length > 1 ? "s" : ""} ready${failed.length ? ` (${failed.length} failed)` : ""}`);
+  status(`${catalog.length} chart${catalog.length > 1 ? "s" : ""} in the library${failed.length ? ` (${failed.length} failed)` : ""}${skipped ? ` (${skipped} already loaded)` : ""}`);
   await rebuild();
+}
+
+// ---- the persistent library: catalog it, land on it -----------------------
+if (library) {
+  const saved = await library.list();
+  // Backfill metadata for archives saved before info rode along: open, read,
+  // close — once per chart; the sidecar persists after.
+  const legacy = saved.filter((c) => !c.info);
+  let n = 0;
+  for (const c of legacy) {
+    loader.progress(`indexing library — ${++n} of ${legacy.length}`, n / legacy.length);
+    const bytes = await library.get(c.name);
+    if (!bytes) continue;
+    try {
+      const { handle, info } = await rpc("openChartBytes", { bytes }, [bytes.buffer]);
+      await rpc("closeChart", { handle });
+      c.info = info;
+      await library.putInfo(c.name, info);
+    } catch (e) {
+      console.warn(`library index ${c.name}:`, e);
+    }
+  }
+  loader.hide();
+  for (const c of saved) if (c.info) catalog.push(c);
+  if (catalog.length) {
+    fitTo(catalog);
+    status(`${catalog.length} chart${catalog.length > 1 ? "s" : ""} in the library`);
+    await rebuild();
+  }
 }
 
 // ---- drag & drop (the early script above catches and queues the events) ---

@@ -71,9 +71,15 @@ const ops = {
     return t.zipExtract(path, names, outPaths);
   },
 
+  // Bake one cell and describe it: the info (bounds, scale, zooms) rides
+  // along so the page can catalog the chart without opening the archive.
   bakeCell({ path }) {
     const arc = t.bakeChartBytes(path);
-    return arc ? [arc, [arc.buffer]] : null;
+    if (!arc) return null;
+    const handle = t.chartOpenBytes(arc);
+    const info = t.chartGetInfo(handle);
+    t.chartClose(handle);
+    return [{ archive: arc, info }, [arc.buffer]];
   },
 
   openChartBytes({ bytes }) {

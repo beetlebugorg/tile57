@@ -106,6 +106,15 @@ The primary engine worker keeps the charts, the compositor, and rendering;
 pool slots only turn cell bytes into archive bytes, and close when the batch
 ends.
 
+Baked archives persist: each cell lands in the browser's origin-private file
+system as it finishes (`chart-library.mjs`, with a metadata sidecar), so a
+page load catalogs the library instead of re-baking, and the 🗑 control
+clears it. The engine keeps only the charts the current view needs resident:
+each rebuild picks the charts whose bounds intersect the view at a suitable
+compilation scale, opens them from the library, composes that subset, and
+evicts least-recently-used charts beyond a small cap — a whole district on
+disk stays a handful of charts in memory.
+
 Serve a directory that holds the page, the `.mjs` modules, and the engine:
 
 ```sh
