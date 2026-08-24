@@ -71,6 +71,18 @@ export class Tile57 {
     return this.takeOut();
   }
 
+  /** Bake every chart in an exchange-set zip to <outDir>/<CELL>/<CELL>.pmtiles
+   * in the WASI file tree (updates applied from the archive). Returns how many
+   * charts were baked. */
+  bakeZip(zipPath, outDir) {
+    const zp = this.allocCString(zipPath);
+    const op = this.allocCString(outDir);
+    this.check("bake_zip", this.e.tile57_bake_zip(zp, op, 1, 0, 0, this.outPtr, this.errPtr));
+    this.wasmFree(zp);
+    this.wasmFree(op);
+    return this.view().getUint32(this.outPtr, true);
+  }
+
   /** Open a baked archive from bytes; returns the chart handle. */
   chartOpenBytes(archive) {
     const p = this.alloc(archive);

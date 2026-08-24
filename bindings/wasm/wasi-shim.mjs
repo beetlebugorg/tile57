@@ -1,7 +1,8 @@
 // A minimal WASI preview1 shim for the browser (no dependencies; node also
-// runs it). It covers exactly what tile57-engine.wasm imports: a read-only
-// in-memory file tree preopened at one path, the clock, randomness, and
-// stdout/stderr to the console. Everything else returns ENOSYS.
+// runs it). It covers what tile57-engine.wasm uses: an in-memory file tree
+// preopened at one path (writable, so the engine's zip bake can write
+// per-chart archives into it), the clock, randomness, and stdout/stderr to
+// the console. Sockets and polling return ENOSYS.
 //
 // usage:
 //   const fsys = new MemFS("/enc");
@@ -11,37 +12,92 @@
 //   wasi.start(inst);                                // reactor _initialize
 
 const E = {
-  SUCCESS: 0, BADF: 8, INVAL: 28, IO: 29, ISDIR: 31,
-  NOENT: 44, NOSYS: 52, NOTDIR: 54, NOTSUP: 58, ROFS: 69,
+  SUCCESS: 0, BADF: 8, EXIST: 20, INVAL: 28, IO: 29, ISDIR: 31,
+  NOENT: 44, NOSYS: 52, NOTDIR: 54, NOTEMPTY: 55, NOTSUP: 58,
 };
 const FILETYPE = { DIR: 3, REGULAR: 4 };
 
-/** A read-only in-memory file tree, preopened at `root` (e.g. "/enc"). */
+/** A growable in-memory file. `data()` is the live content view. */
+class FileNode {
+  constructor(bytes) {
+    this.buf = bytes ?? new Uint8Array(0);
+    this.len = this.buf.length;
+  }
+  data() { return this.buf.subarray(0, this.len); }
+  grow(need) {
+    if (need <= this.buf.length) return;
+    const next = new Uint8Array(Math.max(need, this.buf.length * 2, 4096));
+    next.set(this.buf);
+    this.buf = next;
+  }
+  write(pos, src) {
+    this.grow(pos + src.length);
+    this.buf.set(src, pos);
+    this.len = Math.max(this.len, pos + src.length);
+  }
+  truncate(size) {
+    this.grow(size);
+    if (size > this.len) this.buf.fill(0, this.len, size);
+    this.len = size;
+  }
+}
+
+const parts = (rel) => rel.split("/").filter((p) => p && p !== ".");
+
+/** An in-memory file tree, preopened at `root` (e.g. "/enc"). Directories are
+ * Maps(name -> node); files are FileNodes. */
 export class MemFS {
   constructor(root) {
     this.root = root;
-    this.tree = new Map(); // dir node: Map(name -> node); file node: Uint8Array
+    this.tree = new Map();
   }
-  /** Add one file under the preopen root. `rel` uses "/" separators. */
+  /** Add one file under the preopen root. `rel` uses "/" separators;
+   * intermediate directories are created. */
   add(rel, bytes) {
-    const parts = rel.split("/").filter(Boolean);
+    const p = parts(rel);
     let dir = this.tree;
-    for (const part of parts.slice(0, -1)) {
+    for (const part of p.slice(0, -1)) {
       if (!dir.has(part)) dir.set(part, new Map());
       dir = dir.get(part);
       if (!(dir instanceof Map)) throw new Error(`${part}: file where a directory is needed`);
     }
-    dir.set(parts[parts.length - 1], bytes);
+    dir.set(p[p.length - 1], new FileNode(bytes));
   }
   /** The node at `rel` ("" or "." -> the root dir), or null. */
   lookup(rel) {
     let node = this.tree;
-    for (const part of rel.split("/").filter((p) => p && p !== ".")) {
+    for (const part of parts(rel)) {
       if (!(node instanceof Map)) return null;
       node = node.get(part);
       if (node === undefined) return null;
     }
     return node;
+  }
+  /** File content at `rel`, or null. */
+  read(rel) {
+    const node = this.lookup(rel);
+    return node instanceof FileNode ? node.data() : null;
+  }
+  /** [dirMap, name] for `rel`, or null when the parent path is missing. */
+  parent(rel) {
+    const p = parts(rel);
+    if (p.length === 0) return null;
+    const dir = this.lookup(p.slice(0, -1).join("/"));
+    return dir instanceof Map ? [dir, p[p.length - 1]] : null;
+  }
+  /** Yield [path, FileNode] for every file under `rel` (default: all). */
+  *files(rel = "") {
+    const start = this.lookup(rel);
+    if (!(start instanceof Map)) return;
+    const stack = [[rel, start]];
+    while (stack.length) {
+      const [prefix, dir] = stack.pop();
+      for (const [name, node] of dir) {
+        const path = prefix ? `${prefix}/${name}` : name;
+        if (node instanceof Map) stack.push([path, node]);
+        else yield [path, node];
+      }
+    }
   }
 }
 
@@ -49,7 +105,7 @@ export class WasiShim {
   constructor(fsys) {
     this.fsys = fsys;
     this.memory = null;
-    // fd table: 0/1/2 stdio, 3 = the preopen dir, others opened files.
+    // fd table: 0/1/2 stdio, 3 = the preopen dir, others opened nodes.
     this.fds = new Map([[3, { node: fsys.tree, path: "" }]]);
     this.nextFd = 4;
     this.lines = ["", ""]; // buffered stdout/stderr up to newline
@@ -64,14 +120,21 @@ export class WasiShim {
   bytes() { return new Uint8Array(this.memory.buffer); }
   str(ptr, len) { return new TextDecoder().decode(this.bytes().subarray(ptr, ptr + len)); }
 
+  // The tree path a (dirfd, path string) pair names, or null on a bad dirfd.
+  at(dirfd, ptr, len) {
+    const dir = this.fds.get(dirfd);
+    if (!dir || dir.node instanceof FileNode) return null;
+    return (dir.path ? dir.path + "/" : "") + this.str(ptr, len);
+  }
+
   filestat(buf, node) {
     const d = this.view();
-    const file = node instanceof Uint8Array;
+    const file = node instanceof FileNode;
     d.setBigUint64(buf, 0n, true); // dev
     d.setBigUint64(buf + 8, 0n, true); // ino
     d.setUint8(buf + 16, file ? FILETYPE.REGULAR : FILETYPE.DIR);
     d.setBigUint64(buf + 24, 1n, true); // nlink
-    d.setBigUint64(buf + 32, BigInt(file ? node.length : 0), true); // size
+    d.setBigUint64(buf + 32, BigInt(file ? node.len : 0), true); // size
     d.setBigUint64(buf + 40, 0n, true); // atim
     d.setBigUint64(buf + 48, 0n, true); // mtim
     d.setBigUint64(buf + 56, 0n, true); // ctim
@@ -79,15 +142,28 @@ export class WasiShim {
 
   // Copy out of `node` at `pos` through an iovec list; returns bytes copied.
   readv(node, pos, iovs, iovsLen) {
+    const d = this.view(), m = this.bytes(), data = node.data();
+    let total = 0;
+    for (let i = 0; i < iovsLen; i++) {
+      const buf = d.getUint32(iovs + 8 * i, true);
+      const len = d.getUint32(iovs + 8 * i + 4, true);
+      const n = Math.min(len, data.length - pos);
+      if (n <= 0) break;
+      m.set(data.subarray(pos, pos + n), buf);
+      pos += n; total += n;
+    }
+    return total;
+  }
+
+  // Write into `node` at `pos` from an iovec list; returns bytes written.
+  writev(node, pos, iovs, iovsLen) {
     const d = this.view(), m = this.bytes();
     let total = 0;
     for (let i = 0; i < iovsLen; i++) {
       const buf = d.getUint32(iovs + 8 * i, true);
       const len = d.getUint32(iovs + 8 * i + 4, true);
-      const n = Math.min(len, node.length - pos);
-      if (n <= 0) break;
-      m.set(node.subarray(pos, pos + n), buf);
-      pos += n; total += n;
+      node.write(pos, m.subarray(buf, buf + len));
+      pos += len; total += len;
     }
     return total;
   }
@@ -97,7 +173,7 @@ export class WasiShim {
     const shim = this;
     const file = (fd) => {
       const f = shim.fds.get(fd);
-      return f && f.node instanceof Uint8Array ? f : null;
+      return f && f.node instanceof FileNode ? f : null;
     };
     return {
       wasi_snapshot_preview1: {
@@ -124,22 +200,36 @@ export class WasiShim {
         proc_exit: (code) => { throw new Error(`proc_exit(${code})`); },
 
         fd_write: (fd, iovs, iovsLen, nwritten) => {
-          if (fd !== 1 && fd !== 2) return E.BADF;
           const d = shim.view();
-          let total = 0, text = "";
-          for (let i = 0; i < iovsLen; i++) {
-            const buf = d.getUint32(iovs + 8 * i, true);
-            const len = d.getUint32(iovs + 8 * i + 4, true);
-            text += shim.str(buf, len);
-            total += len;
+          if (fd === 1 || fd === 2) {
+            let total = 0, text = "";
+            for (let i = 0; i < iovsLen; i++) {
+              const buf = d.getUint32(iovs + 8 * i, true);
+              const len = d.getUint32(iovs + 8 * i + 4, true);
+              text += shim.str(buf, len);
+              total += len;
+            }
+            const slot = fd - 1;
+            shim.lines[slot] += text;
+            for (let nl; (nl = shim.lines[slot].indexOf("\n")) !== -1; ) {
+              (fd === 2 ? console.error : console.log)(shim.lines[slot].slice(0, nl));
+              shim.lines[slot] = shim.lines[slot].slice(nl + 1);
+            }
+            d.setUint32(nwritten, total, true);
+            return E.SUCCESS;
           }
-          const slot = fd - 1;
-          shim.lines[slot] += text;
-          for (let nl; (nl = shim.lines[slot].indexOf("\n")) !== -1; ) {
-            (fd === 2 ? console.error : console.log)(shim.lines[slot].slice(0, nl));
-            shim.lines[slot] = shim.lines[slot].slice(nl + 1);
-          }
-          d.setUint32(nwritten, total, true);
+          const f = file(fd);
+          if (!f) return E.BADF;
+          const n = shim.writev(f.node, f.pos, iovs, iovsLen);
+          f.pos += n;
+          d.setUint32(nwritten, n, true);
+          return E.SUCCESS;
+        },
+        fd_pwrite: (fd, iovs, iovsLen, offset, nwritten) => {
+          const f = file(fd);
+          if (!f) return E.BADF;
+          const n = shim.writev(f.node, Number(offset), iovs, iovsLen);
+          shim.view().setUint32(nwritten, n, true);
           return E.SUCCESS;
         },
 
@@ -158,13 +248,19 @@ export class WasiShim {
         },
 
         path_open: (dirfd, _dirflags, path, pathLen, oflags, _rb, _ri, _fdflags, outFd) => {
-          const dir = shim.fds.get(dirfd);
-          if (!dir || dir.node instanceof Uint8Array) return E.BADF;
-          if (oflags & 0b1101) return E.ROFS; // creat / excl / trunc: read-only tree
-          const rel = (dir.path ? dir.path + "/" : "") + shim.str(path, pathLen);
-          const node = shim.fsys.lookup(rel);
-          if (node === null) return E.NOENT;
-          if (oflags & 0b10 && node instanceof Uint8Array) return E.NOTDIR; // O_DIRECTORY
+          const rel = shim.at(dirfd, path, pathLen);
+          if (rel === null) return E.BADF;
+          let node = shim.fsys.lookup(rel);
+          if (node !== null && oflags & 0b100) return E.EXIST; // O_EXCL
+          if (node === null) {
+            if (!(oflags & 0b1)) return E.NOENT; // no O_CREAT
+            const at = shim.fsys.parent(rel);
+            if (!at) return E.NOENT;
+            node = new FileNode();
+            at[0].set(at[1], node);
+          }
+          if (oflags & 0b10 && node instanceof FileNode) return E.NOTDIR; // O_DIRECTORY
+          if (oflags & 0b1000 && node instanceof FileNode) node.truncate(0); // O_TRUNC
           const fd = shim.nextFd++;
           shim.fds.set(fd, { node, path: rel, pos: 0 });
           shim.view().setUint32(outFd, fd, true);
@@ -190,7 +286,7 @@ export class WasiShim {
         fd_seek: (fd, offset, whence, out) => {
           const f = file(fd);
           if (!f) return E.BADF;
-          const base = whence === 0 ? 0 : whence === 1 ? f.pos : f.node.length;
+          const base = whence === 0 ? 0 : whence === 1 ? f.pos : f.node.len;
           const pos = base + Number(offset);
           if (pos < 0) return E.INVAL;
           f.pos = pos;
@@ -204,23 +300,29 @@ export class WasiShim {
           shim.filestat(buf, f.node);
           return E.SUCCESS;
         },
+        fd_filestat_set_size: (fd, size) => {
+          const f = file(fd);
+          if (!f) return E.BADF;
+          f.node.truncate(Number(size));
+          return E.SUCCESS;
+        },
         fd_fdstat_get: (fd, buf) => {
           const f = shim.fds.get(fd);
           const d = shim.view();
           if (fd <= 2) {
             d.setUint8(buf, 2); // character device
           } else if (f) {
-            d.setUint8(buf, f.node instanceof Uint8Array ? FILETYPE.REGULAR : FILETYPE.DIR);
+            d.setUint8(buf, f.node instanceof FileNode ? FILETYPE.REGULAR : FILETYPE.DIR);
           } else return E.BADF;
           d.setUint16(buf + 2, 0, true);
-          d.setBigUint64(buf + 8, ~0n & 0xffffffffffffffffn, true); // all rights
-          d.setBigUint64(buf + 16, ~0n & 0xffffffffffffffffn, true);
+          d.setBigUint64(buf + 8, 0xffffffffffffffffn, true); // all rights
+          d.setBigUint64(buf + 16, 0xffffffffffffffffn, true);
           return E.SUCCESS;
         },
         path_filestat_get: (dirfd, _flags, path, pathLen, buf) => {
-          const dir = shim.fds.get(dirfd);
-          if (!dir || dir.node instanceof Uint8Array) return E.BADF;
-          const node = shim.fsys.lookup((dir.path ? dir.path + "/" : "") + shim.str(path, pathLen));
+          const rel = shim.at(dirfd, path, pathLen);
+          if (rel === null) return E.BADF;
+          const node = shim.fsys.lookup(rel);
           if (node === null) return E.NOENT;
           shim.filestat(buf, node);
           return E.SUCCESS;
@@ -229,7 +331,7 @@ export class WasiShim {
         fd_readdir: (fd, buf, bufLen, cookie, used) => {
           const f = shim.fds.get(fd);
           if (!f) return E.BADF;
-          if (f.node instanceof Uint8Array) return E.NOTDIR;
+          if (f.node instanceof FileNode) return E.NOTDIR;
           const names = [...f.node.keys()];
           const d = shim.view(), m = shim.bytes();
           let off = 0;
@@ -240,7 +342,7 @@ export class WasiShim {
             d.setBigUint64(buf + off, BigInt(i + 1), true); // d_next
             d.setBigUint64(buf + off + 8, 0n, true); // d_ino
             d.setUint32(buf + off + 16, name.length, true);
-            d.setUint8(buf + off + 20, f.node.get(names[i]) instanceof Uint8Array ? FILETYPE.REGULAR : FILETYPE.DIR);
+            d.setUint8(buf + off + 20, f.node.get(names[i]) instanceof FileNode ? FILETYPE.REGULAR : FILETYPE.DIR);
             m.set(name, buf + off + 24);
             off += need;
           }
@@ -248,21 +350,55 @@ export class WasiShim {
           return E.SUCCESS;
         },
 
-        // The engine never reaches these on the read-only browser path.
-        fd_fdstat_set_flags: nosys,
-        fd_filestat_set_size: nosys,
-        fd_filestat_set_times: nosys,
-        fd_pwrite: nosys,
-        fd_renumber: nosys,
+        path_create_directory: (dirfd, path, pathLen) => {
+          const rel = shim.at(dirfd, path, pathLen);
+          if (rel === null) return E.BADF;
+          if (shim.fsys.lookup(rel) !== null) return E.EXIST;
+          const at = shim.fsys.parent(rel);
+          if (!at) return E.NOENT;
+          at[0].set(at[1], new Map());
+          return E.SUCCESS;
+        },
+        path_rename: (dirfd, path, pathLen, newDirfd, newPath, newPathLen) => {
+          const from = shim.at(dirfd, path, pathLen);
+          const to = shim.at(newDirfd, newPath, newPathLen);
+          if (from === null || to === null) return E.BADF;
+          const src = shim.fsys.parent(from), dst = shim.fsys.parent(to);
+          if (!src || !dst || !src[0].has(src[1])) return E.NOENT;
+          dst[0].set(dst[1], src[0].get(src[1]));
+          src[0].delete(src[1]);
+          return E.SUCCESS;
+        },
+        path_unlink_file: (dirfd, path, pathLen) => {
+          const rel = shim.at(dirfd, path, pathLen);
+          if (rel === null) return E.BADF;
+          const at = shim.fsys.parent(rel);
+          if (!at || !at[0].has(at[1])) return E.NOENT;
+          if (at[0].get(at[1]) instanceof Map) return E.ISDIR;
+          at[0].delete(at[1]);
+          return E.SUCCESS;
+        },
+        path_remove_directory: (dirfd, path, pathLen) => {
+          const rel = shim.at(dirfd, path, pathLen);
+          if (rel === null) return E.BADF;
+          const at = shim.fsys.parent(rel);
+          if (!at || !at[0].has(at[1])) return E.NOENT;
+          const node = at[0].get(at[1]);
+          if (!(node instanceof Map)) return E.NOTDIR;
+          if (node.size !== 0) return E.NOTEMPTY;
+          at[0].delete(at[1]);
+          return E.SUCCESS;
+        },
+
+        // Timestamps are not kept; syncing memory is a no-op.
+        fd_filestat_set_times: () => E.SUCCESS,
+        path_filestat_set_times: () => E.SUCCESS,
         fd_sync: () => E.SUCCESS,
-        path_create_directory: nosys,
-        path_filestat_set_times: nosys,
+        fd_fdstat_set_flags: () => E.SUCCESS,
+        fd_renumber: nosys,
         path_link: nosys,
         path_readlink: nosys,
-        path_remove_directory: nosys,
-        path_rename: nosys,
         path_symlink: nosys,
-        path_unlink_file: nosys,
         poll_oneoff: nosys,
       },
     };
