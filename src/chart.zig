@@ -964,7 +964,9 @@ pub fn bakeChartsParallel(paths: []const []const u8, rules_dir: ?[]const u8, wor
     var ctx = BakeCtx{ .next = std.atomic.Value(usize).init(0), .paths = paths, .rules_dir = rules_dir, .out = out };
     var n = @min(@max(workers, 1), paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
-    if (n <= 1) return bakeCellWorker(&ctx);
+    // Single-threaded build (wasm): spawn is a compile error, so the comptime
+    // condition prunes the fan-out and this thread bakes every cell.
+    if (@import("builtin").single_threaded or n <= 1) return bakeCellWorker(&ctx);
     var threads: [MAX_BAKE_WORKERS]std.Thread = undefined;
     var spawned: usize = 0;
     while (spawned < n - 1) : (spawned += 1) {
@@ -1117,7 +1119,8 @@ fn bakeToFiles(io: std.Io, zip: ?*const zipsrc.Archive, in_paths: []const []cons
     var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .zip = zip, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false), .aux = aux };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
-    if (n <= 1) {
+    // The comptime lhs prunes the spawn branch on a single-threaded build (wasm).
+    if (@import("builtin").single_threaded or n <= 1) {
         bakeFileWorker(&ctx);
     } else {
         var threads: [MAX_BAKE_WORKERS]std.Thread = undefined;
@@ -1947,7 +1950,8 @@ fn composeTileWorker(ctx: *ComposeTileCtx) void {
 }
 
 fn runComposeTileWorkers(ctx: *ComposeTileCtx, n: usize) void {
-    if (n <= 1) return composeTileWorker(ctx);
+    // The comptime lhs prunes the spawn code on a single-threaded build (wasm).
+    if (@import("builtin").single_threaded or n <= 1) return composeTileWorker(ctx);
     var threads: [MAX_COMPOSE_WORKERS]std.Thread = undefined;
     var spawned: usize = 0;
     while (spawned < n - 1) : (spawned += 1) {

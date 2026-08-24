@@ -8,6 +8,7 @@
 //! the opaque `tile57_compose` is a `*compose.ComposeSource`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chart = @import("chart.zig");
 const auxfiles = @import("engine").auxfiles; // via the named module: engine owns the file
 const scene = @import("engine").scene; // tile surface + the complex-linestyle walk
@@ -62,7 +63,9 @@ fn sharedIo() std.Io {
 
 // Wall-clock time for "today" date resolution in tile57_style_build. Zig 0.16
 // keeps the clock behind Io; the lib links libc, so call time(3) directly.
-extern fn time(tloc: ?*c_long) callconv(.c) c_long;
+// time_t, not c_long: wasm32's c_long is 32-bit while wasi's time_t is 64-bit,
+// and wasm-ld rejects the signature mismatch against libc's definition.
+extern fn time(tloc: ?*std.c.time_t) callconv(.c) std.c.time_t;
 
 // Keep in sync with the TILE57_VERSION_* macros in tile57.h.
 const version_string = "0.3.0";
@@ -557,10 +560,14 @@ export fn tile57_bake_rasters(
     // only way to know it is there.
     const stack = 16 * 1024 * 1024;
     var threads: [8]std.Thread = undefined;
-    const want = @min(@max(workers, 1), @min(threads.len, n));
     var spawned: usize = 0;
-    while (spawned < want) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+    // Single-threaded build (wasm): spawn is a compile error, so the fan-out
+    // is comptime-gated and the caller's thread does all the work below.
+    if (!builtin.single_threaded) {
+        const want = @min(@max(workers, 1), @min(threads.len, n));
+        while (spawned < want) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+        }
     }
     if (spawned == 0) rasterWorker(&job); // nothing would run otherwise
     for (threads[0..spawned]) |t| t.join();
@@ -773,10 +780,13 @@ export fn tile57_bake_zip_rasters(
     // only the bytes arrive from the archive instead of a file.
     const stack = 16 * 1024 * 1024;
     var threads: [8]std.Thread = undefined;
-    const want = @min(@max(workers, 1), @min(threads.len, n));
     var spawned: usize = 0;
-    while (spawned < want) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+    // Same comptime gate as tile57_bake_rasters: serial on a single-threaded build.
+    if (!builtin.single_threaded) {
+        const want = @min(@max(workers, 1), @min(threads.len, n));
+        while (spawned < want) : (spawned += 1) {
+            threads[spawned] = std.Thread.spawn(.{ .stack_size = stack }, rasterWorker, .{&job}) catch break;
+        }
     }
     if (spawned == 0) rasterWorker(&job);
     for (threads[0..spawned]) |t| t.join();

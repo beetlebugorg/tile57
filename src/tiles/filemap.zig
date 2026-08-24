@@ -34,6 +34,10 @@ extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: windows.LPCVOID) callconv(.w
 /// Map the first `len` bytes of `handle` read-only (`len` must be > 0). Release with
 /// `unmap`. The file handle may be closed once this returns — the view keeps the
 /// underlying data alive on both POSIX (mmap) and Windows (MapViewOfFile).
+///
+/// wasi has no mmap, so there the "map" is a plain read: the bytes are copied
+/// into wasm linear memory (page_allocator) and `unmap` frees them. Same
+/// contract, no lazy paging — a browser host's file system is memory anyway.
 pub fn mapReadonly(handle: std.posix.fd_t, len: usize) error{IoFailed}![]align(page) const u8 {
     if (builtin.os.tag == .windows) {
         const h = CreateFileMappingW(handle, null, PAGE_READONLY, 0, 0, null) orelse return error.IoFailed;
@@ -43,6 +47,21 @@ pub fn mapReadonly(handle: std.posix.fd_t, len: usize) error{IoFailed}![]align(p
         const base: [*]align(page) const u8 = @ptrCast(@alignCast(p));
         return base[0..len];
     }
+    if (builtin.os.tag == .wasi) {
+        const buf = std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(page), len) catch
+            return error.IoFailed;
+        errdefer std.heap.page_allocator.free(buf);
+        var off: usize = 0;
+        while (off < len) {
+            var iov = [1]std.os.wasi.iovec_t{.{ .base = buf.ptr + off, .len = len - off }};
+            var nread: usize = 0;
+            if (std.os.wasi.fd_pread(handle, &iov, 1, off, &nread) != .SUCCESS)
+                return error.IoFailed;
+            if (nread == 0) return error.IoFailed; // shorter than `len`
+            off += nread;
+        }
+        return buf;
+    }
     return std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, handle, 0) catch
         return error.IoFailed;
 }
@@ -51,6 +70,8 @@ pub fn mapReadonly(handle: std.posix.fd_t, len: usize) error{IoFailed}![]align(p
 pub fn unmap(m: []align(page) const u8) void {
     if (builtin.os.tag == .windows) {
         _ = UnmapViewOfFile(@ptrCast(m.ptr));
+    } else if (builtin.os.tag == .wasi) {
+        std.heap.page_allocator.free(@constCast(m));
     } else {
         std.posix.munmap(m);
     }

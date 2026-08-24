@@ -49,15 +49,36 @@ fn addSysrootIncludes(b: *std.Build, mod: *std.Build.Module) void {
     mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
 }
 
-fn addTess(b: *std.Build, mod: *std.Build.Module) void {
+// setjmp/longjmp on wasm: the exception-handling feature + clang's sjlj
+// lowering pass, PER FILE. The raw -Xclang pair re-enables the feature at the
+// cc1 level — zig appends its own `-target-feature -exception-handling`
+// (derived from the module target, which keeps default features so Zig's
+// wasi-libc build never sees the feature and never compiles its broken sjlj
+// runtime) after the driver-level -m flag, and the LAST cc1 flag wins; a raw
+// -Xclang pair in the file flags lands after zig's and wins it back. The
+// driver-level -mexception-handling still matters: it defines
+// __wasm_exception_handling__, which wasi's setjmp.h gates on.
+const wasm_sjlj_flags = [_][]const u8{
+    "-mexception-handling",           "-mllvm",
+    "-wasm-enable-sjlj",              "-Xclang",
+    "-target-feature",                "-Xclang",
+    "+exception-handling",
+};
+
+// `wasm`: sweep.c/tess.c bail out of the tessellation on OOM via
+// setjmp/longjmp, which wasm only has through the sjlj lowering above.
+fn addTess(b: *std.Build, mod: *std.Build.Module, wasm: bool) void {
     mod.link_libc = true; // libtess2 uses assert.h/stdio.h/stdlib.h
     addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/libtess2/Include"));
     mod.addIncludePath(b.path("vendor/libtess2/Source"));
+    var flags = std.ArrayList([]const u8).empty;
+    flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" }) catch @panic("OOM");
+    if (wasm) flags.appendSlice(b.allocator, &wasm_sjlj_flags) catch @panic("OOM");
     mod.addCSourceFiles(.{
         .root = b.path("vendor/libtess2/Source"),
         .files = &tess_sources,
-        .flags = &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" },
+        .flags = flags.items,
     });
 }
 
@@ -87,18 +108,48 @@ fn addCatalogueJson(b: *std.Build, mod: *std.Build.Module) void {
 // `posix`: define LUA_USE_POSIX (Unix). On Windows it must stay OFF — forcing it
 // pulls in <unistd.h>/dlopen; without it luaconf.h auto-selects LUA_USE_WINDOWS
 // from _WIN32. lua_shim.c is already portable (only getenv + ANSI stdio).
-fn addLua(b: *std.Build, mod: *std.Build.Module, posix: bool, ios: bool) void {
+//
+// `wasm`: Lua's error path is setjmp/longjmp, and wasm has that only through
+// the exception-handling proposal. Compile every Lua object (and the vendored
+// sjlj runtime, src/portray/wasm_sjlj_rt.c) with the EH feature + clang's sjlj
+// lowering pass, PER FILE — the target's own feature set stays default, so
+// Zig's wasi-libc build never sees the feature (enabling it target-wide makes
+// zig 0.16 add wasi-libc's sjlj runtime to libc.a and crash compiling it).
+// wasi has no process spawn, so l_system is stubbed exactly as on iOS.
+const LuaTarget = struct { posix: bool = false, ios: bool = false, wasm: bool = false };
+fn addLua(b: *std.Build, mod: *std.Build.Module, lt: LuaTarget) void {
     addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/lua/src"));
-    const shim_flags: []const []const u8 = if (posix) &.{ "-DLUA_USE_POSIX", "-fno-sanitize=undefined" } else &.{"-fno-sanitize=undefined"};
-    mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = shim_flags });
+    var shim_flags = std.ArrayList([]const u8).empty;
+    shim_flags.append(b.allocator, "-fno-sanitize=undefined") catch @panic("OOM");
+    if (lt.posix) shim_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
+    mod.addCSourceFile(.{ .file = b.path("src/portray/lua_shim.c"), .flags = shim_flags.items });
     var lua_flags = std.ArrayList([]const u8).empty;
     lua_flags.appendSlice(b.allocator, &.{ "-std=gnu99", "-O2", "-fno-sanitize=undefined" }) catch @panic("OOM");
-    if (posix) lua_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
-    // iOS forbids system(3) (marked unavailable in the SDK). Stub loslib's
-    // l_system hook to "no shell": os.execute() reports no shell available,
-    // os.execute(cmd) fails — nothing in the portrayal path shells out anyway.
-    if (ios) lua_flags.append(b.allocator, "-Dl_system(cmd)=((cmd)==0?0:-1)") catch @panic("OOM");
+    if (lt.posix) lua_flags.append(b.allocator, "-DLUA_USE_POSIX") catch @panic("OOM");
+    // iOS forbids system(3) (marked unavailable in the SDK); wasi has no
+    // process spawn at all. Stub loslib's l_system hook to "no shell":
+    // os.execute() reports no shell available, os.execute(cmd) fails —
+    // nothing in the portrayal path shells out anyway.
+    if (lt.ios or lt.wasm) lua_flags.append(b.allocator, "-Dl_system(cmd)=((cmd)==0?0:-1)") catch @panic("OOM");
+    if (lt.wasm) {
+        lua_flags.appendSlice(b.allocator, &wasm_sjlj_flags) catch @panic("OOM");
+        // lstate.h includes <signal.h> for sig_atomic_t (the debug-hook trap
+        // flags). wasi's signal.h is gated; the emulation define provides the
+        // types, and nothing in the embedded Lua raises a signal.
+        lua_flags.append(b.allocator, "-D_WASI_EMULATED_SIGNAL") catch @panic("OOM");
+        // wasi has no tmpnam: stub loslib's hook so os.tmpname raises a clean
+        // Lua error. Nothing in the portrayal path names temp files.
+        lua_flags.append(b.allocator, "-DLUA_TMPNAMBUFSIZE=32") catch @panic("OOM");
+        lua_flags.append(b.allocator, "-Dlua_tmpnam(b,e)={(void)(b);(e)=1;}") catch @panic("OOM");
+        // os.clock uses clock(3); wasi emulates it over the wall clock. The
+        // ROOT wasm module links the emulated lib (linkSystemLibrary needs a
+        // module with a known target; this one is target-agnostic).
+        lua_flags.append(b.allocator, "-D_WASI_EMULATED_PROCESS_CLOCKS") catch @panic("OOM");
+        mod.addCSourceFile(.{ .file = b.path("src/portray/wasm_sjlj_rt.c"), .flags = &wasm_sjlj_flags });
+        // Libc definitions wasi-libc declares but does not ship (tmpfile).
+        mod.addCSourceFile(.{ .file = b.path("src/portray/wasi_stubs.c"), .flags = &.{"-fno-sanitize=undefined"} });
+    }
     mod.addCSourceFiles(.{
         .root = b.path("vendor/lua/src"),
         .files = &lua_sources,
@@ -123,7 +174,11 @@ fn addSvgRaster(b: *std.Build, mod: *std.Build.Module) void {
 // deprecated surface. THREADSAFE=1 (serialized) because a host streams tiles
 // from a worker while its UI thread reads metadata, and a per-call mutex is
 // nothing beside a JPEG decode.
-fn addSqlite(b: *std.Build, mod: *std.Build.Module) void {
+// `wasm`: SQLite carries native wasi support (SQLITE_WASI, set from __wasi__),
+// but our explicit THREADSAFE=1 would override its single-thread default and
+// pull in pthread symbols wasi-libc does not have — so it drops to 0 there
+// (the wasm engine is single-threaded end to end).
+fn addSqlite(b: *std.Build, mod: *std.Build.Module, wasm: bool) void {
     addSysrootIncludes(b, mod);
     mod.addIncludePath(b.path("vendor/sqlite"));
     mod.addCSourceFile(.{
@@ -132,7 +187,7 @@ fn addSqlite(b: *std.Build, mod: *std.Build.Module) void {
             "-std=gnu99",
             "-O2",
             "-fno-sanitize=undefined",
-            "-DSQLITE_THREADSAFE=1",
+            if (wasm) "-DSQLITE_THREADSAFE=0" else "-DSQLITE_THREADSAFE=1",
             "-DSQLITE_DQS=0",
             "-DSQLITE_DEFAULT_MEMSTATUS=0",
             "-DSQLITE_OMIT_LOAD_EXTENSION",
@@ -366,7 +421,7 @@ pub fn build(b: *std.Build) void {
         }
     }.f;
     addFont(b, render_mod);
-    addTess(b, render_mod);
+    addTess(b, render_mod, false);
 
     // Integer computational geometry (src/geometry/): the Martinez polygon boolean +
     // the coverage-clipped best-available partition. Pure (std-only); the scene
@@ -430,11 +485,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s101", .module = s101_mod },
         },
     });
-    addLua(b, portray_mod, lua_posix, target.result.os.tag == .ios);
+    addLua(b, portray_mod, .{ .posix = lua_posix, .ios = target.result.os.tag == .ios });
     // Embed the S-101 Lua rules (216 framework + feature-class files) so the Lua
     // `require` searcher in lua_shim.c can load them from memory — tile57 portrays
     // S-57 cells with no on-disk catalogue. An explicit rules dir still overrides.
-    portray_mod.addImport("rules_registry", embedDir(catalog.b, "rules_registry", catalog.b.pathJoin(&.{ catalog.root, "Rules" }), ".lua"));
+    // ONE registry module, shared with the wasm portray variant below (a second
+    // embedDir for the same dir would make a second same-named module).
+    const rules_registry = embedDir(catalog.b, "rules_registry", catalog.b.pathJoin(&.{ catalog.root, "Rules" }), ".lua");
+    portray_mod.addImport("rules_registry", rules_registry);
 
     // MapLibre style generation (src/style/): color tables, line styles, the
     // style.json layer set (maplibre.zig), and the S-52 mariner settings model +
@@ -480,7 +538,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "s57", .module = s57_mod },
         },
     });
-    addSqlite(b, raster_mod);
+    addSqlite(b, raster_mod, false);
 
     // All pure packages, imported by name into engine / libtile57.a / the baker.
     // (portray is libc, wired separately into the lib + baker only.)
@@ -612,13 +670,15 @@ pub fn build(b: *std.Build) void {
     // The engine's own git commit, embedded so the RUNTIME can state which
     // engine a process actually linked (tile57_warmup logs it once): build
     // provenance that survives any amount of checkout / link confusion.
-    {
+    // One options module, shared with the wasm engine build below.
+    const buildinfo_mod = blk: {
         const buildinfo = b.addOptions();
         var code: u8 = 0;
         const raw = b.runAllowFail(&.{ "git", "describe", "--always", "--dirty" }, &code, .ignore) catch "unknown";
         buildinfo.addOption([]const u8, "commit", std.mem.trim(u8, raw, " \n\r\t"));
-        lib_mod.addImport("buildinfo", buildinfo.createModule());
-    }
+        break :blk buildinfo.createModule();
+    };
+    lib_mod.addImport("buildinfo", buildinfo_mod);
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     // Android cross-compile: point the C deps at the NDK sysroot (see -Dandroid-ndk).
     if (android_libc) |libc| lib.setLibCFile(libc);
@@ -783,6 +843,142 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm", "Build the wasm style engine (bindings/)");
     wasm_step.dependOn(&b.addInstallArtifact(wasm, .{}).step);
 
+    // ---- Full-engine wasm (wasm32-wasi reactor) -----------------------------
+    //
+    // The complete C ABI — bake, chart, compose, style, raster — as ONE wasm
+    // module (`zig build wasm-engine`), so a browser chartplotter can bake
+    // charts and serve tiles with no server. wasm32-wasi-musl: the C deps
+    // (Lua, SQLite, libtess2, nanosvg/stb) need a libc, and Zig bundles
+    // wasi-libc for this target; the JS host supplies the small WASI import
+    // set. Reactor model: no _start — the host calls _initialize once, then
+    // the tile57_* exports (rdynamic puts every `export fn` in the export
+    // table). Single-threaded end to end: the thread users (bake_enc
+    // parallelFor, the capi raster workers, the pmtiles reader lock) all gate
+    // on builtin.single_threaded and run serial here.
+    //
+    // portray, raster, and render get their own module instances: their C
+    // flags differ on wasm (Lua and libtess2 need the sjlj lowering, SQLite
+    // drops to THREADSAFE=0), and the native portray/raster carry pic=true,
+    // which wasm must not. scene + sprite fork only to point at the wasm
+    // render. The pure packages and the embedded registries are the SAME
+    // singletons the native artifacts use.
+    const wasi_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi, .abi = .musl });
+    const portray_wasm = b.createModule(.{
+        .root_source_file = b.path("src/portray/portray.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s101", .module = s101_mod },
+        },
+    });
+    addLua(b, portray_wasm, .{ .wasm = true });
+    portray_wasm.addImport("rules_registry", rules_registry);
+
+    const raster_wasm = b.createModule(.{
+        .root_source_file = b.path("src/raster/raster.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "s57", .module = s57_mod },
+        },
+    });
+    addSqlite(b, raster_wasm, true);
+
+    const render_wasm = b.createModule(.{
+        .root_source_file = b.path("src/render/render.zig"),
+        .imports = &.{
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "style", .module = style_mod },
+        },
+    });
+    addFont(b, render_wasm);
+    addTess(b, render_wasm, true);
+
+    const scene_wasm = b.createModule(.{
+        .root_source_file = b.path("src/scene/scene.zig"),
+        .imports = &.{
+            .{ .name = "s57", .module = s57_mod },
+            .{ .name = "s101", .module = s101_mod },
+            .{ .name = "tiles", .module = tiles_mod },
+            .{ .name = "render", .module = render_wasm },
+            .{ .name = "geometry", .module = geometry_mod },
+            .{ .name = "coverage", .module = coverage_mod },
+            .{ .name = "style", .module = style_mod },
+        },
+    });
+
+    const sprite_wasm = b.createModule(.{
+        .root_source_file = b.path("src/sprite/sprite.zig"),
+        .link_libc = true,
+        .imports = &.{.{ .name = "render", .module = render_wasm }},
+    });
+    addSvgRaster(b, sprite_wasm);
+
+    // pure_pkgs with the render/scene edges swapped to the wasm instances.
+    const pure_pkgs_wasm = [_]std.Build.Module.Import{
+        .{ .name = "zipsrc", .module = zipsrc_mod },
+        .{ .name = "auxfiles", .module = auxfiles_mod },
+        .{ .name = "s57", .module = s57_mod },
+        .{ .name = "s101", .module = s101_mod },
+        .{ .name = "tiles", .module = tiles_mod },
+        .{ .name = "scene", .module = scene_wasm },
+        .{ .name = "render", .module = render_wasm },
+        .{ .name = "style", .module = style_mod },
+        .{ .name = "geometry", .module = geometry_mod },
+    };
+
+    const engine_full_wasm = b.createModule(.{
+        .root_source_file = b.path("src/bake_root.zig"),
+        .link_libc = true,
+    });
+    addPkgs(engine_full_wasm, &pure_pkgs_wasm);
+    engine_full_wasm.addImport("portray", portray_wasm);
+
+    const bundle_wasm = b.createModule(.{
+        .root_source_file = b.path("src/bundle.zig"),
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full_wasm },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "sprite", .module = sprite_wasm },
+            .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "compose", .module = compose_mod },
+        },
+    });
+
+    const engine_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm_root.zig"),
+        .target = wasi_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .link_libc = true,
+    });
+    addPkgs(engine_wasm_mod, &pure_pkgs_wasm);
+    engine_wasm_mod.addImport("portray", portray_wasm);
+    engine_wasm_mod.addImport("sprite", sprite_wasm);
+    engine_wasm_mod.addImport("bundle", bundle_wasm);
+    engine_wasm_mod.addImport("compose", compose_mod);
+    engine_wasm_mod.addImport("coverage", coverage_mod);
+    engine_wasm_mod.addImport("errors", errors_mod);
+    engine_wasm_mod.addImport("raster", raster_wasm);
+    engine_wasm_mod.addImport("engine", engine_full_wasm);
+    engine_wasm_mod.addImport("colorprofile_registry", colorprofile_registry);
+    engine_wasm_mod.addImport("catalog", catalog_embed);
+    engine_wasm_mod.addImport("buildinfo", buildinfo_mod);
+    // Lua's os.clock: clock(3) lives in wasi-libc's emulated process-clocks
+    // lib (addLua defines _WASI_EMULATED_PROCESS_CLOCKS on the Lua objects).
+    engine_wasm_mod.linkSystemLibrary("wasi-emulated-process-clocks", .{});
+
+    const engine_wasm = b.addExecutable(.{ .name = "tile57-engine", .root_module = engine_wasm_mod });
+    engine_wasm.wasi_exec_model = .reactor;
+    engine_wasm.rdynamic = true; // export the `export fn`s into the wasm export table
+    // A chart render works down a deep call stack (portrayal -> scene ->
+    // tessellation); the wasm default (1 MB) is not enough headroom.
+    engine_wasm.stack_size = 32 * 1024 * 1024;
+    const engine_wasm_step = b.step("wasm-engine", "Build the full-engine wasm reactor (bindings/)");
+    engine_wasm_step.dependOn(&b.addInstallArtifact(engine_wasm, .{}).step);
+
     // Native parity oracle: same engine + same template/colortables/settings,
     // native target. `zig build style-parity` builds it; the parity script diffs
     // its output against the wasm/JS output.
@@ -839,7 +1035,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "s57", .module = s57_mod },
     });
     raster_test.link_libc = true;
-    addSqlite(b, raster_test);
+    addSqlite(b, raster_test, false);
     _ = addPkgTest(b, test_step, "src/scene/scene.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
         .{ .name = "s101", .module = s101_mod },
@@ -903,7 +1099,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "style", .module = style_mod },
     });
     addFont(b, render_test);
-    addTess(b, render_test);
+    addTess(b, render_test, false);
     // Golden portrayal-instruction test (assertion #5): drives the real embedded Lua
     // rules end-to-end. It rides its own artifact because `portray` links libc + Lua +
     // the rule registry (those settings + C sources propagate from portray_mod), unlike

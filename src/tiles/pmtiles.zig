@@ -287,7 +287,13 @@ pub fn deserializeDir(a: Allocator, buf: []const u8) ![]Entry {
 ///   - Windows: SRWLOCK (SRWLOCK_INIT is 0), the OS's own kernel-blocking lock —
 ///     there is no pthread to link against on an MSVC/mingw target.
 ///   - Linux/Android: a zeroed pthread_mutex_t is PTHREAD_MUTEX_INITIALIZER.
+///   - wasi/freestanding: a no-op. The wasm engine is single-threaded (no
+///     wasi-threads), so the lazy directory state has exactly one reader.
 const Lock = switch (@import("builtin").os.tag) {
+    .wasi, .freestanding => struct {
+        fn lock(_: *@This()) void {}
+        fn unlock(_: *@This()) void {}
+    },
     .macos, .ios, .tvos, .watchos, .visionos => struct {
         const Handle = extern struct { v: u32 = 0 };
         extern "c" fn os_unfair_lock_lock(l: *Handle) void;
