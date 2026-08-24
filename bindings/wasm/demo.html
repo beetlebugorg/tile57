@@ -163,6 +163,7 @@ const dpr = Math.min(devicePixelRatio || 1, 2);
 const canvas = $("map"), img = $("mapimg");
 let gpu = null, gpuWhy = "";
 if (q.get("png")) gpuWhy = "?png=1";
+else if (!isSecureContext) gpuWhy = "insecure context — WebGPU needs https or localhost";
 else if (!GpuRenderer.supported()) gpuWhy = "navigator.gpu is not exposed";
 else {
   try {
