@@ -121,10 +121,19 @@ export class WasiShim {
   str(ptr, len) { return new TextDecoder().decode(this.bytes().subarray(ptr, ptr + len)); }
 
   // The tree path a (dirfd, path string) pair names, or null on a bad dirfd.
+  // Paths arrive relative to the dirfd OR absolute ("/enc/x" — Zig's std
+  // resolves some opens that way); an absolute path resolves against the
+  // preopen root, and one outside it stays unresolvable (NOENT at lookup).
   at(dirfd, ptr, len) {
     const dir = this.fds.get(dirfd);
     if (!dir || dir.node instanceof FileNode) return null;
-    return (dir.path ? dir.path + "/" : "") + this.str(ptr, len);
+    const p = this.str(ptr, len);
+    if (p.startsWith("/")) {
+      const root = this.fsys.root;
+      if (p === root || p.startsWith(root + "/")) return p.slice(root.length).replace(/^\/+/, "");
+      return p.replace(/^\/+/, "");
+    }
+    return (dir.path ? dir.path + "/" : "") + p;
   }
 
   filestat(buf, node) {

@@ -125,6 +125,130 @@ export class Tile57 {
     return this.takeOut();
   }
 
+  // ---- draw-ready GPU scenes (see the tile57.h GPU section) ---------------
+
+  /** {vertex, quad, range, uniforms} struct sizes the engine compiled with.
+   * Compare against the constants the renderer assumes. */
+  abiGpuLayout() {
+    const v = this.e.tile57_abi_gpu_layout();
+    return { vertex: v & 0xff, quad: (v >>> 8) & 0xff, range: (v >>> 16) & 0xff, uniforms: (v >>> 24) & 0xff };
+  }
+
+  // Decode a tile57_gpu_scene struct into wasm-memory views. The views BORROW
+  // linear memory: use them before free(), and re-take them after any call
+  // that can grow the memory.
+  sceneView(sp) {
+    const d = this.view();
+    const s = {
+      vertices: d.getUint32(sp, true), vertexCount: d.getUint32(sp + 4, true),
+      indices: d.getUint32(sp + 8, true), indexCount: d.getUint32(sp + 12, true),
+      quads: d.getUint32(sp + 16, true), quadCount: d.getUint32(sp + 20, true),
+      ranges: d.getUint32(sp + 24, true), rangeCount: d.getUint32(sp + 28, true),
+      patterns: d.getUint32(sp + 32, true), patternCount: d.getUint32(sp + 36, true),
+    };
+    const self = this;
+    return {
+      ...s,
+      vertexBytes: () => self.bytes().subarray(s.vertices, s.vertices + s.vertexCount * 32),
+      indexBytes: () => self.bytes().subarray(s.indices, s.indices + s.indexCount * 4),
+      quadBytes: () => self.bytes().subarray(s.quads, s.quads + s.quadCount * 44),
+      patternList: () => {
+        const dv = self.view(), out = [];
+        for (let i = 0; i < s.patternCount; i++) {
+          const p = s.patterns + 16 * i;
+          const w = dv.getUint32(p, true), h = dv.getUint32(p + 4, true);
+          const rgba = dv.getUint32(p + 8, true), len = dv.getUint32(p + 12, true);
+          out.push({ w, h, rgba: self.bytes().subarray(rgba, rgba + len) });
+        }
+        return out;
+      },
+      free: () => { self.e.tile57_gpu_scene_free(sp); self.wasmFree(sp); },
+    };
+  }
+
+  /** Portray a chart view into draw-ready GPU buffers. Call .free() on the
+   * result once uploaded. */
+  chartGpuScene(chart, lon, lat, zoom, width, height, pixelRatio) {
+    const sp = this.e.tile57_wasm_alloc(44);
+    this.check("chart_gpu_scene", this.e.tile57_chart_gpu_scene(chart, lon, lat, zoom, width, height, 0, pixelRatio, sp, this.errPtr));
+    return this.sceneView(sp);
+  }
+  /** The composed twin of chartGpuScene. */
+  composeGpuScene(compose, lon, lat, zoom, width, height, pixelRatio) {
+    const sp = this.e.tile57_wasm_alloc(44);
+    this.check("compose_gpu_scene", this.e.tile57_compose_gpu_scene(compose, lon, lat, zoom, width, height, 0, pixelRatio, sp, this.errPtr));
+    return this.sceneView(sp);
+  }
+
+  /** Batch a scene's ranges into draw calls (tile57_gpu_batch). `atlasHave`
+   * is a bitmask over the tile57_gpu_atlas ids the host uploaded; `halo` is
+   * the palette background RGBA (0..1) for SDF label halos. */
+  gpuBatch(scene, { textOn = true, soundOn = true, excludeOpaque = false, atlasHave = 0, halo = [1, 1, 1, 1] } = {}) {
+    const op = this.e.tile57_wasm_alloc(20);
+    {
+      const d = this.view();
+      d.setUint8(op, textOn ? 1 : 0);
+      d.setUint8(op + 1, soundOn ? 1 : 0);
+      d.setUint8(op + 2, excludeOpaque ? 1 : 0);
+      d.setUint8(op + 3, atlasHave);
+      for (let i = 0; i < 4; i++) d.setFloat32(op + 4 + 4 * i, halo[i], true);
+    }
+    const cap = scene.rangeCount;
+    const dp = this.e.tile57_wasm_alloc(Math.max(1, cap * 36));
+    const n = this.e.tile57_gpu_batch(scene.ranges, scene.rangeCount, op, dp, cap);
+    if (n > cap) throw new Error("gpu_batch: draw buffer too small");
+    const d = this.view(), draws = [];
+    for (let i = 0; i < n; i++) {
+      const p = dp + 36 * i;
+      draws.push({
+        first: d.getUint32(p, true), count: d.getUint32(p + 4, true),
+        prim: d.getUint8(p + 8), pipeline: d.getUint8(p + 9), atlas: d.getUint8(p + 10),
+        pattern: d.getUint32(p + 12, true), catMaskOr: d.getUint32(p + 16, true),
+        color: [0, 1, 2, 3].map((j) => d.getFloat32(p + 20 + 4 * j, true)),
+      });
+    }
+    this.wasmFree(op);
+    this.wasmFree(dp);
+    return draws;
+  }
+
+  // Read a tile57_assets struct field pair; copy out of linear memory.
+  assetField(ap, off) {
+    const d = this.view();
+    const ptr = d.getUint32(ap + off, true), len = d.getUint32(ap + off + 4, true);
+    return ptr ? this.bytes().slice(ptr, ptr + len) : null;
+  }
+
+  /** The MapLibre-style symbol atlas {json, png} for a scheme (0 day, 1 dusk,
+   * 2 night), rasterized at pixelRatio. Pass the SAME pixelRatio to the
+   * gpu-scene calls, or the UVs will not index the texture. */
+  bakeSpriteMln(pixelRatio, scheme = 0) {
+    const ap = this.e.tile57_wasm_alloc(48);
+    this.check("bake_sprite_mln", this.e.tile57_bake_sprite_mln(0, pixelRatio, scheme, ap, this.errPtr));
+    const out = { json: this.assetField(ap, 16), png: this.assetField(ap, 24) };
+    this.e.tile57_assets_free(ap);
+    this.wasmFree(ap);
+    return out;
+  }
+
+  /** The SDF label-glyph atlas {json, png} for a face: 0 regular, 1 bold,
+   * 2 italic. The png is the RGBA signed-distance field the SDF pipeline
+   * samples. */
+  bakeGlyphSdf(face = 0) {
+    const ap = this.e.tile57_wasm_alloc(48);
+    this.check("bake_glyph_sdf", this.e.tile57_bake_glyph_sdf_face(ap, face, this.errPtr));
+    const out = { json: this.assetField(ap, 16), png: this.assetField(ap, 24) };
+    this.e.tile57_assets_free(ap);
+    this.wasmFree(ap);
+    return out;
+  }
+
+  /** The embedded S-52 colortables JSON (all three palettes). */
+  colortablesDefault() {
+    this.check("colortables_default", this.e.tile57_colortables_default(this.outPtr, this.outLen, this.errPtr));
+    return new TextDecoder().decode(this.takeOut());
+  }
+
   /** Compose open charts (BORROWED: close the compositor before them). */
   composeOpen(charts) {
     const list = this.e.tile57_wasm_alloc(4 * charts.length);

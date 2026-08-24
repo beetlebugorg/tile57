@@ -64,22 +64,37 @@ node bindings/wasm/engine-smoke.mjs <ENC_ROOT> \
     US5BDRAB/US5BDRAB.000 US5BDRBB/US5BDRBB.000 --png out.png
 ```
 
+## WebGPU
+
+`bindings/wasm/gpu-renderer.mjs` renders the engine's draw-ready GPU scenes
+(`tile57_*_gpu_scene`) with WebGPU. Its WGSL is a port of the reference
+shaders in `shaders/` over the same vertex, quad, and uniform layouts; hold
+every change against them. The engine batches the ranges
+(`tile57_gpu_batch`), the renderer uploads the buffers once per scene, and a
+pan or zoom redraws from uniforms alone — the view stays live between scene
+rebuilds.
+
 ## Browser demo
 
-`bindings/wasm/demo.html` is a complete in-page chartplotter: it fetches S-57
-cells over HTTP, bakes them, composes them, and renders every pan/zoom view —
-all inside the page. Serve a directory that holds the page, the two `.mjs`
-modules, `tile57-engine.wasm`, and an `enc/` tree with the cells:
+`bindings/wasm/demo.html` is a complete in-page chartplotter. Drop S-57
+charts on it — `.000` cells with their update files, or an exchange-set
+`.zip` (the engine bakes the whole set through the shim's writable file
+tree). Drag to pan, wheel to zoom, double-click to zoom in. It renders with
+WebGPU where the browser has it, and falls back to PNG views (`?png=1`
+forces the fallback). Serve a directory that holds the page, the `.mjs`
+modules, and the engine:
 
 ```sh
 zig build wasm-engine
 mkdir demo && cd demo
-ln -s ../bindings/wasm/{demo.html,tile57.mjs,wasi-shim.mjs} .
+ln -s ../bindings/wasm/{demo.html,tile57.mjs,wasi-shim.mjs,gpu-renderer.mjs} .
 ln -s ../zig-out/bin/tile57-engine.wasm .
-ln -s <ENC_ROOT> enc
 python3 -m http.server 8080
-# open http://localhost:8080/demo.html?cells=US5BDRAB/US5BDRAB.000
+# open http://localhost:8080/demo.html and drop charts on it
 ```
+
+`?cells=US5BDRAB/US5BDRAB.000` preloads cells from an `enc/` tree beside the
+page.
 
 ## The style-only module
 

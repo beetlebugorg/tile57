@@ -1,110 +1,372 @@
 <!doctype html>
 <!--
   tile57 wasm chartplotter demo. Everything runs in this page: the engine
-  bakes the S-57 cells to PMTiles archives, composes them, and renders every
-  view — no server-side chart work at all.
+  bakes S-57 cells (or whole exchange-set zips) to PMTiles archives, composes
+  them, and renders every view — no server-side chart work at all.
 
-  Serve a directory that holds this page, the two .mjs modules beside it,
-  tile57-engine.wasm (zig build wasm-engine), and the source cells:
+  Drop cells on the page: .000 files (with their .001.. updates), or a .zip
+  exchange set. Drag to pan, wheel to zoom, double-click to zoom in.
 
-    ?cells=US5BDRAB/US5BDRAB.000,US5BDRBB/US5BDRBB.000   cells under ./enc/
-    ?wasm=./tile57-engine.wasm                            engine module URL
-    ?enc=./enc                                            cell base URL
+  Rendering: WebGPU when the browser has it (the engine emits draw-ready GPU
+  scenes; pan/zoom redraws live from uniforms). PNG views otherwise.
+
+  Serve a directory that holds this page, the .mjs modules beside it, and
+  tile57-engine.wasm (zig build wasm-engine). Optional:
+    ?cells=US5BDRAB/US5BDRAB.000,...   preload cells from ./enc/
+    ?wasm=./tile57-engine.wasm         engine module URL
+    ?enc=./enc                         cell base URL
+    ?png=1                             force the PNG path
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tile57 wasm chartplotter</title>
 <style>
-  body { font: 14px system-ui, sans-serif; margin: 1rem; background: #10141a; color: #dde3ea; }
-  h1 { font-size: 1.1rem; margin: 0 0 .5rem; }
-  #view { border: 1px solid #333; image-rendering: auto; display: block; }
-  #bar { margin: .5rem 0; display: flex; gap: .4rem; align-items: center; }
-  button { font: inherit; padding: .2rem .7rem; background: #232a33; color: inherit; border: 1px solid #444; border-radius: 4px; cursor: pointer; }
-  #log { white-space: pre-wrap; font-family: monospace; font-size: 12px; color: #9aa7b4; margin-top: .6rem; }
-  #pos { margin-left: auto; font-family: monospace; font-size: 12px; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10141a;
+               font: 13px system-ui, sans-serif; }
+  #map, #mapimg { position: fixed; inset: 0; width: 100vw; height: 100vh;
+                  touch-action: none; cursor: grab; user-select: none; }
+  #mapimg { object-fit: cover; display: none; }
+  .dragging { cursor: grabbing !important; }
+
+  #hud { position: fixed; top: 10px; left: 10px; z-index: 3;
+         background: rgba(12, 16, 22, 0.78); color: #dde3ea; border-radius: 8px;
+         padding: 8px 12px; font-family: ui-monospace, monospace; font-size: 12px;
+         line-height: 1.5; pointer-events: none; max-width: 44ch; }
+  #hud b { color: #fff; font-weight: 600; }
+  #status { color: #8fd3a7; }
+
+  #ctl { position: fixed; right: 14px; bottom: 18px; z-index: 3;
+         display: flex; flex-direction: column; gap: 8px; }
+  #ctl button { width: 42px; height: 42px; font-size: 20px; color: #dde3ea;
+                background: rgba(12, 16, 22, 0.85); border: 1px solid #3a4450;
+                border-radius: 8px; cursor: pointer; }
+  #ctl button:hover { background: #2a323d; }
+
+  #hint { position: fixed; inset: 0; z-index: 2; display: flex;
+          align-items: center; justify-content: center; pointer-events: none; }
+  #hint div { background: rgba(12, 16, 22, 0.85); color: #dde3ea;
+              border: 2px dashed #4a5561; border-radius: 12px;
+              padding: 28px 40px; font-size: 16px; text-align: center; }
+  body.droptarget #hint div { border-color: #8fd3a7; color: #8fd3a7; }
 </style>
 </head>
 <body>
-<h1>tile57 — charts baked and rendered in this page</h1>
-<div id="bar">
-  <button id="w">&larr;</button><button id="e">&rarr;</button>
-  <button id="n">&uarr;</button><button id="s">&darr;</button>
-  <button id="zi">+</button><button id="zo">&minus;</button>
-  <span id="pos"></span>
+<canvas id="map"></canvas>
+<img id="mapimg" alt="chart view" draggable="false">
+<div id="hud">
+  <div><b>tile57</b> <span id="mode">loading…</span></div>
+  <div id="charts">no charts</div>
+  <div id="center"></div>
+  <div id="cursor"></div>
+  <div id="perf"></div>
+  <div id="status">starting engine…</div>
 </div>
-<img id="view" width="800" height="600" alt="chart view">
-<div id="log"></div>
+<div id="ctl">
+  <button id="zi" title="zoom in">+</button>
+  <button id="zo" title="zoom out">&minus;</button>
+  <button id="fs" title="full screen">⛶</button>
+</div>
+<div id="hint"><div>Drop S-57 charts here<br>
+  <small>.000 cells (with their update files), or an exchange-set .zip</small></div></div>
+
+<script>
+  // Catch drops from the first paint. The module below spends seconds
+  // fetching and compiling the engine, and a drop the page does not cancel
+  // navigates the tab to the file. Files dropped before the engine is up are
+  // queued and processed once it is.
+  window.tile57Drops = { pending: [], handler: null };
+  addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("droptarget"); });
+  addEventListener("dragleave", () => document.body.classList.remove("droptarget"));
+  addEventListener("drop", (e) => {
+    e.preventDefault();
+    document.body.classList.remove("droptarget");
+    const files = [...e.dataTransfer.files];
+    if (window.tile57Drops.handler) window.tile57Drops.handler(files);
+    else window.tile57Drops.pending.push(...files);
+  });
+</script>
 <script type="module">
 import { MemFS, WasiShim } from "./wasi-shim.mjs";
 import { Tile57 } from "./tile57.mjs";
+import { GpuRenderer, lonLatToWorld, worldToLonLat, scaleDenom } from "./gpu-renderer.mjs";
 
+const $ = (id) => document.getElementById(id);
 const q = new URLSearchParams(location.search);
-const cells = (q.get("cells") || "US5BDRAB/US5BDRAB.000,US5BDRBB/US5BDRBB.000").split(",");
-const wasmUrl = q.get("wasm") || "./tile57-engine.wasm";
-const encBase = q.get("enc") || "./enc";
+const status = (s) => { $("status").textContent = s; };
+const tick = () => new Promise((r) => setTimeout(r, 0));
 
-const logEl = document.getElementById("log");
-const log = (s) => { logEl.textContent += s + "\n"; };
-
+// ---- engine ---------------------------------------------------------------
 const fsys = new MemFS("/enc");
-for (const cell of cells) {
-  const r = await fetch(`${encBase}/${cell}`);
-  if (!r.ok) { log(`fetch ${cell}: ${r.status}`); throw new Error(cell); }
-  fsys.add(cell, new Uint8Array(await r.arrayBuffer()));
-  log(`fetched ${cell}`);
-}
-
-const t0 = performance.now();
-const mod = await WebAssembly.compileStreaming(fetch(wasmUrl));
 const wasi = new WasiShim(fsys);
+const mod = await WebAssembly.compileStreaming(fetch(q.get("wasm") || "./tile57-engine.wasm"));
 const inst = await WebAssembly.instantiate(mod, wasi.imports());
 wasi.start(inst);
 const t = new Tile57(inst.exports);
-log(`engine ${t.version()} up in ${(performance.now() - t0).toFixed(0)} ms`);
 t.warmup();
 
-const charts = [];
-let west = 180, south = 90, east = -180, north = -90;
-for (const cell of cells) {
-  const t1 = performance.now();
-  const arc = t.bakeChartBytes("/enc/" + cell);
-  const chart = t.chartOpenBytes(arc);
-  const info = t.chartGetInfo(chart);
-  if (info.hasBounds) {
-    west = Math.min(west, info.west); south = Math.min(south, info.south);
-    east = Math.max(east, info.east); north = Math.max(north, info.north);
+// ---- renderer: WebGPU, or PNG views ---------------------------------------
+const dpr = Math.min(devicePixelRatio || 1, 2);
+const canvas = $("map"), img = $("mapimg");
+let gpu = null;
+if (!q.get("png") && GpuRenderer.supported()) {
+  try {
+    status("starting WebGPU…");
+    gpu = await GpuRenderer.create(canvas, t, dpr);
+  } catch (e) {
+    console.error(e);
+    gpu = null;
   }
-  charts.push(chart);
-  log(`baked ${cell}: ${arc.length} bytes, 1:${info.nativeScale}, ${(performance.now() - t1).toFixed(0)} ms`);
 }
-const compose = charts.length > 1 ? t.composeOpen(charts) : 0;
-if (compose) log(`composed ${charts.length} charts`);
+const surface = gpu ? canvas : img;
+if (!gpu) { canvas.style.display = "none"; img.style.display = "block"; }
+$("mode").textContent = `${t.version()} wasm — ${gpu ? "WebGPU" : "PNG"}`;
 
-const view = { lat: (south + north) / 2, lon: (west + east) / 2, zoom: 14 };
-const img = document.getElementById("view");
-let url = null;
-function render() {
-  const t1 = performance.now();
-  const png = compose
-    ? t.composePng(compose, view.lon, view.lat, view.zoom, 800, 600)
-    : t.chartPng(charts[0], view.lon, view.lat, view.zoom, 800, 600);
-  if (url) URL.revokeObjectURL(url);
-  url = URL.createObjectURL(new Blob([png], { type: "image/png" }));
-  img.src = url;
-  document.getElementById("pos").textContent =
-    `${view.lat.toFixed(4)}, ${view.lon.toFixed(4)} z${view.zoom.toFixed(1)} — ${(performance.now() - t1).toFixed(0)} ms`;
+// ---- state ----------------------------------------------------------------
+const charts = []; // {name, handle, info}
+let compose = 0;
+const cam = { lon: -73.16, lat: 41.14, zoom: 13 };
+let sceneCam = null; // camera the current GPU scene / PNG was built for
+
+const viewW = () => innerWidth, viewH = () => innerHeight;
+function sizeCanvas() {
+  canvas.width = Math.max(1, Math.round(viewW() * dpr));
+  canvas.height = Math.max(1, Math.round(viewH() * dpr));
 }
-const step = () => 200 / 2 ** view.zoom; // ~quarter-view pan
-const move = (dlat, dlon, dz) => { view.lat += dlat; view.lon += dlon; view.zoom = Math.max(2, Math.min(18, view.zoom + dz)); render(); };
-document.getElementById("w").onclick = () => move(0, -step(), 0);
-document.getElementById("e").onclick = () => move(0, step(), 0);
-document.getElementById("n").onclick = () => move(step() * 0.75, 0, 0);
-document.getElementById("s").onclick = () => move(-step() * 0.75, 0, 0);
-document.getElementById("zi").onclick = () => move(0, 0, 1);
-document.getElementById("zo").onclick = () => move(0, 0, -1);
-render();
-log("ready");
+sizeCanvas();
+
+function hud() {
+  $("charts").textContent = charts.length
+    ? `${charts.length} chart${charts.length > 1 ? "s" : ""}: ${charts.map((c) => c.name).slice(0, 4).join(", ")}${charts.length > 4 ? ", …" : ""}`
+    : "no charts";
+  $("center").textContent = `${cam.lat.toFixed(4)}, ${cam.lon.toFixed(4)}  z${cam.zoom.toFixed(1)}  ≈1:${Math.round(scaleDenom(cam.zoom)).toLocaleString()}`;
+  $("hint").style.display = charts.length ? "none" : "flex";
+}
+hud();
+status("ready — drop charts to begin");
+
+// ---- view rebuild (the engine renders / portrays here) --------------------
+let rebuildTimer = 0;
+function scheduleRebuild(ms = 250) {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(rebuild, ms);
+}
+async function rebuild() {
+  if (!charts.length) return;
+  const t0 = performance.now();
+  const [w, h] = gpu ? [canvas.width, canvas.height] : [Math.round(viewW() * dpr), Math.round(viewH() * dpr)];
+  try {
+    if (gpu) {
+      const scene = compose
+        ? t.composeGpuScene(compose, cam.lon, cam.lat, cam.zoom, w, h, dpr)
+        : t.chartGpuScene(charts[0].handle, cam.lon, cam.lat, cam.zoom, w, h, dpr);
+      gpu.setScene(t, scene);
+      gpu.draw(cam);
+      $("perf").textContent = `scene ${(performance.now() - t0).toFixed(0)} ms, ${gpu.draws.length} draws @${w}×${h}`;
+    } else {
+      const png = compose
+        ? t.composePng(compose, cam.lon, cam.lat, cam.zoom, w, h)
+        : t.chartPng(charts[0].handle, cam.lon, cam.lat, cam.zoom, w, h);
+      if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
+      img.dataset.url = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+      img.src = img.dataset.url;
+      img.style.transform = "";
+      $("perf").textContent = `render ${(performance.now() - t0).toFixed(0)} ms @${w}×${h}`;
+    }
+    sceneCam = { ...cam };
+  } catch (e) {
+    console.error(e);
+    status(`render failed: ${e.message}`);
+  }
+  hud();
+}
+
+// GPU: any camera change redraws the uploaded scene immediately.
+let rafPending = false;
+function redraw() {
+  hud();
+  if (!gpu || !charts.length || rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => { rafPending = false; gpu.draw(cam); });
+}
+
+// ---- mouse / touch navigation --------------------------------------------
+const cssWorld = () => 256 * 2 ** cam.zoom; // CSS px per world unit
+function panBy(dxCss, dyCss) {
+  const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
+  const s = cssWorld();
+  [cam.lon, cam.lat] = worldToLonLat(cx - dxCss / s, Math.min(0.9999, Math.max(0.0001, cy - dyCss / s)));
+}
+function zoomAt(mx, my, dz) {
+  const oldS = cssWorld();
+  const [cx, cy] = lonLatToWorld(cam.lon, cam.lat);
+  const wx = cx + (mx - viewW() / 2) / oldS, wy = cy + (my - viewH() / 2) / oldS;
+  cam.zoom = Math.min(18, Math.max(2, cam.zoom + dz));
+  const s = cssWorld();
+  [cam.lon, cam.lat] = worldToLonLat(wx - (mx - viewW() / 2) / s, Math.min(0.9999, Math.max(0.0001, wy - (my - viewH() / 2) / s)));
+}
+
+let drag = null;
+surface.addEventListener("pointerdown", (e) => {
+  if (!charts.length) return;
+  surface.setPointerCapture(e.pointerId);
+  surface.classList.add("dragging");
+  drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY };
+});
+surface.addEventListener("pointermove", (e) => {
+  const [wcx, wcy] = lonLatToWorld(cam.lon, cam.lat);
+  const px = wcx + (e.clientX - viewW() / 2) / cssWorld();
+  const py = wcy + (e.clientY - viewH() / 2) / cssWorld();
+  const [lon, lat] = worldToLonLat(px, Math.min(0.9999, Math.max(0.0001, py)));
+  $("cursor").textContent = `cursor ${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+  if (!drag) return;
+  panBy(e.clientX - drag.x, e.clientY - drag.y);
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (gpu) redraw();
+  else img.style.transform = `translate(${e.clientX - drag.sx}px, ${e.clientY - drag.sy}px)`;
+});
+surface.addEventListener("pointerup", (e) => {
+  if (!drag) return;
+  surface.classList.remove("dragging");
+  drag = null;
+  scheduleRebuild(gpu ? 250 : 0);
+});
+surface.addEventListener("wheel", (e) => {
+  if (!charts.length) return;
+  e.preventDefault();
+  const dz = -e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0022);
+  zoomAt(e.clientX, e.clientY, dz);
+  if (gpu) redraw();
+  else {
+    const k = 2 ** (cam.zoom - (sceneCam?.zoom ?? cam.zoom));
+    img.style.transformOrigin = `${e.clientX}px ${e.clientY}px`;
+    img.style.transform = `scale(${k})`;
+  }
+  scheduleRebuild(gpu ? 300 : 350);
+}, { passive: false });
+surface.addEventListener("dblclick", (e) => {
+  if (!charts.length) return;
+  zoomAt(e.clientX, e.clientY, 1);
+  if (gpu) redraw();
+  scheduleRebuild(0);
+});
+$("zi").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, 1); if (gpu) redraw(); scheduleRebuild(0); };
+$("zo").onclick = () => { zoomAt(viewW() / 2, viewH() / 2, -1); if (gpu) redraw(); scheduleRebuild(0); };
+$("fs").onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+addEventListener("resize", () => { sizeCanvas(); if (gpu) redraw(); scheduleRebuild(200); });
+
+// ---- loading charts -------------------------------------------------------
+function fitTo(list) {
+  let west = 180, south = 90, east = -180, north = -90, ok = false;
+  for (const c of list) {
+    if (!c.info.hasBounds) continue;
+    ok = true;
+    west = Math.min(west, c.info.west); south = Math.min(south, c.info.south);
+    east = Math.max(east, c.info.east); north = Math.max(north, c.info.north);
+  }
+  if (!ok) return;
+  const [wx0, wy0] = lonLatToWorld(west, north), [wx1, wy1] = lonLatToWorld(east, south);
+  const z = Math.log2(Math.min((viewW() * 0.9) / (256 * (wx1 - wx0)), (viewH() * 0.9) / (256 * (wy1 - wy0))));
+  cam.zoom = Math.min(16, Math.max(3, z));
+  [cam.lon, cam.lat] = worldToLonLat((wx0 + wx1) / 2, (wy0 + wy1) / 2);
+}
+
+function openArchive(name, archive) {
+  if (charts.some((c) => c.name === name)) return null; // already loaded
+  const handle = t.chartOpenBytes(archive);
+  const chart = { name, handle, info: t.chartGetInfo(handle) };
+  charts.push(chart);
+  return chart;
+}
+
+let dropSeq = 0;
+async function loadFiles(items) {
+  const added = [];
+  // Group .000 cells with their .001.. update files by cell name.
+  const groups = new Map();
+  const zips = [];
+  for (const { name, bytes } of items) {
+    if (/\.zip$/i.test(name)) zips.push({ name, bytes });
+    else if (/\.\d{3}$/.test(name)) {
+      const stem = name.replace(/\.\d{3}$/, "");
+      if (!groups.has(stem)) groups.set(stem, []);
+      groups.get(stem).push({ name, bytes });
+    }
+  }
+  for (const [stem, files] of groups) {
+    if (!files.some((f) => /\.000$/.test(f.name))) {
+      status(`${stem}: update files without the .000 base — skipped`);
+      continue;
+    }
+    for (const f of files) fsys.add(`drops/${stem}/${f.name}`, f.bytes);
+    status(`baking ${stem}…`);
+    await tick();
+    try {
+      const t0 = performance.now();
+      const arc = t.bakeChartBytes(`/enc/drops/${stem}/${stem}.000`);
+      if (!arc) { status(`${stem}: produced no archive`); continue; }
+      const c = openArchive(stem, arc);
+      if (c) { added.push(c); status(`${stem}: baked in ${(performance.now() - t0).toFixed(0)} ms`); }
+    } catch (e) {
+      console.error(e);
+      status(`${stem}: ${e.message}`);
+    }
+    await tick();
+  }
+  for (const { name, bytes } of zips) {
+    const id = `z${dropSeq++}`;
+    fsys.add(`zips/${id}.zip`, bytes);
+    status(`baking exchange set ${name}…`);
+    await tick();
+    try {
+      const t0 = performance.now();
+      const n = t.bakeZip(`/enc/zips/${id}.zip`, `/enc/baked/${id}`);
+      status(`${name}: ${n} charts baked in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+      for (const [path, node] of fsys.files(`baked/${id}`)) {
+        if (!/\.pmtiles$/.test(path)) continue;
+        const stem = path.replace(/^.*\//, "").replace(/\.pmtiles$/, "");
+        const c = openArchive(stem, node.data().slice());
+        if (c) added.push(c);
+        await tick();
+      }
+    } catch (e) {
+      console.error(e);
+      status(`${name}: ${e.message}`);
+    }
+  }
+  if (!added.length) { hud(); return; }
+
+  // Rebuild the composite over everything loaded (it borrows the charts).
+  if (compose) t.composeClose(compose);
+  compose = charts.length > 1 ? t.composeOpen(charts.map((c) => c.handle)) : 0;
+  fitTo(added);
+  status(`${charts.length} chart${charts.length > 1 ? "s" : ""} ready`);
+  await rebuild();
+}
+
+// ---- drag & drop (the early script above catches and queues the events) ---
+async function onFiles(files) {
+  const items = [];
+  for (const f of files) items.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) });
+  if (items.length) await loadFiles(items);
+}
+window.tile57Drops.handler = onFiles;
+if (window.tile57Drops.pending.length) await onFiles(window.tile57Drops.pending.splice(0));
+
+// ---- optional preload (?cells=) -------------------------------------------
+const preload = q.get("cells");
+if (preload) {
+  const encBase = q.get("enc") || "./enc";
+  const items = [];
+  for (const cell of preload.split(",")) {
+    status(`fetching ${cell}…`);
+    const r = await fetch(`${encBase}/${cell}`);
+    if (!r.ok) { status(`fetch ${cell}: ${r.status}`); continue; }
+    items.push({ name: cell.replace(/^.*\//, ""), bytes: new Uint8Array(await r.arrayBuffer()) });
+  }
+  if (items.length) await loadFiles(items);
+}
 </script>
 </body>
 </html>
