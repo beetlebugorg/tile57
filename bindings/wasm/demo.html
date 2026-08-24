@@ -309,16 +309,15 @@ function selectCharts() {
   // detailed. Suitable charts sit within ~11x either way; when none do,
   // everything still competes — an overscaled chart beats a blank sea.
   const scored = hits.map((c) => ({ c, g: Math.log2((c.info.nativeScale || denom) / denom) }));
-  let pool = scored.filter((s) => Math.abs(s.g) <= 3.5);
-  if (!pool.length) pool = scored;
-  // Most general first. Under the cap the order is moot (the engine's
-  // partition gives detailed charts precedence on overlap anyway); OVER the
-  // cap it decides who draws, and generals cover the view in the fewest
-  // cells — a z3 view over a harbor-cell library fills with the overview
-  // band instead of 32 arbitrary harbor cells. Detail wins back naturally
-  // as zooming narrows the window.
-  pool.sort((a, b) => b.g - a.g);
-  return pool.slice(0, MAX_OPEN).map((s) => s.c);
+  // Suitable charts first, most GENERAL leading: over the cap that order
+  // decides who draws, and generals cover the view in the fewest cells (the
+  // engine's partition gives detailed charts precedence on overlap anyway).
+  // Slots LEFT over go to out-of-window charts nearest the view's scale —
+  // an area only a detailed chart covers should show that chart overscaled,
+  // never a hole, and the window alone left holes at mid zooms.
+  const inWin = scored.filter((sc) => Math.abs(sc.g) <= 3.5).sort((a, b) => b.g - a.g);
+  const outWin = scored.filter((sc) => Math.abs(sc.g) > 3.5).sort((a, b) => Math.abs(a.g) - Math.abs(b.g));
+  return inWin.concat(outWin).slice(0, MAX_OPEN).map((sc) => sc.c);
 }
 
 /** Make the view's charts resident and composed; evict beyond the cap.
@@ -356,6 +355,22 @@ async function ensureView() {
   return { compose, chart: compose ? 0 : sole };
 }
 const cam = { lon: -73.16, lat: 41.14, zoom: 13 };
+// The last view, restored across reloads (localStorage survives the library).
+function restoreView() {
+  try {
+    const v = JSON.parse(localStorage.getItem("tile57.view"));
+    if (!v || ![v.lat, v.lon, v.zoom].every(Number.isFinite)) return false;
+    cam.lat = Math.max(-85, Math.min(85, v.lat));
+    cam.lon = Math.max(-180, Math.min(180, v.lon));
+    cam.zoom = Math.max(2, Math.min(18, v.zoom));
+    return true;
+  } catch { return false; }
+}
+function saveView() {
+  try {
+    localStorage.setItem("tile57.view", JSON.stringify({ lat: cam.lat, lon: cam.lon, zoom: cam.zoom }));
+  } catch { /* private mode; the view just does not persist */ }
+}
 let sceneCam = null; // camera the current scene / PNG was built for
 
 const viewW = () => innerWidth, viewH = () => innerHeight;
@@ -416,6 +431,7 @@ async function rebuild() {
       $("perf").textContent = `render ${(performance.now() - t0).toFixed(0)} ms @${w}×${h}`;
     }
     sceneCam = { ...cam };
+    saveView();
   } catch (e) {
     console.error(e);
     status(`render failed: ${e.message}`, true);
@@ -717,7 +733,7 @@ if (savedCatalog.length) {
   loader.hide();
   for (const c of savedCatalog) if (c.info) catalog.push(c);
   if (catalog.length) {
-    fitTo(catalog);
+    if (!restoreView()) fitTo(catalog);
     status(`${catalog.length} chart${catalog.length > 1 ? "s" : ""} in the library`);
     await rebuild();
   }
