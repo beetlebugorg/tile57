@@ -63,6 +63,15 @@ export class MemFS {
     }
     dir.set(p[p.length - 1], new FileNode(bytes));
   }
+  /** Create directory `rel` and its parents. */
+  mkdirs(rel) {
+    let dir = this.tree;
+    for (const part of parts(rel)) {
+      if (!dir.has(part)) dir.set(part, new Map());
+      dir = dir.get(part);
+      if (!(dir instanceof Map)) throw new Error(`${part}: file where a directory is needed`);
+    }
+  }
   /** The node at `rel` ("" or "." -> the root dir), or null. */
   lookup(rel) {
     let node = this.tree;

@@ -78,16 +78,22 @@ rebuilds.
 
 `bindings/wasm/demo.html` is a complete in-page chartplotter. Drop S-57
 charts on it — `.000` cells with their update files, or an exchange-set
-`.zip` (the engine bakes the whole set through the shim's writable file
-tree). Drag to pan, wheel to zoom, double-click to zoom in. It renders with
+`.zip`. Drag to pan, wheel to zoom, double-click to zoom in. It renders with
 WebGPU where the browser has it, and falls back to PNG views (`?png=1`
-forces the fallback). Serve a directory that holds the page, the `.mjs`
-modules, and the engine:
+forces the fallback; the HUD names the reason when the fallback engages).
+
+The demo runs the engine in a Web Worker (`engine-worker.mjs`): a bake holds
+the CPU for seconds, and off the main thread the map and the loader stay
+live. The page drives one engine call per RPC message — a dropped zip is
+listed, then extracted and baked one cell at a time, so the loader shows real
+per-cell progress.
+
+Serve a directory that holds the page, the `.mjs` modules, and the engine:
 
 ```sh
 zig build wasm-engine
 mkdir demo && cd demo
-ln -s ../bindings/wasm/{demo.html,tile57.mjs,wasi-shim.mjs,gpu-renderer.mjs} .
+ln -s ../bindings/wasm/{demo.html,tile57.mjs,wasi-shim.mjs,gpu-renderer.mjs,engine-worker.mjs} .
 ln -s ../zig-out/bin/tile57-engine.wasm .
 python3 -m http.server 8080
 # open http://localhost:8080/demo.html and drop charts on it

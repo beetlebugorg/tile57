@@ -9,10 +9,15 @@
 // This renderer uploads the buffers once per scene and redraws every frame
 // from uniforms alone, so pan and zoom are live between scene rebuilds.
 //
+// The renderer holds no engine handle — it consumes plain data, so the
+// engine can live in a Web Worker while the device and buffers live here.
+//
 // usage:
-//   const r = await GpuRenderer.create(canvas, t, pixelRatio); // t: Tile57
-//   r.setScene(t, t.composeGpuScene(...));  // takes ownership, frees it
-//   r.draw(camera);                          // {lon, lat, zoom}, any frame
+//   const r = await GpuRenderer.create(canvas, pixelRatio, assets);
+//     // assets: {layout, spritePng, glyphPng, glyphBoldPng, glyphItalicPng,
+//     //          colortables} — the engine-worker's gpuAssets op
+//   r.setScene(data);   // {vertex, index, quad, patterns, draws} — its gpuScene op
+//   r.draw(camera);     // {lon, lat, zoom}, any frame
 
 export const ATLAS = { NONE: 0, SPRITE: 1, GLYPH: 2, GLYPH_BOLD: 3, GLYPH_ITALIC: 4 };
 const NO_PATTERN = 0xffffffff;
@@ -244,10 +249,12 @@ function nodataColor(colortablesJson, scheme = "DAY") {
 export class GpuRenderer {
   static supported() { return typeof navigator !== "undefined" && !!navigator.gpu; }
 
-  /** Build the device, pipelines, and atlas textures. `pixelRatio` must match
-   * every later gpu-scene call, or the sprite UVs will not index the atlas. */
-  static async create(canvas, t, pixelRatio) {
-    const l = t.abiGpuLayout();
+  /** Build the device, pipelines, and atlas textures from the engine's
+   * gpuAssets. `pixelRatio` must match the pixel ratio the assets were baked
+   * at AND every later gpu-scene call, or the sprite UVs will not index the
+   * atlas. */
+  static async create(canvas, pixelRatio, assets) {
+    const l = assets.layout;
     if (l.vertex !== 32 || l.quad !== 44 || l.range !== 24 || l.uniforms !== 128)
       throw new Error(`gpu ABI skew: engine says vertex=${l.vertex} quad=${l.quad} range=${l.range} uniforms=${l.uniforms}`);
 
@@ -290,12 +297,12 @@ export class GpuRenderer {
 
     // The four atlases, baked once by the engine at this density.
     r.atlases = new Array(5).fill(null);
-    r.atlases[ATLAS.SPRITE] = await texFromPng(device, t.bakeSpriteMln(pixelRatio, 0).png);
-    r.atlases[ATLAS.GLYPH] = await texFromPng(device, t.bakeGlyphSdf(0).png);
-    r.atlases[ATLAS.GLYPH_BOLD] = await texFromPng(device, t.bakeGlyphSdf(1).png);
-    r.atlases[ATLAS.GLYPH_ITALIC] = await texFromPng(device, t.bakeGlyphSdf(2).png);
+    r.atlases[ATLAS.SPRITE] = await texFromPng(device, assets.spritePng);
+    r.atlases[ATLAS.GLYPH] = await texFromPng(device, assets.glyphPng);
+    r.atlases[ATLAS.GLYPH_BOLD] = await texFromPng(device, assets.glyphBoldPng);
+    r.atlases[ATLAS.GLYPH_ITALIC] = await texFromPng(device, assets.glyphItalicPng);
     r.atlasHave = (1 << ATLAS.SPRITE) | (1 << ATLAS.GLYPH) | (1 << ATLAS.GLYPH_BOLD) | (1 << ATLAS.GLYPH_ITALIC);
-    r.halo = nodataColor(t.colortablesDefault());
+    r.halo = nodataColor(assets.colortables);
     r.msaa = null;
     r.buffers = null;
     r.draws = [];
@@ -310,23 +317,22 @@ export class GpuRenderer {
     return buf;
   }
 
-  /** Take a scene (from Tile57.chartGpuScene / composeGpuScene): upload its
-   * buffers, batch its ranges, build the bind groups, release it. */
-  setScene(t, scene) {
+  /** Upload one scene's draw-ready data (the engine-worker's gpuScene op):
+   * the three buffers, the pattern cells, and the batched draw list. */
+  setScene({ vertex, index, quad, patterns, draws }) {
     this.disposeScene();
     this.buffers = {
-      vertex: this.upload(scene.vertexBytes(), GPUBufferUsage.VERTEX),
-      index: this.upload(scene.indexBytes(), GPUBufferUsage.INDEX),
-      quad: this.upload(scene.quadBytes(), GPUBufferUsage.VERTEX),
+      vertex: this.upload(vertex, GPUBufferUsage.VERTEX),
+      index: this.upload(index, GPUBufferUsage.INDEX),
+      quad: this.upload(quad, GPUBufferUsage.VERTEX),
     };
-    this.patternTex = scene.patternList().map(({ w, h, rgba }) => {
+    this.patternTex = patterns.map(({ w, h, rgba }) => {
       if (!w || !h) return null; // a cell that never rasterized: drop its draws
       const tex = this.device.createTexture({ size: [w, h], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
       this.device.queue.writeTexture({ texture: tex }, rgba, { bytesPerRow: w * 4 }, [w, h]);
       return tex;
     });
-    this.draws = t.gpuBatch(scene, { atlasHave: this.atlasHave, halo: this.halo });
-    scene.free();
+    this.draws = draws;
 
     // One uniform slot per draw; one bind group per distinct texture.
     const n = Math.max(1, this.draws.length);

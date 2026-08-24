@@ -73,7 +73,8 @@ export class Tile57 {
 
   /** Bake every chart in an exchange-set zip to <outDir>/<CELL>/<CELL>.pmtiles
    * in the WASI file tree (updates applied from the archive). Returns how many
-   * charts were baked. */
+   * charts were baked. One call for the whole set — a host that wants per-cell
+   * progress lists the zip, extracts each cell, and bakes it itself. */
   bakeZip(zipPath, outDir) {
     const zp = this.allocCString(zipPath);
     const op = this.allocCString(outDir);
@@ -81,6 +82,31 @@ export class Tile57 {
     this.wasmFree(zp);
     this.wasmFree(op);
     return this.view().getUint32(this.outPtr, true);
+  }
+
+  /** List a zip's entries: [{name, size, packed}, ...] in central-directory
+   * order. */
+  zipList(zipPath) {
+    const zp = this.allocCString(zipPath);
+    this.check("zip_list", this.e.tile57_zip_list(zp, this.outPtr, this.outLen, this.errPtr));
+    this.wasmFree(zp);
+    return JSON.parse(new TextDecoder().decode(this.takeOut()));
+  }
+
+  /** Extract named zip entries to paths in the WASI file tree. `names[i]`
+   * lands at `outPaths[i]`. Returns how many were written. */
+  zipExtract(zipPath, names, outPaths) {
+    const zp = this.allocCString(zipPath);
+    const strs = names.concat(outPaths).map((s) => this.allocCString(s));
+    const list = this.e.tile57_wasm_alloc(4 * strs.length);
+    const d = this.view();
+    strs.forEach((p, i) => d.setUint32(list + 4 * i, p, true));
+    this.check("zip_extract", this.e.tile57_zip_extract(zp, list, list + 4 * names.length, names.length, 0, 0, this.outPtr, this.errPtr));
+    const done = this.view().getUint32(this.outPtr, true);
+    for (const p of strs) this.wasmFree(p);
+    this.wasmFree(list);
+    this.wasmFree(zp);
+    return done;
   }
 
   /** Open a baked archive from bytes; returns the chart handle. */
