@@ -19,13 +19,20 @@ const std = @import("std");
 /// tile57/2 = the 6-source-layer schema (the `_scamin` twins folded into their
 /// base; SCAMIN is a per-feature `scamin` property the style gates
 /// band-independently).
-pub const SCHEMA_VERSION = "tile57/2";
+/// tile57/3 = /2 plus (a) linestyle-decorated lines split into one
+/// `lines-ls-<STYLE>` source-layer per linestyle and (b) the v3 precomputed
+/// properties (vz/oz gate zooms, mq/iso flags, ep/lsk sort keys) — see
+/// scene.augmentV3. The style's filters and sort keys read the precomputes;
+/// a /2 archive under a /3 style renders, but SCAMIN-gates nothing and sorts
+/// by tile order.
+pub const SCHEMA_VERSION = "tile57/3";
 
 // MapLibre style.json generation lives in maplibre.zig.
 pub const Options = @import("maplibre.zig").Options;
 pub const json = @import("maplibre.zig").json;
 pub const displayDenom = @import("maplibre.zig").displayDenom;
 pub const displayDenomZ = @import("maplibre.zig").displayDenomZ;
+pub const scaminDisplayZoom = @import("maplibre.zig").scaminDisplayZoom;
 pub const scaminGateK = @import("maplibre.zig").scaminGateK;
 pub const buildFromTemplate = @import("maplibre.zig").buildFromTemplate;
 pub const buildFromTemplateScamin = @import("maplibre.zig").buildFromTemplateScamin;

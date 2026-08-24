@@ -228,6 +228,7 @@ const CellBackend = struct {
     portrayal: ?[]const ?[]const u8 = null, // per-feature default S-101 instruction stream
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
+    portrayal_lights: ?[]const ?[]const u8 = null, // FullLightLines variant (sectored lights)
     portray_arena: ?*std.heap.ArenaAllocator = null,
     coverage: []const []const []const s57.LonLat = &.{}, // M_COVR (in portray_arena)
     cscl: i32 = 0, // compilation scale (DSPM CSCL, 1:N)
@@ -264,6 +265,7 @@ fn cellRef(cb: *CellBackend) scene.CellRef {
         .portrayal = cb.portrayal,
         .portrayal_plain = cb.portrayal_plain,
         .portrayal_simplified = cb.portrayal_simplified,
+        .portrayal_lights = cb.portrayal_lights,
         .geo = cb.geo,
         .geo_world = cb.geo_world,
         .feat_bbox = cb.feat_bbox,
@@ -286,6 +288,7 @@ const LazyCell = struct {
     portrayal: ?[]const ?[]const u8 = null,
     portrayal_plain: ?[]const ?[]const u8 = null,
     portrayal_simplified: ?[]const ?[]const u8 = null,
+    portrayal_lights: ?[]const ?[]const u8 = null,
     arena: ?*std.heap.ArenaAllocator = null,
     tick: u64 = 0, // LRU: last tile that used this cell
     // M_COVR(CATCOV=1) coverage polygons, assembled once from `cell` for best-band
@@ -519,6 +522,7 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
             lc.portrayal = cp.base;
             lc.portrayal_plain = cp.plain;
             lc.portrayal_simplified = cp.simplified;
+            lc.portrayal_lights = cp.lights;
             lc.arena = p;
         } else |_| {
             p.deinit();
@@ -547,6 +551,7 @@ fn lazyUnload(lc: *LazyCell) void {
     lc.scamins = &.{}; // ditto (cell.arena)
     lc.portrayal_plain = null;
     lc.portrayal_simplified = null;
+    lc.portrayal_lights = null;
     if (lc.arena) |p| {
         p.deinit();
         gpa.destroy(p);
@@ -687,6 +692,7 @@ fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const 
         cb.portrayal = cp.base;
         cb.portrayal_plain = cp.plain;
         cb.portrayal_simplified = cp.simplified;
+        cb.portrayal_lights = cp.lights;
     } else |_| {}
     // Assemble geometry + its projection + per-feature bboxes ONCE (the baker's
     // per-cell caches) so live per-view rendering reuses them across the view's tiles
@@ -1194,11 +1200,177 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
     return bakeChartsToFiles(io, in_paths.items, out_paths.items, rules_dir, workers, progress, progress_ctx, label, true);
 }
 
+/// Bake a whole exchange set STILL IN ITS ARCHIVE: find the cells, name every
+/// output, bake. The zip twin of `bakeTree`, and for the same reason — working
+/// out where each chart goes is this engine's job, not a thing every host
+/// reinvents. It had been reinvented three times before this existed (the CLI,
+/// the macOS shell, an Android path), and two of the three carried the
+/// archive's own wrapper directory into the output.
+///
+/// THE NAMING RULE. Mirror each entry's path BELOW the directory the archive
+/// wraps everything in. NOAA's All_ENCs.zip puts every cell under `ENC_ROOT/`;
+/// that name belongs to the archive, not to the library being built, so an
+/// `out_dir` of `.../ENC_ROOT` must not produce `.../ENC_ROOT/ENC_ROOT/`. The
+/// prefix is COMPUTED — the longest whole-component prefix the cells share —
+/// rather than assumed to be one level, so an archive holding two districts
+/// keeps them apart. That is what the mirroring is for: two districts carrying
+/// the same boundary cell keep their own copies instead of overwriting each
+/// other, and each cell's referenced text lands beside the right chart.
+///
+/// A cell sharing its directory with no other (a single-cell archive) gets a
+/// directory named for itself — the layout the aux manifest needs, and what a
+/// bake from a loose `.000` already writes.
+pub fn bakeZip(io: std.Io, zip_path: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel) !usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var arc = try zipsrc.Archive.open(a, io, zip_path);
+    defer arc.deinit();
+
+    var names = std.ArrayList([]const u8).empty;
+    for (arc.entries) |e| {
+        if (std.mem.endsWith(u8, e.name, ".000")) names.append(a, e.name) catch continue;
+    }
+    if (names.items.len == 0) return 0;
+
+    // Say the count the moment it is known, before the pass below decides what
+    // is already done. That pass stats one file per chart, which on a phone or
+    // tablet is slow enough to look like a hang — and until this fired the host
+    // had no denominator to draw anything but a spinner with.
+    if (progress) |p| {
+        if (!p(progress_ctx, 0, @intCast(names.items.len))) return 0;
+    }
+
+    const root = archiveRootPrefix(names.items);
+
+    // The cells this run will actually bake, and where each goes. `kept` is a
+    // subset of `names` once the incremental skip below has had its say, and
+    // the two lists must stay index-aligned: `label` names a chart by its index
+    // into what was HANDED to the bake, not into the archive.
+    var kept = std.ArrayList([]const u8).empty;
+    var out_paths = std.ArrayList([]const u8).empty;
+    for (names.items) |n| {
+        const base = std.fs.path.basename(n);
+        const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+        const dir = zipDirOf(n);
+        var rel = dir[@min(root.len, dir.len)..];
+        while (rel.len != 0 and rel[0] == '/') rel = rel[1..];
+        const chart_dir = if (rel.len == 0)
+            std.fs.path.join(a, &.{ out_dir, stem }) catch continue
+        else
+            std.fs.path.join(a, &.{ out_dir, rel }) catch continue;
+        const name = std.fmt.allocPrint(a, "{s}.pmtiles", .{stem}) catch continue;
+        const out_path = std.fs.path.join(a, &.{ chart_dir, name }) catch continue;
+        // INCREMENTAL, as bakeTree is: an archive already newer than the zip it
+        // came from is done. A national exchange set is hours of work on a
+        // tablet and WILL be interrupted — the app is backgrounded, the battery
+        // goes, the mariner stops it to sail — and without this every resume
+        // starts from the first cell again and never finishes.
+        if (fileModNs(io, out_path)) |out_ns| {
+            if (fileModNs(io, zip_path)) |zip_ns| {
+                if (out_ns >= zip_ns) continue;
+            }
+        }
+        std.Io.Dir.cwd().createDirPath(io, chart_dir) catch {};
+        kept.append(a, n) catch continue;
+        out_paths.append(a, out_path) catch continue;
+    }
+    if (out_paths.items.len != kept.items.len) return error.OutOfMemory;
+    if (kept.items.len == 0) return 0; // everything already prepared
+
+    // Correct the count to the work actually left. A resumed import skips what
+    // it already baked, so the number from the listing was the archive's size,
+    // not this run's.
+    if (progress) |p| {
+        if (!p(progress_ctx, 0, @intCast(kept.items.len))) return 0;
+    }
+
+    return bakeZipChartsToFiles(io, &arc, kept.items, out_paths.items, rules_dir, workers, progress, progress_ctx, label, true);
+}
+
+/// Zip entry names always use '/', whatever the platform, so these split on
+/// that rather than on the host separator.
+fn zipDirOf(path: []const u8) []const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
+    return path[0..at];
+}
+
+/// The directory every one of `paths` sits under, as whole path components.
+pub fn archiveRootPrefix(paths: []const []const u8) []const u8 {
+    if (paths.len == 0) return "";
+    var pre: []const u8 = zipDirOf(paths[0]);
+    for (paths[1..]) |p| {
+        pre = commonComponents(pre, zipDirOf(p));
+        if (pre.len == 0) break;
+    }
+    return pre;
+}
+
+/// The longest common prefix of `a` and `b` ending on a component boundary, so
+/// `ENC_ROOT/US5` and `ENC_ROOT/US4` share `ENC_ROOT`, not `ENC_ROOT/US`.
+fn commonComponents(a: []const u8, b: []const u8) []const u8 {
+    var i: usize = 0;
+    var boundary: usize = 0;
+    while (i < a.len and i < b.len and a[i] == b[i]) : (i += 1) {
+        if (a[i] == '/') boundary = i;
+    }
+    if (i == a.len and (i == b.len or b[i] == '/')) return a;
+    if (i == b.len and a[i] == '/') return b;
+    return a[0..boundary];
+}
+
+test "an archive's own root directory is not part of the output path" {
+    // NOAA's All_ENCs.zip: every cell under one ENC_ROOT/. Carrying that
+    // through made `-o ~/Charts/ENC_ROOT` write ~/Charts/ENC_ROOT/ENC_ROOT/ — a
+    // second library beside the real one, which a host that opens the parent
+    // then composes together with it, one vintage silently winning per tile.
+    const noaa = [_][]const u8{ "ENC_ROOT/US5MD12M/US5MD12M.000", "ENC_ROOT/US4MD11M/US4MD11M.000" };
+    try std.testing.expectEqualStrings("ENC_ROOT", archiveRootPrefix(&noaa));
+
+    // What the mirroring is FOR survives it: two districts carrying the same
+    // boundary cell keep their own copies.
+    const districts = [_][]const u8{ "ENC_ROOT/D1/US5MD12M/US5MD12M.000", "ENC_ROOT/D2/US5MD12M/US5MD12M.000" };
+    try std.testing.expectEqualStrings("ENC_ROOT", archiveRootPrefix(&districts));
+
+    // A near-miss must not split mid-component.
+    const near = [_][]const u8{ "ENC_ROOT/US5/a.000", "ENC_ROOT/US4/b.000" };
+    try std.testing.expectEqualStrings("ENC_ROOT", archiveRootPrefix(&near));
+
+    // A flat archive shares nothing; one cell under one directory shares all of
+    // it, and both fall back to a directory named for the chart.
+    const flat = [_][]const u8{ "a.000", "b.000" };
+    try std.testing.expectEqualStrings("", archiveRootPrefix(&flat));
+    const one = [_][]const u8{"ENC_ROOT/US5MD12M/US5MD12M.000"};
+    try std.testing.expectEqualStrings("ENC_ROOT/US5MD12M", archiveRootPrefix(&one));
+}
+
+test "the GPU atlas declares the scale its cells were baked at" {
+    // A sprite quad is sized cell px x scale/ppm, so the ppm buildGpuAtlases
+    // declares must be the one spriteMlnOpts rasterized the cells at.
+    for ([_]f64{ 1.0, 2.0, 3.0 }) |ratio| {
+        try std.testing.expectApproxEqRel(
+            sprite.mlnPpm(ratio),
+            sprite.px_per_unit * 100.0 * ratio * sprite.mln_drawn_scale,
+            1e-12,
+        );
+    }
+    // The drawn scale is the engine's symbol scale, so a cell measured through
+    // that ppm is the size drawSymbol tessellates.
+    try std.testing.expectApproxEqRel(
+        sprite.mln_drawn_scale * sprite.px_per_unit,
+        render.sndfrm.SYMBOL_SCALE,
+        1e-12,
+    );
+}
+
 /// The file's modification time in nanoseconds, or null if it doesn't exist / can't be statted.
 fn fileModNs(io: std.Io, path: []const u8) ?i96 {
-    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer f.close(io);
-    const st = f.stat(io) catch return null;
+    // statFile, not open+fstat+close: this runs once per chart before any bake
+    // starts, and on Android's FUSE-backed storage those three syscalls are
+    // three round trips each. Over a 7,217-cell exchange set that was minutes
+    // of the import spent deciding what was already done.
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
     return st.mtime.nanoseconds;
 }
 
@@ -1292,8 +1464,11 @@ fn buildGpuAtlases(a: std.mem.Allocator, ratio: f64) !struct { sprites: render.g
     // Layout only: the scene consumer reads cells + dims, never the pixels —
     // the full bake here (composite + zlib) was ~2/3 of the render path's
     // cycles in a field profile whenever the shared atlases (re)built.
+    // The ppm must be the one the cells were rasterized at: render/gpu.zig
+    // sizes a sprite quad as cell px x scale/ppm, so a mismatch draws every
+    // symbol, sounding and linestyle brick at the ratio between the two.
     var atlas = try sprite.spriteMlnOpts(a, sym_srcs, fill_srcs, css_data, &[_][]const u8{}, ratio, false);
-    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.px_per_unit * 100.0 * ratio) };
+    var sprites = render.gpu.SpriteAtlas{ .width = atlas.width, .height = atlas.height, .ppm = @floatCast(sprite.mlnPpm(ratio)) };
     var cit = atlas.cells.iterator();
     while (cit.next()) |e| {
         const r = e.value_ptr.*;
@@ -2664,6 +2839,7 @@ pub const Chart = struct {
                     .portrayal = cb.portrayal,
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
+                    .portrayal_lights = cb.portrayal_lights,
                 }};
                 return scene.generateView(&ps, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
             },
@@ -2925,6 +3101,7 @@ pub const Chart = struct {
                     .portrayal = cb2.portrayal,
                     .portrayal_plain = cb2.portrayal_plain,
                     .portrayal_simplified = cb2.portrayal_simplified,
+                    .portrayal_lights = cb2.portrayal_lights,
                     .geo = cb2.geo,
                     .geo_world = cb2.geo_world,
                     .feat_bbox = cb2.feat_bbox,
@@ -3086,6 +3263,7 @@ pub const Chart = struct {
                         .portrayal = cb2.portrayal,
                         .portrayal_plain = cb2.portrayal_plain,
                         .portrayal_simplified = cb2.portrayal_simplified,
+                        .portrayal_lights = cb2.portrayal_lights,
                     }};
                     scene.appendTile(surf, a, &one, z, qt.tx, qt.ty, self.pick_attrs) catch continue;
                 },
@@ -3138,6 +3316,7 @@ pub const Chart = struct {
                     .portrayal = cb.portrayal,
                     .portrayal_plain = cb.portrayal_plain,
                     .portrayal_simplified = cb.portrayal_simplified,
+                    .portrayal_lights = cb.portrayal_lights,
                 }};
                 return scene.generateView(&as, a, gpa, &one, lon, lat, zoom, self.pick_attrs) catch error.TileGen;
             },
@@ -3712,6 +3891,7 @@ const BakeWork = struct {
         var portrayal: ?[]const ?[]const u8 = null;
         var portrayal_plain: ?[]const ?[]const u8 = null;
         var portrayal_simplified: ?[]const ?[]const u8 = null;
+        var portrayal_lights: ?[]const ?[]const u8 = null;
         var geo: ?scene.GeoParts = null;
         var geo_world: ?scene.GeoWorld = null;
         var feat_bbox: ?[]const ?[4]f64 = null;
@@ -3722,6 +3902,7 @@ const BakeWork = struct {
                 portrayal = cp.base;
                 portrayal_plain = cp.plain;
                 portrayal_simplified = cp.simplified;
+                portrayal_lights = cp.lights;
             } else |_| {}
             // Build the geometry cache for EVERY cell, unconditionally.
             // `build_geo` (cacheGeoForBand) gated it to the finer bands, but coarse cells are
@@ -3760,7 +3941,7 @@ const BakeWork = struct {
         // Sector-figure reach (exact, from the portrayal streams): buildTileMap
         // addresses the neighbouring tiles the cell's light legs/arcs cross.
         const lr = scene.collectLightReach(&cell, portrayal);
-        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .geo = geo, .geo_world = geo_world, .feat_bbox = feat_bbox, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
+        c.outs[i] = .{ .cell = cell, .portrayal = portrayal, .portrayal_plain = portrayal_plain, .portrayal_simplified = portrayal_simplified, .portrayal_lights = portrayal_lights, .geo = geo, .geo_world = geo_world, .feat_bbox = feat_bbox, .bounds = b, .cscl = cscl, .coverage = coverage, .scamins = scamins, .light_bbox = lr.bbox, .light_range_m = lr.range_m };
         c.arenas[i] = pa;
     }
 };

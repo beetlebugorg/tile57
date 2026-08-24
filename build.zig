@@ -585,10 +585,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/lib_root.zig"),
         .target = target,
         .optimize = optimize,
-        // iOS: std.debug's stack-trace machinery references
-        // _dyld_get_image_header_containing_address, which iOS' libdyld doesn't
-        // export — strip so the panic path never pulls it in.
-        .strip = target.result.os.tag == .ios,
+        // iOS and visionOS: std.debug's stack-trace machinery references
+        // _dyld_get_image_header_containing_address, which those libdylds do
+        // not export. Strip so the panic path never pulls it in.
+        .strip = target.result.os.tag == .ios or target.result.os.tag == .visionos,
         .pic = true, // links into a PIE C++ host
         .link_libc = true, // Lua needs the C runtime
     });
@@ -703,27 +703,25 @@ pub fn build(b: *std.Build) void {
     else
         target;
 
-    const bake = b.addExecutable(.{
-        .name = "tile57",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/main.zig"),
-            .target = bake_target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "engine", .module = engine_full },
-                .{ .name = "style", .module = style_mod },
-                .{ .name = "sprite", .module = sprite_mod },
-                .{ .name = "catalog", .module = catalog_embed },
-                .{ .name = "bundle", .module = bundle_mod },
-                .{ .name = "compose", .module = compose_mod }, // compose-tile CLI
-                .{ .name = "geometry", .module = geometry_mod }, // compose-tile --scan reads the boolean diagnostics
-                .{ .name = "render", .module = render_mod }, // renderpng pixel path
-                .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
-                .{ .name = "raster", .module = raster_mod }, // `raster info`
-            },
-        }),
+    const bake_mod = b.createModule(.{
+        .root_source_file = b.path("tools/main.zig"),
+        .target = bake_target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "engine", .module = engine_full },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "sprite", .module = sprite_mod },
+            .{ .name = "catalog", .module = catalog_embed },
+            .{ .name = "bundle", .module = bundle_mod },
+            .{ .name = "compose", .module = compose_mod }, // compose-tile CLI
+            .{ .name = "geometry", .module = geometry_mod }, // compose-tile --scan reads the boolean diagnostics
+            .{ .name = "render", .module = render_mod }, // renderpng pixel path
+            .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
+            .{ .name = "raster", .module = raster_mod }, // `raster info`
+        },
     });
+    const bake = b.addExecutable(.{ .name = "tile57", .root_module = bake_mod });
     b.installArtifact(bake);
 
     const run_bake = b.addRunArtifact(bake);
@@ -808,6 +806,10 @@ pub fn build(b: *std.Build) void {
     // module import does NOT pull another module's `test {}` blocks in.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+    // The CLI's own tests. They had never run: nothing but the executable
+    // referenced tools/*.zig, and an executable does not collect tests — so a
+    // test written beside the code it checks was silently dead.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = bake_mod })).step);
     // The sprite module (SDF glyph atlas lives here): needs the C glue
     // (stb_truetype/nanosvg) + libc + render.
     const sprite_test = addPkgTest(b, test_step, "src/sprite/sprite.zig", target, optimize, &.{

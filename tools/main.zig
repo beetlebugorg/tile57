@@ -173,3 +173,10 @@ pub fn main(init: std.process.Init) !void {
 
     common.printUsage();
 }
+
+test {
+    // A test binary rooted here links lua_shim.c through engine's portray
+    // module but analyses only what its tests reach. Referencing engine scans
+    // bake_root.zig, whose comptime block emits the shim's C-ABI accessors.
+    _ = @import("engine");
+}

@@ -455,6 +455,12 @@ pub fn depthTextField(b: B, m: *const Settings) !Value {
 // ---- client-side display filters -------------------------------------------
 
 // Display category (S-52 §10.3.4) + M_QUAL data-quality overlay.
+//
+// Reads the tile57/3 precomputes: `display_category` (the always-present int
+// the bake emits — the old form read a `cat` property no tile ever carried,
+// so every feature coalesced to STANDARD and the base/other toggles gated
+// nothing), `iso` (1 on ISODGR01, replacing the symbol_name string compare)
+// and `mq` (1 on M_QUAL, replacing the class string compare).
 pub fn categoryFilter(b: B, m: *const Settings) !Value {
     var en = Array.init(b.a);
     if (m.display_base) try en.append(b.int(0));
@@ -463,12 +469,12 @@ pub fn categoryFilter(b: B, m: *const Settings) !Value {
     const isoCat: i64 = if (m.show_isolated_dangers_shallow) 1 else 0;
     const cat = try b.arr(&.{
         b.s("case"),
-        try b.arr(&.{ b.s("=="), try b.get("symbol_name"), b.s("ISODGR01") }),
+        try b.arr(&.{ b.s("=="), try b.get("iso"), b.int(1) }),
         b.int(isoCat),
-        try b.coalesce(try b.get("cat"), b.int(1)),
+        try b.coalesce(try b.get("display_category"), b.int(1)),
     });
     const inCat = try b.arr(&.{ b.s("in"), cat, try b.arr(&.{ b.s("literal"), .{ .array = en } }) });
-    const isQual = try b.arr(&.{ b.s("=="), try b.get("class"), b.s("M_QUAL") });
+    const isQual = try b.arr(&.{ b.s("=="), try b.get("mq"), b.int(1) });
     if (m.data_quality)
         return b.arr(&.{ b.s("any"), isQual, try b.arr(&.{ b.s("all"), inCat, try b.arr(&.{ b.s("!"), isQual }) }) });
     return b.arr(&.{ b.s("all"), inCat, try b.arr(&.{ b.s("!"), isQual }) });
@@ -497,6 +503,18 @@ pub fn pointStyleFilter(b: B, m: *const Settings) !Value {
     return b.arr(&.{
         b.s("in"),
         try b.coalesce(try b.get("pts"), b.int(2)),
+        try b.arr(&.{ b.s("literal"), try b.arr(&.{ b.int(2), b.int(rank) }) }),
+    });
+}
+
+// Sector-leg length (S-52 §12.2.4 full sector lines): show common (2) + the
+// active length. A pre-sect bake carries no tag and coalesces to 2, so its
+// 25 mm legs keep drawing whichever way the switch stands.
+pub fn sectorFilter(b: B, m: *const Settings) !Value {
+    const rank: i64 = if (m.show_full_sector_lines) 1 else 0;
+    return b.arr(&.{
+        b.s("in"),
+        try b.coalesce(try b.get("sect"), b.int(2)),
         try b.arr(&.{ b.s("literal"), try b.arr(&.{ b.int(2), b.int(rank) }) }),
     });
 }
@@ -624,6 +642,7 @@ pub fn commonChartFilters(a: std.mem.Allocator, m: *const Settings, enabled_band
     if (enabled_bands) |eb| try clauses.append(try bandFilter(b, eb));
     try clauses.append(try boundaryFilter(b, m));
     try clauses.append(try pointStyleFilter(b, m));
+    try clauses.append(try sectorFilter(b, m));
     if (try viewingGroupFilter(b, m)) |vgf| try clauses.append(vgf); // §14.5 (future use; no-op when null)
     if (!m.show_inform_callouts)
         try clauses.append(try b.arr(&.{ b.s("!="), try b.coalesce(try b.get("symbol_name"), b.s("")), b.s("INFORM01") }));

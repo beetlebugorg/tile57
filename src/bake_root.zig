@@ -33,3 +33,12 @@ pub const zipsrc = root.zipsrc; // charts read straight out of a .zip
 pub const geometry = @import("geometry"); // integer geometry: boolean, plane, partition
 
 pub const portray = @import("portray");
+
+// A test binary rooted on a consumer of this module links lua_shim.c through
+// `portray` but analyses only what its tests reach. Reference the accessor
+// files here so their tgp_* / tgc_* / tg_embedded_lua exports are emitted into
+// every binary that carries the shim, as lib_root.zig does for the archive.
+comptime {
+    _ = portray;
+    _ = catalogue;
+}

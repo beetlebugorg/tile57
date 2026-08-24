@@ -124,7 +124,9 @@ pub const NO_PATTERN: u32 = std.math.maxInt(u32);
 pub const SpriteAtlas = struct {
     width: u32,
     height: u32,
-    /// Atlas px per mm the cells were rasterized at (px_per_mm × display ratio).
+    /// Atlas px per mm the cells were rasterized at. The builder states it
+    /// (sprite.mlnPpm). It is not px_per_mm x ratio, because the sheet is baked
+    /// at the drawn scale.
     /// A sprite quad is sized from its CELL — cell px × (draw scale / ppm) — not
     /// re-derived from the vector outline, so the on-screen artwork is exactly the
     /// rasterized cell (stroke and all), and every glyph of a multi-part mark (a

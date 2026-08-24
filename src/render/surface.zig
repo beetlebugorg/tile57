@@ -109,6 +109,9 @@ pub const FeatureMeta = struct {
     //   0/1 = plain/symbolized boundary or paper/simplified point pass.
     bnd: i64 = 2,
     pts: i64 = 2,
+    /// Sector-leg length variant (S-52 §12.2.4 full sector lines): 2 =
+    /// length-independent, 0 = the 25 mm legs, 1 = the full-length pass.
+    sect: i64 = 2,
     // S-52 §8.6.2 suppressed boundary piece: geometry the producer masked as a
     // cell-limit edge (MASK/USAG), baked anyway so the meta-bounds inspection
     // view can outline meta objects; the standard display never shows it (the

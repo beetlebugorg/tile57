@@ -58,17 +58,18 @@ pub const Op = enum { intersect, unite, diff, sym_diff };
 /// marks a boolean bug at the exact tile being composed. Callers snapshot
 /// before/after; updates are atomic (computes run concurrently in the
 /// partition sweep) but snapshot-delta reads assume no concurrent compute.
-pub var open_chain_walks: u64 = 0;
+/// usize, not u64: a 32-bit target has no 64-bit atomic add.
+pub var open_chain_walks: usize = 0;
 /// Diagnostic: how many compute() calls fell back to the region-sampled
 /// in_result recomputation because the sweep-flag pass dead-ended a walk.
-pub var robust_retries: u64 = 0;
+pub var robust_retries: usize = 0;
 /// Diagnostic: how many micro-stitch edges closed a snap-divergence gap (two
 /// crossings of near-parallel edges snapping to adjacent lattice points leave
 /// the survivor graph with odd-degree vertex pairs a few units apart).
-pub var stitched_gaps: u64 = 0;
+pub var stitched_gaps: usize = 0;
 /// Diagnostic: open chains whose implicit closing chord exceeds 32 units — the
 /// visible-artifact subset of open_chain_walks (micro chords are sub-pixel).
-pub var large_open_chains: u64 = 0;
+pub var large_open_chains: usize = 0;
 
 // ---------------------------------------------------------------------------
 // Exact predicates (i128).
@@ -534,7 +535,7 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
         return first;
     }
     freePolygon(gpa, first);
-    _ = @atomicRmw(u64, &robust_retries, .Add, 1, .monotonic);
+    _ = @atomicRmw(usize, &robust_retries, .Add, 1, .monotonic);
     for (sw.processed.items) |e| {
         if (!(e.left and e.edge_type == .normal)) continue;
         const other: Polygon = if (e.subject) clip else subject;
@@ -565,15 +566,15 @@ pub fn compute(gpa: Allocator, subject: Polygon, clip: Polygon, op: Op) ![][]Pt 
 /// Per-compute walk outcome; folded into the shared counters at the end of the
 /// call so concurrent computes never read each other's in-flight state.
 const WalkStats = struct {
-    chains: u64 = 0,
-    large: u64 = 0,
-    stitched: u64 = 0,
+    chains: usize = 0,
+    large: usize = 0,
+    stitched: usize = 0,
 };
 
 fn publishWalkStats(s: WalkStats) void {
-    if (s.chains != 0) _ = @atomicRmw(u64, &open_chain_walks, .Add, s.chains, .monotonic);
-    if (s.large != 0) _ = @atomicRmw(u64, &large_open_chains, .Add, s.large, .monotonic);
-    if (s.stitched != 0) _ = @atomicRmw(u64, &stitched_gaps, .Add, s.stitched, .monotonic);
+    if (s.chains != 0) _ = @atomicRmw(usize, &open_chain_walks, .Add, s.chains, .monotonic);
+    if (s.large != 0) _ = @atomicRmw(usize, &large_open_chains, .Add, s.large, .monotonic);
+    if (s.stitched != 0) _ = @atomicRmw(usize, &stitched_gaps, .Add, s.stitched, .monotonic);
 }
 
 /// Add one operand's rings to the sweep with its self-overlapping collinear

@@ -231,6 +231,77 @@ static void register_host_stubs(lua_State *L) {
  * directory is present — i.e. when tile57 runs as a standalone binary. Returns 2
  * (loader chunk + the module name) on a hit, or 1 (an explanatory string Lua
  * folds into the "module 'X' not found" message) on a miss. */
+/* COMPILED-ONCE module cache.
+ *
+ * The searcher below compiles Lua source: lexer, parser, code generator. The
+ * bake stands up a fresh VM up to three times per chart (base, plain
+ * boundaries, simplified symbols) and each one `require`s the five framework
+ * modules, so a 7,224-cell exchange set compiled them about 100,000 times.
+ * Lua's code generator was the largest single item in an Android bake profile,
+ * ahead of every piece of chart work.
+ *
+ * Keeping the VM itself would be faster still, and is wrong: the framework
+ * carries per-dataset state, and the golden Part-9 streams change when a second
+ * chart runs in a state the first one used. So the STATE stays per pass and only
+ * the compiled bytecode is kept — `lua_dump` once, undump after. Same isolation,
+ * without the compiler.
+ *
+ * Thread-local: the bake runs a worker per core, and this way the cache needs no
+ * lock. It costs one copy of the bytecode per worker.
+ */
+/* The catalogue is not five modules: the framework requires a rule module per
+ * feature class on demand, and a national bake touches hundreds of them. Sized
+ * at 16 this cached the framework and recompiled every rule — 3,741 misses
+ * against 2,031 hits over sixty charts, which is why it bought nothing. */
+#define TG_BC_MAX 1024
+
+typedef struct {
+    char name[64];
+    size_t nlen;
+    unsigned char *buf;
+    size_t len;
+} tg_bc_entry;
+
+static _Thread_local tg_bc_entry tg_bc_cache[TG_BC_MAX];
+static _Thread_local int tg_bc_count = 0;
+
+static int tg_bc_writer(lua_State *L, const void *p, size_t sz, void *ud) {
+    (void)L;
+    tg_bc_entry *e = (tg_bc_entry *)ud;
+    unsigned char *nb = (unsigned char *)realloc(e->buf, e->len + sz);
+    if (!nb) return 1; /* out of memory: the caller drops the entry */
+    memcpy(nb + e->len, p, sz);
+    e->buf = nb;
+    e->len += sz;
+    return 0;
+}
+
+static const tg_bc_entry *tg_bc_find(const char *name, size_t nlen) {
+    for (int i = 0; i < tg_bc_count; i++) {
+        if (tg_bc_cache[i].nlen == nlen && memcmp(tg_bc_cache[i].name, name, nlen) == 0)
+            return &tg_bc_cache[i];
+    }
+    return NULL;
+}
+
+/* Dump the loader sitting on top of the stack. Leaves it there: the searcher
+ * still has to return it. Debug info is kept (strip = 0) so a rule error still
+ * names its file and line. */
+static void tg_bc_store(lua_State *L, const char *name, size_t nlen) {
+    if (tg_bc_count >= TG_BC_MAX || nlen >= sizeof(tg_bc_cache[0].name)) return;
+    tg_bc_entry *e = &tg_bc_cache[tg_bc_count];
+    e->buf = NULL;
+    e->len = 0;
+    memcpy(e->name, name, nlen);
+    e->nlen = nlen;
+    if (lua_dump(L, tg_bc_writer, e, 0) == 0 && e->buf != NULL) {
+        tg_bc_count++;
+    } else {
+        free(e->buf);
+        e->buf = NULL;
+    }
+}
+
 static int embedded_lua_searcher(lua_State *L) {
     size_t nlen = 0;
     const char *name = luaL_checklstring(L, 1, &nlen);
@@ -250,8 +321,18 @@ static int embedded_lua_searcher(lua_State *L) {
     memcpy(chunk + 1, name, n);
     memcpy(chunk + 1 + n, ".lua", 4);
     chunk[1 + n + 4] = '\0';
+    /* Already compiled on this thread: undump rather than recompile. Lua reads
+     * the binary signature and skips the whole front end. */
+    const tg_bc_entry *hit = tg_bc_find(name, nlen);
+    if (hit != NULL) {
+        if (luaL_loadbuffer(L, (const char *)hit->buf, hit->len, chunk) != LUA_OK)
+            return lua_error(L);
+        lua_pushstring(L, name);
+        return 2;
+    }
     if (luaL_loadbuffer(L, src, len, chunk) != LUA_OK)
         return lua_error(L); /* loader error already on the stack */
+    tg_bc_store(L, name, nlen);
     lua_pushstring(L, name); /* passed to the loader as its 2nd arg, like the file searcher */
     return 2;
 }
@@ -858,6 +939,34 @@ static int lp_store(lua_State *L) { /* tg_store(index, instr) */
  * (PlainBoundaries §8.6.1 / SimplifiedSymbols §11.2.2) plus the mariner
  * depth/light/danger parameters. NULL reproduces the fixed bake context
  * unchanged. Returns 0 on success. */
+/* One VM per thread, reused across charts.
+ *
+ * The expensive half of a pass was standing the VM up: a fresh state, the
+ * standard libraries, thirty-odd host bindings, and the five framework modules.
+ * Only the last of those is cheap now (bytecode cache above), and the rest was
+ * still the largest item in an Android bake profile.
+ *
+ * What makes reuse safe is reloading the FRAMEWORK per pass. PortrayalAPI keeps
+ * featureCache / informationCache / spatialCache at module level, keyed by ID,
+ * and our IDs are feature indices — they repeat from one chart to the next, so a
+ * second chart in a used state reads the first chart's features back out of the
+ * cache. That is not theoretical: it changed six golden Part-9 streams.
+ * Dropping the modules from package.loaded and requiring them again rebuilds
+ * those caches, and costs no compilation.
+ *
+ * Thread-local: a lua_State is not thread-safe and the bake runs a worker per
+ * core. */
+static _Thread_local lua_State *tg_cached_L = NULL;
+static _Thread_local char tg_cached_dir[4096];
+
+/* Re-executes the framework so its per-dataset caches start empty. */
+static const char *tg_reset_chunk =
+    "for _,m in ipairs{'S100Scripting','PortrayalModel','PortrayalAPI','Default','main'} do\n"
+    "  package.loaded[m] = nil\n"
+    "end\n"
+    "require 'S100Scripting'; require 'PortrayalModel'; require 'PortrayalAPI';\n"
+    "require 'Default'; require 'main'\n";
+
 int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
     char dbuf[4096];
     if (dir_len >= sizeof dbuf) return -1;
