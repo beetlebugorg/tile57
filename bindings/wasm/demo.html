@@ -186,10 +186,31 @@ worker.onerror = (e) => {
   status(`engine worker failed: ${e.message ?? "see console"}`, true);
 };
 
+// Ask the engine to start NOW; the stored library shows while it downloads.
+const initPromise = rpc("init", { wasmUrl });
+
+// ---- the chart library: show what is stored before the engine is up -------
+const library = await ChartLibrary.open();
+const savedCatalog = library ? await library.list() : [];
+let storedBytes = savedCatalog.reduce((n, c) => n + (c.size || 0), 0);
+const fmtBytes = (n) =>
+  n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(0)} MB` : `${Math.max(1, Math.round(n / 1e3))} kB`;
+if (savedCatalog.length) {
+  $("charts").textContent =
+    `${savedCatalog.length} chart${savedCatalog.length > 1 ? "s" : ""} stored (${fmtBytes(storedBytes)})`;
+  $("hint").style.display = "none";
+}
+if (!library) $("lib").style.display = "none";
+$("lib").onclick = async () => {
+  if (!library || !confirm("Clear the chart library and reload the page?")) return;
+  await library.clear();
+  location.reload();
+};
+
 loader.show("downloading the engine (a few MB on first visit)…");
 let version;
 try {
-  ({ version } = await rpc("init", { wasmUrl }));
+  ({ version } = await initPromise);
 } catch (e) {
   console.error(e);
   $("loadlabel").textContent = `engine failed to start: ${e.message}`;
@@ -243,19 +264,8 @@ const catalog = [];
 const openMap = new Map(); // name -> engine chart handle (the resident set)
 const lastUsed = new Map(); // name -> viewSeq, for eviction
 const sessionStore = new Map(); // archives when OPFS is unavailable
-const MAX_OPEN = Math.min(128, Math.max(4, parseInt(q.get("open")) || 32)); // residency cap (?open=N)
+const MAX_OPEN = Math.min(128, Math.max(4, parseInt(q.get("open")) || 64)); // residency cap (?open=N)
 let compose = 0, composeKey = null, viewSeq = 0;
-
-// The persistent chart library (OPFS): archives land here as they bake, and
-// a page load catalogs them from the metadata sidecars alone. Null where
-// OPFS is missing — the session then keeps archives in page memory instead.
-const library = await ChartLibrary.open();
-if (!library) $("lib").style.display = "none";
-$("lib").onclick = async () => {
-  if (!library || !confirm("Clear the chart library and reload the page?")) return;
-  await library.clear();
-  location.reload();
-};
 
 async function libGet(name) {
   if (library) return library.get(name);
@@ -269,6 +279,7 @@ async function registerChart(name, archive, info) {
   if (catalog.some((c) => c.name === name)) return null;
   if (library) await library.put(name, archive, info).catch((e) => console.warn(`library save ${name}:`, e));
   else sessionStore.set(name, archive);
+  storedBytes += archive.length;
   const entry = { name, info };
   catalog.push(entry);
   return entry;
@@ -356,10 +367,12 @@ sizeCanvas();
 
 function hud() {
   $("charts").textContent = catalog.length
-    ? `${catalog.length} chart${catalog.length > 1 ? "s" : ""} (${openMap.size} open): ${catalog.map((c) => c.name).slice(0, 3).join(", ")}${catalog.length > 3 ? ", …" : ""}`
-    : "no charts";
+    ? `${catalog.length} chart${catalog.length > 1 ? "s" : ""} (${openMap.size} open, ${fmtBytes(storedBytes)} stored)`
+    : savedCatalog.length
+      ? `${savedCatalog.length} chart${savedCatalog.length > 1 ? "s" : ""} stored (${fmtBytes(storedBytes)})`
+      : "no charts";
   $("center").textContent = `${cam.lat.toFixed(4)}, ${cam.lon.toFixed(4)}  z${cam.zoom.toFixed(1)}  ≈1:${Math.round(scaleDenom(cam.zoom)).toLocaleString()}`;
-  $("hint").style.display = catalog.length ? "none" : "flex";
+  $("hint").style.display = catalog.length || savedCatalog.length ? "none" : "flex";
 }
 loader.hide();
 hud();
@@ -675,11 +688,10 @@ async function loadFiles(files) {
 }
 
 // ---- the persistent library: catalog it, land on it -----------------------
-if (library) {
-  const saved = await library.list();
+if (savedCatalog.length) {
   // Backfill metadata for archives saved before info rode along: open, read,
   // close — once per chart; the sidecar persists after.
-  const legacy = saved.filter((c) => !c.info);
+  const legacy = savedCatalog.filter((c) => !c.info);
   let n = 0;
   for (const c of legacy) {
     loader.progress(`indexing library — ${++n} of ${legacy.length}`, n / legacy.length);
@@ -695,7 +707,7 @@ if (library) {
     }
   }
   loader.hide();
-  for (const c of saved) if (c.info) catalog.push(c);
+  for (const c of savedCatalog) if (c.info) catalog.push(c);
   if (catalog.length) {
     fitTo(catalog);
     status(`${catalog.length} chart${catalog.length > 1 ? "s" : ""} in the library`);

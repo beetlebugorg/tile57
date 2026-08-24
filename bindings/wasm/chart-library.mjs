@@ -25,20 +25,24 @@ export class ChartLibrary {
     this.dir = dir;
   }
 
-  /** The catalog: [{name, info|null}], sorted by name. `info` is null only
-   * for archives saved before metadata rode along. */
+  /** The catalog: [{name, info|null, size}], sorted by name. `info` is null
+   * only for archives saved before metadata rode along; `size` is the
+   * archive's bytes on disk. */
   async list() {
-    const stems = [], metas = new Map();
+    const stems = [], metas = new Map(), sizes = new Map();
     for await (const [name, handle] of this.dir.entries()) {
       if (handle.kind !== "file") continue;
-      if (name.endsWith(".pmtiles")) stems.push(name.slice(0, -".pmtiles".length));
-      else if (name.endsWith(".json")) {
+      if (name.endsWith(".pmtiles")) {
+        const stem = name.slice(0, -".pmtiles".length);
+        stems.push(stem);
+        try { sizes.set(stem, (await handle.getFile()).size); } catch { /* size stays 0 */ }
+      } else if (name.endsWith(".json")) {
         try {
           metas.set(name.slice(0, -".json".length), JSON.parse(await (await handle.getFile()).text()));
         } catch { /* a bad sidecar reads as missing */ }
       }
     }
-    return stems.sort().map((name) => ({ name, info: metas.get(name) ?? null }));
+    return stems.sort().map((name) => ({ name, info: metas.get(name) ?? null, size: sizes.get(name) ?? 0 }));
   }
 
   /** One archive's bytes, or null when absent. */
