@@ -266,6 +266,5 @@ export const CHROME = `
   <div id="splash">
     <div class="spinner"></div>
     <div id="splash-label">Loading the chart engine…</div>
-    <div class="note">a few MB on first visit</div>
   </div>
 `;
