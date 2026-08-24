@@ -83,6 +83,28 @@ export class ChartLibrary {
   async remove(stem) {
     await this.dir.removeEntry(`${stem}.pmtiles`).catch(() => {});
     await this.dir.removeEntry(`${stem}.json`).catch(() => {});
+    await this.dir.removeEntry(`${stem}.aux`, { recursive: true }).catch(() => {});
+  }
+
+  /** Store one aux file (the text and pictures a chart's features point at,
+   * TXTDSC / PICREP) beside the chart's archive. */
+  async putAux(stem, name, bytes) {
+    const dir = await this.dir.getDirectoryHandle(`${stem}.aux`, { create: true });
+    const h = await dir.getFileHandle(name, { create: true });
+    const w = await h.createWritable();
+    await w.write(bytes);
+    await w.close();
+  }
+
+  /** One aux file's bytes, or null when the chart never carried it. */
+  async getAux(stem, name) {
+    try {
+      const dir = await this.dir.getDirectoryHandle(`${stem}.aux`);
+      const f = await (await dir.getFileHandle(name)).getFile();
+      return new Uint8Array(await f.arrayBuffer());
+    } catch {
+      return null;
+    }
   }
 
   /** Delete every archive - one recursive remove, not thousands of calls. */

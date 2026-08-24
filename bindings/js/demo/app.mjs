@@ -276,7 +276,7 @@ wireGestures(surface, root, {
     }
   },
 });
-const pick = new PickReport(root);
+const pick = new PickReport(root, { getAux: (chart, name) => store.getAux(chart, name) });
 
 $("zi").addEventListener("click", () => { zoomAt(viewW() / 2, viewH() / 2, 1); afterCamera(); scheduleRebuild(0); });
 $("zo").addEventListener("click", () => { zoomAt(viewW() / 2, viewH() / 2, -1); afterCamera(); scheduleRebuild(0); });

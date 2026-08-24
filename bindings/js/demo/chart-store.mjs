@@ -17,6 +17,7 @@ export class ChartStore {
     this.catalog = []; // {name, info}
     this.library = null;
     this.sessionStore = new Map(); // archives when OPFS is unavailable
+    this.auxSession = new Map(); // aux files when OPFS is unavailable
     this.openMap = new Map(); // name -> engine chart handle (the resident set)
     this.lastUsed = new Map(); // name -> viewSeq, for eviction
     this.compose = 0;
@@ -79,6 +80,21 @@ export class ChartStore {
   async clear() {
     if (this.library) await this.library.clear();
     this.sessionStore.clear();
+  }
+
+  /** Store an aux file (TXTDSC text, PICREP pictures) for a chart. */
+  async putAux(stem, name, bytes) {
+    try {
+      if (this.library) await this.library.putAux(stem, name, bytes);
+      else this.auxSession.set(`${stem}/${name}`, bytes);
+    } catch (e) {
+      console.warn(`aux save ${stem}/${name}:`, e);
+    }
+  }
+  /** An aux file's bytes, or null. */
+  async getAux(stem, name) {
+    if (this.library) return this.library.getAux(stem, name);
+    return this.auxSession.get(`${stem}/${name}`) ?? null;
   }
 
   async archiveBytes(name) {

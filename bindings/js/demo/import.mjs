@@ -94,11 +94,19 @@ export class ChartImporter {
             run: async (pool) => {
               try {
                 await this.rpc("zipExtract", { path: `/enc/zips/${id}.zip`, names, outPaths });
+                // The cell files (.000 + .NNN updates) go to the bake; the
+                // rest (TXTDSC text, PICREP pictures) go to the library so
+                // the pick report can show them later.
+                const cellFiles = [];
+                for (const p of outPaths) {
+                  const name = p.replace(/^.*\//, "");
+                  if (/\.\d{3}$/.test(name)) {
+                    if (pool) cellFiles.push({ name, bytes: await this.rpc("readFile", { path: p }) });
+                  } else {
+                    await this.store.putAux(stem, name, await this.rpc("readFile", { path: p }));
+                  }
+                }
                 if (!pool) return await this.rpc("bakeCell", { path: `/enc/drops/${id}/${stem}/${stem}.000` });
-                const cellFiles = await Promise.all(outPaths.map(async (p) => ({
-                  name: p.replace(/^.*\//, ""),
-                  bytes: await this.rpc("readFile", { path: p }),
-                })));
                 return pool.bake(stem, cellFiles);
               } finally {
                 this.rpc("remove", { path: `/enc/drops/${id}/${stem}` }).catch(() => {});
