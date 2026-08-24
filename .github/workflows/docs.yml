@@ -55,6 +55,7 @@ jobs:
           cp bindings/wasm/demo.html docs/static/demo-app/index.html
           cp bindings/wasm/wasi-shim.mjs bindings/wasm/tile57.mjs \
              bindings/wasm/gpu-renderer.mjs bindings/wasm/engine-worker.mjs \
+             bindings/wasm/worker-rpc.mjs bindings/wasm/bake-pool.mjs \
              docs/static/demo-app/
           cp zig-out/bin/tile57-engine.wasm docs/static/demo-app/
 

@@ -45,6 +45,16 @@ const ops = {
 
   addFile({ path, bytes }) { fsys.add(path, bytes); },
 
+  // Read one file back out of the tree (transferred) — how the page shuttles
+  // zip-extracted cell files from this worker to a bake-pool worker.
+  readFile({ path }) {
+    const rel = path.startsWith(fsys.root + "/") ? path.slice(fsys.root.length + 1) : path;
+    const data = fsys.read(rel);
+    if (!data) throw new Error(`${path}: not found`);
+    const bytes = data.slice();
+    return [bytes, [bytes.buffer]];
+  },
+
   zipList({ path }) { return t.zipList(path); },
   zipExtract({ path, names, outPaths }) {
     // zip_extract writes to the CALLER's paths and creates no directories.

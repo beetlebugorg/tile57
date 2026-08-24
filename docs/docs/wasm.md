@@ -96,8 +96,15 @@ when the fallback engages). WebGPU needs a secure context — `https://`, or
 The demo runs the engine in a Web Worker (`engine-worker.mjs`): a bake holds
 the CPU for seconds, and off the main thread the map and the loader stay
 live. The page drives one engine call per RPC message — a dropped zip is
-listed, then extracted and baked one cell at a time, so the loader shows real
+listed, then extracted and baked cell by cell, so the loader shows real
 per-cell progress.
+
+Batches bake in parallel: one wasm instance is single-threaded, so the page
+spins up a small pool of extra engine workers (`bake-pool.mjs`, sized from
+the machine's cores; `?workers=N` overrides) and fans the cells across them.
+The primary engine worker keeps the charts, the compositor, and rendering;
+pool slots only turn cell bytes into archive bytes, and close when the batch
+ends.
 
 Serve a directory that holds the page, the `.mjs` modules, and the engine:
 

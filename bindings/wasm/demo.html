@@ -142,6 +142,8 @@
 </script>
 <script type="module">
 import { GpuRenderer, lonLatToWorld, worldToLonLat, scaleDenom } from "./gpu-renderer.mjs";
+import { makeRpc } from "./worker-rpc.mjs";
+import { BakePool } from "./bake-pool.mjs";
 
 const $ = (id) => document.getElementById(id);
 const q = new URLSearchParams(location.search);
@@ -166,22 +168,16 @@ const loader = {
 };
 
 // ---- the engine, in its worker --------------------------------------------
-const worker = new Worker("./engine-worker.mjs", { type: "module" });
-const inflight = new Map();
-let rpcId = 0;
-worker.onmessage = (e) => {
-  const { id, ok, result, error } = e.data;
-  const p = inflight.get(id);
-  inflight.delete(id);
-  if (ok) p.resolve(result);
-  else p.reject(new Error(error));
-};
-const rpc = (op, args, transfer = []) =>
-  new Promise((resolve, reject) => {
-    const id = rpcId++;
-    inflight.set(id, { resolve, reject });
-    worker.postMessage({ id, op, args }, transfer);
-  });
+// The PRIMARY engine worker owns the charts, the compositor, and rendering.
+// Batches of cell bakes fan out across a BakePool of extra engine workers
+// (one wasm instance is single-threaded, so parallel = more instances);
+// ?workers=N overrides the pool size.
+const workerUrl = new URL("./engine-worker.mjs", location.href);
+const wasmUrl = new URL(q.get("wasm") || "./tile57-engine.wasm", location.href).href;
+const bakeWorkers = Math.min(8, Math.max(1,
+  parseInt(q.get("workers")) || Math.min(4, (navigator.hardwareConcurrency || 2) - 1)));
+const worker = new Worker(workerUrl, { type: "module" });
+const rpc = makeRpc(worker);
 
 worker.onerror = (e) => {
   console.error(e);
@@ -191,7 +187,7 @@ worker.onerror = (e) => {
 loader.show("downloading the engine (a few MB on first visit)…");
 let version;
 try {
-  ({ version } = await rpc("init", { wasmUrl: new URL(q.get("wasm") || "./tile57-engine.wasm", location.href).href }));
+  ({ version } = await rpc("init", { wasmUrl }));
 } catch (e) {
   console.error(e);
   $("loadlabel").textContent = `engine failed to start: ${e.message}`;
@@ -432,8 +428,9 @@ async function loadFiles(files) {
       }
     }
 
-    // Cells straight from the drop.
-    const work = []; // {stem, run: async () => archive|null}
+    // Cells straight from the drop. `run(pool)` bakes on a pool slot, or on
+    // the primary engine when the batch is too small for a pool.
+    const work = []; // {stem, run: async (pool|null) => archive|null}
     for (const [stem, cellFiles] of groups) {
       if (!cellFiles.some((f) => /\.000$/.test(f.name))) {
         failed.push(`${stem}: update files without the .000 base`);
@@ -441,18 +438,22 @@ async function loadFiles(files) {
       }
       work.push({
         stem,
-        run: async () => {
-          for (const f of cellFiles) {
-            const bytes = new Uint8Array(await f.arrayBuffer());
-            await rpc("addFile", { path: `drops/${stem}/${f.name}`, bytes }, [bytes.buffer]);
-          }
+        run: async (pool) => {
+          const bytes = await Promise.all(cellFiles.map(async (f) => ({
+            name: f.name,
+            bytes: new Uint8Array(await f.arrayBuffer()),
+          })));
+          if (pool) return pool.bake(stem, bytes);
+          for (const f of bytes)
+            await rpc("addFile", { path: `drops/${stem}/${f.name}`, bytes: f.bytes }, [f.bytes.buffer]);
           return rpc("bakeCell", { path: `/enc/drops/${stem}/${stem}.000` });
         },
       });
     }
 
-    // Cells inside each dropped zip: list it in the worker, extract and bake
-    // one cell at a time, so the loader counts every cell.
+    // Cells inside each dropped zip. The zip lives in the primary engine
+    // (which lists and extracts it); each cell's extracted files shuttle to a
+    // pool slot for the bake, so extraction streams while bakes run wide.
     for (const zf of zips) {
       const id = `z${dropSeq++}`;
       const bytes = new Uint8Array(await zf.arrayBuffer());
@@ -471,37 +472,51 @@ async function loadFiles(files) {
         const dir = en.name.replace(/[^/]*$/, "");
         // The cell and everything beside it (updates, referenced text).
         const names = byDir.get(dir).filter((n) => !n.endsWith("/"));
+        const outPaths = names.map((n) => `/enc/drops/${id}/${stem}/${n.replace(/^.*\//, "")}`);
         work.push({
           stem,
-          run: async () => {
-            await rpc("zipExtract", {
-              path: `/enc/zips/${id}.zip`,
-              names,
-              outPaths: names.map((n) => `/enc/drops/${id}/${stem}/${n.replace(/^.*\//, "")}`),
-            });
-            return rpc("bakeCell", { path: `/enc/drops/${id}/${stem}/${stem}.000` });
+          run: async (pool) => {
+            await rpc("zipExtract", { path: `/enc/zips/${id}.zip`, names, outPaths });
+            if (!pool) return rpc("bakeCell", { path: `/enc/drops/${id}/${stem}/${stem}.000` });
+            const files = await Promise.all(outPaths.map(async (p) => ({
+              name: p.replace(/^.*\//, ""),
+              bytes: await rpc("readFile", { path: p }),
+            })));
+            return pool.bake(stem, files);
           },
         });
       }
     }
 
-    let done = 0;
-    for (const { stem, run } of work) {
-      loader.progress(`baking ${stem} — ${done + 1} of ${work.length}`, done / work.length);
-      status(`baking ${stem}…`);
-      try {
-        const t0 = performance.now();
-        const arc = await run();
-        if (!arc) { failed.push(`${stem}: produced no archive`); continue; }
-        const c = await openArchive(stem, arc);
-        if (c) { added.push(c); status(`${stem}: baked in ${(performance.now() - t0).toFixed(0)} ms`); }
-      } catch (e) {
-        console.error(e);
-        failed.push(`${stem}: ${e.message}`);
-      } finally {
-        done++;
-        loader.progress(`baking — ${done} of ${work.length}`, done / work.length);
+    // Bake, `lanes` cells at a time. Opens land on the primary as bakes
+    // finish, so charts appear in completion order.
+    const lanes = Math.min(bakeWorkers, work.length);
+    const pool = lanes > 1 ? new BakePool(workerUrl, wasmUrl, lanes) : null;
+    let done = 0, next = 0;
+    loader.progress(`baking — 0 of ${work.length}${pool ? ` (${lanes} workers)` : ""}`, 0);
+    const lane = async () => {
+      while (next < work.length) {
+        const { stem, run } = work[next++];
+        status(`baking ${stem}…`);
+        try {
+          const t0 = performance.now();
+          const arc = await run(pool);
+          if (!arc) { failed.push(`${stem}: produced no archive`); continue; }
+          const c = await openArchive(stem, arc);
+          if (c) { added.push(c); status(`${stem}: baked in ${(performance.now() - t0).toFixed(0)} ms`); }
+        } catch (e) {
+          console.error(e);
+          failed.push(`${stem}: ${e.message}`);
+        } finally {
+          done++;
+          loader.progress(`baking — ${done} of ${work.length}${pool ? ` (${lanes} workers)` : ""}`, done / work.length);
+        }
       }
+    };
+    try {
+      await Promise.all(Array.from({ length: Math.max(1, lanes) }, lane));
+    } finally {
+      pool?.close();
     }
   } finally {
     loader.hide();
