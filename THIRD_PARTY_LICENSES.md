@@ -20,6 +20,7 @@ the same change (see the polylabel entry as the worked example).
 | Noto Sans Regular | 2026.05.01 (Google) | `vendor/fonts/NotoSans-Regular.ttf` | SIL Open Font License 1.1 |
 | Noto Sans Bold | 2.000 (Google) | `vendor/fonts/NotoSans-Bold.ttf` | SIL Open Font License 1.1 |
 | Noto Sans Italic | 2.000 (Google) | `vendor/fonts/NotoSans-Italic.ttf` | SIL Open Font License 1.1 |
+| wasi-libc (sjlj runtime) | wasi-libc as bundled with Zig 0.16 | `src/portray/wasm_sjlj_rt.c` | Apache-2.0 / MIT (dual) |
 
 - **Lua** is built from source and driven through `src/portray/lua_shim.c` to run
   the S-101 portrayal rules engine.
@@ -35,6 +36,13 @@ the same change (see the polylabel entry as the worked example).
   mariner left them. Built read-only from the amalgamation; see `addSqlite` in
   build.zig for the trimmed feature set. The authors have dedicated it to the
   public domain — no attribution is required, and this entry is a courtesy.
+- **wasi-libc sjlj runtime**: the wasm engine build (`zig build wasm-engine`)
+  compiles Lua's and libtess2's setjmp/longjmp error paths through clang's
+  wasm sjlj lowering, and `src/portray/wasm_sjlj_rt.c` is the runtime that
+  lowering calls into — a verbatim copy of wasi-libc's
+  `libc-top-half/musl/src/setjmp/wasm32/rt.c` (the file's header comment
+  states why it must be vendored). wasi-libc is dual-licensed Apache-2.0 /
+  MIT; the license texts ship with Zig under `lib/libc/wasi/`.
 
 `vendor/lua/LICENSE.html` carries Lua's full notice; the nanosvg, stb and SQLite
 licenses are in the headers themselves.
