@@ -243,7 +243,7 @@ const catalog = [];
 const openMap = new Map(); // name -> engine chart handle (the resident set)
 const lastUsed = new Map(); // name -> viewSeq, for eviction
 const sessionStore = new Map(); // archives when OPFS is unavailable
-const MAX_OPEN = 32; // residency cap: LRU beyond the current view's set
+const MAX_OPEN = Math.min(128, Math.max(4, parseInt(q.get("open")) || 32)); // residency cap (?open=N)
 let compose = 0, composeKey = null, viewSeq = 0;
 
 // The persistent chart library (OPFS): archives land here as they bake, and
@@ -294,12 +294,20 @@ function selectCharts() {
   const hits = catalog.filter(({ info }) => info?.hasBounds
     && info.west < vb.east && info.east > vb.west
     && info.south < vb.north && info.north > vb.south);
-  const scored = hits.map((c) => ({ c, d: Math.abs(Math.log2((c.info.nativeScale || denom) / denom)) }));
-  // Within ~11x of the view's scale; when nothing is, the nearest few charts
-  // still draw (better an overscaled chart than a blank sea).
-  let keep = scored.filter((s) => s.d <= 3.5);
-  if (!keep.length) keep = scored.sort((a, b) => a.d - b.d).slice(0, 8);
-  return keep.sort((a, b) => a.d - b.d).slice(0, MAX_OPEN).map((s) => s.c);
+  // g > 0: the chart is more GENERAL than the view's scale; g < 0: more
+  // detailed. Suitable charts sit within ~11x either way; when none do,
+  // everything still competes — an overscaled chart beats a blank sea.
+  const scored = hits.map((c) => ({ c, g: Math.log2((c.info.nativeScale || denom) / denom) }));
+  let pool = scored.filter((s) => Math.abs(s.g) <= 3.5);
+  if (!pool.length) pool = scored;
+  // Most general first. Under the cap the order is moot (the engine's
+  // partition gives detailed charts precedence on overlap anyway); OVER the
+  // cap it decides who draws, and generals cover the view in the fewest
+  // cells — a z3 view over a harbor-cell library fills with the overview
+  // band instead of 32 arbitrary harbor cells. Detail wins back naturally
+  // as zooming narrows the window.
+  pool.sort((a, b) => b.g - a.g);
+  return pool.slice(0, MAX_OPEN).map((s) => s.c);
 }
 
 /** Make the view's charts resident and composed; evict beyond the cap.
