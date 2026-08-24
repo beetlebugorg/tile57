@@ -26,7 +26,7 @@ client-side: a chartplotter with no server.
 
 - **Target**: `wasm32-wasi`. The module imports only `wasi_snapshot_preview1`
   functions. In node, the built-in `node:wasi` host provides them. In a
-  browser, `bindings/wasm/wasi-shim.mjs` provides them: a dependency-free shim
+  browser, `bindings/js/wasi-shim.mjs` provides them: a dependency-free shim
   with an in-memory file tree for the source cells.
 - **Reactor model**: the module has no `_start`. Call the exported
   `_initialize` once after instantiation, then call the `tile57_*` exports.
@@ -49,28 +49,31 @@ client-side: a chartplotter with no server.
   `tile57_chart_open_bytes` and keeps residency under its own control.
 - SQLite (raster charts) is built single-thread (`SQLITE_THREADSAFE=0`).
 
-## The JS wrapper
+## The JS package
 
-`bindings/wasm/tile57.mjs` wraps the exports one-to-one for a JS host: it
-handles linear-memory allocation, C strings, out-parameters, and the
-`tile57_error` decode, and returns engine outputs as `Uint8Array` copies.
-Browser and node both run it.
+`bindings/js` is the JavaScript face of the engine: an npm-style package
+named `tile57` whose main export is the full engine. `tile57.mjs` wraps the
+exports one-to-one (linear-memory allocation, C strings, out-parameters, the
+`tile57_error` decode); `createEngine` in `index.mjs` stands one up in a
+browser or node; the worker, bake-pool, GPU-renderer, and chart-library
+modules are the pieces the demo composes. The style-only engine ships as the
+`tile57/style` subpath.
 
 ## Smoke test
 
-`bindings/wasm/engine-smoke.mjs` drives the real pipeline under node's WASI
+`bindings/js/engine-smoke.mjs` drives the real pipeline under node's WASI
 host — bake S-57 cells, open the archives from bytes, compose them, fetch a
 vector tile, render a PNG view:
 
 ```sh
 zig build wasm-engine
-node bindings/wasm/engine-smoke.mjs <ENC_ROOT> \
+node bindings/js/engine-smoke.mjs <ENC_ROOT> \
     US5BDRAB/US5BDRAB.000 US5BDRBB/US5BDRBB.000 --png out.png
 ```
 
 ## WebGPU
 
-`bindings/wasm/gpu-renderer.mjs` renders the engine's draw-ready GPU scenes
+`bindings/js/gpu-renderer.mjs` renders the engine's draw-ready GPU scenes
 (`tile57_*_gpu_scene`) with WebGPU. Its WGSL is a port of the reference
 shaders in `shaders/` over the same vertex, quad, and uniform layouts; hold
 every change against them. The engine batches the ranges
@@ -80,7 +83,7 @@ rebuilds.
 
 ## Browser demo
 
-`bindings/wasm/demo.html` is a complete in-page chartplotter, embedded in
+`bindings/js/demo.html` is a complete in-page chartplotter, embedded in
 these docs as the [live demo](/demo) (the docs workflow builds the engine
 and stages the app; `src/pages/demo.jsx` frames it). Drop S-57 charts on it —
 `.000` cells with their update files, or an exchange-set `.zip` straight
@@ -124,7 +127,7 @@ Serve a directory that holds the page, the `.mjs` modules, and the engine:
 ```sh
 zig build wasm-engine
 mkdir demo && cd demo
-ln -s ../bindings/wasm/{demo.html,tile57.mjs,wasi-shim.mjs,gpu-renderer.mjs,engine-worker.mjs} .
+ln -s ../bindings/js/{demo.html,tile57.mjs,wasi-shim.mjs,gpu-renderer.mjs,engine-worker.mjs} .
 ln -s ../zig-out/bin/tile57-engine.wasm .
 python3 -m http.server 8080
 # open http://localhost:8080/demo.html and drop charts on it

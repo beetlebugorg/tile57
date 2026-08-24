@@ -7,7 +7,7 @@ on:
     # redeploy it too — the demo always runs the current engine.
     paths:
       - "docs/**"
-      - "bindings/wasm/**"
+      - "bindings/js/**"
       - "src/**"
       - "build.zig"
       - "build.zig.zon"
@@ -52,11 +52,11 @@ jobs:
       - name: Stage demo
         run: |
           mkdir -p docs/static/demo-app
-          cp bindings/wasm/demo.html docs/static/demo-app/index.html
-          cp bindings/wasm/wasi-shim.mjs bindings/wasm/tile57.mjs \
-             bindings/wasm/gpu-renderer.mjs bindings/wasm/engine-worker.mjs \
-             bindings/wasm/worker-rpc.mjs bindings/wasm/bake-pool.mjs \
-             bindings/wasm/chart-library.mjs \
+          cp bindings/js/demo.html docs/static/demo-app/index.html
+          cp bindings/js/wasi-shim.mjs bindings/js/tile57.mjs \
+             bindings/js/gpu-renderer.mjs bindings/js/engine-worker.mjs \
+             bindings/js/worker-rpc.mjs bindings/js/bake-pool.mjs \
+             bindings/js/chart-library.mjs \
              docs/static/demo-app/
           cp zig-out/bin/tile57-engine.wasm docs/static/demo-app/
 

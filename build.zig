@@ -826,14 +826,14 @@ pub fn build(b: *std.Build) void {
     // Attach the embedded template + colortables to a bindings consumer module.
     const addStyleAssets = struct {
         fn f(bb: *std.Build, m: *std.Build.Module) void {
-            m.addAnonymousImport("template_json", .{ .root_source_file = bb.path("bindings/wasm/assets/template.json") });
-            m.addAnonymousImport("colortables_json", .{ .root_source_file = bb.path("bindings/wasm/assets/colortables.json") });
+            m.addAnonymousImport("template_json", .{ .root_source_file = bb.path("bindings/js/assets/template.json") });
+            m.addAnonymousImport("colortables_json", .{ .root_source_file = bb.path("bindings/js/assets/colortables.json") });
         }
     }.f;
 
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_mod = b.createModule(.{
-        .root_source_file = b.path("bindings/wasm/style_wasm.zig"),
+        .root_source_file = b.path("bindings/js/style_wasm.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall, // smallest wasm; this isn't a hot path
         .imports = &.{

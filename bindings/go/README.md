@@ -1,7 +1,7 @@
 # tile57 — Go binding
 
 The canonical Go (cgo) binding to **libtile57**, the native Zig chart engine in this
-repo. It lives next to the engine (`bindings/go`, alongside `bindings/wasm`) so it
+repo. It lives next to the engine (`bindings/go`, alongside `bindings/js`) so it
 tracks the C ABI in [`include/tile57.h`](../../include/tile57.h) as that ABI evolves —
 a host imports it and works in **Go only**, never touching cgo, the header, or the
 Zig build.
