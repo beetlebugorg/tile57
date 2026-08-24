@@ -50,19 +50,24 @@ fn addSysrootIncludes(b: *std.Build, mod: *std.Build.Module) void {
 }
 
 // setjmp/longjmp on wasm: the exception-handling feature + clang's sjlj
-// lowering pass, PER FILE. The raw -Xclang pair re-enables the feature at the
-// cc1 level — zig appends its own `-target-feature -exception-handling`
-// (derived from the module target, which keeps default features so Zig's
-// wasi-libc build never sees the feature and never compiles its broken sjlj
-// runtime) after the driver-level -m flag, and the LAST cc1 flag wins; a raw
-// -Xclang pair in the file flags lands after zig's and wins it back. The
-// driver-level -mexception-handling still matters: it defines
-// __wasm_exception_handling__, which wasi's setjmp.h gates on.
+// lowering pass, PER FILE. wasm-use-legacy-eh=false emits the STANDARDIZED
+// instructions (try_table over exnref — browsers deprecate the legacy `try`),
+// which also need the reference-types feature. The raw -Xclang pairs
+// re-enable both features at the cc1 level — zig appends its own disabling
+// `-target-feature` flags (derived from the module target, which keeps
+// default features so Zig's wasi-libc build never sees them and never
+// compiles its broken sjlj runtime) after the driver-level -m flags, and the
+// LAST cc1 flag wins; raw -Xclang pairs in the file flags land after zig's
+// and win the features back. The driver-level -m flags still matter: they
+// define __wasm_exception_handling__, which wasi's setjmp.h gates on.
 const wasm_sjlj_flags = [_][]const u8{
-    "-mexception-handling", "-mllvm",
-    "-wasm-enable-sjlj",    "-Xclang",
-    "-target-feature",      "-Xclang",
-    "+exception-handling",
+    "-mexception-handling", "-mreference-types",
+    "-mllvm",               "-wasm-enable-sjlj",
+    "-mllvm",               "-wasm-use-legacy-eh=false",
+    "-Xclang",              "-target-feature",
+    "-Xclang",              "+exception-handling",
+    "-Xclang",              "-target-feature",
+    "-Xclang",              "+reference-types",
 };
 
 // `wasm`: sweep.c/tess.c bail out of the tessellation on OOM via
