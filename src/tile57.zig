@@ -26,8 +26,8 @@
 
 const std = @import("std");
 
-/// Library version (matches build.zig.zon and tile57_version()).
-pub const version = "0.3.0";
+/// Library version. A release build reports the tag (see -Dversion).
+pub const version = @import("buildinfo").version;
 
 // ---- Chart: open a chart, then render / query / inspect --------------------
 const chart = @import("chart.zig");

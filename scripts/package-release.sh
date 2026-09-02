@@ -23,7 +23,13 @@ rm -rf "$stage"
 mkdir -p "$stage/bin" "$stage/lib" "$stage/include"
 cp "$root/zig-out/bin/$exe" "$stage/bin/"
 cp "$root"/zig-out/lib/* "$stage/lib/"
-cp "$root/include/tile57.h" "$stage/include/"
+# The header ships with the tag in its macros. The committed file holds the
+# 0.0.0 sentinel, so cutting a release leaves the tree as it is.
+IFS=. read -r v_major v_minor v_patch <<<"${version%%-*}"
+sed -e "s/^#define TILE57_VERSION_MAJOR .*/#define TILE57_VERSION_MAJOR $v_major/" \
+    -e "s/^#define TILE57_VERSION_MINOR .*/#define TILE57_VERSION_MINOR $v_minor/" \
+    -e "s/^#define TILE57_VERSION_PATCH .*/#define TILE57_VERSION_PATCH $v_patch/" \
+    "$root/include/tile57.h" > "$stage/include/tile57.h"
 cp "$root/LICENSE" "$root/THIRD_PARTY_LICENSES.md" "$root/README.md" "$stage/"
 
 cd "$out"

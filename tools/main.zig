@@ -180,3 +180,9 @@ test {
     // bake_root.zig, whose comptime block emits the shim's C-ABI accessors.
     _ = @import("engine");
 }
+
+// An import alone does not pull a file's tests into the test build, so name
+// the files with tests here.
+test {
+    _ = common;
+}
