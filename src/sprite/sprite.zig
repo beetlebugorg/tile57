@@ -645,9 +645,52 @@ test "renderSymbolRun composites a two-glyph run pivot-centred" {
     try std.testing.expect(none == null);
 }
 
+test "renderSymbolRun keeps a digit a later glyph's raster covers" {
+    const a = std.testing.allocator;
+    // The sounding geometry a copy blit broke. Each digit inks one 1.25 mm
+    // slot, and the code-4 glyph (the last digit of a 4- or 5-digit sounding)
+    // has a viewBox spanning from its slot back to the pivot, so its raster
+    // covers the whole code-0 digit blitted before it.
+    const d0 =
+        \\<svg width="2.07mm" height="2.82mm" viewBox="-0.16 -1.41 2.07 2.82"><rect x="0.5" y="-1.25" width="1.25" height="2.5" class="sl"/></svg>
+    ;
+    const d4 =
+        \\<svg width="4.32mm" height="2.82mm" viewBox="-0.16 -1.41 4.32 2.82"><rect x="2.75" y="-1.25" width="1.25" height="2.5" class="sl"/></svg>
+    ;
+    const syms = [_]SvgSrc{ .{ .id = "D0", .svg = d0 }, .{ .id = "D4", .svg = d4 } };
+    const css = ".sl{fill:#112233}";
+    const ratio: f64 = 10; // one slot spans many pixels at this density
+    const img = (try renderSymbolRun(a, &syms, css, "D0,D4", ratio)) orelse return error.NoRunImage;
+    defer a.free(img.rgba);
+
+    const ppm = mlnPpm(ratio);
+    const cx = @as(f64, @floatFromInt(img.w)) / 2; // the shared pivot
+    const cy = @as(f64, @floatFromInt(img.h)) / 2;
+    const alphaAt = struct {
+        fn go(i: RunImage, x: f64, y: f64) u8 {
+            const px: usize = @intFromFloat(@round(x));
+            const py: usize = @intFromFloat(@round(y));
+            return i.rgba[(py * i.w + px) * 4 + 3];
+        }
+    }.go;
+    // Both digits are on the sheet, at slot centers 1.125 mm and 3.375 mm
+    // right of the pivot. The first of those read 0 before the fix.
+    try std.testing.expectEqual(@as(u8, 255), alphaAt(img, cx + 1.125 * ppm, cy));
+    try std.testing.expectEqual(@as(u8, 255), alphaAt(img, cx + 3.375 * ppm, cy));
+    // The gap between the two slots stays empty.
+    try std.testing.expectEqual(@as(u8, 0), alphaAt(img, cx + 2.25 * ppm, cy));
+}
+
 // Composite a comma-joined glyph list (e.g. "SOUNDSC3,SOUNDS12,SOUNDS54") into
 // one pivot-centred image — each glyph self-positions by its pivot. Port of
 // build_sprite.py compositeSounding. null if no glyph is known.
+//
+// The glyph rasters overlap where their ink does not. A digit inks one 1.25 mm
+// slot, and its viewBox spans from that slot back to the pivot, so the code-4
+// glyph (the last digit of a 4- or 5-digit sounding) has a raster covering
+// every slot to its left. Blitting it as a copy put its transparent pixels
+// over the code-0 digit underneath and erased that digit, so the stack blends
+// source-over.
 fn compositeSounding(ar: std.mem.Allocator, rendered: *std.StringHashMap(RenderedSym), stack: []const u8) ?Tile {
     const Part = struct { sym: RenderedSym, left: f64, top: f64 };
     var parts = std.ArrayList(Part).empty;
@@ -678,7 +721,7 @@ fn compositeSounding(ar: std.mem.Allocator, rendered: *std.StringHashMap(Rendere
     for (parts.items) |p| {
         const dx: i32 = @intFromFloat(@round(wf / 2 + p.left));
         const dy: i32 = @intFromFloat(@round(hf / 2 + p.top));
-        blitClipped(buf, w, h, p.sym.rgba, p.sym.w, p.sym.h, dx, dy);
+        blitOver(buf, w, h, p.sym.rgba, p.sym.w, p.sym.h, dx, dy);
     }
     return .{ .w = w, .h = h, .rgba = buf };
 }
@@ -714,6 +757,40 @@ fn blitClipped(dst: []u8, dw: u32, dh: u32, src: []const u8, sw: u32, sh: u32, d
             const si = (@as(usize, sy) * sw + sx) * 4;
             const di = (@as(usize, @intCast(y)) * dw + @as(usize, @intCast(x))) * 4;
             @memcpy(dst[di .. di + 4], src[si .. si + 4]);
+        }
+    }
+}
+
+// Source-over a w x h straight-alpha RGBA cell onto dst at (dx,dy), clipped.
+// The destination shows through wherever the source is transparent, so cells
+// whose boxes overlap stack.
+fn blitOver(dst: []u8, dw: u32, dh: u32, src: []const u8, sw: u32, sh: u32, dx: i32, dy: i32) void {
+    var sy: u32 = 0;
+    while (sy < sh) : (sy += 1) {
+        const y = dy + @as(i32, @intCast(sy));
+        if (y < 0 or y >= @as(i32, @intCast(dh))) continue;
+        var sx: u32 = 0;
+        while (sx < sw) : (sx += 1) {
+            const x = dx + @as(i32, @intCast(sx));
+            if (x < 0 or x >= @as(i32, @intCast(dw))) continue;
+            const si = (@as(usize, sy) * sw + sx) * 4;
+            const sa: u32 = src[si + 3];
+            if (sa == 0) continue; // a fully transparent source pixel
+            const di = (@as(usize, @intCast(y)) * dw + @as(usize, @intCast(x))) * 4;
+            // An opaque source pixel, or an empty destination, gives the source
+            // value. Copying it keeps the color exact in the common case.
+            if (sa == 255 or dst[di + 3] == 0) {
+                @memcpy(dst[di .. di + 4], src[si .. si + 4]);
+                continue;
+            }
+            // Straight alpha: out.a = sa + da(1-sa), out.c = (sc*sa + dc*da(1-sa)) / out.a.
+            const keep = @as(u32, dst[di + 3]) * (255 - sa) / 255;
+            const oa = sa + keep;
+            for (0..3) |k| {
+                const c = (@as(u32, src[si + k]) * sa + @as(u32, dst[di + k]) * keep + oa / 2) / oa;
+                dst[di + k] = @intCast(@min(c, 255));
+            }
+            dst[di + 3] = @intCast(@min(oa, 255));
         }
     }
 }
