@@ -1,7 +1,8 @@
 name: Release
 
-# Push a `vX.Y.Z` tag to cut a release: every supported target is built, the
-# archives are attached to a GitHub release, and the Homebrew tap is updated.
+# Push a `vX.Y.Z` tag to cut a release. The tag is the version, so no file needs
+# a bump first: every supported target is built, the archives are attached to a
+# GitHub release, and the Homebrew tap is updated.
 # A tag carrying a suffix (`v0.3.0-rc1`) publishes as a prerelease and leaves
 # the tap alone — use one to prove the matrix before the real tag.
 on:
@@ -41,17 +42,11 @@ jobs:
         with:
           version: 0.16.0
 
-      # The version is written in three places and the tag is a fourth. A
-      # mismatch ships a binary whose `tile57 version` contradicts its download.
-      - name: Check the tag against the version in the source
-        run: |
-          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
-          grep -q "\.version = \"$v\"" build.zig.zon
-          grep -q "pub const version = \"$v\"" src/tile57.zig
-          grep -q "pub const VERSION = \"tile57 $v\"" tools/common.zig
-
+      # -Dversion puts the tag into the library: tile57_version(), tile57.version
+      # and the CLI banner all report it. The build refuses a tag that is not a
+      # semantic version.
       - name: Build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dversion="${GITHUB_REF_NAME#v}"
 
       - name: Package
         run: scripts/package-release.sh "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" "${{ matrix.deb }}"

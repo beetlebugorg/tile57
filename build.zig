@@ -1,4 +1,7 @@
 const std = @import("std");
+/// Read for `.version`, the dev sentinel a source build reports. A release
+/// passes the tag as `-Dversion`.
+const zon = @import("build.zig.zon");
 
 // The vendored S-101 PortrayalCatalog, relative to the engine/ build root. Its
 // Rules (Lua) + Symbols/LineStyles/AreaFills/ColorProfiles (assets) are embedded
@@ -676,14 +679,22 @@ pub fn build(b: *std.Build) void {
     // engine a process actually linked (tile57_warmup logs it once): build
     // provenance that survives any amount of checkout / link confusion.
     // One options module, shared with the wasm engine build below.
+    // The version the library reports. A release passes the tag, so no file
+    // needs an edit to cut one. build.zig.zon holds the default for every
+    // other build.
+    const version = b.option([]const u8, "version", "Version the library reports (default: build.zig.zon)") orelse zon.version;
+    _ = std.SemanticVersion.parse(version) catch @panic("-Dversion is not a semantic version");
     const buildinfo_mod = blk: {
         const buildinfo = b.addOptions();
         var code: u8 = 0;
         const raw = b.runAllowFail(&.{ "git", "describe", "--always", "--dirty" }, &code, .ignore) catch "unknown";
         buildinfo.addOption([]const u8, "commit", std.mem.trim(u8, raw, " \n\r\t"));
+        // NUL-terminated, so tile57_version() returns the pointer straight to C.
+        buildinfo.addOption([:0]const u8, "version", b.allocator.dupeZ(u8, version) catch @panic("OOM"));
         break :blk buildinfo.createModule();
     };
     lib_mod.addImport("buildinfo", buildinfo_mod);
+    tile57_mod.addImport("buildinfo", buildinfo_mod); // tile57.version
     const lib = b.addLibrary(.{ .name = "tile57", .linkage = .static, .root_module = lib_mod });
     // Android cross-compile: point the C deps at the NDK sysroot (see -Dandroid-ndk).
     if (android_libc) |libc| lib.setLibCFile(libc);
@@ -786,6 +797,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "render", .module = render_mod }, // renderpng pixel path
             .{ .name = "chart", .module = chart_mod }, // ENC_ROOT view renders
             .{ .name = "raster", .module = raster_mod }, // `raster info`
+            .{ .name = "buildinfo", .module = buildinfo_mod }, // the VERSION banner
         },
     });
     const bake = b.addExecutable(.{ .name = "tile57", .root_module = bake_mod });

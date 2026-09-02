@@ -77,9 +77,11 @@ extern "C" {
  * 1. Version
  * ======================================================================== */
 
-/* Library version. tile57_version() returns the string form, e.g. "0.3.0". */
+/* Library version. tile57_version() returns the string form, e.g. "0.3.0".
+   The release stamps these three from the tag (scripts/package-release.sh).
+   A source checkout reads the 0.0.0 sentinel, matching build.zig.zon. */
 #define TILE57_VERSION_MAJOR 0
-#define TILE57_VERSION_MINOR 3
+#define TILE57_VERSION_MINOR 0
 #define TILE57_VERSION_PATCH 0
 const char *tile57_version(void);
 

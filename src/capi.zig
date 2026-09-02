@@ -70,8 +70,8 @@ fn sharedIo() std.Io {
 const CTimeT = if (std.c.time_t == void) c_long else std.c.time_t;
 extern fn time(tloc: ?*CTimeT) callconv(.c) CTimeT;
 
-// Keep in sync with the TILE57_VERSION_* macros in tile57.h.
-const version_string = "0.3.0";
+// A release build reports the tag (see -Dversion in build.zig).
+const version_string = @import("buildinfo").version;
 
 fn spanOpt(s: ?[*:0]const u8) ?[]const u8 {
     return if (s) |p| std.mem.span(p) else null;
@@ -210,7 +210,8 @@ export fn tile57_status_str(status: c_int) callconv(.c) [*:0]const u8 {
     };
 }
 
-/// Return the library version string ("0.3.0").
+/// Return the library version string ("0.3.1"). A release build reports the
+/// tag. The string is static, so it needs no free.
 export fn tile57_version() callconv(.c) [*:0]const u8 {
     return version_string;
 }

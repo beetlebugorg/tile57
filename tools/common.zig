@@ -6,7 +6,15 @@
 const std = @import("std");
 const bundle = @import("bundle"); // chart-bundle pipeline (asset emitters etc.) — the lib owns it
 
-pub const VERSION = "tile57 0.3.0";
+pub const VERSION = "tile57 " ++ @import("buildinfo").version;
+
+test "the version banner comes from the build" {
+    const built = @import("buildinfo").version;
+    try std.testing.expectEqualStrings("tile57 " ++ built, VERSION);
+    // A release passes the tag as -Dversion, so the value has to parse as a
+    // semantic version.
+    _ = try std.SemanticVersion.parse(built);
+}
 
 // Env access lives in the Lua C shim (Zig 0.16 gates env behind std.Io);
 // returns the S-101 rules dir from TILE57_S101_RULES or null. Mirrors capi.zig.
