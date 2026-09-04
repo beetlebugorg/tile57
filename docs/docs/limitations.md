@@ -57,7 +57,7 @@ result is **best effort**:
   second `featureName` tagged ISO 639-2 `und`, undetermined, so the
   `national_names` setting selects the national name rather than a named
   language. S-101 permits several `featureName` entries with distinct
-  languages; an S-57 source yields at most one.
+  languages. An S-57 source yields at most one.
 - **Unconvertible objects fall back or drop.** An S-57 object class with no
   S-101 equivalent portrays as the S-52 question mark (QUESMRK1) — or, where
   the S-65 guidance says the object is simply not carried into S-101 (e.g. an
@@ -101,6 +101,12 @@ result is **best effort**:
   arrow (CentreOnArea) is not yet ported.
 
 ## Display / style gaps
+
+- **The embedded font covers Latin, Greek and Cyrillic.** `national_names`
+  selects a feature's national `featureName`, and the pixel and PDF outputs draw
+  it with the bundled Noto Sans. A name in a script the face has no glyphs for
+  draws as boxes. A chart naming its features in Inuktitut syllabics does this.
+  A host that supplies its own face through the surface callbacks is unaffected.
 
 - **Overscale hatch occlusion is tile-path only.** The S-52 §10.1.10 overscale
   indication (`OVERSC01`, see [architecture](./architecture.md)) is gated
