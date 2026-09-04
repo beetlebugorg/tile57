@@ -146,12 +146,12 @@ Depth soundings, drawn as digit glyph strings (SNDFRM digit composition).
 ### text
 
 Text labels (the name typically derives from `OBJNAM` via the `featureName`
-attribute; a feature with `NOBJNM` also gets `text_nat`).
+attribute; a feature named in other languages also gets a `text_<lang>` for each).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `text` | string | The label text. |
-| `text_nat` | string | The same label with the feature's national-language name (`NOBJNM`) in place of `OBJNAM`, present only when the feature has one. A client reading it selects the national name without a re-bake. |
+| `text_<lang>` | string | The same label in one of the languages the chart states, keyed by ISO 639-2 code, one property per language. An S-57 national name (`NOBJNM`) is keyed `text_und`, because S-57 records no language for it. A client selects with the mariner's language without a re-bake. |
 | `font_size_px` | number | Font size in pixels. |
 | `color_token` | string | Text color name. |
 | `halo_color_token` | string | Halo color name (`""` = no halo). |

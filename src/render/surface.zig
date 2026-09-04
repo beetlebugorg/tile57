@@ -63,6 +63,13 @@ pub fn fillToken(token: ColorToken) struct { name: []const u8, alpha: u8 } {
 /// "swept to N" note). Surfaces emit/draw only what is specified — the mvt
 /// surface serializes just text/color/size for a minimal label; a pixel
 /// surface uses its defaults.
+/// One label in one language. `lang` is an ISO 639-2 code, or `und` for an
+/// S-57 national name, because S-57 records no language for NOBJNM.
+pub const NationalText = struct {
+    lang: []const u8,
+    text: []const u8,
+};
+
 pub const TextStyle = struct {
     color: ColorToken,
     font_size: f64,
@@ -73,11 +80,11 @@ pub const TextStyle = struct {
     offset_x: f64 = 0, // S-52 LocalOffset in mm (+x right / +y down)
     offset_y: f64 = 0,
     group: i64 = 0, // S-101 text group (§14.5)
-    /// The national-language twin of this label ("" when the feature has no
-    /// NOBJNM). The scene fills it, a tile bakes it as `text_nat`, and replay
-    /// reads it back, so both paths hand a surface the same pair. This mirrors
-    /// the depth twin, where the raw metres go in `drawDepthText`.
-    national: []const u8 = "",
+    /// This label in each language the chart states besides English. The scene
+    /// fills it from the per-language portrayal passes, a tile bakes each one
+    /// as `text_<lang>`, and replay reads them back, so both paths hand a
+    /// surface the same set. A surface picks by the mariner's language.
+    national: []const NationalText = &.{},
 };
 
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
@@ -85,23 +92,19 @@ pub const TextStyle = struct {
 /// surfaces need not import s57/s101.
 pub const BAND_UNKNOWN: u8 = 255;
 
-/// The national-language twin of a label: NOBJNM substituted for the OBJNAM
-/// occurrence inside the portrayed string. A rule can wrap a name, as
-/// AnchorBerth does with "Nr %s", so substituting keeps the wrapper.
-///
-/// Returns null for a feature with no national name, for one with no OBJNAM
-/// (the portrayed label is already the national name, because the adapter
-/// gives that entry nameUsage 1), and for a label that does not contain the
-/// name. Every text instruction other than this feature's name takes the last
-/// case.
-pub fn nationalName(a: std.mem.Allocator, text: []const u8, name: []const u8, name_nat: []const u8) !?[]const u8 {
-    if (name_nat.len == 0 or name.len == 0) return null;
-    const at = std.mem.indexOf(u8, text, name) orelse return null;
-    const out = try a.alloc(u8, text.len - name.len + name_nat.len);
-    @memcpy(out[0..at], text[0..at]);
-    @memcpy(out[at..][0..name_nat.len], name_nat);
-    @memcpy(out[at + name_nat.len ..], text[at + name.len ..]);
-    return out;
+/// The label a surface draws for the mariner's language `pref`, or null to
+/// draw the portrayed string. An exact language match wins. Failing that, an
+/// `und` entry answers any preference, because an S-57 cell states no language
+/// for its national name and a mariner asking for one wants it.
+pub fn nationalFor(alts: []const NationalText, pref: []const u8) ?[]const u8 {
+    if (pref.len == 0 or alts.len == 0) return null;
+    for (alts) |alt| {
+        if (std.mem.eql(u8, alt.lang, pref)) return alt.text;
+    }
+    for (alts) |alt| {
+        if (std.mem.eql(u8, alt.lang, "und")) return alt.text;
+    }
+    return null;
 }
 
 pub const FeatureMeta = struct {

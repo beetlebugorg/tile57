@@ -778,21 +778,34 @@ fn buildSurveyDateRange(a: std.mem.Allocator, children: *std.ArrayList(ChildEntr
     }
 }
 
-/// The chart's national language: the first featureName language across the
-/// adapted features that is not English. An S-57 cell has one national name per
-/// feature and the adapter tags it `und`; a native S-101 dataset states real
-/// ISO 639-2 codes. Null when every name is English, which is when a national
-/// portrayal pass has nothing to select.
-pub fn nationalLanguage(adapted: []const Adapted) ?[]const u8 {
+/// The distinct non-English featureName languages a chart states, in the order
+/// they first appear. An S-57 cell yields at most `und`, because the adapter
+/// tags NOBJNM that way and S-57 records no language for it. A native S-101
+/// dataset yields its real ISO 639-2 codes.
+///
+/// Capped, because each one costs a portrayal pass at bake time and a text
+/// property per label in the tile. A chart naming its features in more
+/// languages than this keeps the first few.
+pub const max_languages = 4;
+
+pub fn languages(a: std.mem.Allocator, adapted: []const Adapted) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
     for (adapted) |ad| {
         const names = ad.root.childList("featureName") orelse continue;
         for (names) |n| {
             const lang = n.simpleValue("language") orelse continue;
             if (n.simpleValue("name") == null) continue;
-            if (!std.mem.eql(u8, lang, "eng")) return lang;
+            if (std.mem.eql(u8, lang, "eng")) continue;
+            var seen = false;
+            for (out.items) |h| {
+                if (std.mem.eql(u8, h, lang)) seen = true;
+            }
+            if (seen) continue;
+            try out.append(a, lang);
+            if (out.items.len == max_languages) return out.items;
         }
     }
-    return null;
+    return out.items;
 }
 
 /// Adapt all mappable features of a cell. Allocates into `a` (use an arena).
@@ -2278,7 +2291,7 @@ test "a repeated name attribute reads the same way the surface reads it" {
     try std.testing.expectEqualStrings("Eerste", feats[0].attr(s57.ATTR_NOBJNM).?);
 }
 
-test "nationalLanguage finds the non-English featureName language" {
+test "languages lists the non-English featureName languages" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2300,12 +2313,14 @@ test "nationalLanguage finds the non-English featureName language" {
     defer cell.arena.deinit();
 
     const adapted = try adaptCell(a, &cell);
-    try std.testing.expectEqualStrings("und", nationalLanguage(adapted).?);
+    const langs = try languages(a, adapted);
+    try std.testing.expectEqual(@as(usize, 1), langs.len);
+    try std.testing.expectEqualStrings("und", langs[0]);
 
     // Every name in English: no national pass to run.
     const eng = [_]s57.Attr{.{ .code = s57.ATTR_OBJNAM, .value = "Boston" }};
     const f2 = [_]s57.Feature{.{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 13, .attrs = &eng }};
     cell.features = &f2;
     const a2 = try adaptCell(a, &cell);
-    try std.testing.expect(nationalLanguage(a2) == null);
+    try std.testing.expectEqual(@as(usize, 0), (try languages(a, a2)).len);
 }

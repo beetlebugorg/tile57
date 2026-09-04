@@ -1711,23 +1711,26 @@ test "buildFromTemplate: feet reads a dredged area's feet depth text; metres doe
     try std.testing.expect(std.mem.indexOf(u8, metres, "text_ft") == null);
 }
 
-test "buildFromTemplate: national names read the NOBJNM twin" {
+test "buildFromTemplate: a language preference reads that language's twin" {
     const a = std.testing.allocator;
-    const nat = try buildFromTemplate(a, cs_template, &.{ .national_names = true }, cs_ct, null, 1700000000);
-    defer a.free(nat);
-    try std.testing.expect(std.mem.indexOf(u8, nat, "text_nat") != null);
+    const zho = try buildFromTemplate(a, cs_template, &.{ .preferred_language = "zho" }, cs_ct, null, 1700000000);
+    defer a.free(zho);
+    try std.testing.expect(std.mem.indexOf(u8, zho, "text_zho") != null);
+    // An S-57 national name states no language, so it answers any preference.
+    try std.testing.expect(std.mem.indexOf(u8, zho, "text_und") != null);
 
-    // Off reads the string the rule composed, with no national twin in the style.
+    // No preference reads the string the rules composed.
     const off = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
     defer a.free(off);
-    try std.testing.expect(std.mem.indexOf(u8, off, "text_nat") == null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "text_zho") == null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "text_und") == null);
 
-    // Both settings coalesce, national first.
-    const both = try buildFromTemplate(a, cs_template, &.{ .national_names = true, .depth_unit = .feet }, cs_ct, null, 1700000000);
+    // The language wins over the depth twin, and both stay ahead of `text`.
+    const both = try buildFromTemplate(a, cs_template, &.{ .preferred_language = "zho", .depth_unit = .feet }, cs_ct, null, 1700000000);
     defer a.free(both);
-    const inat = std.mem.indexOf(u8, both, "text_nat").?;
+    const izho = std.mem.indexOf(u8, both, "text_zho").?;
     const ift = std.mem.indexOf(u8, both, "text_ft").?;
-    try std.testing.expect(inat < ift);
+    try std.testing.expect(izho < ift);
 }
 
 test "buildFromTemplate: enabled bands add a band filter" {

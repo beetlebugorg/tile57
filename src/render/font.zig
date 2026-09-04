@@ -37,9 +37,24 @@ pub const Font = struct {
     glyf: usize,
     hmtx: usize,
 
+    /// `data` is a bare sfnt, or a TrueType collection, in which case the first
+    /// face is read. A collection starts with the tag `ttcf` and a table of
+    /// per-face offsets to the sfnt directories; the CJK faces a system ships
+    /// arrive this way.
     pub fn init(data: []const u8) !Font {
         if (data.len < 12) return error.BadFont;
-        const num_tables = u16At(data, 4);
+        var base: usize = 0;
+        if (std.mem.eql(u8, data[0..4], "ttcf")) {
+            if (data.len < 16) return error.BadFont;
+            if (u32At(data, 8) == 0) return error.BadFont; // face count
+            base = u32At(data, 12);
+            if (base + 12 > data.len) return error.BadFont;
+        }
+        return initAt(data, base);
+    }
+
+    fn initAt(data: []const u8, base: usize) !Font {
+        const num_tables = u16At(data, base + 4);
         var head: usize = 0;
         var maxp: usize = 0;
         var hhea: usize = 0;
@@ -48,7 +63,7 @@ pub const Font = struct {
         var glyf: usize = 0;
         var cmap: usize = 0;
         for (0..num_tables) |i| {
-            const rec = 12 + i * 16;
+            const rec = base + 12 + i * 16;
             if (rec + 16 > data.len) return error.BadFont;
             const tag = data[rec .. rec + 4];
             const off = u32At(data, rec + 8);
@@ -353,6 +368,21 @@ pub const Font = struct {
 /// The embedded label faces (Noto Sans, OFL 1.1 — see THIRD_PARTY_LICENSES.md).
 /// Regular is the base face; Bold and Italic give the label-tier resolver
 /// (src/style/labeltier.zig) real weight and slant rather than synthesizing them.
+/// A face consulted for codepoints the bundled Noto Sans has no glyph for.
+/// The bundled faces cover Latin, Greek and Cyrillic, so a chart naming its
+/// features in another script draws boxes without one. A host installs it with
+/// `setFallback`, which borrows the bytes for the life of the process.
+///
+/// tile57 reads TILE57_FONT_FALLBACK in the render tools. The engine holds no
+/// path itself, so a host that keeps its own font store passes those bytes.
+pub var fallback: ?Font = null;
+
+/// Install the fallback face. `data` is a TrueType file or a collection, and it
+/// has to outlive every render, because Font borrows it.
+pub fn setFallback(data: []const u8) void {
+    fallback = Font.init(data) catch null;
+}
+
 pub const notosans = @embedFile("font_ttf");
 pub const notosans_bold = @embedFile("font_ttf_bold");
 pub const notosans_italic = @embedFile("font_ttf_italic");

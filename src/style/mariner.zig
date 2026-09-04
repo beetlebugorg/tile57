@@ -98,10 +98,14 @@ pub const Settings = struct {
     text_names: bool = true,
     show_light_descriptions: bool = true,
     text_other: bool = true,
-    /// Label a feature with its national-language name (NOBJNM) where the cell
-    /// carries one. The bake stores that name beside the portrayed one, so this
+    /// The mariner's label language, as an ISO 639-2 code. Empty draws the
+    /// portrayed name. A code the chart states draws that language's name. Any
+    /// other code still draws an S-57 national name, because S-57 records no
+    /// language for NOBJNM and the adapter tags it `und`.
+    ///
+    /// The bake stores each language beside the portrayed name, so this
     /// switches without a re-bake.
-    national_names: bool = false,
+    preferred_language: []const u8 = "",
 
     // -- viewing groups (S-52 §14.5, fine-grained per-VG control). A DENY-LIST: the
     // groups the mariner has turned OFF. null/empty = every viewing group shown
@@ -454,12 +458,18 @@ pub fn contourLabelField(b: B, m: *const Settings) !Value {
 // A feature has at most one of the two twins, so their relative order in the
 // coalesce has no effect.
 pub fn labelTextField(b: B, m: *const Settings) !Value {
-    var terms: [5]Value = undefined;
+    var terms: [6]Value = undefined;
     var n: usize = 0;
     terms[n] = b.s("coalesce");
     n += 1;
-    if (m.national_names) {
-        terms[n] = try b.get("text_nat");
+    if (m.preferred_language.len > 0) {
+        // The chart's own language first, then an S-57 national name, which
+        // states no language. The key is allocated, because the expression
+        // holds the slice after this returns.
+        const key = try std.fmt.allocPrint(b.a, "text_{s}", .{m.preferred_language});
+        terms[n] = try b.get(key);
+        n += 1;
+        terms[n] = try b.get("text_und");
         n += 1;
     }
     if (m.depth_unit == .feet) {

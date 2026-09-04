@@ -229,7 +229,7 @@ const CellBackend = struct {
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     portrayal_lights: ?[]const ?[]const u8 = null, // FullLightLines variant (sectored lights)
-    portrayal_national: ?[]const ?[]const u8 = null, // PreferredLanguage variant (national names)
+    portrayal_national: []const scene.LangStreams = &.{}, // one pass per national language
     portray_arena: ?*std.heap.ArenaAllocator = null,
     coverage: []const []const []const s57.LonLat = &.{}, // M_COVR (in portray_arena)
     cscl: i32 = 0, // compilation scale (DSPM CSCL, 1:N)
@@ -291,7 +291,7 @@ const LazyCell = struct {
     portrayal_plain: ?[]const ?[]const u8 = null,
     portrayal_simplified: ?[]const ?[]const u8 = null,
     portrayal_lights: ?[]const ?[]const u8 = null,
-    portrayal_national: ?[]const ?[]const u8 = null,
+    portrayal_national: []const scene.LangStreams = &.{},
     arena: ?*std.heap.ArenaAllocator = null,
     tick: u64 = 0, // LRU: last tile that used this cell
     // M_COVR(CATCOV=1) coverage polygons, assembled once from `cell` for best-band
@@ -503,6 +503,14 @@ fn parseAnyCell(base: []const u8, updates: []const []const u8) ?CellLoad {
 
 /// Portray a cell three ways, using the native adapted set (S-101) when present,
 /// else the S-57 adapter.
+/// The portrayal's national passes as the scene's own type. The two modules
+/// state the same pair, and scene has no dependency on portray.
+fn nationalPasses(a: std.mem.Allocator, passes: []const portray.LangStreams) []const scene.LangStreams {
+    const out = a.alloc(scene.LangStreams, passes.len) catch return &.{};
+    for (passes, out) |p, *o| o.* = .{ .lang = p.lang, .streams = p.streams };
+    return out;
+}
+
 fn portrayVariantsAny(arena: std.mem.Allocator, cell: *const s57.Cell, adapted: ?[]const s101.adapter.Adapted, dir: []const u8) !portray.CellPortrayal {
     if (adapted) |ad| return portray.portrayCellVariantsAdapted(arena, cell, ad, dir);
     return portray.portrayCellVariants(arena, cell, dir);
@@ -526,7 +534,7 @@ fn lazyEnsureLoaded(ls: *LazySource, lc: *LazyCell) void {
             lc.portrayal_plain = cp.plain;
             lc.portrayal_simplified = cp.simplified;
             lc.portrayal_lights = cp.lights;
-            lc.portrayal_national = cp.national;
+            lc.portrayal_national = nationalPasses(p.allocator(), cp.national);
             lc.arena = p;
         } else |_| {
             p.deinit();
@@ -556,7 +564,7 @@ fn lazyUnload(lc: *LazyCell) void {
     lc.portrayal_plain = null;
     lc.portrayal_simplified = null;
     lc.portrayal_lights = null;
-    lc.portrayal_national = null;
+    lc.portrayal_national = &.{};
     if (lc.arena) |p| {
         p.deinit();
         gpa.destroy(p);
@@ -698,7 +706,7 @@ fn buildCellBackend(base: []const u8, updates: []const []const u8, dir: []const 
         cb.portrayal_plain = cp.plain;
         cb.portrayal_simplified = cp.simplified;
         cb.portrayal_lights = cp.lights;
-        cb.portrayal_national = cp.national;
+        cb.portrayal_national = nationalPasses(pa.allocator(), cp.national);
     } else |_| {}
     // Assemble geometry + its projection + per-feature bboxes ONCE (the baker's
     // per-cell caches) so live per-view rendering reuses them across the view's tiles
@@ -3906,7 +3914,7 @@ const BakeWork = struct {
         var portrayal_plain: ?[]const ?[]const u8 = null;
         var portrayal_simplified: ?[]const ?[]const u8 = null;
         var portrayal_lights: ?[]const ?[]const u8 = null;
-        var portrayal_national: ?[]const ?[]const u8 = null;
+        var portrayal_national: []const scene.LangStreams = &.{};
         var geo: ?scene.GeoParts = null;
         var geo_world: ?scene.GeoWorld = null;
         var feat_bbox: ?[]const ?[4]f64 = null;
@@ -3918,7 +3926,7 @@ const BakeWork = struct {
                 portrayal_plain = cp.plain;
                 portrayal_simplified = cp.simplified;
                 portrayal_lights = cp.lights;
-                portrayal_national = cp.national;
+                portrayal_national = nationalPasses(p.allocator(), cp.national);
             } else |_| {}
             // Build the geometry cache for EVERY cell, unconditionally.
             // `build_geo` (cacheGeoForBand) gated it to the finer bands, but coarse cells are

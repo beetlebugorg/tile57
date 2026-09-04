@@ -55,8 +55,7 @@ result is **best effort**:
   records only the lexical level of the text (part 3 clause 2.4), which is a
   character repertoire rather than a language. The adapter converts it to a
   second `featureName` tagged ISO 639-2 `und`, undetermined, so the
-  `national_names` setting selects the national name rather than a named
-  language. S-101 permits several `featureName` entries with distinct
+  mariner's language setting reaches it whatever code they ask for. S-101 permits several `featureName` entries with distinct
   languages. An S-57 source yields at most one.
 - **Unconvertible objects fall back or drop.** An S-57 object class with no
   S-101 equivalent portrays as the S-52 question mark (QUESMRK1) — or, where
@@ -102,11 +101,17 @@ result is **best effort**:
 
 ## Display / style gaps
 
-- **The embedded font covers Latin, Greek and Cyrillic.** `national_names`
-  selects a feature's national `featureName`, and the pixel and PDF outputs draw
-  it with the bundled Noto Sans. A name in a script the face has no glyphs for
-  draws as boxes. A chart naming its features in Inuktitut syllabics does this.
-  A host that supplies its own face through the surface callbacks is unaffected.
+- **The embedded font covers Latin, Greek and Cyrillic.** A label in another
+  script draws with the bundled Noto Sans, which has no glyphs for it, and comes
+  out as boxes. Point `TILE57_FONT_FALLBACK` at a TrueType file or collection
+  holding the script, and the pixel outputs draw each codepoint the bundled face
+  lacks from that one. The PDF and vector outputs embed a single face per label,
+  so a label mixing scripts still draws its fallback glyphs from the bundled
+  face there. A host that supplies its own face through the surface callbacks is
+  unaffected.
+- **A chart states more than four languages.** The bake runs a portrayal pass
+  per language and stores a text property per language, so it keeps the first
+  four it finds and drops the rest.
 
 - **Overscale hatch occlusion is tile-path only.** The S-52 §10.1.10 overscale
   indication (`OVERSC01`, see [architecture](./architecture.md)) is gated

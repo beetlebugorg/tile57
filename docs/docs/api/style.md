@@ -67,11 +67,13 @@ typedef struct tile57_mariner {
                                      * the S-52 §10.3.4.2 DisplayPlane precedence, which
                                      * the clause conditions on an image beneath the
                                      * chart; radar_overlay satisfies the same gate. */
-    bool national_names;            /* label a feature with its national-language name
-                                     * (NOBJNM) where the cell has one. The bake stores
-                                     * that name beside the portrayed one, so this
-                                     * switches without a re-bake. A feature with only
-                                     * NOBJNM is labelled with it whatever this says. */
+    char preferred_language[4];     /* the mariner's label language, an ISO 639-2 code
+                                     * such as "zho", or "" for the portrayed name. A code
+                                     * the chart states draws that language's name; any
+                                     * other code still draws an S-57 national name
+                                     * (NOBJNM), which records no language. The bake
+                                     * stores each language beside the portrayed name, so
+                                     * this switches without a re-bake. */
 } tile57_mariner;
 
 void tile57_mariner_defaults(tile57_mariner *m);   /* canonical defaults, date_view = "" */

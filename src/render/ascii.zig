@@ -342,13 +342,10 @@ pub const AsciiSurface = struct {
         const self = sp(ctx);
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
-        // The national-language label, when the mariner selected it. The scene
-        // fills style.national and replay reads it back from the tile, so both
-        // paths arrive here the same way.
-        const shown = if (self.settings.national_names and style.national.len > 0)
-            style.national
-        else
-            text;
+        // The label in the mariner's language. The scene fills style.national
+        // and replay reads it back from the tile, so both paths arrive here
+        // the same way.
+        const shown = rs.nationalFor(style.national, self.settings.preferred_language) orelse text;
         // First word only: a text grid earns its keep with placement, not prose.
         const word = shown[0 .. std.mem.indexOfScalar(u8, shown, ' ') orelse shown.len];
         if (word.len == 0) return;

@@ -127,9 +127,9 @@ test "ascii view: water shades left, land '#' right, coastline between" {
 }
 
 test "ascii view: the national name replaces the portrayed one when asked" {
-    // The tile path bakes text_nat for a style to coalesce. A character
-    // surface substitutes at draw time instead. This drives the real rules and
-    // reads the label off the grid.
+    // The tile path bakes a text property per language for a style to
+    // coalesce. A character surface picks at draw time instead. This drives the
+    // real rules and reads the label off the grid.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -182,7 +182,9 @@ test "ascii view: the national name replaces the portrayed one when asked" {
     const draw = struct {
         fn run(al: std.mem.Allocator, c: *s57.Cell, st: portray.CellPortrayal, g: []?[][]s57.LonLat, col: *render.resolve.Colors, m: *const render.resolve.Settings, b: [4]f64) ![]const u8 {
             var as = render.ascii.AsciiSurface.initView(al, col, .day, m, 8.0, 64, 32, 256.0, tile.EXTENT);
-            const cells = [_]scene.CellRef{.{ .cell = c, .portrayal = st.base, .portrayal_national = st.national, .geo = g }};
+            const nat = try al.alloc(scene.LangStreams, st.national.len);
+            for (st.national, nat) |p, *o| o.* = .{ .lang = p.lang, .streams = p.streams };
+            const cells = [_]scene.CellRef{.{ .cell = c, .portrayal = st.base, .portrayal_national = nat, .geo = g }};
             return scene.generateView(&as, al, al, &cells, (b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 8.0, false);
         }
     }.run;
@@ -192,7 +194,7 @@ test "ascii view: the national name replaces the portrayed one when asked" {
     try std.testing.expect(std.mem.indexOf(u8, plain, "Harwich") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Harwijk") == null);
 
-    const on = render.resolve.Settings{ .national_names = true };
+    const on = render.resolve.Settings{ .preferred_language = "und" };
     const national = try draw(a, &cell, cp, geo, &colors, &on, tb);
     try std.testing.expect(std.mem.indexOf(u8, national, "Harwijk") != null);
     try std.testing.expect(std.mem.indexOf(u8, national, "Harwich") == null);
