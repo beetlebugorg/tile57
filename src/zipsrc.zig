@@ -34,6 +34,8 @@ pub const Error = error{
     BadLocalHeader,
     UnsupportedCompressionMethod,
     EntryTooLarge,
+    /// The entry's bytes do not match the CRC32 the archive holds for it.
+    ChecksumMismatch,
 };
 
 pub const Entry = struct {
@@ -191,6 +193,12 @@ pub const Archive = struct {
         var w: std.Io.Writer = .fixed(buf);
         try self.streamEntry(io, i, &w);
         if (w.end != buf.len) return error.EndOfStream;
+        // Every zip entry has a CRC32 of its uncompressed bytes. Raw deflate
+        // has no checksum of its own, so a flipped bit inside a literal run
+        // inflates to bytes that parse. On a chart that moves a boundary vertex
+        // and draws a chart nobody published.
+        const want = e.raw.crc32;
+        if (want != 0 and std.hash.Crc32.hash(buf) != want) return Error.ChecksumMismatch;
         return buf;
     }
 
@@ -651,4 +659,39 @@ test "a file that is not a zip is refused at open" {
     defer gpa.free(zpath);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpath, .data = "0001 this is an S-57 cell, not an archive" });
     try testing.expectError(error.ZipNoEndRecord, Archive.open(gpa, io, zpath));
+}
+
+test "a corrupted entry body is refused" {
+    const gpa = testing.allocator;
+    const io = testIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(gpa, &tmp);
+    defer gpa.free(dir);
+    const zpath = try std.fs.path.join(gpa, &.{ dir, "t.zip" });
+    defer gpa.free(zpath);
+
+    // Stored, so a flipped byte in the file is a flipped byte in the entry.
+    // Deflate has no checksum of its own, so the entry CRC32 covers it.
+    const body = "US5MD12M cell bytes " ** 40;
+    try writeTestZip(gpa, io, zpath, &.{.{ .name = "ENC_ROOT/US5MD12M/US5MD12M.000", .data = body, .deflate = false }});
+
+    {
+        var arc = try Archive.open(gpa, io, zpath);
+        defer arc.deinit();
+        const got = try arc.readAlloc(gpa, io, 0, 1 << 20);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(body, got);
+    }
+
+    // Flip one byte inside the stored body and read again.
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, zpath, gpa, .unlimited);
+    defer gpa.free(raw);
+    const at = std.mem.indexOf(u8, raw, "cell bytes").? + 2;
+    raw[at] ^= 0x20;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpath, .data = raw });
+
+    var arc2 = try Archive.open(gpa, io, zpath);
+    defer arc2.deinit();
+    try testing.expectError(Error.ChecksumMismatch, arc2.readAlloc(gpa, io, 0, 1 << 20));
 }

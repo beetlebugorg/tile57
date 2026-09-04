@@ -1625,7 +1625,20 @@ pub const CatalogEntry = struct {
     impl: []const u8, // "BIN" (a cell) / "ASC" / "TXT" ("" when absent); allocator-owned
     bbox: ?[4]f64, // [west, south, east, north]; null for non-cell / no coverage
     is_cell: bool, // BIN .000 base cell
+    /// The CRC the catalogue gives for the file (S-57 Part 3 3.4, the CATD
+    /// CRCS subfield), as the hex string the field holds. "" when the producer
+    /// gave none, which the spec permits.
+    crcs: []const u8,
 };
+
+/// The CRC32 in a CATD CRCS subfield, or null when it has none or the
+/// text is not eight hex digits. S-57 Part 3 7.4.1 table 7.11 types CRCS as
+/// `A( )` holding hex, and every producer seen writes it big-endian-first.
+pub fn catalogCrc(crcs: []const u8) ?u32 {
+    const t = std.mem.trim(u8, crcs, " ");
+    if (t.len != 8) return null;
+    return std.fmt.parseInt(u32, t, 16) catch null;
+}
 
 /// ASCII whitespace set matching Go's strings.TrimSpace over byte data: space,
 /// tab, LF, VT, FF, CR. The oracle TrimSpace-es every attribute value before
@@ -1699,7 +1712,8 @@ fn decodeCATD(a: Allocator, raw_in: []const u8) ?CatalogEntry {
                     };
     }
     const long_name = a.dupe(u8, parts[1]) catch return null;
-    return .{ .stem = stem, .path = norm, .long_name = long_name, .impl = impl, .bbox = bbox, .is_cell = is_cell };
+    const crcs = a.dupe(u8, parts[7]) catch return null;
+    return .{ .stem = stem, .path = norm, .long_name = long_name, .impl = impl, .bbox = bbox, .is_cell = is_cell, .crcs = crcs };
 }
 
 /// Parse an S-57 exchange-set catalogue (CATALOG.031): one CATD record per file,
@@ -2881,6 +2895,13 @@ test "a catalogue entry naming a file outside the exchange set is dropped" {
     try std.testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.000", e.path);
     try std.testing.expectEqualStrings("US5MD12M", e.stem);
     try std.testing.expect(e.is_cell);
+
+    // The CRC the catalogue gives for the file (S-57 Part 3 3.4).
+    try std.testing.expectEqual(@as(?u32, 0x1A2B3C4D), catalogCrc("1A2B3C4D"));
+    try std.testing.expectEqual(@as(?u32, 0x1A2B3C4D), catalogCrc(" 1a2b3c4d "));
+    try std.testing.expectEqual(@as(?u32, null), catalogCrc("")); // producers may omit it
+    try std.testing.expectEqual(@as(?u32, null), catalogCrc("1A2B"));
+    try std.testing.expectEqual(@as(?u32, null), catalogCrc("ZZZZZZZZ"));
 
     try std.testing.expect(safeCatalogPath("ENC_ROOT/A/B.000"));
     try std.testing.expect(safeCatalogPath("..a/B.000"));
