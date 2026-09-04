@@ -1035,9 +1035,14 @@ pub fn build(b: *std.Build) void {
     addSvgRaster(b, sprite_test);
 
     _ = addPkgTest(b, test_step, "src/iso8211/iso8211.zig", target, optimize, &.{});
-    _ = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{
+    // catalog.zig's cross-check against the spec's attribute list reads the
+    // path from the environment through libc's getenv, as every other
+    // real-file test here does. Without this the module compiles for a target
+    // that links libc implicitly and fails to compile for one that does not.
+    const s57_test = addPkgTest(b, test_step, "src/s57/s57.zig", target, optimize, &.{
         .{ .name = "iso8211", .module = iso8211_mod },
     });
+    s57_test.link_libc = true;
     const s101_test = addPkgTest(b, test_step, "src/s101/s101.zig", target, optimize, &.{
         .{ .name = "s57", .module = s57_mod },
     });
