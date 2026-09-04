@@ -43,6 +43,12 @@ typedef struct tile57_mariner {
     double sounding_size_scale;     /* extra size multiplier for SOUNDINGS, on top of
                                      * size_scale (scales each digit + spacing together).
                                      * 1.0 = none; 0 reads as 1.0. */
+    uint8_t soundings;              /* spot soundings, independent of the display
+                                     * category. 0 = follow the category, 1 = always
+                                     * show, 2 = always hide. S-52 files SOUNDG under
+                                     * OTHER, so 0 means a host enables the whole OTHER
+                                     * category to get soundings, and takes the seabed
+                                     * and the cables with it. */
     double device_scale;            /* device px per reference px — the HiDPI density the
                                      * SURFACE paths are drawn at (2.0 on a Retina backing
                                      * store). Describes the DISPLAY where size_scale
@@ -52,6 +58,15 @@ typedef struct tile57_mariner {
                                      * it (that density is already in the requested
                                      * width/height). 1.0 = a 1x framebuffer; 0 reads as
                                      * 1.0. */
+    bool chart_over_image;          /* CHART OVER PICTURE: a raster chart is drawn
+                                     * beneath this one, so the DEPARE / DRGARE / UNSARE
+                                     * / LNDARE fills and the no-data background drop
+                                     * out and the picture shows through. Contours,
+                                     * symbols, lights, soundings, text and boundaries
+                                     * already drawn as lines or patterns stay. Engages
+                                     * the S-52 §10.3.4.2 DisplayPlane precedence, which
+                                     * the clause conditions on an image beneath the
+                                     * chart; radar_overlay satisfies the same gate. */
     bool national_names;            /* label a feature with its national-language name
                                      * (NOBJNM) where the cell has one. The bake stores
                                      * that name beside the portrayed one, so this
