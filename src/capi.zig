@@ -884,6 +884,10 @@ const CInfo = extern struct {
     tile_type: u8, // the archive's stored encoding (TILE57_TILE_TYPE_*)
     native_scale: i32, // embedded compilation scale (1:N); 0 = derive from zoom band
     is_raster: bool, // the archive stores pictures, not vector tiles
+    // Cells handed to the open that produced no chart. The open succeeds while
+    // one parses, so this is what tells a host the set has a gap. Appended for
+    // ABI-append-safety; a zeroed struct reads 0.
+    skipped_cells: u32,
 };
 
 // tile57_tile_type values (keep in sync with tile57.h).
@@ -909,6 +913,7 @@ export fn tile57_chart_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
     // nothing above tells it apart from a vector chart. Its tiles are images.
     // tile_type cannot carry this: TILE57_TILE_TYPE_MLT is 2, and 2 is PNG in
     // the PMTiles header.
+    o.skipped_cells = s.skipped_cells;
     o.is_raster = switch (s.tileType()) {
         .png, .jpeg, .webp, .avif => true,
         else => false,
@@ -1504,6 +1509,10 @@ const CComposeMeta = extern struct {
     min_zoom: u8,
     max_zoom: u8, // deepest zoom that can be served (native windows + one fill-up overscale zoom)
     charts: u32, // coverage-carrying charts held
+    // Charts handed to the open that embed no usable coverage, so they own no
+    // ground and are absent from every composed tile. Appended for
+    // ABI-append-safety; a zeroed struct reads 0.
+    skipped: u32,
     west: f64,
     south: f64,
     east: f64,
@@ -1627,6 +1636,7 @@ export fn tile57_compose_open(
         error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
         else => fail(err, e),
     }) orelse return failWith(err, .unsupported, "no chart carries per-cell coverage");
+    src.skipped = @intCast(n - na);
     sidecar.refresh(io, src);
     o.* = src;
     return OK;
@@ -1951,6 +1961,7 @@ export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CCompo
         .min_zoom = src.minz,
         .max_zoom = src.loop_max,
         .charts = @intCast(src.readers.len),
+        .skipped = src.skipped,
         .west = src.bounds[0],
         .south = src.bounds[1],
         .east = src.bounds[2],

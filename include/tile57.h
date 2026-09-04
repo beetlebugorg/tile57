@@ -537,6 +537,11 @@ typedef struct {
     uint8_t  tile_type;                                   /* tile57_tile_type */
     int32_t  native_scale;
     bool     is_raster;                                  /* tiles are images, not vector tiles */
+    uint32_t skipped_cells; /* cells handed to the open that produced no chart.
+                         * The open succeeds while one parses, so a host reads
+                         * this to tell a chart set with a gap in it from a
+                         * complete one. Appended for ABI-append-safety; a
+                         * zeroed struct reads 0. */
 } tile57_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_info *out);
 
@@ -1463,6 +1468,10 @@ typedef struct {
     uint8_t min_zoom;
     uint8_t max_zoom;   /* deepest zoom served (native windows + one fill-up overscale zoom) */
     uint32_t charts;    /* coverage-carrying charts held */
+    uint32_t skipped;   /* charts handed to the open that embed no usable coverage:
+                         * they own no ground and are absent from every composed
+                         * tile. Appended for ABI-append-safety; 0 on a zeroed
+                         * struct. */
     double west, south, east, north; /* union coverage bounds, degrees */
 } tile57_compose_meta;
 
