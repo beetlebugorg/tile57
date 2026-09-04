@@ -1004,7 +1004,7 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
         .sound_img = try mariner.soundingsIconImage(b, &m),
         .point_img = try mariner.pointSymbolImage(b, &m),
         .contour_field = try mariner.contourLabelField(b, &m),
-        .text_field = try mariner.depthTextField(b, &m),
+        .text_field = try mariner.labelTextField(b, &m),
         .common = if (filters_on) try mariner.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
         .text_group = if (filters_on) try mariner.textGroupFilter(b, &m) else null,
         .size_scale = opts.size_scale,
@@ -1709,6 +1709,25 @@ test "buildFromTemplate: feet reads a dredged area's feet depth text; metres doe
     const metres = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
     defer a.free(metres);
     try std.testing.expect(std.mem.indexOf(u8, metres, "text_ft") == null);
+}
+
+test "buildFromTemplate: national names read the NOBJNM twin" {
+    const a = std.testing.allocator;
+    const nat = try buildFromTemplate(a, cs_template, &.{ .national_names = true }, cs_ct, null, 1700000000);
+    defer a.free(nat);
+    try std.testing.expect(std.mem.indexOf(u8, nat, "text_nat") != null);
+
+    // Off reads the string the rule composed, with no national twin in the style.
+    const off = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
+    defer a.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "text_nat") == null);
+
+    // Both settings coalesce, national first.
+    const both = try buildFromTemplate(a, cs_template, &.{ .national_names = true, .depth_unit = .feet }, cs_ct, null, 1700000000);
+    defer a.free(both);
+    const inat = std.mem.indexOf(u8, both, "text_nat").?;
+    const ift = std.mem.indexOf(u8, both, "text_ft").?;
+    try std.testing.expect(inat < ift);
 }
 
 test "buildFromTemplate: enabled bands add a band filter" {

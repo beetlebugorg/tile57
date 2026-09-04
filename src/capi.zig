@@ -2264,6 +2264,11 @@ const CMariner = extern struct {
     // background so a raster chart beneath shows through, and engage the
     // DisplayPlane precedence. See tile57.h. Appended for ABI-append-safety.
     chart_over_image: bool,
+    // Label a feature with its national-language name (NOBJNM) where the cell
+    // carries one. The bake stores that name beside the portrayed one as
+    // `text_nat`, so this switches without a re-bake. Appended for
+    // ABI-append-safety; a zeroed struct keeps the portrayed name.
+    national_names: bool,
 };
 
 /// The tri-state `soundings` field as the engine's optional bool.
@@ -2326,6 +2331,7 @@ fn marinerFromC(cm: *const CMariner) mariner.Settings {
         .sounding_size_scale = if (cm.sounding_size_scale > 0) cm.sounding_size_scale else 1.0,
         .device_scale = if (cm.device_scale > 0) cm.device_scale else 1.0,
         .chart_over_image = cm.chart_over_image,
+        .national_names = cm.national_names,
         .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
             cm.viewing_groups_off[0..cm.viewing_groups_off_len]
         else
@@ -2510,6 +2516,7 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
         .sounding_size_scale = d.sounding_size_scale,
         .device_scale = d.device_scale,
         .chart_over_image = d.chart_over_image,
+        .national_names = d.national_names,
     };
 }
 

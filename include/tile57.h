@@ -652,6 +652,13 @@ typedef struct tile57_mariner {
                          * specified values and blending them produces colours the
                          * spec does not name.
                          * Appended for ABI-append-safety; a zeroed struct is off. */
+    bool national_names; /* Label a feature with its national-language name
+                         * (NOBJNM) where the cell carries one. The bake stores
+                         * that name beside the portrayed one, so this switches
+                         * without a re-bake. A feature with only NOBJNM is
+                         * labelled with it whatever this says.
+                         * Appended for ABI-append-safety; 0 keeps the portrayed
+                         * name. */
 } tile57_mariner;
 
 /* Fill *m with the canonical default mariner settings (so a host needn't

@@ -97,6 +97,11 @@ pub const FeatureMeta = struct {
     // (AP(OVERSC01) over the cell's M_COVR coverage), shown only
     // while grossly overscale (denom < oscl, i.e. X2+)
     class: []const u8 = "", // S-57 object-class acronym (e.g. "LIGHTS")
+    /// OBJNAM and NOBJNM as the cell holds them. The portrayal rules pick one
+    /// string for the label, so the surface needs both to bake the national
+    /// twin beside it (scene.drawText).
+    name: []const u8 = "",
+    name_nat: []const u8 = "",
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""
     cell_name: []const u8 = "", // source ENC cell name or ""
     /// Usage band (tiles.band.Band ordinal) of the SOURCE cell, or BAND_UNKNOWN

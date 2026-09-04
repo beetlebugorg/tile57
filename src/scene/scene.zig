@@ -625,6 +625,8 @@ pub const TileSurface = struct {
             .scamin = meta.scamin,
             .oscl = meta.oscl,
             .class = meta.class,
+            .name = meta.name,
+            .name_nat = meta.name_nat,
             .s57 = meta.s57_json,
             .cell = meta.cell_name,
             .band = meta.band,
@@ -787,6 +789,8 @@ pub const TileSurface = struct {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try appendTextProps(s.a, &props, text, text_style); // text already shortened by engine
+        if (try nationalTwin(s.a, text, s.cur)) |nat|
+            try props.append(s.a, .{ .key = "text_nat", .value = .{ .string = nat } });
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
         const single = try s.a.alloc(mvt.Point, 1);
@@ -1127,6 +1131,9 @@ const Meta = struct {
     // fillPattern), NOT via appendMeta — points/lines/text don't need it.
     oscl: i64 = 0,
     class: []const u8 = "", // S-57 object-class acronym (M_QUAL, LIGHTS, …)
+    // OBJNAM and NOBJNM, for the national-language label twin (see nationalTwin).
+    name: []const u8 = "",
+    name_nat: []const u8 = "",
     // Cursor-pick report (S-52 §10.8) + dev feature inspector: the feature's full
     // S-57 attribute set as compact acronym->value JSON. "" = omitted (no reportable
     // attribute, or pick attributes disabled). See encodeS57Attrs / pickS57.
@@ -1246,6 +1253,28 @@ fn textStyleFor(t: instructions.Text, f: s57.Feature, fmeta: rs.FeatureMeta) rs.
 /// Serialize a text label's props in the tile schema order. `text` arrives already
 /// shortened/resolved by the engine. A minimal label (empty halign — see
 /// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
+/// BAKE: the national-language twin of a label, stored as `text_nat` beside
+/// `text`, the way a dredged area's depth stores `text_ft`. Portrayal runs at
+/// bake time and GetFeatureName picks one string, so a host switching language
+/// at runtime needs both in the tile.
+///
+/// The rules wrap a name ("Nr %s" in AnchorBerth), so the twin substitutes
+/// NOBJNM for the OBJNAM occurrence rather than replacing the whole label.
+/// Returns null when the feature carries no national name, when it carries no
+/// OBJNAM (the label already IS the national name, adapter.zig gives it
+/// nameUsage 1), or when the label does not contain the name, which is every
+/// label that is not this feature's name.
+fn nationalTwin(a: Allocator, text: []const u8, meta: Meta) !?[]const u8 {
+    if (meta.name_nat.len == 0 or meta.name.len == 0) return null;
+    const at = std.mem.indexOf(u8, text, meta.name) orelse return null;
+    const out = try a.alloc(u8, text.len - meta.name.len + meta.name_nat.len);
+    @memcpy(out[0..at], text[0..at]);
+    @memcpy(out[at..][0..meta.name_nat.len], meta.name_nat);
+    const tail = text[at + meta.name.len ..];
+    @memcpy(out[at + meta.name_nat.len ..], tail);
+    return out;
+}
+
 fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, text_style: *const rs.TextStyle) !void {
     // Resolved body size: the FontSize modifier px, or 12 (oracle default). Drives
     // both the emitted font_size_px and the halo gate below.
@@ -1858,6 +1887,8 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         .scamin = scamin,
         .oscl = opts.oscl,
         .class = pickClass(cell, f, fi),
+        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
+        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = cell_name,
         .band = opts.band,
@@ -2123,6 +2154,8 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         .display_priority = 6,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
+        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
+        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2186,6 +2219,8 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         .display_priority = 12,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
+        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
+        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2279,6 +2314,8 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         .display_priority = 6,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
+        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
+        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2618,6 +2655,8 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
         .display_category = cat,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
+        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
+        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2649,6 +2688,8 @@ fn emitPickArea(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?G
         .display_category = 2,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
+        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
+        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -3492,4 +3533,26 @@ test "augmentV3: vz/ep/lt/iso/mq/lsk precomputes" {
     try augmentV3(a, &lns, .line, 0);
     try std.testing.expectEqual(@as(i64, 2998), findP(lns[0].properties, "lsk").?.int);
     try std.testing.expectEqual(@as(i64, 1), findP(lns[0].properties, "mq").?.int);
+}
+
+test "nationalTwin substitutes the national name inside the label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const both = Meta{ .display_priority = 0, .name = "Shanghai", .name_nat = "上海" };
+    // The plain label.
+    try std.testing.expectEqualStrings("上海", (try nationalTwin(a, "Shanghai", both)).?);
+    // A rule that wraps the name keeps its wrapper (AnchorBerth uses "Nr %s").
+    try std.testing.expectEqualStrings("Nr 上海", (try nationalTwin(a, "Nr Shanghai", both)).?);
+
+    // A label that is not this feature's name has no twin.
+    try std.testing.expect((try nationalTwin(a, "Fl G 4s", both)) == null);
+    // No national name.
+    const eng_only = Meta{ .display_priority = 0, .name = "Boston" };
+    try std.testing.expect((try nationalTwin(a, "Boston", eng_only)) == null);
+    // National name alone: the portrayed label already IS it, adapter.zig gives
+    // that entry nameUsage 1.
+    const nat_only = Meta{ .display_priority = 0, .name_nat = "日本" };
+    try std.testing.expect((try nationalTwin(a, "日本", nat_only)) == null);
 }

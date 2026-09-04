@@ -98,6 +98,10 @@ pub const Settings = struct {
     text_names: bool = true,
     show_light_descriptions: bool = true,
     text_other: bool = true,
+    /// Label a feature with its national-language name (NOBJNM) where the cell
+    /// carries one. The bake stores that name beside the portrayed one, so this
+    /// switches without a re-bake.
+    national_names: bool = false,
 
     // -- viewing groups (S-52 §14.5, fine-grained per-VG control). A DENY-LIST: the
     // groups the mariner has turned OFF. null/empty = every viewing group shown
@@ -442,14 +446,31 @@ pub fn contourLabelField(b: B, m: *const Settings) !Value {
     });
 }
 
-// A dredged area's depth text. DredgedArea composes it in metres, and the bake
-// stores the feet twin beside it as text_ft. Feet reads that twin and falls back
-// to the metric string, so a chart baked before the twin existed still labels
-// its dredged areas.
-pub fn depthTextField(b: B, m: *const Settings) !Value {
-    if (m.depth_unit != .feet)
-        return b.arr(&.{ b.s("coalesce"), try b.get("text"), b.s("") });
-    return b.arr(&.{ b.s("coalesce"), try b.get("text_ft"), try b.get("text"), b.s("") });
+// The label text-field. The bake stores two twins beside the portrayed string:
+// text_ft, a dredged area's depth in feet, and text_nat, a feature's
+// national-language name. Each setting reads its twin and falls back to `text`,
+// so a chart baked before a twin existed still labels.
+//
+// A feature has at most one of the two twins, so their relative order in the
+// coalesce has no effect.
+pub fn labelTextField(b: B, m: *const Settings) !Value {
+    var terms: [5]Value = undefined;
+    var n: usize = 0;
+    terms[n] = b.s("coalesce");
+    n += 1;
+    if (m.national_names) {
+        terms[n] = try b.get("text_nat");
+        n += 1;
+    }
+    if (m.depth_unit == .feet) {
+        terms[n] = try b.get("text_ft");
+        n += 1;
+    }
+    terms[n] = try b.get("text");
+    n += 1;
+    terms[n] = b.s(""); // coalesce always yields a value
+    n += 1;
+    return b.arr(terms[0..n]);
 }
 
 // ---- client-side display filters -------------------------------------------
