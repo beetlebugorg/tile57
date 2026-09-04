@@ -388,12 +388,21 @@ fn cdup(bytes: []const u8) ?[*]u8 {
 // Peek `relpath`'s bbox+scale; on success append an index-aligned meta + a gpa-owned
 // copy of the path. Cells that don't read / have no coverage bbox are skipped (both
 // lists), keeping meta[i] and paths[i] aligned with the streaming cell index.
-fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8)) !bool {
+fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8), want_crc: ?u32) !bool {
     const bytes = dir.readFileAlloc(io, relpath, gpa, .limited(MAX_CELL_BYTES)) catch {
         std.debug.print("CHART LOST {s}: cell did not read\n", .{relpath});
         return false;
     };
     defer gpa.free(bytes);
+    // S-57 Part 3 3.4: the catalogue may include a CRC per file. A cell whose
+    // bytes disagree with it is not the cell the producer published.
+    if (want_crc) |want| {
+        const got = std.hash.Crc32.hash(bytes);
+        if (got != want) {
+            std.debug.print("CHART LOST {s}: catalogue CRC is {x:0>8}, file is {x:0>8}\n", .{ relpath, want, got });
+            return false;
+        }
+    }
     const m = peekAnyMeta(bytes) orelse {
         std.debug.print("CHART LOST {s}: cell did not parse\n", .{relpath});
         return false;
@@ -2576,7 +2585,7 @@ pub const Chart = struct {
         var skipped: u32 = 0;
 
         if (single_file) {
-            if (!try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths)) skipped += 1;
+            if (!try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths, null)) skipped += 1;
         } else if (dir.readFileAlloc(io, "CATALOG.031", gpa, .limited(MAX_CELL_BYTES))) |cbytes| {
             defer gpa.free(cbytes);
             var carena = std.heap.ArenaAllocator.init(gpa);
@@ -2584,7 +2593,7 @@ pub const Chart = struct {
             if (s57.parseCatalog(carena.allocator(), cbytes)) |entries| {
                 for (entries) |e| {
                     if (e.is_cell) {
-                        if (!try addPathCell(io, dir, e.path, &metas, &paths)) skipped += 1;
+                        if (!try addPathCell(io, dir, e.path, &metas, &paths, s57.catalogCrc(e.crcs))) skipped += 1;
                     }
                 }
             }
@@ -2594,7 +2603,7 @@ pub const Chart = struct {
             while (try walker.next(io)) |entry| {
                 if (entry.kind != .file) continue;
                 if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
-                if (!try addPathCell(io, dir, entry.path, &metas, &paths)) skipped += 1;
+                if (!try addPathCell(io, dir, entry.path, &metas, &paths, null)) skipped += 1;
             }
         }
         if (metas.items.len == 0) return error.OpenFailed;
