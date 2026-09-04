@@ -3518,6 +3518,30 @@ pub const Chart = struct {
         std.mem.sort(u32, vals, {}, std.sort.asc(u32));
         return vals;
     }
+
+    /// The label languages the chart states besides English, as ISO 639-2
+    /// codes, ascending. A host offers the mariner these and nothing else,
+    /// because `preferred_language` outside the set draws the portrayed name.
+    /// A baked source reads them from the archive metadata; a cell source
+    /// takes them from the adapted features. Returns a gpa-owned slice of
+    /// gpa-owned codes.
+    pub fn languages(self: *Chart) ![]const []const u8 {
+        var out = std.ArrayList([]const u8).empty;
+        switch (self.backend) {
+            .reader => |*r| languagesFromMetadata(r, &out),
+            .cell => |*cb| for (cb.portrayal_national) |p| {
+                const code = gpa.dupe(u8, p.lang) catch continue;
+                out.append(gpa, code) catch gpa.free(code);
+            },
+            .cells => {},
+        }
+        std.mem.sort([]const u8, out.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        return out.toOwnedSlice(gpa);
+    }
 };
 
 /// Render ONE feature's resolved portrayal onto a solid background — the
@@ -3888,6 +3912,47 @@ fn scanScaminArray(json: []const u8, set: *std.AutoHashMap(u32, void)) void {
     }
 }
 
+// The archive metadata's `"languages":["…"]` array, the codes the bake spliced
+// in. Read the same way scaminFromMetadata reads its ladder: the metadata is
+// uncompressed in this engine's archives, and a gzip writer is handled too.
+fn languagesFromMetadata(r: *pmtiles.Reader, out: *std.ArrayList([]const u8)) void {
+    const h = r.header;
+    if (h.metadata_length == 0) return;
+    const raw = r.bytes[@intCast(h.metadata_offset)..][0..@intCast(h.metadata_length)];
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| gpa.free(o);
+    const json: []const u8 = switch (h.internal_compression) {
+        .none => raw,
+        .gzip => blk: {
+            owned = gzip.decompress(gpa, raw) catch return;
+            break :blk owned.?;
+        },
+        else => return,
+    };
+    scanLanguageArray(json, out);
+}
+
+// Minimal extractor for `"languages":["zho","und"]`, tolerant of whitespace.
+// Each code is duped into gpa, so it outlives a decompressed metadata buffer.
+fn scanLanguageArray(json: []const u8, out: *std.ArrayList([]const u8)) void {
+    const ki = std.mem.indexOf(u8, json, "\"languages\"") orelse return;
+    var i = ki + "\"languages\"".len;
+    while (i < json.len and json[i] != '[' and json[i] != '}') i += 1; // skip ` : `
+    if (i >= json.len or json[i] != '[') return;
+    i += 1;
+    while (i < json.len and json[i] != ']') {
+        while (i < json.len and json[i] != '"' and json[i] != ']') i += 1;
+        if (i >= json.len or json[i] == ']') break;
+        i += 1;
+        const start = i;
+        while (i < json.len and json[i] != '"') i += 1;
+        if (i >= json.len) return;
+        const code = gpa.dupe(u8, json[start..i]) catch return;
+        out.append(gpa, code) catch gpa.free(code);
+        i += 1;
+    }
+}
+
 // ---- ENC_ROOT bake -------------------------------------------------------
 
 const BakeSource = struct { base: []const u8, updates: []const []const u8, name: []const u8 = "" };
@@ -4029,6 +4094,14 @@ pub fn bakeArchive(
     // of truth) while they're alive, before each band frees them.
     var scamin_set = std.AutoHashMap(u32, void).init(gpa);
     defer scamin_set.deinit();
+    // The label languages every cell in the bake states, for the archive's
+    // "languages" key. A host reads them to offer the mariner what the chart
+    // holds.
+    var langs = std.ArrayList([]const u8).empty;
+    defer {
+        for (langs.items) |l| gpa.free(l);
+        langs.deinit(gpa);
+    }
 
     // The coarsest populated band gets .extend_min (fill down to minzoom — the
     // live tileRefs coarsest-band fallback); every other populated band defers its
@@ -4140,6 +4213,15 @@ pub fn bakeArchive(
                 const q = bake_enc.overscaleGateDenom(be.cscl);
                 if (q > 0) scamin_set.put(@intCast(q), {}) catch {};
             }
+            for (be.portrayal_national) |p| {
+                var seen = false;
+                for (langs.items) |l| {
+                    if (std.mem.eql(u8, l, p.lang)) seen = true;
+                }
+                if (seen) continue;
+                const owned = gpa.dupe(u8, p.lang) catch continue;
+                langs.append(gpa, owned) catch gpa.free(owned);
+            }
             // Fold the sector-figure reach for the archive's "light_reach" key
             // (union bbox, max ground leg) while the backends are alive.
             if (be.light_bbox) |lb| {
@@ -4220,10 +4302,15 @@ pub fn bakeArchive(
         while (it.next()) |k| try scamin_vals.append(gpa, k.*);
         std.mem.sort(u32, scamin_vals.items, {}, std.sort.asc(u32));
     }
+    std.mem.sort([]const u8, langs.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
     var light_reach_json: ?[]const u8 = null;
     defer if (light_reach_json) |lj| gpa.free(lj);
     if (lr_union) |u| light_reach_json = scene.coverage.encodeLightReachJson(gpa, .{ .bbox = u, .range_m = lr_range_m }) catch null;
-    const meta = try scene.metadataJson(gpa, scamin_vals.items, coverage_json, light_reach_json);
+    const meta = try scene.metadataJson(gpa, scamin_vals.items, langs.items, coverage_json, light_reach_json);
     defer gpa.free(meta);
     return try sw.finishBytes(.{
         .metadata_json = meta,
@@ -4246,4 +4333,33 @@ pub fn bakeArchive(
 fn streamSink(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
     const sw: *pmtiles.StreamWriter = @ptrCast(@alignCast(ctx.?));
     try sw.addCompressed(z, x, y, comp);
+}
+
+test "scanLanguageArray reads the codes the bake spliced in" {
+    var out = std.ArrayList([]const u8).empty;
+    defer {
+        for (out.items) |c| gpa.free(c);
+        out.deinit(gpa);
+    }
+    scanLanguageArray("{\"name\":\"chartplotter\",\"languages\":[\"und\",\"zho\"],\"scamin\":[1000]}", &out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualStrings("und", out.items[0]);
+    try std.testing.expectEqualStrings("zho", out.items[1]);
+
+    // Whitespace, and an archive that states none.
+    var ws = std.ArrayList([]const u8).empty;
+    defer {
+        for (ws.items) |c| gpa.free(c);
+        ws.deinit(gpa);
+    }
+    scanLanguageArray("{ \"languages\" : [ \"fin\" ] }", &ws);
+    try std.testing.expectEqual(@as(usize, 1), ws.items.len);
+    try std.testing.expectEqualStrings("fin", ws.items[0]);
+
+    var none = std.ArrayList([]const u8).empty;
+    defer none.deinit(gpa);
+    scanLanguageArray("{\"name\":\"chartplotter\",\"scamin\":[1000]}", &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+    scanLanguageArray("{\"languages\":[]}", &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
 }

@@ -489,6 +489,16 @@ void tile57_chart_get_info(tile57_chart *chart, tile57_info *out);
 tile57_status tile57_chart_scamin(tile57_chart *chart, int32_t **out, size_t *out_len,
                             tile57_error *err);
 
+/* The label languages the chart states besides English, as ISO 639-2 codes,
+ * ascending. A host offers the mariner these and nothing else: a
+ * tile57_mariner.preferred_language outside the set draws the portrayed name,
+ * except on an S-57 chart, whose single national name is coded "und" and
+ * answers any language. TILE57_OK with *out pointing at *out_len
+ * NUL-terminated codes, or NULL/0 when the chart states none. One allocation
+ * holds the pointer array and the codes; free *out with tile57_free. */
+tile57_status tile57_chart_languages(tile57_chart *chart, const char *const **out,
+                            size_t *out_len, tile57_error *err);
+
 /* The chart's M_COVR(CATCOV=1) data-coverage polygons, from the coverage the
  * bake embedded in the archive metadata — the real coverage a host reports so
  * a quilt fills gaps to coarser charts (vs. the bounding box). ring() is called
