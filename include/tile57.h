@@ -1468,10 +1468,6 @@ typedef struct {
     uint8_t min_zoom;
     uint8_t max_zoom;   /* deepest zoom served (native windows + one fill-up overscale zoom) */
     uint32_t charts;    /* coverage-carrying charts held */
-    uint32_t skipped;   /* charts handed to the open that embed no usable coverage:
-                         * they own no ground and are absent from every composed
-                         * tile. Appended for ABI-append-safety; 0 on a zeroed
-                         * struct. */
     double west, south, east, north; /* union coverage bounds, degrees */
 } tile57_compose_meta;
 
@@ -1643,6 +1639,15 @@ tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, do
 
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_get_meta(tile57_compose *c, tile57_compose_meta *out);
+
+/* Charts handed to the open that embed no usable coverage: they own no ground
+ * and are absent from every composed tile, so a host reads this to tell a
+ * complete quilt from one with holes in it. 0 for a NULL handle.
+ *
+ * A call rather than a tile57_compose_meta field: that struct ends on a double
+ * with no padding left, so any field added to it moves the bounds and grows the
+ * struct a host already allocates. */
+uint32_t tile57_compose_skipped(tile57_compose *c);
 
 /* The deepest zoom the chart covering (lon,lat) can serve (its native window +
  * overscale fill-up). A host caps its per-view zoom-in here so it never magnifies
