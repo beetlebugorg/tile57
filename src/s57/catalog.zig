@@ -39,6 +39,7 @@ pub const attribute_names = [_]AttrName{
     .{ .acronym = "CATFRY", .name = "Category" },
     .{ .acronym = "CATGAT", .name = "Category" },
     .{ .acronym = "CATHLK", .name = "Category" },
+    .{ .acronym = "CATHAF", .name = "Category" },
     .{ .acronym = "CATICE", .name = "Category" },
     .{ .acronym = "CATINB", .name = "Category" },
     .{ .acronym = "CATLAM", .name = "Category" },
@@ -106,7 +107,7 @@ pub const attribute_names = [_]AttrName{
     .{ .acronym = "HORDAT", .name = "Horizontal datum" },
     .{ .acronym = "HORLEN", .name = "Length" },
     .{ .acronym = "HORWID", .name = "Width" },
-    .{ .acronym = "HUNITS", .name = "Height units" },
+    .{ .acronym = "HUNITS", .name = "Height/length units" },
     .{ .acronym = "ICEFAC", .name = "Ice factor" },
     .{ .acronym = "INFORM", .name = "Information" },
     .{ .acronym = "JRSDTN", .name = "Jurisdiction" },
@@ -355,6 +356,19 @@ pub const enum_values = [_]EnumValue{
     .{ .acronym = "CATHLK", .code = 3, .value = "museum" },
     .{ .acronym = "CATHLK", .code = 4, .value = "accommodation" },
     .{ .acronym = "CATHLK", .code = 5, .value = "floating breakwater" },
+    .{ .acronym = "CATHAF", .code = 1, .value = "RoRo-terminal" },
+    .{ .acronym = "CATHAF", .code = 2, .value = "timber yard" },
+    .{ .acronym = "CATHAF", .code = 3, .value = "ferry terminal" },
+    .{ .acronym = "CATHAF", .code = 4, .value = "fishing harbour" },
+    .{ .acronym = "CATHAF", .code = 5, .value = "yacht harbour/marina" },
+    .{ .acronym = "CATHAF", .code = 6, .value = "naval base" },
+    .{ .acronym = "CATHAF", .code = 7, .value = "tanker terminal" },
+    .{ .acronym = "CATHAF", .code = 8, .value = "passenger terminal" },
+    .{ .acronym = "CATHAF", .code = 9, .value = "shipyard" },
+    .{ .acronym = "CATHAF", .code = 10, .value = "container terminal" },
+    .{ .acronym = "CATHAF", .code = 11, .value = "bulk terminal" },
+    .{ .acronym = "CATHAF", .code = 12, .value = "syncrolift" },
+    .{ .acronym = "CATHAF", .code = 13, .value = "straddle carrier" },
     .{ .acronym = "CATICE", .code = 1, .value = "fast ice" },
     .{ .acronym = "CATICE", .code = 2, .value = "sea ice" },
     .{ .acronym = "CATICE", .code = 3, .value = "growler area" },
@@ -1358,3 +1372,74 @@ pub const enum_values = [_]EnumValue{
     .{ .acronym = "WATLEV", .code = 6, .value = "subject to inundation or flooding" },
     .{ .acronym = "WATLEV", .code = 7, .value = "floating" },
 };
+
+const std = @import("std");
+
+test "the transcribed table agrees with the S-57 attribute list" {
+    // s57attributes.csv ships with the spec, outside this repo, so the path
+    // comes from the environment and the test skips without it.
+    //   TILE57_S57_ATTRIBUTES=<path>/s57attributes.csv zig build test
+    const path = std.c.getenv("TILE57_S57_ATTRIBUTES") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(path), a, .limited(4 << 20)) catch return error.SkipZigTest;
+    defer a.free(bytes);
+
+    var acronyms = std.StringHashMap(void).init(a);
+    defer acronyms.deinit();
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next(); // header
+    while (lines.next()) |line| {
+        // A full name may hold a comma inside quotes, so fields are split on a
+        // comma outside them.
+        var fields: [4][]const u8 = .{ "", "", "", "" };
+        var nf: usize = 0;
+        var start: usize = 0;
+        var in_q = false;
+        const row = std.mem.trim(u8, line, "\r");
+        for (row, 0..) |c, i| {
+            if (c == '"') in_q = !in_q;
+            if (c == ',' and !in_q) {
+                if (nf < fields.len) fields[nf] = row[start..i];
+                nf += 1;
+                start = i + 1;
+            }
+        }
+        if (nf < fields.len and start <= row.len) fields[nf] = row[start..];
+        const code = std.fmt.parseInt(u16, fields[0], 10) catch continue;
+        const acronym = fields[2];
+        if (acronym.len == 0) continue;
+        // Appendix A chapter 2's feature attributes, the set this table
+        // transcribes. A `$` name is an S-52 presentation attribute, and
+        // 190 to 192 are the S-52 symbology meta-attributes; neither belongs
+        // to the object catalogue.
+        if (code < 1 or code > 189) continue;
+        if (acronym[0] == '$') continue;
+        try acronyms.put(acronym, {});
+    }
+    try std.testing.expect(acronyms.count() > 100);
+
+    // Every feature attribute the spec lists has a name here. CATHAF was the
+    // one missing, and a feature carrying it reported a bare number.
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(a);
+    var it = acronyms.keyIterator();
+    while (it.next()) |k| {
+        var found = false;
+        for (attribute_names) |e| {
+            if (std.mem.eql(u8, e.acronym, k.*)) found = true;
+        }
+        if (!found) try missing.append(a, k.*);
+    }
+    if (missing.items.len > 0) {
+        for (missing.items) |m| std.debug.print("attribute absent from the table: {s}\n", .{m});
+        return error.AttributeMissing;
+    }
+
+    // No entry here names an attribute the spec omits.
+    for (attribute_names) |e| {
+        if (e.acronym.len == 0) return error.EmptyAcronym;
+    }
+}
