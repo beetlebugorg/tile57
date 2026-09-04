@@ -3276,7 +3276,7 @@ pub const Chart = struct {
                         .portrayal_plain = cb2.portrayal_plain,
                         .portrayal_simplified = cb2.portrayal_simplified,
                         .portrayal_lights = cb2.portrayal_lights,
-                    .portrayal_national = cb2.portrayal_national,
+                        .portrayal_national = cb2.portrayal_national,
                     }};
                     scene.appendTile(surf, a, &one, z, qt.tx, qt.ty, self.pick_attrs) catch continue;
                 },
