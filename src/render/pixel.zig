@@ -501,6 +501,13 @@ pub const PixelSurface = struct {
         const self = sp(ctx);
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
+        // The national-language label, when the mariner selected it. The tile
+        // path bakes this as text_nat for a style to coalesce. A pixel surface
+        // resolves it here, the way it resolves depth_unit.
+        const shown = if (self.settings.national_names)
+            (try rs.nationalName(self.a, text, self.cur.name, self.cur.name_nat)) orelse text
+        else
+            text;
         const font_px: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);
         // LocalOffset is millimetres, converted inside pushText at the S-52
         // screen pitch (2.835 px/mm x device scale) — NOT via em units of the
@@ -513,7 +520,7 @@ pub const PixelSurface = struct {
         const haloed = false;
         if (self.fnt == null) return;
         const face = self.pickFace(style.weight, style.slant);
-        try self.pushText(face.f, face.idx, text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, style.group, .{
+        try self.pushText(face.f, face.idx, shown, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, style.group, .{
             .x = self.origin.x + @as(f32, @floatFromInt(at.x)) * self.scale,
             .y = self.origin.y + @as(f32, @floatFromInt(at.y)) * self.scale,
         });

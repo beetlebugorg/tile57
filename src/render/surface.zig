@@ -80,6 +80,25 @@ pub const TextStyle = struct {
 /// surfaces need not import s57/s101.
 pub const BAND_UNKNOWN: u8 = 255;
 
+/// The national-language twin of a label: NOBJNM substituted for the OBJNAM
+/// occurrence inside the portrayed string. A rule can wrap a name, as
+/// AnchorBerth does with "Nr %s", so substituting keeps the wrapper.
+///
+/// Returns null for a feature with no national name, for one with no OBJNAM
+/// (the portrayed label is already the national name, because the adapter
+/// gives that entry nameUsage 1), and for a label that does not contain the
+/// name. Every text instruction other than this feature's name takes the last
+/// case.
+pub fn nationalName(a: std.mem.Allocator, text: []const u8, name: []const u8, name_nat: []const u8) !?[]const u8 {
+    if (name_nat.len == 0 or name.len == 0) return null;
+    const at = std.mem.indexOf(u8, text, name) orelse return null;
+    const out = try a.alloc(u8, text.len - name.len + name_nat.len);
+    @memcpy(out[0..at], text[0..at]);
+    @memcpy(out[at..][0..name_nat.len], name_nat);
+    @memcpy(out[at + name_nat.len ..], text[at + name.len ..]);
+    return out;
+}
+
 pub const FeatureMeta = struct {
     display_priority: i64 = 0,
     /// S-101 DisplayPlane: 0 UnderRadar (default), 1 OverRadar. Outranks
@@ -97,9 +116,9 @@ pub const FeatureMeta = struct {
     // (AP(OVERSC01) over the cell's M_COVR coverage), shown only
     // while grossly overscale (denom < oscl, i.e. X2+)
     class: []const u8 = "", // S-57 object-class acronym (e.g. "LIGHTS")
-    /// OBJNAM and NOBJNM as the cell holds them. The portrayal rules pick one
-    /// string for the label, so the surface needs both to bake the national
-    /// twin beside it (scene.drawText).
+    /// OBJNAM and NOBJNM as the cell holds them. GetFeatureName returns one
+    /// string for the label, so a surface needs both to produce the national
+    /// twin (surface.nationalName).
     name: []const u8 = "",
     name_nat: []const u8 = "",
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""

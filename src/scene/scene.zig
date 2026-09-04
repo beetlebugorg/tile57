@@ -789,7 +789,7 @@ pub const TileSurface = struct {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try appendTextProps(s.a, &props, text, text_style); // text already shortened by engine
-        if (try nationalTwin(s.a, text, s.cur)) |nat|
+        if (try rs.nationalName(s.a, text, s.cur.name, s.cur.name_nat)) |nat|
             try props.append(s.a, .{ .key = "text_nat", .value = .{ .string = nat } });
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
@@ -1253,28 +1253,6 @@ fn textStyleFor(t: instructions.Text, f: s57.Feature, fmeta: rs.FeatureMeta) rs.
 /// Serialize a text label's props in the tile schema order. `text` arrives already
 /// shortened/resolved by the engine. A minimal label (empty halign — see
 /// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
-/// BAKE: the national-language twin of a label, stored as `text_nat` beside
-/// `text`, the way a dredged area's depth stores `text_ft`. Portrayal runs at
-/// bake time and GetFeatureName picks one string, so a host switching language
-/// at runtime needs both in the tile.
-///
-/// The rules wrap a name ("Nr %s" in AnchorBerth), so the twin substitutes
-/// NOBJNM for the OBJNAM occurrence rather than replacing the whole label.
-/// Returns null when the feature carries no national name, when it carries no
-/// OBJNAM (the label already IS the national name, adapter.zig gives it
-/// nameUsage 1), or when the label does not contain the name, which is every
-/// label that is not this feature's name.
-fn nationalTwin(a: Allocator, text: []const u8, meta: Meta) !?[]const u8 {
-    if (meta.name_nat.len == 0 or meta.name.len == 0) return null;
-    const at = std.mem.indexOf(u8, text, meta.name) orelse return null;
-    const out = try a.alloc(u8, text.len - meta.name.len + meta.name_nat.len);
-    @memcpy(out[0..at], text[0..at]);
-    @memcpy(out[at..][0..meta.name_nat.len], meta.name_nat);
-    const tail = text[at + meta.name.len ..];
-    @memcpy(out[at + meta.name_nat.len ..], tail);
-    return out;
-}
-
 fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, text_style: *const rs.TextStyle) !void {
     // Resolved body size: the FontSize modifier px, or 12 (oracle default). Drives
     // both the emitted font_size_px and the halo gate below.
@@ -3535,24 +3513,24 @@ test "augmentV3: vz/ep/lt/iso/mq/lsk precomputes" {
     try std.testing.expectEqual(@as(i64, 1), findP(lns[0].properties, "mq").?.int);
 }
 
-test "nationalTwin substitutes the national name inside the label" {
+test "nationalName substitutes the national name inside the label" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     const both = Meta{ .display_priority = 0, .name = "Shanghai", .name_nat = "上海" };
     // The plain label.
-    try std.testing.expectEqualStrings("上海", (try nationalTwin(a, "Shanghai", both)).?);
+    try std.testing.expectEqualStrings("上海", (try rs.nationalName(a, "Shanghai", both.name, both.name_nat)).?);
     // A rule that wraps the name keeps its wrapper (AnchorBerth uses "Nr %s").
-    try std.testing.expectEqualStrings("Nr 上海", (try nationalTwin(a, "Nr Shanghai", both)).?);
+    try std.testing.expectEqualStrings("Nr 上海", (try rs.nationalName(a, "Nr Shanghai", both.name, both.name_nat)).?);
 
     // A label that is not this feature's name has no twin.
-    try std.testing.expect((try nationalTwin(a, "Fl G 4s", both)) == null);
+    try std.testing.expect((try rs.nationalName(a, "Fl G 4s", both.name, both.name_nat)) == null);
     // No national name.
     const eng_only = Meta{ .display_priority = 0, .name = "Boston" };
-    try std.testing.expect((try nationalTwin(a, "Boston", eng_only)) == null);
+    try std.testing.expect((try rs.nationalName(a, "Boston", eng_only.name, eng_only.name_nat)) == null);
     // National name alone: the portrayed label already IS it, adapter.zig gives
     // that entry nameUsage 1.
     const nat_only = Meta{ .display_priority = 0, .name_nat = "日本" };
-    try std.testing.expect((try nationalTwin(a, "日本", nat_only)) == null);
+    try std.testing.expect((try rs.nationalName(a, "日本", nat_only.name, nat_only.name_nat)) == null);
 }

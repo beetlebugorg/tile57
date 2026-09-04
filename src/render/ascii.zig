@@ -342,8 +342,15 @@ pub const AsciiSurface = struct {
         const self = sp(ctx);
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
+        // The national-language label, when the mariner selected it. The tile
+        // path bakes this as text_nat for a style to coalesce. A character grid
+        // resolves it here, the way it resolves depth_unit.
+        const shown = if (self.settings.national_names)
+            (try rs.nationalName(self.a, text, self.cur.name, self.cur.name_nat)) orelse text
+        else
+            text;
         // First word only: a text grid earns its keep with placement, not prose.
-        const word = text[0 .. std.mem.indexOfScalar(u8, text, ' ') orelse text.len];
+        const word = shown[0 .. std.mem.indexOfScalar(u8, shown, ' ') orelse shown.len];
         if (word.len == 0) return;
         const cell = self.toCell(at);
         var col = cell.col;
