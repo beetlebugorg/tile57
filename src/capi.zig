@@ -1509,10 +1509,6 @@ const CComposeMeta = extern struct {
     min_zoom: u8,
     max_zoom: u8, // deepest zoom that can be served (native windows + one fill-up overscale zoom)
     charts: u32, // coverage-carrying charts held
-    // Charts handed to the open that embed no usable coverage, so they own no
-    // ground and are absent from every composed tile. Appended for
-    // ABI-append-safety; a zeroed struct reads 0.
-    skipped: u32,
     west: f64,
     south: f64,
     east: f64,
@@ -1961,12 +1957,17 @@ export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CCompo
         .min_zoom = src.minz,
         .max_zoom = src.loop_max,
         .charts = @intCast(src.readers.len),
-        .skipped = src.skipped,
         .west = src.bounds[0],
         .south = src.bounds[1],
         .east = src.bounds[2],
         .north = src.bounds[3],
     };
+}
+
+/// Charts handed to the open that embed no usable coverage. See tile57.h.
+export fn tile57_compose_skipped(handle: ?*compose.ComposeSource) callconv(.c) u32 {
+    const src = handle orelse return 0;
+    return src.skipped;
 }
 
 /// The deepest zoom the chart covering (lon,lat) can serve — the host caps its
