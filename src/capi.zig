@@ -948,6 +948,40 @@ export fn tile57_chart_scamin(handle: ?*Chart, out: ?*?[*]i32, out_len: ?*usize,
     return OK;
 }
 
+/// The label languages the chart states besides English, as NUL-terminated
+/// ISO 639-2 codes. A host offers the mariner these, because a
+/// `preferred_language` outside the set draws the portrayed name. One
+/// allocation holds the pointer array and the codes, so `tile57_free` on
+/// `*out` releases all of it.
+export fn tile57_chart_languages(handle: ?*Chart, out: ?*?[*]const [*:0]const u8, out_len: ?*usize, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, bad_out);
+    const n = out_len orelse return failWith(err, .badarg, bad_out);
+    o.* = null;
+    n.* = 0;
+    const s = handle orelse return failWith(err, .badarg, "chart must not be null");
+    const codes = s.languages() catch |e| return fail(err, e);
+    defer {
+        for (codes) |c| gpa.free(c);
+        gpa.free(codes);
+    }
+    if (codes.len == 0) return OK;
+
+    var bytes: usize = codes.len * @sizeOf([*:0]const u8);
+    for (codes) |c| bytes += c.len + 1;
+    const p = exportAlloc(bytes) orelse return failWith(err, .nomem, "out of memory");
+    const table: [*][*:0]const u8 = @ptrCast(@alignCast(p));
+    var at: usize = codes.len * @sizeOf([*:0]const u8);
+    for (codes, 0..) |c, i| {
+        @memcpy(p[at .. at + c.len], c);
+        p[at + c.len] = 0;
+        table[i] = @ptrCast(p + at);
+        at += c.len + 1;
+    }
+    o.* = table;
+    n.* = codes.len;
+    return OK;
+}
+
 const CCoverageCb = extern struct {
     ctx: ?*anyopaque,
     ring: *const fn (?*anyopaque, lonlat: [*]const f64, npts: usize) callconv(.c) void,

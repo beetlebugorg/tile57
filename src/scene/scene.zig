@@ -1082,14 +1082,17 @@ pub const VECTOR_LAYERS = mvt.VECTOR_LAYERS;
 /// the TileJSON, plus a "scamin" array of the distinct SCAMIN denominators present
 /// (ascending) so the client builds one native-minzoom bucket layer per value at
 /// load instead of probing tiles. Mirrors the Go pmtiles.Builder.metadata
-/// (vector_layers + scamin splice). `scamin` empty -> omit the field. `coverage_json`,
+/// (vector_layers + scamin splice). `scamin` empty -> omit the field.
+/// `languages` are the label languages the chart states besides English, as
+/// ISO 639-2 codes, spliced under a "languages" key so a host reads what a
+/// baked chart offers without decoding a tile. Empty -> omit the field. `coverage_json`,
 /// when non-null, is a per-cell coverage object (see `coverage.encodeJson`) spliced
 /// under a "coverage" key — a single-cell composite bake carries its own M_COVR there.
 /// `light_reach_json` (see `coverage.encodeLightReachJson`), when non-null, is the
 /// cell's sector-figure reach summary spliced under a "light_reach" key so the
 /// compositor can widen its tile addressing without re-portraying the cell.
 /// Caller owns the returned bytes (allocated in `a`).
-pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u8, light_reach_json: ?[]const u8) ![]const u8 {
+pub fn metadataJson(a: Allocator, scamin: []const u32, languages: []const []const u8, coverage_json: ?[]const u8, light_reach_json: ?[]const u8) ![]const u8 {
     var b = std.ArrayList(u8).empty;
     try b.appendSlice(a, "{\"name\":\"chartplotter\",\"format\":\"pbf\",\"vector_layers\":[");
     for (VECTOR_LAYERS, 0..) |name, i| {
@@ -1105,6 +1108,16 @@ pub fn metadataJson(a: Allocator, scamin: []const u32, coverage_json: ?[]const u
             if (i > 0) try b.append(a, ',');
             var nbuf: [16]u8 = undefined;
             try b.appendSlice(a, std.fmt.bufPrint(&nbuf, "{d}", .{v}) catch unreachable);
+        }
+        try b.append(a, ']');
+    }
+    if (languages.len > 0) {
+        try b.appendSlice(a, ",\"languages\":[");
+        for (languages, 0..) |lang, i| {
+            if (i > 0) try b.append(a, ',');
+            try b.append(a, '"');
+            try b.appendSlice(a, lang);
+            try b.append(a, '"');
         }
         try b.append(a, ']');
     }
@@ -3591,4 +3604,17 @@ test "nationalFor prefers the mariner's language and falls back to und" {
     try std.testing.expect(rs.nationalFor(&.{}, "zho") == null);
     const only_zho = [_]rs.NationalText{.{ .lang = "zho", .text = "\u{4e0a}\u{6d77}" }};
     try std.testing.expect(rs.nationalFor(&only_zho, "fin") == null);
+}
+
+test "metadataJson states the chart's languages" {
+    const a = std.testing.allocator;
+    const with = try metadataJson(a, &.{}, &.{ "und", "zho" }, null, null);
+    defer a.free(with);
+    try std.testing.expect(std.mem.indexOf(u8, with, "\"languages\":[\"und\",\"zho\"]") != null);
+
+    // A chart naming every feature in English states none, and the key is left
+    // out rather than written empty.
+    const without = try metadataJson(a, &.{}, &.{}, null, null);
+    defer a.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "languages") == null);
 }
