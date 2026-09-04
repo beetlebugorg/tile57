@@ -146,11 +146,12 @@ Depth soundings, drawn as digit glyph strings (SNDFRM digit composition).
 ### text
 
 Text labels (the name typically derives from `OBJNAM` via the `featureName`
-attribute).
+attribute; a feature with `NOBJNM` also gets `text_nat`).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `text` | string | The label text. |
+| `text_nat` | string | The same label with the feature's national-language name (`NOBJNM`) in place of `OBJNAM`, present only when the feature has one. A client reading it selects the national name without a re-bake. |
 | `font_size_px` | number | Font size in pixels. |
 | `color_token` | string | Text color name. |
 | `halo_color_token` | string | Halo color name (`""` = no halo). |

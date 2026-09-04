@@ -51,6 +51,13 @@ result is **best effort**:
 - **Missing S-101 content stays missing.** S-101 attributes and features with
   no S-57 source are never invented; rules that test them take their fallback
   branch.
+- **A national name has no language.** S-57 stores one `NOBJNM` per feature and
+  records only the lexical level of the text (part 3 clause 2.4), which is a
+  character repertoire rather than a language. The adapter converts it to a
+  second `featureName` tagged ISO 639-2 `und`, undetermined, so the
+  `national_names` setting selects the national name rather than a named
+  language. S-101 permits several `featureName` entries with distinct
+  languages; an S-57 source yields at most one.
 - **Unconvertible objects fall back or drop.** An S-57 object class with no
   S-101 equivalent portrays as the S-52 question mark (QUESMRK1) — or, where
   the S-65 guidance says the object is simply not carried into S-101 (e.g. an

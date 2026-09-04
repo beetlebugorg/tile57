@@ -52,6 +52,11 @@ typedef struct tile57_mariner {
                                      * it (that density is already in the requested
                                      * width/height). 1.0 = a 1x framebuffer; 0 reads as
                                      * 1.0. */
+    bool national_names;            /* label a feature with its national-language name
+                                     * (NOBJNM) where the cell has one. The bake stores
+                                     * that name beside the portrayed one, so this
+                                     * switches without a re-bake. A feature with only
+                                     * NOBJNM is labelled with it whatever this says. */
 } tile57_mariner;
 
 void tile57_mariner_defaults(tile57_mariner *m);   /* canonical defaults, date_view = "" */
