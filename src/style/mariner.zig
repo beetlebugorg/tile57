@@ -450,12 +450,12 @@ pub fn contourLabelField(b: B, m: *const Settings) !Value {
     });
 }
 
-// The label text-field. The bake stores two twins beside the portrayed string:
-// text_ft, a dredged area's depth in feet, and text_nat, a feature's
-// national-language name. Each setting reads its twin and falls back to `text`,
-// so a chart baked before a twin existed still labels.
+// The label text-field. The bake stores twins beside the portrayed string:
+// text_ft, a dredged area's depth in feet, and one text_<lang> per language the
+// chart states. Each setting reads its twin and falls back to `text`, so a
+// chart baked before a twin existed still labels.
 //
-// A feature has at most one of the two twins, so their relative order in the
+// A feature has at most one of the two kinds, so their relative order in the
 // coalesce has no effect.
 pub fn labelTextField(b: B, m: *const Settings) !Value {
     var terms: [6]Value = undefined;
