@@ -45,7 +45,7 @@ pub const CNode = struct {
         return cur;
     }
 
-    fn childList(self: *const CNode, code: []const u8) ?[]const CNode {
+    pub fn childList(self: *const CNode, code: []const u8) ?[]const CNode {
         for (self.children) |c| if (std.mem.eql(u8, c.code, code)) return c.nodes;
         return null;
     }
@@ -776,6 +776,23 @@ fn buildSurveyDateRange(a: std.mem.Allocator, children: *std.ArrayList(ChildEntr
         try sdr.addSimple("dateEnd", surend);
         try appendChild(a, children, "surveyDateRange", sdr.build());
     }
+}
+
+/// The chart's national language: the first featureName language across the
+/// adapted features that is not English. An S-57 cell has one national name per
+/// feature and the adapter tags it `und`; a native S-101 dataset states real
+/// ISO 639-2 codes. Null when every name is English, which is when a national
+/// portrayal pass has nothing to select.
+pub fn nationalLanguage(adapted: []const Adapted) ?[]const u8 {
+    for (adapted) |ad| {
+        const names = ad.root.childList("featureName") orelse continue;
+        for (names) |n| {
+            const lang = n.simpleValue("language") orelse continue;
+            if (n.simpleValue("name") == null) continue;
+            if (!std.mem.eql(u8, lang, "eng")) return lang;
+        }
+    }
+    return null;
 }
 
 /// Adapt all mappable features of a cell. Allocates into `a` (use an arena).
@@ -2259,4 +2276,36 @@ test "a repeated name attribute reads the same way the surface reads it" {
     try std.testing.expectEqualStrings("Eerste", adapted[0].root.resolve("featureName:2").?.simpleValue("name").?);
     try std.testing.expectEqualStrings("First", feats[0].attr(s57.ATTR_OBJNAM).?);
     try std.testing.expectEqualStrings("Eerste", feats[0].attr(s57.ATTR_NOBJNM).?);
+}
+
+test "nationalLanguage finds the non-English featureName language" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const both = [_]s57.Attr{
+        .{ .code = s57.ATTR_OBJNAM, .value = "Rossett Island" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "Rossett Inseln" },
+    };
+    const feats = [_]s57.Feature{.{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &both }};
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqualStrings("und", nationalLanguage(adapted).?);
+
+    // Every name in English: no national pass to run.
+    const eng = [_]s57.Attr{.{ .code = s57.ATTR_OBJNAM, .value = "Boston" }};
+    const f2 = [_]s57.Feature{.{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 13, .attrs = &eng }};
+    cell.features = &f2;
+    const a2 = try adaptCell(a, &cell);
+    try std.testing.expect(nationalLanguage(a2) == null);
 }

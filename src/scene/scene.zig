@@ -1248,12 +1248,15 @@ fn textStyleFor(t: instructions.Text, f: s57.Feature, fmeta: rs.FeatureMeta) rs.
 /// Serialize a text label's props in the tile schema order. `text` arrives already
 /// shortened/resolved by the engine. A minimal label (empty halign — see
 /// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
-/// The national twin of `label` for `f`, or "" when the feature has no NOBJNM
-/// and when the label does not hold the feature's OBJNAM.
-fn nationalLabel(a: Allocator, label: []const u8, f: s57.Feature) ![]const u8 {
-    const name = f.attr(s57.ATTR_OBJNAM) orelse return "";
-    const nat = f.attr(s57.ATTR_NOBJNM) orelse return "";
-    return (try rs.nationalName(a, label, name, nat)) orelse "";
+/// The national-language twin of text instruction `ti`, or "" when the
+/// national pass produced the same string. The two passes run the same rules
+/// over the same features, so the instruction at index `ti` is the same
+/// instruction with a different name selected.
+fn nationalText(a: Allocator, class: []const u8, nat_texts: []const instructions.Text, ti: usize, base_text: []const u8) ![]const u8 {
+    if (ti >= nat_texts.len) return "";
+    const nt = nat_texts[ti].text;
+    if (std.mem.eql(u8, nt, base_text)) return "";
+    return expandSeabedText(a, class, stripNameTag(nt));
 }
 
 fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, text_style: *const rs.TextStyle) !void {
@@ -1703,32 +1706,38 @@ fn variantDiffers(base: []const u8, variant: ?[]const u8) bool {
 /// display variants) through the Surface: parse each pass and hand it to
 /// processFeatureParsed, splitting into two passes only when a variant differs
 /// (S-52 boundary §8.6.1 / point-symbol §11.2.2 axes -> the bnd/pts tags).
-fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, lights: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+fn processFeatureInstr(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, instr: []const u8, plain: ?[]const u8, simplified: ?[]const u8, lights: ?[]const u8, national: ?[]const u8, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const base = try instructions.parse(a, instr);
+    // The national pass differs from the base only in the label text, so it
+    // travels as an alternative text list rather than a second drawn pass.
+    const nat_texts: []const instructions.Text = if (variantDiffers(instr, national))
+        (try instructions.parse(a, national.?)).texts
+    else
+        &.{};
     if (f.prim == 1) {
         // The sector-leg axis first: only LightSectored features carry a
         // lights variant, and none of those carries a simplified one, so the
         // two point axes never need a four-way split.
         if (variantDiffers(instr, lights)) {
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, 0, z, x, y, tb, box, opts, surf);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, nat_texts, 2, 2, 0, z, x, y, tb, box, opts, surf);
             const lp = try instructions.parse(a, lights.?);
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, lp, 2, 2, 1, z, x, y, tb, box, opts, surf);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, lp, nat_texts, 2, 2, 1, z, x, y, tb, box, opts, surf);
         } else if (variantDiffers(instr, simplified)) {
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 0, 2, z, x, y, tb, box, opts, surf);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, nat_texts, 2, 0, 2, z, x, y, tb, box, opts, surf);
             const sp2 = try instructions.parse(a, simplified.?);
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, sp2, 2, 1, 2, z, x, y, tb, box, opts, surf);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, sp2, nat_texts, 2, 1, 2, z, x, y, tb, box, opts, surf);
         } else {
-            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, 2, z, x, y, tb, box, opts, surf);
+            try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, nat_texts, 2, 2, 2, z, x, y, tb, box, opts, surf);
         }
         return;
     }
     if (f.prim == 3 and variantDiffers(instr, plain)) {
-        try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 1, 2, 2, z, x, y, tb, box, opts, surf);
+        try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, nat_texts, 1, 2, 2, z, x, y, tb, box, opts, surf);
         const pl = try instructions.parse(a, plain.?);
-        try processFeatureParsed(a, cell, f, fi, geo, geo_world, pl, 0, 2, 2, z, x, y, tb, box, opts, surf);
+        try processFeatureParsed(a, cell, f, fi, geo, geo_world, pl, nat_texts, 0, 2, 2, z, x, y, tb, box, opts, surf);
         return;
     }
-    try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, 2, 2, 2, z, x, y, tb, box, opts, surf);
+    try processFeatureParsed(a, cell, f, fi, geo, geo_world, base, nat_texts, 2, 2, 2, z, x, y, tb, box, opts, surf);
 }
 
 // Web-mercator equatorial circumference (m): converts a ground-distance sector leg
@@ -1857,7 +1866,7 @@ fn pickJson(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, pick: bool)
     return encodeS57Attrs(a, f) catch "";
 }
 
-fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: instructions.Portrayal, bnd: i64, pts: i64, sect: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
+fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?GeoParts, geo_world: ?GeoWorld, p: instructions.Portrayal, nat_texts: []const instructions.Text, bnd: i64, pts: i64, sect: i64, z: u8, x: u32, y: u32, tb: [4]f64, box: tile.Box, opts: CellOpts, surf: rs.Surface) !void {
     const scamin = effScamin(f, opts);
     const cell_name = if (opts.pick_attrs) cell.name else "";
     const fmeta = rs.FeatureMeta{
@@ -1919,10 +1928,10 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 try surf.drawSymbol(sym.symbol, pt, sym.rotation, SYMBOL_SCALE, sym.rot_north, .point, danger_depth);
                 try surf.endFeature();
             }
-            for (p.texts) |t| {
+            for (p.texts, 0..) |t, ti| {
                 var ts = textStyleFor(t, f, fmeta);
                 const label = try expandSeabedText(a, fmeta.class, stripNameTag(t.text));
-                ts.national = try nationalLabel(a, label, f);
+                ts.national = try nationalText(a, fmeta.class, nat_texts, ti, t.text);
                 try surf.beginFeature(&fmeta);
                 try surf.drawText(label, &ts, pt);
                 try surf.endFeature();
@@ -2051,10 +2060,10 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         if (featureAnchor(a, cell, f, fi, geo_parts)) |rp| {
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
-                for (p.texts) |t| {
+                for (p.texts, 0..) |t, ti| {
                     var ts = textStyleFor(t, f, fmeta);
                     const body = try expandSeabedText(a, fmeta.class, stripNameTag(t.text));
-                    ts.national = try nationalLabel(a, body, f);
+                    ts.national = try nationalText(a, fmeta.class, nat_texts, ti, t.text);
                     try surf.beginFeature(&fmeta);
                     if (dredgedDepth(f, surf, body)) |d| {
                         try surf.drawDepthText(d.value, d.trailer, &ts, cpt);
@@ -2368,6 +2377,9 @@ pub const CellRef = struct {
     portrayal_plain: ?[]const ?[]const u8 = null,
     portrayal_simplified: ?[]const ?[]const u8 = null,
     portrayal_lights: ?[]const ?[]const u8 = null,
+    /// PreferredLanguage pass: the same instructions with the national
+    /// featureName selected. Only the label text differs from `portrayal`.
+    portrayal_national: ?[]const ?[]const u8 = null,
     geo: ?GeoParts = null,
     /// World coords parallel to `geo` (precomputed projection) — lets the baker
     /// reproject line/area geometry per tile without per-point tan/log.
@@ -2448,7 +2460,7 @@ pub fn encodeTile(scratch: Allocator, out: Allocator, cells: []const CellRef, z:
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
         };
-        try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.portrayal_lights, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(a, surf, &mvt_surf, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.portrayal_lights, cr.portrayal_national, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 
     return surf.endScene(out);
@@ -2509,7 +2521,7 @@ pub fn appendTile(surf: rs.Surface, scratch: Allocator, cells: []const CellRef, 
             .light_range_m = cr.light_range_m,
             .only_fi = cr.only_fi,
         };
-        try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.portrayal_lights, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
+        try appendCellFeatures(scratch, surf, null, opts, cr.cell, cr.portrayal, cr.portrayal_plain, cr.portrayal_simplified, cr.portrayal_lights, cr.portrayal_national, cr.geo, cr.geo_world, cr.feat_bbox, z, x, y, tb, box);
     }
 }
 
@@ -2688,6 +2700,7 @@ fn appendCellFeatures(
     portrayal_plain: ?[]const ?[]const u8,
     portrayal_simplified: ?[]const ?[]const u8,
     portrayal_lights: ?[]const ?[]const u8,
+    portrayal_national: ?[]const ?[]const u8,
     geo: ?GeoParts,
     geo_world: ?GeoWorld,
     feat_bbox: ?[]const ?[4]f64,
@@ -2814,7 +2827,7 @@ fn appendCellFeatures(
         }
         if (f.objl == 163) {
             if (try symins.buildSyminsPortrayal(a, f)) |sp| {
-                try processFeatureParsed(a, cell.*, f, fi, geo, geo_world, sp, 2, 2, 2, z, x, y, tb, box, fopts, surf);
+                try processFeatureParsed(a, cell.*, f, fi, geo, geo_world, sp, &.{}, 2, 2, 2, z, x, y, tb, box, fopts, surf);
                 continue;
             }
         }
@@ -2825,7 +2838,8 @@ fn appendCellFeatures(
                 const plain: ?[]const u8 = if (portrayal_plain) |pp| (if (fi < pp.len) pp[fi] else null) else null;
                 const simplified: ?[]const u8 = if (portrayal_simplified) |pp| (if (fi < pp.len) pp[fi] else null) else null;
                 const lights: ?[]const u8 = if (portrayal_lights) |pp| (if (fi < pp.len) pp[fi] else null) else null;
-                try processFeatureInstr(a, cell.*, f, fi, geo, geo_world, s, plain, simplified, lights, z, x, y, tb, box, fopts, surf);
+                const national: ?[]const u8 = if (portrayal_national) |pp| (if (fi < pp.len) pp[fi] else null) else null;
+                try processFeatureInstr(a, cell.*, f, fi, geo, geo_world, s, plain, simplified, lights, national, z, x, y, tb, box, fopts, surf);
                 continue;
             }
         }
@@ -3085,7 +3099,7 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries display_pr
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = ATTR_SCAMIN, .value = "22000" }},
     };
-    try processFeatureInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_sc, 0, null, null, "DrawingPriority:7;PointInstruction:BOYLAT01", null, null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 0), ms.points.items.len);
     try std.testing.expectEqual(@as(usize, 1), ms.points_scamin.items.len);
     try std.testing.expectEqual(@as(i64, 7), findProp(ms.points_scamin.items[0].properties, "display_priority").?.int);
@@ -3099,7 +3113,7 @@ test "processFeatureInstr routes SCAMIN point to the bucket + carries display_pr
         .objl = 14,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try processFeatureInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_base, 0, null, null, "PointInstruction:BOYLAT01", null, null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 1), ms.points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "display_priority").?.int);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[0].properties, "scamin"));
@@ -3153,7 +3167,7 @@ test "processFeatureInstr tags pts 0/1 when a point's simplified symbol differs"
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
     // Paper -> BOYLAT01; simplified -> BOYLAT11. Two passes: pts=0 then pts=1.
-    try processFeatureInstr(a, cell, f, 0, null, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f, 0, null, null, "PointInstruction:BOYLAT01", null, "PointInstruction:BOYLAT11", null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 2), ms.points.items.len);
     try std.testing.expectEqual(@as(i64, 0), findProp(ms.points.items[0].properties, "pts").?.int);
     try std.testing.expectEqualStrings("BOYLAT01", findProp(ms.points.items[0].properties, "symbol_name").?.string);
@@ -3202,7 +3216,7 @@ test "processFeatureInstr tags bnd 1/0 when an area's plain boundary differs" {
     // Symbolized boundary draws a complex line; plain draws a simple stroke.
     const symbolized = "ColorFill:DEPMS;LineStyle:CTNARE51,,1,CHMGD;LineInstruction:CTNARE51";
     const plain = "ColorFill:DEPMS;LineStyle:_simple_,,1,CHMGD;LineInstruction:_simple_";
-    try processFeatureInstr(a, cell, f, 0, geo_one, null, symbolized, plain, null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f, 0, geo_one, null, symbolized, plain, null, null, null, 0, 0, 0, tb, box, .{}, surf);
     // Both passes emit the fill: one tagged bnd=1 (symbolized), one bnd=0 (plain).
     try std.testing.expectEqual(@as(usize, 2), ms.areas.items.len);
     try std.testing.expectEqual(@as(i64, 1), findProp(ms.areas.items[0].properties, "bnd").?.int);
@@ -3384,7 +3398,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "15.1" }},
     };
-    try processFeatureInstr(a, cell, f_wreck, 0, null, null, "DrawingPriority:12;PointInstruction:DANGER02", null, null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_wreck, 0, null, null, "DrawingPriority:12;PointInstruction:DANGER02", null, null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 1), ms.points.items.len);
     try std.testing.expectEqualStrings("DANGER01", findProp(ms.points.items[0].properties, "symbol_name").?.string);
     try std.testing.expectEqual(@as(f64, 15.1), findProp(ms.points.items[0].properties, "danger_depth").?.double);
@@ -3398,7 +3412,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .objl = 159,
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
     };
-    try processFeatureInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_nodep, 0, null, null, "PointInstruction:DANGER01", null, null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 2), ms.points.items.len);
     try std.testing.expectEqualStrings("DANGER01", findProp(ms.points.items[1].properties, "symbol_name").?.string);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[1].properties, "danger_depth"));
@@ -3412,7 +3426,7 @@ test "DANGER01/02 on a VALSOU danger normalizes + tags danger_depth/sym_deep for
         .refs = &.{.{ .name = .{ .rcnm = s57.RCNM_VI, .rcid = 1 }, .ornt = 255 }},
         .attrs = &.{.{ .code = s57.ATTR_VALSOU, .value = "4" }},
     };
-    try processFeatureInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, null, 0, 0, 0, tb, box, .{}, surf);
+    try processFeatureInstr(a, cell, f_buoy, 0, null, null, "PointInstruction:DANGER01", null, null, null, null, 0, 0, 0, tb, box, .{}, surf);
     try std.testing.expectEqual(@as(usize, 3), ms.points.items.len);
     try std.testing.expectEqual(@as(?mvt.Value, null), findProp(ms.points.items[2].properties, "sym_deep"));
 }
@@ -3507,30 +3521,22 @@ test "augmentV3: vz/ep/lt/iso/mq/lsk precomputes" {
     try std.testing.expectEqual(@as(i64, 1), findP(lns[0].properties, "mq").?.int);
 }
 
-test "nationalLabel substitutes the national name inside the label" {
+test "nationalText reports only a label the national pass changed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const both = [_]s57.Attr{
-        .{ .code = s57.ATTR_OBJNAM, .value = "Shanghai" },
-        .{ .code = s57.ATTR_NOBJNM, .value = "\u{4e0a}\u{6d77}" },
+    const nat = [_]instructions.Text{
+        .{ .text = "\u{4e0a}\u{6d77}", .color = "CHBLK", .font_size = 10 },
+        .{ .text = "Fl G 4s", .color = "CHBLK", .font_size = 10 },
     };
-    const f = s57.Feature{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &both };
 
-    try std.testing.expectEqualStrings("\u{4e0a}\u{6d77}", try nationalLabel(a, "Shanghai", f));
-    // A rule that wraps the name keeps its wrapper (AnchorBerth uses "Nr %s").
-    try std.testing.expectEqualStrings("Nr \u{4e0a}\u{6d77}", try nationalLabel(a, "Nr Shanghai", f));
-    // A label that is not this feature's name has no twin.
-    try std.testing.expectEqualStrings("", try nationalLabel(a, "Fl G 4s", f));
-
-    const eng_only = [_]s57.Attr{.{ .code = s57.ATTR_OBJNAM, .value = "Boston" }};
-    const fe = s57.Feature{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 13, .attrs = &eng_only };
-    try std.testing.expectEqualStrings("", try nationalLabel(a, "Boston", fe));
-
-    // National name alone: the portrayed label already is it, because the
-    // adapter gives that entry nameUsage 1.
-    const nat_only = [_]s57.Attr{.{ .code = s57.ATTR_NOBJNM, .value = "\u{65e5}\u{672c}" }};
-    const fn_ = s57.Feature{ .rcnm = 100, .rcid = 3, .prim = 3, .objl = 13, .attrs = &nat_only };
-    try std.testing.expectEqualStrings("", try nationalLabel(a, "\u{65e5}\u{672c}", fn_));
+    // The rules picked a different name for instruction 0.
+    try std.testing.expectEqualStrings("\u{4e0a}\u{6d77}", try nationalText(a, "BUAARE", &nat, 0, "Shanghai"));
+    // Instruction 1 is the same string in both passes, so it has no twin.
+    try std.testing.expectEqualStrings("", try nationalText(a, "LIGHTS", &nat, 1, "Fl G 4s"));
+    // A feature the national pass did not cover.
+    try std.testing.expectEqualStrings("", try nationalText(a, "BUAARE", &.{}, 0, "Shanghai"));
+    // An index past the national pass's texts.
+    try std.testing.expectEqualStrings("", try nationalText(a, "BUAARE", &nat, 5, "Shanghai"));
 }

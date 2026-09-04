@@ -174,24 +174,26 @@ test "ascii view: the national name replaces the portrayed one when asked" {
     geo[0] = parts;
 
     portray.setQuiet(true);
-    const streams = try portray.portrayCell(a, &cell, "");
+    // The variants pass runs the rules again with PreferredLanguage set, which
+    // is what produces the national label.
+    const cp = try portray.portrayCellVariants(a, &cell, "");
     var colors = try render.resolve.Colors.init(a, colorprofile_registry.entries[0].bytes);
 
     const draw = struct {
-        fn run(al: std.mem.Allocator, c: *s57.Cell, st: []const ?[]const u8, g: []?[][]s57.LonLat, col: *render.resolve.Colors, m: *const render.resolve.Settings, b: [4]f64) ![]const u8 {
+        fn run(al: std.mem.Allocator, c: *s57.Cell, st: portray.CellPortrayal, g: []?[][]s57.LonLat, col: *render.resolve.Colors, m: *const render.resolve.Settings, b: [4]f64) ![]const u8 {
             var as = render.ascii.AsciiSurface.initView(al, col, .day, m, 8.0, 64, 32, 256.0, tile.EXTENT);
-            const cells = [_]scene.CellRef{.{ .cell = c, .portrayal = st, .geo = g }};
+            const cells = [_]scene.CellRef{.{ .cell = c, .portrayal = st.base, .portrayal_national = st.national, .geo = g }};
             return scene.generateView(&as, al, al, &cells, (b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 8.0, false);
         }
     }.run;
 
     const off = render.resolve.Settings{};
-    const plain = try draw(a, &cell, streams, geo, &colors, &off, tb);
+    const plain = try draw(a, &cell, cp, geo, &colors, &off, tb);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Harwich") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Harwijk") == null);
 
     const on = render.resolve.Settings{ .national_names = true };
-    const national = try draw(a, &cell, streams, geo, &colors, &on, tb);
+    const national = try draw(a, &cell, cp, geo, &colors, &on, tb);
     try std.testing.expect(std.mem.indexOf(u8, national, "Harwijk") != null);
     try std.testing.expect(std.mem.indexOf(u8, national, "Harwich") == null);
 }

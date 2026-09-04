@@ -38,6 +38,17 @@ fn archivePaths(io: std.Io, a: std.mem.Allocator, dir: []const u8) ![]const []co
 // PNG, or the same op stream -> PdfCanvas -> a deterministic vector PDF with
 // real text objects. A view renders ONE whole scene across every covering
 // tile (labels + declutter over the full canvas, no seams).
+/// The language a national-name render portrays in: the chart's own national
+/// language, or English when every name is English. Written into `buf` because
+/// the portrayal context takes a NUL-terminated string.
+fn preferredLanguage(adapted: []const engine.s101.adapter.Adapted, buf: *[16]u8) [:0]const u8 {
+    const lang = engine.s101.adapter.nationalLanguage(adapted) orelse return "eng";
+    if (lang.len >= buf.len) return "eng";
+    @memcpy(buf[0..lang.len], lang);
+    buf[lang.len] = 0;
+    return buf[0..lang.len :0];
+}
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output: render.pixel.Output) !void {
     if (args.len < 4) {
         std.debug.print("usage: tile57 {s} <cell.000|bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--meta] [--scale F]\n" ++
@@ -195,13 +206,26 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
         };
         // A native S-101 dataset (.000, S-100 Part 10a) assembles + portrays without
         // the S-57 -> S-101 adapter; either format applies its .001.. update chain.
+        // A live render portrays once, so the national name is selected by
+        // portraying in that language rather than by baking a twin beside the
+        // label. Passing the language the cell states leaves a cell whose names
+        // are all English portraying as it did.
+        var lctx = pctx;
+        var lang_buf: [16]u8 = undefined;
         if (engine.s101.dataset.detect(data)) {
             const loaded = try engine.s101.native.parseDataset(a, data, readUpdates(io, a, path));
             cell = loaded.cell;
-            streams = try engine.portray.portrayCellWithAdapted(a, &cell, loaded.adapted, resolveRulesDir(rules), pctx);
+            if (m.national_names) lctx.preferred_language = preferredLanguage(loaded.adapted, &lang_buf);
+            streams = try engine.portray.portrayCellWithAdapted(a, &cell, loaded.adapted, resolveRulesDir(rules), lctx);
         } else {
             cell = try engine.s57.parseCellWithUpdates(a, data, readUpdates(io, a, path));
-            streams = try engine.portray.portrayCellWith(a, &cell, resolveRulesDir(rules), pctx);
+            if (m.national_names) {
+                const ad = try engine.s101.adapter.adaptCell(a, &cell);
+                lctx.preferred_language = preferredLanguage(ad, &lang_buf);
+                streams = try engine.portray.portrayCellWithAdapted(a, &cell, ad, resolveRulesDir(rules), lctx);
+            } else {
+                streams = try engine.portray.portrayCellWith(a, &cell, resolveRulesDir(rules), lctx);
+            }
         }
     }
     defer if (!from_bundle) cell.deinit();

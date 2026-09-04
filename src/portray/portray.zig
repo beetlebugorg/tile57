@@ -52,6 +52,7 @@ const CContext = extern struct {
     shallow_contour: f64,
     deep_contour: f64,
     safety_height: f64,
+    preferred_language: [*:0]const u8,
 };
 
 // Suppress the per-cell "[s101] portrayed …" stderr summary (extern in lua_shim.c).
@@ -263,6 +264,10 @@ pub const Context = struct {
     shallow_contour: f64 = 2,
     deep_contour: f64 = 30,
     safety_height: f64 = 0,
+    /// ISO 639-2 code the rules match featureName.language against. The
+    /// catalogue's GetFeatureName returns the entry whose language equals this
+    /// and falls back to the nameUsage 1 entry when none does.
+    preferred_language: [:0]const u8 = "eng",
 
     fn toC(self: Context) CContext {
         return .{
@@ -278,6 +283,7 @@ pub const Context = struct {
             .shallow_contour = self.shallow_contour,
             .deep_contour = self.deep_contour,
             .safety_height = self.safety_height,
+            .preferred_language = self.preferred_language.ptr,
         };
     }
 };
@@ -426,6 +432,11 @@ pub const CellPortrayal = struct {
     /// FullLightLines=true pass over sectored-light points only (S-52 §12.2.4
     /// full-length sector legs); the sect tag's variant axis.
     lights: ?[]const ?[]const u8 = null,
+    /// A pass with PreferredLanguage set to the chart's national language, so
+    /// GetFeatureName returns the national featureName where a feature has one.
+    /// Null when every name in the cell is English. Only the label text differs
+    /// from `base`, which is what scene bakes as the text_nat twin.
+    national: ?[]const ?[]const u8 = null,
 };
 
 /// Portray a cell three ways so the client can toggle boundary style (areas) and
@@ -470,5 +481,17 @@ pub fn portrayCellVariantsAdapted(arena: std.mem.Allocator, cell: *const s57.Cel
         cp.simplified = runAdapted(arena, cell, points.items, rules_dir, .{ .simplified_symbols = true }) catch null;
     if (lights.items.len > 0)
         cp.lights = runAdapted(arena, cell, lights.items, rules_dir, .{ .full_light_lines = true }) catch null;
+    if (adapter.nationalLanguage(adapted)) |lang| {
+        // The catalogue compares featureName.language against this, so the
+        // rules pick the national name and every other instruction the pass
+        // emits stays as it was.
+        var buf: [16]u8 = undefined;
+        if (lang.len < buf.len) {
+            @memcpy(buf[0..lang.len], lang);
+            buf[lang.len] = 0;
+            const z: [:0]const u8 = buf[0..lang.len :0];
+            cp.national = runAdapted(arena, cell, adapted, rules_dir, .{ .preferred_language = z }) catch null;
+        }
+    }
     return cp;
 }
