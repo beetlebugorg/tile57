@@ -119,7 +119,7 @@ tile57 png chart.pmtiles --view -76.48,38.974,15.1 --size 1024x768 -o out.png
 
 # Mariner settings
 tile57 png ... --safety 5 --safety-depth 5 --feet --palette night \
-               --no-names --plain --simplified --dq --scale 1.5
+               --no-names --language zho --plain --simplified --dq --scale 1.5
 ```
 
 ### From C (and therefore Go, Python, C++, …)

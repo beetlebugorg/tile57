@@ -510,6 +510,7 @@ pub const ATTR_QUASOU: u16 = 125; // quality of sounding measurement -> SNDFRM04
 pub const ATTR_TECSOU: u16 = 156; // technique of sounding measurement -> SNDFRM04 swept B1 (4,18)
 pub const ATTR_STATUS: u16 = 149; // status -> SNDFRM04 low-accuracy ring when existence-doubtful (18)
 pub const ATTR_OBJNAM: u16 = 116;
+pub const ATTR_NOBJNM: u16 = 301; // object name in national language (NATF)
 pub const ATTR_INFORM: u16 = 102; // information text -> `information` complex .text (ProcessNauticalInformation VG 90020)
 pub const ATTR_TXTDSC: u16 = 158; // external text-file name -> `information` complex .fileReference (VG 90021)
 pub const ATTR_CATZOC: u16 = 72; // M_QUAL category of zone of confidence
@@ -1184,6 +1185,60 @@ fn parseAttrsKeepDel(a: Allocator, data: []const u8) ![]Attr {
     return parseAttrs(a, data, true);
 }
 
+/// True when an ATTF/NATF field holds two bytes per character.
+///
+/// S-57 clause 2.4 puts general text at lexical level 0, 1 or 2, and level 2 is
+/// UCS-2. At that level the unit terminator is the two-byte code unit 0x001F,
+/// so `1F 00` separates the values. A single-byte split resyncs one byte early
+/// on such a field and reads every ATTL after the first from the wrong offset.
+///
+/// DSSI states the level in NALL. A producer writing UCS-2 while leaving NALL
+/// at 0 has been reported, so the encoding comes from the field's own shape:
+/// every terminator followed by a NUL, and an even number of bytes between
+/// terminators. A single-byte field matches only if every one of its attribute
+/// codes is a multiple of 256 and every value has even length.
+fn isDoubleByteField(data: []const u8) bool {
+    if (data.len < 4) return false;
+    var off: usize = 0;
+    var values: usize = 0;
+    var saw_nul = false;
+    while (off + 2 <= data.len) {
+        // At this level the field terminator is 1E 00, and the ISO 8211 layer
+        // strips a single-byte FT only, so the two bytes are still here.
+        if (data[off] == iso.FT) break;
+        off += 2; // ATTL
+        const end = std.mem.indexOfScalarPos(u8, data, off, iso.UT) orelse return false;
+        if ((end - off) % 2 != 0) return false;
+        values += 1;
+        if (end + 1 >= data.len) break; // the field ends at this terminator
+        if (data[end + 1] != 0x00) return false;
+        saw_nul = true;
+        off = end + 2;
+    }
+    // A single-byte field whose one value happens to have even length ends at
+    // its terminator with no NUL after it, so at least one terminator has to
+    // carry the second byte.
+    return values > 0 and saw_nul;
+}
+
+/// UCS-2 (lexical level 2) attribute text as UTF-8. An unpaired surrogate or an
+/// odd trailing byte reads as U+FFFD rather than failing the cell.
+fn ucs2ToUtf8(a: Allocator, s: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    while (i + 1 < s.len) : (i += 2) {
+        const u = @as(u21, s[i]) | (@as(u21, s[i + 1]) << 8);
+        const cp: u21 = if (u >= 0xD800 and u <= 0xDFFF) 0xFFFD else u;
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch {
+            try out.appendSlice(a, "\u{FFFD}");
+            continue;
+        };
+        try out.appendSlice(a, buf[0..n]);
+    }
+    return out.items;
+}
+
 fn parseAttrs(a: Allocator, data: []const u8, keep_del: bool) ![]Attr {
     var list = std.ArrayList(Attr).empty;
     // One attribute per UT terminator, so size the list once up front (absent /
@@ -1195,6 +1250,23 @@ fn parseAttrs(a: Allocator, data: []const u8, keep_del: bool) ![]Attr {
     // the arena once and slice the values out of that copy — one dupe instead
     // of a validate+dupe per attribute value. Any byte >= 0x80 (national /
     // Latin-1 text needing transcoding) falls through to the per-value path.
+    // A UCS-2 field is framed differently, so it is split before the
+    // single-byte paths below. Latin text in UCS-2 is all bytes under 0x80 and
+    // would otherwise take the ASCII fast path and be mis-framed.
+    if (isDoubleByteField(data)) {
+        var off2: usize = 0;
+        while (off2 + 2 <= data.len) {
+            if (data[off2] == iso.FT) break; // the field's own 1E 00
+            const code = u16le(data, off2);
+            off2 += 2;
+            const end = std.mem.indexOfScalarPos(u8, data, off2, iso.UT) orelse data.len;
+            const val = data[off2..end];
+            if (val.len > 0 and (keep_del or !isDelMarker(val)))
+                try list.append(a, .{ .code = code, .value = try ucs2ToUtf8(a, val) });
+            off2 = end + 2; // UT is two bytes at this level
+        }
+        return list.items;
+    }
     const all_ascii = blk: {
         for (data) |c| {
             if (c >= 0x80) break :blk false;
@@ -2586,4 +2658,67 @@ test "pointInRings: inside, outside, and inside a hole" {
 test {
     _ = iso8211;
     _ = decode;
+}
+
+test "a UCS-2 attribute field is framed and decoded two bytes per character" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // NOBJNM(301) = 上海, then OBJNAM(116) = Bay, both UCS-2 with the two-byte
+    // unit terminator. A producer stating NALL 0 while writing this has been
+    // reported, so the framing comes from the field.
+    const ucs2 = [_]u8{ 0x2D, 0x01, 0x0A, 0x4E, 0x77, 0x6D, iso.UT, 0x00 } ++
+        [_]u8{ 0x74, 0x00, 'B', 0x00, 'a', 0x00, 'y', 0x00, iso.UT, 0x00 };
+    try std.testing.expect(isDoubleByteField(&ucs2));
+    const attrs = try parseATTF(a, &ucs2);
+    try std.testing.expectEqual(@as(usize, 2), attrs.len);
+    try std.testing.expectEqual(@as(u16, 301), attrs[0].code);
+    try std.testing.expectEqualStrings("\u{4E0A}\u{6D77}", attrs[0].value);
+    try std.testing.expectEqual(@as(u16, 116), attrs[1].code);
+    try std.testing.expectEqualStrings("Bay", attrs[1].value);
+
+    // Latin text in UCS-2 is all bytes under 0x80, so the ASCII fast path would
+    // read it one byte at a time.
+    const latin = [_]u8{ 0x2D, 0x01, 'A', 0x00, 'B', 0x00, iso.UT, 0x00 };
+    const la = try parseATTF(a, &latin);
+    try std.testing.expectEqual(@as(usize, 1), la.len);
+    try std.testing.expectEqualStrings("AB", la[0].value);
+}
+
+test "a single-byte attribute field is left alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // One Latin-1 value of even length ending at the field's terminator. The
+    // shape a UCS-2 field has is a NUL after the terminator, which this lacks.
+    const one = [_]u8{ 0x2D, 0x01 } ++ "R\xF6ssett Inseln".* ++ [_]u8{iso.UT};
+    try std.testing.expect(!isDoubleByteField(&one));
+    const attrs = try parseATTF(a, &one);
+    try std.testing.expectEqual(@as(usize, 1), attrs.len);
+    try std.testing.expectEqualStrings("R\u{00F6}ssett Inseln", attrs[0].value);
+
+    // Two ASCII values, the everyday shape.
+    const two = [_]u8{ 116, 0 } ++ "Bay".* ++ [_]u8{iso.UT} ++ [_]u8{ 75, 0 } ++ "3".* ++ [_]u8{iso.UT};
+    try std.testing.expect(!isDoubleByteField(&two));
+    const ta = try parseATTF(a, &two);
+    try std.testing.expectEqual(@as(usize, 2), ta.len);
+    try std.testing.expectEqualStrings("Bay", ta[0].value);
+    try std.testing.expectEqualStrings("3", ta[1].value);
+}
+
+test "a UCS-2 field keeps its two-byte field terminator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The shape a real level 2 NATF has: the value, the two-byte UT, then the
+    // two-byte FT. parseFields strips a single-byte FT, so 1E 00 is still here.
+    const field = [_]u8{ 0x2C, 0x01, 0x2A, 0x6A, 0x99, 0x6C, 0x1A, 0x95, 0x30, 0x57, 0x7F, 0x89, 0x3A, 0x53, iso.UT, 0x00, iso.FT, 0x00 };
+    try std.testing.expect(isDoubleByteField(&field));
+    const attrs = try parseATTF(a, &field);
+    try std.testing.expectEqual(@as(usize, 1), attrs.len);
+    try std.testing.expectEqual(@as(u16, 300), attrs[0].code);
+    try std.testing.expectEqualStrings("\u{6A2A}\u{6C99}\u{951A}\u{5730}\u{897F}\u{533A}", attrs[0].value);
 }

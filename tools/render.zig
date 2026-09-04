@@ -38,6 +38,36 @@ fn archivePaths(io: std.Io, a: std.mem.Allocator, dir: []const u8) ![]const []co
 // PNG, or the same op stream -> PdfCanvas -> a deterministic vector PDF with
 // real text objects. A view renders ONE whole scene across every covering
 // tile (labels + declutter over the full canvas, no seams).
+/// The language a live render portrays in. The mariner's code wins when the
+/// chart states it. Failing that an S-57 national name answers, because S-57
+/// records no language for NOBJNM and the adapter tags it `und`. Written into
+/// `buf` because the portrayal context takes a NUL-terminated string.
+fn chartLanguage(a: std.mem.Allocator, adapted: []const engine.s101.adapter.Adapted, pref: []const u8, buf: *[16]u8) [:0]const u8 {
+    const langs = engine.s101.adapter.languages(a, adapted) catch return "eng";
+    var pick: []const u8 = "";
+    for (langs) |l| {
+        if (std.mem.eql(u8, l, pref)) pick = l;
+    }
+    if (pick.len == 0) {
+        for (langs) |l| {
+            if (std.mem.eql(u8, l, "und")) pick = l;
+        }
+    }
+    if (pick.len == 0 or pick.len >= buf.len) return "eng";
+    @memcpy(buf[0..pick.len], pick);
+    buf[pick.len] = 0;
+    return buf[0..pick.len :0];
+}
+
+/// Install a fallback face for scripts the bundled Noto Sans has no glyphs for,
+/// from the path in TILE57_FONT_FALLBACK. The bytes are leaked deliberately:
+/// render.font borrows them for the life of the process.
+fn loadFallbackFont(io: std.Io, a: std.mem.Allocator) void {
+    const p = std.c.getenv("TILE57_FONT_FALLBACK") orelse return;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(p), a, .limited(128 << 20)) catch return;
+    render.font.setFallback(bytes);
+}
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output: render.pixel.Output) !void {
     if (args.len < 4) {
         std.debug.print("usage: tile57 {s} <cell.000|bundle.pmtiles> <z> <x> <y> -o <out> [--size N] [--palette day|dusk|night] [--rules DIR] [--dq] [--meta] [--scale F]\n" ++
@@ -112,6 +142,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             m.deep_contour = std.fmt.parseFloat(f64, v) catch return usageErr("bad --deep");
         } else if (std.mem.eql(u8, arg, "--feet")) {
             m.depth_unit = .feet;
+        } else if (std.mem.eql(u8, arg, "--language")) {
+            m.preferred_language = f.next() orelse return usageErr("--language needs an ISO 639-2 code");
         } else if (std.mem.eql(u8, arg, "--no-names")) {
             m.text_names = false;
         } else if (std.mem.eql(u8, arg, "--no-light-text")) {
@@ -179,6 +211,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
         // streaming chart loader and `tile57 explore`) — a bare-.000 render of a
         // real NOAA cell without its updates shows stale/deleted features.
         engine.portray.setQuiet(true);
+        loadFallbackFont(io, a);
         // LIVE portrayal context: the mariner's real safety contour / depth /
         // contours / styles evaluate INSIDE the rules — the native win over
         // the tile path's fixed bake context.
@@ -193,13 +226,26 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
         };
         // A native S-101 dataset (.000, S-100 Part 10a) assembles + portrays without
         // the S-57 -> S-101 adapter; either format applies its .001.. update chain.
+        // A live render portrays once, so the national name is selected by
+        // portraying in that language rather than by baking a twin beside the
+        // label. Passing the language the cell states leaves a cell whose names
+        // are all English portraying as it did.
+        var lctx = pctx;
+        var lang_buf: [16]u8 = undefined;
         if (engine.s101.dataset.detect(data)) {
             const loaded = try engine.s101.native.parseDataset(a, data, readUpdates(io, a, path));
             cell = loaded.cell;
-            streams = try engine.portray.portrayCellWithAdapted(a, &cell, loaded.adapted, resolveRulesDir(rules), pctx);
+            if (m.preferred_language.len > 0) lctx.preferred_language = chartLanguage(a, loaded.adapted, m.preferred_language, &lang_buf);
+            streams = try engine.portray.portrayCellWithAdapted(a, &cell, loaded.adapted, resolveRulesDir(rules), lctx);
         } else {
             cell = try engine.s57.parseCellWithUpdates(a, data, readUpdates(io, a, path));
-            streams = try engine.portray.portrayCellWith(a, &cell, resolveRulesDir(rules), pctx);
+            if (m.preferred_language.len > 0) {
+                const ad = try engine.s101.adapter.adaptCell(a, &cell);
+                lctx.preferred_language = chartLanguage(a, ad, m.preferred_language, &lang_buf);
+                streams = try engine.portray.portrayCellWithAdapted(a, &cell, ad, resolveRulesDir(rules), lctx);
+            } else {
+                streams = try engine.portray.portrayCellWith(a, &cell, resolveRulesDir(rules), lctx);
+            }
         }
     }
     defer if (!from_bundle) cell.deinit();

@@ -34,6 +34,7 @@ pub const Backend = struct {
     portrayal_plain: ?[]const ?[]const u8 = null, // PlainBoundaries variant (areas)
     portrayal_simplified: ?[]const ?[]const u8 = null, // SimplifiedSymbols variant (points)
     portrayal_lights: ?[]const ?[]const u8 = null, // FullLightLines variant (sectored lights)
+    portrayal_national: []const scene.LangStreams = &.{}, // one pass per national language
     geo: ?scene.GeoParts = null, // line/area geometry assembled once (buildGeoCache)
     geo_world: ?scene.GeoWorld = null, // world coords parallel to geo (cheap reprojection)
     feat_bbox: ?[]const ?[4]f64 = null, // per-feature bbox for the per-tile spatial cull
@@ -756,7 +757,7 @@ const TileGenCtx = struct {
             // property — the renderer gates symbol declutter on it (render/gpu.zig
             // belowBandWindow). A cell with no compilation scale gets bandOf's 1:50k
             // default, the same default effScaminFloor uses above.
-            refs[nrefs] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .portrayal_lights = be.portrayal_lights, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .band = @intFromEnum(bandOf(be.cscl)), .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .sounding_scamin = scene.soundingScamin(be.cscl), .light_range_m = be.light_range_m };
+            refs[nrefs] = .{ .cell = &be.cell, .portrayal = be.portrayal, .portrayal_plain = be.portrayal_plain, .portrayal_simplified = be.portrayal_simplified, .portrayal_lights = be.portrayal_lights, .portrayal_national = be.portrayal_national, .geo = be.geo, .geo_world = be.geo_world, .feat_bbox = be.feat_bbox, .band = @intFromEnum(bandOf(be.cscl)), .suppress_fills = false, .suppress_patterns = false, .cover_clip = cover_clip, .suppress_lines = false, .suppress_points = false, .oscl = oscl, .overscale_hatch = !reach_only[j] and !holefill[j] and be.cscl > 0 and gf_tile < be.cscl and wins_somewhere, .eff_scamin_floor = effScaminFloor(be.cscl), .sounding_scamin = scene.soundingScamin(be.cscl), .light_range_m = be.light_range_m };
             nrefs += 1;
         }
         const mvt_bytes = scene.encodeTile(scratch, scratch, refs[0..nrefs], z, x, y, c.format, c.pick_attrs) catch return;

@@ -51,6 +51,12 @@ result is **best effort**:
 - **Missing S-101 content stays missing.** S-101 attributes and features with
   no S-57 source are never invented; rules that test them take their fallback
   branch.
+- **A national name has no language.** S-57 stores one `NOBJNM` per feature and
+  records only the lexical level of the text (part 3 clause 2.4), which is a
+  character repertoire rather than a language. The adapter converts it to a
+  second `featureName` tagged ISO 639-2 `und`, undetermined, so the
+  mariner's language setting reaches it whatever code they ask for. S-101 permits several `featureName` entries with distinct
+  languages. An S-57 source yields at most one.
 - **Unconvertible objects fall back or drop.** An S-57 object class with no
   S-101 equivalent portrays as the S-52 question mark (QUESMRK1) — or, where
   the S-65 guidance says the object is simply not carried into S-101 (e.g. an
@@ -94,6 +100,18 @@ result is **best effort**:
   arrow (CentreOnArea) is not yet ported.
 
 ## Display / style gaps
+
+- **The embedded font covers Latin, Greek and Cyrillic.** A label in another
+  script draws with the bundled Noto Sans, which has no glyphs for it, and comes
+  out as boxes. Point `TILE57_FONT_FALLBACK` at a TrueType file or collection
+  holding the script, and the pixel outputs draw each codepoint the bundled face
+  lacks from that one. The PDF and vector outputs embed a single face per label,
+  so a label mixing scripts still draws its fallback glyphs from the bundled
+  face there. A host that supplies its own face through the surface callbacks is
+  unaffected.
+- **A chart states more than four languages.** The bake runs a portrayal pass
+  per language and stores a text property per language, so it keeps the first
+  four it finds and drops the rest.
 
 - **Overscale hatch occlusion is tile-path only.** The S-52 §10.1.10 overscale
   indication (`OVERSC01`, see [architecture](./architecture.md)) is gated

@@ -2203,6 +2203,14 @@ export fn tile57_assets_free(out: ?*CAssets) callconv(.c) void {
 
 // ---- chart-style generation (mirrors tile57_mariner in tile57.h) -----------
 
+/// The mariner language as the ABI's fixed field. A code longer than the field
+/// holds is dropped, which reads as the portrayed name.
+fn langCode(s: []const u8) [4]u8 {
+    var out = [_]u8{0} ** 4;
+    if (s.len < out.len) @memcpy(out[0..s.len], s);
+    return out;
+}
+
 const CMariner = extern struct {
     scheme: c_int,
     shallow_contour: f64,
@@ -2264,6 +2272,11 @@ const CMariner = extern struct {
     // background so a raster chart beneath shows through, and engage the
     // DisplayPlane precedence. See tile57.h. Appended for ABI-append-safety.
     chart_over_image: bool,
+    // The mariner's label language, an ISO 639-2 code, or "" for the portrayed
+    // name. The bake stores each language the chart states beside that name, so
+    // this switches without a re-bake. Appended for ABI-append-safety; a zeroed
+    // struct keeps the portrayed name.
+    preferred_language: [4]u8,
 };
 
 /// The tri-state `soundings` field as the engine's optional bool.
@@ -2326,6 +2339,7 @@ fn marinerFromC(cm: *const CMariner) mariner.Settings {
         .sounding_size_scale = if (cm.sounding_size_scale > 0) cm.sounding_size_scale else 1.0,
         .device_scale = if (cm.device_scale > 0) cm.device_scale else 1.0,
         .chart_over_image = cm.chart_over_image,
+        .preferred_language = std.mem.sliceTo(&cm.preferred_language, 0),
         .viewing_groups_off = if (cm.viewing_groups_off != null and cm.viewing_groups_off_len > 0)
             cm.viewing_groups_off[0..cm.viewing_groups_off_len]
         else
@@ -2510,6 +2524,7 @@ export fn tile57_mariner_defaults(cm: ?*CMariner) callconv(.c) void {
         .sounding_size_scale = d.sounding_size_scale,
         .device_scale = d.device_scale,
         .chart_over_image = d.chart_over_image,
+        .preferred_language = langCode(d.preferred_language),
     };
 }
 

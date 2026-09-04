@@ -63,6 +63,13 @@ pub fn fillToken(token: ColorToken) struct { name: []const u8, alpha: u8 } {
 /// "swept to N" note). Surfaces emit/draw only what is specified — the mvt
 /// surface serializes just text/color/size for a minimal label; a pixel
 /// surface uses its defaults.
+/// One label in one language. `lang` is an ISO 639-2 code, or `und` for an
+/// S-57 national name, because S-57 records no language for NOBJNM.
+pub const NationalText = struct {
+    lang: []const u8,
+    text: []const u8,
+};
+
 pub const TextStyle = struct {
     color: ColorToken,
     font_size: f64,
@@ -73,12 +80,32 @@ pub const TextStyle = struct {
     offset_x: f64 = 0, // S-52 LocalOffset in mm (+x right / +y down)
     offset_y: f64 = 0,
     group: i64 = 0, // S-101 text group (§14.5)
+    /// This label in each language the chart states besides English. The scene
+    /// fills it from the per-language portrayal passes, a tile bakes each one
+    /// as `text_<lang>`, and replay reads them back, so both paths hand a
+    /// surface the same set. A surface picks by the mariner's language.
+    national: []const NationalText = &.{},
 };
 
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
 /// beginFeature / endFeature. All pick data is pre-computed by the engine so
 /// surfaces need not import s57/s101.
 pub const BAND_UNKNOWN: u8 = 255;
+
+/// The label a surface draws for the mariner's language `pref`, or null to
+/// draw the portrayed string. An exact language match wins. Failing that, an
+/// `und` entry answers any preference, because an S-57 cell states no language
+/// for its national name and a mariner asking for one wants it.
+pub fn nationalFor(alts: []const NationalText, pref: []const u8) ?[]const u8 {
+    if (pref.len == 0 or alts.len == 0) return null;
+    for (alts) |alt| {
+        if (std.mem.eql(u8, alt.lang, pref)) return alt.text;
+    }
+    for (alts) |alt| {
+        if (std.mem.eql(u8, alt.lang, "und")) return alt.text;
+    }
+    return null;
+}
 
 pub const FeatureMeta = struct {
     display_priority: i64 = 0,

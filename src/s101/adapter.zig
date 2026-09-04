@@ -45,7 +45,7 @@ pub const CNode = struct {
         return cur;
     }
 
-    fn childList(self: *const CNode, code: []const u8) ?[]const CNode {
+    pub fn childList(self: *const CNode, code: []const u8) ?[]const CNode {
         for (self.children) |c| if (std.mem.eql(u8, c.code, code)) return c.nodes;
         return null;
     }
@@ -778,6 +778,36 @@ fn buildSurveyDateRange(a: std.mem.Allocator, children: *std.ArrayList(ChildEntr
     }
 }
 
+/// The distinct non-English featureName languages a chart states, in the order
+/// they first appear. An S-57 cell yields at most `und`, because the adapter
+/// tags NOBJNM that way and S-57 records no language for it. A native S-101
+/// dataset yields its real ISO 639-2 codes.
+///
+/// Capped, because each one costs a portrayal pass at bake time and a text
+/// property per label in the tile. A chart naming its features in more
+/// languages than this keeps the first few.
+pub const max_languages = 4;
+
+pub fn languages(a: std.mem.Allocator, adapted: []const Adapted) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    for (adapted) |ad| {
+        const names = ad.root.childList("featureName") orelse continue;
+        for (names) |n| {
+            const lang = n.simpleValue("language") orelse continue;
+            if (n.simpleValue("name") == null) continue;
+            if (std.mem.eql(u8, lang, "eng")) continue;
+            var seen = false;
+            for (out.items) |h| {
+                if (std.mem.eql(u8, h, lang)) seen = true;
+            }
+            if (seen) continue;
+            try out.append(a, lang);
+            if (out.items.len == max_languages) return out.items;
+        }
+    }
+    return out.items;
+}
+
 /// Adapt all mappable features of a cell. Allocates into `a` (use an arena).
 pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
     var out = std.ArrayList(Adapted).empty;
@@ -811,6 +841,7 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
         var attrs = std.ArrayList(NameVal).empty;
         var children = std.ArrayList(ChildEntry).empty;
         var name: []const u8 = "";
+        var nat_name: []const u8 = "";
         // M_QUAL deconstructs (S-65 §2.2.3.1): five S-57 attributes feed the proper
         // S-101 complexes below instead of the generic name-for-name loop. M_SREL ->
         // Quality of Survey shares the surveyDateRange piece (§2.2.3.2).
@@ -824,7 +855,13 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             // serve the trimmed value so numeric strings parse cleanly.
             const v = std.mem.trim(u8, at.value, " ");
             if (v.len == 0) continue;
-            if (at.code == s57.ATTR_OBJNAM) name = v; // OBJNAM -> featureName
+            // First match, matching s57.Feature.attr, which scene.zig reads to
+            // build the label twin. S-57 types both as single valued, and
+            // mergeNatf does not dedupe within one NATF field, so a cell
+            // repeating either code would otherwise give the model one value
+            // and the surface another.
+            if (at.code == s57.ATTR_OBJNAM and name.len == 0) name = v; // OBJNAM -> featureName
+            if (at.code == s57.ATTR_NOBJNM and nat_name.len == 0) nat_name = v; // NOBJNM -> featureName
             // Consumed by buildQualityOfBathymetricData: forwarding them flat would be
             // model-noise (SOUACC aliases the *complex* verticalUncertainty itself,
             // SURSTA/SUREND the bare dateStart/dateEnd, CATZOC the bare category).
@@ -843,6 +880,8 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             // framework then ignores (isComplex("information")).
             switch (at.code) {
                 s57.ATTR_INFORM, s57.ATTR_TXTDSC => continue,
+                // NOBJNM feeds the featureName complex below, like OBJNAM.
+                s57.ATTR_NOBJNM => continue,
                 else => {},
             }
             if (catalogue.resolveAttrByCode(at.code)) |aname| {
@@ -862,14 +901,28 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             }
         }
 
-        // featureName[1] from OBJNAM. language + nameUsage are mandatory: the
-        // framework's GetFeatureName requires nameUsage (and prefers language=='eng');
-        // without them PortrayFeatureName emits no text (mirrors Go complex.go:90-92).
+        // featureName from OBJNAM and NOBJNM. language + nameUsage are mandatory:
+        // the framework's GetFeatureName requires nameUsage (and matches language
+        // against contextParameters.PreferredLanguage); without them
+        // PortrayFeatureName emits no text (mirrors Go complex.go:90-92).
+        //
+        // OBJNAM takes nameUsage 1, the entry GetFeatureName falls back to when no
+        // language matches. S-57 does not record which language NOBJNM is written
+        // in, so it takes ISO 639-2 "und", undetermined. A cell carrying only
+        // NOBJNM gives it nameUsage 1, which is what makes that name render at all.
+        // Only one entry may hold nameUsage 1.
         if (name.len > 0) {
             const subs = try a.alloc(NameVal, 3);
             subs[0] = .{ .name = "name", .value = name };
             subs[1] = .{ .name = "language", .value = "eng" };
-            subs[2] = .{ .name = "nameUsage", .value = "1" }; // selected even if language differs
+            subs[2] = .{ .name = "nameUsage", .value = "1" };
+            try appendChild(a, &children, "featureName", .{ .simple = subs });
+        }
+        if (nat_name.len > 0) {
+            const subs = try a.alloc(NameVal, 3);
+            subs[0] = .{ .name = "name", .value = nat_name };
+            subs[1] = .{ .name = "language", .value = "und" };
+            subs[2] = .{ .name = "nameUsage", .value = if (name.len > 0) "2" else "1" };
             try appendChild(a, &children, "featureName", .{ .simple = subs });
         }
         // M_QUAL -> Quality of Bathymetric Data: deconstruct CATZOC into the
@@ -2146,4 +2199,128 @@ test "Gap D: QualityOfSurvey restricts qualityOfHorizontalMeasurement to 4 (doub
     try std.testing.expectEqual(@as(usize, 1), adapted.len);
     try std.testing.expectEqualStrings("QualityOfSurvey", adapted[0].code);
     try std.testing.expectEqual(@as(?[]const u8, null), adapted[0].root.simpleValue("qualityOfHorizontalMeasurement"));
+}
+
+test "NOBJNM becomes a featureName the portrayal can select" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two BUAARE: one with both names, one with the national name alone.
+    const both = [_]s57.Attr{
+        .{ .code = s57.ATTR_OBJNAM, .value = "Shanghai" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "上海" },
+    };
+    const national_only = [_]s57.Attr{
+        .{ .code = s57.ATTR_NOBJNM, .value = "日本" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &both },
+        .{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 13, .attrs = &national_only },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 2), adapted.len);
+
+    // Both names present: OBJNAM holds nameUsage 1, so GetFeatureName returns it
+    // unless PreferredLanguage selects the other entry.
+    try std.testing.expectEqual(@as(usize, 2), adapted[0].root.childCount("featureName"));
+    const eng = adapted[0].root.resolve("featureName:1").?;
+    try std.testing.expectEqualStrings("Shanghai", eng.simpleValue("name").?);
+    try std.testing.expectEqualStrings("eng", eng.simpleValue("language").?);
+    try std.testing.expectEqualStrings("1", eng.simpleValue("nameUsage").?);
+    const nat = adapted[0].root.resolve("featureName:2").?;
+    try std.testing.expectEqualStrings("上海", nat.simpleValue("name").?);
+    try std.testing.expectEqualStrings("und", nat.simpleValue("language").?);
+    try std.testing.expectEqualStrings("2", nat.simpleValue("nameUsage").?);
+
+    // National name alone: it takes nameUsage 1, which is what makes it render.
+    // The feature carried no name at all before.
+    try std.testing.expectEqual(@as(usize, 1), adapted[1].root.childCount("featureName"));
+    const only = adapted[1].root.resolve("featureName:1").?;
+    try std.testing.expectEqualStrings("日本", only.simpleValue("name").?);
+    try std.testing.expectEqualStrings("1", only.simpleValue("nameUsage").?);
+
+    // NOBJNM feeds the complex, so it is not also forwarded as a flat attribute.
+    for (adapted[0].root.simple) |s| try std.testing.expect(!std.mem.eql(u8, s.value, "上海"));
+}
+
+test "a repeated name attribute reads the same way the surface reads it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // S-57 types OBJNAM and NOBJNM as single valued, and mergeNatf does not
+    // dedupe within one NATF field. s57.Feature.attr returns the first match
+    // and scene.zig reads it for the label twin, so the adapter takes the
+    // first too.
+    const dupes = [_]s57.Attr{
+        .{ .code = s57.ATTR_OBJNAM, .value = "First" },
+        .{ .code = s57.ATTR_OBJNAM, .value = "Second" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "Eerste" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "Tweede" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &dupes },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqualStrings("First", adapted[0].root.resolve("featureName:1").?.simpleValue("name").?);
+    try std.testing.expectEqualStrings("Eerste", adapted[0].root.resolve("featureName:2").?.simpleValue("name").?);
+    try std.testing.expectEqualStrings("First", feats[0].attr(s57.ATTR_OBJNAM).?);
+    try std.testing.expectEqualStrings("Eerste", feats[0].attr(s57.ATTR_NOBJNM).?);
+}
+
+test "languages lists the non-English featureName languages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const both = [_]s57.Attr{
+        .{ .code = s57.ATTR_OBJNAM, .value = "Rossett Island" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "Rossett Inseln" },
+    };
+    const feats = [_]s57.Feature{.{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &both }};
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    const langs = try languages(a, adapted);
+    try std.testing.expectEqual(@as(usize, 1), langs.len);
+    try std.testing.expectEqualStrings("und", langs[0]);
+
+    // Every name in English: no national pass to run.
+    const eng = [_]s57.Attr{.{ .code = s57.ATTR_OBJNAM, .value = "Boston" }};
+    const f2 = [_]s57.Feature{.{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 13, .attrs = &eng }};
+    cell.features = &f2;
+    const a2 = try adaptCell(a, &cell);
+    try std.testing.expectEqual(@as(usize, 0), (try languages(a, a2)).len);
 }

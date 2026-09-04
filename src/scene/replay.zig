@@ -82,6 +82,22 @@ fn metaFromProps(props: []const mvt.Prop) rs.FeatureMeta {
 
 /// Replay one decoded tile's layers as Surface calls (between the caller's
 /// begin/endScene). Layer names route exactly as TileSurface emitted them.
+/// The `text_<lang>` properties a tile holds for one label. The key after
+/// `text_` is the language code the scene baked it under.
+fn nationalTexts(a: Allocator, props: []const mvt.Prop) ![]const rs.NationalText {
+    var out = std.ArrayList(rs.NationalText).empty;
+    for (props) |p| {
+        if (!std.mem.startsWith(u8, p.key, "text_")) continue;
+        const lang = p.key["text_".len..];
+        if (lang.len == 0 or std.mem.eql(u8, lang, "ft")) continue; // the depth twin
+        switch (p.value) {
+            .string => |v| try out.append(a, .{ .lang = lang, .text = v }),
+            else => {},
+        }
+    }
+    return out.items;
+}
+
 pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLayer) !void {
     // Pre-scan the tile's depth-contour ladder (DEPCN valdco + DEPARE drval1)
     // so a render surface can snap the mariner's safety contour to the next
@@ -217,6 +233,10 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
                     .offset_x = ox,
                     .offset_y = oy,
                     .group = propInt(f.properties, "tgrp", 0),
+                    // Every language the bake stored beside the label, so a
+                    // surface reading a bundle sees the same set the scene
+                    // hands one reading a chart.
+                    .national = try nationalTexts(a, f.properties),
                 };
                 // A dredged area's depth was baked as its raw metres beside the
                 // metric string, so the surface writes it in the mariner's unit.

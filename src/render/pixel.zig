@@ -501,6 +501,10 @@ pub const PixelSurface = struct {
         const self = sp(ctx);
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
+        // The label in the mariner's language. The scene fills style.national
+        // and replay reads it back from the tile, so both paths arrive here
+        // the same way.
+        const shown = rs.nationalFor(style.national, self.settings.preferred_language) orelse text;
         const font_px: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);
         // LocalOffset is millimetres, converted inside pushText at the S-52
         // screen pitch (2.835 px/mm x device scale) — NOT via em units of the
@@ -513,7 +517,7 @@ pub const PixelSurface = struct {
         const haloed = false;
         if (self.fnt == null) return;
         const face = self.pickFace(style.weight, style.slant);
-        try self.pushText(face.f, face.idx, text, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, style.group, .{
+        try self.pushText(face.f, face.idx, shown, font_px, if (style.halign.len > 0) style.halign else "center", if (style.valign.len > 0) style.valign else "middle", ox, oy, self.resolveColor(style.color), haloed, style.group, .{
             .x = self.origin.x + @as(f32, @floatFromInt(at.x)) * self.scale,
             .y = self.origin.y + @as(f32, @floatFromInt(at.y)) * self.scale,
         });
@@ -521,6 +525,10 @@ pub const PixelSurface = struct {
 
     /// The parsed face + its cache index for a label's weight/slant, falling back
     /// to regular when the bold/italic face failed to load.
+    /// Glyph-cache face index for the fallback. 0, 1 and 2 are the bundled
+    /// regular, bold and italic faces.
+    const FALLBACK_FACE_IDX: u32 = 3;
+
     fn pickFace(self: *PixelSurface, weight: fontmod.Weight, slant: fontmod.Slant) struct { f: *const fontmod.Font, idx: u32 } {
         if (weight == .bold) if (self.fnt_bold) |*b| return .{ .f = b, .idx = 1 };
         if (slant == .italic) if (self.fnt_italic) |*i| return .{ .f = i, .idx = 2 };
@@ -546,12 +554,29 @@ pub const PixelSurface = struct {
 
         // Shape: glyph ids + pen positions (+ the PDF 1000/em advances).
         var gids = std.ArrayList(cv.Glyph).empty;
+        // The face each glyph came from, parallel to `gids`. A codepoint the
+        // run's face has no glyph for is drawn from the fallback face when one
+        // is installed, so a label in another script draws instead of boxes.
+        var faces = std.ArrayList(struct { f: *const fontmod.Font, idx: u32 }).empty;
         var pen: f32 = 0;
         var it = (std.unicode.Utf8View.init(text) catch return).iterator();
         while (it.nextCodepoint()) |cp| {
-            const gid = f.glyphIndex(cp);
-            const adv = f.advance(gid);
+            var gf = f;
+            var gidx = face_idx;
+            var gid = f.glyphIndex(cp);
+            if (gid == 0) {
+                if (fontmod.fallback) |*fb| {
+                    const fgid = fb.glyphIndex(cp);
+                    if (fgid != 0) {
+                        gf = fb;
+                        gidx = FALLBACK_FACE_IDX;
+                        gid = fgid;
+                    }
+                }
+            }
+            const adv = gf.advance(gid);
             try gids.append(self.a, .{ .gid = gid, .cp = cp, .x = pen, .w1000 = @intFromFloat(std.math.clamp(@round(adv * 1000.0), 0, 65535)) });
+            try faces.append(self.a, .{ .f = gf, .idx = gidx });
             pen += adv * px;
         }
         if (gids.items.len == 0) return;
@@ -571,8 +596,8 @@ pub const PixelSurface = struct {
 
         var rings = std.ArrayList([]const cv.Point).empty;
         var bbox = [4]f32{ std.math.floatMax(f32), std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) };
-        for (gids.items) |g| {
-            const contours = try self.glyphOutline(face, face_idx, g.gid);
+        for (gids.items, faces.items) |g, gf| {
+            const contours = try self.glyphOutline(gf.f, gf.idx, g.gid);
             for (contours) |contour| {
                 const pts = try self.a.alloc(cv.Point, contour.len);
                 for (contour, 0..) |p, i| {
