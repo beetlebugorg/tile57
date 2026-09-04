@@ -510,6 +510,7 @@ pub const ATTR_QUASOU: u16 = 125; // quality of sounding measurement -> SNDFRM04
 pub const ATTR_TECSOU: u16 = 156; // technique of sounding measurement -> SNDFRM04 swept B1 (4,18)
 pub const ATTR_STATUS: u16 = 149; // status -> SNDFRM04 low-accuracy ring when existence-doubtful (18)
 pub const ATTR_OBJNAM: u16 = 116;
+pub const ATTR_NOBJNM: u16 = 301; // object name in national language (NATF)
 pub const ATTR_INFORM: u16 = 102; // information text -> `information` complex .text (ProcessNauticalInformation VG 90020)
 pub const ATTR_TXTDSC: u16 = 158; // external text-file name -> `information` complex .fileReference (VG 90021)
 pub const ATTR_CATZOC: u16 = 72; // M_QUAL category of zone of confidence
