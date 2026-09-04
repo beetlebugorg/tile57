@@ -501,11 +501,11 @@ pub const PixelSurface = struct {
         const self = sp(ctx);
         if (!self.cur_visible) return;
         if (!resolve.textGroupVisible(style.group, self.settings)) return;
-        // The national-language label, when the mariner selected it. The tile
-        // path bakes this as text_nat for a style to coalesce. A pixel surface
-        // resolves it here, the way it resolves depth_unit.
-        const shown = if (self.settings.national_names)
-            (try rs.nationalName(self.a, text, self.cur.name, self.cur.name_nat)) orelse text
+        // The national-language label, when the mariner selected it. The scene
+        // fills style.national and replay reads it back from the tile, so both
+        // paths arrive here the same way.
+        const shown = if (self.settings.national_names and style.national.len > 0)
+            style.national
         else
             text;
         const font_px: f32 = @floatCast(if (style.font_size > 0) style.font_size else 12);

@@ -625,8 +625,6 @@ pub const TileSurface = struct {
             .scamin = meta.scamin,
             .oscl = meta.oscl,
             .class = meta.class,
-            .name = meta.name,
-            .name_nat = meta.name_nat,
             .s57 = meta.s57_json,
             .cell = meta.cell_name,
             .band = meta.band,
@@ -789,8 +787,8 @@ pub const TileSurface = struct {
         const s = sp(ctx);
         var props = std.ArrayList(mvt.Prop).empty;
         try appendTextProps(s.a, &props, text, text_style); // text already shortened by engine
-        if (try rs.nationalName(s.a, text, s.cur.name, s.cur.name_nat)) |nat|
-            try props.append(s.a, .{ .key = "text_nat", .value = .{ .string = nat } });
+        if (text_style.national.len > 0)
+            try props.append(s.a, .{ .key = "text_nat", .value = .{ .string = text_style.national } });
         try appendMeta(s.a, &props, s.cur);
         const parts = try s.a.alloc([]const mvt.Point, 1);
         const single = try s.a.alloc(mvt.Point, 1);
@@ -1131,9 +1129,6 @@ const Meta = struct {
     // fillPattern), NOT via appendMeta — points/lines/text don't need it.
     oscl: i64 = 0,
     class: []const u8 = "", // S-57 object-class acronym (M_QUAL, LIGHTS, …)
-    // OBJNAM and NOBJNM, for the national-language label twin (see nationalTwin).
-    name: []const u8 = "",
-    name_nat: []const u8 = "",
     // Cursor-pick report (S-52 §10.8) + dev feature inspector: the feature's full
     // S-57 attribute set as compact acronym->value JSON. "" = omitted (no reportable
     // attribute, or pick attributes disabled). See encodeS57Attrs / pickS57.
@@ -1253,6 +1248,14 @@ fn textStyleFor(t: instructions.Text, f: s57.Feature, fmeta: rs.FeatureMeta) rs.
 /// Serialize a text label's props in the tile schema order. `text` arrives already
 /// shortened/resolved by the engine. A minimal label (empty halign — see
 /// rs.TextStyle) carries only text/color/size, as the native fallbacks always did.
+/// The national twin of `label` for `f`, or "" when the feature has no NOBJNM
+/// and when the label does not hold the feature's OBJNAM.
+fn nationalLabel(a: Allocator, label: []const u8, f: s57.Feature) ![]const u8 {
+    const name = f.attr(s57.ATTR_OBJNAM) orelse return "";
+    const nat = f.attr(s57.ATTR_NOBJNM) orelse return "";
+    return (try rs.nationalName(a, label, name, nat)) orelse "";
+}
+
 fn appendTextProps(a: Allocator, props: *std.ArrayList(mvt.Prop), text: []const u8, text_style: *const rs.TextStyle) !void {
     // Resolved body size: the FontSize modifier px, or 12 (oracle default). Drives
     // both the emitted font_size_px and the halo gate below.
@@ -1865,8 +1868,6 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
         .scamin = scamin,
         .oscl = opts.oscl,
         .class = pickClass(cell, f, fi),
-        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
-        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = cell_name,
         .band = opts.band,
@@ -1919,9 +1920,11 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
                 try surf.endFeature();
             }
             for (p.texts) |t| {
-                const ts = textStyleFor(t, f, fmeta);
+                var ts = textStyleFor(t, f, fmeta);
+                const label = try expandSeabedText(a, fmeta.class, stripNameTag(t.text));
+                ts.national = try nationalLabel(a, label, f);
                 try surf.beginFeature(&fmeta);
-                try surf.drawText(try expandSeabedText(a, fmeta.class, stripNameTag(t.text)), &ts, pt);
+                try surf.drawText(label, &ts, pt);
                 try surf.endFeature();
             }
         }
@@ -2049,8 +2052,9 @@ fn processFeatureParsed(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize,
             if (rp.lon() >= tb[0] and rp.lon() <= tb[2] and rp.lat() >= tb[1] and rp.lat() <= tb[3]) {
                 const cpt = tile.project(rp.lon(), rp.lat(), z, x, y, tile.EXTENT);
                 for (p.texts) |t| {
-                    const ts = textStyleFor(t, f, fmeta);
+                    var ts = textStyleFor(t, f, fmeta);
                     const body = try expandSeabedText(a, fmeta.class, stripNameTag(t.text));
+                    ts.national = try nationalLabel(a, body, f);
                     try surf.beginFeature(&fmeta);
                     if (dredgedDepth(f, surf, body)) |d| {
                         try surf.drawDepthText(d.value, d.trailer, &ts, cpt);
@@ -2132,8 +2136,6 @@ fn emitSweptAreaFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         .display_priority = 6,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
-        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
-        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2197,8 +2199,6 @@ fn emitNavSystemFallback(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize
         .display_priority = 12,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
-        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
-        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2292,8 +2292,6 @@ fn emitDashedBoundary(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, g
         .display_priority = 6,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
-        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
-        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2633,8 +2631,6 @@ fn emitCentredSymbol(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, ge
         .display_category = cat,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
-        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
-        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -2666,8 +2662,6 @@ fn emitPickArea(a: Allocator, cell: s57.Cell, f: s57.Feature, fi: usize, geo: ?G
         .display_category = 2,
         .scamin = effScamin(f, opts),
         .class = pickClass(cell, f, fi),
-        .name = f.attr(s57.ATTR_OBJNAM) orelse "",
-        .name_nat = f.attr(s57.ATTR_NOBJNM) orelse "",
         .s57_json = pickJson(a, cell, f, fi, opts.pick_attrs),
         .cell_name = if (opts.pick_attrs) cell.name else "",
         .band = opts.band,
@@ -3513,24 +3507,30 @@ test "augmentV3: vz/ep/lt/iso/mq/lsk precomputes" {
     try std.testing.expectEqual(@as(i64, 1), findP(lns[0].properties, "mq").?.int);
 }
 
-test "nationalName substitutes the national name inside the label" {
+test "nationalLabel substitutes the national name inside the label" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const both = Meta{ .display_priority = 0, .name = "Shanghai", .name_nat = "上海" };
-    // The plain label.
-    try std.testing.expectEqualStrings("上海", (try rs.nationalName(a, "Shanghai", both.name, both.name_nat)).?);
-    // A rule that wraps the name keeps its wrapper (AnchorBerth uses "Nr %s").
-    try std.testing.expectEqualStrings("Nr 上海", (try rs.nationalName(a, "Nr Shanghai", both.name, both.name_nat)).?);
+    const both = [_]s57.Attr{
+        .{ .code = s57.ATTR_OBJNAM, .value = "Shanghai" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "\u{4e0a}\u{6d77}" },
+    };
+    const f = s57.Feature{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &both };
 
+    try std.testing.expectEqualStrings("\u{4e0a}\u{6d77}", try nationalLabel(a, "Shanghai", f));
+    // A rule that wraps the name keeps its wrapper (AnchorBerth uses "Nr %s").
+    try std.testing.expectEqualStrings("Nr \u{4e0a}\u{6d77}", try nationalLabel(a, "Nr Shanghai", f));
     // A label that is not this feature's name has no twin.
-    try std.testing.expect((try rs.nationalName(a, "Fl G 4s", both.name, both.name_nat)) == null);
-    // No national name.
-    const eng_only = Meta{ .display_priority = 0, .name = "Boston" };
-    try std.testing.expect((try rs.nationalName(a, "Boston", eng_only.name, eng_only.name_nat)) == null);
-    // National name alone: the portrayed label already IS it, adapter.zig gives
-    // that entry nameUsage 1.
-    const nat_only = Meta{ .display_priority = 0, .name_nat = "日本" };
-    try std.testing.expect((try rs.nationalName(a, "日本", nat_only.name, nat_only.name_nat)) == null);
+    try std.testing.expectEqualStrings("", try nationalLabel(a, "Fl G 4s", f));
+
+    const eng_only = [_]s57.Attr{.{ .code = s57.ATTR_OBJNAM, .value = "Boston" }};
+    const fe = s57.Feature{ .rcnm = 100, .rcid = 2, .prim = 3, .objl = 13, .attrs = &eng_only };
+    try std.testing.expectEqualStrings("", try nationalLabel(a, "Boston", fe));
+
+    // National name alone: the portrayed label already is it, because the
+    // adapter gives that entry nameUsage 1.
+    const nat_only = [_]s57.Attr{.{ .code = s57.ATTR_NOBJNM, .value = "\u{65e5}\u{672c}" }};
+    const fn_ = s57.Feature{ .rcnm = 100, .rcid = 3, .prim = 3, .objl = 13, .attrs = &nat_only };
+    try std.testing.expectEqualStrings("", try nationalLabel(a, "\u{65e5}\u{672c}", fn_));
 }

@@ -73,6 +73,11 @@ pub const TextStyle = struct {
     offset_x: f64 = 0, // S-52 LocalOffset in mm (+x right / +y down)
     offset_y: f64 = 0,
     group: i64 = 0, // S-101 text group (§14.5)
+    /// The national-language twin of this label ("" when the feature has no
+    /// NOBJNM). The scene fills it, a tile bakes it as `text_nat`, and replay
+    /// reads it back, so both paths hand a surface the same pair. This mirrors
+    /// the depth twin, where the raw metres go in `drawDepthText`.
+    national: []const u8 = "",
 };
 
 /// Per-feature S-52 metadata, bracketed around each feature's draw calls via
@@ -116,11 +121,6 @@ pub const FeatureMeta = struct {
     // (AP(OVERSC01) over the cell's M_COVR coverage), shown only
     // while grossly overscale (denom < oscl, i.e. X2+)
     class: []const u8 = "", // S-57 object-class acronym (e.g. "LIGHTS")
-    /// OBJNAM and NOBJNM as the cell holds them. GetFeatureName returns one
-    /// string for the label, so a surface needs both to produce the national
-    /// twin (surface.nationalName).
-    name: []const u8 = "",
-    name_nat: []const u8 = "",
     s57_json: []const u8 = "", // cursor-pick blob: acronym->value JSON or ""
     cell_name: []const u8 = "", // source ENC cell name or ""
     /// Usage band (tiles.band.Band ordinal) of the SOURCE cell, or BAND_UNKNOWN

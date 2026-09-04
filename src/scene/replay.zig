@@ -217,6 +217,10 @@ pub fn replayTile(a: Allocator, surf: rs.Surface, layers: []const mvt.DecodedLay
                     .offset_x = ox,
                     .offset_y = oy,
                     .group = propInt(f.properties, "tgrp", 0),
+                    // The national twin the bake stored beside the label, so a
+                    // surface reading a bundle sees the same pair the scene
+                    // hands one reading a chart.
+                    .national = propStr(f.properties, "text_nat"),
                 };
                 // A dredged area's depth was baked as its raw metres beside the
                 // metric string, so the surface writes it in the mariner's unit.

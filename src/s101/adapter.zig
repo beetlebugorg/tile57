@@ -825,8 +825,13 @@ pub fn adaptCell(a: std.mem.Allocator, cell: *const s57.Cell) ![]Adapted {
             // serve the trimmed value so numeric strings parse cleanly.
             const v = std.mem.trim(u8, at.value, " ");
             if (v.len == 0) continue;
-            if (at.code == s57.ATTR_OBJNAM) name = v; // OBJNAM -> featureName
-            if (at.code == s57.ATTR_NOBJNM) nat_name = v; // NOBJNM -> featureName
+            // First match, matching s57.Feature.attr, which scene.zig reads to
+            // build the label twin. S-57 types both as single valued, and
+            // mergeNatf does not dedupe within one NATF field, so a cell
+            // repeating either code would otherwise give the model one value
+            // and the surface another.
+            if (at.code == s57.ATTR_OBJNAM and name.len == 0) name = v; // OBJNAM -> featureName
+            if (at.code == s57.ATTR_NOBJNM and nat_name.len == 0) nat_name = v; // NOBJNM -> featureName
             // Consumed by buildQualityOfBathymetricData: forwarding them flat would be
             // model-noise (SOUACC aliases the *complex* verticalUncertainty itself,
             // SURSTA/SUREND the bare dateStart/dateEnd, CATZOC the bare category).
@@ -2218,4 +2223,40 @@ test "NOBJNM becomes a featureName the portrayal can select" {
 
     // NOBJNM feeds the complex, so it is not also forwarded as a flat attribute.
     for (adapted[0].root.simple) |s| try std.testing.expect(!std.mem.eql(u8, s.value, "上海"));
+}
+
+test "a repeated name attribute reads the same way the surface reads it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // S-57 types OBJNAM and NOBJNM as single valued, and mergeNatf does not
+    // dedupe within one NATF field. s57.Feature.attr returns the first match
+    // and scene.zig reads it for the label twin, so the adapter takes the
+    // first too.
+    const dupes = [_]s57.Attr{
+        .{ .code = s57.ATTR_OBJNAM, .value = "First" },
+        .{ .code = s57.ATTR_OBJNAM, .value = "Second" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "Eerste" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "Tweede" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &dupes },
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const adapted = try adaptCell(a, &cell);
+    try std.testing.expectEqualStrings("First", adapted[0].root.resolve("featureName:1").?.simpleValue("name").?);
+    try std.testing.expectEqualStrings("Eerste", adapted[0].root.resolve("featureName:2").?.simpleValue("name").?);
+    try std.testing.expectEqualStrings("First", feats[0].attr(s57.ATTR_OBJNAM).?);
+    try std.testing.expectEqualStrings("Eerste", feats[0].attr(s57.ATTR_NOBJNM).?);
 }
