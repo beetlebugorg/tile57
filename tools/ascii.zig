@@ -31,6 +31,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var kitty = false;
     var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
     var f = Flags{ .args = args, .i = 2 };
+    var national = false;
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "--view")) {
             const v = f.next() orelse return usageErr("--view needs lon,lat,zoom");
@@ -50,6 +51,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             palette = std.meta.stringToEnum(render.resolve.PaletteId, v) orelse return usageErr("palette must be day|dusk|night");
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules = f.next() orelse return usageErr("--rules needs a dir");
+        } else if (std.mem.eql(u8, arg, "--national-names")) {
+            national = true;
         } else if (std.mem.eql(u8, arg, "--ansi")) {
             ansi = true;
         } else if (std.mem.eql(u8, arg, "--tui")) {
@@ -91,6 +94,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer c.deinit();
 
     var m = render.resolve.Settings{ .display_other = true };
+    m.national_names = national;
     m.scheme = switch (palette) {
         .day => .day,
         .dusk => .dusk,

@@ -112,6 +112,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8, output:
             m.deep_contour = std.fmt.parseFloat(f64, v) catch return usageErr("bad --deep");
         } else if (std.mem.eql(u8, arg, "--feet")) {
             m.depth_unit = .feet;
+        } else if (std.mem.eql(u8, arg, "--national-names")) {
+            m.national_names = true;
         } else if (std.mem.eql(u8, arg, "--no-names")) {
             m.text_names = false;
         } else if (std.mem.eql(u8, arg, "--no-light-text")) {
