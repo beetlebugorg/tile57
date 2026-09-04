@@ -1203,6 +1203,9 @@ fn isDoubleByteField(data: []const u8) bool {
     var values: usize = 0;
     var saw_nul = false;
     while (off + 2 <= data.len) {
+        // At this level the field terminator is 1E 00, and the ISO 8211 layer
+        // strips a single-byte FT only, so the two bytes are still here.
+        if (data[off] == iso.FT) break;
         off += 2; // ATTL
         const end = std.mem.indexOfScalarPos(u8, data, off, iso.UT) orelse return false;
         if ((end - off) % 2 != 0) return false;
@@ -1253,6 +1256,7 @@ fn parseAttrs(a: Allocator, data: []const u8, keep_del: bool) ![]Attr {
     if (isDoubleByteField(data)) {
         var off2: usize = 0;
         while (off2 + 2 <= data.len) {
+            if (data[off2] == iso.FT) break; // the field's own 1E 00
             const code = u16le(data, off2);
             off2 += 2;
             const end = std.mem.indexOfScalarPos(u8, data, off2, iso.UT) orelse data.len;
@@ -2702,4 +2706,19 @@ test "a single-byte attribute field is left alone" {
     try std.testing.expectEqual(@as(usize, 2), ta.len);
     try std.testing.expectEqualStrings("Bay", ta[0].value);
     try std.testing.expectEqualStrings("3", ta[1].value);
+}
+
+test "a UCS-2 field keeps its two-byte field terminator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The shape a real level 2 NATF has: the value, the two-byte UT, then the
+    // two-byte FT. parseFields strips a single-byte FT, so 1E 00 is still here.
+    const field = [_]u8{ 0x2C, 0x01, 0x2A, 0x6A, 0x99, 0x6C, 0x1A, 0x95, 0x30, 0x57, 0x7F, 0x89, 0x3A, 0x53, iso.UT, 0x00, iso.FT, 0x00 };
+    try std.testing.expect(isDoubleByteField(&field));
+    const attrs = try parseATTF(a, &field);
+    try std.testing.expectEqual(@as(usize, 1), attrs.len);
+    try std.testing.expectEqual(@as(u16, 300), attrs[0].code);
+    try std.testing.expectEqualStrings("\u{6A2A}\u{6C99}\u{951A}\u{5730}\u{897F}\u{533A}", attrs[0].value);
 }
