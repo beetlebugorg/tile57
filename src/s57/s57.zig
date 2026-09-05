@@ -1155,11 +1155,23 @@ fn isDelMarker(v: []const u8) bool {
     if (v.len == 0) return false;
     // S-57 8.4.2.2 a, table 8.1: the delete character is (7/15) at lexical
     // levels 0 and 1, and (0/0)(7/15) at level 2.
-    if (v.len % 2 == 0) {
+    //
+    // At level 2 the unit terminator is two bytes as well, and the field scan
+    // that produced this value split on the single byte that ends it. A level-2
+    // value therefore includes the terminator's other half, a trailing NUL
+    // outside any character. Drop it before pairing up.
+    var s = v;
+    if (s.len % 2 == 1 and s[s.len - 1] == 0x00) s = s[0 .. s.len - 1];
+    // 7.2.2.1 orders multi-byte codes least significant byte first while the
+    // Annex A examples write the NUL first, so accept the pair either way
+    // rather than reading one producer's order as a name.
+    if (s.len >= 2 and s.len % 2 == 0) {
         var i: usize = 0;
         var all_l2 = true;
-        while (i + 1 < v.len) : (i += 2) {
-            if (v[i] != 0x00 or v[i + 1] != 0x7f) all_l2 = false;
+        while (i + 1 < s.len) : (i += 2) {
+            const hi = s[i];
+            const lo = s[i + 1];
+            if (!((hi == 0x00 and lo == 0x7f) or (hi == 0x7f and lo == 0x00))) all_l2 = false;
         }
         if (all_l2) return true;
     }
@@ -2469,6 +2481,25 @@ test "parseATTF drops an S-57 DEL (0x7F) attribute-delete marker" {
     try std.testing.expect(!isDelMarker("\x00"));
     try std.testing.expect(!isDelMarker("\x00\x7fA"));
     try std.testing.expect(!isDelMarker("\x00A"));
+
+    // Through a real level-2 field, where the terminator is two bytes as well.
+    // The value the field scan produces includes the terminator's other half,
+    // so a check written against the bare character alone never matches the
+    // bytes of an update file. Both byte orders the spec leaves open are
+    // exercised: NUL first, and least significant byte first.
+    const nul_first = [_]u8{ 45, 1, 0x00, 0x7f, 0x00, iso.UT } ++ [_]u8{ 137, 0 } ++ "90".* ++ [_]u8{iso.UT};
+    const kept_nf = try parseAttrsKeepDel(a, &nul_first);
+    try std.testing.expectEqual(@as(usize, 2), kept_nf.len);
+    try std.testing.expect(isDelMarker(kept_nf[0].value));
+    try std.testing.expect(!isDelMarker(kept_nf[1].value));
+
+    const lsb_first = [_]u8{ 45, 1, 0x7f, 0x00, iso.UT, 0x00 } ++ [_]u8{ 137, 0 } ++ "90".* ++ [_]u8{iso.UT};
+    const kept_lf = try parseAttrsKeepDel(a, &lsb_first);
+    try std.testing.expect(isDelMarker(kept_lf[0].value));
+
+    // The tombstone still has to be distinguishable from a level-2 name, so a
+    // value that merely ends in a NUL is not one.
+    try std.testing.expect(!isDelMarker("\x00A\x00"));
 }
 
 test "attrFloat / parseFloatOpt trim full ASCII whitespace (oracle TrimSpace)" {
