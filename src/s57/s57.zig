@@ -2025,6 +2025,23 @@ fn peekUpdateHeader(a: Allocator, bytes: []const u8) UpdateHeader {
     return h;
 }
 
+/// True when a base and an update name different editions, so the update was
+/// written against other data.
+///
+/// An update need not repeat the edition. NOAA writes EDTN 0 on an update that
+/// leaves the edition alone, beside a base at edition 10, and blank appears
+/// too. Only two stated editions can disagree. The compare is numeric, so a
+/// producer padding the field does not read as a different edition.
+fn edtnDiffers(base_edtn: []const u8, upd_edtn: []const u8) bool {
+    const b = std.mem.trim(u8, base_edtn, " ");
+    const u = std.mem.trim(u8, upd_edtn, " ");
+    if (b.len == 0 or u.len == 0) return false;
+    const bn = std.fmt.parseInt(u32, b, 10) catch return !std.mem.eql(u8, b, u);
+    const un = std.fmt.parseInt(u32, u, 10) catch return !std.mem.eql(u8, b, u);
+    if (un == 0) return false; // the update names no edition
+    return bn != un;
+}
+
 pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []const []const u8) !Cell {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -2119,7 +2136,7 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
             // failing, so the error reads as a plausible position.
             if (up.comf != params.comf or up.somf != params.somf) break;
         }
-        if (uh.edtn.len > 0 and base_edtn.len > 0 and !std.mem.eql(u8, uh.edtn, base_edtn)) break;
+        if (edtnDiffers(base_edtn, uh.edtn)) break;
         if (uh.updn.len > 0) {
             const got = std.fmt.parseInt(u32, std.mem.trim(u8, uh.updn, " "), 10) catch break;
             // No update can follow the largest UPDN value, so a
@@ -2999,6 +3016,28 @@ test "an update out of sequence or against another edition stops the chain" {
     var other_edition = try parseCellWithUpdates(gpa, base.items, &.{wrong_edtn.items});
     defer other_edition.deinit();
     try std.testing.expectEqual(@as(usize, 0), other_edition.updates_applied);
+
+    // An update leaving the edition alone applies. NOAA writes EDTN 0 on such
+    // an update, beside a base at edition 2, and reading the 0 as a different
+    // edition dropped the update from 184 of the 2129 cells in one exchange
+    // set that carry one.
+    var edtn_zero = std.ArrayList(u8).empty;
+    defer edtn_zero.deinit(gpa);
+    var b4: [64]u8 = undefined;
+    try iso.writeRecord(gpa, &edtn_zero, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &edtn_zero, 'D', &.{.{ .tag = "DSID", .data = dsidFor("0", "1", &b4) }});
+    try iso.writeRecord(gpa, &edtn_zero, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var unstated = try parseCellWithUpdates(gpa, base.items, &.{edtn_zero.items});
+    defer unstated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), unstated.updates_applied);
+
+    // A padded edition is the same edition.
+    try std.testing.expect(!edtnDiffers("2", " 2 "));
+    try std.testing.expect(!edtnDiffers("2", "02"));
+    try std.testing.expect(!edtnDiffers("10", "0"));
+    try std.testing.expect(!edtnDiffers("", "3"));
+    try std.testing.expect(edtnDiffers("2", "3"));
 }
 
 test "an update declaring other coordinate factors stops the chain" {
