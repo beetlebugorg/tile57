@@ -611,6 +611,9 @@ pub const Cell = struct {
     /// report's "source cell" badge. Set by the loader from the filename stem after
     /// parse (the parser sees only bytes); "" when unknown (the `cell` prop is omitted).
     name: []const u8 = "",
+    /// Update files applied whole. Short of the chain supplied when one failed
+    /// to merge, which stops the chain and keeps the cell.
+    updates_applied: usize = 0,
     vectors: []VectorRecord,
     features: []const Feature,
     nodes: std.AutoHashMap(u64, LonLat), // (rcnm<<32|rcid) -> point (VI/VC)
@@ -2035,8 +2038,41 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     }
 
     try mergeFile(a, &feats, &fidx, &vecs, &vidx, base_bytes, comf, somf, false);
+
+    // A broken update stops the chain and keeps the cell. A cell applied
+    // through update 3 is a chart, and dropping it because update 4 is corrupt
+    // leaves the mariner with none. chart.readCellFiles applies the same
+    // policy for the read; this is the parse.
+    //
+    // mergeFile edits feats and vecs in place, so a file that fails part way
+    // through has already modified records. Snapshot the lists and the indices
+    // before each file and restore them on failure, which leaves the cell at
+    // the last update that applied whole.
+    var applied: usize = 0;
     for (updates) |u| {
-        try mergeFile(a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true);
+        const feats_snap = try gpa.dupe(?Feature, feats.items);
+        defer gpa.free(feats_snap);
+        const vecs_snap = try gpa.dupe(?VectorRecord, vecs.items);
+        defer gpa.free(vecs_snap);
+        var fidx_snap = try fidx.clone();
+        var vidx_snap = try vidx.clone();
+
+        if (mergeFile(a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true)) |_| {
+            fidx_snap.deinit();
+            vidx_snap.deinit();
+        } else |_| {
+            feats.clearRetainingCapacity();
+            try feats.appendSlice(a, feats_snap);
+            vecs.clearRetainingCapacity();
+            try vecs.appendSlice(a, vecs_snap);
+            fidx.deinit();
+            fidx = fidx_snap;
+            vidx.deinit();
+            vidx = vidx_snap;
+            break;
+        }
+        applied += 1;
+
         // Merge the update's DSID: non-empty identity fields revise the base.
         // The update just strict-parsed cleanly in mergeFile, so the tolerant
         // walk here sees the same records.
@@ -2110,7 +2146,7 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
         if (f.foid != 0) try foid_index.put(a, f.foid, i);
     }
 
-    return .{ .params = params, .dsid = dsid, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .foid_index = foid_index, .arena = arena };
+    return .{ .params = params, .dsid = dsid, .updates_applied = applied, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .foid_index = foid_index, .arena = arena };
 }
 
 // ---- tests --------------------------------------------------------------
@@ -2731,4 +2767,49 @@ test "a spatial MODIFY carrying ATTV updates QUAPOS" {
     try iso.writeRecord(gpa, &upd2, 'D', &.{.{ .tag = "VRID", .data = &vrid_mod2 }});
     try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd2.items, 1, 1, true);
     try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
+}
+
+test "a broken update stops the chain and keeps the cell" {
+    // chart.readCellFiles sets the policy for the read: an ENC applied
+    // through update 3 is a chart. The parse dropped the whole cell instead,
+    // base included, when a later update failed to merge.
+    const gpa = std.testing.allocator;
+
+    // FRID: RCNM=100 RCID=9 PRIM=1 GRUP=2 OBJL=17(BOYLAT) RVER RUIN
+    const frid_base = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 1, 0, 1 }; // insert
+    const frid_mod = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 }; // modify
+    const frid_ghost = [_]u8{ 100, 77, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 }; // modify a record that is absent
+    const attf_base = [_]u8{ 116, 0 } ++ "Base".* ++ [_]u8{iso.UT}; // OBJNAM
+    const attf_upd = [_]u8{ 116, 0 } ++ "Update one".* ++ [_]u8{iso.UT};
+
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "ATTF", .data = &attf_base } });
+
+    var up1 = std.ArrayList(u8).empty;
+    defer up1.deinit(gpa);
+    try iso.writeRecord(gpa, &up1, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &up1, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var up2 = std.ArrayList(u8).empty;
+    defer up2.deinit(gpa);
+    try iso.writeRecord(gpa, &up2, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &up2, 'D', &.{.{ .tag = "FRID", .data = &frid_ghost }});
+
+    var cell = try parseCellWithUpdates(gpa, base.items, &.{ up1.items, up2.items });
+    defer cell.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), cell.updates_applied);
+    try std.testing.expectEqual(@as(usize, 1), cell.features.len);
+    var name: []const u8 = "";
+    for (cell.features[0].attrs) |at| if (at.code == 116) {
+        name = at.value;
+    };
+    try std.testing.expectEqualStrings("Update one", name);
+
+    // The whole chain applies when every file merges.
+    var ok = try parseCellWithUpdates(gpa, base.items, &.{up1.items});
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ok.updates_applied);
 }
