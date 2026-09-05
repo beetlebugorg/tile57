@@ -388,7 +388,7 @@ fn cdup(bytes: []const u8) ?[*]u8 {
 // copy of the path. Cells that don't read / have no coverage bbox are skipped (both
 // lists), keeping meta[i] and paths[i] aligned with the streaming cell index.
 fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8)) !void {
-    const bytes = dir.readFileAlloc(io, relpath, gpa, .unlimited) catch return;
+    const bytes = dir.readFileAlloc(io, relpath, gpa, .limited(MAX_CELL_BYTES)) catch return;
     defer gpa.free(bytes);
     const m = s57.peekMeta(gpa, bytes) orelse return;
     const bb = m.bounds orelse return;
@@ -403,7 +403,7 @@ fn pathRead(user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool
     const ctx: *PathCtx = @ptrCast(@alignCast(user orelse return false));
     if (index >= ctx.paths.len) return false;
     const bpath = ctx.paths[index];
-    const base = ctx.dir.readFileAlloc(ctx.io, bpath, gpa, .unlimited) catch return false;
+    const base = ctx.dir.readFileAlloc(ctx.io, bpath, gpa, .limited(MAX_CELL_BYTES)) catch return false;
     defer gpa.free(base);
     const cbase = cdup(base) orelse return false;
     out.* = .{ .base = cbase, .base_len = base.len };
@@ -417,7 +417,7 @@ fn pathRead(user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool
     while (u <= 999) : (u += 1) {
         const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
         defer gpa.free(upn);
-        const ub = ctx.dir.readFileAlloc(ctx.io, upn, gpa, .unlimited) catch break;
+        const ub = ctx.dir.readFileAlloc(ctx.io, upn, gpa, .limited(MAX_CELL_BYTES)) catch break;
         defer gpa.free(ub);
         const cub = cdup(ub) orelse break;
         ulens.append(gpa, ub.len) catch {
