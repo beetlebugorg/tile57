@@ -1855,10 +1855,12 @@ fn mergeFile(
                         ex.vptrs = v.vptrs;
                         deriveEndpoints(ex);
                     }
-                    // The oracle's spatial MODIFY (updates.go:288-348) updates only
-                    // coordinates and vector pointers — it never re-reads ATTV, so a
-                    // modified record keeps its base QUAPOS. Match that for byte-parity
-                    // (don't refresh ex.quapos from the update's ATTV here).
+                    // S-57 8.4.3.2 a: an ATTV in an update record inserts the
+                    // attribute when the target lacks it and replaces the value
+                    // when the target has it. QUAPOS drives the S-52 low
+                    // accuracy line style, so an update downgrading a survey
+                    // has to reach the target record.
+                    if (flds.attv != null) ex.quapos = v.quapos;
                 } else return error.ModifyMissingSpatial;
                 continue;
             }
@@ -2681,4 +2683,52 @@ test "a catalogue entry naming a file outside the exchange set is dropped" {
     try std.testing.expect(!safeCatalogPath("../B.000"));
     try std.testing.expect(!safeCatalogPath("A/../../B.000"));
     try std.testing.expect(!safeCatalogPath(""));
+}
+
+test "a spatial MODIFY carrying ATTV updates QUAPOS" {
+    // A resurvey downgrading a stretch of coastline ships VRID{RUIN=modify}
+    // with ATTV{QUAPOS=4} and no coordinates. S-57 8.4.3.2 a replaces the
+    // value on the target record. Keeping the base value drew an approximate
+    // position as a confident solid line.
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // VRID: RCNM=130(VE) RCID=4471 RVER RUIN
+    const vrid_base = [_]u8{ 130, 0x77, 0x11, 0, 0, 1, 0, 1 }; // RUIN=insert
+    const vrid_mod = [_]u8{ 130, 0x77, 0x11, 0, 0, 2, 0, 3 }; // RUIN=modify
+    const attv_base = [_]u8{ 146, 1 } ++ "1".* ++ [_]u8{iso.UT}; // QUAPOS(402)=1 surveyed
+    const attv_mod = [_]u8{ 146, 1 } ++ "4".* ++ [_]u8{iso.UT}; // QUAPOS(402)=4 approximate
+
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "VRID", .data = &vrid_base }, .{ .tag = "ATTV", .data = &attv_base } });
+    var upd = std.ArrayList(u8).empty;
+    defer upd.deinit(gpa);
+    try iso.writeRecord(gpa, &upd, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{ .{ .tag = "VRID", .data = &vrid_mod }, .{ .tag = "ATTV", .data = &attv_mod } });
+
+    var feats = std.ArrayList(?Feature).empty;
+    var fidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer fidx.deinit();
+    var vecs = std.ArrayList(?VectorRecord).empty;
+    var vidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer vidx.deinit();
+
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, base.items, 1, 1, false);
+    try std.testing.expectEqual(@as(i32, 1), vecs.items[0].?.quapos);
+
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
+
+    // An update with no ATTV leaves the value alone.
+    var upd2 = std.ArrayList(u8).empty;
+    defer upd2.deinit(gpa);
+    const vrid_mod2 = [_]u8{ 130, 0x77, 0x11, 0, 0, 3, 0, 3 };
+    try iso.writeRecord(gpa, &upd2, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd2, 'D', &.{.{ .tag = "VRID", .data = &vrid_mod2 }});
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd2.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
 }
