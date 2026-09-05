@@ -1970,6 +1970,39 @@ fn mergeFile(
 /// / modify by (RCNM,RCID) for features and vectors alike, with SGCC/FSPC control
 /// fields for indexed coordinate/pointer edits. Pass an empty `updates` for a
 /// plain base cell.
+/// The identity and coordinate factors an update file declares, read before it
+/// is applied. S-57 3.2.1 and 3.3 scope COMF and SOMF to the data set, and an
+/// update file is its own data set, so its coordinates are only decodable with
+/// its own factors.
+const UpdateHeader = struct {
+    edtn: []const u8 = "",
+    updn: []const u8 = "",
+    params: ?DatasetParams = null,
+};
+
+fn peekUpdateHeader(a: Allocator, bytes: []const u8) UpdateHeader {
+    var h = UpdateHeader{};
+    var seen_dsid = false;
+    var it = iso.iterate(bytes);
+    _ = it.next(); // skip the DDR
+    while (it.next()) |rec| {
+        if (h.params == null) {
+            if (rec.field("DSPM")) |d| h.params = parseDSPM(d);
+        }
+        if (!seen_dsid) {
+            if (rec.field("DSID")) |d| {
+                seen_dsid = true;
+                if (parseDSID(a, d)) |pd| {
+                    h.edtn = pd.edtn;
+                    h.updn = pd.updn;
+                }
+            }
+        }
+        if (h.params != null and seen_dsid) break;
+    }
+    return h;
+}
+
 pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []const []const u8) !Cell {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -2049,7 +2082,28 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     // before each file and restore them on failure, which leaves the cell at
     // the last update that applied whole.
     var applied: usize = 0;
+    // The update number the chain has reached. S-57 8.4.2.1 applies updates in
+    // sequence, so the next file has one higher.
+    var last_updn: u32 = std.fmt.parseInt(u32, std.mem.trim(u8, dsid.updn, " "), 10) catch 0;
+    const base_edtn = dsid.edtn;
     for (updates) |u| {
+        // Read what the file says about itself before applying any of it. A
+        // mismatch stops the chain and keeps the cell, the same policy a merge
+        // failure follows below.
+        const uh = peekUpdateHeader(a, u);
+        if (uh.params) |up| {
+            // Decoding this file's coordinates with the base factors scales
+            // them wrong, and degToE7 clamps the extreme case rather than
+            // failing, so the error reads as a plausible position.
+            if (up.comf != params.comf or up.somf != params.somf) break;
+        }
+        if (uh.edtn.len > 0 and base_edtn.len > 0 and !std.mem.eql(u8, uh.edtn, base_edtn)) break;
+        if (uh.updn.len > 0) {
+            const got = std.fmt.parseInt(u32, std.mem.trim(u8, uh.updn, " "), 10) catch break;
+            if (got != last_updn + 1) break;
+            last_updn = got;
+        }
+
         const feats_snap = try gpa.dupe(?Feature, feats.items);
         defer gpa.free(feats_snap);
         const vecs_snap = try gpa.dupe(?VectorRecord, vecs.items);
@@ -2810,6 +2864,122 @@ test "a broken update stops the chain and keeps the cell" {
 
     // The whole chain applies when every file merges.
     var ok = try parseCellWithUpdates(gpa, base.items, &.{up1.items});
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ok.updates_applied);
+}
+
+test "an update out of sequence or against another edition stops the chain" {
+    const gpa = std.testing.allocator;
+
+    // DSID: RCNM+RCID+EXPP+INTU, then DSNM, EDTN, UPDN.
+    const dsidFor = struct {
+        fn make(edtn: []const u8, updn: []const u8, buf: *[64]u8) []const u8 {
+            const head = [_]u8{ 10, 1, 0, 0, 0, 1, 1 } ++ "T".* ++ [_]u8{iso.UT};
+            var n: usize = 0;
+            @memcpy(buf[n..][0..head.len], &head);
+            n += head.len;
+            @memcpy(buf[n..][0..edtn.len], edtn);
+            n += edtn.len;
+            buf[n] = iso.UT;
+            n += 1;
+            @memcpy(buf[n..][0..updn.len], updn);
+            n += updn.len;
+            buf[n] = iso.UT;
+            n += 1;
+            return buf[0..n];
+        }
+    }.make;
+
+    const frid_base = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 1, 0, 1 }; // insert
+    const frid_mod = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 }; // modify
+    const attf_base = [_]u8{ 116, 0 } ++ "Base".* ++ [_]u8{iso.UT};
+    const attf_upd = [_]u8{ 116, 0 } ++ "Applied".* ++ [_]u8{iso.UT};
+
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{.{ .tag = "DSID", .data = dsidFor("2", "0", &b1) }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "ATTF", .data = &attf_base } });
+
+    // An update giving update 1 of edition 2 applies.
+    var ok_u = std.ArrayList(u8).empty;
+    defer ok_u.deinit(gpa);
+    try iso.writeRecord(gpa, &ok_u, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &ok_u, 'D', &.{.{ .tag = "DSID", .data = dsidFor("2", "1", &b2) }});
+    try iso.writeRecord(gpa, &ok_u, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var applied_cell = try parseCellWithUpdates(gpa, base.items, &.{ok_u.items});
+    defer applied_cell.deinit();
+    try std.testing.expectEqual(@as(usize, 1), applied_cell.updates_applied);
+
+    // The same file twice: the second gives update 1 again, so the chain stops
+    // and its edits do not run a second time.
+    var twice = try parseCellWithUpdates(gpa, base.items, &.{ ok_u.items, ok_u.items });
+    defer twice.deinit();
+    try std.testing.expectEqual(@as(usize, 1), twice.updates_applied);
+
+    // An update issued against edition 3 does not apply to an edition 2 base.
+    var wrong_edtn = std.ArrayList(u8).empty;
+    defer wrong_edtn.deinit(gpa);
+    var b3: [64]u8 = undefined;
+    try iso.writeRecord(gpa, &wrong_edtn, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &wrong_edtn, 'D', &.{.{ .tag = "DSID", .data = dsidFor("3", "1", &b3) }});
+    try iso.writeRecord(gpa, &wrong_edtn, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var other_edition = try parseCellWithUpdates(gpa, base.items, &.{wrong_edtn.items});
+    defer other_edition.deinit();
+    try std.testing.expectEqual(@as(usize, 0), other_edition.updates_applied);
+}
+
+test "an update declaring other coordinate factors stops the chain" {
+    const gpa = std.testing.allocator;
+
+    const dspm = struct {
+        fn make(comf: i32, buf: *[24]u8) []const u8 {
+            @memset(buf, 0);
+            buf[0] = 20; // RCNM = DSPM
+            std.mem.writeInt(i32, buf[8..12], 25000, .little); // CSCL
+            std.mem.writeInt(i32, buf[16..20], comf, .little);
+            std.mem.writeInt(i32, buf[20..24], 10, .little); // SOMF
+            return buf[0..];
+        }
+    }.make;
+
+    const frid_base = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 1, 0, 1 };
+    const frid_mod = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 };
+    const attf = [_]u8{ 116, 0 } ++ "X".* ++ [_]u8{iso.UT};
+
+    var d1: [24]u8 = undefined;
+    var d2: [24]u8 = undefined;
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{.{ .tag = "DSPM", .data = dspm(10_000_000, &d1) }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "ATTF", .data = &attf } });
+
+    // Same shape, a tenth of the base's COMF. Applying it with the base factors
+    // decodes every coordinate this file inserts ten times too large.
+    var upd = std.ArrayList(u8).empty;
+    defer upd.deinit(gpa);
+    try iso.writeRecord(gpa, &upd, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{.{ .tag = "DSPM", .data = dspm(1_000_000, &d2) }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf } });
+
+    var cell = try parseCellWithUpdates(gpa, base.items, &.{upd.items});
+    defer cell.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cell.updates_applied);
+
+    // The same factors apply.
+    var same = std.ArrayList(u8).empty;
+    defer same.deinit(gpa);
+    var d3: [24]u8 = undefined;
+    try iso.writeRecord(gpa, &same, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &same, 'D', &.{.{ .tag = "DSPM", .data = dspm(10_000_000, &d3) }});
+    try iso.writeRecord(gpa, &same, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf } });
+
+    var ok = try parseCellWithUpdates(gpa, base.items, &.{same.items});
     defer ok.deinit();
     try std.testing.expectEqual(@as(usize, 1), ok.updates_applied);
 }
