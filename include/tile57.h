@@ -538,9 +538,12 @@ typedef struct {
     int32_t  native_scale;
     bool     is_raster;                                  /* tiles are images, not vector tiles */
     uint32_t skipped_cells; /* cells handed to the open that produced no chart.
-                         * The open succeeds while one parses, so a host reads
-                         * this to tell a chart set with a gap in it from a
-                         * complete one. Appended for ABI-append-safety; a
+                         * The open succeeds while one parses, so this tells a
+                         * chart set with a gap in it from a complete one.
+                         * Set on a chart opened from ENC source. The opens
+                         * this header exports are archive-backed, where it
+                         * stays 0; the engine names each dropped cell on
+                         * stderr as it goes. Appended for ABI-append-safety; a
                          * zeroed struct reads 0. */
 } tile57_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_info *out);
