@@ -21,6 +21,12 @@
 const std = @import("std");
 
 pub const index_name = "index.json";
+
+/// Ceilings for the two reads that take their size from the chart directory.
+/// A TXTDSC note and a PICREP picture are small. The manifest lists one line
+/// per referenced file.
+const max_index_bytes: usize = 8 << 20;
+const max_file_bytes: usize = 64 << 20;
 pub const version = 1;
 
 /// The lookup key for a reference: the bare basename, upper-cased.
@@ -120,19 +126,36 @@ pub const Reader = struct {
     pub fn open(io: std.Io, alloc: std.mem.Allocator, dir: []const u8) !?Reader {
         const index_path = try std.fs.path.join(alloc, &.{ dir, index_name });
         defer alloc.free(index_path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, index_path, alloc, .unlimited) catch return null;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, index_path, alloc, .limited(max_index_bytes)) catch return null;
         defer alloc.free(bytes);
 
         var self = Reader{ .alloc = alloc, .dir = try alloc.dupe(u8, dir) };
         errdefer self.deinit();
 
-        const parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch return null;
+        // `self` owns a copy of `dir` by now, so every return past this point
+        // releases it. errdefer covers the error returns only.
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, bytes, .{}) catch {
+            self.deinit();
+            return null;
+        };
         defer parsed.deinit();
+        // A chart directory travels with the chart, so the manifest is third
+        // party input. Check each tag before reading the union: parseFromSlice
+        // rejects malformed JSON, and well-formed JSON of the wrong shape
+        // reaches here. The keys are the reference names, so the manifest
+        // cannot be a plain struct.
+        if (parsed.value != .object) {
+            self.deinit();
+            return null;
+        }
         const files = parsed.value.object.get("files") orelse return self;
+        if (files != .object) return self;
         var it = files.object.iterator();
         while (it.next()) |kv| {
+            if (kv.value_ptr.* != .object) continue;
             const stored = kv.value_ptr.object.get("stored") orelse continue;
             const typ = kv.value_ptr.object.get("type") orelse continue;
+            if (stored != .string or typ != .string) continue;
             try self.entries.put(alloc, try alloc.dupe(u8, kv.key_ptr.*), .{
                 .stored = try alloc.dupe(u8, stored.string),
                 .mime = try alloc.dupe(u8, typ.string),
@@ -149,9 +172,12 @@ pub const Reader = struct {
         const entry = self.entries.get(k) orelse return null;
         if (self.cache.get(k)) |bytes| return .{ .bytes = bytes, .mime = entry.mime };
 
-        const path = try std.fs.path.join(self.alloc, &.{ self.dir, entry.stored });
+        // `stored` comes from the manifest. writeDir stores every file under
+        // its basename, so taking the basename here keeps the read inside the
+        // chart directory and still resolves what writeDir wrote.
+        const path = try std.fs.path.join(self.alloc, &.{ self.dir, std.fs.path.basename(entry.stored) });
         defer self.alloc.free(path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, self.alloc, .unlimited) catch return null;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, self.alloc, .limited(max_file_bytes)) catch return null;
         try self.cache.put(self.alloc, try self.alloc.dupe(u8, k), bytes);
         return .{ .bytes = bytes, .mime = entry.mime };
     }
@@ -195,4 +221,86 @@ test "mime states what a client must decode" {
     try std.testing.expectEqualStrings("image/tiff", mime("A.tif"));
     try std.testing.expectEqualStrings("image/jpeg", mime("A.JPG"));
     try std.testing.expectEqualStrings("application/octet-stream", mime("A.bin"));
+}
+
+fn testIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn tmpPath(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    return std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+}
+
+/// Write `index.json` with the given body into a fresh directory and open it.
+fn openWithIndex(alloc: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir, body: []const u8) !struct { dir: []u8, reader: ?Reader } {
+    const dir = try tmpPath(alloc, tmp);
+    const p = try std.fs.path.join(alloc, &.{ dir, index_name });
+    defer alloc.free(p);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = body });
+    return .{ .dir = dir, .reader = try Reader.open(io, alloc, dir) };
+}
+
+test "a manifest of the wrong shape yields no entries" {
+    const a = std.testing.allocator;
+    const io = testIo();
+    // Each of these parses as JSON and then fails a shape the reader assumed.
+    // Reading the union without checking its tag is undefined behaviour in a
+    // ReleaseFast build, the shipped default.
+    const bodies = [_][]const u8{
+        "{\"files\":[1,2,3]}",
+        "{\"files\":{\"A.TXT\":{\"stored\":1,\"type\":2}}}",
+        "{\"files\":{\"A.TXT\":\"nope\"}}",
+        "{\"files\":42}",
+        "[1,2,3]",
+        "\"a string\"",
+    };
+    for (bodies) |body| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var got = try openWithIndex(a, io, &tmp, body);
+        defer a.free(got.dir);
+        if (got.reader) |*r| {
+            defer r.deinit();
+            try std.testing.expectEqual(@as(usize, 0), r.entries.count());
+        }
+    }
+}
+
+test "a stored name cannot read outside the chart directory" {
+    const a = std.testing.allocator;
+    const io = testIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A file one level above the chart directory, named by a traversing
+    // `stored`. writeDir only ever stores basenames, so resolving the basename
+    // finds what writeDir wrote and misses this.
+    const root = try tmpPath(a, &tmp);
+    defer a.free(root);
+    const secret = try std.fs.path.join(a, &.{ root, "secret.txt" });
+    defer a.free(secret);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = secret, .data = "private" });
+
+    const chart_dir = try std.fs.path.join(a, &.{ root, "chart" });
+    defer a.free(chart_dir);
+    try std.Io.Dir.cwd().createDirPath(io, chart_dir);
+    const idx = try std.fs.path.join(a, &.{ chart_dir, index_name });
+    defer a.free(idx);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = idx,
+        .data = "{\"files\":{\"A.TXT\":{\"stored\":\"../secret.txt\",\"type\":\"text/plain\"}}}",
+    });
+
+    var r = (try Reader.open(io, a, chart_dir)).?;
+    defer r.deinit();
+    try std.testing.expect((try r.get(io, "A.TXT")) == null);
+
+    // The same manifest resolves a file that is actually in the directory.
+    const inside = try std.fs.path.join(a, &.{ chart_dir, "secret.txt" });
+    defer a.free(inside);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = inside, .data = "chart note" });
+    var r2 = (try Reader.open(io, a, chart_dir)).?;
+    defer r2.deinit();
+    const hit = (try r2.get(io, "A.TXT")).?;
+    try std.testing.expectEqualStrings("chart note", hit.bytes);
 }
