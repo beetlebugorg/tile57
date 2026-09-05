@@ -1313,16 +1313,24 @@ fn mergeAttrDelta(a: Allocator, base: []const Attr, delta: []const Attr) ![]Attr
     return list.items;
 }
 
-/// ATTV (spatial-level attributes) carry QUAPOS — quality of position lives on the
-/// edge/node records, not on the feature. ATTV shares the ATTL(2)+ATVL layout of a
-/// feature's ATTF, so reuse parseATTF and pull out QUAPOS. Returns 0 if absent.
-fn quaposFromAttv(a: Allocator, data: []const u8) i32 {
-    const attrs = parseATTF(a, data) catch return 0;
+/// ATTV holds the spatial-level attributes. Quality of position lives on the
+/// edge/node records rather than on the feature. ATTV shares the ATTL(2)+ATVL
+/// layout of a feature's ATTF, so reuse the ATTF parse and pull out QUAPOS.
+///
+/// Null means the ATTV has no QUAPOS. POSACC and QUAPOS are both spatial, so
+/// an ATTV may hold POSACC alone, and under S-57 8.4.3.2 a an attribute the
+/// update omits is left as it was. A missing QUAPOS is therefore unknown here,
+/// and 0 is a value the caller writes. The DEL tombstone is different: it
+/// removes the attribute, and an absent QUAPOS reads as 0.
+fn quaposFromAttv(a: Allocator, data: []const u8) ?i32 {
+    const attrs = parseAttrsKeepDel(a, data) catch return null;
     for (attrs) |at| {
-        if (at.code == ATTR_QUAPOS)
+        if (at.code == ATTR_QUAPOS) {
+            if (isDelMarker(at.value)) return 0;
             return std.fmt.parseInt(i32, std.mem.trim(u8, at.value, " "), 10) catch 0;
+        }
     }
-    return 0;
+    return null;
 }
 
 /// FSPT: repeated 8-byte entries NAME(5)+ORNT(1)+USAG(1)+MASK(1).
@@ -1819,7 +1827,8 @@ fn mergeFile(
             if (flds.sg2d) |sg| v.points = try parseSG2D(a, sg, comf);
             if (flds.sg3d) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
             if (flds.vrpt) |vp| try parseVRPT(a, &v, vp);
-            if (flds.attv) |av| v.quapos = quaposFromAttv(a, av);
+            const attv_quapos: ?i32 = if (flds.attv) |av| quaposFromAttv(a, av) else null;
+            if (attv_quapos) |q| v.quapos = q;
 
             if (ruin == 3) { // modify in place
                 // The oracle errors on a MODIFY whose target is absent (updates.go:291),
@@ -1862,8 +1871,9 @@ fn mergeFile(
                     // attribute when the target lacks it and replaces the value
                     // when the target has it. QUAPOS drives the S-52 low
                     // accuracy line style, so an update downgrading a survey
-                    // has to reach the target record.
-                    if (flds.attv != null) ex.quapos = v.quapos;
+                    // has to reach the target record. An ATTV holding only
+                    // some other spatial attribute leaves QUAPOS as it was.
+                    if (attv_quapos) |q| ex.quapos = q;
                 } else return error.ModifyMissingSpatial;
                 continue;
             }
@@ -2821,6 +2831,28 @@ test "a spatial MODIFY carrying ATTV updates QUAPOS" {
     try iso.writeRecord(gpa, &upd2, 'D', &.{.{ .tag = "VRID", .data = &vrid_mod2 }});
     try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd2.items, 1, 1, true);
     try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
+
+    // An ATTV holding only POSACC(401) revises positional accuracy and omits
+    // QUAPOS, so the approximate reading survives.
+    var upd3 = std.ArrayList(u8).empty;
+    defer upd3.deinit(gpa);
+    const vrid_mod3 = [_]u8{ 130, 0x77, 0x11, 0, 0, 4, 0, 3 };
+    const attv_posacc = [_]u8{ 145, 1 } ++ "10".* ++ [_]u8{iso.UT};
+    try iso.writeRecord(gpa, &upd3, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd3, 'D', &.{ .{ .tag = "VRID", .data = &vrid_mod3 }, .{ .tag = "ATTV", .data = &attv_posacc } });
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd3.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
+
+    // QUAPOS with the DEL tombstone removes the attribute. An absent QUAPOS
+    // reads as 0, the same as a record that never had one.
+    var upd4 = std.ArrayList(u8).empty;
+    defer upd4.deinit(gpa);
+    const vrid_mod4 = [_]u8{ 130, 0x77, 0x11, 0, 0, 5, 0, 3 };
+    const attv_del = [_]u8{ 146, 1, 0x7f, iso.UT };
+    try iso.writeRecord(gpa, &upd4, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd4, 'D', &.{ .{ .tag = "VRID", .data = &vrid_mod4 }, .{ .tag = "ATTV", .data = &attv_del } });
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd4.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 0), vecs.items[0].?.quapos);
 }
 
 test "a broken update stops the chain and keeps the cell" {
