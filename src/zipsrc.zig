@@ -44,6 +44,25 @@ pub const Entry = struct {
     raw: zip.Iterator.Entry,
 };
 
+/// True when an archive entry name is usable as a relative path under a
+/// caller-chosen directory. Entry names come from the archive, and a chart
+/// archive arrives by download, share, or SD card. A consumer that builds an
+/// output path from an entry name writes where the archive says.
+/// `chart.bakeZip` builds one. Rejecting the name here gives every consumer
+/// the same guarantee.
+///
+/// Rejects absolute names, Windows drive letters, and any `..` component.
+/// Both separators count, because some producers store backslashes and
+/// `s57.decodeCATD` folds them.
+pub fn isSafeEntryName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '/' or name[0] == '\\') return false;
+    if (name.len >= 2 and name[1] == ':') return false; // "C:..."
+    var it = std.mem.splitAny(u8, name, "/\\");
+    while (it.next()) |seg| if (std.mem.eql(u8, seg, "..")) return false;
+    return true;
+}
+
 /// A zip opened for reading charts. Read-only once opened, so any number of
 /// threads may `readAlloc`/`extractTo` from one `Archive` at the same time.
 pub const Archive = struct {
@@ -57,10 +76,15 @@ pub const Archive = struct {
     /// Directory prefix (no trailing '/') -> the entries directly in it. Built
     /// once, because the alternative is rescanning 27,680 names per cell.
     by_dir: std.StringHashMapUnmanaged([]usize),
+    /// Entries `open` dropped because their name was unusable: unsafe as a
+    /// relative path (`isSafeEntryName`), or longer than the name buffer.
+    rejected: usize,
 
     /// Walk the central directory. Directory entries (trailing '/') are left
-    /// out — they are never charts. Encrypted and multi-disk archives are
-    /// rejected here, by `zip.Iterator`, rather than at the first read.
+    /// out, because they are never charts. Entries whose name is unusable as a
+    /// relative path are left out too and counted in `rejected`. See
+    /// `isSafeEntryName`. Encrypted and multi-disk archives are rejected here,
+    /// by `zip.Iterator`, rather than at the first read.
     pub fn open(gpa: Allocator, io: std.Io, path: []const u8) !Archive {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -77,12 +101,20 @@ pub const Archive = struct {
         try entries.ensureTotalCapacity(gpa, @intCast(@min(it.cd_record_count, 1 << 20)));
 
         var name_buf: [4096]u8 = undefined;
+        var rejected: usize = 0;
         while (try it.next()) |e| {
-            if (e.filename_len == 0 or e.filename_len > name_buf.len) continue;
+            if (e.filename_len == 0 or e.filename_len > name_buf.len) {
+                rejected += 1;
+                continue;
+            }
             const name = name_buf[0..e.filename_len];
             try fr.seekTo(e.header_zip_offset + @sizeOf(zip.CentralDirectoryFileHeader));
             try fr.interface.readSliceAll(name);
             if (name[name.len - 1] == '/') continue; // a directory, not a chart
+            if (!isSafeEntryName(name)) {
+                rejected += 1;
+                continue;
+            }
             try entries.append(gpa, .{
                 .name = try a.dupe(u8, name),
                 .uncompressed_size = e.uncompressed_size,
@@ -131,6 +163,7 @@ pub const Archive = struct {
             .entries = owned,
             .by_name = by_name,
             .by_dir = by_dir,
+            .rejected = rejected,
         };
     }
 
@@ -526,7 +559,7 @@ test "extractTo writes the entry under the caller's name" {
 
     const body = "tiles and more tiles " ** 500;
     try writeTestZip(gpa, io, zpath, &.{
-        .{ .name = "../evil/USA.mbtiles", .data = body, .deflate = true },
+        .{ .name = "rasters/USA.mbtiles", .data = body, .deflate = true },
     });
     var arc = try Archive.open(gpa, io, zpath);
     defer arc.deinit();
@@ -539,6 +572,44 @@ test "extractTo writes the entry under the caller's name" {
     const got = try std.Io.Dir.cwd().readFileAlloc(io, out, gpa, .unlimited);
     defer gpa.free(got);
     try testing.expectEqualStrings(body, got);
+}
+
+test "an entry whose name escapes its directory never reaches a consumer" {
+    // bakeZip builds an output path from the entry name. Refusing the name at
+    // open keeps it away from that path.
+    try testing.expect(!isSafeEntryName("ENC_ROOT/../../../evil/US4MD11M.000"));
+    try testing.expect(!isSafeEntryName("../evil/USA.mbtiles"));
+    try testing.expect(!isSafeEntryName("/etc/passwd"));
+    try testing.expect(!isSafeEntryName("C:\\Windows\\x.000"));
+    try testing.expect(!isSafeEntryName("ENC_ROOT\\..\\..\\evil.000")); // folded separator
+    try testing.expect(!isSafeEntryName(".."));
+    try testing.expect(!isSafeEntryName(""));
+    // A `..` component is the only thing rejected. Dots elsewhere are fine.
+    try testing.expect(isSafeEntryName("ENC_ROOT/US5MD12M/US5MD12M.000"));
+    try testing.expect(isSafeEntryName("ENC_ROOT/..a/x.000"));
+    try testing.expect(isSafeEntryName("a...b/x.000"));
+
+    const gpa = testing.allocator;
+    const io = testIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(gpa, &tmp);
+    defer gpa.free(dir);
+    const zpath = try std.fs.path.join(gpa, &.{ dir, "t.zip" });
+    defer gpa.free(zpath);
+
+    try writeTestZip(gpa, io, zpath, &.{
+        .{ .name = "ENC_ROOT/US5MD12M/US5MD12M.000", .data = "good", .deflate = false },
+        .{ .name = "ENC_ROOT/../../../../evil/US4MD11M.000", .data = "bad", .deflate = false },
+    });
+    var arc = try Archive.open(gpa, io, zpath);
+    defer arc.deinit();
+
+    // The legitimate cell still resolves; the escaping one is gone and counted.
+    try testing.expectEqual(@as(usize, 1), arc.entries.len);
+    try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.000", arc.entries[0].name);
+    try testing.expectEqual(@as(usize, 1), arc.rejected);
+    try testing.expect(arc.find("ENC_ROOT/../../../../evil/US4MD11M.000") == null);
 }
 
 test "the listing is JSON and NUL-terminated" {
