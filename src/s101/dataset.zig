@@ -257,6 +257,11 @@ fn digit(c: u8) ?u8 {
 /// resolve their class/attribute NAMES against ITS tables before merging.
 const Tables = struct {
     params: Params = .{},
+    /// DSID's dataset name, the file's own name including the
+    /// update extension (`10100AA_X01SW.003`). S-100 Part 10a puts the update
+    /// number there, so the sequence a chain claims is readable without the
+    /// path the bytes arrived from.
+    dsnm: []const u8 = "",
     fc: CodeTable = .{}, // FTCS (feature classes)
     ac: CodeTable = .{}, // ATCS (attributes)
     ic: CodeTable = .{}, // ITCS (information types)
@@ -313,6 +318,25 @@ pub fn parse(gpa: Allocator, bytes: []const u8) !Dataset {
 /// `.002`, … in order), merging records by (RCNM, RCID): RUIN 1=insert, 2=delete,
 /// 3=modify (S-100 Part 10a §4a-4.5). Names resolve per file (each carries its own
 /// code tables). All kept bytes are duped into the result's arena, so the base and
+/// The update number in a dataset name, from the extension S-100 Part 10a
+/// gives it (`10100AA_X01SW.003` is update 3, and a base has `.000`). Null
+/// when the name has no numeric extension.
+fn updateNumber(dsnm: []const u8) ?u32 {
+    const dot = std.mem.lastIndexOfScalar(u8, dsnm, '.') orelse return null;
+    const ext = dsnm[dot + 1 ..];
+    if (ext.len == 0) return null;
+    return std.fmt.parseInt(u32, ext, 10) catch null;
+}
+
+/// True when two dataset names address the same cell, comparing the stem
+/// before the update extension.
+fn sameDataset(a_name: []const u8, b_name: []const u8) bool {
+    if (a_name.len == 0 or b_name.len == 0) return true; // no name to disagree with
+    const sa = a_name[0 .. std.mem.lastIndexOfScalar(u8, a_name, '.') orelse a_name.len];
+    const sb = b_name[0 .. std.mem.lastIndexOfScalar(u8, b_name, '.') orelse b_name.len];
+    return std.mem.eql(u8, sa, sb);
+}
+
 /// update ISO readers are transient. Pass an empty `updates` for a plain base cell.
 pub fn parseWithUpdates(gpa: Allocator, base: []const u8, updates: []const []const u8) !Dataset {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -330,9 +354,24 @@ pub fn parseWithUpdates(gpa: Allocator, base: []const u8, updates: []const []con
     const base_tables = try readHeader(a, base);
     try decodeInto(a, &m, base, base_tables);
 
+    // The chain stops on anything that says this file does not follow the last
+    // one applied, the way the S-57 path stops on a mismatched edition or
+    // update number. A corrupt update stops it too, keeping the prior state.
+    var applied: u32 = updateNumber(base_tables.dsnm) orelse 0;
     for (updates) |u| {
-        iso.validate(u) catch break; // reject a corrupt update; keep prior state
+        iso.validate(u) catch break;
         const t = readHeader(a, u) catch break;
+        // S-100 Part 10a 3.2: the factors scale every coordinate in the file
+        // that declares them, so the base's factors decode this one by the
+        // wrong scale.
+        if (t.params.cmfx != base_tables.params.cmfx or
+            t.params.cmfy != base_tables.params.cmfy or
+            t.params.cmfz != base_tables.params.cmfz) break;
+        if (!sameDataset(base_tables.dsnm, t.dsnm)) break;
+        if (updateNumber(t.dsnm)) |n| {
+            if (n != applied + 1) break;
+            applied = n;
+        }
         decodeInto(a, &m, u, t) catch break;
     }
 
@@ -466,7 +505,7 @@ fn readHeader(a: Allocator, bytes: []const u8) !Tables {
     while (it.next()) |rec| {
         const lead = rec.firstTag() orelse continue;
         if (!std.mem.eql(u8, lead, "DSID")) continue;
-        try parseDatasetRecord(a, rec, &t.params, &t.fc, &t.ac, &t.ic, &t.arc);
+        try parseDatasetRecord(a, rec, &t.dsnm, &t.params, &t.fc, &t.ac, &t.ic, &t.arc);
         break;
     }
     return t;
@@ -475,12 +514,27 @@ fn readHeader(a: Allocator, bytes: []const u8) !Tables {
 fn parseDatasetRecord(
     a: Allocator,
     rec: iso.RecordView,
+    dsnm: *[]const u8,
     params: *Params,
     feature_codes: *CodeTable,
     attr_codes: *CodeTable,
     info_codes: *CodeTable,
     assoc_codes: *CodeTable,
 ) !void {
+    if (rec.field("DSID")) |d| {
+        // RCNM(1) RCID(4) then UT-separated ASCII: ENSP, ENED, PRSP, PRED,
+        // PROF, DSNM, and the rest.
+        if (d.len > 5) {
+            var it = std.mem.splitScalar(u8, d[5..], 0x1f);
+            var i: usize = 0;
+            while (it.next()) |part| : (i += 1) {
+                if (i == 5) {
+                    dsnm.* = try a.dupe(u8, part);
+                    break;
+                }
+            }
+        }
+    }
     if (rec.field("DSSI")) |s| {
         // (3b48,10b14): DCOX,DCOY,DCOZ (origin, unused) then CMFX,CMFY,CMFZ then the
         // seven record counts NOIR,NOPN,NOMN,NOCN,NOXN,NOSN,NOFR.
@@ -755,4 +809,21 @@ test "modifyFeature applies SAUI spatial-association edits" {
     try std.testing.expectEqual(@as(u32, 10), ex.spas[0].rrid); // kept
     try std.testing.expectEqual(@as(u32, 12), ex.spas[1].rrid); // inserted (11 removed)
     try std.testing.expectEqual(@as(u16, 2), ex.version);
+}
+
+test "an update names its own number and cell in DSNM" {
+    // S-100 Part 10a names a file in DSID, extension included, so a chain is
+    // checkable without the path the bytes arrived from.
+    try std.testing.expectEqual(@as(?u32, 0), updateNumber("10100AA_X01SW.000"));
+    try std.testing.expectEqual(@as(?u32, 3), updateNumber("10100AA_X01SW.003"));
+    try std.testing.expectEqual(@as(?u32, 12), updateNumber("10100AA_X01SW.012"));
+    try std.testing.expectEqual(@as(?u32, null), updateNumber("10100AA_X01SW"));
+    try std.testing.expectEqual(@as(?u32, null), updateNumber("10100AA_X01SW.abc"));
+    try std.testing.expectEqual(@as(?u32, null), updateNumber(""));
+
+    try std.testing.expect(sameDataset("10100AA_X01SW.000", "10100AA_X01SW.003"));
+    try std.testing.expect(!sameDataset("10100AA_X01SW.000", "10100AA_X02NE.001"));
+    // A file with no name disagrees with neither.
+    try std.testing.expect(sameDataset("10100AA_X01SW.000", ""));
+    try std.testing.expect(sameDataset("", "10100AA_X01SW.001"));
 }
