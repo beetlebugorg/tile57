@@ -1632,7 +1632,10 @@ export fn tile57_compose_open(
         error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
         else => fail(err, e),
     }) orelse return failWith(err, .unsupported, "no chart carries per-cell coverage");
-    src.skipped = @intCast(n - na);
+    // What the open kept, subtracted from what it was handed. Counting the
+    // charts with no decoded coverage missed the ones openBorrowed drops later
+    // for an empty coverage ring, so charts + skipped came to less than n.
+    src.skipped = @intCast(n - src.readers.len);
     sidecar.refresh(io, src);
     o.* = src;
     return OK;
@@ -1731,6 +1734,7 @@ export fn tile57_compose_rasters(
         error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
         else => fail(err, e),
     }) orelse return failWith(err, .unsupported, "no raster chart carries a compilation scale and coverage");
+    src.skipped = @intCast(n - src.readers.len);
     o.* = src;
     return OK;
 }

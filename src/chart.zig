@@ -4164,9 +4164,6 @@ pub fn bakeArchive(
     }
 
     var loaded: usize = 0;
-    // Cells that produced no backend. The bake keeps going, and the count is
-    // what a host reports instead of a silent gap in the chart set.
-    var skipped: usize = 0;
     var band_ord: u8 = 0;
     // Union sector-figure reach across the baked cells — published as the
     // archive's "light_reach" metadata so the compositor widens its tile
@@ -4224,7 +4221,8 @@ pub fn bakeArchive(
             if (o != null) {
                 loaded += 1;
             } else {
-                skipped += 1;
+                // The bake keeps going. This line is the report: a cell absent
+                // from the archive with no word for it reads as empty ocean.
                 std.debug.print("CHART LOST {s}: parse produced no cell\n", .{cells_in[ci].name});
             }
         }
