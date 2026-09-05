@@ -77,6 +77,26 @@ pub const File = struct {
     bytes: []const u8,
 };
 
+/// Append `s` as the body of a JSON string, escaping what RFC 8259 requires.
+///
+/// A file name here comes from the exchange set. A set built on Windows names
+/// its files with backslashes, and the reader on the other side of this
+/// manifest treats one as the start of an escape: `US5MD12M\US348MDE.TXT` gave
+/// `\U`, the parse failed, and every caution note for that chart went missing
+/// with no error to say why.
+fn appendJsonEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        0x08 => try out.appendSlice(alloc, "\\b"),
+        0x0c => try out.appendSlice(alloc, "\\f"),
+        '\n' => try out.appendSlice(alloc, "\\n"),
+        '\r' => try out.appendSlice(alloc, "\\r"),
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        else => if (c < 0x20) try out.print(alloc, "\\u{x:0>4}", .{c}) else try out.append(alloc, c),
+    };
+}
+
 /// Write `files` beside the chart in `dir`, with the manifest. Returns the
 /// number written; an empty list writes nothing.
 ///
@@ -100,7 +120,11 @@ pub fn writeDir(io: std.Io, alloc: std.mem.Allocator, dir: []const u8, files: []
         defer alloc.free(path);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = f.bytes });
         if (written > 0) try manifest.appendSlice(alloc, ",\n");
-        try manifest.print(alloc, "    \"{s}\": {{ \"stored\": \"{s}\", \"type\": \"{s}\" }}", .{ k, stored, mime(stored) });
+        try manifest.appendSlice(alloc, "    \"");
+        try appendJsonEscaped(alloc, &manifest, k);
+        try manifest.appendSlice(alloc, "\": { \"stored\": \"");
+        try appendJsonEscaped(alloc, &manifest, stored);
+        try manifest.print(alloc, "\", \"type\": \"{s}\" }}", .{mime(stored)});
         written += 1;
     }
     try manifest.appendSlice(alloc, "\n  }\n}\n");
@@ -303,4 +327,30 @@ test "a stored name cannot read outside the chart directory" {
     defer r2.deinit();
     const hit = (try r2.get(io, "A.TXT")).?;
     try std.testing.expectEqualStrings("chart note", hit.bytes);
+}
+
+test "a manifest survives a name a Windows-built exchange set writes" {
+    const a = std.testing.allocator;
+    const io = testIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const chart_dir = try tmpPath(a, &tmp);
+    defer a.free(chart_dir);
+
+    // A set built on Windows separates with backslashes, and basename splits on
+    // '/' only, so the whole string is the stored name. Written raw it read
+    // back as the escape \U and the parse failed, taking every caution note
+    // for the chart with it.
+    const files = [_]File{
+        .{ .name = "US5MD12M\\US348MDE.TXT", .bytes = "caution" },
+        .{ .name = "quote\".TXT", .bytes = "quoted" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), try writeDir(io, a, chart_dir, &files));
+
+    var r = (try Reader.open(io, a, chart_dir)).?;
+    defer r.deinit();
+    const hit = (try r.get(io, "US5MD12M\\US348MDE.TXT")).?;
+    try std.testing.expectEqualStrings("caution", hit.bytes);
+    const hit2 = (try r.get(io, "QUOTE\".TXT")).?;
+    try std.testing.expectEqualStrings("quoted", hit2.bytes);
 }
