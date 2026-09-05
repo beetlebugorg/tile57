@@ -336,10 +336,21 @@ const PathCtx = struct {
     io: std.Io,
     dir: std.Io.Dir,
     paths: [][]u8, // base .000 path per cell, relative to `dir`
+    /// CRC per file from the exchange set's catalogue, keyed by the same
+    /// relative path the reads use. Empty when the set has no catalogue, or
+    /// when its producer left the CRCs out. Keys are owned.
+    ///
+    /// The base cells are verified once at open. The update files are read
+    /// later, on demand, so their CRCs travel here to be checked at that point
+    /// rather than costing a second pass over the whole set.
+    crcs: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinit(self: *PathCtx) void {
         for (self.paths) |p| gpa.free(p);
         gpa.free(self.paths);
+        var it = self.crcs.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        self.crcs.deinit(gpa);
         self.dir.close(self.io);
         self.threaded.deinit();
         gpa.destroy(self.threaded);
@@ -440,6 +451,16 @@ fn pathRead(user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool
         defer gpa.free(upn);
         const ub = ctx.dir.readFileAlloc(ctx.io, upn, gpa, .limited(MAX_CELL_BYTES)) catch break;
         defer gpa.free(ub);
+        // An update whose bytes disagree with the catalogue is damaged. Stop
+        // the chain here and keep what applied before it, the policy a corrupt
+        // update already follows.
+        if (ctx.crcs.get(upn)) |want| {
+            const got = std.hash.Crc32.hash(ub);
+            if (got != want) {
+                std.debug.print("UPDATE LOST {s}: catalogue CRC is {x:0>8}, file is {x:0>8}\n", .{ upn, want, got });
+                break;
+            }
+        }
         const cub = cdup(ub) orelse break;
         ulens.append(gpa, ub.len) catch {
             std.c.free(cub);
@@ -1124,6 +1145,11 @@ const BakeFileCtx = struct {
     done: std.atomic.Value(u32),
     /// Set when a progress callback returned false; every worker drains out at its next cell.
     cancel: std.atomic.Value(bool),
+    /// CRC per file from the exchange set's catalogue, keyed as `in_paths`
+    /// names them. Empty when the set published none, or when reading from an
+    /// archive, where every entry is checked against its own CRC as it
+    /// inflates. Read-only once the workers start.
+    crcs: std.StringHashMapUnmanaged(u32) = .empty,
     /// Write the text and pictures each cell references beside its archive.
     aux: bool = true,
 };
@@ -1173,12 +1199,15 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
         if (ctx.cancel.load(.monotonic)) return; // a peer's progress callback said stop
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.in_paths.len) return;
-        bakeOneToFile(ctx, i);
+        // A file that fails its catalogue CRC has already named itself, so it
+        // is not baked and does not draw the generic loss line below.
+        const verified = ctx.crcs.count() == 0 or catalogVerified(ctx.io, ctx.in_paths[i], &ctx.crcs);
+        if (verified) bakeOneToFile(ctx, i);
         // The label names a chart that was written. It fired for every cell
         // before, so a host printed a finished chart for one that failed.
         if (ctx.ok[i]) {
             if (ctx.label) |lb| lb(ctx.progress_ctx, @intCast(i));
-        } else {
+        } else if (verified) {
             std.debug.print("CHART LOST {s}: bake produced no archive\n", .{ctx.in_paths[i]});
         }
         const d = ctx.done.fetchAdd(1, .monotonic) + 1; // attempted count (smooth progress)
@@ -1227,7 +1256,11 @@ fn bakeToFiles(io: std.Io, zip: ?*const zipsrc.Archive, in_paths: []const []cons
     const cell_ms = gpa.alloc(i64, in_paths.len) catch return 0;
     defer gpa.free(cell_ms);
     @memset(cell_ms, 0);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .zip = zip, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false), .aux = aux };
+    // A zip entry is checked against its own CRC as it inflates, so the
+    // catalogue lookup is for the on-disk bake only.
+    var crcs = if (zip == null) catalogCrcsFor(io, in_paths) else std.StringHashMapUnmanaged(u32).empty;
+    defer freeCrcMap(&crcs);
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .zip = zip, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false), .aux = aux, .crcs = crcs };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     // The comptime lhs prunes the spawn branch on a single-threaded build (wasm).
@@ -1279,6 +1312,92 @@ fn bakeToFiles(io: std.Io, zip: ?*const zipsrc.Archive, in_paths: []const []cons
 /// input (.000 + update chain) is skipped, so a re-run over an unchanged tree bakes nothing — and a
 /// run that resumes a cancelled one only bakes what the cancel left undone. Returns the count baked
 /// THIS run; errors if `in_dir` is unreadable.
+/// The CRCs an exchange set's catalogue gives, keyed by path the way
+/// `in_paths` names each cell, so a bake can check a file against the value
+/// the set publishes for it.
+///
+/// S-57 Part 3 puts CATALOG.031 at the exchange set's root, with the cells
+/// either beside it or one directory below, so a cell's own directory and its
+/// parent are the two places to look. Each catalogue found is parsed once,
+/// however many cells it covers. An empty result means the set published no
+/// catalogue, which S-57 allows, and the bake proceeds unchecked as before.
+fn catalogCrcsFor(io: std.Io, in_paths: []const []const u8) std.StringHashMapUnmanaged(u32) {
+    var out: std.StringHashMapUnmanaged(u32) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+
+    for (in_paths) |p| {
+        const d1 = std.fs.path.dirname(p) orelse continue;
+        const roots = [_][]const u8{ d1, std.fs.path.dirname(d1) orelse d1 };
+        for (roots) |root| {
+            if (seen.contains(root)) continue;
+            seen.put(gpa, root, {}) catch continue;
+            const cat = std.fs.path.join(gpa, &.{ root, "CATALOG.031" }) catch continue;
+            defer gpa.free(cat);
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, cat, gpa, .limited(MAX_CELL_BYTES)) catch continue;
+            defer gpa.free(bytes);
+            var carena = std.heap.ArenaAllocator.init(gpa);
+            defer carena.deinit();
+            const entries = s57.parseCatalog(carena.allocator(), bytes) orelse continue;
+            for (entries) |e| {
+                const want = s57.catalogCrc(e.crcs) orelse continue;
+                const key = std.fs.path.join(gpa, &.{ root, e.path }) catch continue;
+                out.put(gpa, key, want) catch gpa.free(key);
+            }
+        }
+    }
+    return out;
+}
+
+fn freeCrcMap(m: *std.StringHashMapUnmanaged(u32)) void {
+    var it = m.keyIterator();
+    while (it.next()) |k| gpa.free(k.*);
+    m.deinit(gpa);
+}
+
+/// True when the cell at `path` and every update beside it match the CRC the
+/// catalogue gives. A file the catalogue gives no CRC for passes, the case
+/// S-57 lets a producer leave out.
+///
+/// A damaged update fails the whole cell rather than truncating its chain: the
+/// bake writes one archive per cell, and an archive built to an earlier update
+/// than the set names cannot be told apart from a complete one afterwards. The
+/// serve path keeps the cell and stops the chain instead, because a mariner
+/// underway needs the chart already in hand.
+fn catalogVerified(io: std.Io, path: []const u8, crcs: *const std.StringHashMapUnmanaged(u32)) bool {
+    const check = struct {
+        fn one(io_: std.Io, p: []const u8, m: *const std.StringHashMapUnmanaged(u32)) bool {
+            const want = m.get(p) orelse return true;
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io_, p, gpa, .limited(MAX_CELL_BYTES)) catch {
+                std.debug.print("CHART LOST {s}: did not read\n", .{p});
+                return false;
+            };
+            defer gpa.free(bytes);
+            const got = std.hash.Crc32.hash(bytes);
+            if (got != want) {
+                std.debug.print("CHART LOST {s}: catalogue CRC is {x:0>8}, file is {x:0>8}\n", .{ p, want, got });
+                return false;
+            }
+            return true;
+        }
+    }.one;
+
+    if (!check(io, path, crcs)) return false;
+    if (!std.mem.endsWith(u8, path, ".000")) return true;
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return true;
+    defer dir.close(io);
+    var nums = updateNumbersFor(dir, io, std.fs.path.basename(path)) catch return true;
+    defer nums.deinit(gpa);
+    const stem = path[0 .. path.len - 4]; // strip ".000"
+    for (nums.items) |u| {
+        const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch return true;
+        defer gpa.free(upn);
+        if (!check(io, upn, crcs)) return false;
+    }
+    return true;
+}
+
 pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel) !usize {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1289,6 +1408,7 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
 
     var dir = try std.Io.Dir.cwd().openDir(io, in_dir, .{ .iterate = true });
     defer dir.close(io);
+
     var walker = try dir.walk(a);
     defer walker.deinit();
     while (walker.next(io) catch null) |entry| {
@@ -2583,6 +2703,12 @@ pub const Chart = struct {
         // Cells the walk found and could not use. The open succeeds on the
         // rest, so this is what tells a host the set has a gap.
         var skipped: u32 = 0;
+        var crcs: std.StringHashMapUnmanaged(u32) = .empty;
+        errdefer {
+            var cit = crcs.keyIterator();
+            while (cit.next()) |k| gpa.free(k.*);
+            crcs.deinit(gpa);
+        }
 
         if (single_file) {
             if (!try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths, null)) skipped += 1;
@@ -2591,6 +2717,14 @@ pub const Chart = struct {
             var carena = std.heap.ArenaAllocator.init(gpa);
             defer carena.deinit();
             if (s57.parseCatalog(carena.allocator(), cbytes)) |entries| {
+                // Keep every CRC the catalogue gives, cells and updates alike.
+                // A cell is verified below, as its bytes are already read; an
+                // update is verified when the chain reaches it.
+                for (entries) |e| {
+                    const want = s57.catalogCrc(e.crcs) orelse continue;
+                    const key = gpa.dupe(u8, e.path) catch continue;
+                    crcs.put(gpa, key, want) catch gpa.free(key);
+                }
                 for (entries) |e| {
                     if (e.is_cell) {
                         if (!try addPathCell(io, dir, e.path, &metas, &paths, s57.catalogCrc(e.crcs))) skipped += 1;
@@ -2615,7 +2749,7 @@ pub const Chart = struct {
         src.skipped_cells = skipped;
         const ctx = try gpa.create(PathCtx);
         errdefer gpa.destroy(ctx);
-        ctx.* = .{ .threaded = threaded, .io = io, .dir = dir, .paths = try paths.toOwnedSlice(gpa) };
+        ctx.* = .{ .threaded = threaded, .io = io, .dir = dir, .paths = try paths.toOwnedSlice(gpa), .crcs = crcs };
         src.backend.cells.reader_user = ctx;
         src.backend.cells.path_ctx = ctx;
         return src;
