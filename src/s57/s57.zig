@@ -1458,6 +1458,13 @@ fn parseDSID(a: Allocator, data: []const u8) ?Dsid {
     var off: usize = 7; // RCNM+RCID+EXPP+INTU
     const ascii = struct {
         fn next(buf: []const u8, o: *usize) []const u8 {
+            // The fixed-width skips below move `off` past the end on a
+            // truncated DSID. Clamp before slicing. A short field reads as
+            // empty and the caller keeps what it parsed.
+            if (o.* >= buf.len) {
+                o.* = buf.len;
+                return buf[buf.len..];
+            }
             const start = o.*;
             while (o.* < buf.len and buf[o.*] != 0x1f) o.* += 1;
             const s = buf[start..o.*];
@@ -2074,6 +2081,26 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
 }
 
 // ---- tests --------------------------------------------------------------
+
+test "a DSID truncated after UPDN parses what it has" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // RCNM+RCID+EXPP+INTU, then DSNM, EDTN, UPDN. The UADT, STED and PRSP
+    // skips that follow move `off` past the end. The reads after them return
+    // empty instead of slicing start > end.
+    const data = [_]u8{ 10, 1, 0, 0, 0, 1, 1 } ++ "AB" ++ [_]u8{0x1f} ++ "3" ++ [_]u8{0x1f} ++ "2" ++ [_]u8{0x1f};
+    const d = parseDSID(a, data).?;
+    try std.testing.expectEqualStrings("AB", d.dsnm);
+    try std.testing.expectEqualStrings("3", d.edtn);
+    try std.testing.expectEqualStrings("2", d.updn);
+
+    // Every prefix of a well-formed DSID parses. A truncated file has this
+    // shape.
+    var i: usize = 0;
+    while (i <= data.len) : (i += 1) _ = parseDSID(a, data[0..i]);
+}
 
 test "parse DSPM coordinate factors" {
     var data: [24]u8 = undefined;
