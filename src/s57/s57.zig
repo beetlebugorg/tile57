@@ -2110,6 +2110,11 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
         if (uh.edtn.len > 0 and base_edtn.len > 0 and !std.mem.eql(u8, uh.edtn, base_edtn)) break;
         if (uh.updn.len > 0) {
             const got = std.fmt.parseInt(u32, std.mem.trim(u8, uh.updn, " "), 10) catch break;
+            // No update can follow the largest UPDN value, so a
+            // file claiming to is corrupt or hostile. Stopping here also keeps
+            // the add below from overflowing, which panics in a safe build and
+            // ends the whole bake run over one bad file.
+            if (last_updn == std.math.maxInt(u32)) break;
             if (got != last_updn + 1) break;
             last_updn = got;
         }
