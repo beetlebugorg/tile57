@@ -333,6 +333,52 @@ fn updateNumber(dsnm: []const u8) ?u32 {
     return std.fmt.parseInt(u32, ext, 10) catch null;
 }
 
+/// What a native S-101 dataset says about itself, for an inventory row. The
+/// slices borrow the bytes they were read from.
+pub const Identity = struct {
+    /// DSID's dataset name, the file's own name including the extension.
+    dsnm: []const u8 = "",
+    /// DSID's edition (see Tables.dsed).
+    dsed: []const u8 = "",
+
+    /// The edition number on its own, without the updates folded into it.
+    pub fn editionText(self: Identity) []const u8 {
+        return self.dsed[0 .. std.mem.indexOfScalar(u8, self.dsed, '.') orelse self.dsed.len];
+    }
+
+    /// The updates already folded in, empty when the edition names none.
+    pub fn updateText(self: Identity) []const u8 {
+        const dot = std.mem.indexOfScalar(u8, self.dsed, '.') orelse return "";
+        return self.dsed[dot + 1 ..];
+    }
+};
+
+/// Read a dataset's identity out of DSID without parsing the file. Null when
+/// the bytes hold no DSID record. See parseDatasetRecord for the subfield
+/// positions and why a value outside the shape of a number is read as absent.
+pub fn peekIdentity(bytes: []const u8) ?Identity {
+    var it = iso.iterate(bytes);
+    _ = it.next(); // the DDR declares the schema rather than the values
+    while (it.next()) |rec| {
+        const lead = rec.firstTag() orelse continue;
+        if (!std.mem.eql(u8, lead, "DSID")) continue;
+        const d = rec.field("DSID") orelse return null;
+        if (d.len <= 5) return null;
+        var out: Identity = .{};
+        var parts = std.mem.splitScalar(u8, d[5..], 0x1f);
+        var i: usize = 0;
+        while (parts.next()) |part| : (i += 1) {
+            if (i == 5) out.dsnm = part;
+            if (i == 9) {
+                if (looksNumeric(part)) out.dsed = part;
+                break;
+            }
+        }
+        return out;
+    }
+    return null;
+}
+
 /// True when every byte is a digit or a dot, the shape an edition is written
 /// in. Guards the positional read of the edition out of DSID.
 fn looksNumeric(s: []const u8) bool {
@@ -890,6 +936,38 @@ test "an update names its own number and cell in DSNM" {
     // A file with no name disagrees with neither.
     try std.testing.expect(sameDataset("10100AA_X01SW.000", ""));
     try std.testing.expect(sameDataset("", "10100AA_X01SW.001"));
+}
+
+test "peekIdentity reads the name and edition out of a DSID record" {
+    // An S-57 DSID reader finds different subfields at these positions, so an
+    // inventory built with one described a native dataset as the S-100 profile
+    // name at edition "1.1" with the product specification URN as its update.
+    const a = std.testing.allocator;
+    const ut = [_]u8{0x1f};
+    // RCNM(1) RCID(4), then the UT-separated parts: index 5 is DSNM, index 9
+    // the edition. Index 7 holds the fixed-width issue date run together with
+    // the part after it, as the producers write it.
+    const dsid = [_]u8{ 10, 1, 0, 0, 0 } ++ "S-100 Part 10a".* ++ ut ++ "1.1".* ++ ut ++
+        "INT.IHO.S-101.1.1.0".* ++ ut ++ "1.1.0".* ++ ut ++ "1".* ++ ut ++
+        "10100AA_X01SW.000".* ++ ut ++ "note".* ++ ut ++ "20050908EN".* ++ ut ++
+        "".* ++ ut ++ "1.3".* ++ ut;
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try iso.writeRecord(a, &buf, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(a, &buf, 'D', &.{.{ .tag = "DSID", .data = &dsid }});
+
+    const id = peekIdentity(buf.items).?;
+    try std.testing.expectEqualStrings("10100AA_X01SW.000", id.dsnm);
+    try std.testing.expectEqualStrings("1.3", id.dsed);
+    try std.testing.expectEqualStrings("1", id.editionText());
+    try std.testing.expectEqualStrings("3", id.updateText());
+
+    // A file with no DSID has no identity to read.
+    var empty = std.ArrayList(u8).empty;
+    defer empty.deinit(a);
+    try iso.writeRecord(a, &empty, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try std.testing.expect(peekIdentity(empty.items) == null);
 }
 
 test "an edition gives its number and the updates it already includes" {

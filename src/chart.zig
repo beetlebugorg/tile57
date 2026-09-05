@@ -506,6 +506,34 @@ fn peekAnyMeta(bytes: []const u8) ?s57.CellMeta {
     return s57.peekMeta(gpa, bytes);
 }
 
+/// The inventory row for one cell, whichever format it is in.
+///
+/// s57.peekCellInfo reads an S-57 DSID. An S-101 DSID holds different subfields
+/// in those positions, so it produced a row of unrelated strings: the S-100
+/// profile name where the cell name goes, the product specification URN as the
+/// update number, and two bytes of the file name read as an agency code. A
+/// native dataset gets its identity from the S-101 reader instead. Strings are
+/// duped into `a`, so the row outlives the bytes it was read from.
+fn peekAnyInfo(a: std.mem.Allocator, base: []const u8, updates: []const []const u8) ?s57.CellInfo {
+    if (!s101.dataset.detect(base)) return s57.peekCellInfo(a, base, updates);
+
+    const id = s101.dataset.peekIdentity(base) orelse return null;
+    const m = peekAnyMeta(base) orelse return null;
+    var info = s57.CellInfo{ .scale = m.cscl, .bounds = m.bounds };
+    const ext = std.fs.path.extension(id.dsnm);
+    info.name = a.dupe(u8, id.dsnm[0 .. id.dsnm.len - ext.len]) catch return null;
+    info.edition = a.dupe(u8, id.editionText()) catch return null;
+    info.update = a.dupe(u8, id.updateText()) catch return null;
+    // The newest file of this edition gives the update the chart is at, the
+    // same way the S-57 walk reads the last file in the chain.
+    for (updates) |u| {
+        const ui = s101.dataset.peekIdentity(u) orelse continue;
+        if (!std.mem.eql(u8, ui.editionText(), info.edition)) continue;
+        info.update = a.dupe(u8, ui.updateText()) catch continue;
+    }
+    return info;
+}
+
 /// assembles via s101.native; an S-57 cell parses via s57. Returns null on failure.
 fn parseAnyCell(base: []const u8, updates: []const []const u8) ?CellLoad {
     if (s101.dataset.detect(base)) {
@@ -3418,7 +3446,7 @@ pub const Chart = struct {
             .cells => |*ls| {
                 for (ls.cells) |*lc| {
                     if (lc.base.len > 0) {
-                        if (s57.peekCellInfo(a, lc.base, lc.updates)) |ci| try infos.append(a, ci);
+                        if (peekAnyInfo(a, lc.base, lc.updates)) |ci| try infos.append(a, ci);
                     } else if (lc.cell) |*c| {
                         const d = c.dsid;
                         const ext = std.fs.path.extension(d.dsnm);
@@ -3447,7 +3475,7 @@ pub const Chart = struct {
                             } else |_| {}
                         }
                         defer if (ups_arr) |arr| gpa.free(arr);
-                        if (s57.peekCellInfo(a, cb.base[0..cb.base_len], ups)) |ci| try infos.append(a, ci);
+                        if (peekAnyInfo(a, cb.base[0..cb.base_len], ups)) |ci| try infos.append(a, ci);
                     }
                 }
             },
