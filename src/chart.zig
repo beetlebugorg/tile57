@@ -750,7 +750,7 @@ fn readCellFiles(path: []const u8) !CellFiles {
     defer dir.close(io);
 
     const bn = std.fs.path.basename(path);
-    const base = try dir.readFileAlloc(io, bn, gpa, .unlimited);
+    const base = try dir.readFileAlloc(io, bn, gpa, .limited(MAX_CELL_BYTES));
     errdefer gpa.free(base);
     var updates = std.ArrayList([]u8).empty;
     errdefer {
@@ -763,7 +763,7 @@ fn readCellFiles(path: []const u8) !CellFiles {
         while (u <= 999) : (u += 1) {
             const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
             defer gpa.free(upn);
-            const ub = dir.readFileAlloc(io, upn, gpa, .unlimited) catch break;
+            const ub = dir.readFileAlloc(io, upn, gpa, .limited(MAX_CELL_BYTES)) catch break;
             updates.append(gpa, ub) catch {
                 gpa.free(ub);
                 break;
@@ -773,9 +773,11 @@ fn readCellFiles(path: []const u8) !CellFiles {
     return .{ .base = base, .updates = try updates.toOwnedSlice(gpa) };
 }
 
-/// The most a single ENC cell may claim to expand to. Cells run to a few MiB;
-/// a header promising more than this is a damaged or hostile archive, and the
-/// point of a cap is to find that out before allocating rather than after.
+/// The most any single file an exchange set names may claim: a cell, one of its
+/// updates, an aux file it references, or the catalogue that lists them. Cells
+/// run to a few MiB, so a size past this marks a damaged or hostile set,
+/// and the point of a cap is to find that out before allocating rather than
+/// after. The zip reads and the on-disk reads share it.
 pub const MAX_CELL_BYTES: u64 = 256 << 20;
 
 /// `readCellFiles` out of a zip: the base entry plus its update chain, each
@@ -860,7 +862,7 @@ fn writeAuxFromDir(io: std.Io, cell_path: []const u8, out_path: []const u8) void
         // The iterator reuses its name buffer, so both the name and the bytes
         // must be copied before the next step.
         const name = a.dupe(u8, ent.name) catch continue;
-        const bytes = dir.readFileAlloc(io, name, a, .unlimited) catch continue;
+        const bytes = dir.readFileAlloc(io, name, a, .limited(MAX_CELL_BYTES)) catch continue;
         files.append(a, .{ .owner = stem, .name = name, .bytes = bytes }) catch continue;
     }
     _ = auxfiles.writeDir(io, a, dst, files.items) catch {};
@@ -2463,7 +2465,7 @@ pub const Chart = struct {
 
         if (single_file) {
             try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths);
-        } else if (dir.readFileAlloc(io, "CATALOG.031", gpa, .unlimited)) |cbytes| {
+        } else if (dir.readFileAlloc(io, "CATALOG.031", gpa, .limited(MAX_CELL_BYTES))) |cbytes| {
             defer gpa.free(cbytes);
             var carena = std.heap.ArenaAllocator.init(gpa);
             defer carena.deinit();
