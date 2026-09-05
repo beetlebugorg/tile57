@@ -1128,8 +1128,12 @@ fn deriveEndpoints(v: *VectorRecord) void {
 
 /// VRPT: repeated 9-byte entries NAME(5)+ORNT(1)+USAG(1)+TOPI(1)+MASK(1). Retains
 /// the full pointer list (for VRPC indexed modifies) and derives begin/end nodes.
-fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) void {
-    const list = a.alloc(VPtr, data.len / 9) catch return;
+fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) !void {
+    // Every other field parser reports its allocation failure. This one
+    // returned void, so a failed alloc left vptrs empty, and the MODIFY path
+    // reads an empty list as a deliberate replacement and clears the edge's
+    // begin and end nodes.
+    const list = try a.alloc(VPtr, data.len / 9);
     var cnt: usize = 0;
     var off: usize = 0;
     while (off + 9 <= data.len) : (off += 9) {
@@ -1146,6 +1150,16 @@ fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) void {
 /// an all-DEL value means "attribute removed" — equivalent to absent.
 fn isDelMarker(v: []const u8) bool {
     if (v.len == 0) return false;
+    // S-57 8.4.2.2 a, table 8.1: the delete character is (7/15) at lexical
+    // levels 0 and 1, and (0/0)(7/15) at level 2.
+    if (v.len % 2 == 0) {
+        var i: usize = 0;
+        var all_l2 = true;
+        while (i + 1 < v.len) : (i += 2) {
+            if (v[i] != 0x00 or v[i + 1] != 0x7f) all_l2 = false;
+        }
+        if (all_l2) return true;
+    }
     for (v) |c| if (c != 0x7f) return false;
     return true;
 }
@@ -1801,7 +1815,7 @@ fn mergeFile(
             var v = VectorRecord{ .rcnm = rcnm, .rcid = rcid, .points = &.{}, .soundings = &.{} };
             if (flds.sg2d) |sg| v.points = try parseSG2D(a, sg, comf);
             if (flds.sg3d) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
-            if (flds.vrpt) |vp| parseVRPT(a, &v, vp);
+            if (flds.vrpt) |vp| try parseVRPT(a, &v, vp);
             if (flds.attv) |av| v.quapos = quaposFromAttv(a, av);
 
             if (ruin == 3) { // modify in place
@@ -2342,6 +2356,12 @@ test "parseATTF drops an S-57 DEL (0x7F) attribute-delete marker" {
     try std.testing.expect(isDelMarker("\x7f\x7f"));
     try std.testing.expect(!isDelMarker(""));
     try std.testing.expect(!isDelMarker("90"));
+    // Lexical level 2 spells the delete character (0/0)(7/15).
+    try std.testing.expect(isDelMarker("\x00\x7f"));
+    try std.testing.expect(isDelMarker("\x00\x7f\x00\x7f"));
+    try std.testing.expect(!isDelMarker("\x00"));
+    try std.testing.expect(!isDelMarker("\x00\x7fA"));
+    try std.testing.expect(!isDelMarker("\x00A"));
 }
 
 test "attrFloat / parseFloatOpt trim full ASCII whitespace (oracle TrimSpace)" {
