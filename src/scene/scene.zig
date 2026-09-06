@@ -922,8 +922,9 @@ const AugmentKind = enum { area, line, point, text };
 ///    latitude (finer than the style's one archive-centre latitude).
 ///  - oz (f32): the display zoom above which the cell is overscaled — the
 ///    same fold of the oscl denominator gate.
-///  - mq (int 1): present on M_QUAL features; the data-quality clause becomes
-///    an int check instead of a string compare.
+///  - mq (int 1): present on the data-quality meta feature, under either
+///    standard; the data-quality clause becomes an int check instead of a
+///    string compare.
 ///  - iso (int 1): present on ISODGR01 danger symbols; the isolated-danger
 ///    category override stops string-comparing symbol_name per feature.
 ///  - lt (int 1): present on LIGHTS points; the point-family partition stops
@@ -945,7 +946,7 @@ fn augmentV3(a: Allocator, feats: []mvt.Feature, kind: AugmentKind, gate_lat: f6
             try extra.append(a, .{ .key = "oz", .value = .{ .float = oz } });
         };
         const class = propString(f.properties, "class") orelse "";
-        if (std.mem.eql(u8, class, "M_QUAL"))
+        if (style.mariner.isDataQuality(class))
             try extra.append(a, .{ .key = "mq", .value = .{ .int = 1 } });
         switch (kind) {
             .point => {
@@ -3492,4 +3493,18 @@ test "augmentV3: vz/ep/lt/iso/mq/lsk precomputes" {
     try augmentV3(a, &lns, .line, 0);
     try std.testing.expectEqual(@as(i64, 2998), findP(lns[0].properties, "lsk").?.int);
     try std.testing.expectEqual(@as(i64, 1), findP(lns[0].properties, "mq").?.int);
+
+    // An S-101 chart names the same feature QualityOfBathymetricData, and the
+    // overlay gate reads mq rather than the class.
+    var s101 = [_]mvt.Feature{.{ .geom_type = .polygon, .parts = &.{}, .properties = &.{
+        .{ .key = "class", .value = .{ .string = "QualityOfBathymetricData" } },
+    } }};
+    try augmentV3(a, &s101, .area, 0);
+    try std.testing.expectEqual(@as(i64, 1), findP(s101[0].properties, "mq").?.int);
+
+    var other = [_]mvt.Feature{.{ .geom_type = .polygon, .parts = &.{}, .properties = &.{
+        .{ .key = "class", .value = .{ .string = "QualityOfSurvey" } },
+    } }};
+    try augmentV3(a, &other, .area, 0);
+    try std.testing.expectEqual(@as(?mvt.Value, null), findP(other[0].properties, "mq"));
 }
