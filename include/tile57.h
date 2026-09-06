@@ -145,6 +145,66 @@ typedef struct {
 
 /* ---- reading ENC source data --------------------------------------------- */
 
+/* What kind of chart file the inventory found. */
+typedef enum {
+    TILE57_FILE_OTHER  = 0, /* shortlisted by extension and not a chart */
+    TILE57_FILE_SOURCE = 1, /* a dataset; it bakes before it draws */
+    TILE57_FILE_UPDATE = 2, /* an S-57 update; it bakes with its base chart */
+    TILE57_FILE_BAKED  = 3, /* a baked archive; it draws now */
+    TILE57_FILE_RASTER = 4  /* a picture chart */
+} tile57_file_kind;
+
+/* The standard a dataset states in its leading record. */
+typedef enum {
+    TILE57_STANDARD_NONE = 0,
+    TILE57_STANDARD_S57  = 1,
+    TILE57_STANDARD_S101 = 2
+} tile57_standard;
+
+/* One file the inventory looked at. Strings are borrowed until
+ * tile57_inventory_close. A field the file does not state is an empty string
+ * or 0. */
+typedef struct {
+    const char *path;      /* as given, or relative to the directory walked */
+    uint64_t bytes;
+    uint8_t kind;          /* tile57_file_kind */
+    uint8_t standard;      /* tile57_standard; NONE unless a dataset */
+    const char *name;      /* the cell name, from DSID */
+    const char *edition, *update, *issue_date;
+    uint16_t agency;
+    int32_t scale;         /* compilation scale denominator */
+    bool has_bounds; double west, south, east, north;
+    /* Why a shortlisted file will not open. Empty when it read cleanly. */
+    const char *reason;
+} tile57_inventory_row;
+
+/* Opaque inventory handle: what one path holds. */
+typedef struct tile57_inventory tile57_inventory;
+
+/* Report the files under `path` that look like charts. `path` is one file, or
+ * a directory walked to the bottom. An exchange set still in its .zip is out
+ * of scope: an entry inflates before it can be read.
+ *
+ * An extension shortlists the files to open (.000 through .999, .pmtiles,
+ * .mbtiles, .kap, .bsb). The file then states what it is: a dataset states its
+ * standard in its leading record, its cell name and edition in DSID, and its
+ * scale in the dataset parameters. A shortlisted file that is something else
+ * is TILE57_FILE_OTHER with a reason.
+ *
+ * Every file reported on is opened. A dataset costs a leading-record peek and
+ * a baked archive costs its header.
+ *
+ * TILE57_OK with the handle in *out, holding no file open. It fails when the
+ * path cannot be read. */
+tile57_status tile57_inventory_open(const char *path, tile57_inventory **out,
+                                    tile57_error *err);
+void tile57_inventory_close(tile57_inventory *inv);
+
+/* The rows, in path order. Borrowed until close. *out_n receives the count.
+ * It is 0 when the path holds no chart file. */
+const tile57_inventory_row *tile57_inventory_rows(tile57_inventory *inv,
+                                                  size_t *out_n);
+
 /* The per-chart metadata of the S-57 data at `path` — ONE chart (a .000 file,
  * with its .001.. update chain auto-read from the same directory) or a whole
  * ENC_ROOT directory — as a JSON array, one object per chart:

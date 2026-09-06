@@ -2590,3 +2590,84 @@ export fn tile57_free(ptr: ?*anyopaque) callconv(.c) void {
     const total = std.mem.readInt(usize, base[0..@sizeOf(usize)], .little);
     gpa.free(base[0..total]);
 }
+
+// ---- the inventory ----------------------------------------------------------
+
+const CInventoryRow = extern struct {
+    path: [*:0]const u8,
+    bytes: u64,
+    kind: u8,
+    standard: u8,
+    name: [*:0]const u8,
+    edition: [*:0]const u8,
+    update: [*:0]const u8,
+    issue_date: [*:0]const u8,
+    agency: u16,
+    scale: i32,
+    has_bounds: bool,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    reason: [*:0]const u8,
+};
+
+/// What one path holds: the rows, and the arena their strings live in.
+const Inventory = struct {
+    inv: *chart.Inventory,
+    rows: []CInventoryRow,
+};
+
+/// Look through a path and report the files under it that look like charts.
+/// See tile57.h.
+export fn tile57_inventory_open(path: ?[*:0]const u8, out: ?*?*Inventory, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    const inv = chart.inventoryOpen(sharedIo(), p) catch |e| return failCtx(err, e, p);
+    errdefer inv.close();
+    const rows = gpa.alloc(CInventoryRow, inv.rows.len) catch |e| return fail(err, e);
+    errdefer gpa.free(rows);
+    for (inv.rows, rows) |src, *dst| {
+        dst.* = .{
+            .path = src.path.ptr,
+            .bytes = src.bytes,
+            .kind = @intFromEnum(src.kind),
+            .standard = @intFromEnum(src.standard),
+            .name = src.name.ptr,
+            .edition = src.edition.ptr,
+            .update = src.update.ptr,
+            .issue_date = src.issue_date.ptr,
+            .agency = src.agency,
+            .scale = src.scale,
+            .has_bounds = src.bounds != null,
+            .west = if (src.bounds) |b| b[0] else 0,
+            .south = if (src.bounds) |b| b[1] else 0,
+            .east = if (src.bounds) |b| b[2] else 0,
+            .north = if (src.bounds) |b| b[3] else 0,
+            .reason = src.reason.ptr,
+        };
+    }
+    const handle = gpa.create(Inventory) catch |e| return fail(err, e);
+    handle.* = .{ .inv = inv, .rows = rows };
+    o.* = handle;
+    return OK;
+}
+
+export fn tile57_inventory_close(handle: ?*Inventory) callconv(.c) void {
+    const h = handle orelse return;
+    gpa.free(h.rows);
+    h.inv.close();
+    gpa.destroy(h);
+}
+
+/// The rows, in path order. Borrowed until close. See tile57.h.
+export fn tile57_inventory_rows(handle: ?*Inventory, out_n: ?*usize) callconv(.c) ?[*]const CInventoryRow {
+    const h = handle orelse {
+        if (out_n) |n| n.* = 0;
+        return null;
+    };
+    if (out_n) |n| n.* = h.rows.len;
+    if (h.rows.len == 0) return null;
+    return h.rows.ptr;
+}
