@@ -413,8 +413,9 @@ fn pathRead(user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool
     var ulens = std.ArrayList(usize).empty;
     defer ulens.deinit(gpa);
     const stem = bpath[0 .. bpath.len - 4]; // strip ".000"
-    var u: u32 = 1;
-    while (u <= 999) : (u += 1) {
+    var nums = updateNumbersFor(ctx.dir, ctx.io, bpath) catch std.ArrayList(u32).empty;
+    defer nums.deinit(gpa);
+    for (nums.items) |u| {
         const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
         defer gpa.free(upn);
         const ub = ctx.dir.readFileAlloc(ctx.io, upn, gpa, .limited(MAX_CELL_BYTES)) catch break;
@@ -736,6 +737,42 @@ pub const CellFiles = struct {
     }
 };
 
+/// The update numbers held beside the `.000` cell at `relpath`, ascending.
+/// `relpath` is resolved against `dir`, so it may name a cell in a
+/// subdirectory of it.
+///
+/// The chain does not have to start at `.001`. A re-issued base includes its
+/// earlier updates and is delivered with only the ones that follow it, so
+/// reading until the first absent extension drops every update in the set.
+/// This gathers the numbered files present. The update gate then applies the
+/// ones following the base's edition and number.
+fn updateNumbersFor(dir: std.Io.Dir, io: std.Io, relpath: []const u8) !std.ArrayList(u32) {
+    var opened: ?std.Io.Dir = null;
+    defer if (opened) |*d| d.close(io);
+    var cell_dir = dir;
+    if (std.fs.path.dirname(relpath)) |sub| {
+        opened = try dir.openDir(io, sub, .{ .iterate = true });
+        cell_dir = opened.?;
+    }
+    const bn = std.fs.path.basename(relpath);
+    const stem = bn[0 .. bn.len - 4]; // strip ".000"
+
+    var nums = std.ArrayList(u32).empty;
+    errdefer nums.deinit(gpa);
+    var it = cell_dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        if (ent.kind != .file) continue;
+        if (ent.name.len != stem.len + 4) continue;
+        if (!std.mem.eql(u8, ent.name[0..stem.len], stem)) continue;
+        if (ent.name[stem.len] != '.') continue;
+        const n = std.fmt.parseInt(u32, ent.name[stem.len + 1 ..], 10) catch continue;
+        if (n == 0) continue; // the base itself
+        try nums.append(gpa, n);
+    }
+    std.mem.sort(u32, nums.items, {}, std.sort.asc(u32));
+    return nums;
+}
+
 /// Read a .000 cell + its .001.. updates from the cell's directory into gpa buffers.
 fn readCellFiles(path: []const u8) !CellFiles {
     const threaded = try gpa.create(std.Io.Threaded);
@@ -746,7 +783,7 @@ fn readCellFiles(path: []const u8) !CellFiles {
     }
     const io = threaded.io();
     const dir_path = std.fs.path.dirname(path) orelse ".";
-    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
 
     const bn = std.fs.path.basename(path);
@@ -759,8 +796,9 @@ fn readCellFiles(path: []const u8) !CellFiles {
     }
     if (bn.len > 4) {
         const stem = bn[0 .. bn.len - 4]; // strip ".000"
-        var u: u32 = 1;
-        while (u <= 999) : (u += 1) {
+        var nums = try updateNumbersFor(dir, io, bn);
+        defer nums.deinit(gpa);
+        for (nums.items) |u| {
             const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
             defer gpa.free(upn);
             const ub = dir.readFileAlloc(io, upn, gpa, .limited(MAX_CELL_BYTES)) catch break;

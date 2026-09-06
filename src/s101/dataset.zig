@@ -257,6 +257,16 @@ fn digit(c: u8) ?u8 {
 /// resolve their class/attribute NAMES against ITS tables before merging.
 const Tables = struct {
     params: Params = .{},
+    /// DSID's dataset name, the file's own name including the
+    /// update extension (`10100AA_X01SW.003`). S-100 Part 10a puts the update
+    /// number there, so the sequence a chain claims is readable without the
+    /// path the bytes arrived from.
+    dsnm: []const u8 = "",
+    /// DSID's edition, written `<edition>` or `<edition>.<updates folded in>`.
+    /// `2.0` is edition 2 with none applied, `1.3` a base that already includes
+    /// updates 1 through 3, a bare `7` edition 7. Empty when the record has
+    /// no readable value there.
+    dsed: []const u8 = "",
     fc: CodeTable = .{}, // FTCS (feature classes)
     ac: CodeTable = .{}, // ATCS (attributes)
     ic: CodeTable = .{}, // ITCS (information types)
@@ -313,6 +323,55 @@ pub fn parse(gpa: Allocator, bytes: []const u8) !Dataset {
 /// `.002`, … in order), merging records by (RCNM, RCID): RUIN 1=insert, 2=delete,
 /// 3=modify (S-100 Part 10a §4a-4.5). Names resolve per file (each carries its own
 /// code tables). All kept bytes are duped into the result's arena, so the base and
+/// The update number in a dataset name, from the extension S-100 Part 10a
+/// gives it (`10100AA_X01SW.003` is update 3, and a base has `.000`). Null
+/// when the name has no numeric extension.
+fn updateNumber(dsnm: []const u8) ?u32 {
+    const dot = std.mem.lastIndexOfScalar(u8, dsnm, '.') orelse return null;
+    const ext = dsnm[dot + 1 ..];
+    if (ext.len == 0) return null;
+    return std.fmt.parseInt(u32, ext, 10) catch null;
+}
+
+/// True when every byte is a digit or a dot, the shape an edition is written
+/// in. Guards the positional read of the edition out of DSID.
+fn looksNumeric(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (c != '.' and (c < '0' or c > '9')) return false;
+    }
+    return true;
+}
+
+/// The edition number in an edition string: the part before the dot. Null
+/// when the string has none.
+fn editionOf(dsed: []const u8) ?u32 {
+    const stem = dsed[0 .. std.mem.indexOfScalar(u8, dsed, '.') orelse dsed.len];
+    if (stem.len == 0) return null;
+    return std.fmt.parseInt(u32, stem, 10) catch null;
+}
+
+/// The updates an edition string marks as already folded into the file: the
+/// part after the dot. A base issued clean has `.0` or no dot at all. A
+/// re-issue gives the number it was re-issued through, so the chain resumes
+/// past those instead of applying them a second time. Null when the string
+/// has no value after the dot.
+fn updatesFolded(dsed: []const u8) ?u32 {
+    const dot = std.mem.indexOfScalar(u8, dsed, '.') orelse return null;
+    const rest = dsed[dot + 1 ..];
+    if (rest.len == 0) return null;
+    return std.fmt.parseInt(u32, rest, 10) catch null;
+}
+
+/// True when two dataset names address the same cell, comparing the stem
+/// before the update extension.
+fn sameDataset(a_name: []const u8, b_name: []const u8) bool {
+    if (a_name.len == 0 or b_name.len == 0) return true; // no name to disagree with
+    const sa = a_name[0 .. std.mem.lastIndexOfScalar(u8, a_name, '.') orelse a_name.len];
+    const sb = b_name[0 .. std.mem.lastIndexOfScalar(u8, b_name, '.') orelse b_name.len];
+    return std.mem.eql(u8, sa, sb);
+}
+
 /// update ISO readers are transient. Pass an empty `updates` for a plain base cell.
 pub fn parseWithUpdates(gpa: Allocator, base: []const u8, updates: []const []const u8) !Dataset {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -330,9 +389,47 @@ pub fn parseWithUpdates(gpa: Allocator, base: []const u8, updates: []const []con
     const base_tables = try readHeader(a, base);
     try decodeInto(a, &m, base, base_tables);
 
+    // The chain stops on anything that says this file does not follow the last
+    // one applied, the way the S-57 path stops on a mismatched edition or
+    // update number. A corrupt update stops it too, keeping the prior state.
+    // Where the base already stands. A re-issue is delivered as `.000` like any
+    // base, so its file name gives 0 and only its edition gives the updates it
+    // was re-issued through. Seeding from the name alone re-applied the updates
+    // the re-issue already included, corrupting the chart.
+    var applied: u32 = updatesFolded(base_tables.dsed) orelse
+        updateNumber(base_tables.dsnm) orelse 0;
+    const base_edition = editionOf(base_tables.dsed);
     for (updates) |u| {
-        iso.validate(u) catch break; // reject a corrupt update; keep prior state
+        iso.validate(u) catch break;
         const t = readHeader(a, u) catch break;
+        // S-100 Part 10a 3.2: the factors scale every coordinate in the file
+        // that declares them, so the base's factors decode this one by the
+        // wrong scale.
+        if (t.params.cmfx != base_tables.params.cmfx or
+            t.params.cmfy != base_tables.params.cmfy or
+            t.params.cmfz != base_tables.params.cmfz) break;
+        if (!sameDataset(base_tables.dsnm, t.dsnm)) break;
+        // A new edition restarts its updates at `.001` and is delivered as
+        // `.000` under the same name, so the extension alone cannot tell an
+        // update of THIS edition from one left behind by the last. The S-57
+        // path stops on an EDTN mismatch; this is the same stop.
+        if (base_edition) |be| {
+            if (editionOf(t.dsed)) |ue| {
+                if (ue != be) break;
+            }
+        }
+        if (updateNumber(t.dsnm)) |n| {
+            // An update at or below where the base already stands is one the
+            // base was re-issued with. Skipping it resumes the chain at the
+            // first file with something new, instead of stopping on the
+            // superseded files an earlier exchange set left in the directory.
+            if (n <= applied) continue;
+            // No update follows the largest number statable, and stopping here
+            // keeps the add below from overflowing.
+            if (applied == std.math.maxInt(u32)) break;
+            if (n != applied + 1) break;
+            applied = n;
+        }
         decodeInto(a, &m, u, t) catch break;
     }
 
@@ -466,7 +563,7 @@ fn readHeader(a: Allocator, bytes: []const u8) !Tables {
     while (it.next()) |rec| {
         const lead = rec.firstTag() orelse continue;
         if (!std.mem.eql(u8, lead, "DSID")) continue;
-        try parseDatasetRecord(a, rec, &t.params, &t.fc, &t.ac, &t.ic, &t.arc);
+        try parseDatasetRecord(a, rec, &t.dsnm, &t.dsed, &t.params, &t.fc, &t.ac, &t.ic, &t.arc);
         break;
     }
     return t;
@@ -475,12 +572,33 @@ fn readHeader(a: Allocator, bytes: []const u8) !Tables {
 fn parseDatasetRecord(
     a: Allocator,
     rec: iso.RecordView,
+    dsnm: *[]const u8,
+    dsed: *[]const u8,
     params: *Params,
     feature_codes: *CodeTable,
     attr_codes: *CodeTable,
     info_codes: *CodeTable,
     assoc_codes: *CodeTable,
 ) !void {
+    if (rec.field("DSID")) |d| {
+        // RCNM(1) RCID(4) then UT-separated ASCII: ENSP, ENED, PRSP, PRED,
+        // PROF, DSNM, and the rest. The edition follows four parts later:
+        // the DDR writes the issue date fixed-width, so it shares a split with
+        // the part after it and the count reaches 9. That offset describes the
+        // layout these producers write rather than a guarantee, so a part
+        // holding anything but digits and dots is read as absent.
+        if (d.len > 5) {
+            var it = std.mem.splitScalar(u8, d[5..], 0x1f);
+            var i: usize = 0;
+            while (it.next()) |part| : (i += 1) {
+                if (i == 5) dsnm.* = try a.dupe(u8, part);
+                if (i == 9) {
+                    if (looksNumeric(part)) dsed.* = try a.dupe(u8, part);
+                    break;
+                }
+            }
+        }
+    }
     if (rec.field("DSSI")) |s| {
         // (3b48,10b14): DCOX,DCOY,DCOZ (origin, unused) then CMFX,CMFY,CMFZ then the
         // seven record counts NOIR,NOPN,NOMN,NOCN,NOXN,NOSN,NOFR.
@@ -755,4 +873,46 @@ test "modifyFeature applies SAUI spatial-association edits" {
     try std.testing.expectEqual(@as(u32, 10), ex.spas[0].rrid); // kept
     try std.testing.expectEqual(@as(u32, 12), ex.spas[1].rrid); // inserted (11 removed)
     try std.testing.expectEqual(@as(u16, 2), ex.version);
+}
+
+test "an update names its own number and cell in DSNM" {
+    // S-100 Part 10a names a file in DSID, extension included, so a chain is
+    // checkable without the path the bytes arrived from.
+    try std.testing.expectEqual(@as(?u32, 0), updateNumber("10100AA_X01SW.000"));
+    try std.testing.expectEqual(@as(?u32, 3), updateNumber("10100AA_X01SW.003"));
+    try std.testing.expectEqual(@as(?u32, 12), updateNumber("10100AA_X01SW.012"));
+    try std.testing.expectEqual(@as(?u32, null), updateNumber("10100AA_X01SW"));
+    try std.testing.expectEqual(@as(?u32, null), updateNumber("10100AA_X01SW.abc"));
+    try std.testing.expectEqual(@as(?u32, null), updateNumber(""));
+
+    try std.testing.expect(sameDataset("10100AA_X01SW.000", "10100AA_X01SW.003"));
+    try std.testing.expect(!sameDataset("10100AA_X01SW.000", "10100AA_X02NE.001"));
+    // A file with no name disagrees with neither.
+    try std.testing.expect(sameDataset("10100AA_X01SW.000", ""));
+    try std.testing.expect(sameDataset("", "10100AA_X01SW.001"));
+}
+
+test "an edition gives its number and the updates it already includes" {
+    // The shapes real producers write: a base issued clean, a base re-issued
+    // through update 3, an update of edition 1, and an edition with no dot.
+    try std.testing.expectEqual(@as(?u32, 2), editionOf("2.0"));
+    try std.testing.expectEqual(@as(?u32, 1), editionOf("1.3"));
+    try std.testing.expectEqual(@as(?u32, 1), editionOf("1.1"));
+    try std.testing.expectEqual(@as(?u32, 7), editionOf("7"));
+    try std.testing.expectEqual(@as(?u32, null), editionOf(""));
+    try std.testing.expectEqual(@as(?u32, null), editionOf(".3"));
+
+    // What the file already includes, so the chain resumes past it.
+    try std.testing.expectEqual(@as(?u32, 0), updatesFolded("2.0"));
+    try std.testing.expectEqual(@as(?u32, 3), updatesFolded("1.3"));
+    try std.testing.expectEqual(@as(?u32, null), updatesFolded("7"));
+    try std.testing.expectEqual(@as(?u32, null), updatesFolded("1."));
+
+    // The edition is read out of DSID by position, so a value outside the
+    // shape of a number is read as absent.
+    try std.testing.expect(looksNumeric("1.3"));
+    try std.testing.expect(looksNumeric("7"));
+    try std.testing.expect(!looksNumeric("20050908EN"));
+    try std.testing.expect(!looksNumeric(""));
+    try std.testing.expect(!looksNumeric("EN"));
 }

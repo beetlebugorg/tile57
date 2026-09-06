@@ -611,6 +611,9 @@ pub const Cell = struct {
     /// report's "source cell" badge. Set by the loader from the filename stem after
     /// parse (the parser sees only bytes); "" when unknown (the `cell` prop is omitted).
     name: []const u8 = "",
+    /// Update files applied whole. Short of the chain supplied when one failed
+    /// to merge, which stops the chain and keeps the cell.
+    updates_applied: usize = 0,
     vectors: []VectorRecord,
     features: []const Feature,
     nodes: std.AutoHashMap(u64, LonLat), // (rcnm<<32|rcid) -> point (VI/VC)
@@ -1128,8 +1131,12 @@ fn deriveEndpoints(v: *VectorRecord) void {
 
 /// VRPT: repeated 9-byte entries NAME(5)+ORNT(1)+USAG(1)+TOPI(1)+MASK(1). Retains
 /// the full pointer list (for VRPC indexed modifies) and derives begin/end nodes.
-fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) void {
-    const list = a.alloc(VPtr, data.len / 9) catch return;
+fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) !void {
+    // Every other field parser reports its allocation failure. This one
+    // returned void, so a failed alloc left vptrs empty, and the MODIFY path
+    // reads an empty list as a deliberate replacement and clears the edge's
+    // begin and end nodes.
+    const list = try a.alloc(VPtr, data.len / 9);
     var cnt: usize = 0;
     var off: usize = 0;
     while (off + 9 <= data.len) : (off += 9) {
@@ -1146,6 +1153,28 @@ fn parseVRPT(a: Allocator, v: *VectorRecord, data: []const u8) void {
 /// an all-DEL value means "attribute removed" — equivalent to absent.
 fn isDelMarker(v: []const u8) bool {
     if (v.len == 0) return false;
+    // S-57 8.4.2.2 a, table 8.1: the delete character is (7/15) at lexical
+    // levels 0 and 1, and (0/0)(7/15) at level 2.
+    //
+    // At level 2 the unit terminator is two bytes as well, and the field scan
+    // that produced this value split on the single byte that ends it. A level-2
+    // value therefore includes the terminator's other half, a trailing NUL
+    // outside any character. Drop it before pairing up.
+    var s = v;
+    if (s.len % 2 == 1 and s[s.len - 1] == 0x00) s = s[0 .. s.len - 1];
+    // 7.2.2.1 orders multi-byte codes least significant byte first while the
+    // Annex A examples write the NUL first, so accept the pair either way
+    // rather than reading one producer's order as a name.
+    if (s.len >= 2 and s.len % 2 == 0) {
+        var i: usize = 0;
+        var all_l2 = true;
+        while (i + 1 < s.len) : (i += 2) {
+            const hi = s[i];
+            const lo = s[i + 1];
+            if (!((hi == 0x00 and lo == 0x7f) or (hi == 0x7f and lo == 0x00))) all_l2 = false;
+        }
+        if (all_l2) return true;
+    }
     for (v) |c| if (c != 0x7f) return false;
     return true;
 }
@@ -1296,16 +1325,24 @@ fn mergeAttrDelta(a: Allocator, base: []const Attr, delta: []const Attr) ![]Attr
     return list.items;
 }
 
-/// ATTV (spatial-level attributes) carry QUAPOS — quality of position lives on the
-/// edge/node records, not on the feature. ATTV shares the ATTL(2)+ATVL layout of a
-/// feature's ATTF, so reuse parseATTF and pull out QUAPOS. Returns 0 if absent.
-fn quaposFromAttv(a: Allocator, data: []const u8) i32 {
-    const attrs = parseATTF(a, data) catch return 0;
+/// ATTV holds the spatial-level attributes. Quality of position lives on the
+/// edge/node records rather than on the feature. ATTV shares the ATTL(2)+ATVL
+/// layout of a feature's ATTF, so reuse the ATTF parse and pull out QUAPOS.
+///
+/// Null means the ATTV has no QUAPOS. POSACC and QUAPOS are both spatial, so
+/// an ATTV may hold POSACC alone, and under S-57 8.4.3.2 a an attribute the
+/// update omits is left as it was. A missing QUAPOS is therefore unknown here,
+/// and 0 is a value the caller writes. The DEL tombstone is different: it
+/// removes the attribute, and an absent QUAPOS reads as 0.
+fn quaposFromAttv(a: Allocator, data: []const u8) ?i32 {
+    const attrs = parseAttrsKeepDel(a, data) catch return null;
     for (attrs) |at| {
-        if (at.code == ATTR_QUAPOS)
+        if (at.code == ATTR_QUAPOS) {
+            if (isDelMarker(at.value)) return 0;
             return std.fmt.parseInt(i32, std.mem.trim(u8, at.value, " "), 10) catch 0;
+        }
     }
-    return 0;
+    return null;
 }
 
 /// FSPT: repeated 8-byte entries NAME(5)+ORNT(1)+USAG(1)+MASK(1).
@@ -1801,8 +1838,9 @@ fn mergeFile(
             var v = VectorRecord{ .rcnm = rcnm, .rcid = rcid, .points = &.{}, .soundings = &.{} };
             if (flds.sg2d) |sg| v.points = try parseSG2D(a, sg, comf);
             if (flds.sg3d) |sg| v.soundings = try parseSG3D(a, sg, comf, somf);
-            if (flds.vrpt) |vp| parseVRPT(a, &v, vp);
-            if (flds.attv) |av| v.quapos = quaposFromAttv(a, av);
+            if (flds.vrpt) |vp| try parseVRPT(a, &v, vp);
+            const attv_quapos: ?i32 = if (flds.attv) |av| quaposFromAttv(a, av) else null;
+            if (attv_quapos) |q| v.quapos = q;
 
             if (ruin == 3) { // modify in place
                 // The oracle errors on a MODIFY whose target is absent (updates.go:291),
@@ -1841,10 +1879,13 @@ fn mergeFile(
                         ex.vptrs = v.vptrs;
                         deriveEndpoints(ex);
                     }
-                    // The oracle's spatial MODIFY (updates.go:288-348) updates only
-                    // coordinates and vector pointers — it never re-reads ATTV, so a
-                    // modified record keeps its base QUAPOS. Match that for byte-parity
-                    // (don't refresh ex.quapos from the update's ATTV here).
+                    // S-57 8.4.3.2 a: an ATTV in an update record inserts the
+                    // attribute when the target lacks it and replaces the value
+                    // when the target has it. QUAPOS drives the S-52 low
+                    // accuracy line style, so an update downgrading a survey
+                    // has to reach the target record. An ATTV holding only
+                    // some other spatial attribute leaves QUAPOS as it was.
+                    if (attv_quapos) |q| ex.quapos = q;
                 } else return error.ModifyMissingSpatial;
                 continue;
             }
@@ -1951,6 +1992,56 @@ fn mergeFile(
 /// / modify by (RCNM,RCID) for features and vectors alike, with SGCC/FSPC control
 /// fields for indexed coordinate/pointer edits. Pass an empty `updates` for a
 /// plain base cell.
+/// The identity and coordinate factors an update file declares, read before it
+/// is applied. S-57 3.2.1 and 3.3 scope COMF and SOMF to the data set, and an
+/// update file is its own data set, so its coordinates are only decodable with
+/// its own factors.
+const UpdateHeader = struct {
+    edtn: []const u8 = "",
+    updn: []const u8 = "",
+    params: ?DatasetParams = null,
+};
+
+fn peekUpdateHeader(a: Allocator, bytes: []const u8) UpdateHeader {
+    var h = UpdateHeader{};
+    var seen_dsid = false;
+    var it = iso.iterate(bytes);
+    _ = it.next(); // skip the DDR
+    while (it.next()) |rec| {
+        if (h.params == null) {
+            if (rec.field("DSPM")) |d| h.params = parseDSPM(d);
+        }
+        if (!seen_dsid) {
+            if (rec.field("DSID")) |d| {
+                seen_dsid = true;
+                if (parseDSID(a, d)) |pd| {
+                    h.edtn = pd.edtn;
+                    h.updn = pd.updn;
+                }
+            }
+        }
+        if (h.params != null and seen_dsid) break;
+    }
+    return h;
+}
+
+/// True when a base and an update name different editions, so the update was
+/// written against other data.
+///
+/// An update need not repeat the edition. NOAA writes EDTN 0 on an update that
+/// leaves the edition alone, beside a base at edition 10, and blank appears
+/// too. Only two stated editions can disagree. The compare is numeric, so a
+/// producer padding the field does not read as a different edition.
+fn edtnDiffers(base_edtn: []const u8, upd_edtn: []const u8) bool {
+    const b = std.mem.trim(u8, base_edtn, " ");
+    const u = std.mem.trim(u8, upd_edtn, " ");
+    if (b.len == 0 or u.len == 0) return false;
+    const bn = std.fmt.parseInt(u32, b, 10) catch return !std.mem.eql(u8, b, u);
+    const un = std.fmt.parseInt(u32, u, 10) catch return !std.mem.eql(u8, b, u);
+    if (un == 0) return false; // the update names no edition
+    return bn != un;
+}
+
 pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []const []const u8) !Cell {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -2019,8 +2110,67 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
     }
 
     try mergeFile(a, &feats, &fidx, &vecs, &vidx, base_bytes, comf, somf, false);
+
+    // A broken update stops the chain and keeps the cell. A cell applied
+    // through update 3 is a chart, and dropping it because update 4 is corrupt
+    // leaves the mariner with none. chart.readCellFiles applies the same
+    // policy for the read; this is the parse.
+    //
+    // mergeFile edits feats and vecs in place, so a file that fails part way
+    // through has already modified records. Snapshot the lists and the indices
+    // before each file and restore them on failure, which leaves the cell at
+    // the last update that applied whole.
+    var applied: usize = 0;
+    // The update number the chain has reached. S-57 8.4.2.1 applies updates in
+    // sequence, so the next file has one higher.
+    var last_updn: u32 = std.fmt.parseInt(u32, std.mem.trim(u8, dsid.updn, " "), 10) catch 0;
+    const base_edtn = dsid.edtn;
     for (updates) |u| {
-        try mergeFile(a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true);
+        // Read what the file says about itself before applying any of it. A
+        // mismatch stops the chain and keeps the cell, the same policy a merge
+        // failure follows below.
+        const uh = peekUpdateHeader(a, u);
+        if (uh.params) |up| {
+            // Decoding this file's coordinates with the base factors scales
+            // them wrong, and degToE7 clamps the extreme case rather than
+            // failing, so the error reads as a plausible position.
+            if (up.comf != params.comf or up.somf != params.somf) break;
+        }
+        if (edtnDiffers(base_edtn, uh.edtn)) break;
+        if (uh.updn.len > 0) {
+            const got = std.fmt.parseInt(u32, std.mem.trim(u8, uh.updn, " "), 10) catch break;
+            // No update can follow the largest UPDN value, so a
+            // file claiming to is corrupt or hostile. Stopping here also keeps
+            // the add below from overflowing, which panics in a safe build and
+            // ends the whole bake run over one bad file.
+            if (last_updn == std.math.maxInt(u32)) break;
+            if (got != last_updn + 1) break;
+            last_updn = got;
+        }
+
+        const feats_snap = try gpa.dupe(?Feature, feats.items);
+        defer gpa.free(feats_snap);
+        const vecs_snap = try gpa.dupe(?VectorRecord, vecs.items);
+        defer gpa.free(vecs_snap);
+        var fidx_snap = try fidx.clone();
+        var vidx_snap = try vidx.clone();
+
+        if (mergeFile(a, &feats, &fidx, &vecs, &vidx, u, comf, somf, true)) |_| {
+            fidx_snap.deinit();
+            vidx_snap.deinit();
+        } else |_| {
+            feats.clearRetainingCapacity();
+            try feats.appendSlice(a, feats_snap);
+            vecs.clearRetainingCapacity();
+            try vecs.appendSlice(a, vecs_snap);
+            fidx.deinit();
+            fidx = fidx_snap;
+            vidx.deinit();
+            vidx = vidx_snap;
+            break;
+        }
+        applied += 1;
+
         // Merge the update's DSID: non-empty identity fields revise the base.
         // The update just strict-parsed cleanly in mergeFile, so the tolerant
         // walk here sees the same records.
@@ -2094,7 +2244,7 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
         if (f.foid != 0) try foid_index.put(a, f.foid, i);
     }
 
-    return .{ .params = params, .dsid = dsid, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .foid_index = foid_index, .arena = arena };
+    return .{ .params = params, .dsid = dsid, .updates_applied = applied, .vectors = vectors.items, .features = features.items, .nodes = nodes, .edges = edges, .sounding_vecs = sounding_vecs, .coast_edges = coast_edges, .foid_index = foid_index, .arena = arena };
 }
 
 // ---- tests --------------------------------------------------------------
@@ -2342,6 +2492,31 @@ test "parseATTF drops an S-57 DEL (0x7F) attribute-delete marker" {
     try std.testing.expect(isDelMarker("\x7f\x7f"));
     try std.testing.expect(!isDelMarker(""));
     try std.testing.expect(!isDelMarker("90"));
+    // Lexical level 2 spells the delete character (0/0)(7/15).
+    try std.testing.expect(isDelMarker("\x00\x7f"));
+    try std.testing.expect(isDelMarker("\x00\x7f\x00\x7f"));
+    try std.testing.expect(!isDelMarker("\x00"));
+    try std.testing.expect(!isDelMarker("\x00\x7fA"));
+    try std.testing.expect(!isDelMarker("\x00A"));
+
+    // Through a real level-2 field, where the terminator is two bytes as well.
+    // The value the field scan produces includes the terminator's other half,
+    // so a check written against the bare character alone never matches the
+    // bytes of an update file. Both byte orders the spec leaves open are
+    // exercised: NUL first, and least significant byte first.
+    const nul_first = [_]u8{ 45, 1, 0x00, 0x7f, 0x00, iso.UT } ++ [_]u8{ 137, 0 } ++ "90".* ++ [_]u8{iso.UT};
+    const kept_nf = try parseAttrsKeepDel(a, &nul_first);
+    try std.testing.expectEqual(@as(usize, 2), kept_nf.len);
+    try std.testing.expect(isDelMarker(kept_nf[0].value));
+    try std.testing.expect(!isDelMarker(kept_nf[1].value));
+
+    const lsb_first = [_]u8{ 45, 1, 0x7f, 0x00, iso.UT, 0x00 } ++ [_]u8{ 137, 0 } ++ "90".* ++ [_]u8{iso.UT};
+    const kept_lf = try parseAttrsKeepDel(a, &lsb_first);
+    try std.testing.expect(isDelMarker(kept_lf[0].value));
+
+    // The tombstone still has to be distinguishable from a level-2 name, so a
+    // value that merely ends in a NUL is not one.
+    try std.testing.expect(!isDelMarker("\x00A\x00"));
 }
 
 test "attrFloat / parseFloatOpt trim full ASCII whitespace (oracle TrimSpace)" {
@@ -2661,4 +2836,257 @@ test "a catalogue entry naming a file outside the exchange set is dropped" {
     try std.testing.expect(!safeCatalogPath("../B.000"));
     try std.testing.expect(!safeCatalogPath("A/../../B.000"));
     try std.testing.expect(!safeCatalogPath(""));
+}
+
+test "a spatial MODIFY carrying ATTV updates QUAPOS" {
+    // A resurvey downgrading a stretch of coastline ships VRID{RUIN=modify}
+    // with ATTV{QUAPOS=4} and no coordinates. S-57 8.4.3.2 a replaces the
+    // value on the target record. Keeping the base value drew an approximate
+    // position as a confident solid line.
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // VRID: RCNM=130(VE) RCID=4471 RVER RUIN
+    const vrid_base = [_]u8{ 130, 0x77, 0x11, 0, 0, 1, 0, 1 }; // RUIN=insert
+    const vrid_mod = [_]u8{ 130, 0x77, 0x11, 0, 0, 2, 0, 3 }; // RUIN=modify
+    const attv_base = [_]u8{ 146, 1 } ++ "1".* ++ [_]u8{iso.UT}; // QUAPOS(402)=1 surveyed
+    const attv_mod = [_]u8{ 146, 1 } ++ "4".* ++ [_]u8{iso.UT}; // QUAPOS(402)=4 approximate
+
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "VRID", .data = &vrid_base }, .{ .tag = "ATTV", .data = &attv_base } });
+    var upd = std.ArrayList(u8).empty;
+    defer upd.deinit(gpa);
+    try iso.writeRecord(gpa, &upd, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{ .{ .tag = "VRID", .data = &vrid_mod }, .{ .tag = "ATTV", .data = &attv_mod } });
+
+    var feats = std.ArrayList(?Feature).empty;
+    var fidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer fidx.deinit();
+    var vecs = std.ArrayList(?VectorRecord).empty;
+    var vidx = std.AutoHashMap(u64, usize).init(gpa);
+    defer vidx.deinit();
+
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, base.items, 1, 1, false);
+    try std.testing.expectEqual(@as(i32, 1), vecs.items[0].?.quapos);
+
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
+
+    // An update with no ATTV leaves the value alone.
+    var upd2 = std.ArrayList(u8).empty;
+    defer upd2.deinit(gpa);
+    const vrid_mod2 = [_]u8{ 130, 0x77, 0x11, 0, 0, 3, 0, 3 };
+    try iso.writeRecord(gpa, &upd2, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd2, 'D', &.{.{ .tag = "VRID", .data = &vrid_mod2 }});
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd2.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
+
+    // An ATTV holding only POSACC(401) revises positional accuracy and omits
+    // QUAPOS, so the approximate reading survives.
+    var upd3 = std.ArrayList(u8).empty;
+    defer upd3.deinit(gpa);
+    const vrid_mod3 = [_]u8{ 130, 0x77, 0x11, 0, 0, 4, 0, 3 };
+    const attv_posacc = [_]u8{ 145, 1 } ++ "10".* ++ [_]u8{iso.UT};
+    try iso.writeRecord(gpa, &upd3, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd3, 'D', &.{ .{ .tag = "VRID", .data = &vrid_mod3 }, .{ .tag = "ATTV", .data = &attv_posacc } });
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd3.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 4), vecs.items[0].?.quapos);
+
+    // QUAPOS with the DEL tombstone removes the attribute. An absent QUAPOS
+    // reads as 0, the same as a record that never had one.
+    var upd4 = std.ArrayList(u8).empty;
+    defer upd4.deinit(gpa);
+    const vrid_mod4 = [_]u8{ 130, 0x77, 0x11, 0, 0, 5, 0, 3 };
+    const attv_del = [_]u8{ 146, 1, 0x7f, iso.UT };
+    try iso.writeRecord(gpa, &upd4, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd4, 'D', &.{ .{ .tag = "VRID", .data = &vrid_mod4 }, .{ .tag = "ATTV", .data = &attv_del } });
+    try mergeFile(a, &feats, &fidx, &vecs, &vidx, upd4.items, 1, 1, true);
+    try std.testing.expectEqual(@as(i32, 0), vecs.items[0].?.quapos);
+}
+
+test "a broken update stops the chain and keeps the cell" {
+    // chart.readCellFiles sets the policy for the read: an ENC applied
+    // through update 3 is a chart. The parse dropped the whole cell instead,
+    // base included, when a later update failed to merge.
+    const gpa = std.testing.allocator;
+
+    // FRID: RCNM=100 RCID=9 PRIM=1 GRUP=2 OBJL=17(BOYLAT) RVER RUIN
+    const frid_base = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 1, 0, 1 }; // insert
+    const frid_mod = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 }; // modify
+    const frid_ghost = [_]u8{ 100, 77, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 }; // modify a record that is absent
+    const attf_base = [_]u8{ 116, 0 } ++ "Base".* ++ [_]u8{iso.UT}; // OBJNAM
+    const attf_upd = [_]u8{ 116, 0 } ++ "Update one".* ++ [_]u8{iso.UT};
+
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "ATTF", .data = &attf_base } });
+
+    var up1 = std.ArrayList(u8).empty;
+    defer up1.deinit(gpa);
+    try iso.writeRecord(gpa, &up1, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &up1, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var up2 = std.ArrayList(u8).empty;
+    defer up2.deinit(gpa);
+    try iso.writeRecord(gpa, &up2, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &up2, 'D', &.{.{ .tag = "FRID", .data = &frid_ghost }});
+
+    var cell = try parseCellWithUpdates(gpa, base.items, &.{ up1.items, up2.items });
+    defer cell.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), cell.updates_applied);
+    try std.testing.expectEqual(@as(usize, 1), cell.features.len);
+    var name: []const u8 = "";
+    for (cell.features[0].attrs) |at| if (at.code == 116) {
+        name = at.value;
+    };
+    try std.testing.expectEqualStrings("Update one", name);
+
+    // The whole chain applies when every file merges.
+    var ok = try parseCellWithUpdates(gpa, base.items, &.{up1.items});
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ok.updates_applied);
+}
+
+test "an update out of sequence or against another edition stops the chain" {
+    const gpa = std.testing.allocator;
+
+    // DSID: RCNM+RCID+EXPP+INTU, then DSNM, EDTN, UPDN.
+    const dsidFor = struct {
+        fn make(edtn: []const u8, updn: []const u8, buf: *[64]u8) []const u8 {
+            const head = [_]u8{ 10, 1, 0, 0, 0, 1, 1 } ++ "T".* ++ [_]u8{iso.UT};
+            var n: usize = 0;
+            @memcpy(buf[n..][0..head.len], &head);
+            n += head.len;
+            @memcpy(buf[n..][0..edtn.len], edtn);
+            n += edtn.len;
+            buf[n] = iso.UT;
+            n += 1;
+            @memcpy(buf[n..][0..updn.len], updn);
+            n += updn.len;
+            buf[n] = iso.UT;
+            n += 1;
+            return buf[0..n];
+        }
+    }.make;
+
+    const frid_base = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 1, 0, 1 }; // insert
+    const frid_mod = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 }; // modify
+    const attf_base = [_]u8{ 116, 0 } ++ "Base".* ++ [_]u8{iso.UT};
+    const attf_upd = [_]u8{ 116, 0 } ++ "Applied".* ++ [_]u8{iso.UT};
+
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{.{ .tag = "DSID", .data = dsidFor("2", "0", &b1) }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "ATTF", .data = &attf_base } });
+
+    // An update giving update 1 of edition 2 applies.
+    var ok_u = std.ArrayList(u8).empty;
+    defer ok_u.deinit(gpa);
+    try iso.writeRecord(gpa, &ok_u, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &ok_u, 'D', &.{.{ .tag = "DSID", .data = dsidFor("2", "1", &b2) }});
+    try iso.writeRecord(gpa, &ok_u, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var applied_cell = try parseCellWithUpdates(gpa, base.items, &.{ok_u.items});
+    defer applied_cell.deinit();
+    try std.testing.expectEqual(@as(usize, 1), applied_cell.updates_applied);
+
+    // The same file twice: the second gives update 1 again, so the chain stops
+    // and its edits do not run a second time.
+    var twice = try parseCellWithUpdates(gpa, base.items, &.{ ok_u.items, ok_u.items });
+    defer twice.deinit();
+    try std.testing.expectEqual(@as(usize, 1), twice.updates_applied);
+
+    // An update issued against edition 3 does not apply to an edition 2 base.
+    var wrong_edtn = std.ArrayList(u8).empty;
+    defer wrong_edtn.deinit(gpa);
+    var b3: [64]u8 = undefined;
+    try iso.writeRecord(gpa, &wrong_edtn, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &wrong_edtn, 'D', &.{.{ .tag = "DSID", .data = dsidFor("3", "1", &b3) }});
+    try iso.writeRecord(gpa, &wrong_edtn, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var other_edition = try parseCellWithUpdates(gpa, base.items, &.{wrong_edtn.items});
+    defer other_edition.deinit();
+    try std.testing.expectEqual(@as(usize, 0), other_edition.updates_applied);
+
+    // An update leaving the edition alone applies. NOAA writes EDTN 0 on such
+    // an update, beside a base at edition 2, and reading the 0 as a different
+    // edition dropped the update from 184 of the 2129 cells in one exchange
+    // set that carry one.
+    var edtn_zero = std.ArrayList(u8).empty;
+    defer edtn_zero.deinit(gpa);
+    var b4: [64]u8 = undefined;
+    try iso.writeRecord(gpa, &edtn_zero, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &edtn_zero, 'D', &.{.{ .tag = "DSID", .data = dsidFor("0", "1", &b4) }});
+    try iso.writeRecord(gpa, &edtn_zero, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf_upd } });
+
+    var unstated = try parseCellWithUpdates(gpa, base.items, &.{edtn_zero.items});
+    defer unstated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), unstated.updates_applied);
+
+    // A padded edition is the same edition.
+    try std.testing.expect(!edtnDiffers("2", " 2 "));
+    try std.testing.expect(!edtnDiffers("2", "02"));
+    try std.testing.expect(!edtnDiffers("10", "0"));
+    try std.testing.expect(!edtnDiffers("", "3"));
+    try std.testing.expect(edtnDiffers("2", "3"));
+}
+
+test "an update declaring other coordinate factors stops the chain" {
+    const gpa = std.testing.allocator;
+
+    const dspm = struct {
+        fn make(comf: i32, buf: *[24]u8) []const u8 {
+            @memset(buf, 0);
+            buf[0] = 20; // RCNM = DSPM
+            std.mem.writeInt(i32, buf[8..12], 25000, .little); // CSCL
+            std.mem.writeInt(i32, buf[16..20], comf, .little);
+            std.mem.writeInt(i32, buf[20..24], 10, .little); // SOMF
+            return buf[0..];
+        }
+    }.make;
+
+    const frid_base = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 1, 0, 1 };
+    const frid_mod = [_]u8{ 100, 9, 0, 0, 0, 1, 2, 17, 0, 2, 0, 3 };
+    const attf = [_]u8{ 116, 0 } ++ "X".* ++ [_]u8{iso.UT};
+
+    var d1: [24]u8 = undefined;
+    var d2: [24]u8 = undefined;
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{.{ .tag = "DSPM", .data = dspm(10_000_000, &d1) }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "FRID", .data = &frid_base }, .{ .tag = "ATTF", .data = &attf } });
+
+    // Same shape, a tenth of the base's COMF. Applying it with the base factors
+    // decodes every coordinate this file inserts ten times too large.
+    var upd = std.ArrayList(u8).empty;
+    defer upd.deinit(gpa);
+    try iso.writeRecord(gpa, &upd, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{.{ .tag = "DSPM", .data = dspm(1_000_000, &d2) }});
+    try iso.writeRecord(gpa, &upd, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf } });
+
+    var cell = try parseCellWithUpdates(gpa, base.items, &.{upd.items});
+    defer cell.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cell.updates_applied);
+
+    // The same factors apply.
+    var same = std.ArrayList(u8).empty;
+    defer same.deinit(gpa);
+    var d3: [24]u8 = undefined;
+    try iso.writeRecord(gpa, &same, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &same, 'D', &.{.{ .tag = "DSPM", .data = dspm(10_000_000, &d3) }});
+    try iso.writeRecord(gpa, &same, 'D', &.{ .{ .tag = "FRID", .data = &frid_mod }, .{ .tag = "ATTF", .data = &attf } });
+
+    var ok = try parseCellWithUpdates(gpa, base.items, &.{same.items});
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ok.updates_applied);
 }

@@ -208,10 +208,13 @@ pub const Archive = struct {
         try fw.interface.flush();
     }
 
-    /// The `.001..` update chain belonging to the `.000` cell at `i`, in order,
-    /// stopping at the first gap — the same rule the on-disk reader applies to
-    /// a cell's directory, applied to the archive's names instead. Empty when
-    /// `i` is not a base cell. Caller frees.
+    /// The numbered update files belonging to the `.000` cell at `i`, ascending:
+    /// the same set the on-disk reader gathers from a cell's directory, read
+    /// from the archive's names instead. A gap does not end the walk. A
+    /// re-issued base includes its earlier updates and is delivered with only
+    /// the ones that follow, so a chain may start above `.001`, and the update
+    /// gate selects which of these apply. Empty when `i` is not a base cell.
+    /// Caller frees.
     pub fn updatesFor(self: *const Archive, gpa: Allocator, i: usize) ![]usize {
         var out: std.ArrayList(usize) = .empty;
         errdefer out.deinit(gpa);
@@ -224,7 +227,7 @@ pub const Archive = struct {
         var u: u32 = 1;
         while (u <= 999) : (u += 1) {
             const up = std.fmt.bufPrint(&buf, "{s}.{d:0>3}", .{ stem, u }) catch break;
-            const idx = self.find(up) orelse break;
+            const idx = self.find(up) orelse continue;
             try out.append(gpa, idx);
         }
         return out.toOwnedSlice(gpa);
@@ -473,7 +476,7 @@ test "an entry that claims more than the cap is refused before allocating" {
     try testing.expectError(Error.EntryTooLarge, arc.readAlloc(gpa, io, 0, 4));
 }
 
-test "the update chain follows the cell and stops at the first gap" {
+test "the update chain follows the cell across a gap" {
     const gpa = testing.allocator;
     const io = testIo();
     var tmp = std.testing.tmpDir(.{});
@@ -483,9 +486,10 @@ test "the update chain follows the cell and stops at the first gap" {
     const zpath = try std.fs.path.join(gpa, &.{ dir, "t.zip" });
     defer gpa.free(zpath);
 
-    // .003 is missing, so .004 is not part of the chain even though it is in
-    // the archive. A cell in another directory with the same stem must not be
-    // mistaken for an update of this one.
+    // .003 is missing. The archive still passes .004 to the parse, which has
+    // the edition and the number the base stands at and can separate a
+    // re-issue's skipped range from a real gap. A cell in another directory
+    // with the same stem must not be mistaken for an update of this one.
     try writeTestZip(gpa, io, zpath, &.{
         .{ .name = "ENC_ROOT/US5MD12M/US5MD12M.000", .data = "base", .deflate = false },
         .{ .name = "ENC_ROOT/US5MD12M/US5MD12M.001", .data = "u1", .deflate = false },
@@ -501,9 +505,10 @@ test "the update chain follows the cell and stops at the first gap" {
     const base = arc.find("ENC_ROOT/US5MD12M/US5MD12M.000").?;
     const ups = try arc.updatesFor(gpa, base);
     defer gpa.free(ups);
-    try testing.expectEqual(@as(usize, 2), ups.len);
+    try testing.expectEqual(@as(usize, 3), ups.len);
     try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.001", arc.entries[ups[0]].name);
     try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.002", arc.entries[ups[1]].name);
+    try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.004", arc.entries[ups[2]].name);
 
     // A .TXT is not a base cell, so it has no chain.
     const txt = arc.find("ENC_ROOT/US5MD12M/US5MD12M.TXT").?;
