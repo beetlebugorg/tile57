@@ -1458,6 +1458,13 @@ fn parseDSID(a: Allocator, data: []const u8) ?Dsid {
     var off: usize = 7; // RCNM+RCID+EXPP+INTU
     const ascii = struct {
         fn next(buf: []const u8, o: *usize) []const u8 {
+            // The fixed-width skips below move `off` past the end on a
+            // truncated DSID. Clamp before slicing. A short field reads as
+            // empty and the caller keeps what it parsed.
+            if (o.* >= buf.len) {
+                o.* = buf.len;
+                return buf[buf.len..];
+            }
             const start = o.*;
             while (o.* < buf.len and buf[o.*] != 0x1f) o.* += 1;
             const s = buf[start..o.*];
@@ -1561,6 +1568,22 @@ fn parseFloatOpt(s_in: []const u8) ?f64 {
 // Decode one CATD field (S-57 App. B.1). ASCII, unit-terminator (0x1f) delimited:
 //   [0] RCNM(2 "CD") + RCID(digits) + FILE   [1] LFIL  [2] VOLM
 //   [3] IMPL(3 BIN/ASC/TXT) + SLAT  [4] WLON  [5] NLAT  [6] ELON  [7] CRCS  [8] COMT
+/// True when a CATALOG.031 FILE name is usable as a path relative to the
+/// exchange-set root. The catalogue is part of the chart data, so the name is
+/// third party input, and `chart.addPathCell` opens whatever it holds. Call
+/// after folding backslashes, so only '/' separates.
+///
+/// `zipsrc.isSafeEntryName` applies the same rule to archive entry names. The
+/// two are separate because s57 sits below the archive reader.
+fn safeCatalogPath(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '/') return false;
+    if (name.len >= 2 and name[1] == ':') return false; // "C:..."
+    var it = std.mem.splitScalar(u8, name, '/');
+    while (it.next()) |seg| if (std.mem.eql(u8, seg, "..")) return false;
+    return true;
+}
+
 fn decodeCATD(a: Allocator, raw_in: []const u8) ?CatalogEntry {
     var end = raw_in.len;
     while (end > 0 and raw_in[end - 1] == 0x1e) end -= 1; // drop trailing field terminator(s)
@@ -1582,6 +1605,7 @@ fn decodeCATD(a: Allocator, raw_in: []const u8) ?CatalogEntry {
     for (norm) |*c| {
         if (c.* == '\\') c.* = '/';
     }
+    if (!safeCatalogPath(norm)) return null;
     const base = std.fs.path.basename(norm);
     const ext = std.fs.path.extension(base);
     const stem = a.dupe(u8, base[0 .. base.len - ext.len]) catch return null;
@@ -2074,6 +2098,26 @@ pub fn parseCellWithUpdates(gpa: Allocator, base_bytes: []const u8, updates: []c
 }
 
 // ---- tests --------------------------------------------------------------
+
+test "a DSID truncated after UPDN parses what it has" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // RCNM+RCID+EXPP+INTU, then DSNM, EDTN, UPDN. The UADT, STED and PRSP
+    // skips that follow move `off` past the end. The reads after them return
+    // empty instead of slicing start > end.
+    const data = [_]u8{ 10, 1, 0, 0, 0, 1, 1 } ++ "AB" ++ [_]u8{0x1f} ++ "3" ++ [_]u8{0x1f} ++ "2" ++ [_]u8{0x1f};
+    const d = parseDSID(a, data).?;
+    try std.testing.expectEqualStrings("AB", d.dsnm);
+    try std.testing.expectEqualStrings("3", d.edtn);
+    try std.testing.expectEqualStrings("2", d.updn);
+
+    // Every prefix of a well-formed DSID parses. A truncated file has this
+    // shape.
+    var i: usize = 0;
+    while (i <= data.len) : (i += 1) _ = parseDSID(a, data[0..i]);
+}
 
 test "parse DSPM coordinate factors" {
     var data: [24]u8 = undefined;
@@ -2586,4 +2630,35 @@ test "pointInRings: inside, outside, and inside a hole" {
 test {
     _ = iso8211;
     _ = decode;
+}
+
+test "a catalogue entry naming a file outside the exchange set is dropped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // CATD subfields: RCNM+RCID+FILE, LNAM, IMPL+SLAT, WLON, NLAT, ELON.
+    // chart.addPathCell opens whatever FILE holds, so a traversing name is
+    // refused at decode.
+    const esc = "CD1..\\..\\..\\etc\\shadow.000" ++ [_]u8{0x1f} ++ "long" ++ [_]u8{0x1f} ++
+        "x" ++ [_]u8{0x1f} ++ "BIN0" ++ [_]u8{0x1f} ++ "0" ++ [_]u8{0x1f} ++ "0" ++ [_]u8{0x1f} ++ "0";
+    try std.testing.expect(decodeCATD(a, esc) == null);
+
+    const abs = "CD1/etc/shadow.000" ++ [_]u8{0x1f} ++ "long" ++ [_]u8{0x1f} ++
+        "x" ++ [_]u8{0x1f} ++ "BIN0" ++ [_]u8{0x1f} ++ "0" ++ [_]u8{0x1f} ++ "0" ++ [_]u8{0x1f} ++ "0";
+    try std.testing.expect(decodeCATD(a, abs) == null);
+
+    // The shape a real catalogue uses still decodes.
+    const ok = "CD1ENC_ROOT/US5MD12M/US5MD12M.000" ++ [_]u8{0x1f} ++ "long" ++ [_]u8{0x1f} ++
+        "x" ++ [_]u8{0x1f} ++ "BIN0" ++ [_]u8{0x1f} ++ "0" ++ [_]u8{0x1f} ++ "0" ++ [_]u8{0x1f} ++ "0";
+    const e = decodeCATD(a, ok).?;
+    try std.testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.000", e.path);
+    try std.testing.expectEqualStrings("US5MD12M", e.stem);
+    try std.testing.expect(e.is_cell);
+
+    try std.testing.expect(safeCatalogPath("ENC_ROOT/A/B.000"));
+    try std.testing.expect(safeCatalogPath("..a/B.000"));
+    try std.testing.expect(!safeCatalogPath("../B.000"));
+    try std.testing.expect(!safeCatalogPath("A/../../B.000"));
+    try std.testing.expect(!safeCatalogPath(""));
 }

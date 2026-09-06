@@ -156,9 +156,12 @@ fn sequence(a: std.mem.Allocator, raw: []const u8) ?[]const u8 {
 /// Print SCAMIN, the smallest scale the object shows at: 29999 becomes
 /// "1:30,000 and larger".
 fn scamin(a: std.mem.Allocator, raw: []const u8) ?[]const u8 {
-    const v = std.fmt.parseInt(i64, raw, 10) catch return null;
+    // Parse into i32. The value comes from the cell, and `v + 1` below
+    // overflows on i64 max, which traps in a safety-checked build when the
+    // mariner picks the feature. No scale denominator reaches i32 max.
+    const v = std.fmt.parseInt(i32, raw, 10) catch return null;
     if (v <= 0) return null;
-    const denom: i64 = if (@rem(v + 1, 1000) == 0) v + 1 else v;
+    const denom: i64 = if (@rem(@as(i64, v) + 1, 1000) == 0) @as(i64, v) + 1 else v;
     return std.fmt.allocPrint(a, "1:{s} and larger", .{grouped(a, denom) orelse return null}) catch null;
 }
 
@@ -274,6 +277,12 @@ test "decodeValue reads the catalogue and the print forms" {
     try std.testing.expectEqualStrings("15 Jun each year", decodeValue(a, "PERSTA", "--0615").?);
     // Unknown codes pass through as raw (null): never invent a meaning.
     try std.testing.expect(decodeValue(a, "NOSUCH", "7") == null);
+    // A SCAMIN past the i32 range reads as raw. The old i64 parse overflowed
+    // on `v + 1` while formatting the pick report.
+    try std.testing.expect(decodeValue(a, "SCAMIN", "9223372036854775807") == null);
+    try std.testing.expect(decodeValue(a, "SCAMIN", "2147483648") == null);
+    try std.testing.expect(decodeValue(a, "SCAMIN", "-1") == null);
+    try std.testing.expectEqualStrings("1:2,147,483,647 and larger", decodeValue(a, "SCAMIN", "2147483647").?);
 }
 
 test "the signature is the chart's shorthand" {
