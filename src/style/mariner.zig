@@ -454,6 +454,18 @@ pub fn depthTextField(b: B, m: *const Settings) !Value {
 
 // ---- client-side display filters -------------------------------------------
 
+/// True when `class` is the data-quality meta feature the overlay toggle gates.
+///
+/// S-101 renames M_QUAL to QualityOfBathymetricData, and a native S-101 chart
+/// puts that name on the feature, so a gate that reads the S-57 acronym alone
+/// leaves the overlay drawn on an S-101 chart with the toggle off. The other
+/// two quality classes S-101 renames, QualityOfNonBathymetricData (M_ACCY) and
+/// QualityOfSurvey (M_SREL), ride the display category on both standards.
+pub fn isDataQuality(class: []const u8) bool {
+    return std.mem.eql(u8, class, "M_QUAL") or
+        std.mem.eql(u8, class, "QualityOfBathymetricData");
+}
+
 // Display category (S-52 §10.3.4) + M_QUAL data-quality overlay.
 //
 // Reads the tile57/3 precomputes: `display_category` (the always-present int
