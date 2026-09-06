@@ -388,13 +388,23 @@ fn cdup(bytes: []const u8) ?[*]u8 {
 // Peek `relpath`'s bbox+scale; on success append an index-aligned meta + a gpa-owned
 // copy of the path. Cells that don't read / have no coverage bbox are skipped (both
 // lists), keeping meta[i] and paths[i] aligned with the streaming cell index.
-fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8)) !void {
-    const bytes = dir.readFileAlloc(io, relpath, gpa, .limited(MAX_CELL_BYTES)) catch return;
+fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8)) !bool {
+    const bytes = dir.readFileAlloc(io, relpath, gpa, .limited(MAX_CELL_BYTES)) catch {
+        std.debug.print("CHART LOST {s}: cell did not read\n", .{relpath});
+        return false;
+    };
     defer gpa.free(bytes);
-    const m = peekAnyMeta(bytes) orelse return;
-    const bb = m.bounds orelse return;
+    const m = peekAnyMeta(bytes) orelse {
+        std.debug.print("CHART LOST {s}: cell did not parse\n", .{relpath});
+        return false;
+    };
+    const bb = m.bounds orelse {
+        std.debug.print("CHART LOST {s}: cell has no extent\n", .{relpath});
+        return false;
+    };
     try metas.append(gpa, .{ .west = bb[0], .south = bb[1], .east = bb[2], .north = bb[3], .cscl = m.cscl });
     try paths.append(gpa, try gpa.dupe(u8, relpath));
+    return true;
 }
 
 // Internal ChartReadFn for a path-backed chart: read cell `index`'s base .000 + its
@@ -1155,7 +1165,13 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.in_paths.len) return;
         bakeOneToFile(ctx, i);
-        if (ctx.label) |lb| lb(ctx.progress_ctx, @intCast(i)); // name the chart just finished
+        // The label names a chart that was written. It fired for every cell
+        // before, so a host printed a finished chart for one that failed.
+        if (ctx.ok[i]) {
+            if (ctx.label) |lb| lb(ctx.progress_ctx, @intCast(i));
+        } else {
+            std.debug.print("CHART LOST {s}: bake produced no archive\n", .{ctx.in_paths[i]});
+        }
         const d = ctx.done.fetchAdd(1, .monotonic) + 1; // attempted count (smooth progress)
         if (ctx.progress) |cb| {
             if (!cb(ctx.progress_ctx, d, @intCast(ctx.in_paths.len))) {
@@ -2389,6 +2405,10 @@ pub const Chart = struct {
     /// partition sidecar the bake wrote next to the archives, so a host never
     /// has to know that file exists.
     source_path: ?[]u8 = null,
+    /// Cells handed to the open that produced no chart. The open succeeds while
+    /// one cell parses, so a host reads this to tell a chart set with a gap in
+    /// it from a complete one.
+    skipped_cells: u32 = 0,
     cache: std.AutoHashMap(u64, []u8), // tile key -> MVT bytes (owned)
     cache_max: usize = 8192,
     // Emit the per-feature pick-report attrs (s57/cell) on live-generated tiles.
@@ -2459,8 +2479,12 @@ pub const Chart = struct {
         bake_enc.parallelFor(gpa, cells_in.len, &ow, OpenWork.run);
 
         var valid: usize = 0;
-        for (ok) |k| {
-            if (k) valid += 1;
+        for (ok, cells_in) |k, in| {
+            if (k) {
+                valid += 1;
+            } else {
+                std.debug.print("CHART LOST {s}: cell did not parse\n", .{in.name});
+            }
         }
         if (valid == 0) return error.InvalidCell; // cells provided, but none parsed
 
@@ -2481,6 +2505,7 @@ pub const Chart = struct {
         };
         src.* = .{
             .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy } },
+            .skipped_cells = @intCast(cells_in.len - valid),
             .cache = std.AutoHashMap(u64, []u8).init(gpa),
             .pick_attrs = pick_attrs,
         };
@@ -2546,16 +2571,21 @@ pub const Chart = struct {
             for (paths.items) |p| gpa.free(p);
             paths.deinit(gpa);
         }
+        // Cells the walk found and could not use. The open succeeds on the
+        // rest, so this is what tells a host the set has a gap.
+        var skipped: u32 = 0;
 
         if (single_file) {
-            try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths);
+            if (!try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths)) skipped += 1;
         } else if (dir.readFileAlloc(io, "CATALOG.031", gpa, .limited(MAX_CELL_BYTES))) |cbytes| {
             defer gpa.free(cbytes);
             var carena = std.heap.ArenaAllocator.init(gpa);
             defer carena.deinit();
             if (s57.parseCatalog(carena.allocator(), cbytes)) |entries| {
                 for (entries) |e| {
-                    if (e.is_cell) try addPathCell(io, dir, e.path, &metas, &paths);
+                    if (e.is_cell) {
+                        if (!try addPathCell(io, dir, e.path, &metas, &paths)) skipped += 1;
+                    }
                 }
             }
         } else |_| {
@@ -2564,7 +2594,7 @@ pub const Chart = struct {
             while (try walker.next(io)) |entry| {
                 if (entry.kind != .file) continue;
                 if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
-                try addPathCell(io, dir, entry.path, &metas, &paths);
+                if (!try addPathCell(io, dir, entry.path, &metas, &paths)) skipped += 1;
             }
         }
         if (metas.items.len == 0) return error.OpenFailed;
@@ -2573,6 +2603,7 @@ pub const Chart = struct {
         // Chart owns the PathCtx (Io + Dir + paths) via ls.path_ctx, freed in deinit.
         const src = try openChartsStreaming(metas.items, pathRead, null, rules_dir, pick_attrs);
         errdefer src.deinit();
+        src.skipped_cells = skipped;
         const ctx = try gpa.create(PathCtx);
         errdefer gpa.destroy(ctx);
         ctx.* = .{ .threaded = threaded, .io = io, .dir = dir, .paths = try paths.toOwnedSlice(gpa) };
@@ -4184,7 +4215,17 @@ pub fn bakeArchive(
         @memset(pas, null);
         var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir, .build_geo = bake_enc.cacheGeoForBand(band) };
         bake_enc.parallelFor(gpa, sources.items.len, &bw, BakeWork.run);
-        loaded += idxs.len;
+        // Count the cells that produced a backend. `idxs.len` counted the ones
+        // attempted, so progress reached the total whether they loaded or not.
+        for (outs, idxs) |o, ci| {
+            if (o != null) {
+                loaded += 1;
+            } else {
+                // The bake keeps going. This line is the report: a cell absent
+                // from the archive with no word for it reads as empty ocean.
+                std.debug.print("CHART LOST {s}: parse produced no cell\n", .{cells_in[ci].name});
+            }
+        }
         if (progress) |cb| if (has_work) cb(user, 0, loaded, cells_in.len, band_ord - 1, band_count, @tagName(band).ptr);
 
         var backs = std.ArrayList(bake_enc.Backend).empty;

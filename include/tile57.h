@@ -537,6 +537,14 @@ typedef struct {
     uint8_t  tile_type;                                   /* tile57_tile_type */
     int32_t  native_scale;
     bool     is_raster;                                  /* tiles are images, not vector tiles */
+    uint32_t skipped_cells; /* cells handed to the open that produced no chart.
+                         * The open succeeds while one parses, so this tells a
+                         * chart set with a gap in it from a complete one.
+                         * Set on a chart opened from ENC source. The opens
+                         * this header exports are archive-backed, where it
+                         * stays 0; the engine names each dropped cell on
+                         * stderr as it goes. Appended for ABI-append-safety; a
+                         * zeroed struct reads 0. */
 } tile57_info;
 void tile57_chart_get_info(tile57_chart *chart, tile57_info *out);
 
@@ -1634,6 +1642,15 @@ tile57_status tile57_compose_query(tile57_compose *c, double lon, double lat, do
 
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_get_meta(tile57_compose *c, tile57_compose_meta *out);
+
+/* Charts handed to the open that embed no usable coverage: they own no ground
+ * and are absent from every composed tile, so a host reads this to tell a
+ * complete quilt from one with holes in it. 0 for a NULL handle.
+ *
+ * A call rather than a tile57_compose_meta field: that struct ends on a double
+ * with no padding left, so any field added to it moves the bounds and grows the
+ * struct a host already allocates. */
+uint32_t tile57_compose_skipped(tile57_compose *c);
 
 /* The deepest zoom the chart covering (lon,lat) can serve (its native window +
  * overscale fill-up). A host caps its per-view zoom-in here so it never magnifies
