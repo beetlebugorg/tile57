@@ -390,7 +390,7 @@ fn cdup(bytes: []const u8) ?[*]u8 {
 fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8)) !void {
     const bytes = dir.readFileAlloc(io, relpath, gpa, .limited(MAX_CELL_BYTES)) catch return;
     defer gpa.free(bytes);
-    const m = s57.peekMeta(gpa, bytes) orelse return;
+    const m = peekAnyMeta(bytes) orelse return;
     const bb = m.bounds orelse return;
     try metas.append(gpa, .{ .west = bb[0], .south = bb[1], .east = bb[2], .north = bb[3], .cscl = m.cscl });
     try paths.append(gpa, try gpa.dupe(u8, relpath));
@@ -489,6 +489,51 @@ const CellLoad = struct { cell: s57.Cell, adapted: ?[]const s101.adapter.Adapted
 
 /// Parse a .000 chart, auto-detecting S-101 vs S-57 from the file itself, and apply
 /// its sequential `.001…` update chain. A native S-101 dataset (S-100 Part 10a)
+/// A cell's compilation scale and extent, whichever model it is in.
+///
+/// s57.peekMeta reads the S-57 DSPM and the raw SG2D/SG3D coordinates. A native
+/// S-101 dataset has neither, so it reported no extent and every caller dropped
+/// the chart, though parseAnyCell parses it. S-101 keeps its display scale on a
+/// DataCoverage feature's attributes, which needs the record assembly, so the
+/// native branch parses the dataset instead of peeking it. Native charts are the
+/// rare path and were being lost outright, so the cost buys correctness.
+fn peekAnyMeta(bytes: []const u8) ?s57.CellMeta {
+    if (s101.dataset.detect(bytes)) {
+        var loaded = s101.native.parseDataset(gpa, bytes, &.{}) catch return null;
+        defer loaded.cell.deinit();
+        return .{ .cscl = loaded.cell.params.cscl, .bounds = loaded.cell.bounds() };
+    }
+    return s57.peekMeta(gpa, bytes);
+}
+
+/// The inventory row for one cell, whichever format it is in.
+///
+/// s57.peekCellInfo reads an S-57 DSID. An S-101 DSID holds different subfields
+/// in those positions, so it produced a row of unrelated strings: the S-100
+/// profile name where the cell name goes, the product specification URN as the
+/// update number, and two bytes of the file name read as an agency code. A
+/// native dataset gets its identity from the S-101 reader instead. Strings are
+/// duped into `a`, so the row outlives the bytes it was read from.
+fn peekAnyInfo(a: std.mem.Allocator, base: []const u8, updates: []const []const u8) ?s57.CellInfo {
+    if (!s101.dataset.detect(base)) return s57.peekCellInfo(a, base, updates);
+
+    const id = s101.dataset.peekIdentity(base) orelse return null;
+    const m = peekAnyMeta(base) orelse return null;
+    var info = s57.CellInfo{ .scale = m.cscl, .bounds = m.bounds };
+    const ext = std.fs.path.extension(id.dsnm);
+    info.name = a.dupe(u8, id.dsnm[0 .. id.dsnm.len - ext.len]) catch return null;
+    info.edition = a.dupe(u8, id.editionText()) catch return null;
+    info.update = a.dupe(u8, id.updateText()) catch return null;
+    // The newest file of this edition gives the update the chart is at, the
+    // same way the S-57 walk reads the last file in the chain.
+    for (updates) |u| {
+        const ui = s101.dataset.peekIdentity(u) orelse continue;
+        if (!std.mem.eql(u8, ui.editionText(), info.edition)) continue;
+        info.update = a.dupe(u8, ui.updateText()) catch continue;
+    }
+    return info;
+}
+
 /// assembles via s101.native; an S-57 cell parses via s57. Returns null on failure.
 fn parseAnyCell(base: []const u8, updates: []const []const u8) ?CellLoad {
     if (s101.dataset.detect(base)) {
@@ -2307,7 +2352,7 @@ const OpenWork = struct {
         _ = scratch; // persistent outputs go straight to `gpa`
         const c: *OpenWork = @ptrCast(@alignCast(uptr));
         const in = c.inputs[i];
-        const meta = s57.peekMeta(gpa, in.base) orelse return;
+        const meta = peekAnyMeta(in.base) orelse return;
         const bbox = meta.bounds orelse return;
         const base = gpa.dupe(u8, in.base) catch return;
         var ups: [][]u8 = &.{};
@@ -3401,7 +3446,7 @@ pub const Chart = struct {
             .cells => |*ls| {
                 for (ls.cells) |*lc| {
                     if (lc.base.len > 0) {
-                        if (s57.peekCellInfo(a, lc.base, lc.updates)) |ci| try infos.append(a, ci);
+                        if (peekAnyInfo(a, lc.base, lc.updates)) |ci| try infos.append(a, ci);
                     } else if (lc.cell) |*c| {
                         const d = c.dsid;
                         const ext = std.fs.path.extension(d.dsnm);
@@ -3430,7 +3475,7 @@ pub const Chart = struct {
                             } else |_| {}
                         }
                         defer if (ups_arr) |arr| gpa.free(arr);
-                        if (s57.peekCellInfo(a, cb.base[0..cb.base_len], ups)) |ci| try infos.append(a, ci);
+                        if (peekAnyInfo(a, cb.base[0..cb.base_len], ups)) |ci| try infos.append(a, ci);
                     }
                 }
             },
@@ -4025,7 +4070,7 @@ pub fn bakeArchive(
     const cbboxes = gpa.alloc([4]f64, cells_in.len) catch return error.BakeFailed;
     defer gpa.free(cbboxes);
     for (cells_in, 0..) |in, i| {
-        const m = s57.peekMeta(gpa, in.base);
+        const m = peekAnyMeta(in.base);
         const band = bake_enc.bandOf(if (m) |mm| mm.cscl else 0);
         cbands[i] = band;
         cbboxes[i] = if (m) |mm| (mm.bounds orelse .{ 1e9, 1e9, -1e9, -1e9 }) else .{ 1e9, 1e9, -1e9, -1e9 };

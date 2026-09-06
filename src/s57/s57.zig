@@ -461,8 +461,13 @@ pub const RCNM_VE: u8 = 130; // edge
 pub const RCNM_VF: u8 = 140; // face
 
 pub const DatasetParams = struct {
-    comf: i32 = 10_000_000, // coordinate multiplication factor (1e7)
-    somf: i32 = 10, // sounding multiplication factor
+    // S-57 7.3.2.1 table 7.6 types all three as b14, which 7.2.2.1 table 7.2
+    // defines as a 4-byte UNSIGNED integer. comf and somf are held wide enough
+    // for the whole domain. cscl stays i32 because the band mapping and the
+    // chart metadata carry it as one, and a compilation scale above 2^31-1
+    // reads as unknown.
+    comf: i64 = 10_000_000, // coordinate multiplication factor (1e7)
+    somf: i64 = 10, // sounding multiplication factor
     cscl: i32 = 0, // compilation scale (1:N)
 };
 
@@ -1062,13 +1067,26 @@ pub const Cell = struct {
         var max_lon: f64 = -1e9;
         var max_lat: f64 = -1e9;
         var any = false;
-        for (self.vectors) |v| for (v.points) |p| {
-            any = true;
-            min_lon = @min(min_lon, p.lon());
-            min_lat = @min(min_lat, p.lat());
-            max_lon = @max(max_lon, p.lon());
-            max_lat = @max(max_lat, p.lat());
-        };
+        for (self.vectors) |v| {
+            for (v.points) |p| {
+                any = true;
+                min_lon = @min(min_lon, p.lon());
+                min_lat = @min(min_lat, p.lat());
+                max_lon = @max(max_lon, p.lon());
+                max_lat = @max(max_lat, p.lat());
+            }
+            // A SOUNDG node has SG3D and no SG2D, so its coordinates live
+            // in `soundings`. Leaving them out put a sounding beyond the SG2D
+            // hull outside the baked extent, and made a cell whose only vector
+            // records are sounding nodes return null.
+            for (v.soundings) |snd| {
+                any = true;
+                min_lon = @min(min_lon, snd.lon());
+                min_lat = @min(min_lat, snd.lat());
+                max_lon = @max(max_lon, snd.lon());
+                max_lat = @max(max_lat, snd.lat());
+            }
+        }
         return if (any) .{ min_lon, min_lat, max_lon, max_lat } else null;
     }
 };
@@ -1087,13 +1105,16 @@ fn parseDSPM(data: []const u8) DatasetParams {
     var p = DatasetParams{};
     if (data.len < 24 or data[0] != 20) return p;
     // RCNM(1) RCID(4) HDAT(1) VDAT(1) SDAT(1) CSCL(4)@8 DUNI(1) HUNI(1) PUNI(1) COUN(1) COMF(4)@16 SOMF(4)@20
-    p.cscl = i32le(data, 8);
-    p.comf = i32le(data, 16);
-    p.somf = i32le(data, 20);
-    // §7.3.2.1 requires a positive multiplier; a zero OR NEGATIVE factor falls back
-    // to the standard default (matches the oracle's `<= 0` guard, not just `== 0`).
-    if (p.comf <= 0) p.comf = 10_000_000;
-    if (p.somf <= 0) p.somf = 10;
+    const cscl_u = u32le(data, 8);
+    p.cscl = if (cscl_u <= std.math.maxInt(i32)) @intCast(cscl_u) else 0;
+    p.comf = u32le(data, 16);
+    p.somf = u32le(data, 20);
+    // §7.3.2.1 requires a positive multiplier, so a zero factor falls back to
+    // the standard default. Reading these signed made every value above
+    // 2^31-1 negative, and this guard then substituted the default for a
+    // factor the cell had given.
+    if (p.comf == 0) p.comf = 10_000_000;
+    if (p.somf == 0) p.somf = 10;
     return p;
 }
 
@@ -1460,17 +1481,34 @@ pub fn peekMeta(_: Allocator, bytes: []const u8) ?CellMeta {
     var it2 = iso.iterate(bytes);
     while (it2.next()) |rec| {
         if (rec.leader.leader_id != 'D') continue;
-        const sg = rec.field("SG2D") orelse continue;
-        const cnt = sg.len / 8;
-        var i: usize = 0;
-        while (i < cnt) : (i += 1) {
-            const lat = @as(f64, @floatFromInt(i32le(sg, i * 8))) / comf;
-            const lon = @as(f64, @floatFromInt(i32le(sg, i * 8 + 4))) / comf;
-            w = @min(w, lon);
-            e = @max(e, lon);
-            s = @min(s, lat);
-            n = @max(n, lat);
-            have = true;
+        if (rec.field("SG2D")) |sg| {
+            const cnt = sg.len / 8;
+            var i: usize = 0;
+            while (i < cnt) : (i += 1) {
+                const lat = @as(f64, @floatFromInt(i32le(sg, i * 8))) / comf;
+                const lon = @as(f64, @floatFromInt(i32le(sg, i * 8 + 4))) / comf;
+                w = @min(w, lon);
+                e = @max(e, lon);
+                s = @min(s, lat);
+                n = @max(n, lat);
+                have = true;
+            }
+        }
+        // A SOUNDG node has SG3D (5.1.4.1: Y, X, depth triplets) and no
+        // SG2D, so a cell indexed on SG2D alone reported an extent that left
+        // its soundings out.
+        if (rec.field("SG3D")) |sg| {
+            const cnt = sg.len / 12;
+            var i: usize = 0;
+            while (i < cnt) : (i += 1) {
+                const lat = @as(f64, @floatFromInt(i32le(sg, i * 12))) / comf;
+                const lon = @as(f64, @floatFromInt(i32le(sg, i * 12 + 4))) / comf;
+                w = @min(w, lon);
+                e = @max(e, lon);
+                s = @min(s, lat);
+                n = @max(n, lat);
+                have = true;
+            }
         }
     }
     if (have) m.bounds = .{ w, s, e, n };
@@ -2277,16 +2315,29 @@ test "parse DSPM coordinate factors" {
     std.mem.writeInt(i32, data[16..20], 10_000_000, .little); // COMF
     std.mem.writeInt(i32, data[20..24], 10, .little); // SOMF
     const p = parseDSPM(&data);
-    try std.testing.expectEqual(@as(i32, 10_000_000), p.comf);
-    try std.testing.expectEqual(@as(i32, 10), p.somf);
+    try std.testing.expectEqual(@as(i64, 10_000_000), p.comf);
+    try std.testing.expectEqual(@as(i64, 10), p.somf);
     try std.testing.expectEqual(@as(i32, 25000), p.cscl);
 
-    // Zero OR negative COMF/SOMF both fall back to the standard defaults (§7.3.2.1).
-    std.mem.writeInt(i32, data[16..20], -5, .little);
-    std.mem.writeInt(i32, data[20..24], 0, .little);
-    const pn = parseDSPM(&data);
-    try std.testing.expectEqual(@as(i32, 10_000_000), pn.comf);
-    try std.testing.expectEqual(@as(i32, 10), pn.somf);
+    // A zero factor falls back to the standard default (§7.3.2.1).
+    std.mem.writeInt(u32, data[16..20], 0, .little);
+    std.mem.writeInt(u32, data[20..24], 0, .little);
+    const pz = parseDSPM(&data);
+    try std.testing.expectEqual(@as(i64, 10_000_000), pz.comf);
+    try std.testing.expectEqual(@as(i64, 10), pz.somf);
+
+    // b14 is unsigned (§7.2.2.1 table 7.2), so a factor with the top bit set is
+    // a large multiplier, and the cell is decoded by its own factor. Reading it
+    // signed made it negative and substituted the default, which drew the cell
+    // at plausible looking wrong positions instead.
+    std.mem.writeInt(u32, data[16..20], 0xFFFFFFFB, .little);
+    const pu = parseDSPM(&data);
+    try std.testing.expectEqual(@as(i64, 4_294_967_291), pu.comf);
+
+    // A compilation scale that cannot be held reads as unknown, the same way
+    // the band mapping already treats a missing CSCL.
+    std.mem.writeInt(u32, data[8..12], 0xFFFFFFFF, .little);
+    try std.testing.expectEqual(@as(i32, 0), parseDSPM(&data).cscl);
 }
 
 test "parseFFPT decodes LNAM + RIND + COMT feature-to-feature pointers" {
@@ -3089,4 +3140,40 @@ test "an update declaring other coordinate factors stops the chain" {
     var ok = try parseCellWithUpdates(gpa, base.items, &.{same.items});
     defer ok.deinit();
     try std.testing.expectEqual(@as(usize, 1), ok.updates_applied);
+}
+
+test "a sounding-only cell reports an extent" {
+    const gpa = std.testing.allocator;
+
+    // One VI record with SG3D and no SG2D, the encoding of a SOUNDG node. The
+    // extent came back null before, so the bake skipped the cell.
+    var sg3d: [24]u8 = undefined;
+    std.mem.writeInt(i32, sg3d[0..4], 385000000, .little); // lat 38.5
+    std.mem.writeInt(i32, sg3d[4..8], -764000000, .little); // lon -76.4
+    std.mem.writeInt(i32, sg3d[8..12], 51, .little); // depth 5.1
+    std.mem.writeInt(i32, sg3d[12..16], 386000000, .little); // lat 38.6
+    std.mem.writeInt(i32, sg3d[16..20], -763000000, .little); // lon -76.3
+    std.mem.writeInt(i32, sg3d[20..24], 74, .little);
+    const vrid = [_]u8{ 110, 1, 0, 0, 0, 1, 0, 1 }; // RCNM=VI RCID=1 insert
+
+    var base = std.ArrayList(u8).empty;
+    defer base.deinit(gpa);
+    try iso.writeRecord(gpa, &base, 'L', &.{.{ .tag = "0000", .data = "0000;&   " }});
+    try iso.writeRecord(gpa, &base, 'D', &.{ .{ .tag = "VRID", .data = &vrid }, .{ .tag = "SG3D", .data = &sg3d } });
+
+    var cell = try parseCellWithUpdates(gpa, base.items, &.{});
+    defer cell.deinit();
+    const b = cell.bounds().?;
+    try std.testing.expectApproxEqAbs(@as(f64, -76.4), b[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 38.5), b[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, -76.3), b[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f64, 38.6), b[3], 1e-6);
+
+    // peekMeta indexes an ENC_ROOT without assembling topology and must agree.
+    const m = peekMeta(gpa, base.items).?;
+    const pb = m.bounds.?;
+    try std.testing.expectApproxEqAbs(b[0], pb[0], 1e-6);
+    try std.testing.expectApproxEqAbs(b[1], pb[1], 1e-6);
+    try std.testing.expectApproxEqAbs(b[2], pb[2], 1e-6);
+    try std.testing.expectApproxEqAbs(b[3], pb[3], 1e-6);
 }
