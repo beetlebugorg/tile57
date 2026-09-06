@@ -37,6 +37,7 @@ const cell_coverage = @import("coverage"); // per-cell M_COVR coverage embedded 
 const compose_mod = @import("compose"); // the runtime compositor (compose-backed view renders)
 const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
 const auxfiles = @import("auxfiles"); // the text and pictures a cell points at
+const raster_pkg = @import("raster"); // picture charts, for the inventory probe
 
 // c_allocator, not smp_allocator: smp's per-CPU slab freelists never return
 // pages to the OS, so a long-lived host process's footprint ratchets up to the
@@ -4311,4 +4312,266 @@ pub fn bakeArchive(
 fn streamSink(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
     const sw: *pmtiles.StreamWriter = @ptrCast(@alignCast(ctx.?));
     try sw.addCompressed(z, x, y, comp);
+}
+
+// ---- the inventory ----------------------------------------------------------
+//
+// What a path holds. An extension shortlists the files to open, and the file
+// states what it is. See tile57_inventory_open in include/tile57.h.
+
+pub const FileKind = enum(u8) { other = 0, source = 1, update = 2, baked = 3, raster = 4 };
+
+pub const Standard = enum(u8) { none = 0, s57 = 1, s101 = 2 };
+
+/// One file the inventory looked at. Every string lives in the inventory's
+/// arena. A field the file does not state is empty.
+pub const InventoryRow = struct {
+    path: [:0]const u8,
+    bytes: u64 = 0,
+    kind: FileKind = .other,
+    standard: Standard = .none,
+    name: [:0]const u8 = "",
+    edition: [:0]const u8 = "",
+    update: [:0]const u8 = "",
+    issue_date: [:0]const u8 = "",
+    agency: u16 = 0,
+    scale: i32 = 0,
+    bounds: ?[4]f64 = null,
+    reason: [:0]const u8 = "",
+};
+
+pub const Inventory = struct {
+    arena: std.heap.ArenaAllocator,
+    rows: []InventoryRow,
+
+    pub fn close(self: *Inventory) void {
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// True when a name could be a chart file. The three digit extensions are the
+/// S-57 and S-101 dataset numbering, where .000 is the base and .001 up are its
+/// updates.
+fn shortlisted(basename: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return false;
+    const ext = basename[dot + 1 ..];
+    for ([_][]const u8{ "pmtiles", "mbtiles", "kap", "bsb" }) |e| {
+        if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    }
+    if (ext.len != 3) return false;
+    for (ext) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// The three digit dataset number, or null when the extension is not one.
+fn datasetNumber(basename: []const u8) ?u16 {
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return null;
+    const ext = basename[dot + 1 ..];
+    if (ext.len != 3) return null;
+    return std.fmt.parseInt(u16, ext, 10) catch null;
+}
+
+fn dupeZ(a: std.mem.Allocator, s: []const u8) [:0]const u8 {
+    return a.dupeZ(u8, s) catch "";
+}
+
+/// Read one shortlisted file and say what it is.
+fn inventoryRow(a: std.mem.Allocator, io: std.Io, path: []const u8, basename: []const u8, bytes: u64) InventoryRow {
+    var row: InventoryRow = .{ .path = dupeZ(a, path), .bytes = bytes };
+
+    if (datasetNumber(basename)) |number| {
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(MAX_CELL_BYTES)) catch {
+            row.reason = dupeZ(a, "the file could not be read");
+            return row;
+        };
+        defer gpa.free(raw);
+        row.standard = if (s101.dataset.detect(raw)) .s101 else .s57;
+        // A dataset states its own name in DSID. No name means the file is
+        // not one, whatever its extension suggested.
+        const info = peekAnyInfo(a, raw, &.{}) orelse {
+            row.standard = .none;
+            row.reason = dupeZ(a, "not a chart dataset");
+            return row;
+        };
+        if (info.name.len == 0) {
+            row.standard = .none;
+            row.reason = dupeZ(a, "not a chart dataset");
+            return row;
+        }
+        row.kind = if (number == 0) .source else .update;
+        row.name = dupeZ(a, info.name);
+        row.edition = dupeZ(a, info.edition);
+        row.update = dupeZ(a, info.update);
+        row.issue_date = dupeZ(a, info.issue_date);
+        row.agency = info.agency;
+        row.scale = info.scale;
+        row.bounds = info.bounds;
+        return row;
+    }
+
+    const zpath = a.dupeZ(u8, path) catch {
+        row.reason = dupeZ(a, "out of memory");
+        return row;
+    };
+    if (std.ascii.eqlIgnoreCase(std.fs.path.extension(basename), ".pmtiles")) {
+        const c = openPmtilesPath(io, path) catch |e| {
+            row.reason = dupeZ(a, @errorName(e));
+            return row;
+        };
+        defer c.deinit();
+        // A baked archive has no dataset name inside it. The bake writes the
+        // chart name as the archive stem, so the stem here is this engine's
+        // own output naming.
+        const ext = std.fs.path.extension(basename);
+        row.name = dupeZ(a, basename[0 .. basename.len - ext.len]);
+        // Its tiles say whether it holds pictures. tile_type cannot: MLT is 2,
+        // and 2 is PNG in the PMTiles header.
+        row.kind = switch (c.tileType()) {
+            .png, .jpeg, .webp, .avif => .raster,
+            else => .baked,
+        };
+        row.scale = c.nativeScale();
+        row.bounds = c.bounds();
+        return row;
+    }
+
+    // .mbtiles, .kap and .bsb: the reader's own text names the cause when one
+    // will not open.
+    var msg: raster_pkg.ErrMsg = .{};
+    var rc = raster_pkg.RasterChart.open(io, gpa, zpath, &msg) catch |e| {
+        row.reason = dupeZ(a, if (msg.len > 0) msg.slice() else @errorName(e));
+        return row;
+    };
+    defer rc.close();
+    const ri = rc.getInfo();
+    row.kind = .raster;
+    row.scale = std.math.cast(i32, ri.scale) orelse 0;
+    if (ri.bounds_declared) row.bounds = .{ ri.west, ri.south, ri.east, ri.north };
+    return row;
+}
+
+/// Report the files under `path` that look like charts. One file, or a
+/// directory walked to the bottom. See tile57.h.
+pub fn inventoryOpen(io: std.Io, path: []const u8) !*Inventory {
+    const inv = try gpa.create(Inventory);
+    errdefer gpa.destroy(inv);
+    inv.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .rows = &.{} };
+    errdefer inv.arena.deinit();
+    const a = inv.arena.allocator();
+
+    var rows = std.ArrayList(InventoryRow).empty;
+
+    if (!isDirIo(io, path)) {
+        const base = std.fs.path.basename(path);
+        if (shortlisted(base)) {
+            try rows.append(a, inventoryRow(a, io, path, base, fileBytes(io, path)));
+        }
+        inv.rows = try rows.toOwnedSlice(a);
+        return inv;
+    }
+
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return error.NotFound;
+    defer dir.close(io);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!shortlisted(entry.basename)) continue;
+        const full = std.fs.path.join(a, &.{ path, entry.path }) catch continue;
+        try rows.append(a, inventoryRow(a, io, full, entry.basename, fileBytes(io, full)));
+    }
+    std.mem.sort(InventoryRow, rows.items, {}, struct {
+        fn lt(_: void, x: InventoryRow, y: InventoryRow) bool {
+            return std.mem.lessThan(u8, x.path, y.path);
+        }
+    }.lt);
+    inv.rows = try rows.toOwnedSlice(a);
+    return inv;
+}
+
+fn fileBytes(io: std.Io, path: []const u8) u64 {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return 0;
+    defer f.close(io);
+    const st = f.stat(io) catch return 0;
+    return st.size;
+}
+
+test "the shortlist opens what could be a chart and skips the rest" {
+    // The dataset numbering, both standards.
+    try std.testing.expect(shortlisted("US5MD1MC.000"));
+    try std.testing.expect(shortlisted("101AA00DS0001.000"));
+    try std.testing.expect(shortlisted("10100AA_X01SW.000"));
+    try std.testing.expect(shortlisted("US5MD1MC.001"));
+    // The stem is not part of the test. The shortlist accepts any stem and
+    // the file states what it is.
+    try std.testing.expect(shortlisted("CATALOG.031"));
+    try std.testing.expect(shortlisted("anything at all.000"));
+    // The other chart files.
+    try std.testing.expect(shortlisted("US5MD1MC.pmtiles"));
+    try std.testing.expect(shortlisted("ncds_08.mbtiles"));
+    try std.testing.expect(shortlisted("11013_1.KAP"));
+    // What a chart folder also holds. The S-164 sets carry 72 xml and 45 log
+    // files beside 26 datasets.
+    try std.testing.expect(!shortlisted("checks.log"));
+    try std.testing.expect(!shortlisted("10100AA_SCAMN.xml"));
+    try std.testing.expect(!shortlisted("ReadMe-V3.txt"));
+    try std.testing.expect(!shortlisted("FoldersV3.pdf"));
+    try std.testing.expect(!shortlisted("partition.tpart"));
+    try std.testing.expect(!shortlisted("noextension"));
+
+    try std.testing.expectEqual(@as(?u16, 0), datasetNumber("US5MD1MC.000"));
+    try std.testing.expectEqual(@as(?u16, 31), datasetNumber("CATALOG.031"));
+    try std.testing.expectEqual(@as(?u16, null), datasetNumber("US5MD1MC.pmtiles"));
+}
+
+test "a folder holding no chart file inventories to no rows" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "checks.log", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.xml", .data = "x" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const inv = try inventoryOpen(io, root);
+    defer inv.close();
+    try std.testing.expectEqual(@as(usize, 0), inv.rows.len);
+}
+
+test "a shortlisted file that is not a chart says so" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // The extension is the S-57 update numbering and the file is not a
+    // dataset. This is the case a name test was carrying.
+    try tmp.dir.writeFile(io, .{ .sub_path = "CATALOG.031", .data = "not a dataset" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const inv = try inventoryOpen(io, root);
+    defer inv.close();
+    try std.testing.expectEqual(@as(usize, 1), inv.rows.len);
+    try std.testing.expectEqual(FileKind.other, inv.rows[0].kind);
+    try std.testing.expectEqual(Standard.none, inv.rows[0].standard);
+    try std.testing.expect(inv.rows[0].reason.len > 0);
+}
+
+// The real cells, from the environment: T57_INV_DIR names a folder to look
+// through. Skipped when it is not set, so the gate runs everywhere and a
+// developer can point it at an exchange set.
+test "a real folder inventories to the charts in it" {
+    const dirz = std.c.getenv("T57_INV_DIR") orelse return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const inv = try inventoryOpen(io, std.mem.span(dirz));
+    defer inv.close();
+    try std.testing.expect(inv.rows.len > 0);
+    for (inv.rows) |r| {
+        try std.testing.expect(r.path.len > 0);
+        if (r.kind == .source or r.kind == .update) {
+            try std.testing.expect(r.standard != .none);
+            try std.testing.expect(r.name.len > 0);
+        }
+        if (r.kind != .other) try std.testing.expectEqualStrings("", r.reason);
+    }
 }
