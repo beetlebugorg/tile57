@@ -668,6 +668,10 @@ pub const ComposeSource = struct {
     /// is common, and everything above it — clip a feature or stack a picture,
     /// portray or not — is not. Set at open and never changed.
     kind: Kind = .vector,
+    /// Charts handed to the open that embed no usable coverage. They own no
+    /// ground, so they are absent from every composed tile, and the open
+    /// succeeds without them.
+    skipped: u32 = 0,
     // A files-open owns its readers + mmaps (deinit closes them); a charts-open
     // borrows them from the charts, which must outlive this source.
     owns_archives: bool = true,
