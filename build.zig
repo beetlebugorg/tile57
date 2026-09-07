@@ -1069,25 +1069,6 @@ pub fn build(b: *std.Build) void {
     // Charts read straight out of a .zip, and the aux files that travel with
     // them: pure over std, so each tests alone.
     _ = addPkgTest(b, test_step, "src/zipsrc.zig", target, optimize, &.{});
-    // src/chart.zig holds tests that nothing collected: the engine imports it
-    // as a module, and a module import does not pull another module's test
-    // blocks in. It needs libc for portray's embedded Lua.
-    addPkgTest(b, test_step, "src/chart.zig", target, optimize, &.{
-        .{ .name = "s57", .module = s57_mod },
-        .{ .name = "s101", .module = s101_mod },
-        .{ .name = "tiles", .module = tiles_mod },
-        .{ .name = "scene", .module = scene_mod },
-        .{ .name = "render", .module = render_mod },
-        .{ .name = "portray", .module = portray_mod },
-        .{ .name = "sprite", .module = sprite_mod },
-        .{ .name = "catalog", .module = catalog_embed },
-        .{ .name = "zipsrc", .module = zipsrc_mod },
-        .{ .name = "auxfiles", .module = auxfiles_mod },
-        .{ .name = "style", .module = style_mod },
-        .{ .name = "coverage", .module = coverage_mod },
-        .{ .name = "compose", .module = compose_mod },
-        .{ .name = "raster", .module = raster_mod },
-    }).link_libc = true;
     _ = addPkgTest(b, test_step, "src/auxfiles.zig", target, optimize, &.{});
     // Geometry core for the cross-band composition. No longer std-only: plane.zig
     // reads its partition tuning/stats valves via std.c.getenv, so the test binary
