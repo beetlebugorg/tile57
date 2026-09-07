@@ -46,6 +46,11 @@ fn enumValue(acronym: []const u8, code: u16) ?[]const u8 {
 
 /// The chart's abbreviation for a light character (LITCHR). The catalogue
 /// says "quick-flashing"; the chart prints "Q".
+/// The chart's shorthand for a light character. S-57 Appendix A ch.2 2.146
+/// gives each code's meaning and its INT 1 reference, and leaves the
+/// abbreviation to INT 1 itself, so the codes below are the ones this table has
+/// always held. `litchrText` names the rest from the catalogue rather than
+/// dropping the whole characteristic.
 const litchr_abbrev = [_]struct { code: u16, abbr: []const u8 }{
     .{ .code = 1, .abbr = "F" },       .{ .code = 2, .abbr = "Fl" },
     .{ .code = 3, .abbr = "LFl" },     .{ .code = 4, .abbr = "Q" },
@@ -64,6 +69,15 @@ const colour_abbrev = [_]struct { code: u16, abbr: []const u8 }{
     .{ .code = 6, .abbr = "Y" },   .{ .code = 9, .abbr = "Am" },
     .{ .code = 10, .abbr = "Vi" }, .{ .code = 11, .abbr = "Or" },
 };
+
+/// The light character for a report: the chart's abbreviation where this table
+/// holds one, else the catalogue's own wording. Thirteen of the 29 LITCHR codes
+/// have no abbreviation here, and returning null for those dropped the
+/// character, the period and the range from the report of an alternating light.
+fn litchrText(code: u16) ?[]const u8 {
+    if (abbrevOf(litchr_abbrev, code)) |abbr| return abbr;
+    return enumValue("LITCHR", code);
+}
 
 fn abbrevOf(comptime table: anytype, code: u16) ?[]const u8 {
     for (table) |e| if (e.code == code) return e.abbr;
@@ -226,7 +240,7 @@ fn date(a: std.mem.Allocator, raw: []const u8) ?[]const u8 {
 pub fn lightSignature(a: std.mem.Allocator, attrs: *const std.json.ObjectMap) ?[]const u8 {
     const chr_raw = strAttr(attrs, "LITCHR") orelse return null;
     const chr = std.fmt.parseInt(u16, chr_raw, 10) catch return null;
-    const abbr = abbrevOf(litchr_abbrev, chr) orelse return null;
+    const abbr = litchrText(chr) orelse return null;
     var out = std.ArrayList(u8).empty;
     out.appendSlice(a, abbr) catch return null;
     if (strAttr(attrs, "SIGGRP")) |grp| {
@@ -499,7 +513,7 @@ fn lowered(a: std.mem.Allocator, s: []const u8) []const u8 {
 fn lightSignatureRows(a: std.mem.Allocator, rows: []const Row) ?[]const u8 {
     const chr_raw = rowValue(rows, "LITCHR") orelse return null;
     const chr = std.fmt.parseInt(u16, chr_raw, 10) catch return null;
-    const abbr = abbrevOf(litchr_abbrev, chr) orelse return null;
+    const abbr = litchrText(chr) orelse return null;
     var out = std.ArrayList(u8).empty;
     out.appendSlice(a, abbr) catch return null;
     if (rowValue(rows, "SIGGRP")) |grp| {
@@ -538,18 +552,28 @@ fn chipTitle(a: std.mem.Allocator, cls: []const u8, rows: []const Row) []const u
 
 /// The report a shell renders for one picked feature, as JSON:
 /// {"title","subtitle","chip","notes":[…],"rows":[{"label","value","depth",
-/// "file","picture"}…],"footnote","empty":"none"|"source"}. The "empty"
-/// field appears only when there is nothing to read. The caller frees the
-/// bytes.
+/// "file","picture"}…],"footnote","empty":"none"|"source"|"unreadable"}. The
+/// "empty" field appears only when there is no text to read: "none" for a
+/// feature with no attributes, "source" when it has some the report does not
+/// show, and "unreadable" when its attribute blob did not parse. The caller
+/// frees the bytes.
 pub fn report(alloc: std.mem.Allocator, cls: []const u8, cell: []const u8, s57_json: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
     var rows = std.ArrayList(Row).empty;
-    if (std.json.parseFromSlice(std.json.Value, a, s57_json, .{})) |parsed| {
-        try flatten(a, &rows, parsed.value, null, 0);
-    } else |_| {}
+    // A feature whose attribute blob does not parse read as one with no
+    // attributes, so a wreck whose bytes were corrupted showed the same report
+    // as a land area that has none. The third `empty` value tells them apart.
+    var unreadable = false;
+    if (s57_json.len > 0) {
+        if (std.json.parseFromSlice(std.json.Value, a, s57_json, .{})) |parsed| {
+            try flatten(a, &rows, parsed.value, null, 0);
+        } else |_| {
+            unreadable = true;
+        }
+    }
 
     // Sort the top-level blocks into reading order. Sub-rows stay under
     // their parents. The sort is stable for rows the order does not name.
@@ -642,7 +666,7 @@ pub fn report(alloc: std.mem.Allocator, cls: []const u8, cell: []const u8, s57_j
     }
     if (n_detail == 0 and n_notes == 0) {
         try js.objectField("empty");
-        try js.write(if (rows.items.len == 0) "none" else "source");
+        try js.write(if (unreadable) "unreadable" else if (rows.items.len == 0) "none" else "source");
     }
     try js.endObject();
 
@@ -673,4 +697,40 @@ test "report marks an empty body" {
     const none = try report(a, "LNDARE", "C", "{}");
     defer a.free(none);
     try std.testing.expect(std.mem.indexOf(u8, none, "\"empty\":\"none\"") != null);
+}
+
+test "a light character without an abbreviation still reports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Sixteen of the 29 LITCHR codes have a chart abbreviation here. The other
+    // thirteen dropped the character, the period and the range from the report.
+    try std.testing.expectEqualStrings("Fl", litchrText(2).?);
+    try std.testing.expectEqualStrings("Q+LFl", litchrText(25).?);
+    try std.testing.expectEqualStrings("Occulting alternating", litchrText(17).?);
+    try std.testing.expectEqualStrings("Group alternating", litchrText(20).?);
+    try std.testing.expectEqualStrings("Ultra quick-flash plus long-flash", litchrText(27).?);
+    try std.testing.expect(litchrText(99) == null);
+
+    // The whole signature reads for an alternating light.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"LITCHR\":\"17\",\"COLOUR\":\"1\",\"SIGPER\":\"6\"}", .{});
+    const sig = lightSignature(a, &parsed.value.object).?;
+    try std.testing.expect(std.mem.indexOf(u8, sig, "Occulting alternating") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sig, "6s") != null);
+}
+
+test "a report says when the attributes did not read" {
+    const a = std.testing.allocator;
+
+    // A feature with no attributes and one whose blob is corrupt looked the
+    // same, so a mariner read "this wreck records no depth" for one that could
+    // not be read.
+    const none = try report(a, "LNDARE", "US5MD1MC", "{}");
+    defer a.free(none);
+    try std.testing.expect(std.mem.indexOf(u8, none, "\"empty\":\"none\"") != null);
+
+    const bad = try report(a, "WRECKS", "US5MD1MC", "{\"VALSOU\":");
+    defer a.free(bad);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "\"empty\":\"unreadable\"") != null);
 }
