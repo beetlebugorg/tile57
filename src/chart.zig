@@ -37,6 +37,7 @@ const cell_coverage = @import("coverage"); // per-cell M_COVR coverage embedded 
 const compose_mod = @import("compose"); // the runtime compositor (compose-backed view renders)
 const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
 const auxfiles = @import("auxfiles"); // the text and pictures a cell points at
+const raster_pkg = @import("raster"); // picture charts, for the inventory probe
 
 // c_allocator, not smp_allocator: smp's per-CPU slab freelists never return
 // pages to the OS, so a long-lived host process's footprint ratchets up to the
@@ -338,10 +339,21 @@ const PathCtx = struct {
     io: std.Io,
     dir: std.Io.Dir,
     paths: [][]u8, // base .000 path per cell, relative to `dir`
+    /// CRC per file from the exchange set's catalogue, keyed by the same
+    /// relative path the reads use. Empty when the set has no catalogue, or
+    /// when its producer left the CRCs out. Keys are owned.
+    ///
+    /// The base cells are verified once at open. The update files are read
+    /// later, on demand, so their CRCs travel here to be checked at that point
+    /// rather than costing a second pass over the whole set.
+    crcs: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinit(self: *PathCtx) void {
         for (self.paths) |p| gpa.free(p);
         gpa.free(self.paths);
+        var it = self.crcs.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        self.crcs.deinit(gpa);
         self.dir.close(self.io);
         self.threaded.deinit();
         gpa.destroy(self.threaded);
@@ -390,13 +402,32 @@ fn cdup(bytes: []const u8) ?[*]u8 {
 // Peek `relpath`'s bbox+scale; on success append an index-aligned meta + a gpa-owned
 // copy of the path. Cells that don't read / have no coverage bbox are skipped (both
 // lists), keeping meta[i] and paths[i] aligned with the streaming cell index.
-fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8)) !void {
-    const bytes = dir.readFileAlloc(io, relpath, gpa, .unlimited) catch return;
+fn addPathCell(io: std.Io, dir: std.Io.Dir, relpath: []const u8, metas: *std.ArrayList(ChartMeta), paths: *std.ArrayList([]u8), want_crc: ?u32) !bool {
+    const bytes = dir.readFileAlloc(io, relpath, gpa, .limited(MAX_CELL_BYTES)) catch {
+        std.debug.print("CHART LOST {s}: cell did not read\n", .{relpath});
+        return false;
+    };
     defer gpa.free(bytes);
-    const m = s57.peekMeta(gpa, bytes) orelse return;
-    const bb = m.bounds orelse return;
+    // S-57 Part 3 3.4: the catalogue may include a CRC per file. A cell whose
+    // bytes disagree with it is not the cell the producer published.
+    if (want_crc) |want| {
+        const got = std.hash.Crc32.hash(bytes);
+        if (got != want) {
+            std.debug.print("CHART LOST {s}: catalogue CRC is {x:0>8}, file is {x:0>8}\n", .{ relpath, want, got });
+            return false;
+        }
+    }
+    const m = peekAnyMeta(bytes) orelse {
+        std.debug.print("CHART LOST {s}: cell did not parse\n", .{relpath});
+        return false;
+    };
+    const bb = m.bounds orelse {
+        std.debug.print("CHART LOST {s}: cell has no extent\n", .{relpath});
+        return false;
+    };
     try metas.append(gpa, .{ .west = bb[0], .south = bb[1], .east = bb[2], .north = bb[3], .cscl = m.cscl });
     try paths.append(gpa, try gpa.dupe(u8, relpath));
+    return true;
 }
 
 // Internal ChartReadFn for a path-backed chart: read cell `index`'s base .000 + its
@@ -406,7 +437,7 @@ fn pathRead(user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool
     const ctx: *PathCtx = @ptrCast(@alignCast(user orelse return false));
     if (index >= ctx.paths.len) return false;
     const bpath = ctx.paths[index];
-    const base = ctx.dir.readFileAlloc(ctx.io, bpath, gpa, .unlimited) catch return false;
+    const base = ctx.dir.readFileAlloc(ctx.io, bpath, gpa, .limited(MAX_CELL_BYTES)) catch return false;
     defer gpa.free(base);
     const cbase = cdup(base) orelse return false;
     out.* = .{ .base = cbase, .base_len = base.len };
@@ -416,12 +447,23 @@ fn pathRead(user: ?*anyopaque, index: usize, out: *ChartBytes) callconv(.c) bool
     var ulens = std.ArrayList(usize).empty;
     defer ulens.deinit(gpa);
     const stem = bpath[0 .. bpath.len - 4]; // strip ".000"
-    var u: u32 = 1;
-    while (u <= 999) : (u += 1) {
+    var nums = updateNumbersFor(ctx.dir, ctx.io, bpath) catch std.ArrayList(u32).empty;
+    defer nums.deinit(gpa);
+    for (nums.items) |u| {
         const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
         defer gpa.free(upn);
-        const ub = ctx.dir.readFileAlloc(ctx.io, upn, gpa, .unlimited) catch break;
+        const ub = ctx.dir.readFileAlloc(ctx.io, upn, gpa, .limited(MAX_CELL_BYTES)) catch break;
         defer gpa.free(ub);
+        // An update whose bytes disagree with the catalogue is damaged. Stop
+        // the chain here and keep what applied before it, the policy a corrupt
+        // update already follows.
+        if (ctx.crcs.get(upn)) |want| {
+            const got = std.hash.Crc32.hash(ub);
+            if (got != want) {
+                std.debug.print("UPDATE LOST {s}: catalogue CRC is {x:0>8}, file is {x:0>8}\n", .{ upn, want, got });
+                break;
+            }
+        }
         const cub = cdup(ub) orelse break;
         ulens.append(gpa, ub.len) catch {
             std.c.free(cub);
@@ -491,6 +533,51 @@ const CellLoad = struct { cell: s57.Cell, adapted: ?[]const s101.adapter.Adapted
 
 /// Parse a .000 chart, auto-detecting S-101 vs S-57 from the file itself, and apply
 /// its sequential `.001…` update chain. A native S-101 dataset (S-100 Part 10a)
+/// A cell's compilation scale and extent, whichever model it is in.
+///
+/// s57.peekMeta reads the S-57 DSPM and the raw SG2D/SG3D coordinates. A native
+/// S-101 dataset has neither, so it reported no extent and every caller dropped
+/// the chart, though parseAnyCell parses it. S-101 keeps its display scale on a
+/// DataCoverage feature's attributes, which needs the record assembly, so the
+/// native branch parses the dataset instead of peeking it. Native charts are the
+/// rare path and were being lost outright, so the cost buys correctness.
+fn peekAnyMeta(bytes: []const u8) ?s57.CellMeta {
+    if (s101.dataset.detect(bytes)) {
+        var loaded = s101.native.parseDataset(gpa, bytes, &.{}) catch return null;
+        defer loaded.cell.deinit();
+        return .{ .cscl = loaded.cell.params.cscl, .bounds = loaded.cell.bounds() };
+    }
+    return s57.peekMeta(gpa, bytes);
+}
+
+/// The inventory row for one cell, whichever format it is in.
+///
+/// s57.peekCellInfo reads an S-57 DSID. An S-101 DSID holds different subfields
+/// in those positions, so it produced a row of unrelated strings: the S-100
+/// profile name where the cell name goes, the product specification URN as the
+/// update number, and two bytes of the file name read as an agency code. A
+/// native dataset gets its identity from the S-101 reader instead. Strings are
+/// duped into `a`, so the row outlives the bytes it was read from.
+fn peekAnyInfo(a: std.mem.Allocator, base: []const u8, updates: []const []const u8) ?s57.CellInfo {
+    if (!s101.dataset.detect(base)) return s57.peekCellInfo(a, base, updates);
+
+    const id = s101.dataset.peekIdentity(base) orelse return null;
+    const m = peekAnyMeta(base) orelse return null;
+    var info = s57.CellInfo{ .scale = m.cscl, .bounds = m.bounds };
+    const ext = std.fs.path.extension(id.dsnm);
+    info.name = a.dupe(u8, id.dsnm[0 .. id.dsnm.len - ext.len]) catch return null;
+    info.edition = a.dupe(u8, id.editionText()) catch return null;
+    info.update = a.dupe(u8, id.updateText()) catch return null;
+    // The newest file of this edition gives the update the chart is at, the
+    // same way the S-57 walk reads the last file in the chain.
+    for (updates) |u| {
+        const ui = s101.dataset.peekIdentity(u) orelse continue;
+        if (!std.mem.eql(u8, ui.editionText(), info.edition)) continue;
+        info.update = a.dupe(u8, ui.updateText()) catch continue;
+    }
+    return info;
+}
+
 /// assembles via s101.native; an S-57 cell parses via s57. Returns null on failure.
 fn parseAnyCell(base: []const u8, updates: []const []const u8) ?CellLoad {
     if (s101.dataset.detect(base)) {
@@ -750,6 +837,42 @@ pub const CellFiles = struct {
     }
 };
 
+/// The update numbers held beside the `.000` cell at `relpath`, ascending.
+/// `relpath` is resolved against `dir`, so it may name a cell in a
+/// subdirectory of it.
+///
+/// The chain does not have to start at `.001`. A re-issued base includes its
+/// earlier updates and is delivered with only the ones that follow it, so
+/// reading until the first absent extension drops every update in the set.
+/// This gathers the numbered files present. The update gate then applies the
+/// ones following the base's edition and number.
+fn updateNumbersFor(dir: std.Io.Dir, io: std.Io, relpath: []const u8) !std.ArrayList(u32) {
+    var opened: ?std.Io.Dir = null;
+    defer if (opened) |*d| d.close(io);
+    var cell_dir = dir;
+    if (std.fs.path.dirname(relpath)) |sub| {
+        opened = try dir.openDir(io, sub, .{ .iterate = true });
+        cell_dir = opened.?;
+    }
+    const bn = std.fs.path.basename(relpath);
+    const stem = bn[0 .. bn.len - 4]; // strip ".000"
+
+    var nums = std.ArrayList(u32).empty;
+    errdefer nums.deinit(gpa);
+    var it = cell_dir.iterate();
+    while (it.next(io) catch null) |ent| {
+        if (ent.kind != .file) continue;
+        if (ent.name.len != stem.len + 4) continue;
+        if (!std.mem.eql(u8, ent.name[0..stem.len], stem)) continue;
+        if (ent.name[stem.len] != '.') continue;
+        const n = std.fmt.parseInt(u32, ent.name[stem.len + 1 ..], 10) catch continue;
+        if (n == 0) continue; // the base itself
+        try nums.append(gpa, n);
+    }
+    std.mem.sort(u32, nums.items, {}, std.sort.asc(u32));
+    return nums;
+}
+
 /// Read a .000 cell + its .001.. updates from the cell's directory into gpa buffers.
 fn readCellFiles(path: []const u8) !CellFiles {
     const threaded = try gpa.create(std.Io.Threaded);
@@ -760,11 +883,11 @@ fn readCellFiles(path: []const u8) !CellFiles {
     }
     const io = threaded.io();
     const dir_path = std.fs.path.dirname(path) orelse ".";
-    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
 
     const bn = std.fs.path.basename(path);
-    const base = try dir.readFileAlloc(io, bn, gpa, .unlimited);
+    const base = try dir.readFileAlloc(io, bn, gpa, .limited(MAX_CELL_BYTES));
     errdefer gpa.free(base);
     var updates = std.ArrayList([]u8).empty;
     errdefer {
@@ -773,11 +896,12 @@ fn readCellFiles(path: []const u8) !CellFiles {
     }
     if (bn.len > 4) {
         const stem = bn[0 .. bn.len - 4]; // strip ".000"
-        var u: u32 = 1;
-        while (u <= 999) : (u += 1) {
+        var nums = try updateNumbersFor(dir, io, bn);
+        defer nums.deinit(gpa);
+        for (nums.items) |u| {
             const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch break;
             defer gpa.free(upn);
-            const ub = dir.readFileAlloc(io, upn, gpa, .unlimited) catch break;
+            const ub = dir.readFileAlloc(io, upn, gpa, .limited(MAX_CELL_BYTES)) catch break;
             updates.append(gpa, ub) catch {
                 gpa.free(ub);
                 break;
@@ -787,9 +911,11 @@ fn readCellFiles(path: []const u8) !CellFiles {
     return .{ .base = base, .updates = try updates.toOwnedSlice(gpa) };
 }
 
-/// The most a single ENC cell may claim to expand to. Cells run to a few MiB;
-/// a header promising more than this is a damaged or hostile archive, and the
-/// point of a cap is to find that out before allocating rather than after.
+/// The most any single file an exchange set names may claim: a cell, one of its
+/// updates, an aux file it references, or the catalogue that lists them. Cells
+/// run to a few MiB, so a size past this marks a damaged or hostile set,
+/// and the point of a cap is to find that out before allocating rather than
+/// after. The zip reads and the on-disk reads share it.
 pub const MAX_CELL_BYTES: u64 = 256 << 20;
 
 /// `readCellFiles` out of a zip: the base entry plus its update chain, each
@@ -874,7 +1000,7 @@ fn writeAuxFromDir(io: std.Io, cell_path: []const u8, out_path: []const u8) void
         // The iterator reuses its name buffer, so both the name and the bytes
         // must be copied before the next step.
         const name = a.dupe(u8, ent.name) catch continue;
-        const bytes = dir.readFileAlloc(io, name, a, .unlimited) catch continue;
+        const bytes = dir.readFileAlloc(io, name, a, .limited(MAX_CELL_BYTES)) catch continue;
         files.append(a, .{ .owner = stem, .name = name, .bytes = bytes }) catch continue;
     }
     _ = auxfiles.writeDir(io, a, dst, files.items) catch {};
@@ -1033,6 +1159,11 @@ const BakeFileCtx = struct {
     done: std.atomic.Value(u32),
     /// Set when a progress callback returned false; every worker drains out at its next cell.
     cancel: std.atomic.Value(bool),
+    /// CRC per file from the exchange set's catalogue, keyed as `in_paths`
+    /// names them. Empty when the set published none, or when reading from an
+    /// archive, where every entry is checked against its own CRC as it
+    /// inflates. Read-only once the workers start.
+    crcs: std.StringHashMapUnmanaged(u32) = .empty,
     /// Write the text and pictures each cell references beside its archive.
     aux: bool = true,
 };
@@ -1082,8 +1213,17 @@ fn bakeFileWorker(ctx: *BakeFileCtx) void {
         if (ctx.cancel.load(.monotonic)) return; // a peer's progress callback said stop
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.in_paths.len) return;
-        bakeOneToFile(ctx, i);
-        if (ctx.label) |lb| lb(ctx.progress_ctx, @intCast(i)); // name the chart just finished
+        // A file that fails its catalogue CRC has already named itself, so it
+        // is not baked and does not draw the generic loss line below.
+        const verified = ctx.crcs.count() == 0 or catalogVerified(ctx.io, ctx.in_paths[i], &ctx.crcs);
+        if (verified) bakeOneToFile(ctx, i);
+        // The label names a chart that was written. It fired for every cell
+        // before, so a host printed a finished chart for one that failed.
+        if (ctx.ok[i]) {
+            if (ctx.label) |lb| lb(ctx.progress_ctx, @intCast(i));
+        } else if (verified) {
+            std.debug.print("CHART LOST {s}: bake produced no archive\n", .{ctx.in_paths[i]});
+        }
         const d = ctx.done.fetchAdd(1, .monotonic) + 1; // attempted count (smooth progress)
         if (ctx.progress) |cb| {
             if (!cb(ctx.progress_ctx, d, @intCast(ctx.in_paths.len))) {
@@ -1130,7 +1270,11 @@ fn bakeToFiles(io: std.Io, zip: ?*const zipsrc.Archive, in_paths: []const []cons
     const cell_ms = gpa.alloc(i64, in_paths.len) catch return 0;
     defer gpa.free(cell_ms);
     @memset(cell_ms, 0);
-    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .zip = zip, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false), .aux = aux };
+    // A zip entry is checked against its own CRC as it inflates, so the
+    // catalogue lookup is for the on-disk bake only.
+    var crcs = if (zip == null) catalogCrcsFor(io, in_paths) else std.StringHashMapUnmanaged(u32).empty;
+    defer freeCrcMap(&crcs);
+    var ctx = BakeFileCtx{ .next = std.atomic.Value(usize).init(0), .in_paths = in_paths, .out_paths = out_paths, .rules_dir = rules_dir, .zip = zip, .io = io, .ok = ok, .ms = cell_ms, .progress = progress, .progress_ctx = progress_ctx, .label = label, .done = std.atomic.Value(u32).init(0), .cancel = std.atomic.Value(bool).init(false), .aux = aux, .crcs = crcs };
     var n = @min(@max(workers, 1), in_paths.len);
     if (n > MAX_BAKE_WORKERS) n = MAX_BAKE_WORKERS;
     // The comptime lhs prunes the spawn branch on a single-threaded build (wasm).
@@ -1182,6 +1326,92 @@ fn bakeToFiles(io: std.Io, zip: ?*const zipsrc.Archive, in_paths: []const []cons
 /// input (.000 + update chain) is skipped, so a re-run over an unchanged tree bakes nothing — and a
 /// run that resumes a cancelled one only bakes what the cancel left undone. Returns the count baked
 /// THIS run; errors if `in_dir` is unreadable.
+/// The CRCs an exchange set's catalogue gives, keyed by path the way
+/// `in_paths` names each cell, so a bake can check a file against the value
+/// the set publishes for it.
+///
+/// S-57 Part 3 puts CATALOG.031 at the exchange set's root, with the cells
+/// either beside it or one directory below, so a cell's own directory and its
+/// parent are the two places to look. Each catalogue found is parsed once,
+/// however many cells it covers. An empty result means the set published no
+/// catalogue, which S-57 allows, and the bake proceeds unchecked as before.
+fn catalogCrcsFor(io: std.Io, in_paths: []const []const u8) std.StringHashMapUnmanaged(u32) {
+    var out: std.StringHashMapUnmanaged(u32) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+
+    for (in_paths) |p| {
+        const d1 = std.fs.path.dirname(p) orelse continue;
+        const roots = [_][]const u8{ d1, std.fs.path.dirname(d1) orelse d1 };
+        for (roots) |root| {
+            if (seen.contains(root)) continue;
+            seen.put(gpa, root, {}) catch continue;
+            const cat = std.fs.path.join(gpa, &.{ root, "CATALOG.031" }) catch continue;
+            defer gpa.free(cat);
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, cat, gpa, .limited(MAX_CELL_BYTES)) catch continue;
+            defer gpa.free(bytes);
+            var carena = std.heap.ArenaAllocator.init(gpa);
+            defer carena.deinit();
+            const entries = s57.parseCatalog(carena.allocator(), bytes) orelse continue;
+            for (entries) |e| {
+                const want = s57.catalogCrc(e.crcs) orelse continue;
+                const key = std.fs.path.join(gpa, &.{ root, e.path }) catch continue;
+                out.put(gpa, key, want) catch gpa.free(key);
+            }
+        }
+    }
+    return out;
+}
+
+fn freeCrcMap(m: *std.StringHashMapUnmanaged(u32)) void {
+    var it = m.keyIterator();
+    while (it.next()) |k| gpa.free(k.*);
+    m.deinit(gpa);
+}
+
+/// True when the cell at `path` and every update beside it match the CRC the
+/// catalogue gives. A file the catalogue gives no CRC for passes, the case
+/// S-57 lets a producer leave out.
+///
+/// A damaged update fails the whole cell rather than truncating its chain: the
+/// bake writes one archive per cell, and an archive built to an earlier update
+/// than the set names cannot be told apart from a complete one afterwards. The
+/// serve path keeps the cell and stops the chain instead, because a mariner
+/// underway needs the chart already in hand.
+fn catalogVerified(io: std.Io, path: []const u8, crcs: *const std.StringHashMapUnmanaged(u32)) bool {
+    const check = struct {
+        fn one(io_: std.Io, p: []const u8, m: *const std.StringHashMapUnmanaged(u32)) bool {
+            const want = m.get(p) orelse return true;
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io_, p, gpa, .limited(MAX_CELL_BYTES)) catch {
+                std.debug.print("CHART LOST {s}: did not read\n", .{p});
+                return false;
+            };
+            defer gpa.free(bytes);
+            const got = std.hash.Crc32.hash(bytes);
+            if (got != want) {
+                std.debug.print("CHART LOST {s}: catalogue CRC is {x:0>8}, file is {x:0>8}\n", .{ p, want, got });
+                return false;
+            }
+            return true;
+        }
+    }.one;
+
+    if (!check(io, path, crcs)) return false;
+    if (!std.mem.endsWith(u8, path, ".000")) return true;
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return true;
+    defer dir.close(io);
+    var nums = updateNumbersFor(dir, io, std.fs.path.basename(path)) catch return true;
+    defer nums.deinit(gpa);
+    const stem = path[0 .. path.len - 4]; // strip ".000"
+    for (nums.items) |u| {
+        const upn = std.fmt.allocPrint(gpa, "{s}.{d:0>3}", .{ stem, u }) catch return true;
+        defer gpa.free(upn);
+        if (!check(io, upn, crcs)) return false;
+    }
+    return true;
+}
+
 pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: ?[]const u8, workers: usize, progress: BakeProgress, progress_ctx: ?*anyopaque, label: BakeLabel) !usize {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1192,6 +1422,7 @@ pub fn bakeTree(io: std.Io, in_dir: []const u8, out_dir: []const u8, rules_dir: 
 
     var dir = try std.Io.Dir.cwd().openDir(io, in_dir, .{ .iterate = true });
     defer dir.close(io);
+
     var walker = try dir.walk(a);
     defer walker.deinit();
     while (walker.next(io) catch null) |entry| {
@@ -2281,7 +2512,7 @@ const OpenWork = struct {
         _ = scratch; // persistent outputs go straight to `gpa`
         const c: *OpenWork = @ptrCast(@alignCast(uptr));
         const in = c.inputs[i];
-        const meta = s57.peekMeta(gpa, in.base) orelse return;
+        const meta = peekAnyMeta(in.base) orelse return;
         const bbox = meta.bounds orelse return;
         const base = gpa.dupe(u8, in.base) catch return;
         var ups: [][]u8 = &.{};
@@ -2317,6 +2548,10 @@ pub const Chart = struct {
     /// partition sidecar the bake wrote next to the archives, so a host never
     /// has to know that file exists.
     source_path: ?[]u8 = null,
+    /// Cells handed to the open that produced no chart. The open succeeds while
+    /// one cell parses, so a host reads this to tell a chart set with a gap in
+    /// it from a complete one.
+    skipped_cells: u32 = 0,
     cache: std.AutoHashMap(u64, []u8), // tile key -> MVT bytes (owned)
     cache_max: usize = 8192,
     // Emit the per-feature pick-report attrs (s57/cell) on live-generated tiles.
@@ -2387,8 +2622,12 @@ pub const Chart = struct {
         bake_enc.parallelFor(gpa, cells_in.len, &ow, OpenWork.run);
 
         var valid: usize = 0;
-        for (ok) |k| {
-            if (k) valid += 1;
+        for (ok, cells_in) |k, in| {
+            if (k) {
+                valid += 1;
+            } else {
+                std.debug.print("CHART LOST {s}: cell did not parse\n", .{in.name});
+            }
         }
         if (valid == 0) return error.InvalidCell; // cells provided, but none parsed
 
@@ -2409,6 +2648,7 @@ pub const Chart = struct {
         };
         src.* = .{
             .backend = .{ .cells = .{ .cells = cells, .rules_dir = dir_copy } },
+            .skipped_cells = @intCast(cells_in.len - valid),
             .cache = std.AutoHashMap(u64, []u8).init(gpa),
             .pick_attrs = pick_attrs,
         };
@@ -2474,16 +2714,35 @@ pub const Chart = struct {
             for (paths.items) |p| gpa.free(p);
             paths.deinit(gpa);
         }
+        // Cells the walk found and could not use. The open succeeds on the
+        // rest, so this is what tells a host the set has a gap.
+        var skipped: u32 = 0;
+        var crcs: std.StringHashMapUnmanaged(u32) = .empty;
+        errdefer {
+            var cit = crcs.keyIterator();
+            while (cit.next()) |k| gpa.free(k.*);
+            crcs.deinit(gpa);
+        }
 
         if (single_file) {
-            try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths);
-        } else if (dir.readFileAlloc(io, "CATALOG.031", gpa, .unlimited)) |cbytes| {
+            if (!try addPathCell(io, dir, std.fs.path.basename(path), &metas, &paths, null)) skipped += 1;
+        } else if (dir.readFileAlloc(io, "CATALOG.031", gpa, .limited(MAX_CELL_BYTES))) |cbytes| {
             defer gpa.free(cbytes);
             var carena = std.heap.ArenaAllocator.init(gpa);
             defer carena.deinit();
             if (s57.parseCatalog(carena.allocator(), cbytes)) |entries| {
+                // Keep every CRC the catalogue gives, cells and updates alike.
+                // A cell is verified below, as its bytes are already read; an
+                // update is verified when the chain reaches it.
                 for (entries) |e| {
-                    if (e.is_cell) try addPathCell(io, dir, e.path, &metas, &paths);
+                    const want = s57.catalogCrc(e.crcs) orelse continue;
+                    const key = gpa.dupe(u8, e.path) catch continue;
+                    crcs.put(gpa, key, want) catch gpa.free(key);
+                }
+                for (entries) |e| {
+                    if (e.is_cell) {
+                        if (!try addPathCell(io, dir, e.path, &metas, &paths, s57.catalogCrc(e.crcs))) skipped += 1;
+                    }
                 }
             }
         } else |_| {
@@ -2492,7 +2751,7 @@ pub const Chart = struct {
             while (try walker.next(io)) |entry| {
                 if (entry.kind != .file) continue;
                 if (!std.mem.endsWith(u8, entry.path, ".000")) continue;
-                try addPathCell(io, dir, entry.path, &metas, &paths);
+                if (!try addPathCell(io, dir, entry.path, &metas, &paths, null)) skipped += 1;
             }
         }
         if (metas.items.len == 0) return error.OpenFailed;
@@ -2501,9 +2760,10 @@ pub const Chart = struct {
         // Chart owns the PathCtx (Io + Dir + paths) via ls.path_ctx, freed in deinit.
         const src = try openChartsStreaming(metas.items, pathRead, null, rules_dir, pick_attrs);
         errdefer src.deinit();
+        src.skipped_cells = skipped;
         const ctx = try gpa.create(PathCtx);
         errdefer gpa.destroy(ctx);
-        ctx.* = .{ .threaded = threaded, .io = io, .dir = dir, .paths = try paths.toOwnedSlice(gpa) };
+        ctx.* = .{ .threaded = threaded, .io = io, .dir = dir, .paths = try paths.toOwnedSlice(gpa), .crcs = crcs };
         src.backend.cells.reader_user = ctx;
         src.backend.cells.path_ctx = ctx;
         return src;
@@ -3379,7 +3639,7 @@ pub const Chart = struct {
             .cells => |*ls| {
                 for (ls.cells) |*lc| {
                     if (lc.base.len > 0) {
-                        if (s57.peekCellInfo(a, lc.base, lc.updates)) |ci| try infos.append(a, ci);
+                        if (peekAnyInfo(a, lc.base, lc.updates)) |ci| try infos.append(a, ci);
                     } else if (lc.cell) |*c| {
                         const d = c.dsid;
                         const ext = std.fs.path.extension(d.dsnm);
@@ -3408,7 +3668,7 @@ pub const Chart = struct {
                             } else |_| {}
                         }
                         defer if (ups_arr) |arr| gpa.free(arr);
-                        if (s57.peekCellInfo(a, cb.base[0..cb.base_len], ups)) |ci| try infos.append(a, ci);
+                        if (peekAnyInfo(a, cb.base[0..cb.base_len], ups)) |ci| try infos.append(a, ci);
                     }
                 }
             },
@@ -4070,7 +4330,7 @@ pub fn bakeArchive(
     const cbboxes = gpa.alloc([4]f64, cells_in.len) catch return error.BakeFailed;
     defer gpa.free(cbboxes);
     for (cells_in, 0..) |in, i| {
-        const m = s57.peekMeta(gpa, in.base);
+        const m = peekAnyMeta(in.base);
         const band = bake_enc.bandOf(if (m) |mm| mm.cscl else 0);
         cbands[i] = band;
         cbboxes[i] = if (m) |mm| (mm.bounds orelse .{ 1e9, 1e9, -1e9, -1e9 }) else .{ 1e9, 1e9, -1e9, -1e9 };
@@ -4191,7 +4451,17 @@ pub fn bakeArchive(
         @memset(pas, null);
         var bw = BakeWork{ .sources = sources.items, .outs = outs, .arenas = pas, .rules_dir = dir, .build_geo = bake_enc.cacheGeoForBand(band) };
         bake_enc.parallelFor(gpa, sources.items.len, &bw, BakeWork.run);
-        loaded += idxs.len;
+        // Count the cells that produced a backend. `idxs.len` counted the ones
+        // attempted, so progress reached the total whether they loaded or not.
+        for (outs, idxs) |o, ci| {
+            if (o != null) {
+                loaded += 1;
+            } else {
+                // The bake keeps going. This line is the report: a cell absent
+                // from the archive with no word for it reads as empty ocean.
+                std.debug.print("CHART LOST {s}: parse produced no cell\n", .{cells_in[ci].name});
+            }
+        }
         if (progress) |cb| if (has_work) cb(user, 0, loaded, cells_in.len, band_ord - 1, band_count, @tagName(band).ptr);
 
         var backs = std.ArrayList(bake_enc.Backend).empty;
@@ -4333,6 +4603,268 @@ pub fn bakeArchive(
 fn streamSink(ctx: ?*anyopaque, z: u8, x: u32, y: u32, comp: []const u8) anyerror!void {
     const sw: *pmtiles.StreamWriter = @ptrCast(@alignCast(ctx.?));
     try sw.addCompressed(z, x, y, comp);
+}
+
+// ---- the inventory ----------------------------------------------------------
+//
+// What a path holds. An extension shortlists the files to open, and the file
+// states what it is. See tile57_inventory_open in include/tile57.h.
+
+pub const FileKind = enum(u8) { other = 0, source = 1, update = 2, baked = 3, raster = 4 };
+
+pub const Standard = enum(u8) { none = 0, s57 = 1, s101 = 2 };
+
+/// One file the inventory looked at. Every string lives in the inventory's
+/// arena. A field the file does not state is empty.
+pub const InventoryRow = struct {
+    path: [:0]const u8,
+    bytes: u64 = 0,
+    kind: FileKind = .other,
+    standard: Standard = .none,
+    name: [:0]const u8 = "",
+    edition: [:0]const u8 = "",
+    update: [:0]const u8 = "",
+    issue_date: [:0]const u8 = "",
+    agency: u16 = 0,
+    scale: i32 = 0,
+    bounds: ?[4]f64 = null,
+    reason: [:0]const u8 = "",
+};
+
+pub const Inventory = struct {
+    arena: std.heap.ArenaAllocator,
+    rows: []InventoryRow,
+
+    pub fn close(self: *Inventory) void {
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// True when a name could be a chart file. The three digit extensions are the
+/// S-57 and S-101 dataset numbering, where .000 is the base and .001 up are its
+/// updates.
+fn shortlisted(basename: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return false;
+    const ext = basename[dot + 1 ..];
+    for ([_][]const u8{ "pmtiles", "mbtiles", "kap", "bsb" }) |e| {
+        if (std.ascii.eqlIgnoreCase(ext, e)) return true;
+    }
+    if (ext.len != 3) return false;
+    for (ext) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// The three digit dataset number, or null when the extension is not one.
+fn datasetNumber(basename: []const u8) ?u16 {
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return null;
+    const ext = basename[dot + 1 ..];
+    if (ext.len != 3) return null;
+    return std.fmt.parseInt(u16, ext, 10) catch null;
+}
+
+fn dupeZ(a: std.mem.Allocator, s: []const u8) [:0]const u8 {
+    return a.dupeZ(u8, s) catch "";
+}
+
+/// Read one shortlisted file and say what it is.
+fn inventoryRow(a: std.mem.Allocator, io: std.Io, path: []const u8, basename: []const u8, bytes: u64) InventoryRow {
+    var row: InventoryRow = .{ .path = dupeZ(a, path), .bytes = bytes };
+
+    if (datasetNumber(basename)) |number| {
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(MAX_CELL_BYTES)) catch {
+            row.reason = dupeZ(a, "the file could not be read");
+            return row;
+        };
+        defer gpa.free(raw);
+        row.standard = if (s101.dataset.detect(raw)) .s101 else .s57;
+        // A dataset states its own name in DSID. No name means the file is
+        // not one, whatever its extension suggested.
+        const info = peekAnyInfo(a, raw, &.{}) orelse {
+            row.standard = .none;
+            row.reason = dupeZ(a, "not a chart dataset");
+            return row;
+        };
+        if (info.name.len == 0) {
+            row.standard = .none;
+            row.reason = dupeZ(a, "not a chart dataset");
+            return row;
+        }
+        row.kind = if (number == 0) .source else .update;
+        row.name = dupeZ(a, info.name);
+        row.edition = dupeZ(a, info.edition);
+        row.update = dupeZ(a, info.update);
+        row.issue_date = dupeZ(a, info.issue_date);
+        row.agency = info.agency;
+        row.scale = info.scale;
+        row.bounds = info.bounds;
+        return row;
+    }
+
+    const zpath = a.dupeZ(u8, path) catch {
+        row.reason = dupeZ(a, "out of memory");
+        return row;
+    };
+    if (std.ascii.eqlIgnoreCase(std.fs.path.extension(basename), ".pmtiles")) {
+        const c = openPmtilesPath(io, path) catch |e| {
+            row.reason = dupeZ(a, @errorName(e));
+            return row;
+        };
+        defer c.deinit();
+        // A baked archive has no dataset name inside it. The bake writes the
+        // chart name as the archive stem, so the stem here is this engine's
+        // own output naming.
+        const ext = std.fs.path.extension(basename);
+        row.name = dupeZ(a, basename[0 .. basename.len - ext.len]);
+        // Its tiles say whether it holds pictures. tile_type cannot: MLT is 2,
+        // and 2 is PNG in the PMTiles header.
+        row.kind = switch (c.tileType()) {
+            .png, .jpeg, .webp, .avif => .raster,
+            else => .baked,
+        };
+        row.scale = c.nativeScale();
+        row.bounds = c.bounds();
+        return row;
+    }
+
+    // .mbtiles, .kap and .bsb: the reader's own text names the cause when one
+    // will not open.
+    var msg: raster_pkg.ErrMsg = .{};
+    var rc = raster_pkg.RasterChart.open(io, gpa, zpath, &msg) catch |e| {
+        row.reason = dupeZ(a, if (msg.len > 0) msg.slice() else @errorName(e));
+        return row;
+    };
+    defer rc.close();
+    const ri = rc.getInfo();
+    row.kind = .raster;
+    row.scale = std.math.cast(i32, ri.scale) orelse 0;
+    if (ri.bounds_declared) row.bounds = .{ ri.west, ri.south, ri.east, ri.north };
+    return row;
+}
+
+/// Report the files under `path` that look like charts. One file, or a
+/// directory walked to the bottom. See tile57.h.
+pub fn inventoryOpen(io: std.Io, path: []const u8) !*Inventory {
+    const inv = try gpa.create(Inventory);
+    errdefer gpa.destroy(inv);
+    inv.* = .{ .arena = std.heap.ArenaAllocator.init(gpa), .rows = &.{} };
+    errdefer inv.arena.deinit();
+    const a = inv.arena.allocator();
+
+    var rows = std.ArrayList(InventoryRow).empty;
+
+    if (!isDirIo(io, path)) {
+        const base = std.fs.path.basename(path);
+        if (shortlisted(base)) {
+            try rows.append(a, inventoryRow(a, io, path, base, fileBytes(io, path)));
+        }
+        inv.rows = try rows.toOwnedSlice(a);
+        return inv;
+    }
+
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return error.NotFound;
+    defer dir.close(io);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!shortlisted(entry.basename)) continue;
+        const full = std.fs.path.join(a, &.{ path, entry.path }) catch continue;
+        try rows.append(a, inventoryRow(a, io, full, entry.basename, fileBytes(io, full)));
+    }
+    std.mem.sort(InventoryRow, rows.items, {}, struct {
+        fn lt(_: void, x: InventoryRow, y: InventoryRow) bool {
+            return std.mem.lessThan(u8, x.path, y.path);
+        }
+    }.lt);
+    inv.rows = try rows.toOwnedSlice(a);
+    return inv;
+}
+
+fn fileBytes(io: std.Io, path: []const u8) u64 {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return 0;
+    defer f.close(io);
+    const st = f.stat(io) catch return 0;
+    return st.size;
+}
+
+test "the shortlist opens what could be a chart and skips the rest" {
+    // The dataset numbering, both standards.
+    try std.testing.expect(shortlisted("US5MD1MC.000"));
+    try std.testing.expect(shortlisted("101AA00DS0001.000"));
+    try std.testing.expect(shortlisted("10100AA_X01SW.000"));
+    try std.testing.expect(shortlisted("US5MD1MC.001"));
+    // The stem is not part of the test. The shortlist accepts any stem and
+    // the file states what it is.
+    try std.testing.expect(shortlisted("CATALOG.031"));
+    try std.testing.expect(shortlisted("anything at all.000"));
+    // The other chart files.
+    try std.testing.expect(shortlisted("US5MD1MC.pmtiles"));
+    try std.testing.expect(shortlisted("ncds_08.mbtiles"));
+    try std.testing.expect(shortlisted("11013_1.KAP"));
+    // What a chart folder also holds. The S-164 sets carry 72 xml and 45 log
+    // files beside 26 datasets.
+    try std.testing.expect(!shortlisted("checks.log"));
+    try std.testing.expect(!shortlisted("10100AA_SCAMN.xml"));
+    try std.testing.expect(!shortlisted("ReadMe-V3.txt"));
+    try std.testing.expect(!shortlisted("FoldersV3.pdf"));
+    try std.testing.expect(!shortlisted("partition.tpart"));
+    try std.testing.expect(!shortlisted("noextension"));
+
+    try std.testing.expectEqual(@as(?u16, 0), datasetNumber("US5MD1MC.000"));
+    try std.testing.expectEqual(@as(?u16, 31), datasetNumber("CATALOG.031"));
+    try std.testing.expectEqual(@as(?u16, null), datasetNumber("US5MD1MC.pmtiles"));
+}
+
+test "a folder holding no chart file inventories to no rows" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "checks.log", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.xml", .data = "x" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const inv = try inventoryOpen(io, root);
+    defer inv.close();
+    try std.testing.expectEqual(@as(usize, 0), inv.rows.len);
+}
+
+test "a shortlisted file that is not a chart says so" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // The extension is the S-57 update numbering and the file is not a
+    // dataset. This is the case a name test was carrying.
+    try tmp.dir.writeFile(io, .{ .sub_path = "CATALOG.031", .data = "not a dataset" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const inv = try inventoryOpen(io, root);
+    defer inv.close();
+    try std.testing.expectEqual(@as(usize, 1), inv.rows.len);
+    try std.testing.expectEqual(FileKind.other, inv.rows[0].kind);
+    try std.testing.expectEqual(Standard.none, inv.rows[0].standard);
+    try std.testing.expect(inv.rows[0].reason.len > 0);
+}
+
+// The real cells, from the environment: T57_INV_DIR names a folder to look
+// through. Skipped when it is not set, so the gate runs everywhere and a
+// developer can point it at an exchange set.
+test "a real folder inventories to the charts in it" {
+    const dirz = std.c.getenv("T57_INV_DIR") orelse return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const inv = try inventoryOpen(io, std.mem.span(dirz));
+    defer inv.close();
+    try std.testing.expect(inv.rows.len > 0);
+    for (inv.rows) |r| {
+        try std.testing.expect(r.path.len > 0);
+        if (r.kind == .source or r.kind == .update) {
+            try std.testing.expect(r.standard != .none);
+            try std.testing.expect(r.name.len > 0);
+        }
+        if (r.kind != .other) try std.testing.expectEqualStrings("", r.reason);
+    }
 }
 
 test "scanLanguageArray reads the codes the bake spliced in" {

@@ -884,6 +884,10 @@ const CInfo = extern struct {
     tile_type: u8, // the archive's stored encoding (TILE57_TILE_TYPE_*)
     native_scale: i32, // embedded compilation scale (1:N); 0 = derive from zoom band
     is_raster: bool, // the archive stores pictures, not vector tiles
+    // Cells handed to the open that produced no chart. The open succeeds while
+    // one parses, so this is what tells a host the set has a gap. Appended for
+    // ABI-append-safety; a zeroed struct reads 0.
+    skipped_cells: u32,
 };
 
 // tile57_tile_type values (keep in sync with tile57.h).
@@ -909,6 +913,7 @@ export fn tile57_chart_get_info(src: ?*Chart, out: ?*CInfo) callconv(.c) void {
     // nothing above tells it apart from a vector chart. Its tiles are images.
     // tile_type cannot carry this: TILE57_TILE_TYPE_MLT is 2, and 2 is PNG in
     // the PMTiles header.
+    o.skipped_cells = s.skipped_cells;
     o.is_raster = switch (s.tileType()) {
         .png, .jpeg, .webp, .avif => true,
         else => false,
@@ -1661,6 +1666,10 @@ export fn tile57_compose_open(
         error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
         else => fail(err, e),
     }) orelse return failWith(err, .unsupported, "no chart carries per-cell coverage");
+    // What the open kept, subtracted from what it was handed. Counting the
+    // charts with no decoded coverage missed the ones openBorrowed drops later
+    // for an empty coverage ring, so charts + skipped came to less than n.
+    src.skipped = @intCast(n - src.readers.len);
     sidecar.refresh(io, src);
     o.* = src;
     return OK;
@@ -1759,6 +1768,7 @@ export fn tile57_compose_rasters(
         error.MixedChartKinds => failWith(err, .unsupported, mixed_kinds),
         else => fail(err, e),
     }) orelse return failWith(err, .unsupported, "no raster chart carries a compilation scale and coverage");
+    src.skipped = @intCast(n - src.readers.len);
     o.* = src;
     return OK;
 }
@@ -1990,6 +2000,12 @@ export fn tile57_compose_get_meta(handle: ?*compose.ComposeSource, out: ?*CCompo
         .east = src.bounds[2],
         .north = src.bounds[3],
     };
+}
+
+/// Charts handed to the open that embed no usable coverage. See tile57.h.
+export fn tile57_compose_skipped(handle: ?*compose.ComposeSource) callconv(.c) u32 {
+    const src = handle orelse return 0;
+    return src.skipped;
 }
 
 /// The deepest zoom the chart covering (lon,lat) can serve — the host caps its
@@ -2638,4 +2654,85 @@ export fn tile57_free(ptr: ?*anyopaque) callconv(.c) void {
     const base: [*]align(16) u8 = @alignCast(@as([*]u8, @ptrCast(p)) - EXPORT_HDR);
     const total = std.mem.readInt(usize, base[0..@sizeOf(usize)], .little);
     gpa.free(base[0..total]);
+}
+
+// ---- the inventory ----------------------------------------------------------
+
+const CInventoryRow = extern struct {
+    path: [*:0]const u8,
+    bytes: u64,
+    kind: u8,
+    standard: u8,
+    name: [*:0]const u8,
+    edition: [*:0]const u8,
+    update: [*:0]const u8,
+    issue_date: [*:0]const u8,
+    agency: u16,
+    scale: i32,
+    has_bounds: bool,
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+    reason: [*:0]const u8,
+};
+
+/// What one path holds: the rows, and the arena their strings live in.
+const Inventory = struct {
+    inv: *chart.Inventory,
+    rows: []CInventoryRow,
+};
+
+/// Look through a path and report the files under it that look like charts.
+/// See tile57.h.
+export fn tile57_inventory_open(path: ?[*:0]const u8, out: ?*?*Inventory, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = null;
+    const p = spanOpt(path) orelse return failWith(err, .badarg, "path must not be null");
+    const inv = chart.inventoryOpen(sharedIo(), p) catch |e| return failCtx(err, e, p);
+    errdefer inv.close();
+    const rows = gpa.alloc(CInventoryRow, inv.rows.len) catch |e| return fail(err, e);
+    errdefer gpa.free(rows);
+    for (inv.rows, rows) |src, *dst| {
+        dst.* = .{
+            .path = src.path.ptr,
+            .bytes = src.bytes,
+            .kind = @intFromEnum(src.kind),
+            .standard = @intFromEnum(src.standard),
+            .name = src.name.ptr,
+            .edition = src.edition.ptr,
+            .update = src.update.ptr,
+            .issue_date = src.issue_date.ptr,
+            .agency = src.agency,
+            .scale = src.scale,
+            .has_bounds = src.bounds != null,
+            .west = if (src.bounds) |b| b[0] else 0,
+            .south = if (src.bounds) |b| b[1] else 0,
+            .east = if (src.bounds) |b| b[2] else 0,
+            .north = if (src.bounds) |b| b[3] else 0,
+            .reason = src.reason.ptr,
+        };
+    }
+    const handle = gpa.create(Inventory) catch |e| return fail(err, e);
+    handle.* = .{ .inv = inv, .rows = rows };
+    o.* = handle;
+    return OK;
+}
+
+export fn tile57_inventory_close(handle: ?*Inventory) callconv(.c) void {
+    const h = handle orelse return;
+    gpa.free(h.rows);
+    h.inv.close();
+    gpa.destroy(h);
+}
+
+/// The rows, in path order. Borrowed until close. See tile57.h.
+export fn tile57_inventory_rows(handle: ?*Inventory, out_n: ?*usize) callconv(.c) ?[*]const CInventoryRow {
+    const h = handle orelse {
+        if (out_n) |n| n.* = 0;
+        return null;
+    };
+    if (out_n) |n| n.* = h.rows.len;
+    if (h.rows.len == 0) return null;
+    return h.rows.ptr;
 }

@@ -83,6 +83,11 @@ tile57_status tile57_compose_gpu_scene(tile57_compose *c, double lon, double lat
 /* Fill *out with the compositor's zoom range + union coverage bounds. */
 void tile57_compose_get_meta(tile57_compose *c, tile57_compose_meta *out);
 
+/* Charts handed to the open that embed no usable coverage: they own no ground
+ * and are absent from every composed tile, so a host reads this to tell a
+ * complete quilt from one with holes in it. 0 for a NULL handle. */
+uint32_t tile57_compose_skipped(tile57_compose *c);
+
 /* Serialize the ownership partition to `path` (a sidecar a later
  * tile57_compose_open loads to skip the build). */
 tile57_status tile57_compose_save_partition(tile57_compose *c, const char *path,
