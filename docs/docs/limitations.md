@@ -109,10 +109,6 @@ result is **best effort**:
   so a label mixing scripts still draws its fallback glyphs from the bundled
   face there. A host that supplies its own face through the surface callbacks is
   unaffected.
-- **A chart states more than four languages.** The bake runs a portrayal pass
-  per language and stores a text property per language, so it keeps the first
-  four it finds and drops the rest.
-
 - **Overscale hatch occlusion is tile-path only.** The S-52 §10.1.10 overscale
   indication (`OVERSC01`, see [architecture](./architecture.md)) is gated
   correctly everywhere, but only the generated MapLibre style sandwiches the

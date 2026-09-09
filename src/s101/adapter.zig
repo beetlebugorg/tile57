@@ -782,12 +782,6 @@ fn buildSurveyDateRange(a: std.mem.Allocator, children: *std.ArrayList(ChildEntr
 /// they first appear. An S-57 cell yields at most `und`, because the adapter
 /// tags NOBJNM that way and S-57 records no language for it. A native S-101
 /// dataset yields its real ISO 639-2 codes.
-///
-/// Capped, because each one costs a portrayal pass at bake time and a text
-/// property per label in the tile. A chart naming its features in more
-/// languages than this keeps the first few.
-pub const max_languages = 4;
-
 pub fn languages(a: std.mem.Allocator, adapted: []const Adapted) ![]const []const u8 {
     var out = std.ArrayList([]const u8).empty;
     for (adapted) |ad| {
@@ -802,7 +796,6 @@ pub fn languages(a: std.mem.Allocator, adapted: []const Adapted) ![]const []cons
             }
             if (seen) continue;
             try out.append(a, lang);
-            if (out.items.len == max_languages) return out.items;
         }
     }
     return out.items;
