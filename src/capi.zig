@@ -2209,6 +2209,41 @@ export fn tile57_bake_glyph_sdf_face(out: ?*CAssets, face: i32, err: ?*CError) c
     return bakeGlyphSdf(out, face, err);
 }
 
+/// An SDF sheet for named codepoints, out of a font the HOST supplies. See
+/// tile57.h.
+export fn tile57_bake_glyph_sdf_codepoints(
+    out: ?*CAssets,
+    font_bytes: ?[*]const u8,
+    font_len: usize,
+    codepoints: ?[*]const u32,
+    count: usize,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = .{};
+    const fb = font_bytes orelse return failWith(err, .badarg, "font_bytes must not be null");
+    if (font_len == 0) return failWith(err, .badarg, "font_len must not be zero");
+    const cps_c = codepoints orelse return failWith(err, .badarg, "codepoints must not be null");
+    if (count == 0) return failWith(err, .badarg, "count must not be zero");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cps = a.alloc(u21, count) catch |e| return fail(err, e);
+    for (cps_c[0..count], cps) |src, *dst| {
+        if (src > 0x10FFFF) return failWith(err, .badarg, "codepoint above the Unicode range");
+        dst.* = @intCast(src);
+    }
+    var atlas = glyph_sdf.build(a, fb[0..font_len], cps, 32.0, 6) catch |e| return fail(err, e);
+    // Every codepoint came back with neither ink nor an advance. Either the
+    // face draws none of them, or its outlines are in a format the rasterizer
+    // cannot read. Say so: a host that took an empty sheet as success would
+    // record the characters as served and never ask for them again.
+    if (atlas.glyphs.count() == 0)
+        return failWith(err, .unsupported, "the face draws none of those codepoints");
+    return finishGlyphSdf(o, a, &atlas, err);
+}
+
 fn bakeGlyphSdf(out: ?*CAssets, face: i32, err: ?*CError) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = .{};
@@ -2223,9 +2258,16 @@ fn bakeGlyphSdf(out: ?*CAssets, face: i32, err: ?*CError) c_int {
     };
     const cps = glyph_sdf.defaultCodepoints(a) catch |e| return fail(err, e);
     var atlas = glyph_sdf.build(a, font, cps, 32.0, 6) catch |e| return fail(err, e);
+    return finishGlyphSdf(o, a, &atlas, err);
+}
+
+/// Encode a built atlas into *out. `a` is the arena the atlas lives in; the two
+/// buffers that leave are duped into gpa, which is what tile57_assets_free
+/// releases.
+fn finishGlyphSdf(o: *CAssets, a: std.mem.Allocator, atlas: *glyph_sdf.Atlas, err: ?*CError) c_int {
     const png = (atlas.encodePng(a) catch |e| return fail(err, e)) orelse
         return failWith(err, .internal, "glyph atlas PNG encode produced nothing");
-    const json = glyphMetricsJson(a, &atlas) catch |e| return fail(err, e);
+    const json = glyphMetricsJson(a, atlas) catch |e| return fail(err, e);
     o.sprite_png = (gpa.dupe(u8, png) catch |e| {
         tile57_assets_free(o);
         return fail(err, e);

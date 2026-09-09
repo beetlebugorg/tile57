@@ -1750,6 +1750,25 @@ tile57_status tile57_bake_glyph_sdf(tile57_assets *out, tile57_error *err);
  * place names and italic hydrography from the SDF text path. Free with
  * tile57_assets_free. */
 tile57_status tile57_bake_glyph_sdf_face(tile57_assets *out, int32_t face, tile57_error *err);
+/* tile57_bake_glyph_sdf for named codepoints, out of a font the HOST supplies:
+ * `font_bytes` is a TrueType file or a collection, of which the first face is
+ * read, and `codepoints` names the characters to rasterize.
+ *
+ * The bundled Noto Sans covers Latin, Greek and Cyrillic, and the prebaked
+ * sheets carry printable ASCII and Latin-1. A chart naming its features in
+ * another script needs glyphs no prebaked sheet can hold — CJK alone is some
+ * 20,000 — so a host bakes the characters its labels actually use, from
+ * whatever face its platform has for the script, and merges the sheet into the
+ * atlas it already has.
+ *
+ * Same output as tile57_bake_glyph_sdf: only sprite_* filled, at the same em
+ * size and spread, so the two sheets share one atlas. A codepoint the face has
+ * no glyph for is left out rather than failing the bake. Free with
+ * tile57_assets_free. */
+tile57_status tile57_bake_glyph_sdf_codepoints(tile57_assets *out,
+                                               const uint8_t *font_bytes, size_t font_len,
+                                               const uint32_t *codepoints, size_t count,
+                                               tile57_error *err);
 void tile57_assets_free(tile57_assets *out);
 
 /* ---- chart-style generation ---------------------------------------------
