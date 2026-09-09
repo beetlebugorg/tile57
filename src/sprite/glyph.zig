@@ -9,6 +9,14 @@ const Allocator = std.mem.Allocator;
 // C glue (src/sprite/svgraster.c): stb_truetype SDF + the shared PNG encoder.
 extern fn tg_glyph_sdf(font: [*]const u8, font_len: c_int, cp: c_int, em_px: f32, pad: c_int, onedge: c_int, dist_scale: f32, w: *c_int, h: *c_int, xoff: *c_int, yoff: *c_int, advance: *f32) callconv(.c) ?[*]u8;
 extern fn tg_glyph_free(p: ?[*]u8) callconv(.c) void;
+extern fn tg_glyph_present(font: [*]const u8, font_len: c_int, cp: c_int) callconv(.c) c_int;
+
+/// True when `font` has a glyph of its own for `cp`. A codepoint the face does
+/// not map resolves to .notdef, which has an advance and usually a box, so the
+/// metrics a rasterizer returns cannot answer this on their own.
+pub fn present(font: []const u8, cp: u21) bool {
+    return tg_glyph_present(font.ptr, @intCast(font.len), @intCast(cp)) != 0;
+}
 extern fn tg_png_encode(rgba: [*]const u8, w: c_int, h: c_int, out_len: *c_int) callconv(.c) ?[*]u8;
 extern fn tg_svg_free(p: ?*anyopaque) callconv(.c) void;
 
@@ -90,6 +98,16 @@ pub fn build(a: Allocator, font: []const u8, cps: []const u21, em_px: f32, pad: 
             .h = @as(f32, @floatFromInt(h)) / em_px,
             .advance = adv / em_px,
         };
+        // A codepoint the face does not map resolves to .notdef, whose box
+        // would be baked as if it were the character. And a face whose
+        // outlines the rasterizer cannot read at all (Apple's variable UI
+        // faces carry `cidg` rather than glyf or CFF) yields neither ink nor
+        // an advance, which a host would pack into its atlas and lay out as
+        // nothing — a blank label that says the glyph arrived. Skip both: an
+        // absent codepoint is what "this face cannot draw it" means. A space
+        // has a glyph of its own and advances, so it survives.
+        if (!present(font, cp)) continue;
+        if (sdf == null and adv <= 0) continue;
         try cells.append(a, .{ .cp = cp, .w = @intCast(@max(w, 0)), .h = @intCast(@max(h, 0)), .sdf = sdf, .gi = gi });
     }
 
