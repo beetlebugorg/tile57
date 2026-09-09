@@ -1769,6 +1769,22 @@ tile57_status tile57_bake_glyph_sdf_codepoints(tile57_assets *out,
                                                const uint8_t *font_bytes, size_t font_len,
                                                const uint32_t *codepoints, size_t count,
                                                tile57_error *err);
+/* True when `font_bytes` can draw `codepoint`: the face has a glyph for it AND
+ * the rasterizer can read that glyph's outlines.
+ *
+ * A host picking a face out of its platform's font store has to ask, because
+ * the two are not the same question. Apple's UI faces cover CJK and are what
+ * CoreText hands back for Chinese text, but they carry Apple's `cidg` outlines
+ * rather than glyf or CFF, and no glyph comes out of them. A host that
+ * installed one would draw blank labels with nothing to say why. Ask with one
+ * character of the script, then install the first face that answers true. */
+tile57_status tile57_font_covers(const uint8_t *font_bytes, size_t font_len,
+                                 uint32_t codepoint, bool *out, tile57_error *err);
+/* The same question about the BUNDLED label face, so a host can tell which
+ * scripts it needs a platform font for and which are already drawn. A chart
+ * stating four languages may need a face for one of them: asking first stops a
+ * host from mapping a font for Finnish and leaving Inuktitut blank. */
+tile57_status tile57_label_font_covers(uint32_t codepoint, bool *out, tile57_error *err);
 void tile57_assets_free(tile57_assets *out);
 
 /* ---- chart-style generation ---------------------------------------------

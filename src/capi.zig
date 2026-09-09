@@ -2244,6 +2244,41 @@ export fn tile57_bake_glyph_sdf_codepoints(
     return finishGlyphSdf(o, a, &atlas, err);
 }
 
+/// True when the BUNDLED label face can draw `codepoint`. See tile57.h.
+export fn tile57_label_font_covers(codepoint: u32, out: ?*bool, err: ?*CError) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = false;
+    if (codepoint > 0x10FFFF) return failWith(err, .badarg, "codepoint above the Unicode range");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const one = [_]u21{@intCast(codepoint)};
+    const ft = @import("render").font;
+    var atlas = glyph_sdf.build(arena.allocator(), ft.notosans, &one, 32.0, 6) catch |e| return fail(err, e);
+    o.* = atlas.glyphs.count() > 0;
+    return OK;
+}
+
+/// True when `font_bytes` can draw `codepoint`. See tile57.h.
+export fn tile57_font_covers(
+    font_bytes: ?[*]const u8,
+    font_len: usize,
+    codepoint: u32,
+    out: ?*bool,
+    err: ?*CError,
+) callconv(.c) c_int {
+    const o = out orelse return failWith(err, .badarg, "out must not be null");
+    o.* = false;
+    const fb = font_bytes orelse return failWith(err, .badarg, "font_bytes must not be null");
+    if (font_len == 0) return failWith(err, .badarg, "font_len must not be zero");
+    if (codepoint > 0x10FFFF) return failWith(err, .badarg, "codepoint above the Unicode range");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const one = [_]u21{@intCast(codepoint)};
+    var atlas = glyph_sdf.build(arena.allocator(), fb[0..font_len], &one, 32.0, 6) catch |e| return fail(err, e);
+    o.* = atlas.glyphs.count() > 0;
+    return OK;
+}
+
 fn bakeGlyphSdf(out: ?*CAssets, face: i32, err: ?*CError) c_int {
     const o = out orelse return failWith(err, .badarg, "out must not be null");
     o.* = .{};
