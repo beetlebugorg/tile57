@@ -46,6 +46,16 @@ void tile57_chart_get_info(tile57_chart *chart, tile57_info *out);
 tile57_status tile57_chart_scamin(tile57_chart *chart, int32_t **out, size_t *out_len,
                             tile57_error *err);
 
+/* The label languages the chart states besides English, as ISO 639-2 codes
+ * (ascending); NULL/0 when none. A host offers the mariner these: a
+ * preferred_language outside the set draws the portrayed name, except on an
+ * S-57 chart, whose one national name is coded "und" and answers any language.
+ * One allocation holds the pointer array and the codes; free *out with
+ * tile57_free. The compositor borrows its charts, so a host reading a quilt
+ * unions the sets from the charts it opened, the way it does for SCAMIN. */
+tile57_status tile57_chart_languages(tile57_chart *chart, const char *const **out,
+                            size_t *out_len, tile57_error *err);
+
 /* The chart's M_COVR data-coverage polygons, from the coverage the bake embedded:
  * ring() is called once per polygon with its exterior ring as npts interleaved
  * lon,lat doubles (valid only during the call). OK with no calls when the archive
