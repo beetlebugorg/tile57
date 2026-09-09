@@ -39,6 +39,17 @@ const zipsrc = @import("zipsrc"); // charts read straight out of a .zip
 const auxfiles = @import("auxfiles"); // the text and pictures a cell points at
 const raster_pkg = @import("raster"); // picture charts, for the inventory probe
 
+// lua_shim.c is compiled into every binary that links the portray module, and
+// it references 30 symbols exported from portray.zig, s101/catalogue.zig and
+// portray/rules_embed.zig. Zig emits an export only after analyzing the
+// declaration, and the tests in this file reach none of the three, so without
+// these references a test binary links lua_shim.o against 30 undefined
+// symbols. rules_embed follows from portray.
+comptime {
+    _ = portray;
+    _ = catalogue;
+}
+
 // c_allocator, not smp_allocator: smp's per-CPU slab freelists never return
 // pages to the OS, so a long-lived host process's footprint ratchets up to the
 // worst transient peak (compose bursts) and never recovers. libc malloc frees
