@@ -47,6 +47,19 @@ unsigned char *tg_glyph_sdf(const unsigned char *font, int font_len, int cp,
 }
 void tg_glyph_free(unsigned char *p) { stbtt_FreeSDF(p, NULL); }
 
+// Whether the face has a glyph of its own for `cp`. stbtt_FindGlyphIndex
+// answers 0 for a codepoint the cmap does not map, which is .notdef — a real
+// glyph with a real advance and, in most faces, a visible box. Metrics alone
+// therefore cannot tell a character the face draws from one it does not, and a
+// caller that trusted them would bake a row of tofu and record it as the text.
+// 1 when the face has the glyph, 0 when it does not or cannot be read.
+int tg_glyph_present(const unsigned char *font, int font_len, int cp) {
+    (void)font_len;
+    stbtt_fontinfo f;
+    if (!stbtt_InitFont(&f, font, stbtt_GetFontOffsetForIndex(font, 0))) return 0;
+    return stbtt_FindGlyphIndex(&f, cp) != 0;
+}
+
 // Rasterize a flattened SVG (viewBox normalized to "0 0 W H") at `scale` device
 // px per user unit. Forces even-odd winding on every shape — the S-101 danger
 // glyphs are compound paths whose inner subpath is a hole, and nonzero winding
