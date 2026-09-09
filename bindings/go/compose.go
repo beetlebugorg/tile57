@@ -173,6 +173,18 @@ func (c *ComposeSource) Meta() ComposeMeta {
 	}
 }
 
+// Skipped returns the charts handed to the open that embed no usable coverage.
+// They own no ground and are absent from every composed tile, so this is what
+// tells a complete quilt from one with holes in it.
+func (c *ComposeSource) Skipped() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ptr == nil {
+		return 0
+	}
+	return uint32(C.tile57_compose_skipped(c.ptr))
+}
+
 
 // Close releases the compositor, then any charts [OpenCompose] opened for it.
 // Borrowed charts (from [OpenComposeCharts]) stay open. Idempotent.

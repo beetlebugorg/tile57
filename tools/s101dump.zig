@@ -7,8 +7,11 @@ const std = @import("std");
 const engine = @import("engine");
 const s101 = engine.s101;
 
-/// The sequential `.001`, `.002`, … update files beside a `<stem>.000` base, read in
-/// order until the first gap. Returns an empty slice for a non-.000 path.
+/// The numbered update files beside a `<stem>.000` base, ascending. A gap does
+/// not end the walk, because a re-issued base is delivered with only the
+/// updates that follow it. This gathers the files present and leaves the
+/// selection to the parse, as the engine's reader does. Empty for a non-.000
+/// path.
 fn readUpdates(io: std.Io, a: std.mem.Allocator, base_path: []const u8) []const []const u8 {
     if (!std.mem.endsWith(u8, base_path, ".000")) return &.{};
     const stem = base_path[0 .. base_path.len - 3];
@@ -16,7 +19,7 @@ fn readUpdates(io: std.Io, a: std.mem.Allocator, base_path: []const u8) []const 
     var n: u32 = 1;
     while (n < 1000) : (n += 1) {
         const p = std.fmt.allocPrint(a, "{s}{d:0>3}", .{ stem, n }) catch break;
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, a, .unlimited) catch break;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, p, a, .unlimited) catch continue;
         list.append(a, bytes) catch break;
     }
     return list.items;

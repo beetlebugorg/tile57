@@ -34,6 +34,8 @@ pub const Error = error{
     BadLocalHeader,
     UnsupportedCompressionMethod,
     EntryTooLarge,
+    /// The entry's bytes do not match the CRC32 the archive holds for it.
+    ChecksumMismatch,
 };
 
 pub const Entry = struct {
@@ -43,6 +45,25 @@ pub const Entry = struct {
     compressed_size: u64,
     raw: zip.Iterator.Entry,
 };
+
+/// True when an archive entry name is usable as a relative path under a
+/// caller-chosen directory. Entry names come from the archive, and a chart
+/// archive arrives by download, share, or SD card. A consumer that builds an
+/// output path from an entry name writes where the archive says.
+/// `chart.bakeZip` builds one. Rejecting the name here gives every consumer
+/// the same guarantee.
+///
+/// Rejects absolute names, Windows drive letters, and any `..` component.
+/// Both separators count, because some producers store backslashes and
+/// `s57.decodeCATD` folds them.
+pub fn isSafeEntryName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '/' or name[0] == '\\') return false;
+    if (name.len >= 2 and name[1] == ':') return false; // "C:..."
+    var it = std.mem.splitAny(u8, name, "/\\");
+    while (it.next()) |seg| if (std.mem.eql(u8, seg, "..")) return false;
+    return true;
+}
 
 /// A zip opened for reading charts. Read-only once opened, so any number of
 /// threads may `readAlloc`/`extractTo` from one `Archive` at the same time.
@@ -57,10 +78,15 @@ pub const Archive = struct {
     /// Directory prefix (no trailing '/') -> the entries directly in it. Built
     /// once, because the alternative is rescanning 27,680 names per cell.
     by_dir: std.StringHashMapUnmanaged([]usize),
+    /// Entries `open` dropped because their name was unusable: unsafe as a
+    /// relative path (`isSafeEntryName`), or longer than the name buffer.
+    rejected: usize,
 
     /// Walk the central directory. Directory entries (trailing '/') are left
-    /// out — they are never charts. Encrypted and multi-disk archives are
-    /// rejected here, by `zip.Iterator`, rather than at the first read.
+    /// out, because they are never charts. Entries whose name is unusable as a
+    /// relative path are left out too and counted in `rejected`. See
+    /// `isSafeEntryName`. Encrypted and multi-disk archives are rejected here,
+    /// by `zip.Iterator`, rather than at the first read.
     pub fn open(gpa: Allocator, io: std.Io, path: []const u8) !Archive {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -77,12 +103,20 @@ pub const Archive = struct {
         try entries.ensureTotalCapacity(gpa, @intCast(@min(it.cd_record_count, 1 << 20)));
 
         var name_buf: [4096]u8 = undefined;
+        var rejected: usize = 0;
         while (try it.next()) |e| {
-            if (e.filename_len == 0 or e.filename_len > name_buf.len) continue;
+            if (e.filename_len == 0 or e.filename_len > name_buf.len) {
+                rejected += 1;
+                continue;
+            }
             const name = name_buf[0..e.filename_len];
             try fr.seekTo(e.header_zip_offset + @sizeOf(zip.CentralDirectoryFileHeader));
             try fr.interface.readSliceAll(name);
             if (name[name.len - 1] == '/') continue; // a directory, not a chart
+            if (!isSafeEntryName(name)) {
+                rejected += 1;
+                continue;
+            }
             try entries.append(gpa, .{
                 .name = try a.dupe(u8, name),
                 .uncompressed_size = e.uncompressed_size,
@@ -131,6 +165,7 @@ pub const Archive = struct {
             .entries = owned,
             .by_name = by_name,
             .by_dir = by_dir,
+            .rejected = rejected,
         };
     }
 
@@ -158,6 +193,12 @@ pub const Archive = struct {
         var w: std.Io.Writer = .fixed(buf);
         try self.streamEntry(io, i, &w);
         if (w.end != buf.len) return error.EndOfStream;
+        // Every zip entry has a CRC32 of its uncompressed bytes. Raw deflate
+        // has no checksum of its own, so a flipped bit inside a literal run
+        // inflates to bytes that parse. On a chart that moves a boundary vertex
+        // and draws a chart nobody published.
+        const want = e.raw.crc32;
+        if (want != 0 and std.hash.Crc32.hash(buf) != want) return Error.ChecksumMismatch;
         return buf;
     }
 
@@ -175,10 +216,13 @@ pub const Archive = struct {
         try fw.interface.flush();
     }
 
-    /// The `.001..` update chain belonging to the `.000` cell at `i`, in order,
-    /// stopping at the first gap — the same rule the on-disk reader applies to
-    /// a cell's directory, applied to the archive's names instead. Empty when
-    /// `i` is not a base cell. Caller frees.
+    /// The numbered update files belonging to the `.000` cell at `i`, ascending:
+    /// the same set the on-disk reader gathers from a cell's directory, read
+    /// from the archive's names instead. A gap does not end the walk. A
+    /// re-issued base includes its earlier updates and is delivered with only
+    /// the ones that follow, so a chain may start above `.001`, and the update
+    /// gate selects which of these apply. Empty when `i` is not a base cell.
+    /// Caller frees.
     pub fn updatesFor(self: *const Archive, gpa: Allocator, i: usize) ![]usize {
         var out: std.ArrayList(usize) = .empty;
         errdefer out.deinit(gpa);
@@ -191,7 +235,7 @@ pub const Archive = struct {
         var u: u32 = 1;
         while (u <= 999) : (u += 1) {
             const up = std.fmt.bufPrint(&buf, "{s}.{d:0>3}", .{ stem, u }) catch break;
-            const idx = self.find(up) orelse break;
+            const idx = self.find(up) orelse continue;
             try out.append(gpa, idx);
         }
         return out.toOwnedSlice(gpa);
@@ -440,7 +484,7 @@ test "an entry that claims more than the cap is refused before allocating" {
     try testing.expectError(Error.EntryTooLarge, arc.readAlloc(gpa, io, 0, 4));
 }
 
-test "the update chain follows the cell and stops at the first gap" {
+test "the update chain follows the cell across a gap" {
     const gpa = testing.allocator;
     const io = testIo();
     var tmp = std.testing.tmpDir(.{});
@@ -450,9 +494,10 @@ test "the update chain follows the cell and stops at the first gap" {
     const zpath = try std.fs.path.join(gpa, &.{ dir, "t.zip" });
     defer gpa.free(zpath);
 
-    // .003 is missing, so .004 is not part of the chain even though it is in
-    // the archive. A cell in another directory with the same stem must not be
-    // mistaken for an update of this one.
+    // .003 is missing. The archive still passes .004 to the parse, which has
+    // the edition and the number the base stands at and can separate a
+    // re-issue's skipped range from a real gap. A cell in another directory
+    // with the same stem must not be mistaken for an update of this one.
     try writeTestZip(gpa, io, zpath, &.{
         .{ .name = "ENC_ROOT/US5MD12M/US5MD12M.000", .data = "base", .deflate = false },
         .{ .name = "ENC_ROOT/US5MD12M/US5MD12M.001", .data = "u1", .deflate = false },
@@ -468,9 +513,10 @@ test "the update chain follows the cell and stops at the first gap" {
     const base = arc.find("ENC_ROOT/US5MD12M/US5MD12M.000").?;
     const ups = try arc.updatesFor(gpa, base);
     defer gpa.free(ups);
-    try testing.expectEqual(@as(usize, 2), ups.len);
+    try testing.expectEqual(@as(usize, 3), ups.len);
     try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.001", arc.entries[ups[0]].name);
     try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.002", arc.entries[ups[1]].name);
+    try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.004", arc.entries[ups[2]].name);
 
     // A .TXT is not a base cell, so it has no chain.
     const txt = arc.find("ENC_ROOT/US5MD12M/US5MD12M.TXT").?;
@@ -526,7 +572,7 @@ test "extractTo writes the entry under the caller's name" {
 
     const body = "tiles and more tiles " ** 500;
     try writeTestZip(gpa, io, zpath, &.{
-        .{ .name = "../evil/USA.mbtiles", .data = body, .deflate = true },
+        .{ .name = "rasters/USA.mbtiles", .data = body, .deflate = true },
     });
     var arc = try Archive.open(gpa, io, zpath);
     defer arc.deinit();
@@ -539,6 +585,44 @@ test "extractTo writes the entry under the caller's name" {
     const got = try std.Io.Dir.cwd().readFileAlloc(io, out, gpa, .unlimited);
     defer gpa.free(got);
     try testing.expectEqualStrings(body, got);
+}
+
+test "an entry whose name escapes its directory never reaches a consumer" {
+    // bakeZip builds an output path from the entry name. Refusing the name at
+    // open keeps it away from that path.
+    try testing.expect(!isSafeEntryName("ENC_ROOT/../../../evil/US4MD11M.000"));
+    try testing.expect(!isSafeEntryName("../evil/USA.mbtiles"));
+    try testing.expect(!isSafeEntryName("/etc/passwd"));
+    try testing.expect(!isSafeEntryName("C:\\Windows\\x.000"));
+    try testing.expect(!isSafeEntryName("ENC_ROOT\\..\\..\\evil.000")); // folded separator
+    try testing.expect(!isSafeEntryName(".."));
+    try testing.expect(!isSafeEntryName(""));
+    // A `..` component is the only thing rejected. Dots elsewhere are fine.
+    try testing.expect(isSafeEntryName("ENC_ROOT/US5MD12M/US5MD12M.000"));
+    try testing.expect(isSafeEntryName("ENC_ROOT/..a/x.000"));
+    try testing.expect(isSafeEntryName("a...b/x.000"));
+
+    const gpa = testing.allocator;
+    const io = testIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(gpa, &tmp);
+    defer gpa.free(dir);
+    const zpath = try std.fs.path.join(gpa, &.{ dir, "t.zip" });
+    defer gpa.free(zpath);
+
+    try writeTestZip(gpa, io, zpath, &.{
+        .{ .name = "ENC_ROOT/US5MD12M/US5MD12M.000", .data = "good", .deflate = false },
+        .{ .name = "ENC_ROOT/../../../../evil/US4MD11M.000", .data = "bad", .deflate = false },
+    });
+    var arc = try Archive.open(gpa, io, zpath);
+    defer arc.deinit();
+
+    // The legitimate cell still resolves; the escaping one is gone and counted.
+    try testing.expectEqual(@as(usize, 1), arc.entries.len);
+    try testing.expectEqualStrings("ENC_ROOT/US5MD12M/US5MD12M.000", arc.entries[0].name);
+    try testing.expectEqual(@as(usize, 1), arc.rejected);
+    try testing.expect(arc.find("ENC_ROOT/../../../../evil/US4MD11M.000") == null);
 }
 
 test "the listing is JSON and NUL-terminated" {
@@ -575,4 +659,39 @@ test "a file that is not a zip is refused at open" {
     defer gpa.free(zpath);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpath, .data = "0001 this is an S-57 cell, not an archive" });
     try testing.expectError(error.ZipNoEndRecord, Archive.open(gpa, io, zpath));
+}
+
+test "a corrupted entry body is refused" {
+    const gpa = testing.allocator;
+    const io = testIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(gpa, &tmp);
+    defer gpa.free(dir);
+    const zpath = try std.fs.path.join(gpa, &.{ dir, "t.zip" });
+    defer gpa.free(zpath);
+
+    // Stored, so a flipped byte in the file is a flipped byte in the entry.
+    // Deflate has no checksum of its own, so the entry CRC32 covers it.
+    const body = "US5MD12M cell bytes " ** 40;
+    try writeTestZip(gpa, io, zpath, &.{.{ .name = "ENC_ROOT/US5MD12M/US5MD12M.000", .data = body, .deflate = false }});
+
+    {
+        var arc = try Archive.open(gpa, io, zpath);
+        defer arc.deinit();
+        const got = try arc.readAlloc(gpa, io, 0, 1 << 20);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(body, got);
+    }
+
+    // Flip one byte inside the stored body and read again.
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, zpath, gpa, .unlimited);
+    defer gpa.free(raw);
+    const at = std.mem.indexOf(u8, raw, "cell bytes").? + 2;
+    raw[at] ^= 0x20;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = zpath, .data = raw });
+
+    var arc2 = try Archive.open(gpa, io, zpath);
+    defer arc2.deinit();
+    try testing.expectError(Error.ChecksumMismatch, arc2.readAlloc(gpa, io, 0, 1 << 20));
 }

@@ -137,10 +137,10 @@ pub fn seabedToken(d: rs.DepthRange, m: *const Settings) []const u8 {
 /// the effective category is the feature's `cat` (0 base / 1 standard /
 /// 2 other; null defaults to standard, like the style's coalesce), except
 /// ISODGR01 which rides the isolated-dangers-shallow toggle instead of its
-/// baked category. M_QUAL is the data-quality overlay: shown iff the overlay
-/// is on (then regardless of category), hidden otherwise.
+/// baked category. The data-quality overlay is shown iff the overlay is on
+/// (then regardless of category), hidden otherwise.
 pub fn categoryVisible(cat: ?i64, class: []const u8, symbol_name: ?[]const u8, m: *const Settings) bool {
-    if (std.mem.eql(u8, class, "M_QUAL")) return m.data_quality;
+    if (mariner.isDataQuality(class)) return m.data_quality;
     // Meta-object boundaries (mirrors mariner.commonChartFilters): hidden unless
     // the meta-bounds inspection view is on; when on, category still applies.
     if (!m.show_meta_bounds) {
@@ -332,6 +332,10 @@ test "categoryVisible mirrors mariner.categoryFilter" {
     try std.testing.expect(!categoryVisible(0, "M_QUAL", null, &def));
     const dq = Settings{ .data_quality = true };
     try std.testing.expect(categoryVisible(2, "M_QUAL", null, &dq)); // shown regardless of cat
+    // The same feature under S-101, which names it QualityOfBathymetricData.
+    try std.testing.expect(!categoryVisible(0, "QualityOfBathymetricData", null, &def));
+    try std.testing.expect(!categoryVisible(2, "QualityOfBathymetricData", null, &def));
+    try std.testing.expect(categoryVisible(2, "QualityOfBathymetricData", null, &dq));
     // ISODGR01 rides its own toggle: off -> cat 0 (base on -> visible);
     // base ALSO off -> hidden; toggle on -> cat 1 (standard).
     try std.testing.expect(categoryVisible(2, "UWTROC", "ISODGR01", &def));

@@ -193,7 +193,10 @@ fn parseRecord(a: Allocator, bytes: []const u8, offset: usize) !struct { rec: Re
     if (leader.field_area_start < 24 or offset + leader.field_area_start > bytes.len) return error.BadRecordLength;
     const entries = try parseDirectory(a, leader, bytes[offset .. offset + leader.field_area_start]);
     if (leader.record_length == 0) leader.record_length = leader.field_area_start + fieldAreaSizeFromDirectory(entries);
-    if (leader.record_length < 24 or offset + leader.record_length > bytes.len) return error.BadRecordLength;
+    // A stored length shorter than the directory makes the field-area slice
+    // below start past the end of the record. `validateRecord` already rejects
+    // this. field_area_start >= 24 is established above.
+    if (leader.record_length < leader.field_area_start or offset + leader.record_length > bytes.len) return error.BadRecordLength;
     const rec_bytes = bytes[offset .. offset + leader.record_length];
     const field_area = rec_bytes[leader.field_area_start..];
     const fields = try parseFields(a, entries, field_area);
@@ -333,7 +336,11 @@ pub const RecordView = struct {
     pub fn firstTag(self: RecordView) ?[]const u8 {
         const L = self.leader;
         const entry_len = @as(usize, L.size_of_field_tag) + L.size_of_field_length + L.size_of_field_position;
-        if (24 + entry_len > L.field_area_start or self.base[24] == FT) return null;
+        // `iterate` admits a record whose stored length is shorter than its
+        // directory, so base can be 24 bytes while field_area_start is larger.
+        // `field` and `FieldIterator.next` already guard this.
+        if (24 + entry_len > L.field_area_start or L.field_area_start > self.base.len) return null;
+        if (self.base[24] == FT) return null;
         return self.base[24 .. 24 + L.size_of_field_tag];
     }
 
@@ -603,6 +610,41 @@ test "record_length==0 (length not stored) recovers size from the directory" {
     const pad = "00000" ++ "     " ++ "00" ++ "00024" ++ "   " ++ "11 1"; // id byte (pos 6) = ' '
     try std.testing.expectEqual(@as(usize, 24), pad.len);
     try std.testing.expectError(error.EndOfRecords, parseRecord(a, pad, 0));
+}
+
+test "a record whose stored length is shorter than its directory is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // field_area_start says the directory runs to byte 100. record_length says
+    // the record is 24 bytes, so the field area starts past the end of the
+    // record. The eager path refuses it. The tolerant path admits it and still
+    // reads within 24 bytes.
+    var buf: [100]u8 = undefined;
+    @memset(&buf, ' ');
+    @memcpy(buf[0..5], "00024"); // record_length
+    buf[5] = '3';
+    buf[6] = 'D';
+    buf[8] = '1';
+    buf[10] = '0';
+    buf[11] = '9';
+    @memcpy(buf[12..17], "00100"); // field_area_start
+    buf[20] = '3'; // size_of_field_length
+    buf[21] = '4'; // size_of_field_position
+    buf[23] = '4'; // size_of_field_tag
+    buf[22] = '0';
+    buf[24] = FT; // empty directory
+    buf[99] = FT; // directory terminator
+
+    try std.testing.expectError(error.BadRecordLength, parseRecord(a, &buf, 0));
+    try std.testing.expectError(error.BadRecordLength, validate(&buf));
+
+    var it = iterate(&buf);
+    const rec = it.next().?;
+    try std.testing.expectEqual(@as(usize, 24), rec.base.len);
+    try std.testing.expect(rec.firstTag() == null);
+    try std.testing.expect(rec.field("DSID") == null);
 }
 
 test "subfield format control parsing" {
