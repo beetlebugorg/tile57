@@ -1004,7 +1004,7 @@ pub fn json(alloc: std.mem.Allocator, opts: Options) ![]u8 {
         .sound_img = try mariner.soundingsIconImage(b, &m),
         .point_img = try mariner.pointSymbolImage(b, &m),
         .contour_field = try mariner.contourLabelField(b, &m),
-        .text_field = try mariner.depthTextField(b, &m),
+        .text_field = try mariner.labelTextField(b, &m),
         .common = if (filters_on) try mariner.commonChartFilters(ba, &m, opts.enabled_bands, opts.now_unix) else &.{},
         .text_group = if (filters_on) try mariner.textGroupFilter(b, &m) else null,
         .size_scale = opts.size_scale,
@@ -1709,6 +1709,28 @@ test "buildFromTemplate: feet reads a dredged area's feet depth text; metres doe
     const metres = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
     defer a.free(metres);
     try std.testing.expect(std.mem.indexOf(u8, metres, "text_ft") == null);
+}
+
+test "buildFromTemplate: a language preference reads that language's twin" {
+    const a = std.testing.allocator;
+    const zho = try buildFromTemplate(a, cs_template, &.{ .preferred_language = "zho" }, cs_ct, null, 1700000000);
+    defer a.free(zho);
+    try std.testing.expect(std.mem.indexOf(u8, zho, "text_zho") != null);
+    // An S-57 national name states no language, so it answers any preference.
+    try std.testing.expect(std.mem.indexOf(u8, zho, "text_und") != null);
+
+    // No preference reads the string the rules composed.
+    const off = try buildFromTemplate(a, cs_template, &.{}, cs_ct, null, 1700000000);
+    defer a.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "text_zho") == null);
+    try std.testing.expect(std.mem.indexOf(u8, off, "text_und") == null);
+
+    // The language wins over the depth twin, and both stay ahead of `text`.
+    const both = try buildFromTemplate(a, cs_template, &.{ .preferred_language = "zho", .depth_unit = .feet }, cs_ct, null, 1700000000);
+    defer a.free(both);
+    const izho = std.mem.indexOf(u8, both, "text_zho").?;
+    const ift = std.mem.indexOf(u8, both, "text_ft").?;
+    try std.testing.expect(izho < ift);
 }
 
 test "buildFromTemplate: enabled bands add a band filter" {

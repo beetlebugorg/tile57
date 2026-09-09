@@ -125,3 +125,77 @@ test "ascii view: water shades left, land '#' right, coastline between" {
     try std.testing.expect(west == '▒' or west == '░' or west == '~' or west == '%');
     try std.testing.expect(std.mem.indexOf(u8, text, "|") != null);
 }
+
+test "ascii view: the national name replaces the portrayed one when asked" {
+    // The tile path bakes a text property per language for a style to
+    // coalesce. A character surface picks at draw time instead. This drives the
+    // real rules and reads the label off the grid.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const z: u8 = 8;
+    const x: u32 = 128;
+    const y: u32 = 96;
+    const tb = tile.tileBoundsLonLat(z, x, y);
+    const w = tb[2] - tb[0];
+    const h = tb[3] - tb[1];
+
+    // One BUAARE over the tile, named in both languages. The character grid
+    // keeps the first word of a label, so both names are single words.
+    const attrs = [_]s57.Attr{
+        .{ .code = s57.ATTR_OBJNAM, .value = "Harwich" },
+        .{ .code = s57.ATTR_NOBJNM, .value = "Harwijk" },
+    };
+    const feats = [_]s57.Feature{
+        .{ .rcnm = 100, .rcid = 1, .prim = 3, .objl = 13, .attrs = &attrs }, // BUAARE
+    };
+    var cell = s57.Cell{
+        .params = .{},
+        .vectors = &.{},
+        .features = &feats,
+        .nodes = std.AutoHashMap(u64, s57.LonLat).init(a),
+        .edges = std.AutoHashMap(u32, usize).init(a),
+        .sounding_vecs = std.AutoHashMap(u64, usize).init(a),
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+    };
+    defer cell.arena.deinit();
+
+    const ring = [_]s57.LonLat{
+        s57.LonLat.init(tb[0] + 0.1 * w, tb[1] + 0.1 * h),
+        s57.LonLat.init(tb[0] + 0.9 * w, tb[1] + 0.1 * h),
+        s57.LonLat.init(tb[0] + 0.9 * w, tb[1] + 0.9 * h),
+        s57.LonLat.init(tb[0] + 0.1 * w, tb[1] + 0.9 * h),
+        s57.LonLat.init(tb[0] + 0.1 * w, tb[1] + 0.1 * h),
+    };
+    const geo = try a.alloc(?[][]s57.LonLat, 1);
+    const parts = try a.alloc([]s57.LonLat, 1);
+    parts[0] = try a.dupe(s57.LonLat, &ring);
+    geo[0] = parts;
+
+    portray.setQuiet(true);
+    // The variants pass runs the rules again with PreferredLanguage set, which
+    // is what produces the national label.
+    const cp = try portray.portrayCellVariants(a, &cell, "");
+    var colors = try render.resolve.Colors.init(a, colorprofile_registry.entries[0].bytes);
+
+    const draw = struct {
+        fn run(al: std.mem.Allocator, c: *s57.Cell, st: portray.CellPortrayal, g: []?[][]s57.LonLat, col: *render.resolve.Colors, m: *const render.resolve.Settings, b: [4]f64) ![]const u8 {
+            var as = render.ascii.AsciiSurface.initView(al, col, .day, m, 8.0, 64, 32, 256.0, tile.EXTENT);
+            const nat = try al.alloc(scene.LangStreams, st.national.len);
+            for (st.national, nat) |p, *o| o.* = .{ .lang = p.lang, .streams = p.streams };
+            const cells = [_]scene.CellRef{.{ .cell = c, .portrayal = st.base, .portrayal_national = nat, .geo = g }};
+            return scene.generateView(&as, al, al, &cells, (b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 8.0, false);
+        }
+    }.run;
+
+    const off = render.resolve.Settings{};
+    const plain = try draw(a, &cell, cp, geo, &colors, &off, tb);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Harwich") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Harwijk") == null);
+
+    const on = render.resolve.Settings{ .preferred_language = "und" };
+    const national = try draw(a, &cell, cp, geo, &colors, &on, tb);
+    try std.testing.expect(std.mem.indexOf(u8, national, "Harwijk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, national, "Harwich") == null);
+}

@@ -140,6 +140,10 @@ typedef struct tg_portray_ctx {
     double shallow_contour;
     double deep_contour;
     double safety_height;
+    /* ISO 639-2 code the rules match featureName.language against. The
+     * catalogue's GetFeatureName returns the entry whose language equals this,
+     * and falls back to the nameUsage 1 entry when none does. */
+    const char *preferred_language;
 } tg_portray_ctx;
 
 static const tg_portray_ctx tg_default_ctx = {
@@ -166,6 +170,8 @@ static void tg_set_ctx_globals(lua_State *L, const tg_portray_ctx *ctx) {
     TG_SET_REAL("SHALLOW_CONTOUR", ctx->shallow_contour);
     TG_SET_REAL("DEEP_CONTOUR", ctx->deep_contour);
     TG_SET_REAL("SAFETY_HEIGHT", ctx->safety_height);
+    lua_pushstring(L, ctx->preferred_language ? ctx->preferred_language : "eng");
+    lua_setglobal(L, "PREFERRED_LANGUAGE");
 #undef TG_SET_BOOL
 #undef TG_SET_REAL
 }
@@ -583,7 +589,7 @@ int tile57_diag_portray_demo(const char *dir) {
         "cp('ShallowWaterDangers','boolean','false'); cp('SafetyContour','real','30')\n"
         "cp('SafetyDepth','real','30'); cp('ShallowContour','real','2')\n"
         "cp('DeepContour','real','30'); cp('SafetyHeight','real','0')\n"
-        "cp('PreferredLanguage','text','eng')\n"
+        "cp('PreferredLanguage','text', PREFERRED_LANGUAGE)\n"
         "PortrayalInitializeContextParameters(cps)\n"
         "local out={}\n"
         "local ctx=portrayalContext.ContextParameters\n"
@@ -1107,7 +1113,7 @@ int tg_portray_run(const char *dir, size_t dir_len, const tg_portray_ctx *ctx) {
         "cp('ShallowWaterDangers','boolean', b(SHALLOW_WATER_DANGERS)); cp('SafetyContour','real', SAFETY_CONTOUR)\n"
         "cp('SafetyDepth','real', SAFETY_DEPTH); cp('ShallowContour','real', SHALLOW_CONTOUR)\n"
         "cp('DeepContour','real', DEEP_CONTOUR); cp('SafetyHeight','real', SAFETY_HEIGHT)\n"
-        "cp('PreferredLanguage','text','eng')\n"
+        "cp('PreferredLanguage','text', PREFERRED_LANGUAGE)\n"
         "PortrayalInitializeContextParameters(cps)\n"
         // Drive portrayal through the reference S-100 Part 9a entry point exactly as
         // the catalogue intends. HostPortrayalEmit is the framework's per-feature

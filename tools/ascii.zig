@@ -15,6 +15,15 @@ const cellPx = common.cellPx;
 // The chart on stdout as a Unicode text grid — the render-engine EXAMPLE
 // backend (src/render/ascii.zig): the same chart layer + view driver as
 // `tile57 png`, with the AsciiSurface at the end instead of the pixel one.
+/// Install a fallback face for scripts the bundled Noto Sans has no glyphs for,
+/// from the path in TILE57_FONT_FALLBACK. The bytes are leaked deliberately:
+/// render.font borrows them for the life of the process.
+fn loadFallbackFont(io: std.Io, a: std.mem.Allocator) void {
+    const p = std.c.getenv("TILE57_FONT_FALLBACK") orelse return;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(p), a, .limited(128 << 20)) catch return;
+    render.font.setFallback(bytes);
+}
+
 pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
         std.debug.print("usage: tile57 ascii <cell.000|bundle.pmtiles> --view <lon,lat,zoom> [--size COLSxROWS (default: terminal size)] [--palette day|dusk|night] [--ansi] [--tui] [--kitty] [--rules DIR]\n", .{});
@@ -31,6 +40,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     var kitty = false;
     var view: ?struct { lon: f64, lat: f64, zoom: f64 } = null;
     var f = Flags{ .args = args, .i = 2 };
+    var language: []const u8 = "";
     while (f.next()) |arg| {
         if (std.mem.eql(u8, arg, "--view")) {
             const v = f.next() orelse return usageErr("--view needs lon,lat,zoom");
@@ -50,6 +60,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
             palette = std.meta.stringToEnum(render.resolve.PaletteId, v) orelse return usageErr("palette must be day|dusk|night");
         } else if (std.mem.eql(u8, arg, "--rules")) {
             rules = f.next() orelse return usageErr("--rules needs a dir");
+        } else if (std.mem.eql(u8, arg, "--language")) {
+            language = f.next() orelse return usageErr("--language needs an ISO 639-2 code");
         } else if (std.mem.eql(u8, arg, "--ansi")) {
             ansi = true;
         } else if (std.mem.eql(u8, arg, "--tui")) {
@@ -90,7 +102,9 @@ pub fn run(io: std.Io, a: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else chart.Chart.openPath(path, rules, false) catch return usageErr("cannot open source");
     defer c.deinit();
 
+    loadFallbackFont(io, a);
     var m = render.resolve.Settings{ .display_other = true };
+    m.preferred_language = language;
     m.scheme = switch (palette) {
         .day => .day,
         .dusk => .dusk,
