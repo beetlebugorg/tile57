@@ -6,6 +6,12 @@
 //! linked by clang++ in the host (avoiding Zig's linker tripping on the
 //! system crt's .sframe relocations).
 
+const std = @import("std");
+
+/// glibc places static TLS inside each thread's stack, and std's default
+/// 256 KB per-thread signal stack is static TLS.
+pub const std_options: std.Options = .{ .signal_stack_size = 64 * 1024 };
+
 // The full engine surface (root.zig + portray) via the named "engine" module, NOT a
 // root.zig file-import: bundle (below) pulls in engine_full, which owns root.zig, so a
 // second file-import here would double-claim the file (one-module-per-file per artifact).
